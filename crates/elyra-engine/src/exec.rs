@@ -512,17 +512,15 @@ async fn join_select(
 /// If a single-table conjunct is `indexed_col = <literal>` (PK or secondary
 /// index), the base relation is fetched via the O(log n) fast path instead of
 /// a full scan.
-async fn load_relation(
-    db: &Db,
-    tf: &TableFactor,
-    conjuncts: &[Expr],
-) -> Result<(Vec<ColumnDef>, Vec<Vec<Value>>)> {
+/// Resolve a table reference to its definition and qualified ("alias.col")
+/// columns, without reading any rows.
+async fn resolve_table(db: &Db, tf: &TableFactor) -> Result<(TableDef, Vec<ColumnDef>)> {
     match tf {
         TableFactor::Table { name, alias, .. } => {
             let tname = table_ident(name)?;
             let def = catalog::load(db, &tname).await?;
             let a = alias.as_ref().map(|al| al.name.value.clone()).unwrap_or_else(|| tname.clone());
-            let cols: Vec<ColumnDef> = def
+            let cols = def
                 .schema
                 .columns
                 .iter()
@@ -532,26 +530,111 @@ async fn load_relation(
                     nullable: c.nullable,
                 })
                 .collect();
-
-            // Pick an accelerable conjunct (eq on PK / indexed column) that
-            // references only this relation, and route it through the index.
-            let rel_schema = Schema::new(cols.clone());
-            let accel = conjuncts
-                .iter()
-                .find(|c| refs_in_schema(c, &rel_schema) && is_accelerable(&def, c).unwrap_or(false));
-
-            let rows = match accel {
-                Some(c) => collect_matches(db, &def, Some(c), None)
-                    .await?
-                    .into_iter()
-                    .map(|(_, r)| r)
-                    .collect(),
-                None => scan_rows(db, &def, None).await?,
-            };
-            Ok((cols, rows))
+            Ok((def, cols))
         }
         _ => Err(Error::Unsupported("only plain table references are supported in joins".into())),
     }
+}
+
+async fn load_relation(
+    db: &Db,
+    tf: &TableFactor,
+    conjuncts: &[Expr],
+) -> Result<(Vec<ColumnDef>, Vec<Vec<Value>>)> {
+    let (def, cols) = resolve_table(db, tf).await?;
+
+    // Pick an accelerable conjunct (eq on PK / indexed column) that references
+    // only this relation, and route it through the index fast path.
+    let rel_schema = Schema::new(cols.clone());
+    let accel = conjuncts
+        .iter()
+        .find(|c| refs_in_schema(c, &rel_schema) && is_accelerable(&def, c).unwrap_or(false));
+
+    let rows = match accel {
+        Some(c) => collect_matches(db, &def, Some(c), None)
+            .await?
+            .into_iter()
+            .map(|(_, r)| r)
+            .collect(),
+        None => scan_rows(db, &def, None).await?,
+    };
+    Ok((cols, rows))
+}
+
+/// Driving-side row count at or below which we prefer an index nested-loop
+/// join (probe the partner per row) over materialising the whole partner.
+const NLJ_MAX_DRIVING: usize = 2048;
+
+/// Fetch partner rows where `col == value` via PK/point or secondary index.
+async fn lookup_rows_by_eq(
+    db: &Db,
+    def: &TableDef,
+    col: usize,
+    value: &Value,
+) -> Result<Vec<Vec<Value>>> {
+    let deser = |b: Vec<u8>| -> Result<Vec<Value>> {
+        bincode::deserialize(&b).map_err(|e| Error::Storage(e.to_string()))
+    };
+    if def.pk_col == Some(col) {
+        let key = data_key(&def.name, &keyenc::encode(value)?);
+        return Ok(match db.get(key).await? {
+            Some(b) => vec![deser(b)?],
+            None => vec![],
+        });
+    }
+    if let Some(idx) = index::index_on(def, col) {
+        let mut out = Vec::new();
+        for dk in index::lookup_eq(db, &def.name, idx, value).await? {
+            if let Some(b) = db.get(dk).await? {
+                out.push(deser(b)?);
+            }
+        }
+        return Ok(out);
+    }
+    Err(Error::Query("column is not indexed for nested-loop join".into()))
+}
+
+/// If `on` is `A = B` with one operand referencing only the driving side and
+/// the other a plain column of the partner, return `(driving_key_expr,
+/// partner_col_index)` for an index nested-loop probe.
+fn equi_nlj(on: &Expr, driving: &Schema, partner: &Schema) -> Option<(Expr, usize)> {
+    let Expr::BinaryOp { left, op: sqlparser::ast::BinaryOperator::Eq, right } = on else {
+        return None;
+    };
+    let plain = |e: &Expr| -> Option<String> {
+        match e {
+            Expr::Identifier(id) => Some(id.value.clone()),
+            Expr::CompoundIdentifier(p) => {
+                Some(p.iter().map(|i| i.value.as_str()).collect::<Vec<_>>().join("."))
+            }
+            _ => None,
+        }
+    };
+    if refs_in_schema(left, driving) {
+        if let Some(n) = plain(right) {
+            if let Ok(i) = predicate::resolve_index(&n, partner) {
+                return Some(((**left).clone(), i));
+            }
+        }
+    }
+    if refs_in_schema(right, driving) {
+        if let Some(n) = plain(left) {
+            if let Ok(i) = predicate::resolve_index(&n, partner) {
+                return Some(((**right).clone(), i));
+            }
+        }
+    }
+    None
+}
+
+fn join_on(op: &JoinOperator) -> Result<(Option<Expr>, bool)> {
+    Ok(match op {
+        JoinOperator::Inner(JoinConstraint::On(e)) => (Some(e.clone()), false),
+        JoinOperator::Inner(JoinConstraint::None) | JoinOperator::CrossJoin => (None, false),
+        JoinOperator::LeftOuter(JoinConstraint::On(e)) => (Some(e.clone()), true),
+        JoinOperator::LeftOuter(JoinConstraint::None) => (None, true),
+        other => return Err(Error::Unsupported(format!("join type not supported: {other:?}"))),
+    })
 }
 
 /// Whether `conjunct` is `col = <literal>` on this table's PK or an index.
@@ -586,6 +669,51 @@ async fn build_from(
             cur_rows = r;
         }
         for join in &twj.joins {
+            // Index nested-loop join: when the driving side is small and the
+            // partner is indexed on the join key, probe the partner per row
+            // instead of materialising it in full.
+            let (pdef, pcols) = resolve_table(db, &join.relation).await?;
+            let driving_schema = Schema::new(cur_cols.clone());
+            let partner_schema = Schema::new(pcols.clone());
+            let (on, left_outer) = join_on(&join.join_operator)?;
+
+            let nlj = on
+                .as_ref()
+                .and_then(|e| equi_nlj(e, &driving_schema, &partner_schema))
+                .filter(|(_, pcol)| {
+                    cur_rows.len() <= NLJ_MAX_DRIVING
+                        && (pdef.pk_col == Some(*pcol) || index::index_on(&pdef, *pcol).is_some())
+                });
+
+            if let Some((driving_key, pcol)) = nlj {
+                let plen = pcols.len();
+                let mut out = Vec::new();
+                for l in &cur_rows {
+                    let v = predicate::eval_row(&driving_key, &driving_schema, l)?;
+                    let matches = if v.is_null() {
+                        Vec::new()
+                    } else {
+                        lookup_rows_by_eq(db, &pdef, pcol, &v).await?
+                    };
+                    let mut matched = false;
+                    for m in matches {
+                        let mut combined = l.clone();
+                        combined.extend(m);
+                        out.push(combined);
+                        matched = true;
+                    }
+                    if left_outer && !matched {
+                        let mut combined = l.clone();
+                        combined.extend(std::iter::repeat(Value::Null).take(plen));
+                        out.push(combined);
+                    }
+                }
+                cur_cols.extend(pcols);
+                cur_rows = out;
+                continue;
+            }
+
+            // Fallback: materialise the partner (with pushdown) and hash/nested join.
             let (jc, mut jr) = load_relation(db, &join.relation, conjuncts).await?;
             jr = apply_pushdown(jr, &jc, conjuncts)?;
             let (c, r) = combine(&cur_cols, &cur_rows, &jc, &jr, &join.join_operator)?;
