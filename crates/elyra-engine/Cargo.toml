@@ -9,6 +9,7 @@ description = "ElyraSQL query engine: parse, plan and execute SQL"
 [dependencies]
 elyra-core.workspace = true
 elyra-storage.workspace = true
+elyra-vector.workspace = true
 sqlparser.workspace = true
 bincode.workspace = true
 serde.workspace = true

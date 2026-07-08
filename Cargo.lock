@@ -496,6 +496,7 @@ dependencies = [
  "bincode",
  "elyra-core",
  "elyra-storage",
+ "elyra-vector",
  "serde",
  "sqlparser",
  "tokio",

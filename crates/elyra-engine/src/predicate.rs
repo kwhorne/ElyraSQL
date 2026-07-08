@@ -16,6 +16,7 @@ pub fn eval_row(expr: &Expr, schema: &Schema, row: &[Value]) -> Result<Value> {
             let name = parts.last().map(|i| i.value.as_str()).unwrap_or("");
             resolve(name, schema, row)
         }
+        Expr::Function(f) => eval_function(f, schema, row),
         Expr::IsNull(e) => Ok(Value::Bool(eval_row(e, schema, row)?.is_null())),
         Expr::IsNotNull(e) => Ok(Value::Bool(!eval_row(e, schema, row)?.is_null())),
         Expr::UnaryOp { op, expr } => {
@@ -48,6 +49,64 @@ pub fn eval_row(expr: &Expr, schema: &Schema, row: &[Value]) -> Result<Value> {
 /// Does `expr` filter `row` in or out?
 pub fn matches(expr: &Expr, schema: &Schema, row: &[Value]) -> Result<bool> {
     Ok(truthy(&eval_row(expr, schema, row)?))
+}
+
+/// Evaluate a scalar function. Currently the ElyraSQL vector distance family.
+fn eval_function(f: &sqlparser::ast::Function, schema: &Schema, row: &[Value]) -> Result<Value> {
+    use elyra_vector::Metric;
+    let name = f.name.0.last().map(|i| i.value.to_ascii_lowercase()).unwrap_or_default();
+    let metric = match name.as_str() {
+        "vec_distance" | "vec_l2_distance" | "vec_distance_l2" => Metric::L2,
+        "vec_cosine_distance" | "vec_distance_cosine" => Metric::Cosine,
+        "vec_inner_product" | "vec_distance_ip" => Metric::InnerProduct,
+        other => return Err(Error::Unsupported(format!("unknown function: {other}"))),
+    };
+
+    let args = function_arg_exprs(f)?;
+    if args.len() != 2 {
+        return Err(Error::Query(format!("{name} expects 2 arguments")));
+    }
+    let a = to_vector(&eval_row(args[0], schema, row)?)?;
+    let b = to_vector(&eval_row(args[1], schema, row)?)?;
+    match elyra_vector::distance(&a, &b, metric) {
+        Some(d) => Ok(Value::Float(d as f64)),
+        None => Err(Error::Vector(format!(
+            "vector dimension mismatch: {} vs {}",
+            a.len(),
+            b.len()
+        ))),
+    }
+}
+
+fn function_arg_exprs(f: &sqlparser::ast::Function) -> Result<Vec<&Expr>> {
+    use sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArguments};
+    let FunctionArguments::List(list) = &f.args else {
+        return Err(Error::Query("function requires arguments".into()));
+    };
+    let mut out = Vec::new();
+    for a in &list.args {
+        match a {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => out.push(e),
+            _ => return Err(Error::Unsupported("unsupported function argument".into())),
+        }
+    }
+    Ok(out)
+}
+
+/// Coerce a value to a vector: a `VECTOR` value, or a `'[..]'` text literal.
+fn to_vector(v: &Value) -> Result<Vec<f32>> {
+    match v {
+        Value::Vector(x) => Ok(x.clone()),
+        Value::Text(s) => {
+            let inner = s.trim().trim_start_matches('[').trim_end_matches(']');
+            inner
+                .split(',')
+                .filter(|t| !t.trim().is_empty())
+                .map(|t| t.trim().parse::<f32>().map_err(|_| Error::Vector(format!("bad vector element: {t}"))))
+                .collect()
+        }
+        other => Err(Error::Vector(format!("value is not a vector: {other:?}"))),
+    }
 }
 
 fn resolve(name: &str, schema: &Schema, row: &[Value]) -> Result<Value> {

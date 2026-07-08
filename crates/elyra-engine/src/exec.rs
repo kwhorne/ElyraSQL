@@ -305,6 +305,21 @@ pub async fn select(db: &Db, query: &SqlQuery) -> Result<QueryResult> {
         return Ok(QueryResult::Rows(RowStream::literal(schema, out_rows)));
     }
 
+    // Materialised path: needed for ORDER BY, or for expression projections
+    // such as `VEC_DISTANCE(embedding, '[..]') AS dist`.
+    if !order_exprs.is_empty() || !projection_is_simple(&select.projection) {
+        // ORDER BY may reference a projection alias (e.g. `ORDER BY dist`);
+        // substitute it with the expression it names.
+        let resolved = resolve_order_aliases(&order_exprs, &select.projection, &def.schema);
+        let mut rows = scan_rows(db, &def, filter.as_ref()).await?;
+        if !resolved.is_empty() {
+            sort_full_rows(&mut rows, &def.schema, &resolved)?;
+        }
+        apply_offset_limit(&mut rows, offset, limit);
+        let (schema, out) = project_exprs(&select.projection, &def.schema, &rows)?;
+        return Ok(QueryResult::Rows(RowStream::literal(schema, out)));
+    }
+
     // Build projection.
     use sqlparser::ast::SelectItem;
     let (projection, out_cols): (Vec<usize>, Vec<ColumnDef>) = if select
@@ -345,19 +360,6 @@ pub async fn select(db: &Db, query: &SqlQuery) -> Result<QueryResult> {
     };
 
     let out_schema = Schema::new(out_cols);
-
-    // ORDER BY without aggregation: materialise, sort on full rows (order keys
-    // may reference non-projected columns), then page and project.
-    if !order_exprs.is_empty() {
-        let mut rows = scan_rows(db, &def, filter.as_ref()).await?;
-        sort_full_rows(&mut rows, &def.schema, &order_exprs)?;
-        apply_offset_limit(&mut rows, offset, limit);
-        let out: Vec<Vec<Value>> = rows
-            .iter()
-            .map(|r| projection.iter().map(|&i| r[i].clone()).collect())
-            .collect();
-        return Ok(QueryResult::Rows(RowStream::literal(out_schema, out)));
-    }
 
     // Secondary-index fast path: `WHERE indexed_col = <literal>` retrieves
     // matching rows via the index instead of scanning the whole table.
@@ -645,6 +647,125 @@ fn eval_usize(e: &Expr) -> Result<usize> {
     match eval_expr(e)? {
         Value::Int(i) if i >= 0 => Ok(i as usize),
         other => Err(Error::Query(format!("expected non-negative integer, got {other:?}"))),
+    }
+}
+
+/// True when every projection item is `*` or a bare column reference, so it
+/// can go through the streaming scan path.
+/// Rewrite ORDER BY items that name a projection alias into the aliased
+/// expression, so sorting can evaluate them against the table row.
+fn resolve_order_aliases(
+    order: &[(Expr, bool)],
+    projection: &[sqlparser::ast::SelectItem],
+    schema: &Schema,
+) -> Vec<(Expr, bool)> {
+    use sqlparser::ast::SelectItem;
+    order
+        .iter()
+        .map(|(e, asc)| {
+            if let Some(name) = ident_name(e) {
+                let is_column = schema.columns.iter().any(|c| c.name.eq_ignore_ascii_case(name));
+                if !is_column {
+                    for item in projection {
+                        if let SelectItem::ExprWithAlias { expr, alias } = item {
+                            if alias.value.eq_ignore_ascii_case(name) {
+                                return (expr.clone(), *asc);
+                            }
+                        }
+                    }
+                }
+            }
+            (e.clone(), *asc)
+        })
+        .collect()
+}
+
+fn projection_is_simple(projection: &[sqlparser::ast::SelectItem]) -> bool {
+    use sqlparser::ast::SelectItem;
+    projection.iter().all(|item| match item {
+        SelectItem::Wildcard(_) => true,
+        SelectItem::UnnamedExpr(e) => ident_name(e).is_some(),
+        SelectItem::ExprWithAlias { expr, .. } => ident_name(expr).is_some(),
+        _ => false,
+    })
+}
+
+/// Project (possibly expression) columns over materialised rows. Supports
+/// `*`, bare columns, and scalar expressions like `VEC_DISTANCE(...)`.
+fn project_exprs(
+    projection: &[sqlparser::ast::SelectItem],
+    schema: &Schema,
+    rows: &[Vec<Value>],
+) -> Result<(Schema, Vec<Vec<Value>>)> {
+    use sqlparser::ast::SelectItem;
+
+    enum Proj<'a> {
+        Col(usize),
+        Expr(&'a Expr),
+    }
+    let mut names: Vec<String> = Vec::new();
+    let mut projs: Vec<Proj> = Vec::new();
+
+    for item in projection {
+        match item {
+            SelectItem::Wildcard(_) => {
+                for (i, c) in schema.columns.iter().enumerate() {
+                    names.push(c.name.clone());
+                    projs.push(Proj::Col(i));
+                }
+            }
+            SelectItem::UnnamedExpr(e) => {
+                names.push(ident_name(e).map(|s| s.to_string()).unwrap_or_else(|| e.to_string()));
+                projs.push(Proj::Expr(e));
+            }
+            SelectItem::ExprWithAlias { expr, alias } => {
+                names.push(alias.value.clone());
+                projs.push(Proj::Expr(expr));
+            }
+            other => {
+                return Err(Error::Unsupported(format!("projection item not supported: {other}")))
+            }
+        }
+    }
+
+    let mut out_rows = Vec::with_capacity(rows.len());
+    for row in rows {
+        let mut o = Vec::with_capacity(projs.len());
+        for p in &projs {
+            o.push(match p {
+                Proj::Col(i) => row[*i].clone(),
+                Proj::Expr(e) => predicate::eval_row(e, schema, row)?,
+            });
+        }
+        out_rows.push(o);
+    }
+
+    // Infer output column types (from the source column, else the first row).
+    let mut cols = Vec::with_capacity(projs.len());
+    for (ci, (name, p)) in names.iter().zip(&projs).enumerate() {
+        let ty = match p {
+            Proj::Col(i) => schema.columns[*i].ty.clone(),
+            Proj::Expr(e) => match ident_name(e).and_then(|n| {
+                schema.columns.iter().find(|c| c.name.eq_ignore_ascii_case(n))
+            }) {
+                Some(c) => c.ty.clone(),
+                None => out_rows.first().map(|r| infer_val(&r[ci])).unwrap_or(ColumnType::Text),
+            },
+        };
+        cols.push(ColumnDef { name: name.clone(), ty, nullable: true });
+    }
+
+    Ok((Schema::new(cols), out_rows))
+}
+
+fn infer_val(v: &Value) -> ColumnType {
+    match v {
+        Value::Bool(_) => ColumnType::Bool,
+        Value::Int(_) => ColumnType::Int,
+        Value::Float(_) => ColumnType::Float,
+        Value::Bytes(_) => ColumnType::Bytes,
+        Value::Vector(x) => ColumnType::Vector(x.len() as u32),
+        _ => ColumnType::Text,
     }
 }
 
