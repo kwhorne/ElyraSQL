@@ -10,6 +10,7 @@ use sqlparser::ast::{
     ObjectName, SetExpr, TableConstraint, TableFactor, TableWithJoins, Query as SqlQuery,
 };
 
+use crate::aggregate;
 use crate::predicate;
 
 use crate::catalog::{self, catalog_key, data_key, data_prefix, rowid_key, TableDef};
@@ -219,6 +220,28 @@ pub async fn select(db: &Db, query: &SqlQuery) -> Result<QueryResult> {
     };
     let filter = select.selection.clone();
 
+    // GROUP BY / ORDER BY.
+    let group_by: Vec<Expr> = match &select.group_by {
+        sqlparser::ast::GroupByExpr::Expressions(exprs, _) => exprs.clone(),
+        sqlparser::ast::GroupByExpr::All(_) => {
+            return Err(Error::Unsupported("GROUP BY ALL is not supported".into()))
+        }
+    };
+    let order_exprs: Vec<(Expr, bool)> = match &query.order_by {
+        Some(ob) => ob.exprs.iter().map(|o| (o.expr.clone(), o.asc.unwrap_or(true))).collect(),
+        None => Vec::new(),
+    };
+
+    // Aggregation / grouping path: materialise, aggregate, order, page.
+    if !group_by.is_empty() || aggregate::projection_has_aggregate(&select.projection) {
+        let rows = scan_rows(db, &def, filter.as_ref()).await?;
+        let (schema, mut out_rows) =
+            aggregate::run(&def.schema, &select.projection, &group_by, rows)?;
+        order_output_rows(&mut out_rows, &schema, &order_exprs)?;
+        apply_offset_limit(&mut out_rows, offset, limit);
+        return Ok(QueryResult::Rows(RowStream::literal(schema, out_rows)));
+    }
+
     // Build projection.
     use sqlparser::ast::SelectItem;
     let (projection, out_cols): (Vec<usize>, Vec<ColumnDef>) = if select
@@ -259,6 +282,19 @@ pub async fn select(db: &Db, query: &SqlQuery) -> Result<QueryResult> {
     };
 
     let out_schema = Schema::new(out_cols);
+
+    // ORDER BY without aggregation: materialise, sort on full rows (order keys
+    // may reference non-projected columns), then page and project.
+    if !order_exprs.is_empty() {
+        let mut rows = scan_rows(db, &def, filter.as_ref()).await?;
+        sort_full_rows(&mut rows, &def.schema, &order_exprs)?;
+        apply_offset_limit(&mut rows, offset, limit);
+        let out: Vec<Vec<Value>> = rows
+            .iter()
+            .map(|r| projection.iter().map(|&i| r[i].clone()).collect())
+            .collect();
+        return Ok(QueryResult::Rows(RowStream::literal(out_schema, out)));
+    }
 
     // Fast path: `WHERE pk = <literal>` becomes an O(log n) point lookup on
     // the clustered key instead of a full table scan.
@@ -481,6 +517,94 @@ fn eval_usize(e: &Expr) -> Result<usize> {
     match eval_expr(e)? {
         Value::Int(i) if i >= 0 => Ok(i as usize),
         other => Err(Error::Query(format!("expected non-negative integer, got {other:?}"))),
+    }
+}
+
+/// Materialise all rows matching `filter` (drops storage keys).
+async fn scan_rows(db: &Db, def: &TableDef, filter: Option<&Expr>) -> Result<Vec<Vec<Value>>> {
+    Ok(collect_matches(db, def, filter, None)
+        .await?
+        .into_iter()
+        .map(|(_, r)| r)
+        .collect())
+}
+
+fn apply_offset_limit(rows: &mut Vec<Vec<Value>>, offset: usize, limit: Option<usize>) {
+    if offset > 0 {
+        rows.drain(0..offset.min(rows.len()));
+    }
+    if let Some(l) = limit {
+        rows.truncate(l);
+    }
+}
+
+/// Sort full table rows by ORDER BY expressions evaluated against the row.
+fn sort_full_rows(
+    rows: &mut [Vec<Value>],
+    schema: &Schema,
+    order: &[(Expr, bool)],
+) -> Result<()> {
+    // Precompute sort keys once per row.
+    let mut keyed: Vec<(Vec<Value>, usize)> = Vec::with_capacity(rows.len());
+    for (i, row) in rows.iter().enumerate() {
+        let mut keys = Vec::with_capacity(order.len());
+        for (e, _) in order {
+            keys.push(predicate::eval_row(e, schema, row)?);
+        }
+        keyed.push((keys, i));
+    }
+    sort_keyed(&mut keyed, order);
+    reorder(rows, &keyed);
+    Ok(())
+}
+
+/// Sort already-computed output rows by ORDER BY referencing output columns.
+fn order_output_rows(
+    rows: &mut [Vec<Value>],
+    schema: &Schema,
+    order: &[(Expr, bool)],
+) -> Result<()> {
+    if order.is_empty() {
+        return Ok(());
+    }
+    // Resolve each order expr to an output column index.
+    let mut cols = Vec::with_capacity(order.len());
+    for (e, _) in order {
+        let name = ident_name(e).map(|s| s.to_string()).unwrap_or_else(|| e.to_string());
+        let idx = schema
+            .columns
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(&name))
+            .ok_or_else(|| Error::Query(format!("ORDER BY references unknown output column: {name}")))?;
+        cols.push(idx);
+    }
+    let mut keyed: Vec<(Vec<Value>, usize)> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, row)| (cols.iter().map(|&c| row[c].clone()).collect(), i))
+        .collect();
+    sort_keyed(&mut keyed, order);
+    reorder(rows, &keyed);
+    Ok(())
+}
+
+fn sort_keyed(keyed: &mut [(Vec<Value>, usize)], order: &[(Expr, bool)]) {
+    keyed.sort_by(|a, b| {
+        for (i, (_, asc)) in order.iter().enumerate() {
+            let ord = aggregate::value_cmp(&a.0[i], &b.0[i]);
+            let ord = if *asc { ord } else { ord.reverse() };
+            if ord != std::cmp::Ordering::Equal {
+                return ord;
+            }
+        }
+        std::cmp::Ordering::Equal
+    });
+}
+
+fn reorder(rows: &mut [Vec<Value>], keyed: &[(Vec<Value>, usize)]) {
+    let snapshot: Vec<Vec<Value>> = keyed.iter().map(|(_, i)| rows[*i].clone()).collect();
+    for (slot, row) in rows.iter_mut().zip(snapshot) {
+        *slot = row;
     }
 }
 

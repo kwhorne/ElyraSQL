@@ -6,6 +6,7 @@
 //! never fully materialised. This is what lets ElyraSQL handle large data
 //! under high traffic.
 
+mod aggregate;
 mod catalog;
 mod eval;
 mod exec;
