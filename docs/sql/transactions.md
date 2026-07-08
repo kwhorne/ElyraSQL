@@ -21,9 +21,10 @@ COMMIT;                      -- or ROLLBACK to discard
   discards them, leaving storage untouched.
 - **Write-conflict detection.** On `COMMIT`, ElyraSQL verifies that every row
   the transaction wrote is unchanged since its snapshot. If another transaction
-  committed a change to one of those rows first, the commit is **rejected** with
-  a serialization failure (MySQL error `1213`) and the transaction is aborted
-  (first-committer-wins). Retry the transaction.
+  committed a change first, the commit is **rejected** with a serialization
+  failure (MySQL error `1213`) and the transaction is aborted
+  (first-committer-wins). Under `SERIALIZABLE`, read rows and scanned ranges are
+  validated too (see below).
 
 ```sql
 -- If another connection commits a change to id = 1 first, this COMMIT fails
@@ -50,11 +51,29 @@ COMMIT;
 Statements outside an explicit transaction commit immediately. Each connection
 has its own transaction state.
 
-!!! note "Isolation level"
-    This is **snapshot isolation with first-committer-wins** write-conflict
-    detection — stronger than read-committed and free of lost updates and dirty
-    reads. It is not fully serializable: because only the write set is checked
-    (not the read set), **write skew** remains possible. Full serializability is
-    future work.
+## Isolation levels
 
+The default is **snapshot** isolation (with first-committer-wins write-conflict
+detection). A stronger **serializable** level is available per connection:
+
+```sql
+SET SESSION TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+BEGIN;
+-- ...
+COMMIT;   -- may fail with error 1213 if a read row or scanned range changed
+```
+
+| Level | Guarantees |
+|-------|-----------|
+| `SNAPSHOT` (default) | Snapshot reads, no dirty reads, no lost updates. Write skew possible. |
+| `SERIALIZABLE` | Additionally validates the **read set** and **scanned ranges** at commit, preventing write skew and phantoms. |
+
+Under `SERIALIZABLE`, a commit is rejected (error `1213`) if any row the
+transaction read, or any range it scanned, changed since its snapshot. This
+costs more aborts under contention; retry the transaction.
+
+Other levels (`READ COMMITTED`, `REPEATABLE READ`) are accepted and mapped to
+snapshot isolation.
+
+!!! note
     `SET autocommit=0` is accepted but not honoured; use explicit `BEGIN`.

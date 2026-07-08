@@ -14,13 +14,22 @@
 //! Callers only ever see ElyraSQL types; `redb` never leaks past this crate.
 
 mod db;
-pub use db::Db;
+pub use db::{Db, Validation};
 
 use std::path::Path;
 use std::sync::Arc;
 
 use elyra_core::{Error, Result};
 use redb::{Database, ReadTransaction, ReadableTable, TableDefinition};
+
+/// A scanned range and its content at snapshot time, validated on a
+/// serializable commit to detect phantoms and concurrent range changes.
+#[derive(Clone)]
+pub struct RangeSnapshot {
+    pub start: Vec<u8>,
+    pub end: Option<Vec<u8>>,
+    pub content: Vec<(Vec<u8>, Vec<u8>)>,
+}
 
 /// A point-in-time MVCC read snapshot. Reads through it always observe the
 /// committed state as of when it was taken, regardless of later commits — the
@@ -322,12 +331,14 @@ impl Storage {
     /// snapshot). If any differs, another transaction changed it since the
     /// snapshot: return [`Error::Conflict`] and commit nothing. This is the
     /// write-write conflict check behind snapshot isolation.
-    pub fn apply_checked(
+    pub fn apply_validated(
         &self,
-        expected: &[(Vec<u8>, Option<Vec<u8>>)],
+        keys: &[(Vec<u8>, Option<Vec<u8>>)],
+        ranges: &[RangeSnapshot],
         puts: &[(Vec<u8>, Vec<u8>)],
         deletes: &[Vec<u8>],
     ) -> Result<()> {
+        use std::ops::Bound;
         let wtx = self
             .db
             .begin_write()
@@ -336,15 +347,33 @@ impl Storage {
             let mut t = wtx
                 .open_table(KV)
                 .map_err(|e| Error::Storage(e.to_string()))?;
-            for (k, exp) in expected {
+            for (k, exp) in keys {
                 let current = t
                     .get(k.as_slice())
                     .map_err(|e| Error::Storage(e.to_string()))?
                     .map(|v| v.value().to_vec());
                 if &current != exp {
-                    // Abort: drop the write transaction without committing.
                     return Err(Error::Conflict(
                         "row modified by another transaction since snapshot".into(),
+                    ));
+                }
+            }
+            for r in ranges {
+                let upper = match &r.end {
+                    Some(e) => Bound::Excluded(e.as_slice()),
+                    None => Bound::Unbounded,
+                };
+                let mut current = Vec::with_capacity(r.content.len());
+                for item in t
+                    .range::<&[u8]>((Bound::Included(r.start.as_slice()), upper))
+                    .map_err(|e| Error::Storage(e.to_string()))?
+                {
+                    let (k, v) = item.map_err(|e| Error::Storage(e.to_string()))?;
+                    current.push((k.value().to_vec(), v.value().to_vec()));
+                }
+                if current != r.content {
+                    return Err(Error::Conflict(
+                        "a scanned range changed since snapshot (phantom or update)".into(),
                     ));
                 }
             }

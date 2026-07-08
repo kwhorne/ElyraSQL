@@ -22,11 +22,15 @@ use elyra_core::{Error, Result};
 use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
 
-use crate::{Snapshot, Storage};
+use crate::{RangeSnapshot, Snapshot, Storage};
 
-/// `(key, expected snapshot value)` pairs validated before a transactional
-/// commit.
-type Expected = Vec<(Vec<u8>, Option<Vec<u8>>)>;
+/// Optimistic validation performed atomically at commit: read/written keys must
+/// still equal their snapshot values, and scanned ranges must be unchanged.
+#[derive(Default)]
+pub struct Validation {
+    pub keys: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+    pub ranges: Vec<RangeSnapshot>,
+}
 
 /// Max writes folded into a single group commit.
 const GROUP_COMMIT_MAX: usize = 1024;
@@ -39,7 +43,7 @@ struct WriteJob {
     deletes: Vec<Vec<u8>>,
     /// When set, validate these `(key, snapshot-value)` pairs before applying
     /// (transactional commit); such jobs are applied alone, not merged.
-    expected: Option<Expected>,
+    validation: Option<Validation>,
     ack: oneshot::Sender<Result<()>>,
 }
 
@@ -126,29 +130,29 @@ impl Db {
         self.submit(puts, deletes, None).await
     }
 
-    /// Submit a validated (transactional) commit: verify `expected` values
-    /// still hold before applying, else fail with [`elyra_core::Error::Conflict`].
-    pub async fn commit_checked(
+    /// Submit a validated (transactional) commit: the validation must still
+    /// hold before applying, else fail with [`elyra_core::Error::Conflict`].
+    pub async fn commit_validated(
         &self,
-        expected: Expected,
+        validation: Validation,
         puts: Vec<(Vec<u8>, Vec<u8>)>,
         deletes: Vec<Vec<u8>>,
     ) -> Result<()> {
-        self.submit(puts, deletes, Some(expected)).await
+        self.submit(puts, deletes, Some(validation)).await
     }
 
     async fn submit(
         &self,
         puts: Vec<(Vec<u8>, Vec<u8>)>,
         deletes: Vec<Vec<u8>>,
-        expected: Option<Expected>,
+        validation: Option<Validation>,
     ) -> Result<()> {
         let (ack, wait) = oneshot::channel();
         self.writer
             .send(WriteJob {
                 puts,
                 deletes,
-                expected,
+                validation,
                 ack,
             })
             .await
@@ -176,8 +180,8 @@ fn writer_loop(storage: Arc<Storage>, mut rx: mpsc::Receiver<WriteJob>) {
     while let Some(first) = rx.blocking_recv() {
         // A validated (transactional) commit is applied on its own, so a
         // conflict fails only that transaction, not batched neighbours.
-        if let Some(expected) = &first.expected {
-            let result = storage.apply_checked(expected, &first.puts, &first.deletes);
+        if let Some(v) = &first.validation {
+            let result = storage.apply_validated(&v.keys, &v.ranges, &first.puts, &first.deletes);
             let _ = first.ack.send(result);
             continue;
         }
@@ -187,7 +191,7 @@ fn writer_loop(storage: Arc<Storage>, mut rx: mpsc::Receiver<WriteJob>) {
         let mut pending: Option<WriteJob> = None;
         while jobs.len() < GROUP_COMMIT_MAX {
             match rx.try_recv() {
-                Ok(job) if job.expected.is_none() => jobs.push(job),
+                Ok(job) if job.validation.is_none() => jobs.push(job),
                 Ok(job) => {
                     pending = Some(job); // validated: handle after this group
                     break;
@@ -214,7 +218,8 @@ fn writer_loop(storage: Arc<Storage>, mut rx: mpsc::Receiver<WriteJob>) {
         }
 
         if let Some(job) = pending {
-            let r = storage.apply_checked(job.expected.as_ref().unwrap(), &job.puts, &job.deletes);
+            let v = job.validation.as_ref().unwrap();
+            let r = storage.apply_validated(&v.keys, &v.ranges, &job.puts, &job.deletes);
             let _ = job.ack.send(r);
         }
     }

@@ -13,17 +13,36 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 
 use elyra_core::{Error, Result};
-use elyra_storage::{Db, Snapshot};
+use elyra_storage::{Db, RangeSnapshot, Snapshot, Validation};
+
+/// Transaction isolation level.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Isolation {
+    /// Snapshot reads + first-committer-wins write-conflict detection.
+    Snapshot,
+    /// Also validates the read set and scanned ranges at commit (prevents
+    /// write skew and phantoms) at the cost of more aborts.
+    Serializable,
+}
 
 struct TxnState {
     snapshot: Snapshot,
     puts: BTreeMap<Vec<u8>, Vec<u8>>,
     deletes: BTreeSet<Vec<u8>>,
+    /// Serializable bookkeeping (unused under snapshot isolation).
+    serializable: bool,
+    reads: BTreeSet<Vec<u8>>,
+    ranges: Vec<(Vec<u8>, Option<Vec<u8>>)>,
 }
 
 pub struct Session {
     db: Db,
     txn: Mutex<Option<TxnState>>,
+    isolation: Mutex<Isolation>,
+}
+
+fn is_meta(k: &[u8]) -> bool {
+    k.starts_with(b"meta::")
 }
 
 impl Session {
@@ -31,7 +50,12 @@ impl Session {
         Session {
             db,
             txn: Mutex::new(None),
+            isolation: Mutex::new(Isolation::Snapshot),
         }
+    }
+
+    pub fn set_isolation(&self, level: Isolation) {
+        *self.isolation.lock().unwrap() = level;
     }
 
     pub fn in_txn(&self) -> bool {
@@ -48,10 +72,14 @@ impl Session {
 
     pub fn begin(&self) -> Result<()> {
         let snapshot = self.db.snapshot()?;
+        let serializable = *self.isolation.lock().unwrap() == Isolation::Serializable;
         *self.txn.lock().unwrap() = Some(TxnState {
             snapshot,
             puts: BTreeMap::new(),
             deletes: BTreeSet::new(),
+            serializable,
+            reads: BTreeSet::new(),
+            ranges: Vec::new(),
         });
         Ok(())
     }
@@ -63,27 +91,56 @@ impl Session {
             snapshot,
             puts,
             deletes,
+            serializable,
+            reads,
+            ranges,
         } = tx;
 
-        // Expected value of every written key at snapshot time. The commit is
-        // rejected (Conflict) if any of these changed in the meantime.
-        // Validate data/index/catalog keys, but not the per-table monotonic
-        // counters (`meta::…`): those are bumped by every write and would cause
-        // false conflicts between transactions on the same table. Real row
-        // collisions are still caught via their data keys.
-        let is_meta = |k: &[u8]| k.starts_with(b"meta::");
-        let mut keys: Vec<Vec<u8>> = Vec::with_capacity(puts.len() + deletes.len());
-        keys.extend(puts.keys().filter(|k| !is_meta(k)).cloned());
-        keys.extend(deletes.iter().filter(|k| !is_meta(k)).cloned());
+        // Keys to validate = written keys, plus (serializable) read keys.
+        // Per-table monotonic counters (`meta::…`) are excluded: they are bumped
+        // by every write and would cause false conflicts between transactions on
+        // the same table; real row collisions are still caught via data keys.
+        let mut keyset: BTreeSet<Vec<u8>> = BTreeSet::new();
+        keyset.extend(puts.keys().filter(|k| !is_meta(k)).cloned());
+        keyset.extend(deletes.iter().filter(|k| !is_meta(k)).cloned());
+        if serializable {
+            keyset.extend(reads.iter().filter(|k| !is_meta(k)).cloned());
+        }
+        let keys: Vec<Vec<u8>> = keyset.into_iter().collect();
         let snap = snapshot.clone();
         let kq = keys.clone();
         let snap_vals = spawn(move || snap.multi_get(&kq)).await?;
         let expected: Vec<(Vec<u8>, Option<Vec<u8>>)> = keys.into_iter().zip(snap_vals).collect();
 
+        // Serializable: snapshot content of each scanned range, validated at
+        // commit to detect phantoms / concurrent range changes.
+        let mut range_snaps: Vec<RangeSnapshot> = Vec::new();
+        if serializable {
+            for (start, end) in ranges {
+                let snap = snapshot.clone();
+                let (s, e) = (start.clone(), end.clone());
+                let content = spawn(move || snap.scan_range(&s, e.as_deref(), usize::MAX)).await?;
+                range_snaps.push(RangeSnapshot {
+                    start,
+                    end,
+                    content,
+                });
+            }
+        }
+
         let put_vec: Vec<(Vec<u8>, Vec<u8>)> = puts.into_iter().collect();
         let del_vec: Vec<Vec<u8>> = deletes.into_iter().collect();
         // On conflict the transaction is already cleared above -> aborted.
-        self.db.commit_checked(expected, put_vec, del_vec).await
+        self.db
+            .commit_validated(
+                Validation {
+                    keys: expected,
+                    ranges: range_snaps,
+                },
+                put_vec,
+                del_vec,
+            )
+            .await
     }
 
     pub fn rollback(&self) {
@@ -94,10 +151,13 @@ impl Session {
 
     pub async fn get(&self, key: Vec<u8>) -> Result<Option<Vec<u8>>> {
         let snapshot = {
-            let guard = self.txn.lock().unwrap();
-            match &*guard {
+            let mut guard = self.txn.lock().unwrap();
+            match guard.as_mut() {
                 None => None,
                 Some(tx) => {
+                    if tx.serializable && !is_meta(&key) {
+                        tx.reads.insert(key.clone());
+                    }
                     if tx.deletes.contains(&key) {
                         return Ok(None);
                     }
@@ -116,10 +176,17 @@ impl Session {
 
     pub async fn multi_get(&self, keys: Vec<Vec<u8>>) -> Result<Vec<Option<Vec<u8>>>> {
         let snapshot = {
-            let guard = self.txn.lock().unwrap();
-            match &*guard {
+            let mut guard = self.txn.lock().unwrap();
+            match guard.as_mut() {
                 None => None,
                 Some(tx) => {
+                    if tx.serializable {
+                        for k in &keys {
+                            if !is_meta(k) {
+                                tx.reads.insert(k.clone());
+                            }
+                        }
+                    }
                     // Resolve overlay hits; collect misses for the snapshot.
                     let mut result: Vec<Option<Vec<u8>>> = Vec::with_capacity(keys.len());
                     let mut misses: Vec<(usize, Vec<u8>)> = Vec::new();
@@ -158,10 +225,14 @@ impl Session {
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         // Snapshot + overlay entries within [start, end), if in a transaction.
         let plan = {
-            let guard = self.txn.lock().unwrap();
-            match &*guard {
+            let mut guard = self.txn.lock().unwrap();
+            match guard.as_mut() {
                 None => None,
                 Some(tx) => {
+                    if tx.serializable && !is_meta(&start) {
+                        // Record the scanned range for phantom validation.
+                        tx.ranges.push((start.clone(), end.clone()));
+                    }
                     let mut overlay: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::new();
                     let upper = end.clone();
                     let in_range =

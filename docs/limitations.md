@@ -26,10 +26,12 @@ implemented, so you can judge fit.
 
 ## Transactions
 
-- **Snapshot isolation** with **first-committer-wins** write-conflict detection
-  (conflicting commits fail with error `1213`). It is not fully serializable:
-  only the write set is validated, so **write skew** is still possible.
-  Serializable isolation is future work.
+- **Snapshot** isolation (default, first-committer-wins) and **serializable**
+  isolation (opt-in via `SET SESSION TRANSACTION ISOLATION LEVEL SERIALIZABLE`,
+  read-set + scanned-range validation). Serializable is optimistic
+  (validate-on-commit), so it aborts conflicting transactions with error `1213`
+  rather than blocking; range validation is conservative (any change in a
+  scanned range aborts).
 - `SET autocommit=0` is accepted but not honoured; use explicit `BEGIN`.
 
 ## Analytics
@@ -50,8 +52,8 @@ implemented, so you can judge fit.
 Candidate next steps, roughly in order of value:
 
 1. Window functions and scalar subqueries in the SELECT list.
-2. Serializable isolation (read-set validation).
-3. More JSON functions (`JSON_SET`, `JSON_ARRAY`, containment).
+2. More JSON functions (`JSON_SET`, `JSON_ARRAY`, containment).
+3. CTEs (`WITH`).
 4. Secondary-index range on composite keys; merge joins.
 5. Columnar OLAP with spill-to-disk.
 6. Richer `information_schema` / `SHOW`.

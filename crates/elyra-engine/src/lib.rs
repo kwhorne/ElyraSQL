@@ -17,7 +17,7 @@ mod session;
 mod stream;
 mod vindex;
 
-pub use session::Session;
+pub use session::{Isolation, Session};
 
 use elyra_core::{ColumnType, Error, Privilege, Result, Schema, Value};
 use elyra_storage::Db;
@@ -80,6 +80,19 @@ impl Engine {
         privilege: Privilege,
         sess: &Session,
     ) -> Result<Vec<QueryResult>> {
+        // Transaction isolation level (SET [SESSION] TRANSACTION ISOLATION
+        // LEVEL ...) — handled by string match since not all forms parse.
+        let lower = sql.trim().to_ascii_lowercase();
+        if lower.starts_with("set") && lower.contains("isolation level") {
+            let level = if lower.contains("serializable") {
+                Isolation::Serializable
+            } else {
+                Isolation::Snapshot
+            };
+            sess.set_isolation(level);
+            return Ok(vec![QueryResult::empty_ok()]);
+        }
+
         if let Some(r) = self.intercept_session(sql) {
             return Ok(vec![r]); // session/introspection: read-level
         }
