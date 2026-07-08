@@ -9,7 +9,7 @@ COPY . .
 RUN cargo build --release --locked -p elyra-cli \
     && strip target/release/elyrasql
 
-FROM alpine:3.20
+FROM alpine:3.24
 
 RUN addgroup -S elyrasql && adduser -S -G elyrasql -H elyrasql \
     && mkdir -p /var/lib/elyrasql && chown elyrasql:elyrasql /var/lib/elyrasql
