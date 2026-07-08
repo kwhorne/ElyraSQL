@@ -15,6 +15,12 @@ pub enum ColumnType {
     Bytes,
     /// Fixed-dimension float32 vector for ANN search. Dimension is the arg.
     Vector(u32),
+    /// Calendar date.
+    Date,
+    /// Date + time of day.
+    DateTime,
+    /// Fixed-point decimal: (precision, scale).
+    Decimal(u8, u8),
 }
 
 impl ColumnType {
@@ -27,6 +33,9 @@ impl ColumnType {
             ColumnType::Text => "TEXT".into(),
             ColumnType::Bytes => "BLOB".into(),
             ColumnType::Vector(d) => format!("VECTOR({d})"),
+            ColumnType::Date => "DATE".into(),
+            ColumnType::DateTime => "DATETIME".into(),
+            ColumnType::Decimal(p, s) => format!("DECIMAL({p},{s})"),
         }
     }
 }

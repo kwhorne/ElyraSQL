@@ -210,29 +210,14 @@ fn arith(l: Value, op: &BinaryOperator, r: Value) -> Result<Value> {
     })
 }
 
-/// Three-way compare; `None` when either side is NULL (SQL semantics).
+/// Three-way compare with SQL cross-type coercion; `None` when either side is
+/// NULL. Delegates to the shared [`Value::compare`].
 fn cmp(l: &Value, r: &Value) -> Result<Option<std::cmp::Ordering>> {
-    use std::cmp::Ordering;
-    if l.is_null() || r.is_null() {
-        return Ok(None);
-    }
-    if let (Some(a), Some(b)) = (num(l), num(r)) {
-        return Ok(a.partial_cmp(&b));
-    }
-    match (l, r) {
-        (Value::Text(a), Value::Text(b)) => Ok(Some(a.cmp(b))),
-        (Value::Bool(a), Value::Bool(b)) => Ok(Some(a.cmp(b))),
-        _ => Ok(Some(Ordering::Equal).filter(|_| l == r).or(None)),
-    }
+    Ok(l.compare(r))
 }
 
 fn num(v: &Value) -> Option<f64> {
-    match v {
-        Value::Int(i) => Some(*i as f64),
-        Value::Float(f) => Some(*f),
-        Value::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
-        _ => None,
-    }
+    v.as_f64()
 }
 
 fn truthy(v: &Value) -> bool {

@@ -15,6 +15,11 @@ pub fn encode(value: &Value) -> Result<Vec<u8>> {
         // UTF-8 bytes already sort correctly for a single trailing key.
         Value::Text(s) => s.as_bytes().to_vec(),
         Value::Bool(b) => vec![*b as u8],
+        Value::Date(d) => (*d as u32 ^ 0x8000_0000).to_be_bytes().to_vec(),
+        Value::DateTime(t) => (*t as u64 ^ 0x8000_0000_0000_0000).to_be_bytes().to_vec(),
+        // Scale is uniform per column, so comparing unscaled values preserves
+        // order. Sign-flip the top bit for correct signed ordering.
+        Value::Decimal(u, _) => (*u as u128 ^ (1u128 << 127)).to_be_bytes().to_vec(),
         other => {
             return Err(Error::Unsupported(format!(
                 "value type cannot be used as a primary key: {other:?}"

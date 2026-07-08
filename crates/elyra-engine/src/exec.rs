@@ -45,14 +45,22 @@ fn map_type(dt: &DataType) -> Result<ColumnType> {
         | DataType::Int(_)
         | DataType::Integer(_)
         | DataType::BigInt(_) => ColumnType::Int,
-        DataType::Float(_) | DataType::Real | DataType::Double | DataType::Decimal(_) => {
-            ColumnType::Float
-        }
+        DataType::Float(_) | DataType::Real | DataType::Double => ColumnType::Float,
         DataType::Text
         | DataType::String(_)
         | DataType::Varchar(_)
         | DataType::Char(_) => ColumnType::Text,
         DataType::Blob(_) | DataType::Bytea => ColumnType::Bytes,
+        DataType::Date => ColumnType::Date,
+        DataType::Datetime(_) | DataType::Timestamp(_, _) => ColumnType::DateTime,
+        DataType::Decimal(info) | DataType::Numeric(info) => {
+            let (p, s) = match info {
+                sqlparser::ast::ExactNumberInfo::None => (10, 0),
+                sqlparser::ast::ExactNumberInfo::Precision(p) => (*p as u8, 0),
+                sqlparser::ast::ExactNumberInfo::PrecisionAndScale(p, s) => (*p as u8, *s as u8),
+            };
+            ColumnType::Decimal(p, s)
+        }
         DataType::Custom(name, args) if name.0.last().map(|i| i.value.eq_ignore_ascii_case("vector")).unwrap_or(false) => {
             let dim = args
                 .first()
@@ -716,21 +724,29 @@ fn as_range(
         return Ok(None);
     }
     let col_of = |n: &str| def.schema.columns.iter().position(|c| c.name.eq_ignore_ascii_case(n));
+    let coerce_col = |col: usize, v: Value| {
+        let c = &def.schema.columns[col];
+        coerce(v, &c.ty, &c.name).ok()
+    };
     if let Some(col) = ident_name(left).and_then(col_of) {
         if let Ok(v) = eval_expr(right) {
-            return Ok(Some((col, op.clone(), v)));
+            if let Some(cv) = coerce_col(col, v) {
+                return Ok(Some((col, op.clone(), cv)));
+            }
         }
     }
     if let Some(col) = ident_name(right).and_then(col_of) {
         if let Ok(v) = eval_expr(left) {
-            let flipped = match op {
-                Gt => Lt,
-                GtEq => LtEq,
-                Lt => Gt,
-                LtEq => GtEq,
-                _ => unreachable!(),
-            };
-            return Ok(Some((col, flipped, v)));
+            if let Some(cv) = coerce_col(col, v) {
+                let flipped = match op {
+                    Gt => Lt,
+                    GtEq => LtEq,
+                    Lt => Gt,
+                    LtEq => GtEq,
+                    _ => unreachable!(),
+                };
+                return Ok(Some((col, flipped, cv)));
+            }
         }
     }
     Ok(None)
@@ -740,8 +756,12 @@ fn as_between(def: &TableDef, expr: &Expr) -> Result<Option<(usize, Value, Value
     let Expr::Between { expr: e, negated: false, low, high } = expr else { return Ok(None) };
     let col_of = |n: &str| def.schema.columns.iter().position(|c| c.name.eq_ignore_ascii_case(n));
     let Some(col) = ident_name(e).and_then(col_of) else { return Ok(None) };
+    let c = &def.schema.columns[col];
     match (eval_expr(low), eval_expr(high)) {
-        (Ok(lo), Ok(hi)) => Ok(Some((col, lo, hi))),
+        (Ok(lo), Ok(hi)) => match (coerce(lo, &c.ty, &c.name), coerce(hi, &c.ty, &c.name)) {
+            (Ok(lo), Ok(hi)) => Ok(Some((col, lo, hi))),
+            _ => Ok(None),
+        },
         _ => Ok(None),
     }
 }
@@ -1161,7 +1181,13 @@ fn eq_col_literal(def: &TableDef, filter: Option<&Expr>) -> Result<Option<(usize
     else {
         return Ok(None);
     };
-    Ok(Some((idx, eval_expr(lit_expr)?)))
+    // Coerce the literal to the column's type so index/PK key encoding matches
+    // the stored entries (e.g. a DATE column vs a '2024-01-01' text literal).
+    let col = &def.schema.columns[idx];
+    match coerce(eval_expr(lit_expr)?, &col.ty, &col.name) {
+        Ok(v) => Ok(Some((idx, v))),
+        Err(_) => Ok(None),
+    }
 }
 
 fn pk_eq_literal(def: &TableDef, filter: Option<&Expr>) -> Result<Option<Value>> {
@@ -1538,6 +1564,9 @@ fn infer_val(v: &Value) -> ColumnType {
         Value::Float(_) => ColumnType::Float,
         Value::Bytes(_) => ColumnType::Bytes,
         Value::Vector(x) => ColumnType::Vector(x.len() as u32),
+        Value::Date(_) => ColumnType::Date,
+        Value::DateTime(_) => ColumnType::DateTime,
+        Value::Decimal(_, s) => ColumnType::Decimal(38, *s),
         _ => ColumnType::Text,
     }
 }
@@ -1842,6 +1871,28 @@ fn coerce(v: Value, ty: &ColumnType, col: &str) -> Result<Value> {
         (ColumnType::Text, Value::Text(s)) => Value::Text(s),
         (ColumnType::Bytes, Value::Text(s)) => Value::Bytes(s.into_bytes()),
         (ColumnType::Bytes, Value::Bytes(b)) => Value::Bytes(b),
+        (ColumnType::Date, Value::Date(d)) => Value::Date(d),
+        (ColumnType::Date, Value::Text(s)) => elyra_core::datetime::parse_date(&s)
+            .map(Value::Date)
+            .ok_or_else(|| Error::Type(format!("invalid DATE literal: {s}")))?,
+        (ColumnType::DateTime, Value::DateTime(t)) => Value::DateTime(t),
+        (ColumnType::DateTime, Value::Text(s)) => elyra_core::datetime::parse_datetime(&s)
+            .map(Value::DateTime)
+            .ok_or_else(|| Error::Type(format!("invalid DATETIME literal: {s}")))?,
+        (ColumnType::Decimal(_, sc), Value::Text(s)) => elyra_core::value::parse_decimal(&s, *sc)
+            .map(|(u, s)| Value::Decimal(u, s))
+            .ok_or_else(|| Error::Type(format!("invalid DECIMAL literal: {s}")))?,
+        (ColumnType::Decimal(_, sc), Value::Int(i)) => {
+            Value::Decimal(i as i128 * 10i128.pow(*sc as u32), *sc)
+        }
+        (ColumnType::Decimal(_, sc), Value::Float(f)) => elyra_core::value::parse_decimal(&f.to_string(), *sc)
+            .map(|(u, s)| Value::Decimal(u, s))
+            .ok_or_else(|| Error::Type(format!("invalid DECIMAL value: {f}")))?,
+        (ColumnType::Decimal(_, sc), Value::Decimal(u, s)) => {
+            // Rescale to the column's declared scale.
+            let v = if s <= *sc { u * 10i128.pow((*sc - s) as u32) } else { u / 10i128.pow((s - *sc) as u32) };
+            Value::Decimal(v, *sc)
+        }
         (ColumnType::Vector(dim), Value::Text(s)) => Value::Vector(parse_vector(&s, *dim)?),
         (want, got) => {
             return Err(Error::Type(format!(

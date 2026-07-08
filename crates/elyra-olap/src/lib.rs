@@ -233,28 +233,11 @@ fn finish(acc: &Acc, func: AggFunc) -> Value {
 }
 
 fn num(v: &Value) -> Option<f64> {
-    match v {
-        Value::Int(i) => Some(*i as f64),
-        Value::Float(f) => Some(*f),
-        Value::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
-        _ => None,
-    }
+    v.as_f64()
 }
 
-/// Total order over values: NULL first, then numbers, then text.
+/// Total order over values (NULL first). Delegates to the shared
+/// [`Value::total_cmp`] so date/decimal ordering is consistent everywhere.
 pub fn value_cmp(a: &Value, b: &Value) -> Ordering {
-    match (a, b) {
-        (Value::Null, Value::Null) => Ordering::Equal,
-        (Value::Null, _) => Ordering::Less,
-        (_, Value::Null) => Ordering::Greater,
-        _ => {
-            if let (Some(x), Some(y)) = (num(a), num(b)) {
-                return x.partial_cmp(&y).unwrap_or(Ordering::Equal);
-            }
-            match (a, b) {
-                (Value::Text(x), Value::Text(y)) => x.cmp(y),
-                _ => format!("{a:?}").cmp(&format!("{b:?}")),
-            }
-        }
-    }
+    a.total_cmp(b)
 }

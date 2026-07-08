@@ -4,6 +4,7 @@
 //! (storage, query, analytics) depend on this crate for a common
 //! vocabulary of values, types and errors.
 
+pub mod datetime;
 pub mod error;
 pub mod types;
 pub mod value;

@@ -98,6 +98,10 @@ fn column_type(ty: &elyra_core::ColumnType) -> ColumnType {
         elyra_core::ColumnType::Text => ColumnType::MYSQL_TYPE_VAR_STRING,
         elyra_core::ColumnType::Bytes => ColumnType::MYSQL_TYPE_BLOB,
         elyra_core::ColumnType::Vector(_) => ColumnType::MYSQL_TYPE_VAR_STRING,
+        // Date/time/decimal are sent as their canonical string form.
+        elyra_core::ColumnType::Date => ColumnType::MYSQL_TYPE_VAR_STRING,
+        elyra_core::ColumnType::DateTime => ColumnType::MYSQL_TYPE_VAR_STRING,
+        elyra_core::ColumnType::Decimal(_, _) => ColumnType::MYSQL_TYPE_VAR_STRING,
     }
 }
 
@@ -292,6 +296,8 @@ fn write_cell<W: AsyncWrite + Send + Unpin>(
             let inner = vec.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(",");
             rw.write_col(format!("[{inner}]"))
         }
+        // Date/time/decimal: their canonical string form.
+        other => rw.write_col(other.to_wire_string()),
     }
 }
 

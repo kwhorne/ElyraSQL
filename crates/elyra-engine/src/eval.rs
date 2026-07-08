@@ -136,6 +136,9 @@ fn infer_type(v: &Value) -> ColumnType {
         Value::Text(_) => ColumnType::Text,
         Value::Bytes(_) => ColumnType::Bytes,
         Value::Vector(v) => ColumnType::Vector(v.len() as u32),
+        Value::Date(_) => ColumnType::Date,
+        Value::DateTime(_) => ColumnType::DateTime,
+        Value::Decimal(_, s) => ColumnType::Decimal(38, *s),
     }
 }
 
