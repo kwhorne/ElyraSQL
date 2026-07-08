@@ -7,6 +7,9 @@
 //! Milestone status: **planned** (an HNSW index backs `VECTOR` columns).
 //! The distance math below is real and used for exact search / tests today.
 
+pub mod hnsw;
+pub use hnsw::Hnsw;
+
 /// Distance/similarity metrics supported by ElyraSQL vector search.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Metric {

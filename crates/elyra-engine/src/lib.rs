@@ -14,6 +14,7 @@ mod index;
 mod keyenc;
 mod predicate;
 mod stream;
+mod vindex;
 
 use elyra_core::{ColumnType, Error, Result, Schema, Value};
 use elyra_storage::Db;
@@ -51,11 +52,12 @@ impl QueryResult {
 #[derive(Clone)]
 pub struct Engine {
     db: Db,
+    vindex: vindex::VectorRegistry,
 }
 
 impl Engine {
     pub fn new(db: Db) -> Self {
-        Self { db }
+        Self { db, vindex: vindex::VectorRegistry::new() }
     }
 
     /// Parse and execute one or more `;`-separated statements.
@@ -79,7 +81,7 @@ impl Engine {
         match stmt {
             Statement::Query(q) => {
                 if query_has_from(&q) {
-                    exec::select(&self.db, &q).await
+                    exec::select(&self.db, &self.vindex, &q).await
                 } else {
                     eval::eval_literal_select(&q)
                 }

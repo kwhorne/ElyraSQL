@@ -15,7 +15,11 @@ use crate::aggregate;
 use crate::index;
 use crate::predicate;
 
-use crate::catalog::{self, catalog_key, data_key, data_prefix, rowid_key, IndexDef, TableDef};
+use crate::catalog::{
+    self, catalog_key, data_key, data_prefix, rowid_key, wcount_key, IndexDef, TableDef,
+};
+use crate::vindex::{read_wcount, VectorRegistry};
+use elyra_vector::Metric;
 use crate::eval::eval_expr;
 use crate::keyenc;
 use crate::stream::{RowStream, ScanSpec};
@@ -148,7 +152,8 @@ pub async fn create_index(db: &Db, ci: CreateIndex) -> Result<QueryResult> {
         return Err(Error::Catalog(format!("index already exists: {name}")));
     }
 
-    def.indexes.push(IndexDef { name, col, unique: ci.unique });
+    let is_vector = matches!(def.schema.columns[col].ty, ColumnType::Vector(_));
+    def.indexes.push(IndexDef { name, col, unique: ci.unique, vector: is_vector });
 
     // Persist the new catalog and backfill index entries for existing rows.
     let mut puts: Vec<(Vec<u8>, Vec<u8>)> = vec![(catalog_key(&table), def.encode()?)];
@@ -254,12 +259,17 @@ pub async fn insert(db: &Db, ins: Insert) -> Result<QueryResult> {
     if def.pk_col.is_none() {
         puts.push((rowid_key(&name), next_rowid.to_le_bytes().to_vec()));
     }
+    puts.push(bump_wcount(db, &name).await?);
 
     db.commit(puts, vec![]).await?;
     Ok(QueryResult::Affected(affected))
 }
 
-pub async fn select(db: &Db, query: &SqlQuery) -> Result<QueryResult> {
+pub async fn select(
+    db: &Db,
+    vindex: &VectorRegistry,
+    query: &SqlQuery,
+) -> Result<QueryResult> {
     let select = match query.body.as_ref() {
         SetExpr::Select(s) => s,
         _ => return Err(Error::Unsupported("only simple SELECT is supported".into())),
@@ -311,6 +321,32 @@ pub async fn select(db: &Db, query: &SqlQuery) -> Result<QueryResult> {
         // ORDER BY may reference a projection alias (e.g. `ORDER BY dist`);
         // substitute it with the expression it names.
         let resolved = resolve_order_aliases(&order_exprs, &select.projection, &def.schema);
+
+        // Vector ANN fast path: `ORDER BY VEC_DISTANCE(col, q) LIMIT k` with an
+        // HNSW index and no WHERE — search the index instead of scanning all.
+        if filter.is_none() && offset == 0 {
+            if let Some((col, q, k)) = ann_query(&resolved, limit, &def)? {
+                if def.indexes.iter().any(|i| i.vector && i.col == col) {
+                    let cached = vindex.get(db, &def, col, Metric::L2).await?;
+                    let hits = cached.index.search(&q, k, (k * 4).max(64));
+                    let mut rows = Vec::with_capacity(hits.len());
+                    for (node, _) in hits {
+                        if let Some(bytes) = db.get(cached.keys[node as usize].clone()).await? {
+                            rows.push(
+                                bincode::deserialize::<Vec<Value>>(&bytes)
+                                    .map_err(|e| Error::Storage(e.to_string()))?,
+                            );
+                        }
+                    }
+                    // Order the candidate set by exact distance for a clean top-k.
+                    sort_full_rows(&mut rows, &def.schema, &resolved)?;
+                    rows.truncate(k);
+                    let (schema, out) = project_exprs(&select.projection, &def.schema, &rows)?;
+                    return Ok(QueryResult::Rows(RowStream::literal(schema, out)));
+                }
+            }
+        }
+
         let mut rows = scan_rows(db, &def, filter.as_ref()).await?;
         if !resolved.is_empty() {
             sort_full_rows(&mut rows, &def.schema, &resolved)?;
@@ -603,6 +639,7 @@ pub async fn update(
         puts.extend(new_index_entries);
     }
 
+    puts.push(bump_wcount(db, &name).await?);
     db.commit(puts, deletes).await?;
     Ok(QueryResult::Affected(affected))
 }
@@ -631,7 +668,8 @@ pub async fn delete(db: &Db, del: &Delete) -> Result<QueryResult> {
         deletes.push(key);
     }
 
-    db.commit(vec![], deletes).await?;
+    let wc = bump_wcount(db, &name).await?;
+    db.commit(vec![wc], deletes).await?;
     Ok(QueryResult::Affected(affected))
 }
 
@@ -767,6 +805,77 @@ fn infer_val(v: &Value) -> ColumnType {
         Value::Vector(x) => ColumnType::Vector(x.len() as u32),
         _ => ColumnType::Text,
     }
+}
+
+/// Detect the `ORDER BY VEC_DISTANCE(col, <literal>) ASC LIMIT k` pattern.
+/// Returns the vector column index, the query vector, and k.
+fn ann_query(
+    resolved: &[(Expr, bool)],
+    limit: Option<usize>,
+    def: &TableDef,
+) -> Result<Option<(usize, Vec<f32>, usize)>> {
+    let Some(k) = limit else { return Ok(None) };
+    if resolved.len() != 1 || !resolved[0].1 {
+        return Ok(None);
+    }
+    let Expr::Function(f) = &resolved[0].0 else { return Ok(None) };
+    let name = f.name.0.last().map(|i| i.value.to_ascii_lowercase()).unwrap_or_default();
+    // Only the L2 family is accelerated (HNSW is built with L2).
+    if !matches!(name.as_str(), "vec_distance" | "vec_l2_distance" | "vec_distance_l2") {
+        return Ok(None);
+    }
+    let args = fn_arg_exprs(f);
+    if args.len() != 2 {
+        return Ok(None);
+    }
+    let (col, lit_expr) = match (ident_name(args[0]), ident_name(args[1])) {
+        (Some(n), None) => (col_of(def, n), args[1]),
+        (None, Some(n)) => (col_of(def, n), args[0]),
+        _ => return Ok(None),
+    };
+    let Some(col) = col else { return Ok(None) };
+    if !matches!(def.schema.columns[col].ty, ColumnType::Vector(_)) {
+        return Ok(None);
+    }
+    let q = match eval_expr(lit_expr)? {
+        Value::Text(s) => parse_vec_free(&s)?,
+        Value::Vector(v) => v,
+        _ => return Ok(None),
+    };
+    Ok(Some((col, q, k)))
+}
+
+fn fn_arg_exprs(f: &sqlparser::ast::Function) -> Vec<&Expr> {
+    use sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArguments};
+    let FunctionArguments::List(list) = &f.args else { return Vec::new() };
+    let mut out = Vec::new();
+    for a in &list.args {
+        if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) = a {
+            out.push(e);
+        } else {
+            return Vec::new();
+        }
+    }
+    out
+}
+
+fn col_of(def: &TableDef, name: &str) -> Option<usize> {
+    def.schema.columns.iter().position(|c| c.name.eq_ignore_ascii_case(name))
+}
+
+fn parse_vec_free(s: &str) -> Result<Vec<f32>> {
+    let inner = s.trim().trim_start_matches('[').trim_end_matches(']');
+    inner
+        .split(',')
+        .filter(|t| !t.trim().is_empty())
+        .map(|t| t.trim().parse::<f32>().map_err(|_| Error::Vector(format!("bad vector element: {t}"))))
+        .collect()
+}
+
+/// Produce the `(key, value)` put that advances a table's write counter.
+async fn bump_wcount(db: &Db, table: &str) -> Result<(Vec<u8>, Vec<u8>)> {
+    let next = read_wcount(db, table).await? + 1;
+    Ok((wcount_key(table), next.to_le_bytes().to_vec()))
 }
 
 /// Materialise all rows matching `filter` (drops storage keys).

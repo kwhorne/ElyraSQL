@@ -16,6 +16,9 @@ pub struct IndexDef {
     /// Schema index of the indexed column.
     pub col: usize,
     pub unique: bool,
+    /// A vector (HNSW ANN) index rather than a B-tree secondary index.
+    #[serde(default)]
+    pub vector: bool,
 }
 
 /// Definition of a table. `pk_col` is the schema index of the single-column
@@ -35,6 +38,12 @@ pub fn catalog_key(table: &str) -> Vec<u8> {
 
 pub fn rowid_key(table: &str) -> Vec<u8> {
     format!("meta::rowid::{table}").into_bytes()
+}
+
+/// Monotonic write counter per table; bumped on every mutation. Used to
+/// invalidate cached in-memory indexes (e.g. the vector HNSW).
+pub fn wcount_key(table: &str) -> Vec<u8> {
+    format!("meta::wcount::{table}").into_bytes()
 }
 
 /// Prefix under which all rows of a table live.

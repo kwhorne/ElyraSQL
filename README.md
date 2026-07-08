@@ -95,7 +95,7 @@ SELECT VERSION();   -- 8.0.0-ElyraSQL-0.1.0
 - [x] `VECTOR(n)` columns + exact KNN via `VEC_DISTANCE` in `ORDER BY`
 - [x] Secondary indexes (`CREATE INDEX`) with planner integration
 - [x] Aggregation (`COUNT/SUM/AVG/MIN/MAX`), `GROUP BY`, `ORDER BY`
-- [ ] Vector ANN acceleration (HNSW) for large collections
+- [x] Vector ANN acceleration (HNSW), cached & rebuilt-when-stale
 - [ ] OLAP acceleration (columnar analytics)
 - [ ] Auth, roles, TLS
 - [ ] systemd packaging for Ubuntu 24.04+
