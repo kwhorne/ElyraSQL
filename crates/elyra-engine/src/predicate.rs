@@ -23,6 +23,24 @@ pub fn eval_row(expr: &Expr, schema: &Schema, row: &[Value]) -> Result<Value> {
             resolve(&qualified, schema, row)
         }
         Expr::Function(f) => eval_function(f, schema, row),
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            let v = eval_row(expr, schema, row)?;
+            if v.is_null() {
+                return Ok(Value::Null);
+            }
+            let mut found = false;
+            for item in list {
+                if v.compare(&eval_row(item, schema, row)?) == Some(std::cmp::Ordering::Equal) {
+                    found = true;
+                    break;
+                }
+            }
+            Ok(Value::Bool(found != *negated))
+        }
         Expr::IsNull(e) => Ok(Value::Bool(eval_row(e, schema, row)?.is_null())),
         Expr::IsNotNull(e) => Ok(Value::Bool(!eval_row(e, schema, row)?.is_null())),
         Expr::UnaryOp { op, expr } => {

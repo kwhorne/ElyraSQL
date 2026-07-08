@@ -572,7 +572,12 @@ pub async fn select(
         Some(e) => Some(eval_usize(e)?),
         None => None,
     };
-    let filter = select.selection.clone();
+    // Resolve any uncorrelated subqueries in the WHERE clause into literals /
+    // value lists before planning (IN / scalar / EXISTS).
+    let filter = match select.selection.clone() {
+        Some(f) => Some(resolve_subqueries(db, vindex, f).await?),
+        None => None,
+    };
 
     // GROUP BY / ORDER BY.
     let group_by: Vec<Expr> = match &select.group_by {
@@ -2008,6 +2013,115 @@ fn infer_val(v: &Value) -> ColumnType {
         Value::Json(_) => ColumnType::Json,
         _ => ColumnType::Text,
     }
+}
+
+/// Materialise a subquery's rows by executing it through the query engine.
+async fn run_subquery(
+    db: &Session,
+    vindex: &VectorRegistry,
+    q: &SqlQuery,
+) -> Result<Vec<Vec<Value>>> {
+    // Boxed to break the select -> resolve -> run -> select async cycle.
+    match Box::pin(select(db, vindex, q)).await? {
+        QueryResult::Rows(mut stream) => {
+            let mut rows = Vec::new();
+            loop {
+                let batch = stream.next_batch(4096).await?;
+                if batch.is_empty() {
+                    break;
+                }
+                rows.extend(batch);
+            }
+            Ok(rows)
+        }
+        QueryResult::Affected(_) => Ok(Vec::new()),
+    }
+}
+
+fn value_to_expr(v: &Value) -> Expr {
+    use sqlparser::ast::Value as V;
+    let lit = match v {
+        Value::Null => V::Null,
+        Value::Bool(b) => V::Boolean(*b),
+        Value::Int(i) => V::Number(i.to_string(), false),
+        Value::Float(f) => V::Number(f.to_string(), false),
+        Value::Decimal(..) | Value::Date(_) | Value::DateTime(_) | Value::Time(_) => {
+            V::SingleQuotedString(v.to_wire_string().unwrap_or_default())
+        }
+        Value::Text(s) | Value::Json(s) => V::SingleQuotedString(s.clone()),
+        Value::Bytes(_) | Value::Vector(_) => {
+            V::SingleQuotedString(v.to_wire_string().unwrap_or_default())
+        }
+    };
+    Expr::Value(lit)
+}
+
+/// Recursively replace uncorrelated subqueries in `expr` with literals:
+/// scalar `(SELECT ...)` -> value, `x IN (SELECT ...)` -> `x IN (list)`,
+/// `EXISTS (SELECT ...)` -> boolean. Correlated subqueries are not supported
+/// (the inner query is executed standalone).
+fn resolve_subqueries<'a>(
+    db: &'a Session,
+    vindex: &'a VectorRegistry,
+    expr: Expr,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Expr>> + Send + 'a>> {
+    Box::pin(async move {
+        Ok(match expr {
+            Expr::Subquery(q) => {
+                let rows = run_subquery(db, vindex, &q).await?;
+                let v = rows
+                    .first()
+                    .and_then(|r| r.first())
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                value_to_expr(&v)
+            }
+            Expr::InSubquery {
+                expr,
+                subquery,
+                negated,
+            } => {
+                let inner = resolve_subqueries(db, vindex, *expr).await?;
+                let rows = run_subquery(db, vindex, &subquery).await?;
+                let list = rows
+                    .iter()
+                    .filter_map(|r| r.first())
+                    .map(value_to_expr)
+                    .collect();
+                Expr::InList {
+                    expr: Box::new(inner),
+                    list,
+                    negated,
+                }
+            }
+            Expr::Exists { subquery, negated } => {
+                let rows = run_subquery(db, vindex, &subquery).await?;
+                Expr::Value(sqlparser::ast::Value::Boolean(!rows.is_empty() != negated))
+            }
+            Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
+                left: Box::new(resolve_subqueries(db, vindex, *left).await?),
+                op,
+                right: Box::new(resolve_subqueries(db, vindex, *right).await?),
+            },
+            Expr::UnaryOp { op, expr } => Expr::UnaryOp {
+                op,
+                expr: Box::new(resolve_subqueries(db, vindex, *expr).await?),
+            },
+            Expr::Nested(e) => Expr::Nested(Box::new(resolve_subqueries(db, vindex, *e).await?)),
+            Expr::Between {
+                expr,
+                negated,
+                low,
+                high,
+            } => Expr::Between {
+                expr: Box::new(resolve_subqueries(db, vindex, *expr).await?),
+                negated,
+                low: Box::new(resolve_subqueries(db, vindex, *low).await?),
+                high: Box::new(resolve_subqueries(db, vindex, *high).await?),
+            },
+            other => other,
+        })
+    })
 }
 
 /// Detect the `ORDER BY VEC_DISTANCE(col, <literal>) ASC LIMIT k` pattern.

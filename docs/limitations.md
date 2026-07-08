@@ -5,7 +5,9 @@ implemented, so you can judge fit.
 
 ## SQL surface
 
-- No subqueries, CTEs (`WITH`), window functions, or `HAVING`.
+- Uncorrelated subqueries in `WHERE` (`IN`, scalar, `EXISTS`) are supported;
+  **correlated** subqueries, **derived tables** (`FROM (SELECT ...)`), CTEs
+  (`WITH`), window functions, and `HAVING` are not.
 - No views, triggers, stored procedures, or user-defined functions.
 - `ALTER TABLE` covers add/drop/rename column and rename table — not
   `MODIFY`/`CHANGE` (column type changes) or `ADD/DROP INDEX` via `ALTER`.
@@ -46,7 +48,7 @@ implemented, so you can judge fit.
 
 Candidate next steps, roughly in order of value:
 
-1. Subqueries and `HAVING`.
+1. Correlated subqueries, derived tables, and `HAVING`.
 2. Serializable isolation (read-set validation).
 3. More JSON functions (`JSON_SET`, `JSON_ARRAY`, containment).
 4. Secondary-index range on composite keys; merge joins.

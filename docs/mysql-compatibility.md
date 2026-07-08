@@ -26,7 +26,8 @@ drivers connect without modification.
 ElyraSQL implements a focused, growing subset of MySQL SQL. Notable current
 gaps:
 
-- No subqueries, CTEs, window functions, or `HAVING` yet.
+- Uncorrelated `WHERE` subqueries (`IN`, scalar, `EXISTS`) work; correlated
+  subqueries, derived tables, CTEs, window functions, and `HAVING` do not yet.
 - No views, triggers, stored procedures, or user-defined functions.
 - `ALTER TABLE` supports add/drop/rename column and rename table (not
   `MODIFY`/`CHANGE` type changes).

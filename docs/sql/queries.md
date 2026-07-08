@@ -74,3 +74,28 @@ FROM users u LEFT JOIN orders o ON u.id = o.user_id;
 
 Qualify ambiguous columns (`u.id`, `o.id`); a bare column that exists in
 multiple joined tables raises an "ambiguous column" error.
+
+## Subqueries
+
+Uncorrelated subqueries are supported in `WHERE`:
+
+```sql
+-- IN / NOT IN
+SELECT name FROM users WHERE id IN (SELECT uid FROM orders);
+SELECT name FROM users WHERE id NOT IN (SELECT uid FROM orders);
+
+-- scalar subquery
+SELECT name FROM users WHERE age = (SELECT MAX(age) FROM users);
+SELECT name FROM users WHERE age > (SELECT AVG(age) FROM users);
+
+-- EXISTS / NOT EXISTS
+SELECT name FROM users WHERE EXISTS (SELECT 1 FROM orders);
+```
+
+Subqueries are executed once, before the outer query is planned, and their
+results are substituted in. A scalar subquery yields the first column of the
+first row (or `NULL` if empty).
+
+!!! note "Not yet supported"
+    **Correlated** subqueries (that reference the outer row) and **derived
+    tables** (`FROM (SELECT ...) AS t`) are not supported yet.
