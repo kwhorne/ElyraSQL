@@ -10,6 +10,7 @@ mod catalog;
 mod eval;
 mod exec;
 mod keyenc;
+mod predicate;
 mod stream;
 
 use elyra_core::{ColumnType, Error, Result, Schema, Value};

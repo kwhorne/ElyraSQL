@@ -13,8 +13,9 @@ use sqlparser::ast::{
 use crate::catalog::{self, catalog_key, data_key, data_prefix, rowid_key, TableDef};
 use crate::eval::eval_expr;
 use crate::keyenc;
-use crate::stream::RowStream;
+use crate::stream::{RowStream, ScanSpec};
 use crate::QueryResult;
+use sqlparser::ast::Expr;
 
 fn table_ident(name: &ObjectName) -> Result<String> {
     name.0
@@ -206,6 +207,16 @@ pub async fn select(db: &Db, query: &SqlQuery) -> Result<QueryResult> {
     };
     let def = catalog::load(db, &table).await?;
 
+    let offset = match &query.offset {
+        Some(o) => eval_usize(&o.value)?,
+        None => 0,
+    };
+    let limit = match &query.limit {
+        Some(e) => Some(eval_usize(e)?),
+        None => None,
+    };
+    let filter = select.selection.clone();
+
     // Build projection.
     use sqlparser::ast::SelectItem;
     let (projection, out_cols): (Vec<usize>, Vec<ColumnDef>) = if select
@@ -245,12 +256,80 @@ pub async fn select(db: &Db, query: &SqlQuery) -> Result<QueryResult> {
         (idxs, cols)
     };
 
+    let out_schema = Schema::new(out_cols);
+
+    // Fast path: `WHERE pk = <literal>` becomes an O(log n) point lookup on
+    // the clustered key instead of a full table scan.
+    if offset == 0 && limit != Some(0) {
+        match try_pk_lookup(db, &def, filter.as_ref()).await? {
+            PkLookup::Found(row) => {
+                let projected = projection.iter().map(|&i| row[i].clone()).collect();
+                return Ok(QueryResult::Rows(RowStream::literal(out_schema, vec![projected])));
+            }
+            PkLookup::NotFound => {
+                return Ok(QueryResult::Rows(RowStream::literal(out_schema, vec![])));
+            }
+            PkLookup::NotApplicable => {}
+        }
+    }
+
     Ok(QueryResult::Rows(RowStream::scan(
         db.clone(),
         &def,
-        projection,
-        Schema::new(out_cols),
+        ScanSpec { projection, out_schema, filter, offset, limit },
     )))
+}
+
+/// Outcome of attempting the clustered PK point-lookup fast path.
+enum PkLookup {
+    /// The predicate is not `pk = <literal>`; use a normal scan.
+    NotApplicable,
+    /// Point lookup ran, no matching row.
+    NotFound,
+    /// Point lookup ran, here is the row.
+    Found(Vec<Value>),
+}
+
+/// If `filter` is exactly `pk = <literal>` (either operand order), fetch the
+/// single row directly from the clustered key.
+async fn try_pk_lookup(db: &Db, def: &TableDef, filter: Option<&Expr>) -> Result<PkLookup> {
+    use sqlparser::ast::BinaryOperator;
+    let Some(pk) = def.pk_col else { return Ok(PkLookup::NotApplicable) };
+    let Some(Expr::BinaryOp { left, op: BinaryOperator::Eq, right }) = filter else {
+        return Ok(PkLookup::NotApplicable);
+    };
+    let pk_name = &def.schema.columns[pk].name;
+
+    // Identify which side is the pk column and which is the literal.
+    let lit = match (ident_name(left), ident_name(right)) {
+        (Some(n), None) if n.eq_ignore_ascii_case(pk_name) => eval_expr(right)?,
+        (None, Some(n)) if n.eq_ignore_ascii_case(pk_name) => eval_expr(left)?,
+        _ => return Ok(PkLookup::NotApplicable),
+    };
+    let key = data_key(&def.name, &keyenc::encode(&lit)?);
+    match db.get(key).await? {
+        Some(bytes) => {
+            let row: Vec<Value> =
+                bincode::deserialize(&bytes).map_err(|e| Error::Storage(e.to_string()))?;
+            Ok(PkLookup::Found(row))
+        }
+        None => Ok(PkLookup::NotFound),
+    }
+}
+
+fn ident_name(e: &Expr) -> Option<&str> {
+    match e {
+        Expr::Identifier(id) => Some(&id.value),
+        Expr::CompoundIdentifier(parts) => parts.last().map(|i| i.value.as_str()),
+        _ => None,
+    }
+}
+
+fn eval_usize(e: &Expr) -> Result<usize> {
+    match eval_expr(e)? {
+        Value::Int(i) if i >= 0 => Ok(i as usize),
+        other => Err(Error::Query(format!("expected non-negative integer, got {other:?}"))),
+    }
 }
 
 pub async fn drop_table(db: &Db, name: &str, if_exists: bool) -> Result<QueryResult> {
