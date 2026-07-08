@@ -84,6 +84,10 @@ impl Engine {
             }
             Statement::CreateTable(ct) => exec::create_table(&self.db, ct).await,
             Statement::Insert(ins) => exec::insert(&self.db, ins).await,
+            Statement::Update { table, assignments, selection, .. } => {
+                exec::update(&self.db, &table, &assignments, selection.as_ref()).await
+            }
+            Statement::Delete(del) => exec::delete(&self.db, &del).await,
             Statement::Drop { object_type, names, if_exists, .. }
                 if object_type == sqlparser::ast::ObjectType::Table =>
             {

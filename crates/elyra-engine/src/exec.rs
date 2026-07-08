@@ -6,9 +6,11 @@
 use elyra_core::{ColumnDef, ColumnType, Error, Result, Schema, Value};
 use elyra_storage::Db;
 use sqlparser::ast::{
-    ColumnOption, CreateTable, DataType, Insert, ObjectName, SetExpr, TableConstraint,
-    TableFactor, Query as SqlQuery,
+    Assignment, AssignmentTarget, ColumnOption, CreateTable, DataType, Delete, FromTable, Insert,
+    ObjectName, SetExpr, TableConstraint, TableFactor, TableWithJoins, Query as SqlQuery,
 };
+
+use crate::predicate;
 
 use crate::catalog::{self, catalog_key, data_key, data_prefix, rowid_key, TableDef};
 use crate::eval::eval_expr;
@@ -290,22 +292,24 @@ enum PkLookup {
     Found(Vec<Value>),
 }
 
-/// If `filter` is exactly `pk = <literal>` (either operand order), fetch the
-/// single row directly from the clustered key.
-async fn try_pk_lookup(db: &Db, def: &TableDef, filter: Option<&Expr>) -> Result<PkLookup> {
+/// If `filter` is exactly `pk = <literal>` (either operand order), return the
+/// literal to look up directly on the clustered key.
+fn pk_eq_literal(def: &TableDef, filter: Option<&Expr>) -> Result<Option<Value>> {
     use sqlparser::ast::BinaryOperator;
-    let Some(pk) = def.pk_col else { return Ok(PkLookup::NotApplicable) };
+    let Some(pk) = def.pk_col else { return Ok(None) };
     let Some(Expr::BinaryOp { left, op: BinaryOperator::Eq, right }) = filter else {
-        return Ok(PkLookup::NotApplicable);
+        return Ok(None);
     };
     let pk_name = &def.schema.columns[pk].name;
+    Ok(match (ident_name(left), ident_name(right)) {
+        (Some(n), None) if n.eq_ignore_ascii_case(pk_name) => Some(eval_expr(right)?),
+        (None, Some(n)) if n.eq_ignore_ascii_case(pk_name) => Some(eval_expr(left)?),
+        _ => None,
+    })
+}
 
-    // Identify which side is the pk column and which is the literal.
-    let lit = match (ident_name(left), ident_name(right)) {
-        (Some(n), None) if n.eq_ignore_ascii_case(pk_name) => eval_expr(right)?,
-        (None, Some(n)) if n.eq_ignore_ascii_case(pk_name) => eval_expr(left)?,
-        _ => return Ok(PkLookup::NotApplicable),
-    };
+async fn try_pk_lookup(db: &Db, def: &TableDef, filter: Option<&Expr>) -> Result<PkLookup> {
+    let Some(lit) = pk_eq_literal(def, filter)? else { return Ok(PkLookup::NotApplicable) };
     let key = data_key(&def.name, &keyenc::encode(&lit)?);
     match db.get(key).await? {
         Some(bytes) => {
@@ -315,6 +319,154 @@ async fn try_pk_lookup(db: &Db, def: &TableDef, filter: Option<&Expr>) -> Result
         }
         None => Ok(PkLookup::NotFound),
     }
+}
+
+/// Collect `(storage_key, row)` for every row matching `filter`, up to
+/// `limit`. Uses the PK point-lookup fast path when possible, otherwise a
+/// bounded-batch clustered scan.
+async fn collect_matches(
+    db: &Db,
+    def: &TableDef,
+    filter: Option<&Expr>,
+    limit: Option<usize>,
+) -> Result<Vec<(Vec<u8>, Vec<Value>)>> {
+    let mut out = Vec::new();
+
+    if pk_eq_literal(def, filter)?.is_some() {
+        if let PkLookup::Found(row) = try_pk_lookup(db, def, filter).await? {
+            let lit = pk_eq_literal(def, filter)?.expect("checked");
+            out.push((data_key(&def.name, &keyenc::encode(&lit)?), row));
+        }
+        return Ok(out);
+    }
+
+    let prefix = data_prefix(&def.name);
+    let mut cursor: Option<Vec<u8>> = None;
+    loop {
+        let chunk = db.scan_batch(prefix.clone(), cursor.clone(), 4096).await?;
+        if chunk.is_empty() {
+            break;
+        }
+        let last = chunk.len() < 4096;
+        cursor = chunk.last().map(|(k, _)| k.clone());
+        for (k, v) in chunk {
+            let row: Vec<Value> =
+                bincode::deserialize(&v).map_err(|e| Error::Storage(e.to_string()))?;
+            let keep = match filter {
+                Some(f) => predicate::matches(f, &def.schema, &row)?,
+                None => true,
+            };
+            if keep {
+                out.push((k, row));
+                if let Some(l) = limit {
+                    if out.len() >= l {
+                        return Ok(out);
+                    }
+                }
+            }
+        }
+        if last {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+fn table_of(twj: &TableWithJoins) -> Result<String> {
+    match &twj.relation {
+        TableFactor::Table { name, .. } => table_ident(name),
+        _ => Err(Error::Unsupported("only plain table references are supported".into())),
+    }
+}
+
+pub async fn update(
+    db: &Db,
+    table: &TableWithJoins,
+    assignments: &[Assignment],
+    selection: Option<&Expr>,
+) -> Result<QueryResult> {
+    let name = table_of(table)?;
+    let def = catalog::load(db, &name).await?;
+
+    // Resolve assignment targets to column indices.
+    let mut sets: Vec<(usize, &Expr)> = Vec::with_capacity(assignments.len());
+    for a in assignments {
+        let col = match &a.target {
+            AssignmentTarget::ColumnName(n) => n
+                .0
+                .last()
+                .map(|i| i.value.clone())
+                .ok_or_else(|| Error::Query("empty assignment target".into()))?,
+            AssignmentTarget::Tuple(_) => {
+                return Err(Error::Unsupported("tuple assignment is not supported".into()))
+            }
+        };
+        let idx = def
+            .schema
+            .columns
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(&col))
+            .ok_or_else(|| Error::Catalog(format!("unknown column: {col}")))?;
+        sets.push((idx, &a.value));
+    }
+
+    let matches = collect_matches(db, &def, selection, None).await?;
+    let affected = matches.len() as u64;
+
+    let mut puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    let mut deletes: Vec<Vec<u8>> = Vec::new();
+
+    for (old_key, old_row) in matches {
+        let mut new_row = old_row.clone();
+        for (idx, expr) in &sets {
+            // Assignment RHS may reference existing column values.
+            let v = predicate::eval_row(expr, &def.schema, &old_row)?;
+            let col = &def.schema.columns[*idx];
+            new_row[*idx] = coerce(v, &col.ty, &col.name)?;
+        }
+        for (i, col) in def.schema.columns.iter().enumerate() {
+            if !col.nullable && new_row[i].is_null() {
+                return Err(Error::Query(format!("column '{}' cannot be NULL", col.name)));
+            }
+        }
+
+        // If the primary key changed, the clustered key moves.
+        let new_key = match def.pk_col {
+            Some(i) => data_key(&name, &keyenc::encode(&new_row[i])?),
+            None => old_key.clone(),
+        };
+        if new_key != old_key {
+            deletes.push(old_key);
+        }
+        let encoded = bincode::serialize(&new_row).map_err(|e| Error::Storage(e.to_string()))?;
+        puts.push((new_key, encoded));
+    }
+
+    db.commit(puts, deletes).await?;
+    Ok(QueryResult::Affected(affected))
+}
+
+pub async fn delete(db: &Db, del: &Delete) -> Result<QueryResult> {
+    let relations = match &del.from {
+        FromTable::WithFromKeyword(v) | FromTable::WithoutKeyword(v) => v,
+    };
+    if relations.len() != 1 {
+        return Err(Error::Unsupported("multi-table DELETE is not supported".into()));
+    }
+    let name = table_of(&relations[0])?;
+    let def = catalog::load(db, &name).await?;
+
+    let limit = match &del.limit {
+        Some(e) => Some(eval_usize(e)?),
+        None => None,
+    };
+
+    let matches = collect_matches(db, &def, del.selection.as_ref(), limit).await?;
+    let affected = matches.len() as u64;
+    let deletes: Vec<Vec<u8>> = matches.into_iter().map(|(k, _)| k).collect();
+
+    db.commit(vec![], deletes).await?;
+    Ok(QueryResult::Affected(affected))
 }
 
 fn ident_name(e: &Expr) -> Option<&str> {
