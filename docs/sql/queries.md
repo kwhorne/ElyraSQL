@@ -92,10 +92,37 @@ SELECT name FROM users WHERE age > (SELECT AVG(age) FROM users);
 SELECT name FROM users WHERE EXISTS (SELECT 1 FROM orders);
 ```
 
-Subqueries are executed once, before the outer query is planned, and their
-results are substituted in. A scalar subquery yields the first column of the
-first row (or `NULL` if empty).
+Uncorrelated subqueries are executed once, before the outer query is planned.
+A scalar subquery yields the first column of the first row (or `NULL` if empty).
+
+### Correlated subqueries
+
+Subqueries that reference the outer row are supported and evaluated per outer
+row:
+
+```sql
+SELECT name FROM users u
+WHERE EXISTS (SELECT 1 FROM orders o WHERE o.uid = u.id);
+
+SELECT name FROM users u
+WHERE (SELECT COUNT(*) FROM orders o WHERE o.uid = u.id) >= 2;
+```
+
+!!! note
+    Correlated references must be **qualified** with the outer table's
+    name/alias (`u.id`) so they are not confused with an inner column. This
+    path materialises the outer rows and runs the subquery per row.
+
+### Derived tables
+
+```sql
+SELECT x.region, x.total
+FROM (SELECT region, SUM(amount) AS total FROM sales GROUP BY region) x
+WHERE x.total > 1000;
+```
+
+A derived table must have an alias. It works standalone and in joins.
 
 !!! note "Not yet supported"
-    **Correlated** subqueries (that reference the outer row) and **derived
-    tables** (`FROM (SELECT ...) AS t`) are not supported yet.
+    Scalar subqueries in the **SELECT list**, CTEs (`WITH`), and correlated
+    subqueries combined with joins are not supported yet.

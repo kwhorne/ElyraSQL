@@ -236,12 +236,16 @@ pub fn resolve_index(name: &str, schema: &Schema) -> Result<usize> {
     {
         return Ok(i);
     }
+    // Match on the bare (unqualified) name on both sides, so a qualified
+    // reference like `t.col` resolves against a single-table (bare) schema and
+    // a bare `col` resolves against a joined (`alias.col`) schema.
     let bare = |n: &str| n.rsplit('.').next().unwrap_or(n).to_string();
+    let target = bare(name);
     let hits: Vec<usize> = schema
         .columns
         .iter()
         .enumerate()
-        .filter(|(_, c)| bare(&c.name).eq_ignore_ascii_case(name))
+        .filter(|(_, c)| bare(&c.name).eq_ignore_ascii_case(&target))
         .map(|(i, _)| i)
         .collect();
     match hits.len() {

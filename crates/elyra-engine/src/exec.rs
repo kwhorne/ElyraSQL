@@ -572,12 +572,11 @@ pub async fn select(
         Some(e) => Some(eval_usize(e)?),
         None => None,
     };
-    // Resolve any uncorrelated subqueries in the WHERE clause into literals /
-    // value lists before planning (IN / scalar / EXISTS).
-    let filter = match select.selection.clone() {
-        Some(f) => Some(resolve_subqueries(db, vindex, f).await?),
-        None => None,
-    };
+    // Resolve uncorrelated WHERE subqueries into literals / value lists
+    // (IN / scalar / EXISTS). A subquery that references an outer column fails
+    // to resolve standalone; that marks the filter as correlated, handled
+    // per-row after the table is loaded.
+    let raw_filter = select.selection.clone();
 
     // GROUP BY / ORDER BY.
     let group_by: Vec<Expr> = match &select.group_by {
@@ -603,6 +602,10 @@ pub async fn select(
             .iter()
             .any(|t| !t.joins.is_empty() || matches!(t.relation, TableFactor::Derived { .. }));
     if is_join {
+        let filter = match raw_filter {
+            Some(f) => Some(resolve_subqueries(db, vindex, f).await?),
+            None => None,
+        };
         return join_select(
             db,
             vindex,
@@ -630,6 +633,41 @@ pub async fn select(
         }
     };
     let def = catalog::load(db, &table).await?;
+
+    // Outer table name/alias, used to detect and bind correlated subqueries.
+    let outer = match &select.from[0].relation {
+        TableFactor::Table { alias, .. } => alias
+            .as_ref()
+            .map(|a| a.name.value.clone())
+            .unwrap_or_else(|| table.clone()),
+        _ => table.clone(),
+    };
+
+    // A WHERE subquery that references `outer.<col>` is correlated: evaluate it
+    // per outer row with the outer columns bound to literals.
+    if let Some(f) = &raw_filter {
+        if filter_correlated(f, &outer) {
+            return correlated_select(
+                db,
+                vindex,
+                select,
+                &def,
+                &outer,
+                f,
+                &group_by,
+                &order_exprs,
+                offset,
+                limit,
+            )
+            .await;
+        }
+    }
+
+    // Otherwise resolve uncorrelated subqueries into literals.
+    let filter = match raw_filter {
+        Some(f) => Some(resolve_subqueries(db, vindex, f).await?),
+        None => None,
+    };
 
     // Aggregation / grouping path: parallel streaming aggregation (OLAP).
     if !group_by.is_empty() || aggregate::projection_has_aggregate(&select.projection) {
@@ -2068,6 +2106,114 @@ fn infer_val(v: &Value) -> ColumnType {
     }
 }
 
+/// True if any subquery in `filter` references `outer.<col>` (i.e. correlates
+/// with the outer query). Correlated references must be qualified with the
+/// outer table name/alias.
+fn filter_correlated(filter: &Expr, outer: &str) -> bool {
+    let found = std::cell::Cell::new(false);
+    let check = |e: &Expr| -> Option<Expr> {
+        if let Expr::Subquery(q)
+        | Expr::InSubquery { subquery: q, .. }
+        | Expr::Exists { subquery: q, .. } = e
+        {
+            if query_refs_qualifier(q, outer) {
+                found.set(true);
+            }
+        }
+        None
+    };
+    let _ = map_expr(filter, &check);
+    found.get()
+}
+
+/// True if any expression in `q` (recursively) is a `qualifier.<col>` reference.
+fn query_refs_qualifier(q: &SqlQuery, qualifier: &str) -> bool {
+    let found = std::cell::Cell::new(false);
+    let check = |e: &Expr| -> Option<Expr> {
+        if let Expr::CompoundIdentifier(parts) = e {
+            if parts
+                .first()
+                .map(|i| i.value.eq_ignore_ascii_case(qualifier))
+                .unwrap_or(false)
+            {
+                found.set(true);
+            }
+        }
+        None
+    };
+    let _ = rewrite_query(q, &check);
+    found.get()
+}
+
+/// Evaluate a query whose WHERE has a correlated subquery: materialise the
+/// outer rows, and for each row bind outer column references (qualified with
+/// `outer`, or bare columns of the outer table) into the subqueries, resolve
+/// them, and test the predicate.
+#[allow(clippy::too_many_arguments)]
+async fn correlated_select(
+    db: &Session,
+    vindex: &VectorRegistry,
+    select: &Select,
+    def: &TableDef,
+    outer: &str,
+    corr_filter: &Expr,
+    group_by: &[Expr],
+    order_exprs: &[(Expr, bool)],
+    offset: usize,
+    limit: Option<usize>,
+) -> Result<QueryResult> {
+    let all = scan_rows(db, def, None).await?;
+    let mut matched: Vec<Vec<Value>> = Vec::new();
+
+    for row in all {
+        let subst = |e: &Expr| -> Option<Expr> {
+            match e {
+                Expr::CompoundIdentifier(parts) if parts.len() >= 2 => {
+                    let tbl = &parts[parts.len() - 2].value;
+                    let col = &parts[parts.len() - 1].value;
+                    if tbl.eq_ignore_ascii_case(outer) {
+                        if let Some(i) = def
+                            .schema
+                            .columns
+                            .iter()
+                            .position(|c| c.name.eq_ignore_ascii_case(col))
+                        {
+                            return Some(value_to_expr(&row[i]));
+                        }
+                    }
+                    None
+                }
+                Expr::Identifier(id) => def
+                    .schema
+                    .columns
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(&id.value))
+                    .map(|i| value_to_expr(&row[i])),
+                _ => None,
+            }
+        };
+        let bound = map_expr(corr_filter, &subst);
+        let resolved = resolve_subqueries(db, vindex, bound).await?;
+        if predicate::matches(&resolved, &def.schema, &row)? {
+            matched.push(row);
+        }
+    }
+
+    if !group_by.is_empty() || aggregate::projection_has_aggregate(&select.projection) {
+        let (schema, mut out) = aggregate::run(&def.schema, &select.projection, group_by, matched)?;
+        order_output_rows(&mut out, &schema, order_exprs)?;
+        apply_offset_limit(&mut out, offset, limit);
+        return Ok(QueryResult::Rows(RowStream::literal(schema, out)));
+    }
+    let resolved = resolve_order_aliases(order_exprs, &select.projection, &def.schema);
+    if !resolved.is_empty() {
+        sort_full_rows(&mut matched, &def.schema, &resolved)?;
+    }
+    apply_offset_limit(&mut matched, offset, limit);
+    let (schema, out) = project_exprs(&select.projection, &def.schema, &matched)?;
+    Ok(QueryResult::Rows(RowStream::literal(schema, out)))
+}
+
 /// Materialise a subquery's rows by executing it through the query engine.
 async fn run_subquery(
     db: &Session,
@@ -2172,7 +2318,7 @@ fn resolve_subqueries<'a>(
             }
             Expr::Exists { subquery, negated } => {
                 let rows = run_subquery(db, vindex, &subquery).await?;
-                Expr::Value(sqlparser::ast::Value::Boolean(!rows.is_empty() != negated))
+                Expr::Value(sqlparser::ast::Value::Boolean(rows.is_empty() == negated))
             }
             Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
                 left: Box::new(resolve_subqueries(db, vindex, *left).await?),
@@ -2198,6 +2344,119 @@ fn resolve_subqueries<'a>(
             other => other,
         })
     })
+}
+
+/// Rewrite every expression in `expr`, including those nested inside
+/// subqueries, by applying `f` (which may replace a node). Used to bind outer
+/// column references for correlated subqueries.
+fn map_expr(expr: &Expr, f: &dyn Fn(&Expr) -> Option<Expr>) -> Expr {
+    if let Some(r) = f(expr) {
+        return r;
+    }
+    match expr {
+        Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
+            left: Box::new(map_expr(left, f)),
+            op: op.clone(),
+            right: Box::new(map_expr(right, f)),
+        },
+        Expr::UnaryOp { op, expr } => Expr::UnaryOp {
+            op: *op,
+            expr: Box::new(map_expr(expr, f)),
+        },
+        Expr::Nested(e) => Expr::Nested(Box::new(map_expr(e, f))),
+        Expr::IsNull(e) => Expr::IsNull(Box::new(map_expr(e, f))),
+        Expr::IsNotNull(e) => Expr::IsNotNull(Box::new(map_expr(e, f))),
+        Expr::Between {
+            expr,
+            negated,
+            low,
+            high,
+        } => Expr::Between {
+            expr: Box::new(map_expr(expr, f)),
+            negated: *negated,
+            low: Box::new(map_expr(low, f)),
+            high: Box::new(map_expr(high, f)),
+        },
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => Expr::InList {
+            expr: Box::new(map_expr(expr, f)),
+            list: list.iter().map(|e| map_expr(e, f)).collect(),
+            negated: *negated,
+        },
+        Expr::Subquery(q) => Expr::Subquery(Box::new(rewrite_query(q, f))),
+        Expr::InSubquery {
+            expr,
+            subquery,
+            negated,
+        } => Expr::InSubquery {
+            expr: Box::new(map_expr(expr, f)),
+            subquery: Box::new(rewrite_query(subquery, f)),
+            negated: *negated,
+        },
+        Expr::Exists { subquery, negated } => Expr::Exists {
+            subquery: Box::new(rewrite_query(subquery, f)),
+            negated: *negated,
+        },
+        Expr::Function(func) => {
+            let mut func = func.clone();
+            if let sqlparser::ast::FunctionArguments::List(list) = &mut func.args {
+                for arg in &mut list.args {
+                    if let sqlparser::ast::FunctionArg::Unnamed(
+                        sqlparser::ast::FunctionArgExpr::Expr(e),
+                    ) = arg
+                    {
+                        *e = map_expr(e, f);
+                    }
+                }
+            }
+            Expr::Function(func)
+        }
+        other => other.clone(),
+    }
+}
+
+/// Apply `map_expr` to the expression positions of a query (projection, WHERE,
+/// JOIN conditions, GROUP BY, HAVING, ORDER BY), recursing into subqueries.
+fn rewrite_query(q: &SqlQuery, f: &dyn Fn(&Expr) -> Option<Expr>) -> SqlQuery {
+    let mut q = q.clone();
+    if let SetExpr::Select(select) = q.body.as_mut() {
+        for item in &mut select.projection {
+            match item {
+                sqlparser::ast::SelectItem::UnnamedExpr(e)
+                | sqlparser::ast::SelectItem::ExprWithAlias { expr: e, .. } => {
+                    *e = map_expr(e, f);
+                }
+                _ => {}
+            }
+        }
+        if let Some(sel) = &select.selection {
+            select.selection = Some(map_expr(sel, f));
+        }
+        if let Some(h) = &select.having {
+            select.having = Some(map_expr(h, f));
+        }
+        for twj in &mut select.from {
+            for join in &mut twj.joins {
+                if let sqlparser::ast::JoinOperator::Inner(sqlparser::ast::JoinConstraint::On(e))
+                | sqlparser::ast::JoinOperator::LeftOuter(
+                    sqlparser::ast::JoinConstraint::On(e),
+                )
+                | sqlparser::ast::JoinOperator::RightOuter(
+                    sqlparser::ast::JoinConstraint::On(e),
+                )
+                | sqlparser::ast::JoinOperator::FullOuter(
+                    sqlparser::ast::JoinConstraint::On(e),
+                ) = &mut join.join_operator
+                {
+                    *e = map_expr(e, f);
+                }
+            }
+        }
+    }
+    q
 }
 
 /// Detect the `ORDER BY VEC_DISTANCE(col, <literal>) ASC LIMIT k` pattern.

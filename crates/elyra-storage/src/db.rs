@@ -24,6 +24,10 @@ use tracing::warn;
 
 use crate::{Snapshot, Storage};
 
+/// `(key, expected snapshot value)` pairs validated before a transactional
+/// commit.
+type Expected = Vec<(Vec<u8>, Option<Vec<u8>>)>;
+
 /// Max writes folded into a single group commit.
 const GROUP_COMMIT_MAX: usize = 1024;
 /// Bound on the writer queue → backpressure under write storms.
@@ -35,7 +39,7 @@ struct WriteJob {
     deletes: Vec<Vec<u8>>,
     /// When set, validate these `(key, snapshot-value)` pairs before applying
     /// (transactional commit); such jobs are applied alone, not merged.
-    expected: Option<Vec<(Vec<u8>, Option<Vec<u8>>)>>,
+    expected: Option<Expected>,
     ack: oneshot::Sender<Result<()>>,
 }
 
@@ -126,7 +130,7 @@ impl Db {
     /// still hold before applying, else fail with [`elyra_core::Error::Conflict`].
     pub async fn commit_checked(
         &self,
-        expected: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+        expected: Expected,
         puts: Vec<(Vec<u8>, Vec<u8>)>,
         deletes: Vec<Vec<u8>>,
     ) -> Result<()> {
@@ -137,7 +141,7 @@ impl Db {
         &self,
         puts: Vec<(Vec<u8>, Vec<u8>)>,
         deletes: Vec<Vec<u8>>,
-        expected: Option<Vec<(Vec<u8>, Option<Vec<u8>>)>>,
+        expected: Option<Expected>,
     ) -> Result<()> {
         let (ack, wait) = oneshot::channel();
         self.writer
