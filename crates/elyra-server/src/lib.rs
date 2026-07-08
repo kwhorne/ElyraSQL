@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use elyra_engine::{Engine, QueryResult};
+use elyra_engine::{Engine, QueryResult, Txn};
 use opensrv_mysql::{
     AsyncMysqlIntermediary, AsyncMysqlShim, Column, ColumnFlags, ColumnType, ErrorKind,
     InitWriter, OkResponse, ParamParser, QueryResultWriter, StatementMetaWriter,
@@ -66,6 +66,8 @@ pub struct ElyraShim {
     salt: [u8; 20],
     /// Privilege of the authenticated user (set during `authenticate`).
     privilege: std::sync::Mutex<elyra_core::Privilege>,
+    /// Per-connection transaction state (BEGIN/COMMIT/ROLLBACK).
+    txn: Txn,
     stmts: HashMap<u32, Prepared>,
     next_id: u32,
 }
@@ -77,6 +79,7 @@ impl ElyraShim {
             auth,
             salt: auth::generate_salt(),
             privilege: std::sync::Mutex::new(elyra_core::Privilege::Read),
+            txn: Txn::new(),
             stmts: HashMap::new(),
             next_id: 1,
         }
@@ -183,7 +186,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for ElyraShim {
         };
 
         let privilege = self.privilege();
-        match self.engine.execute(&sql, privilege).await {
+        match self.engine.execute(&sql, privilege, &mut self.txn).await {
             Ok(outcomes) => write_outcomes(outcomes, results).await,
             Err(e) => results.error(ErrorKind::ER_UNKNOWN_ERROR, e.to_string().as_bytes()).await,
         }
@@ -208,7 +211,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for ElyraShim {
         results: QueryResultWriter<'a, W>,
     ) -> Result<(), Self::Error> {
         let privilege = self.privilege();
-        match self.engine.execute(query, privilege).await {
+        match self.engine.execute(query, privilege, &mut self.txn).await {
             Ok(outcomes) => write_outcomes(outcomes, results).await,
             Err(e) => results.error(ErrorKind::ER_UNKNOWN_ERROR, e.to_string().as_bytes()).await,
         }

@@ -14,7 +14,10 @@ mod index;
 mod keyenc;
 mod predicate;
 mod stream;
+mod txn;
 mod vindex;
+
+pub use txn::Txn;
 
 use elyra_core::{ColumnType, Error, Privilege, Result, Schema, Value};
 use elyra_storage::Db;
@@ -62,7 +65,12 @@ impl Engine {
 
     /// Parse and execute one or more `;`-separated statements, enforcing that
     /// each statement is permitted at the caller's `privilege` level.
-    pub async fn execute(&self, sql: &str, privilege: Privilege) -> Result<Vec<QueryResult>> {
+    pub async fn execute(
+        &self,
+        sql: &str,
+        privilege: Privilege,
+        txn: &mut Txn,
+    ) -> Result<Vec<QueryResult>> {
         if let Some(r) = self.intercept_session(sql) {
             return Ok(vec![r]); // session/introspection: read-level
         }
@@ -79,12 +87,12 @@ impl Engine {
                     "access denied: statement requires {need:?} privilege"
                 )));
             }
-            out.push(self.execute_stmt(stmt).await?);
+            out.push(self.execute_stmt(stmt, txn).await?);
         }
         Ok(out)
     }
 
-    async fn execute_stmt(&self, stmt: Statement) -> Result<QueryResult> {
+    async fn execute_stmt(&self, stmt: Statement, txn: &mut Txn) -> Result<QueryResult> {
         match stmt {
             Statement::Query(q) => {
                 if query_has_from(&q) {
@@ -93,13 +101,13 @@ impl Engine {
                     eval::eval_literal_select(&q)
                 }
             }
-            Statement::CreateTable(ct) => exec::create_table(&self.db, ct).await,
-            Statement::CreateIndex(ci) => exec::create_index(&self.db, ci).await,
-            Statement::Insert(ins) => exec::insert(&self.db, ins).await,
+            Statement::CreateTable(ct) => exec::create_table(&self.db, txn, ct).await,
+            Statement::CreateIndex(ci) => exec::create_index(&self.db, txn, ci).await,
+            Statement::Insert(ins) => exec::insert(&self.db, txn, ins).await,
             Statement::Update { table, assignments, selection, .. } => {
-                exec::update(&self.db, &table, &assignments, selection.as_ref()).await
+                exec::update(&self.db, txn, &table, &assignments, selection.as_ref()).await
             }
-            Statement::Delete(del) => exec::delete(&self.db, &del).await,
+            Statement::Delete(del) => exec::delete(&self.db, txn, &del).await,
             Statement::Drop { object_type, names, if_exists, .. }
                 if object_type == sqlparser::ast::ObjectType::Table =>
             {
@@ -108,7 +116,19 @@ impl Engine {
                     .and_then(|n| n.0.last())
                     .map(|i| i.value.clone())
                     .ok_or_else(|| Error::Catalog("empty table name".into()))?;
-                exec::drop_table(&self.db, &name, if_exists).await
+                exec::drop_table(&self.db, txn, &name, if_exists).await
+            }
+            Statement::StartTransaction { .. } => {
+                txn.begin();
+                Ok(QueryResult::empty_ok())
+            }
+            Statement::Commit { .. } => {
+                txn.commit();
+                Ok(QueryResult::empty_ok())
+            }
+            Statement::Rollback { .. } => {
+                txn.rollback(&self.db).await?;
+                Ok(QueryResult::empty_ok())
             }
             Statement::SetVariable { .. } | Statement::Use { .. } => Ok(QueryResult::empty_ok()),
             other => Err(Error::Unsupported(format!(
@@ -151,6 +171,9 @@ fn required_privilege(stmt: &Statement) -> Privilege {
         | Statement::SetVariable { .. }
         | Statement::Use { .. } => Privilege::Read,
         Statement::Insert(_) | Statement::Update { .. } | Statement::Delete(_) => Privilege::Write,
+        Statement::StartTransaction { .. }
+        | Statement::Commit { .. }
+        | Statement::Rollback { .. } => Privilege::Read,
         _ => Privilege::Admin, // CREATE / DROP / CREATE INDEX and anything else
     }
 }

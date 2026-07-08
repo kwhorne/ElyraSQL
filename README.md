@@ -124,7 +124,7 @@ journalctl -u elyrasql -f
 - [x] Vector ANN acceleration (HNSW), cached & rebuilt-when-stale
 - [x] OLAP acceleration: parallel, bounded-memory streaming aggregation
 - [x] Authentication (mysql_native_password) + TLS
-- [ ] Roles / per-user privileges
+- [x] Transactions: `BEGIN` / `COMMIT` / `ROLLBACK` (undo-log, read-your-writes)
 - [x] systemd packaging for Ubuntu 24.04+
 - [ ] ElyraSQL client (Rust + Svelte on Elyra Framework)
 

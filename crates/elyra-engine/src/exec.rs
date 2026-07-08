@@ -15,6 +15,7 @@ use crate::aggregate;
 use crate::aggregate::AggPlan;
 use crate::index;
 use crate::predicate;
+use crate::txn::Txn;
 use elyra_olap::GroupAggregator;
 
 use crate::catalog::{
@@ -69,7 +70,7 @@ fn is_tinyint_bool(_dt: &DataType) -> bool {
     false
 }
 
-pub async fn create_table(db: &Db, ct: CreateTable) -> Result<QueryResult> {
+pub async fn create_table(db: &Db, txn: &mut Txn, ct: CreateTable) -> Result<QueryResult> {
     let name = table_ident(&ct.name)?;
 
     if catalog::exists(db, &name).await? {
@@ -122,11 +123,11 @@ pub async fn create_table(db: &Db, ct: CreateTable) -> Result<QueryResult> {
         pk_col,
         indexes: Vec::new(),
     };
-    db.commit(vec![(catalog_key(&name), def.encode()?)], vec![]).await?;
+    txn.apply(db, vec![(catalog_key(&name), def.encode()?)], vec![]).await?;
     Ok(QueryResult::Affected(0))
 }
 
-pub async fn create_index(db: &Db, ci: CreateIndex) -> Result<QueryResult> {
+pub async fn create_index(db: &Db, txn: &mut Txn, ci: CreateIndex) -> Result<QueryResult> {
     let table = table_ident(&ci.table_name)?;
     let mut def = catalog::load(db, &table).await?;
 
@@ -177,11 +178,11 @@ pub async fn create_index(db: &Db, ci: CreateIndex) -> Result<QueryResult> {
             break;
         }
     }
-    db.commit(puts, vec![]).await?;
+    txn.apply(db, puts, vec![]).await?;
     Ok(QueryResult::Affected(0))
 }
 
-pub async fn insert(db: &Db, ins: Insert) -> Result<QueryResult> {
+pub async fn insert(db: &Db, txn: &mut Txn, ins: Insert) -> Result<QueryResult> {
     let name = table_ident(&ins.table_name)?;
     let def = catalog::load(db, &name).await?;
 
@@ -263,7 +264,7 @@ pub async fn insert(db: &Db, ins: Insert) -> Result<QueryResult> {
     }
     puts.push(bump_wcount(db, &name).await?);
 
-    db.commit(puts, vec![]).await?;
+    txn.apply(db, puts, vec![]).await?;
     Ok(QueryResult::Affected(affected))
 }
 
@@ -1290,6 +1291,7 @@ fn table_of(twj: &TableWithJoins) -> Result<String> {
 
 pub async fn update(
     db: &Db,
+    txn: &mut Txn,
     table: &TableWithJoins,
     assignments: &[Assignment],
     selection: Option<&Expr>,
@@ -1358,11 +1360,11 @@ pub async fn update(
     }
 
     puts.push(bump_wcount(db, &name).await?);
-    db.commit(puts, deletes).await?;
+    txn.apply(db, puts, deletes).await?;
     Ok(QueryResult::Affected(affected))
 }
 
-pub async fn delete(db: &Db, del: &Delete) -> Result<QueryResult> {
+pub async fn delete(db: &Db, txn: &mut Txn, del: &Delete) -> Result<QueryResult> {
     let relations = match &del.from {
         FromTable::WithFromKeyword(v) | FromTable::WithoutKeyword(v) => v,
     };
@@ -1387,7 +1389,7 @@ pub async fn delete(db: &Db, del: &Delete) -> Result<QueryResult> {
     }
 
     let wc = bump_wcount(db, &name).await?;
-    db.commit(vec![wc], deletes).await?;
+    txn.apply(db, vec![wc], deletes).await?;
     Ok(QueryResult::Affected(affected))
 }
 
@@ -1780,7 +1782,7 @@ fn reorder(rows: &mut [Vec<Value>], keyed: &[(Vec<Value>, usize)]) {
     }
 }
 
-pub async fn drop_table(db: &Db, name: &str, if_exists: bool) -> Result<QueryResult> {
+pub async fn drop_table(db: &Db, txn: &mut Txn, name: &str, if_exists: bool) -> Result<QueryResult> {
     if !catalog::exists(db, name).await? {
         if if_exists {
             return Ok(QueryResult::Affected(0));
@@ -1804,7 +1806,7 @@ pub async fn drop_table(db: &Db, name: &str, if_exists: bool) -> Result<QueryRes
             break;
         }
     }
-    db.commit(vec![], deletes).await?;
+    txn.apply(db, vec![], deletes).await?;
     Ok(QueryResult::Affected(0))
 }
 
