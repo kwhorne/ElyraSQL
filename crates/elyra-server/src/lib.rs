@@ -82,16 +82,16 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for ElyraShim {
         query: &'a str,
         results: QueryResultWriter<'a, W>,
     ) -> Result<(), Self::Error> {
-        match self.engine.execute(query) {
+        match self.engine.execute(query).await {
             Ok(outcomes) => write_outcomes(outcomes, results).await,
-            Err(e) => {
-                let code = ErrorKind::ER_UNKNOWN_ERROR;
-                let _ = e.mysql_code();
-                results.error(code, e.to_string().as_bytes()).await
-            }
+            Err(e) => results.error(ErrorKind::ER_UNKNOWN_ERROR, e.to_string().as_bytes()).await,
         }
     }
 }
+
+/// Rows pulled from storage per batch while streaming a result set. Bounds
+/// per-connection memory regardless of table size.
+const STREAM_BATCH: usize = 1024;
 
 async fn write_outcomes<W: AsyncWrite + Send + Unpin>(
     mut outcomes: Vec<QueryResult>,
@@ -99,8 +99,9 @@ async fn write_outcomes<W: AsyncWrite + Send + Unpin>(
 ) -> Result<(), std::io::Error> {
     // The text protocol returns a single result per query in this build.
     match outcomes.drain(..).next() {
-        Some(QueryResult::Set { schema, rows }) => {
-            let cols: Vec<Column> = schema
+        Some(QueryResult::Rows(mut stream)) => {
+            let cols: Vec<Column> = stream
+                .schema
                 .columns
                 .iter()
                 .map(|c| Column {
@@ -112,9 +113,24 @@ async fn write_outcomes<W: AsyncWrite + Send + Unpin>(
                 .collect();
 
             let mut rw = results.start(&cols).await?;
-            for row in rows {
-                let cells: Vec<Option<String>> = row.iter().map(|v| v.to_wire_string()).collect();
-                rw.write_row(cells).await?;
+            // Drain the stream batch-by-batch straight onto the wire.
+            loop {
+                let batch = match stream.next_batch(STREAM_BATCH).await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        // Mid-stream engine error: surface it and stop.
+                        let msg = e.to_string().into_bytes();
+                        return rw.finish_error(ErrorKind::ER_UNKNOWN_ERROR, &msg).await;
+                    }
+                };
+                if batch.is_empty() {
+                    break;
+                }
+                for row in batch {
+                    let cells: Vec<Option<String>> =
+                        row.iter().map(|v| v.to_wire_string()).collect();
+                    rw.write_row(cells).await?;
+                }
             }
             rw.finish().await
         }

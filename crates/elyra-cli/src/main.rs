@@ -1,11 +1,10 @@
 //! `elyrasql` — the ElyraSQL server binary.
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use elyra_engine::Engine;
-use elyra_storage::Storage;
+use elyra_storage::Db;
 
 /// ElyraSQL — a robust, MySQL-compatible SQL server written in Rust.
 #[derive(Parser)]
@@ -47,8 +46,8 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Serve { data, listen } => {
             tracing::info!(?data, "opening ElyraSQL database file");
-            let storage = Arc::new(Storage::open(&data)?);
-            let engine = Engine::new(storage);
+            let db = Db::open(&data)?;
+            let engine = Engine::new(db);
             elyra_server::serve(&listen, engine).await?;
         }
     }

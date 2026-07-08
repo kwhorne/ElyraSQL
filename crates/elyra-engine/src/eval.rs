@@ -9,19 +9,15 @@ use sqlparser::ast::{
     BinaryOperator, Expr, Query, SelectItem, SetExpr, UnaryOperator, Value as SqlValue,
 };
 
+use crate::stream::RowStream;
 use crate::QueryResult;
 
-pub fn eval_query(q: &Query) -> Result<QueryResult> {
+/// Evaluate a `SELECT` without a `FROM` clause (literals/arithmetic).
+pub fn eval_literal_select(q: &Query) -> Result<QueryResult> {
     let select = match q.body.as_ref() {
         SetExpr::Select(s) => s,
         _ => return Err(Error::Unsupported("only simple SELECT is implemented".into())),
     };
-
-    if !select.from.is_empty() {
-        return Err(Error::Unsupported(
-            "table scans are not implemented in this build yet".into(),
-        ));
-    }
 
     let mut columns = Vec::new();
     let mut row = Vec::new();
@@ -43,13 +39,13 @@ pub fn eval_query(q: &Query) -> Result<QueryResult> {
         row.push(value);
     }
 
-    Ok(QueryResult::Set {
-        schema: Schema::new(columns),
-        rows: vec![row],
-    })
+    Ok(QueryResult::Rows(RowStream::literal(
+        Schema::new(columns),
+        vec![row],
+    )))
 }
 
-fn eval_expr(expr: &Expr) -> Result<Value> {
+pub fn eval_expr(expr: &Expr) -> Result<Value> {
     match expr {
         Expr::Value(v) => eval_literal(value_of(v)),
         Expr::Nested(e) => eval_expr(e),

@@ -13,6 +13,9 @@
 //!
 //! Callers only ever see ElyraSQL types; `redb` never leaks past this crate.
 
+mod db;
+pub use db::Db;
+
 use std::path::Path;
 
 use elyra_core::{Error, Result};
@@ -101,6 +104,67 @@ impl Storage {
             }
         }
         Ok(out)
+    }
+
+    /// Cursor-based range scan. Returns up to `limit` key/value pairs whose
+    /// key starts with `prefix` and is strictly greater than `after` (when
+    /// given). This is the primitive behind streaming table scans: callers
+    /// pass the last-seen key back as `after` to fetch the next batch, so
+    /// memory stays bounded regardless of table size.
+    pub fn scan_batch(
+        &self,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let rtx = self.db.begin_read().map_err(|e| Error::Storage(e.to_string()))?;
+        let t = rtx.open_table(KV).map_err(|e| Error::Storage(e.to_string()))?;
+
+        // Start just after the cursor, or at the prefix itself.
+        let lower: Vec<u8> = match after {
+            Some(a) => {
+                let mut k = a.to_vec();
+                k.push(0); // smallest key strictly greater than `a`
+                k
+            }
+            None => prefix.to_vec(),
+        };
+
+        let mut out = Vec::with_capacity(limit.min(1024));
+        let range = t
+            .range(lower.as_slice()..)
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        for item in range {
+            let (k, v) = item.map_err(|e| Error::Storage(e.to_string()))?;
+            let key = k.value().to_vec();
+            if !key.starts_with(prefix) {
+                break; // left the table's keyspace — done
+            }
+            out.push((key, v.value().to_vec()));
+            if out.len() >= limit {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Atomically apply many puts and deletes in a single write transaction.
+    /// This is the primitive the group-commit writer uses to fold many
+    /// pending writes into one commit under high write traffic.
+    pub fn apply(&self, puts: &[(Vec<u8>, Vec<u8>)], deletes: &[Vec<u8>]) -> Result<()> {
+        let wtx = self.db.begin_write().map_err(|e| Error::Storage(e.to_string()))?;
+        {
+            let mut t = wtx.open_table(KV).map_err(|e| Error::Storage(e.to_string()))?;
+            for (k, v) in puts {
+                t.insert(k.as_slice(), v.as_slice())
+                    .map_err(|e| Error::Storage(e.to_string()))?;
+            }
+            for k in deletes {
+                t.remove(k.as_slice()).map_err(|e| Error::Storage(e.to_string()))?;
+            }
+        }
+        wtx.commit().map_err(|e| Error::Storage(e.to_string()))?;
+        Ok(())
     }
 }
 
