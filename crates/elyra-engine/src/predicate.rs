@@ -13,8 +13,10 @@ pub fn eval_row(expr: &Expr, schema: &Schema, row: &[Value]) -> Result<Value> {
         Expr::Nested(e) => eval_row(e, schema, row),
         Expr::Identifier(id) => resolve(&id.value, schema, row),
         Expr::CompoundIdentifier(parts) => {
-            let name = parts.last().map(|i| i.value.as_str()).unwrap_or("");
-            resolve(name, schema, row)
+            // Qualified reference like `t.col` -> match a combined-schema
+            // column named "t.col".
+            let qualified = parts.iter().map(|i| i.value.as_str()).collect::<Vec<_>>().join(".");
+            resolve(&qualified, schema, row)
         }
         Expr::Function(f) => eval_function(f, schema, row),
         Expr::IsNull(e) => Ok(Value::Bool(eval_row(e, schema, row)?.is_null())),
@@ -110,12 +112,30 @@ fn to_vector(v: &Value) -> Result<Vec<f32>> {
 }
 
 fn resolve(name: &str, schema: &Schema, row: &[Value]) -> Result<Value> {
-    let idx = schema
+    let idx = resolve_index(name, schema)?;
+    Ok(row.get(idx).cloned().unwrap_or(Value::Null))
+}
+
+/// Resolve a column reference to an index. Handles both single-table (bare
+/// names) and joined (qualified "table.col") schemas: exact match first, then
+/// a unique bare-suffix match (so `col` resolves against `t.col`).
+pub fn resolve_index(name: &str, schema: &Schema) -> Result<usize> {
+    if let Some(i) = schema.columns.iter().position(|c| c.name.eq_ignore_ascii_case(name)) {
+        return Ok(i);
+    }
+    let bare = |n: &str| n.rsplit('.').next().unwrap_or(n).to_string();
+    let hits: Vec<usize> = schema
         .columns
         .iter()
-        .position(|c| c.name.eq_ignore_ascii_case(name))
-        .ok_or_else(|| Error::Catalog(format!("unknown column: {name}")))?;
-    Ok(row.get(idx).cloned().unwrap_or(Value::Null))
+        .enumerate()
+        .filter(|(_, c)| bare(&c.name).eq_ignore_ascii_case(name))
+        .map(|(i, _)| i)
+        .collect();
+    match hits.len() {
+        1 => Ok(hits[0]),
+        0 => Err(Error::Catalog(format!("unknown column: {name}"))),
+        _ => Err(Error::Query(format!("ambiguous column: {name}"))),
+    }
 }
 
 fn literal(v: &SqlValue) -> Result<Value> {

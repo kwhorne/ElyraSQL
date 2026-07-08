@@ -7,8 +7,8 @@ use elyra_core::{ColumnDef, ColumnType, Error, Result, Schema, Value};
 use elyra_storage::Db;
 use sqlparser::ast::{
     Assignment, AssignmentTarget, ColumnOption, CreateIndex, CreateTable, DataType, Delete,
-    FromTable, Insert, ObjectName, SetExpr, TableConstraint, TableFactor, TableWithJoins,
-    Query as SqlQuery,
+    FromTable, Insert, JoinConstraint, JoinOperator, ObjectName, Select, SetExpr, TableConstraint,
+    TableFactor, TableWithJoins, Query as SqlQuery,
 };
 
 use crate::aggregate;
@@ -274,15 +274,6 @@ pub async fn select(
         SetExpr::Select(s) => s,
         _ => return Err(Error::Unsupported("only simple SELECT is supported".into())),
     };
-    if select.from.len() != 1 {
-        return Err(Error::Unsupported("exactly one table in FROM is supported".into()));
-    }
-    let table = match &select.from[0].relation {
-        TableFactor::Table { name, .. } => table_ident(name)?,
-        _ => return Err(Error::Unsupported("only plain table references are supported".into())),
-    };
-    let def = catalog::load(db, &table).await?;
-
     let offset = match &query.offset {
         Some(o) => eval_usize(&o.value)?,
         None => 0,
@@ -304,6 +295,22 @@ pub async fn select(
         Some(ob) => ob.exprs.iter().map(|o| (o.expr.clone(), o.asc.unwrap_or(true))).collect(),
         None => Vec::new(),
     };
+
+    // Multi-table / JOIN queries take a dedicated materialised path.
+    let is_join =
+        select.from.len() > 1 || select.from.iter().any(|t| !t.joins.is_empty());
+    if is_join {
+        return join_select(db, select, filter, group_by, order_exprs, offset, limit).await;
+    }
+
+    if select.from.len() != 1 {
+        return Err(Error::Unsupported("exactly one table in FROM is supported".into()));
+    }
+    let table = match &select.from[0].relation {
+        TableFactor::Table { name, .. } => table_ident(name)?,
+        _ => return Err(Error::Unsupported("only plain table references are supported".into())),
+    };
+    let def = catalog::load(db, &table).await?;
 
     // Aggregation / grouping path: materialise, aggregate, order, page.
     if !group_by.is_empty() || aggregate::projection_has_aggregate(&select.projection) {
@@ -449,6 +456,154 @@ enum PkLookup {
 
 /// If `filter` is exactly `pk = <literal>` (either operand order), return the
 /// literal to look up directly on the clustered key.
+/// Execute a multi-table / JOIN SELECT: materialise the joined row set, then
+/// apply WHERE, aggregation or ORDER BY, projection and paging.
+async fn join_select(
+    db: &Db,
+    select: &Select,
+    filter: Option<Expr>,
+    group_by: Vec<Expr>,
+    order_exprs: Vec<(Expr, bool)>,
+    offset: usize,
+    limit: Option<usize>,
+) -> Result<QueryResult> {
+    let (cols, mut rows) = build_from(db, &select.from).await?;
+    let schema = Schema::new(cols);
+
+    // WHERE over the joined rows.
+    if let Some(f) = &filter {
+        let mut kept = Vec::with_capacity(rows.len());
+        for row in rows.into_iter() {
+            if predicate::matches(f, &schema, &row)? {
+                kept.push(row);
+            }
+        }
+        rows = kept;
+    }
+
+    // Aggregation / grouping.
+    if !group_by.is_empty() || aggregate::projection_has_aggregate(&select.projection) {
+        let (osch, mut orows) = aggregate::run(&schema, &select.projection, &group_by, rows)?;
+        order_output_rows(&mut orows, &osch, &order_exprs)?;
+        apply_offset_limit(&mut orows, offset, limit);
+        return Ok(QueryResult::Rows(RowStream::literal(osch, orows)));
+    }
+
+    // ORDER BY + projection.
+    let resolved = resolve_order_aliases(&order_exprs, &select.projection, &schema);
+    if !resolved.is_empty() {
+        sort_full_rows(&mut rows, &schema, &resolved)?;
+    }
+    apply_offset_limit(&mut rows, offset, limit);
+    let (osch, out) = project_exprs(&select.projection, &schema, &rows)?;
+    Ok(QueryResult::Rows(RowStream::literal(osch, out)))
+}
+
+/// Load a single FROM relation into `(qualified columns, rows)`. Column names
+/// are qualified with the table alias (or name) as "alias.col".
+async fn load_relation(db: &Db, tf: &TableFactor) -> Result<(Vec<ColumnDef>, Vec<Vec<Value>>)> {
+    match tf {
+        TableFactor::Table { name, alias, .. } => {
+            let tname = table_ident(name)?;
+            let def = catalog::load(db, &tname).await?;
+            let a = alias.as_ref().map(|al| al.name.value.clone()).unwrap_or_else(|| tname.clone());
+            let cols = def
+                .schema
+                .columns
+                .iter()
+                .map(|c| ColumnDef {
+                    name: format!("{a}.{}", c.name),
+                    ty: c.ty.clone(),
+                    nullable: c.nullable,
+                })
+                .collect();
+            let rows = scan_rows(db, &def, None).await?;
+            Ok((cols, rows))
+        }
+        _ => Err(Error::Unsupported("only plain table references are supported in joins".into())),
+    }
+}
+
+/// Build the joined row set from a FROM clause (comma cross-joins + explicit
+/// JOINs). Nested-loop join.
+async fn build_from(
+    db: &Db,
+    from: &[TableWithJoins],
+) -> Result<(Vec<ColumnDef>, Vec<Vec<Value>>)> {
+    let mut cur_cols: Vec<ColumnDef> = Vec::new();
+    let mut cur_rows: Vec<Vec<Value>> = Vec::new();
+    let mut first = true;
+
+    for twj in from {
+        let (bc, br) = load_relation(db, &twj.relation).await?;
+        if first {
+            cur_cols = bc;
+            cur_rows = br;
+            first = false;
+        } else {
+            let (c, r) = combine(&cur_cols, &cur_rows, &bc, &br, &JoinOperator::CrossJoin)?;
+            cur_cols = c;
+            cur_rows = r;
+        }
+        for join in &twj.joins {
+            let (jc, jr) = load_relation(db, &join.relation).await?;
+            let (c, r) = combine(&cur_cols, &cur_rows, &jc, &jr, &join.join_operator)?;
+            cur_cols = c;
+            cur_rows = r;
+        }
+    }
+    Ok((cur_cols, cur_rows))
+}
+
+/// Nested-loop combine of two materialised relations under a join operator.
+fn combine(
+    lcols: &[ColumnDef],
+    lrows: &[Vec<Value>],
+    rcols: &[ColumnDef],
+    rrows: &[Vec<Value>],
+    op: &JoinOperator,
+) -> Result<(Vec<ColumnDef>, Vec<Vec<Value>>)> {
+    let (on, left_outer) = match op {
+        JoinOperator::Inner(JoinConstraint::On(e)) => (Some(e.clone()), false),
+        JoinOperator::Inner(JoinConstraint::None) | JoinOperator::CrossJoin => (None, false),
+        JoinOperator::LeftOuter(JoinConstraint::On(e)) => (Some(e.clone()), true),
+        JoinOperator::LeftOuter(JoinConstraint::None) => (None, true),
+        other => {
+            return Err(Error::Unsupported(format!(
+                "join type not supported: {other:?}"
+            )))
+        }
+    };
+
+    let mut cols = lcols.to_vec();
+    cols.extend_from_slice(rcols);
+    let schema = Schema::new(cols.clone());
+    let rlen = rcols.len();
+    let mut out = Vec::new();
+
+    for l in lrows {
+        let mut matched = false;
+        for r in rrows {
+            let mut combined = l.clone();
+            combined.extend_from_slice(r);
+            let keep = match &on {
+                Some(e) => predicate::matches(e, &schema, &combined)?,
+                None => true,
+            };
+            if keep {
+                out.push(combined);
+                matched = true;
+            }
+        }
+        if left_outer && !matched {
+            let mut combined = l.clone();
+            combined.extend(std::iter::repeat(Value::Null).take(rlen));
+            out.push(combined);
+        }
+    }
+    Ok((cols, out))
+}
+
 /// If `filter` is exactly `col = <literal>` (either operand order), return the
 /// column index and the literal value.
 fn eq_col_literal(def: &TableDef, filter: Option<&Expr>) -> Result<Option<(usize, Value)>> {

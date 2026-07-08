@@ -69,17 +69,17 @@ fn item_expr_and_alias(item: &SelectItem) -> Result<(&Expr, Option<String>)> {
 }
 
 fn col_index(schema: &Schema, name: &str) -> Result<usize> {
-    schema
-        .columns
-        .iter()
-        .position(|c| c.name.eq_ignore_ascii_case(name))
-        .ok_or_else(|| Error::Catalog(format!("unknown column: {name}")))
+    // Join-aware: handles bare and qualified ("table.col") names.
+    crate::predicate::resolve_index(name, schema)
 }
 
-fn ident_of(expr: &Expr) -> Option<&str> {
+/// Column reference as a resolvable name (qualified for `t.col`).
+fn ident_of(expr: &Expr) -> Option<String> {
     match expr {
-        Expr::Identifier(id) => Some(&id.value),
-        Expr::CompoundIdentifier(parts) => parts.last().map(|i| i.value.as_str()),
+        Expr::Identifier(id) => Some(id.value.clone()),
+        Expr::CompoundIdentifier(parts) => {
+            Some(parts.iter().map(|i| i.value.as_str()).collect::<Vec<_>>().join("."))
+        }
         _ => None,
     }
 }
@@ -99,7 +99,7 @@ fn agg_arg(schema: &Schema, f: &sqlparser::ast::Function) -> Result<(Option<usiz
         Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(e))) => {
             let name = ident_of(e)
                 .ok_or_else(|| Error::Unsupported("aggregate arg must be a column".into()))?;
-            Some(col_index(schema, name)?)
+            Some(col_index(schema, &name)?)
         }
         _ => return Err(Error::Unsupported("unsupported aggregate argument".into())),
     };
@@ -132,7 +132,7 @@ pub fn run(
     for g in group_by {
         let name = ident_of(g)
             .ok_or_else(|| Error::Unsupported("GROUP BY must reference a column".into()))?;
-        group_cols.push(col_index(schema, name)?);
+        group_cols.push(col_index(schema, &name)?);
     }
 
     // Build the output plan and schema.
@@ -161,7 +161,7 @@ pub fn run(
         } else {
             let name = ident_of(expr)
                 .ok_or_else(|| Error::Unsupported("non-aggregated column must be a plain column".into()))?;
-            let idx = col_index(schema, name)?;
+            let idx = col_index(schema, &name)?;
             out_cols.push(ColumnDef {
                 name: alias.unwrap_or_else(|| schema.columns[idx].name.clone()),
                 ty: schema.columns[idx].ty.clone(),
