@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Documentation
+    url: https://kwhorne.github.io/ElyraSQL/
+    about: Guides, SQL reference, deployment, and limitations.
+  - name: Security vulnerability
+    url: https://github.com/kwhorne/ElyraSQL/security/advisories/new
+    about: Report vulnerabilities privately — do not open a public issue.

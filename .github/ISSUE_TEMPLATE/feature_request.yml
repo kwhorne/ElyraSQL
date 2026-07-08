@@ -1,0 +1,36 @@
+name: Feature request
+description: Suggest a capability or improvement
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please describe the **problem** you want solved, not only a proposed
+        solution — it helps us find the best design.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / use case
+      description: What are you trying to do, and where does ElyraSQL fall short?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: SQL syntax, behavior, or API you have in mind (if any).
+    validations:
+      required: false
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+    validations:
+      required: false
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I checked the [roadmap/limitations](https://kwhorne.github.io/ElyraSQL/limitations/) and existing issues.
+          required: true

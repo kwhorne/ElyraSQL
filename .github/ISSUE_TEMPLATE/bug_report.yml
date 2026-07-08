@@ -1,0 +1,68 @@
+name: Bug report
+description: Report incorrect behavior in ElyraSQL
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report! Please include a **minimal reproduction** —
+        schema, statements, and expected vs. actual output.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: Describe the bug and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: The exact SQL (schema + statements) that triggers it.
+      render: sql
+      placeholder: |
+        CREATE TABLE t (id BIGINT PRIMARY KEY, v TEXT);
+        INSERT INTO t VALUES (1, 'a');
+        SELECT ...;   -- expected X, got Y
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: ElyraSQL version
+      description: Output of `elyrasql version` (or image tag / commit).
+      placeholder: 8.0.0-ElyraSQL-0.1.0
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: How are you running it?
+      options:
+        - Static binary
+        - Docker image
+        - Built from source
+    validations:
+      required: true
+  - type: input
+    id: client
+    attributes:
+      label: Client / driver
+      description: e.g. mysql CLI, PyMySQL, mysql-connector, DBeaver, JDBC…
+    validations:
+      required: false
+  - type: input
+    id: os
+    attributes:
+      label: OS / architecture
+      placeholder: Ubuntu 24.04 / x86_64
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: Server logs
+      description: Relevant lines (run with `RUST_LOG=debug` if useful).
+      render: shell
+    validations:
+      required: false
