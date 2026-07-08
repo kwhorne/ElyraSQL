@@ -155,12 +155,14 @@ impl Storage {
         let wtx = self.db.begin_write().map_err(|e| Error::Storage(e.to_string()))?;
         {
             let mut t = wtx.open_table(KV).map_err(|e| Error::Storage(e.to_string()))?;
+            // Deletes first, then puts: a key present in both (e.g. an index
+            // entry that is unchanged across an UPDATE) ends up kept.
+            for k in deletes {
+                t.remove(k.as_slice()).map_err(|e| Error::Storage(e.to_string()))?;
+            }
             for (k, v) in puts {
                 t.insert(k.as_slice(), v.as_slice())
                     .map_err(|e| Error::Storage(e.to_string()))?;
-            }
-            for k in deletes {
-                t.remove(k.as_slice()).map_err(|e| Error::Storage(e.to_string()))?;
             }
         }
         wtx.commit().map_err(|e| Error::Storage(e.to_string()))?;

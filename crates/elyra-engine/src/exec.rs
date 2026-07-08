@@ -6,14 +6,16 @@
 use elyra_core::{ColumnDef, ColumnType, Error, Result, Schema, Value};
 use elyra_storage::Db;
 use sqlparser::ast::{
-    Assignment, AssignmentTarget, ColumnOption, CreateTable, DataType, Delete, FromTable, Insert,
-    ObjectName, SetExpr, TableConstraint, TableFactor, TableWithJoins, Query as SqlQuery,
+    Assignment, AssignmentTarget, ColumnOption, CreateIndex, CreateTable, DataType, Delete,
+    FromTable, Insert, ObjectName, SetExpr, TableConstraint, TableFactor, TableWithJoins,
+    Query as SqlQuery,
 };
 
 use crate::aggregate;
+use crate::index;
 use crate::predicate;
 
-use crate::catalog::{self, catalog_key, data_key, data_prefix, rowid_key, TableDef};
+use crate::catalog::{self, catalog_key, data_key, data_prefix, rowid_key, IndexDef, TableDef};
 use crate::eval::eval_expr;
 use crate::keyenc;
 use crate::stream::{RowStream, ScanSpec};
@@ -108,8 +110,67 @@ pub async fn create_table(db: &Db, ct: CreateTable) -> Result<QueryResult> {
         }
     }
 
-    let def = TableDef { name: name.clone(), schema: Schema::new(columns), pk_col };
+    let def = TableDef {
+        name: name.clone(),
+        schema: Schema::new(columns),
+        pk_col,
+        indexes: Vec::new(),
+    };
     db.commit(vec![(catalog_key(&name), def.encode()?)], vec![]).await?;
+    Ok(QueryResult::Affected(0))
+}
+
+pub async fn create_index(db: &Db, ci: CreateIndex) -> Result<QueryResult> {
+    let table = table_ident(&ci.table_name)?;
+    let mut def = catalog::load(db, &table).await?;
+
+    if ci.columns.len() != 1 {
+        return Err(Error::Unsupported("composite indexes are not supported yet".into()));
+    }
+    let col_expr = &ci.columns[0].expr;
+    let col_name = ident_name(col_expr)
+        .ok_or_else(|| Error::Unsupported("index column must be a plain column".into()))?;
+    let col = def
+        .schema
+        .columns
+        .iter()
+        .position(|c| c.name.eq_ignore_ascii_case(col_name))
+        .ok_or_else(|| Error::Catalog(format!("unknown column: {col_name}")))?;
+
+    let name = match &ci.name {
+        Some(n) => n.0.last().map(|i| i.value.clone()).unwrap_or_default(),
+        None => format!("{table}_{col_name}_idx"),
+    };
+    if def.indexes.iter().any(|i| i.name.eq_ignore_ascii_case(&name)) {
+        if ci.if_not_exists {
+            return Ok(QueryResult::Affected(0));
+        }
+        return Err(Error::Catalog(format!("index already exists: {name}")));
+    }
+
+    def.indexes.push(IndexDef { name, col, unique: ci.unique });
+
+    // Persist the new catalog and backfill index entries for existing rows.
+    let mut puts: Vec<(Vec<u8>, Vec<u8>)> = vec![(catalog_key(&table), def.encode()?)];
+    let prefix = data_prefix(&table);
+    let mut cursor: Option<Vec<u8>> = None;
+    loop {
+        let chunk = db.scan_batch(prefix.clone(), cursor.clone(), 4096).await?;
+        if chunk.is_empty() {
+            break;
+        }
+        let last = chunk.len() < 4096;
+        cursor = chunk.last().map(|(k, _)| k.clone());
+        for (k, v) in chunk {
+            let row: Vec<Value> =
+                bincode::deserialize(&v).map_err(|e| Error::Storage(e.to_string()))?;
+            puts.extend(index::entries_for_row(&def, &row, &k)?);
+        }
+        if last {
+            break;
+        }
+    }
+    db.commit(puts, vec![]).await?;
     Ok(QueryResult::Affected(0))
 }
 
@@ -182,7 +243,9 @@ pub async fn insert(db: &Db, ins: Insert) -> Result<QueryResult> {
             }
         };
         let encoded = bincode::serialize(&row).map_err(|e| Error::Storage(e.to_string()))?;
+        let idx_entries = index::entries_for_row(&def, &row, &key)?;
         puts.push((key, encoded));
+        puts.extend(idx_entries);
     }
 
     let affected = puts.len() as u64;
@@ -296,6 +359,24 @@ pub async fn select(db: &Db, query: &SqlQuery) -> Result<QueryResult> {
         return Ok(QueryResult::Rows(RowStream::literal(out_schema, out)));
     }
 
+    // Secondary-index fast path: `WHERE indexed_col = <literal>` retrieves
+    // matching rows via the index instead of scanning the whole table.
+    if let Some((col, _)) = eq_col_literal(&def, filter.as_ref())? {
+        if def.pk_col != Some(col) && index::index_on(&def, col).is_some() {
+            let mut rows: Vec<Vec<Value>> = collect_matches(db, &def, filter.as_ref(), None)
+                .await?
+                .into_iter()
+                .map(|(_, r)| r)
+                .collect();
+            apply_offset_limit(&mut rows, offset, limit);
+            let out: Vec<Vec<Value>> = rows
+                .iter()
+                .map(|r| projection.iter().map(|&i| r[i].clone()).collect())
+                .collect();
+            return Ok(QueryResult::Rows(RowStream::literal(out_schema, out)));
+        }
+    }
+
     // Fast path: `WHERE pk = <literal>` becomes an O(log n) point lookup on
     // the clustered key instead of a full table scan.
     if offset == 0 && limit != Some(0) {
@@ -330,16 +411,33 @@ enum PkLookup {
 
 /// If `filter` is exactly `pk = <literal>` (either operand order), return the
 /// literal to look up directly on the clustered key.
-fn pk_eq_literal(def: &TableDef, filter: Option<&Expr>) -> Result<Option<Value>> {
+/// If `filter` is exactly `col = <literal>` (either operand order), return the
+/// column index and the literal value.
+fn eq_col_literal(def: &TableDef, filter: Option<&Expr>) -> Result<Option<(usize, Value)>> {
     use sqlparser::ast::BinaryOperator;
-    let Some(pk) = def.pk_col else { return Ok(None) };
     let Some(Expr::BinaryOp { left, op: BinaryOperator::Eq, right }) = filter else {
         return Ok(None);
     };
-    let pk_name = &def.schema.columns[pk].name;
-    Ok(match (ident_name(left), ident_name(right)) {
-        (Some(n), None) if n.eq_ignore_ascii_case(pk_name) => Some(eval_expr(right)?),
-        (None, Some(n)) if n.eq_ignore_ascii_case(pk_name) => Some(eval_expr(left)?),
+    let (name, lit_expr): (&str, &Expr) = match (ident_name(left), ident_name(right)) {
+        (Some(n), None) => (n, right),
+        (None, Some(n)) => (n, left),
+        _ => return Ok(None),
+    };
+    let Some(idx) = def
+        .schema
+        .columns
+        .iter()
+        .position(|c| c.name.eq_ignore_ascii_case(name))
+    else {
+        return Ok(None);
+    };
+    Ok(Some((idx, eval_expr(lit_expr)?)))
+}
+
+fn pk_eq_literal(def: &TableDef, filter: Option<&Expr>) -> Result<Option<Value>> {
+    let Some(pk) = def.pk_col else { return Ok(None) };
+    Ok(match eq_col_literal(def, filter)? {
+        Some((idx, lit)) if idx == pk => Some(lit),
         _ => None,
     })
 }
@@ -374,6 +472,25 @@ async fn collect_matches(
             out.push((data_key(&def.name, &keyenc::encode(&lit)?), row));
         }
         return Ok(out);
+    }
+
+    // Secondary-index fast path: `WHERE indexed_col = <literal>`.
+    if let Some((col, lit)) = eq_col_literal(def, filter)? {
+        if let Some(idx) = index::index_on(def, col) {
+            for data_key in index::lookup_eq(db, &def.name, idx, &lit).await? {
+                if let Some(bytes) = db.get(data_key.clone()).await? {
+                    let row: Vec<Value> =
+                        bincode::deserialize(&bytes).map_err(|e| Error::Storage(e.to_string()))?;
+                    out.push((data_key, row));
+                    if let Some(l) = limit {
+                        if out.len() >= l {
+                            return Ok(out);
+                        }
+                    }
+                }
+            }
+            return Ok(out);
+        }
     }
 
     let prefix = data_prefix(&def.name);
@@ -471,11 +588,17 @@ pub async fn update(
             Some(i) => data_key(&name, &keyenc::encode(&new_row[i])?),
             None => old_key.clone(),
         };
+
+        // Index maintenance: drop old entries, write new ones. Deletes are
+        // applied before puts, so unchanged index entries survive.
+        deletes.extend(index::entry_keys_for_row(&def, &old_row, &old_key)?);
+        let new_index_entries = index::entries_for_row(&def, &new_row, &new_key)?;
         if new_key != old_key {
             deletes.push(old_key);
         }
         let encoded = bincode::serialize(&new_row).map_err(|e| Error::Storage(e.to_string()))?;
         puts.push((new_key, encoded));
+        puts.extend(new_index_entries);
     }
 
     db.commit(puts, deletes).await?;
@@ -499,7 +622,12 @@ pub async fn delete(db: &Db, del: &Delete) -> Result<QueryResult> {
 
     let matches = collect_matches(db, &def, del.selection.as_ref(), limit).await?;
     let affected = matches.len() as u64;
-    let deletes: Vec<Vec<u8>> = matches.into_iter().map(|(k, _)| k).collect();
+
+    let mut deletes: Vec<Vec<u8>> = Vec::with_capacity(matches.len());
+    for (key, row) in matches {
+        deletes.extend(index::entry_keys_for_row(&def, &row, &key)?);
+        deletes.push(key);
+    }
 
     db.commit(vec![], deletes).await?;
     Ok(QueryResult::Affected(affected))

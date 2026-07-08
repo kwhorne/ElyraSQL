@@ -9,6 +9,15 @@ use elyra_core::{Error, Result, Schema};
 use elyra_storage::Db;
 use serde::{Deserialize, Serialize};
 
+/// A single-column secondary index.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexDef {
+    pub name: String,
+    /// Schema index of the indexed column.
+    pub col: usize,
+    pub unique: bool,
+}
+
 /// Definition of a table. `pk_col` is the schema index of the single-column
 /// primary key (InnoDB-style clustered key); `None` means a hidden rowid.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -16,6 +25,8 @@ pub struct TableDef {
     pub name: String,
     pub schema: Schema,
     pub pk_col: Option<usize>,
+    #[serde(default)]
+    pub indexes: Vec<IndexDef>,
 }
 
 pub fn catalog_key(table: &str) -> Vec<u8> {

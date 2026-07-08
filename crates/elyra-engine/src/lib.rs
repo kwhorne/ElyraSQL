@@ -10,6 +10,7 @@ mod aggregate;
 mod catalog;
 mod eval;
 mod exec;
+mod index;
 mod keyenc;
 mod predicate;
 mod stream;
@@ -84,6 +85,7 @@ impl Engine {
                 }
             }
             Statement::CreateTable(ct) => exec::create_table(&self.db, ct).await,
+            Statement::CreateIndex(ci) => exec::create_index(&self.db, ci).await,
             Statement::Insert(ins) => exec::insert(&self.db, ins).await,
             Statement::Update { table, assignments, selection, .. } => {
                 exec::update(&self.db, &table, &assignments, selection.as_ref()).await
