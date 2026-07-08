@@ -28,6 +28,24 @@ ORDER BY total DESC;
 `GROUP BY` accepts one or more columns. Aggregation works over joined result
 sets too.
 
+## HAVING
+
+Filter groups after aggregation. `HAVING` may reference aggregates or a
+projection alias:
+
+```sql
+SELECT region, SUM(amount) AS total
+FROM sales
+GROUP BY region
+HAVING SUM(amount) > 1000        -- or: HAVING total > 1000
+ORDER BY total DESC;
+
+SELECT region, COUNT(*) AS n FROM sales GROUP BY region HAVING COUNT(*) >= 3;
+```
+
+`HAVING` references must appear in the SELECT list (as an aggregate expression
+or an alias) or be a grouped column.
+
 ## The OLAP engine
 
 Large aggregations run through a dedicated analytical path:

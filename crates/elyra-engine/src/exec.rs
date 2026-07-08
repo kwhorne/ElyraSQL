@@ -673,7 +673,13 @@ pub async fn select(
     if !group_by.is_empty() || aggregate::projection_has_aggregate(&select.projection) {
         let plan = aggregate::build_plan(&def.schema, &select.projection, &group_by)?;
         let agg = olap_aggregate(db, &def, filter.clone(), &plan).await?;
-        let (schema, mut out_rows) = plan.finalize(agg);
+        let (schema, out_rows) = plan.finalize(agg);
+        let mut out_rows = apply_having(
+            select.having.as_ref(),
+            &select.projection,
+            &schema,
+            out_rows,
+        )?;
         order_output_rows(&mut out_rows, &schema, &order_exprs)?;
         apply_offset_limit(&mut out_rows, offset, limit);
         return Ok(QueryResult::Rows(RowStream::literal(schema, out_rows)));
@@ -850,7 +856,8 @@ async fn join_select(
 
     // Aggregation / grouping.
     if !group_by.is_empty() || aggregate::projection_has_aggregate(&select.projection) {
-        let (osch, mut orows) = aggregate::run(&schema, &select.projection, &group_by, rows)?;
+        let (osch, orows) = aggregate::run(&schema, &select.projection, &group_by, rows)?;
+        let mut orows = apply_having(select.having.as_ref(), &select.projection, &osch, orows)?;
         order_output_rows(&mut orows, &osch, &order_exprs)?;
         apply_offset_limit(&mut orows, offset, limit);
         return Ok(QueryResult::Rows(RowStream::literal(osch, orows)));
@@ -2106,6 +2113,43 @@ fn infer_val(v: &Value) -> ColumnType {
     }
 }
 
+/// Apply a `HAVING` clause to aggregated output rows. Aggregate expressions
+/// and columns in `HAVING` are matched to output columns by their SELECT-list
+/// text or alias, then evaluated against each output row.
+fn apply_having(
+    having: Option<&Expr>,
+    projection: &[sqlparser::ast::SelectItem],
+    schema: &Schema,
+    rows: Vec<Vec<Value>>,
+) -> Result<Vec<Vec<Value>>> {
+    use sqlparser::ast::SelectItem;
+    let Some(h) = having else { return Ok(rows) };
+
+    // Map each SELECT-list expression's text to its output column name.
+    let mut map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for (item, col) in projection.iter().zip(&schema.columns) {
+        let expr = match item {
+            SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => e,
+            _ => continue,
+        };
+        map.insert(expr.to_string(), col.name.clone());
+    }
+
+    // Rewrite HAVING so aggregate/column expressions reference output columns.
+    let rewritten = map_expr(h, &|e| {
+        map.get(&e.to_string())
+            .map(|n| Expr::Identifier(sqlparser::ast::Ident::new(n.clone())))
+    });
+
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        if predicate::matches(&rewritten, schema, &row)? {
+            out.push(row);
+        }
+    }
+    Ok(out)
+}
+
 /// True if any subquery in `filter` references `outer.<col>` (i.e. correlates
 /// with the outer query). Correlated references must be qualified with the
 /// outer table name/alias.
@@ -2200,7 +2244,8 @@ async fn correlated_select(
     }
 
     if !group_by.is_empty() || aggregate::projection_has_aggregate(&select.projection) {
-        let (schema, mut out) = aggregate::run(&def.schema, &select.projection, group_by, matched)?;
+        let (schema, out) = aggregate::run(&def.schema, &select.projection, group_by, matched)?;
+        let mut out = apply_having(select.having.as_ref(), &select.projection, &schema, out)?;
         order_output_rows(&mut out, &schema, order_exprs)?;
         apply_offset_limit(&mut out, offset, limit);
         return Ok(QueryResult::Rows(RowStream::literal(schema, out)));
