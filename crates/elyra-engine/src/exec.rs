@@ -467,7 +467,14 @@ async fn join_select(
     offset: usize,
     limit: Option<usize>,
 ) -> Result<QueryResult> {
-    let (cols, mut rows) = build_from(db, &select.from).await?;
+    // Decompose the WHERE into AND-conjuncts so single-table predicates can be
+    // pushed down to the base relations before joining.
+    let mut conjuncts = Vec::new();
+    if let Some(f) = &filter {
+        split_and(f, &mut conjuncts);
+    }
+
+    let (cols, mut rows) = build_from(db, &select.from, &conjuncts).await?;
     let schema = Schema::new(cols);
 
     // WHERE over the joined rows.
@@ -525,17 +532,19 @@ async fn load_relation(db: &Db, tf: &TableFactor) -> Result<(Vec<ColumnDef>, Vec
 }
 
 /// Build the joined row set from a FROM clause (comma cross-joins + explicit
-/// JOINs). Nested-loop join.
+/// JOINs), pushing single-table `conjuncts` down to each base relation.
 async fn build_from(
     db: &Db,
     from: &[TableWithJoins],
+    conjuncts: &[Expr],
 ) -> Result<(Vec<ColumnDef>, Vec<Vec<Value>>)> {
     let mut cur_cols: Vec<ColumnDef> = Vec::new();
     let mut cur_rows: Vec<Vec<Value>> = Vec::new();
     let mut first = true;
 
     for twj in from {
-        let (bc, br) = load_relation(db, &twj.relation).await?;
+        let (bc, mut br) = load_relation(db, &twj.relation).await?;
+        br = apply_pushdown(br, &bc, conjuncts)?;
         if first {
             cur_cols = bc;
             cur_rows = br;
@@ -546,7 +555,8 @@ async fn build_from(
             cur_rows = r;
         }
         for join in &twj.joins {
-            let (jc, jr) = load_relation(db, &join.relation).await?;
+            let (jc, mut jr) = load_relation(db, &join.relation).await?;
+            jr = apply_pushdown(jr, &jc, conjuncts)?;
             let (c, r) = combine(&cur_cols, &cur_rows, &jc, &jr, &join.join_operator)?;
             cur_cols = c;
             cur_rows = r;
@@ -555,7 +565,37 @@ async fn build_from(
     Ok((cur_cols, cur_rows))
 }
 
-/// Nested-loop combine of two materialised relations under a join operator.
+/// Filter `rows` by every conjunct that references only this relation's
+/// columns (predicate pushdown).
+fn apply_pushdown(
+    rows: Vec<Vec<Value>>,
+    cols: &[ColumnDef],
+    conjuncts: &[Expr],
+) -> Result<Vec<Vec<Value>>> {
+    let schema = Schema::new(cols.to_vec());
+    let applicable: Vec<&Expr> =
+        conjuncts.iter().filter(|c| refs_in_schema(c, &schema)).collect();
+    if applicable.is_empty() {
+        return Ok(rows);
+    }
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let mut keep = true;
+        for c in &applicable {
+            if !predicate::matches(c, &schema, &row)? {
+                keep = false;
+                break;
+            }
+        }
+        if keep {
+            out.push(row);
+        }
+    }
+    Ok(out)
+}
+
+/// Combine two materialised relations under a join operator. Uses a hash join
+/// for equi-join `ON`s (`l.x = r.y`), falling back to nested-loop otherwise.
 fn combine(
     lcols: &[ColumnDef],
     lrows: &[Vec<Value>],
@@ -569,18 +609,26 @@ fn combine(
         JoinOperator::LeftOuter(JoinConstraint::On(e)) => (Some(e.clone()), true),
         JoinOperator::LeftOuter(JoinConstraint::None) => (None, true),
         other => {
-            return Err(Error::Unsupported(format!(
-                "join type not supported: {other:?}"
-            )))
+            return Err(Error::Unsupported(format!("join type not supported: {other:?}")))
         }
     };
 
     let mut cols = lcols.to_vec();
     cols.extend_from_slice(rcols);
+    let lschema = Schema::new(lcols.to_vec());
+    let rschema = Schema::new(rcols.to_vec());
+
+    // Try to plan a hash join from an equi-`ON`.
+    if let Some(e) = &on {
+        if let Some((lkey, rkey)) = equi_keys(e, &lschema, &rschema) {
+            return Ok((cols, hash_join(lrows, rrows, &lschema, &rschema, &lkey, &rkey, left_outer)?));
+        }
+    }
+
+    // Nested-loop fallback.
     let schema = Schema::new(cols.clone());
     let rlen = rcols.len();
     let mut out = Vec::new();
-
     for l in lrows {
         let mut matched = false;
         for r in rrows {
@@ -602,6 +650,136 @@ fn combine(
         }
     }
     Ok((cols, out))
+}
+
+/// Hash join: build a map on the right key, probe with the left key.
+#[allow(clippy::too_many_arguments)]
+fn hash_join(
+    lrows: &[Vec<Value>],
+    rrows: &[Vec<Value>],
+    lschema: &Schema,
+    rschema: &Schema,
+    lkey: &Expr,
+    rkey: &Expr,
+    left_outer: bool,
+) -> Result<Vec<Vec<Value>>> {
+    use std::collections::HashMap;
+    let rlen = rschema.columns.len();
+    let mut table: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, r) in rrows.iter().enumerate() {
+        let k = key_str(&predicate::eval_row(rkey, rschema, r)?);
+        if let Some(k) = k {
+            table.entry(k).or_default().push(i);
+        }
+    }
+
+    let mut out = Vec::new();
+    for l in lrows {
+        let probe = key_str(&predicate::eval_row(lkey, lschema, l)?);
+        let mut matched = false;
+        if let Some(k) = probe {
+            if let Some(idxs) = table.get(&k) {
+                for &i in idxs {
+                    let mut combined = l.clone();
+                    combined.extend_from_slice(&rrows[i]);
+                    out.push(combined);
+                    matched = true;
+                }
+            }
+        }
+        if left_outer && !matched {
+            let mut combined = l.clone();
+            combined.extend(std::iter::repeat(Value::Null).take(rlen));
+            out.push(combined);
+        }
+    }
+    Ok(out)
+}
+
+/// Hash-key string for a value; `None` for NULL (never matches, per SQL).
+fn key_str(v: &Value) -> Option<String> {
+    if v.is_null() {
+        None
+    } else {
+        Some(format!("{v:?}"))
+    }
+}
+
+/// If `on` is `A = B` with one operand referencing only the left relation and
+/// the other only the right, return `(left_key_expr, right_key_expr)`.
+fn equi_keys(on: &Expr, lschema: &Schema, rschema: &Schema) -> Option<(Expr, Expr)> {
+    let Expr::BinaryOp { left, op: sqlparser::ast::BinaryOperator::Eq, right } = on else {
+        return None;
+    };
+    if refs_in_schema(left, lschema) && refs_in_schema(right, rschema) {
+        Some(((**left).clone(), (**right).clone()))
+    } else if refs_in_schema(right, lschema) && refs_in_schema(left, rschema) {
+        Some(((**right).clone(), (**left).clone()))
+    } else {
+        None
+    }
+}
+
+/// Split an expression on top-level `AND` into conjuncts.
+fn split_and(expr: &Expr, out: &mut Vec<Expr>) {
+    if let Expr::BinaryOp { left, op: sqlparser::ast::BinaryOperator::And, right } = expr {
+        split_and(left, out);
+        split_and(right, out);
+    } else {
+        out.push(expr.clone());
+    }
+}
+
+/// True if every column referenced by `expr` resolves within `schema` (and the
+/// expression is fully analysable).
+fn refs_in_schema(expr: &Expr, schema: &Schema) -> bool {
+    let mut refs = Vec::new();
+    if !collect_refs(expr, &mut refs) {
+        return false;
+    }
+    refs.iter().all(|r| predicate::resolve_index(r, schema).is_ok())
+}
+
+/// Collect column references from `expr`. Returns false if the expression
+/// contains a construct we do not analyse (so callers stay conservative).
+fn collect_refs(expr: &Expr, out: &mut Vec<String>) -> bool {
+    match expr {
+        Expr::Identifier(id) => {
+            out.push(id.value.clone());
+            true
+        }
+        Expr::CompoundIdentifier(parts) => {
+            out.push(parts.iter().map(|i| i.value.as_str()).collect::<Vec<_>>().join("."));
+            true
+        }
+        Expr::Value(_) => true,
+        Expr::Nested(e) | Expr::UnaryOp { expr: e, .. } => collect_refs(e, out),
+        Expr::IsNull(e) | Expr::IsNotNull(e) => collect_refs(e, out),
+        Expr::BinaryOp { left, right, .. } => collect_refs(left, out) && collect_refs(right, out),
+        Expr::Between { expr, low, high, .. } => {
+            collect_refs(expr, out) && collect_refs(low, out) && collect_refs(high, out)
+        }
+        Expr::Function(f) => {
+            if let sqlparser::ast::FunctionArguments::List(list) = &f.args {
+                for a in &list.args {
+                    if let sqlparser::ast::FunctionArg::Unnamed(
+                        sqlparser::ast::FunctionArgExpr::Expr(e),
+                    ) = a
+                    {
+                        if !collect_refs(e, out) {
+                            return false;
+                        }
+                    } else {
+                        return false;
+                    }
+                }
+                true
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
 }
 
 /// If `filter` is exactly `col = <literal>` (either operand order), return the
