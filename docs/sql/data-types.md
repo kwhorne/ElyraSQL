@@ -40,6 +40,31 @@ INSERT INTO t VALUES
 - **JSON** must be structurally valid; invalid JSON is rejected.
 - **VECTOR** accepts a `'[a,b,c]'` string literal of the declared dimension.
 
+## JSON access
+
+Extract values from `JSON` columns with the `->` / `->>` operators or
+`JSON_EXTRACT`, using MySQL-style paths (`$`, `$.key`, `$[0]`, chained):
+
+```sql
+SELECT doc->'$.name'        AS name_json,   -- returns JSON (quoted)
+       doc->>'$.name'       AS name_text,   -- returns unquoted text
+       doc->>'$.addr.city'  AS city,
+       doc->>'$.tags[0]'    AS first_tag,
+       JSON_EXTRACT(doc, '$.age') AS age
+FROM docs;
+```
+
+`JSON_UNQUOTE` returns the raw scalar of a JSON value. A missing path yields
+`NULL`.
+
+!!! warning "Parenthesize in `WHERE`/`ORDER BY`"
+    The parser binds `=` tighter than `->>`, so wrap the extraction in
+    parentheses when comparing:
+
+    ```sql
+    SELECT id FROM docs WHERE (doc->>'$.addr.city') = 'Bergen';
+    ```
+
 ## Comparison semantics
 
 Cross-type comparisons are coerced (date vs. text, decimal vs. numeric). `NULL`

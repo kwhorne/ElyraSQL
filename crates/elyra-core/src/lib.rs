@@ -6,6 +6,7 @@
 
 pub mod datetime;
 pub mod error;
+pub mod json;
 pub mod types;
 pub mod value;
 

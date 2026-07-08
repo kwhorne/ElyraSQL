@@ -48,15 +48,23 @@ pub fn eval_row(expr: &Expr, schema: &Schema, row: &[Value]) -> Result<Value> {
                 && cmp(&v, &hi)?.map(|o| o.is_le()).unwrap_or(false);
             Ok(Value::Bool(if *negated { !inside } else { inside }))
         }
-        Expr::BinaryOp { left, op, right } => binary(
-            eval_row(left, schema, row)?,
-            op,
-            || eval_row(right, schema, row),
-            left,
-            right,
-            schema,
-            row,
-        ),
+        Expr::BinaryOp { left, op, right } => match op {
+            BinaryOperator::Arrow => {
+                json_path(eval_row(left, schema, row)?, right, schema, row, false)
+            }
+            BinaryOperator::LongArrow => {
+                json_path(eval_row(left, schema, row)?, right, schema, row, true)
+            }
+            _ => binary(
+                eval_row(left, schema, row)?,
+                op,
+                || eval_row(right, schema, row),
+                left,
+                right,
+                schema,
+                row,
+            ),
+        },
         other => Err(Error::Unsupported(format!(
             "expression not supported in WHERE: {other}"
         ))),
@@ -69,6 +77,42 @@ pub fn matches(expr: &Expr, schema: &Schema, row: &[Value]) -> Result<bool> {
 }
 
 /// Evaluate a scalar function. Currently the ElyraSQL vector distance family.
+/// Apply a JSON path operator. `unquote` selects `->>` (raw text) over `->`.
+fn json_path(
+    doc: Value,
+    path_expr: &Expr,
+    schema: &Schema,
+    row: &[Value],
+    unquote: bool,
+) -> Result<Value> {
+    let path = match eval_row(path_expr, schema, row)? {
+        Value::Text(s) | Value::Json(s) => s,
+        Value::Null => return Ok(Value::Null),
+        other => {
+            return Err(Error::Type(format!(
+                "JSON path must be a string, got {other:?}"
+            )))
+        }
+    };
+    let text = match &doc {
+        Value::Json(s) | Value::Text(s) => s.clone(),
+        Value::Null => return Ok(Value::Null),
+        other => {
+            return Err(Error::Type(format!(
+                "-> requires a JSON value, got {other:?}"
+            )))
+        }
+    };
+    let Some(parsed) = elyra_core::json::parse(&text) else {
+        return Err(Error::Type("left side of -> is not valid JSON".into()));
+    };
+    Ok(match parsed.extract(&path) {
+        Some(v) if unquote => Value::Text(v.to_unquoted()),
+        Some(v) => Value::Json(v.to_json_string()),
+        None => Value::Null,
+    })
+}
+
 fn eval_function(f: &sqlparser::ast::Function, schema: &Schema, row: &[Value]) -> Result<Value> {
     use elyra_vector::Metric;
     let name = f
@@ -77,6 +121,29 @@ fn eval_function(f: &sqlparser::ast::Function, schema: &Schema, row: &[Value]) -
         .last()
         .map(|i| i.value.to_ascii_lowercase())
         .unwrap_or_default();
+
+    if name == "json_extract" {
+        let args = function_arg_exprs(f)?;
+        if args.len() != 2 {
+            return Err(Error::Query("JSON_EXTRACT expects (doc, path)".into()));
+        }
+        return json_path(eval_row(args[0], schema, row)?, args[1], schema, row, false);
+    }
+    if name == "json_unquote" {
+        let args = function_arg_exprs(f)?;
+        if args.len() != 1 {
+            return Err(Error::Query("JSON_UNQUOTE expects (doc)".into()));
+        }
+        return Ok(match eval_row(args[0], schema, row)? {
+            Value::Json(s) | Value::Text(s) => Value::Text(
+                elyra_core::json::parse(&s)
+                    .map(|j| j.to_unquoted())
+                    .unwrap_or(s),
+            ),
+            v => v,
+        });
+    }
+
     let metric = match name.as_str() {
         "vec_distance" | "vec_l2_distance" | "vec_distance_l2" => Metric::L2,
         "vec_cosine_distance" | "vec_distance_cosine" => Metric::Cosine,
