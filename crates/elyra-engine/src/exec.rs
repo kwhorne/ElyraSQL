@@ -336,14 +336,15 @@ pub async fn select(
                 if def.indexes.iter().any(|i| i.vector && i.col == col) {
                     let cached = vindex.get(db, &def, col, Metric::L2).await?;
                     let hits = cached.index.search(&q, k, (k * 4).max(64));
-                    let mut rows = Vec::with_capacity(hits.len());
-                    for (node, _) in hits {
-                        if let Some(bytes) = db.get(cached.keys[node as usize].clone()).await? {
-                            rows.push(
-                                bincode::deserialize::<Vec<Value>>(&bytes)
-                                    .map_err(|e| Error::Storage(e.to_string()))?,
-                            );
-                        }
+                    let keys: Vec<Vec<u8>> =
+                        hits.iter().map(|(node, _)| cached.keys[*node as usize].clone()).collect();
+                    let blobs = db.multi_get(keys).await?;
+                    let mut rows = Vec::with_capacity(blobs.len());
+                    for bytes in blobs.into_iter().flatten() {
+                        rows.push(
+                            bincode::deserialize::<Vec<Value>>(&bytes)
+                                .map_err(|e| Error::Storage(e.to_string()))?,
+                        );
                     }
                     // Order the candidate set by exact distance for a clean top-k.
                     sort_full_rows(&mut rows, &def.schema, &resolved)?;
@@ -583,11 +584,11 @@ async fn lookup_rows_by_eq(
         });
     }
     if let Some(idx) = index::index_on(def, col) {
+        let dks = index::lookup_eq(db, &def.name, idx, value).await?;
+        let blobs = db.multi_get(dks).await?;
         let mut out = Vec::new();
-        for dk in index::lookup_eq(db, &def.name, idx, value).await? {
-            if let Some(b) = db.get(dk).await? {
-                out.push(deser(b)?);
-            }
+        for b in blobs.into_iter().flatten() {
+            out.push(deser(b)?);
         }
         return Ok(out);
     }
@@ -1007,8 +1008,10 @@ async fn collect_matches(
     // Secondary-index fast path: `WHERE indexed_col = <literal>`.
     if let Some((col, lit)) = eq_col_literal(def, filter)? {
         if let Some(idx) = index::index_on(def, col) {
-            for data_key in index::lookup_eq(db, &def.name, idx, &lit).await? {
-                if let Some(bytes) = db.get(data_key.clone()).await? {
+            let data_keys = index::lookup_eq(db, &def.name, idx, &lit).await?;
+            let blobs = db.multi_get(data_keys.clone()).await?;
+            for (data_key, blob) in data_keys.into_iter().zip(blobs) {
+                if let Some(bytes) = blob {
                     let row: Vec<Value> =
                         bincode::deserialize(&bytes).map_err(|e| Error::Storage(e.to_string()))?;
                     out.push((data_key, row));

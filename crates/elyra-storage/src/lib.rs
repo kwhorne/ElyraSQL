@@ -79,6 +79,23 @@ impl Storage {
         Ok(out)
     }
 
+    /// Fetch many values in a single read transaction. Output aligns with
+    /// `keys` (index i -> value for keys[i], `None` if absent). Avoids the
+    /// per-call transaction overhead of looping [`Storage::get`].
+    pub fn multi_get(&self, keys: &[Vec<u8>]) -> Result<Vec<Option<Vec<u8>>>> {
+        let rtx = self.db.begin_read().map_err(|e| Error::Storage(e.to_string()))?;
+        let t = rtx.open_table(KV).map_err(|e| Error::Storage(e.to_string()))?;
+        let mut out = Vec::with_capacity(keys.len());
+        for k in keys {
+            out.push(
+                t.get(k.as_slice())
+                    .map_err(|e| Error::Storage(e.to_string()))?
+                    .map(|v| v.value().to_vec()),
+            );
+        }
+        Ok(out)
+    }
+
     /// Delete a key. Returns whether something was removed.
     pub fn delete(&self, key: &[u8]) -> Result<bool> {
         let wtx = self.db.begin_write().map_err(|e| Error::Storage(e.to_string()))?;

@@ -19,18 +19,16 @@ MySQL wire round-trip and the Python client's row decoding.)
 | PK point lookup | **0.15 ms** | clustered key, O(log n) |
 | Selective join (index NLJ) | **0.18 ms** | `u.id = ?` probes partner index |
 | Vector ANN, cached | **0.29 ms** | HNSW top-10 over 20k × 32-d |
+| Indexed `COUNT` (≈1,667 matches) | **0.86 ms** | batched multi-get |
 | Full scan `COUNT` (no index) | 10.9 ms | scans 100k rows |
-| Indexed `COUNT` (≈1,667 matches) | 15.6 ms | see caveat below |
 | `GROUP BY age` | 17.5 ms | full aggregation |
 | Vector ANN, first query | 1.1 s | one-time HNSW build over 20k vectors |
 
 ## Honest caveats
 
-- **Non-unique index with many matches is currently *slower* than a full
-  scan.** Each match is fetched with an individual point `get` (its own read
-  transaction), so ~1,667 gets lose to one sequential scan. Batched multi-get
-  in a single read transaction is the planned fix; the planner should also
-  fall back to a scan when an equality is non-selective.
+- **Non-unique index lookups use a batched multi-get** (all matching rows in a
+  single read transaction), so an equality matching ~1,667 rows resolves in
+  ~0.86 ms — an order of magnitude faster than the full scan it replaces.
 - **Vector ANN pays a one-time build cost** (rebuild-when-stale). Ideal for
   read-heavy embedding/RAG workloads; write-heavy vector tables rebuild often.
 - **`ORDER BY` / `GROUP BY` / joins materialise** their working set in memory.
@@ -41,5 +39,5 @@ MySQL wire round-trip and the Python client's row decoding.)
 
 The fast paths work as designed: point lookups, selective (index nested-loop)
 joins, and cached vector search are all sub-millisecond, and bulk ingest sustains
-six-figure rows/s. The slow spots are exactly the documented follow-ups
-(batched multi-get, columnar OLAP for large aggregations).
+six-figure rows/s. The remaining slow spot is large full-table aggregation (`GROUP BY` over all
+rows), which is the columnar OLAP follow-up.

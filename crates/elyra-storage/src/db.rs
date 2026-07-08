@@ -76,6 +76,13 @@ impl Db {
         spawn_read(move || storage.get(&key)).await
     }
 
+    /// Fetch many values in a single read transaction (see
+    /// [`Storage::multi_get`]).
+    pub async fn multi_get(&self, keys: Vec<Vec<u8>>) -> Result<Vec<Option<Vec<u8>>>> {
+        let storage = self.storage.clone();
+        spawn_read(move || storage.multi_get(&keys)).await
+    }
+
     /// Cursor-based streaming scan: up to `limit` pairs under `prefix`,
     /// strictly after `after`. Backs bounded-memory table scans.
     pub async fn scan_batch(
