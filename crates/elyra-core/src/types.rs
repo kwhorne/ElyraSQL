@@ -64,6 +64,8 @@ impl Schema {
     }
 
     pub fn column(&self, name: &str) -> Option<&ColumnDef> {
-        self.columns.iter().find(|c| c.name.eq_ignore_ascii_case(name))
+        self.columns
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(name))
     }
 }

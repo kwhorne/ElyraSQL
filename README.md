@@ -1,5 +1,7 @@
 # ElyraSQL
 
+[![CI](https://github.com/kwhorne/ElyraSQL/actions/workflows/ci.yml/badge.svg)](https://github.com/kwhorne/ElyraSQL/actions/workflows/ci.yml)
+
 A robust, **MySQL-compatible** SQL server written in Rust. Single database
 file, ACID storage, OLAP-ready and vector-native — all under one brand.
 

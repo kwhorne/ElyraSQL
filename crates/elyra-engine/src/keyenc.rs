@@ -29,9 +29,7 @@ fn encode_component(value: &Value, out: &mut Vec<u8>) -> Result<()> {
         Value::DateTime(t) => {
             out.extend_from_slice(&(*t as u64 ^ 0x8000_0000_0000_0000).to_be_bytes())
         }
-        Value::Decimal(u, _) => {
-            out.extend_from_slice(&(*u as u128 ^ (1u128 << 127)).to_be_bytes())
-        }
+        Value::Decimal(u, _) => out.extend_from_slice(&(*u as u128 ^ (1u128 << 127)).to_be_bytes()),
         Value::Time(t) => out.extend_from_slice(&(*t as u64 ^ 0x8000_0000_0000_0000).to_be_bytes()),
         Value::Bool(b) => out.push(*b as u8),
         // Escape 0x00 as 0x00 0x01, terminate with 0x00 0x00 (< any 0x00 0x01),

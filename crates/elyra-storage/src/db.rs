@@ -67,7 +67,10 @@ impl Db {
             .spawn(move || writer_loop(writer_storage, rx))
             .map_err(Error::Io)?;
 
-        Ok(Self { storage, writer: tx })
+        Ok(Self {
+            storage,
+            writer: tx,
+        })
     }
 
     /// Take an MVCC read snapshot of the current committed state.
@@ -118,8 +121,7 @@ impl Db {
             .send(WriteJob { puts, deletes, ack })
             .await
             .map_err(|_| Error::Storage("writer thread stopped".into()))?;
-        wait
-            .await
+        wait.await
             .map_err(|_| Error::Storage("write acknowledgement lost".into()))?
     }
 }

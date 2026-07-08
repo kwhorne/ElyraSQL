@@ -28,7 +28,10 @@ pub struct Session {
 
 impl Session {
     pub fn new(db: Db) -> Self {
-        Session { db, txn: Mutex::new(None) }
+        Session {
+            db,
+            txn: Mutex::new(None),
+        }
     }
 
     pub fn in_txn(&self) -> bool {
@@ -45,8 +48,11 @@ impl Session {
 
     pub fn begin(&self) -> Result<()> {
         let snapshot = self.db.snapshot()?;
-        *self.txn.lock().unwrap() =
-            Some(TxnState { snapshot, puts: BTreeMap::new(), deletes: BTreeSet::new() });
+        *self.txn.lock().unwrap() = Some(TxnState {
+            snapshot,
+            puts: BTreeMap::new(),
+            deletes: BTreeSet::new(),
+        });
         Ok(())
     }
 
@@ -138,9 +144,8 @@ impl Session {
                 Some(tx) => {
                     let mut overlay: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::new();
                     let upper = end.clone();
-                    let in_range = |k: &Vec<u8>| {
-                        k >= &start && upper.as_ref().map_or(true, |e| k < e)
-                    };
+                    let in_range =
+                        |k: &Vec<u8>| k >= &start && upper.as_ref().is_none_or(|e| k < e);
                     for (k, v) in tx.puts.range(start.clone()..) {
                         if !in_range(k) {
                             break;

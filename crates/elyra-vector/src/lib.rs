@@ -49,7 +49,10 @@ mod tests {
 
     #[test]
     fn l2_identity_is_zero() {
-        assert_eq!(distance(&[1.0, 2.0, 3.0], &[1.0, 2.0, 3.0], Metric::L2), Some(0.0));
+        assert_eq!(
+            distance(&[1.0, 2.0, 3.0], &[1.0, 2.0, 3.0], Metric::L2),
+            Some(0.0)
+        );
     }
 
     #[test]

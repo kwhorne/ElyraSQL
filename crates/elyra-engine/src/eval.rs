@@ -16,7 +16,11 @@ use crate::QueryResult;
 pub fn eval_literal_select(q: &Query) -> Result<QueryResult> {
     let select = match q.body.as_ref() {
         SetExpr::Select(s) => s,
-        _ => return Err(Error::Unsupported("only simple SELECT is implemented".into())),
+        _ => {
+            return Err(Error::Unsupported(
+                "only simple SELECT is implemented".into(),
+            ))
+        }
     };
 
     let mut columns = Vec::new();
@@ -35,7 +39,11 @@ pub fn eval_literal_select(q: &Query) -> Result<QueryResult> {
         let value = eval_expr(expr)?;
         let ty = infer_type(&value);
         let _ = i;
-        columns.push(ColumnDef { name, ty, nullable: true });
+        columns.push(ColumnDef {
+            name,
+            ty,
+            nullable: true,
+        });
         row.push(value);
     }
 
@@ -123,7 +131,9 @@ fn eval_literal(v: &SqlValue) -> Result<Value> {
         }
         SqlValue::Boolean(b) => Ok(Value::Bool(*b)),
         SqlValue::Null => Ok(Value::Null),
-        other => Err(Error::Unsupported(format!("literal not supported: {other}"))),
+        other => Err(Error::Unsupported(format!(
+            "literal not supported: {other}"
+        ))),
     }
 }
 

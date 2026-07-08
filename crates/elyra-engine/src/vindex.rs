@@ -9,8 +9,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use elyra_core::{Error, Result, Value};
 use crate::session::Session;
+use elyra_core::{Error, Result, Value};
 use elyra_vector::{Hnsw, Metric};
 
 use crate::catalog::{data_prefix, wcount_key, TableDef};
@@ -102,5 +102,9 @@ async fn build(
     }
 
     let index = Hnsw::build(vectors, dim, metric);
-    Ok(CachedIndex { wcount, keys, index })
+    Ok(CachedIndex {
+        wcount,
+        keys,
+        index,
+    })
 }

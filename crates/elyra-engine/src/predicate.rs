@@ -15,7 +15,11 @@ pub fn eval_row(expr: &Expr, schema: &Schema, row: &[Value]) -> Result<Value> {
         Expr::CompoundIdentifier(parts) => {
             // Qualified reference like `t.col` -> match a combined-schema
             // column named "t.col".
-            let qualified = parts.iter().map(|i| i.value.as_str()).collect::<Vec<_>>().join(".");
+            let qualified = parts
+                .iter()
+                .map(|i| i.value.as_str())
+                .collect::<Vec<_>>()
+                .join(".");
             resolve(&qualified, schema, row)
         }
         Expr::Function(f) => eval_function(f, schema, row),
@@ -31,7 +35,12 @@ pub fn eval_row(expr: &Expr, schema: &Schema, row: &[Value]) -> Result<Value> {
                 _ => Err(Error::Unsupported("unsupported unary operator".into())),
             }
         }
-        Expr::Between { expr, negated, low, high } => {
+        Expr::Between {
+            expr,
+            negated,
+            low,
+            high,
+        } => {
             let v = eval_row(expr, schema, row)?;
             let lo = eval_row(low, schema, row)?;
             let hi = eval_row(high, schema, row)?;
@@ -39,9 +48,15 @@ pub fn eval_row(expr: &Expr, schema: &Schema, row: &[Value]) -> Result<Value> {
                 && cmp(&v, &hi)?.map(|o| o.is_le()).unwrap_or(false);
             Ok(Value::Bool(if *negated { !inside } else { inside }))
         }
-        Expr::BinaryOp { left, op, right } => {
-            binary(eval_row(left, schema, row)?, op, || eval_row(right, schema, row), left, right, schema, row)
-        }
+        Expr::BinaryOp { left, op, right } => binary(
+            eval_row(left, schema, row)?,
+            op,
+            || eval_row(right, schema, row),
+            left,
+            right,
+            schema,
+            row,
+        ),
         other => Err(Error::Unsupported(format!(
             "expression not supported in WHERE: {other}"
         ))),
@@ -56,7 +71,12 @@ pub fn matches(expr: &Expr, schema: &Schema, row: &[Value]) -> Result<bool> {
 /// Evaluate a scalar function. Currently the ElyraSQL vector distance family.
 fn eval_function(f: &sqlparser::ast::Function, schema: &Schema, row: &[Value]) -> Result<Value> {
     use elyra_vector::Metric;
-    let name = f.name.0.last().map(|i| i.value.to_ascii_lowercase()).unwrap_or_default();
+    let name = f
+        .name
+        .0
+        .last()
+        .map(|i| i.value.to_ascii_lowercase())
+        .unwrap_or_default();
     let metric = match name.as_str() {
         "vec_distance" | "vec_l2_distance" | "vec_distance_l2" => Metric::L2,
         "vec_cosine_distance" | "vec_distance_cosine" => Metric::Cosine,
@@ -104,7 +124,11 @@ fn to_vector(v: &Value) -> Result<Vec<f32>> {
             inner
                 .split(',')
                 .filter(|t| !t.trim().is_empty())
-                .map(|t| t.trim().parse::<f32>().map_err(|_| Error::Vector(format!("bad vector element: {t}"))))
+                .map(|t| {
+                    t.trim()
+                        .parse::<f32>()
+                        .map_err(|_| Error::Vector(format!("bad vector element: {t}")))
+                })
                 .collect()
         }
         other => Err(Error::Vector(format!("value is not a vector: {other:?}"))),
@@ -120,7 +144,11 @@ fn resolve(name: &str, schema: &Schema, row: &[Value]) -> Result<Value> {
 /// names) and joined (qualified "table.col") schemas: exact match first, then
 /// a unique bare-suffix match (so `col` resolves against `t.col`).
 pub fn resolve_index(name: &str, schema: &Schema) -> Result<usize> {
-    if let Some(i) = schema.columns.iter().position(|c| c.name.eq_ignore_ascii_case(name)) {
+    if let Some(i) = schema
+        .columns
+        .iter()
+        .position(|c| c.name.eq_ignore_ascii_case(name))
+    {
         return Ok(i);
     }
     let bare = |n: &str| n.rsplit('.').next().unwrap_or(n).to_string();
@@ -150,7 +178,9 @@ fn literal(v: &SqlValue) -> Result<Value> {
         }
         SqlValue::Boolean(b) => Ok(Value::Bool(*b)),
         SqlValue::Null => Ok(Value::Null),
-        other => Err(Error::Unsupported(format!("literal not supported: {other}"))),
+        other => Err(Error::Unsupported(format!(
+            "literal not supported: {other}"
+        ))),
     }
 }
 
@@ -173,12 +203,22 @@ fn binary(
     }
     let r = eval_right()?;
     match op {
-        Eq => Ok(Value::Bool(cmp(&l, &r)?.map(|o| o.is_eq()).unwrap_or(false))),
+        Eq => Ok(Value::Bool(
+            cmp(&l, &r)?.map(|o| o.is_eq()).unwrap_or(false),
+        )),
         NotEq => Ok(Value::Bool(cmp(&l, &r)?.map(|o| o.is_ne()).unwrap_or(true))),
-        Lt => Ok(Value::Bool(cmp(&l, &r)?.map(|o| o.is_lt()).unwrap_or(false))),
-        LtEq => Ok(Value::Bool(cmp(&l, &r)?.map(|o| o.is_le()).unwrap_or(false))),
-        Gt => Ok(Value::Bool(cmp(&l, &r)?.map(|o| o.is_gt()).unwrap_or(false))),
-        GtEq => Ok(Value::Bool(cmp(&l, &r)?.map(|o| o.is_ge()).unwrap_or(false))),
+        Lt => Ok(Value::Bool(
+            cmp(&l, &r)?.map(|o| o.is_lt()).unwrap_or(false),
+        )),
+        LtEq => Ok(Value::Bool(
+            cmp(&l, &r)?.map(|o| o.is_le()).unwrap_or(false),
+        )),
+        Gt => Ok(Value::Bool(
+            cmp(&l, &r)?.map(|o| o.is_gt()).unwrap_or(false),
+        )),
+        GtEq => Ok(Value::Bool(
+            cmp(&l, &r)?.map(|o| o.is_ge()).unwrap_or(false),
+        )),
         Plus | Minus | Multiply | Divide | Modulo => arith(l, op, r),
         _ => Err(Error::Unsupported(format!("operator not supported: {op}"))),
     }

@@ -28,6 +28,7 @@ use sqlparser::parser::Parser;
 pub use stream::RowStream;
 
 /// Outcome of a single SQL statement.
+#[allow(clippy::large_enum_variant)]
 pub enum QueryResult {
     /// A (streaming) result set.
     Rows(RowStream),
@@ -60,7 +61,10 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(db: Db) -> Self {
-        Self { db, vindex: vindex::VectorRegistry::new() }
+        Self {
+            db,
+            vindex: vindex::VectorRegistry::new(),
+        }
     }
 
     /// Parse and execute one or more `;`-separated statements, enforcing that
@@ -108,17 +112,23 @@ impl Engine {
             }
             Statement::CreateTable(ct) => exec::create_table(sess, ct).await,
             Statement::CreateIndex(ci) => exec::create_index(sess, ci).await,
-            Statement::AlterTable { name, operations, .. } => {
-                exec::alter_table(sess, &name, &operations).await
-            }
+            Statement::AlterTable {
+                name, operations, ..
+            } => exec::alter_table(sess, &name, &operations).await,
             Statement::Insert(ins) => exec::insert(sess, ins).await,
-            Statement::Update { table, assignments, selection, .. } => {
-                exec::update(sess, &table, &assignments, selection.as_ref()).await
-            }
+            Statement::Update {
+                table,
+                assignments,
+                selection,
+                ..
+            } => exec::update(sess, &table, &assignments, selection.as_ref()).await,
             Statement::Delete(del) => exec::delete(sess, &del).await,
-            Statement::Drop { object_type, names, if_exists, .. }
-                if object_type == sqlparser::ast::ObjectType::Table =>
-            {
+            Statement::Drop {
+                object_type: sqlparser::ast::ObjectType::Table,
+                names,
+                if_exists,
+                ..
+            } => {
                 let name = names
                     .first()
                     .and_then(|n| n.0.last())
@@ -151,21 +161,23 @@ impl Engine {
         let lower = t.to_ascii_lowercase();
 
         match lower.as_str() {
-            "select @@version_comment limit 1" | "select @@version_comment" => Some(
-                QueryResult::scalar(
+            "select @@version_comment limit 1" | "select @@version_comment" => {
+                Some(QueryResult::scalar(
                     "@@version_comment",
                     ColumnType::Text,
                     Value::Text("ElyraSQL — MIT licensed, robust SQL server".into()),
-                ),
-            ),
+                ))
+            }
             "select @@version" | "select version()" => Some(QueryResult::scalar(
                 "version()",
                 ColumnType::Text,
                 Value::Text(elyra_core::SERVER_VERSION.into()),
             )),
-            "select database()" | "select schema()" => {
-                Some(QueryResult::scalar("database()", ColumnType::Text, Value::Null))
-            }
+            "select database()" | "select schema()" => Some(QueryResult::scalar(
+                "database()",
+                ColumnType::Text,
+                Value::Null,
+            )),
             _ if lower.starts_with("set ") => Some(QueryResult::empty_ok()),
             _ => None,
         }
@@ -175,9 +187,9 @@ impl Engine {
 /// Minimum privilege required to run a statement.
 fn required_privilege(stmt: &Statement) -> Privilege {
     match stmt {
-        Statement::Query(_)
-        | Statement::SetVariable { .. }
-        | Statement::Use { .. } => Privilege::Read,
+        Statement::Query(_) | Statement::SetVariable { .. } | Statement::Use { .. } => {
+            Privilege::Read
+        }
         Statement::Insert(_) | Statement::Update { .. } | Statement::Delete(_) => Privilege::Write,
         Statement::StartTransaction { .. }
         | Statement::Commit { .. }

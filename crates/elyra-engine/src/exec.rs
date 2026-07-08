@@ -3,12 +3,12 @@
 //! Implements `CREATE TABLE`, `INSERT`, `SELECT ... FROM`, `DROP TABLE`.
 //! Inserts are batched into one group-commit; scans stream.
 
-use elyra_core::{ColumnDef, ColumnType, Error, Result, Schema, Value};
 use crate::session::Session;
+use elyra_core::{ColumnDef, ColumnType, Error, Result, Schema, Value};
 use sqlparser::ast::{
     AlterTableOperation, Assignment, AssignmentTarget, ColumnOption, CreateIndex, CreateTable,
-    DataType, Delete, FromTable, Insert, JoinConstraint, JoinOperator, ObjectName, Select, SetExpr,
-    TableConstraint, TableFactor, TableWithJoins, Query as SqlQuery,
+    DataType, Delete, FromTable, Insert, JoinConstraint, JoinOperator, ObjectName,
+    Query as SqlQuery, Select, SetExpr, TableConstraint, TableFactor, TableWithJoins,
 };
 
 use crate::aggregate;
@@ -20,12 +20,12 @@ use elyra_olap::GroupAggregator;
 use crate::catalog::{
     self, catalog_key, data_key, data_prefix, rowid_key, wcount_key, IndexDef, TableDef,
 };
-use crate::vindex::{read_wcount, VectorRegistry};
-use elyra_vector::Metric;
 use crate::eval::eval_expr;
 use crate::keyenc;
 use crate::stream::{RowStream, ScanSpec};
+use crate::vindex::{read_wcount, VectorRegistry};
 use crate::QueryResult;
+use elyra_vector::Metric;
 use sqlparser::ast::Expr;
 
 fn table_ident(name: &ObjectName) -> Result<String> {
@@ -45,10 +45,9 @@ fn map_type(dt: &DataType) -> Result<ColumnType> {
         | DataType::Integer(_)
         | DataType::BigInt(_) => ColumnType::Int,
         DataType::Float(_) | DataType::Real | DataType::Double => ColumnType::Float,
-        DataType::Text
-        | DataType::String(_)
-        | DataType::Varchar(_)
-        | DataType::Char(_) => ColumnType::Text,
+        DataType::Text | DataType::String(_) | DataType::Varchar(_) | DataType::Char(_) => {
+            ColumnType::Text
+        }
         DataType::Blob(_) | DataType::Bytea => ColumnType::Bytes,
         DataType::Date => ColumnType::Date,
         DataType::Datetime(_) | DataType::Timestamp(_, _) => ColumnType::DateTime,
@@ -62,15 +61,25 @@ fn map_type(dt: &DataType) -> Result<ColumnType> {
             };
             ColumnType::Decimal(p, s)
         }
-        DataType::Custom(name, args) if name.0.last().map(|i| i.value.eq_ignore_ascii_case("vector")).unwrap_or(false) => {
+        DataType::Custom(name, args)
+            if name
+                .0
+                .last()
+                .map(|i| i.value.eq_ignore_ascii_case("vector"))
+                .unwrap_or(false) =>
+        {
             let dim = args
                 .first()
                 .and_then(|s| s.parse::<u32>().ok())
-                .ok_or_else(|| Error::Type("VECTOR requires a dimension, e.g. VECTOR(768)".into()))?;
+                .ok_or_else(|| {
+                    Error::Type("VECTOR requires a dimension, e.g. VECTOR(768)".into())
+                })?;
             ColumnType::Vector(dim)
         }
         other => {
-            return Err(Error::Unsupported(format!("column type not supported: {other}")))
+            return Err(Error::Unsupported(format!(
+                "column type not supported: {other}"
+            )))
         }
     })
 }
@@ -98,14 +107,20 @@ pub async fn create_table(db: &Session, ct: CreateTable) -> Result<QueryResult> 
         for opt in &col.options {
             match &opt.option {
                 ColumnOption::NotNull => nullable = false,
-                ColumnOption::Unique { is_primary: true, .. } => {
+                ColumnOption::Unique {
+                    is_primary: true, ..
+                } => {
                     pk_cols.push(idx);
                     nullable = false;
                 }
                 _ => {}
             }
         }
-        columns.push(ColumnDef { name: col.name.value.clone(), ty, nullable });
+        columns.push(ColumnDef {
+            name: col.name.value.clone(),
+            ty,
+            nullable,
+        });
     }
 
     // Table-level PRIMARY KEY (single or composite).
@@ -131,7 +146,8 @@ pub async fn create_table(db: &Session, ct: CreateTable) -> Result<QueryResult> 
         pk_cols,
         indexes: Vec::new(),
     };
-    db.commit_write(vec![(catalog_key(&name), def.encode()?)], vec![]).await?;
+    db.commit_write(vec![(catalog_key(&name), def.encode()?)], vec![])
+        .await?;
     Ok(QueryResult::Affected(0))
 }
 
@@ -152,7 +168,10 @@ pub async fn alter_table(
             AlterTableOperation::DropColumn { column_name, .. } => {
                 alter_drop_column(db, &mut def, &column_name.value).await?
             }
-            AlterTableOperation::RenameColumn { old_column_name, new_column_name } => {
+            AlterTableOperation::RenameColumn {
+                old_column_name,
+                new_column_name,
+            } => {
                 let i = def
                     .schema
                     .columns
@@ -167,13 +186,16 @@ pub async fn alter_table(
                 persist_catalog = false;
             }
             other => {
-                return Err(Error::Unsupported(format!("ALTER operation not supported: {other}")))
+                return Err(Error::Unsupported(format!(
+                    "ALTER operation not supported: {other}"
+                )))
             }
         }
     }
 
     if persist_catalog {
-        db.commit_write(vec![(catalog_key(&def.name), def.encode()?)], vec![]).await?;
+        db.commit_write(vec![(catalog_key(&def.name), def.encode()?)], vec![])
+            .await?;
     }
     Ok(QueryResult::Affected(0))
 }
@@ -215,13 +237,20 @@ async fn alter_add_column(
             let mut row: Vec<Value> =
                 bincode::deserialize(&v).map_err(|e| Error::Storage(e.to_string()))?;
             row.push(default.clone());
-            puts.push((k, bincode::serialize(&row).map_err(|e| Error::Storage(e.to_string()))?));
+            puts.push((
+                k,
+                bincode::serialize(&row).map_err(|e| Error::Storage(e.to_string()))?,
+            ));
         }
         if last {
             break;
         }
     }
-    def.schema.columns.push(ColumnDef { name: col.name.value.clone(), ty, nullable });
+    def.schema.columns.push(ColumnDef {
+        name: col.name.value.clone(),
+        ty,
+        nullable,
+    });
     if !puts.is_empty() {
         db.commit_write(puts, vec![]).await?;
     }
@@ -236,10 +265,14 @@ async fn alter_drop_column(db: &Session, def: &mut TableDef, name: &str) -> Resu
         .position(|c| c.name.eq_ignore_ascii_case(name))
         .ok_or_else(|| Error::Catalog(format!("unknown column: {name}")))?;
     if def.pk_cols.contains(&idx) {
-        return Err(Error::Unsupported("cannot drop a primary key column".into()));
+        return Err(Error::Unsupported(
+            "cannot drop a primary key column".into(),
+        ));
     }
     if def.indexes.iter().any(|i| i.cols.contains(&idx)) {
-        return Err(Error::Unsupported("cannot drop an indexed column; drop the index first".into()));
+        return Err(Error::Unsupported(
+            "cannot drop an indexed column; drop the index first".into(),
+        ));
     }
 
     // Rewrite rows without the dropped position.
@@ -259,7 +292,10 @@ async fn alter_drop_column(db: &Session, def: &mut TableDef, name: &str) -> Resu
             if idx < row.len() {
                 row.remove(idx);
             }
-            puts.push((k, bincode::serialize(&row).map_err(|e| Error::Storage(e.to_string()))?));
+            puts.push((
+                k,
+                bincode::serialize(&row).map_err(|e| Error::Storage(e.to_string()))?,
+            ));
         }
         if last {
             break;
@@ -296,7 +332,9 @@ async fn alter_rename_table(db: &Session, def: &mut TableDef, new: &str) -> Resu
     let old_prefix = data_prefix(&old);
     let mut cursor: Option<Vec<u8>> = None;
     loop {
-        let chunk = db.scan_batch(old_prefix.clone(), cursor.clone(), 4096).await?;
+        let chunk = db
+            .scan_batch(old_prefix.clone(), cursor.clone(), 4096)
+            .await?;
         if chunk.is_empty() {
             break;
         }
@@ -320,7 +358,9 @@ async fn alter_rename_table(db: &Session, def: &mut TableDef, new: &str) -> Resu
     let old_index_prefix = format!("index::{old}::").into_bytes();
     let mut cursor: Option<Vec<u8>> = None;
     loop {
-        let chunk = db.scan_batch(old_index_prefix.clone(), cursor.clone(), 4096).await?;
+        let chunk = db
+            .scan_batch(old_index_prefix.clone(), cursor.clone(), 4096)
+            .await?;
         if chunk.is_empty() {
             break;
         }
@@ -354,7 +394,9 @@ pub async fn create_index(db: &Session, ci: CreateIndex) -> Result<QueryResult> 
     let mut def = catalog::load(db, &table).await?;
 
     if ci.columns.is_empty() {
-        return Err(Error::Query("CREATE INDEX requires at least one column".into()));
+        return Err(Error::Query(
+            "CREATE INDEX requires at least one column".into(),
+        ));
     }
     let mut cols = Vec::with_capacity(ci.columns.len());
     let mut col_names = Vec::new();
@@ -375,7 +417,11 @@ pub async fn create_index(db: &Session, ci: CreateIndex) -> Result<QueryResult> 
         Some(n) => n.0.last().map(|i| i.value.clone()).unwrap_or_default(),
         None => format!("{table}_{}_idx", col_names.join("_")),
     };
-    if def.indexes.iter().any(|i| i.name.eq_ignore_ascii_case(&name)) {
+    if def
+        .indexes
+        .iter()
+        .any(|i| i.name.eq_ignore_ascii_case(&name))
+    {
         if ci.if_not_exists {
             return Ok(QueryResult::Affected(0));
         }
@@ -385,7 +431,12 @@ pub async fn create_index(db: &Session, ci: CreateIndex) -> Result<QueryResult> 
     // A vector (HNSW) index is a single VECTOR column; composite must be B-tree.
     let is_vector =
         cols.len() == 1 && matches!(def.schema.columns[cols[0]].ty, ColumnType::Vector(_));
-    def.indexes.push(IndexDef { name, cols, unique: ci.unique, vector: is_vector });
+    def.indexes.push(IndexDef {
+        name,
+        cols,
+        unique: ci.unique,
+        vector: is_vector,
+    });
 
     // Persist the new catalog and backfill index entries for existing rows.
     let mut puts: Vec<(Vec<u8>, Vec<u8>)> = vec![(catalog_key(&table), def.encode()?)];
@@ -437,11 +488,19 @@ pub async fn insert(db: &Session, ins: Insert) -> Result<QueryResult> {
         .ok_or_else(|| Error::Unsupported("INSERT without VALUES is not supported".into()))?;
     let value_rows = match source_rows(source)? {
         Some(rows) => rows,
-        None => return Err(Error::Unsupported("only INSERT ... VALUES is supported".into())),
+        None => {
+            return Err(Error::Unsupported(
+                "only INSERT ... VALUES is supported".into(),
+            ))
+        }
     };
 
     // Load rowid counter once for tables without a PK.
-    let mut next_rowid = if def.has_pk() { 0 } else { read_rowid(db, &name).await? };
+    let mut next_rowid = if def.has_pk() {
+        0
+    } else {
+        read_rowid(db, &name).await?
+    };
 
     let mut puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(value_rows.len());
 
@@ -464,7 +523,10 @@ pub async fn insert(db: &Session, ins: Insert) -> Result<QueryResult> {
         // Enforce NOT NULL.
         for (i, col) in def.schema.columns.iter().enumerate() {
             if !col.nullable && row[i].is_null() {
-                return Err(Error::Query(format!("column '{}' cannot be NULL", col.name)));
+                return Err(Error::Query(format!(
+                    "column '{}' cannot be NULL",
+                    col.name
+                )));
             }
         }
 
@@ -520,23 +582,32 @@ pub async fn select(
         }
     };
     let order_exprs: Vec<(Expr, bool)> = match &query.order_by {
-        Some(ob) => ob.exprs.iter().map(|o| (o.expr.clone(), o.asc.unwrap_or(true))).collect(),
+        Some(ob) => ob
+            .exprs
+            .iter()
+            .map(|o| (o.expr.clone(), o.asc.unwrap_or(true)))
+            .collect(),
         None => Vec::new(),
     };
 
     // Multi-table / JOIN queries take a dedicated materialised path.
-    let is_join =
-        select.from.len() > 1 || select.from.iter().any(|t| !t.joins.is_empty());
+    let is_join = select.from.len() > 1 || select.from.iter().any(|t| !t.joins.is_empty());
     if is_join {
         return join_select(db, select, filter, group_by, order_exprs, offset, limit).await;
     }
 
     if select.from.len() != 1 {
-        return Err(Error::Unsupported("exactly one table in FROM is supported".into()));
+        return Err(Error::Unsupported(
+            "exactly one table in FROM is supported".into(),
+        ));
     }
     let table = match &select.from[0].relation {
         TableFactor::Table { name, .. } => table_ident(name)?,
-        _ => return Err(Error::Unsupported("only plain table references are supported".into())),
+        _ => {
+            return Err(Error::Unsupported(
+                "only plain table references are supported".into(),
+            ))
+        }
     };
     let def = catalog::load(db, &table).await?;
 
@@ -561,11 +632,17 @@ pub async fn select(
         // HNSW index and no WHERE — search the index instead of scanning all.
         if filter.is_none() && offset == 0 {
             if let Some((col, q, k)) = ann_query(&resolved, limit, &def)? {
-                if def.indexes.iter().any(|i| i.vector && i.single_col() == Some(col)) {
+                if def
+                    .indexes
+                    .iter()
+                    .any(|i| i.vector && i.single_col() == Some(col))
+                {
                     let cached = vindex.get(db, &def, col, Metric::L2).await?;
                     let hits = cached.index.search(&q, k, (k * 4).max(64));
-                    let keys: Vec<Vec<u8>> =
-                        hits.iter().map(|(node, _)| cached.keys[*node as usize].clone()).collect();
+                    let keys: Vec<Vec<u8>> = hits
+                        .iter()
+                        .map(|(node, _)| cached.keys[*node as usize].clone())
+                        .collect();
                     let blobs = db.multi_get(keys).await?;
                     let mut rows = Vec::with_capacity(blobs.len());
                     for bytes in blobs.into_iter().flatten() {
@@ -665,7 +742,13 @@ pub async fn select(
     Ok(QueryResult::Rows(RowStream::scan(
         db.raw_db(),
         &def,
-        ScanSpec { projection, out_schema, filter, offset, limit },
+        ScanSpec {
+            projection,
+            out_schema,
+            filter,
+            offset,
+            limit,
+        },
     )))
 }
 
@@ -732,7 +815,10 @@ async fn resolve_table(db: &Session, tf: &TableFactor) -> Result<(TableDef, Vec<
         TableFactor::Table { name, alias, .. } => {
             let tname = table_ident(name)?;
             let def = catalog::load(db, &tname).await?;
-            let a = alias.as_ref().map(|al| al.name.value.clone()).unwrap_or_else(|| tname.clone());
+            let a = alias
+                .as_ref()
+                .map(|al| al.name.value.clone())
+                .unwrap_or_else(|| tname.clone());
             let cols = def
                 .schema
                 .columns
@@ -745,7 +831,9 @@ async fn resolve_table(db: &Session, tf: &TableFactor) -> Result<(TableDef, Vec<
                 .collect();
             Ok((def, cols))
         }
-        _ => Err(Error::Unsupported("only plain table references are supported in joins".into())),
+        _ => Err(Error::Unsupported(
+            "only plain table references are supported in joins".into(),
+        )),
     }
 }
 
@@ -804,22 +892,32 @@ async fn lookup_rows_by_eq(
         }
         return Ok(out);
     }
-    Err(Error::Query("column is not indexed for nested-loop join".into()))
+    Err(Error::Query(
+        "column is not indexed for nested-loop join".into(),
+    ))
 }
 
 /// If `on` is `A = B` with one operand referencing only the driving side and
 /// the other a plain column of the partner, return `(driving_key_expr,
 /// partner_col_index)` for an index nested-loop probe.
 fn equi_nlj(on: &Expr, driving: &Schema, partner: &Schema) -> Option<(Expr, usize)> {
-    let Expr::BinaryOp { left, op: sqlparser::ast::BinaryOperator::Eq, right } = on else {
+    let Expr::BinaryOp {
+        left,
+        op: sqlparser::ast::BinaryOperator::Eq,
+        right,
+    } = on
+    else {
         return None;
     };
     let plain = |e: &Expr| -> Option<String> {
         match e {
             Expr::Identifier(id) => Some(id.value.clone()),
-            Expr::CompoundIdentifier(p) => {
-                Some(p.iter().map(|i| i.value.as_str()).collect::<Vec<_>>().join("."))
-            }
+            Expr::CompoundIdentifier(p) => Some(
+                p.iter()
+                    .map(|i| i.value.as_str())
+                    .collect::<Vec<_>>()
+                    .join("."),
+            ),
             _ => None,
         }
     };
@@ -839,8 +937,6 @@ fn equi_nlj(on: &Expr, driving: &Schema, partner: &Schema) -> Option<(Expr, usiz
     }
     None
 }
-
-
 
 /// Whether `conjunct` is `col = <literal>` on this table's PK or an index.
 fn is_accelerable(def: &TableDef, conjunct: &Expr) -> Result<bool> {
@@ -890,8 +986,14 @@ fn range_bounds(def: &TableDef, filter: Option<&Expr>) -> Result<Option<RangeQue
             continue;
         }
         let indexed = def.pk_cols == [col] || index::index_on(def, col).is_some();
-        let encodable = lo.as_ref().map(|(v, _)| keyenc::encode(v).is_ok()).unwrap_or(true)
-            && hi.as_ref().map(|(v, _)| keyenc::encode(v).is_ok()).unwrap_or(true);
+        let encodable = lo
+            .as_ref()
+            .map(|(v, _)| keyenc::encode(v).is_ok())
+            .unwrap_or(true)
+            && hi
+                .as_ref()
+                .map(|(v, _)| keyenc::encode(v).is_ok())
+                .unwrap_or(true);
         if indexed && encodable {
             return Ok(Some(RangeQuery { col, lo, hi }));
         }
@@ -905,11 +1007,18 @@ fn as_range(
     expr: &Expr,
 ) -> Result<Option<(usize, sqlparser::ast::BinaryOperator, Value)>> {
     use sqlparser::ast::BinaryOperator::*;
-    let Expr::BinaryOp { left, op, right } = expr else { return Ok(None) };
+    let Expr::BinaryOp { left, op, right } = expr else {
+        return Ok(None);
+    };
     if !matches!(op, Gt | GtEq | Lt | LtEq) {
         return Ok(None);
     }
-    let col_of = |n: &str| def.schema.columns.iter().position(|c| c.name.eq_ignore_ascii_case(n));
+    let col_of = |n: &str| {
+        def.schema
+            .columns
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(n))
+    };
     let coerce_col = |col: usize, v: Value| {
         let c = &def.schema.columns[col];
         coerce(v, &c.ty, &c.name).ok()
@@ -939,9 +1048,24 @@ fn as_range(
 }
 
 fn as_between(def: &TableDef, expr: &Expr) -> Result<Option<(usize, Value, Value)>> {
-    let Expr::Between { expr: e, negated: false, low, high } = expr else { return Ok(None) };
-    let col_of = |n: &str| def.schema.columns.iter().position(|c| c.name.eq_ignore_ascii_case(n));
-    let Some(col) = ident_name(e).and_then(col_of) else { return Ok(None) };
+    let Expr::Between {
+        expr: e,
+        negated: false,
+        low,
+        high,
+    } = expr
+    else {
+        return Ok(None);
+    };
+    let col_of = |n: &str| {
+        def.schema
+            .columns
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(n))
+    };
+    let Some(col) = ident_name(e).and_then(col_of) else {
+        return Ok(None);
+    };
     let c = &def.schema.columns[col];
     match (eval_expr(low), eval_expr(high)) {
         (Ok(lo), Ok(hi)) => match (coerce(lo, &c.ty, &c.name), coerce(hi, &c.ty, &c.name)) {
@@ -953,7 +1077,11 @@ fn as_between(def: &TableDef, expr: &Expr) -> Result<Option<(usize, Value, Value
 }
 
 /// Range scan over the clustered (PK) data keyspace.
-async fn clustered_range(db: &Session, def: &TableDef, rq: &RangeQuery) -> Result<Vec<(Vec<u8>, Vec<Value>)>> {
+async fn clustered_range(
+    db: &Session,
+    def: &TableDef,
+    rq: &RangeQuery,
+) -> Result<Vec<(Vec<u8>, Vec<Value>)>> {
     let prefix = data_prefix(&def.name);
     let mut start = match &rq.lo {
         Some((v, incl)) => {
@@ -978,12 +1106,21 @@ async fn clustered_range(db: &Session, def: &TableDef, rq: &RangeQuery) -> Resul
 
     let mut out = Vec::new();
     loop {
-        let batch = db.scan_range(start.clone(), Some(end.clone()), 4096).await?;
+        let batch = db
+            .scan_range(start.clone(), Some(end.clone()), 4096)
+            .await?;
         if batch.is_empty() {
             break;
         }
         let last = batch.len() < 4096;
-        start = batch.last().map(|(k, _)| { let mut n = k.clone(); n.push(0); n }).unwrap();
+        start = batch
+            .last()
+            .map(|(k, _)| {
+                let mut n = k.clone();
+                n.push(0);
+                n
+            })
+            .unwrap();
         for (k, v) in batch {
             let row = bincode::deserialize(&v).map_err(|e| Error::Storage(e.to_string()))?;
             out.push((k, row));
@@ -1009,7 +1146,10 @@ async fn index_range(
     let mut out = Vec::new();
     for (k, blob) in data_keys.into_iter().zip(blobs) {
         if let Some(b) = blob {
-            out.push((k, bincode::deserialize(&b).map_err(|e| Error::Storage(e.to_string()))?));
+            out.push((
+                k,
+                bincode::deserialize(&b).map_err(|e| Error::Storage(e.to_string()))?,
+            ));
         }
     }
     Ok(out)
@@ -1076,7 +1216,7 @@ async fn build_from(
                     }
                     if left_outer && !matched {
                         let mut combined = l.clone();
-                        combined.extend(std::iter::repeat(Value::Null).take(plen));
+                        combined.extend(std::iter::repeat_n(Value::Null, plen));
                         out.push(combined);
                     }
                 }
@@ -1104,8 +1244,10 @@ fn apply_pushdown(
     conjuncts: &[Expr],
 ) -> Result<Vec<Vec<Value>>> {
     let schema = Schema::new(cols.to_vec());
-    let applicable: Vec<&Expr> =
-        conjuncts.iter().filter(|c| refs_in_schema(c, &schema)).collect();
+    let applicable: Vec<&Expr> = conjuncts
+        .iter()
+        .filter(|c| refs_in_schema(c, &schema))
+        .collect();
     if applicable.is_empty() {
         return Ok(rows);
     }
@@ -1145,7 +1287,11 @@ fn join_kind(op: &JoinOperator) -> Result<(JoinKind, Option<Expr>)> {
         JoinOperator::LeftOuter(c) => (JoinKind::Left, on(c)),
         JoinOperator::RightOuter(c) => (JoinKind::Right, on(c)),
         JoinOperator::FullOuter(c) => (JoinKind::Full, on(c)),
-        other => return Err(Error::Unsupported(format!("join type not supported: {other:?}"))),
+        other => {
+            return Err(Error::Unsupported(format!(
+                "join type not supported: {other:?}"
+            )))
+        }
     })
 }
 
@@ -1169,7 +1315,13 @@ fn combine(
         if let Some(e) = on {
             if let Some((lkey, rkey)) = equi_keys(e, &lschema, &rschema) {
                 let rows = hash_join(
-                    lrows, rrows, &lschema, &rschema, &lkey, &rkey, kind == JoinKind::Left,
+                    lrows,
+                    rrows,
+                    &lschema,
+                    &rschema,
+                    &lkey,
+                    &rkey,
+                    kind == JoinKind::Left,
                 )?;
                 return Ok((cols, rows));
             }
@@ -1199,7 +1351,7 @@ fn combine(
         }
         if matches!(kind, JoinKind::Left | JoinKind::Full) && !matched {
             let mut combined = l.clone();
-            combined.extend(std::iter::repeat(Value::Null).take(rlen));
+            combined.extend(std::iter::repeat_n(Value::Null, rlen));
             out.push(combined);
         }
     }
@@ -1254,7 +1406,7 @@ fn hash_join(
         }
         if left_outer && !matched {
             let mut combined = l.clone();
-            combined.extend(std::iter::repeat(Value::Null).take(rlen));
+            combined.extend(std::iter::repeat_n(Value::Null, rlen));
             out.push(combined);
         }
     }
@@ -1273,7 +1425,12 @@ fn key_str(v: &Value) -> Option<String> {
 /// If `on` is `A = B` with one operand referencing only the left relation and
 /// the other only the right, return `(left_key_expr, right_key_expr)`.
 fn equi_keys(on: &Expr, lschema: &Schema, rschema: &Schema) -> Option<(Expr, Expr)> {
-    let Expr::BinaryOp { left, op: sqlparser::ast::BinaryOperator::Eq, right } = on else {
+    let Expr::BinaryOp {
+        left,
+        op: sqlparser::ast::BinaryOperator::Eq,
+        right,
+    } = on
+    else {
         return None;
     };
     if refs_in_schema(left, lschema) && refs_in_schema(right, rschema) {
@@ -1287,7 +1444,12 @@ fn equi_keys(on: &Expr, lschema: &Schema, rschema: &Schema) -> Option<(Expr, Exp
 
 /// Split an expression on top-level `AND` into conjuncts.
 fn split_and(expr: &Expr, out: &mut Vec<Expr>) {
-    if let Expr::BinaryOp { left, op: sqlparser::ast::BinaryOperator::And, right } = expr {
+    if let Expr::BinaryOp {
+        left,
+        op: sqlparser::ast::BinaryOperator::And,
+        right,
+    } = expr
+    {
         split_and(left, out);
         split_and(right, out);
     } else {
@@ -1302,7 +1464,8 @@ fn refs_in_schema(expr: &Expr, schema: &Schema) -> bool {
     if !collect_refs(expr, &mut refs) {
         return false;
     }
-    refs.iter().all(|r| predicate::resolve_index(r, schema).is_ok())
+    refs.iter()
+        .all(|r| predicate::resolve_index(r, schema).is_ok())
 }
 
 /// Collect column references from `expr`. Returns false if the expression
@@ -1314,16 +1477,22 @@ fn collect_refs(expr: &Expr, out: &mut Vec<String>) -> bool {
             true
         }
         Expr::CompoundIdentifier(parts) => {
-            out.push(parts.iter().map(|i| i.value.as_str()).collect::<Vec<_>>().join("."));
+            out.push(
+                parts
+                    .iter()
+                    .map(|i| i.value.as_str())
+                    .collect::<Vec<_>>()
+                    .join("."),
+            );
             true
         }
         Expr::Value(_) => true,
         Expr::Nested(e) | Expr::UnaryOp { expr: e, .. } => collect_refs(e, out),
         Expr::IsNull(e) | Expr::IsNotNull(e) => collect_refs(e, out),
         Expr::BinaryOp { left, right, .. } => collect_refs(left, out) && collect_refs(right, out),
-        Expr::Between { expr, low, high, .. } => {
-            collect_refs(expr, out) && collect_refs(low, out) && collect_refs(high, out)
-        }
+        Expr::Between {
+            expr, low, high, ..
+        } => collect_refs(expr, out) && collect_refs(low, out) && collect_refs(high, out),
         Expr::Function(f) => {
             if let sqlparser::ast::FunctionArguments::List(list) = &f.args {
                 for a in &list.args {
@@ -1351,7 +1520,12 @@ fn collect_refs(expr: &Expr, out: &mut Vec<String>) -> bool {
 /// column index and the literal value.
 fn eq_col_literal(def: &TableDef, filter: Option<&Expr>) -> Result<Option<(usize, Value)>> {
     use sqlparser::ast::BinaryOperator;
-    let Some(Expr::BinaryOp { left, op: BinaryOperator::Eq, right }) = filter else {
+    let Some(Expr::BinaryOp {
+        left,
+        op: BinaryOperator::Eq,
+        right,
+    }) = filter
+    else {
         return Ok(None);
     };
     let (name, lit_expr): (&str, &Expr) = match (ident_name(left), ident_name(right)) {
@@ -1543,7 +1717,9 @@ async fn collect_matches(
 fn table_of(twj: &TableWithJoins) -> Result<String> {
     match &twj.relation {
         TableFactor::Table { name, .. } => table_ident(name),
-        _ => Err(Error::Unsupported("only plain table references are supported".into())),
+        _ => Err(Error::Unsupported(
+            "only plain table references are supported".into(),
+        )),
     }
 }
 
@@ -1560,13 +1736,15 @@ pub async fn update(
     let mut sets: Vec<(usize, &Expr)> = Vec::with_capacity(assignments.len());
     for a in assignments {
         let col = match &a.target {
-            AssignmentTarget::ColumnName(n) => n
-                .0
-                .last()
-                .map(|i| i.value.clone())
-                .ok_or_else(|| Error::Query("empty assignment target".into()))?,
+            AssignmentTarget::ColumnName(n) => {
+                n.0.last()
+                    .map(|i| i.value.clone())
+                    .ok_or_else(|| Error::Query("empty assignment target".into()))?
+            }
             AssignmentTarget::Tuple(_) => {
-                return Err(Error::Unsupported("tuple assignment is not supported".into()))
+                return Err(Error::Unsupported(
+                    "tuple assignment is not supported".into(),
+                ))
             }
         };
         let idx = def
@@ -1594,7 +1772,10 @@ pub async fn update(
         }
         for (i, col) in def.schema.columns.iter().enumerate() {
             if !col.nullable && new_row[i].is_null() {
-                return Err(Error::Query(format!("column '{}' cannot be NULL", col.name)));
+                return Err(Error::Query(format!(
+                    "column '{}' cannot be NULL",
+                    col.name
+                )));
             }
         }
 
@@ -1628,7 +1809,9 @@ pub async fn delete(db: &Session, del: &Delete) -> Result<QueryResult> {
         FromTable::WithFromKeyword(v) | FromTable::WithoutKeyword(v) => v,
     };
     if relations.len() != 1 {
-        return Err(Error::Unsupported("multi-table DELETE is not supported".into()));
+        return Err(Error::Unsupported(
+            "multi-table DELETE is not supported".into(),
+        ));
     }
     let name = table_of(&relations[0])?;
     let def = catalog::load(db, &name).await?;
@@ -1663,7 +1846,9 @@ fn ident_name(e: &Expr) -> Option<&str> {
 fn eval_usize(e: &Expr) -> Result<usize> {
     match eval_expr(e)? {
         Value::Int(i) if i >= 0 => Ok(i as usize),
-        other => Err(Error::Query(format!("expected non-negative integer, got {other:?}"))),
+        other => Err(Error::Query(format!(
+            "expected non-negative integer, got {other:?}"
+        ))),
     }
 }
 
@@ -1681,7 +1866,10 @@ fn resolve_order_aliases(
         .iter()
         .map(|(e, asc)| {
             if let Some(name) = ident_name(e) {
-                let is_column = schema.columns.iter().any(|c| c.name.eq_ignore_ascii_case(name));
+                let is_column = schema
+                    .columns
+                    .iter()
+                    .any(|c| c.name.eq_ignore_ascii_case(name));
                 if !is_column {
                     for item in projection {
                         if let SelectItem::ExprWithAlias { expr, alias } = item {
@@ -1732,7 +1920,11 @@ fn project_exprs(
                 }
             }
             SelectItem::UnnamedExpr(e) => {
-                names.push(ident_name(e).map(|s| s.to_string()).unwrap_or_else(|| e.to_string()));
+                names.push(
+                    ident_name(e)
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| e.to_string()),
+                );
                 projs.push(Proj::Expr(e));
             }
             SelectItem::ExprWithAlias { expr, alias } => {
@@ -1740,7 +1932,9 @@ fn project_exprs(
                 projs.push(Proj::Expr(expr));
             }
             other => {
-                return Err(Error::Unsupported(format!("projection item not supported: {other}")))
+                return Err(Error::Unsupported(format!(
+                    "projection item not supported: {other}"
+                )))
             }
         }
     }
@@ -1763,17 +1957,23 @@ fn project_exprs(
     for (ci, (name, p)) in names.iter().zip(&projs).enumerate() {
         let ty = match p {
             Proj::Col(i) => schema.columns[*i].ty.clone(),
-            Proj::Expr(e) => match col_ref_name(e).and_then(|n| predicate::resolve_index(&n, schema).ok()) {
-                Some(idx) => schema.columns[idx].ty.clone(),
-                None => out_rows
-                    .iter()
-                    .map(|r| &r[ci])
-                    .find(|v| !v.is_null())
-                    .map(infer_val)
-                    .unwrap_or(ColumnType::Text),
-            },
+            Proj::Expr(e) => {
+                match col_ref_name(e).and_then(|n| predicate::resolve_index(&n, schema).ok()) {
+                    Some(idx) => schema.columns[idx].ty.clone(),
+                    None => out_rows
+                        .iter()
+                        .map(|r| &r[ci])
+                        .find(|v| !v.is_null())
+                        .map(infer_val)
+                        .unwrap_or(ColumnType::Text),
+                }
+            }
         };
-        cols.push(ColumnDef { name: name.clone(), ty, nullable: true });
+        cols.push(ColumnDef {
+            name: name.clone(),
+            ty,
+            nullable: true,
+        });
     }
 
     Ok((Schema::new(cols), out_rows))
@@ -1783,9 +1983,13 @@ fn project_exprs(
 fn col_ref_name(e: &Expr) -> Option<String> {
     match e {
         Expr::Identifier(id) => Some(id.value.clone()),
-        Expr::CompoundIdentifier(parts) => {
-            Some(parts.iter().map(|i| i.value.as_str()).collect::<Vec<_>>().join("."))
-        }
+        Expr::CompoundIdentifier(parts) => Some(
+            parts
+                .iter()
+                .map(|i| i.value.as_str())
+                .collect::<Vec<_>>()
+                .join("."),
+        ),
         _ => None,
     }
 }
@@ -1817,10 +2021,20 @@ fn ann_query(
     if resolved.len() != 1 || !resolved[0].1 {
         return Ok(None);
     }
-    let Expr::Function(f) = &resolved[0].0 else { return Ok(None) };
-    let name = f.name.0.last().map(|i| i.value.to_ascii_lowercase()).unwrap_or_default();
+    let Expr::Function(f) = &resolved[0].0 else {
+        return Ok(None);
+    };
+    let name = f
+        .name
+        .0
+        .last()
+        .map(|i| i.value.to_ascii_lowercase())
+        .unwrap_or_default();
     // Only the L2 family is accelerated (HNSW is built with L2).
-    if !matches!(name.as_str(), "vec_distance" | "vec_l2_distance" | "vec_distance_l2") {
+    if !matches!(
+        name.as_str(),
+        "vec_distance" | "vec_l2_distance" | "vec_distance_l2"
+    ) {
         return Ok(None);
     }
     let args = fn_arg_exprs(f);
@@ -1846,7 +2060,9 @@ fn ann_query(
 
 fn fn_arg_exprs(f: &sqlparser::ast::Function) -> Vec<&Expr> {
     use sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArguments};
-    let FunctionArguments::List(list) = &f.args else { return Vec::new() };
+    let FunctionArguments::List(list) = &f.args else {
+        return Vec::new();
+    };
     let mut out = Vec::new();
     for a in &list.args {
         if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) = a {
@@ -1859,7 +2075,10 @@ fn fn_arg_exprs(f: &sqlparser::ast::Function) -> Vec<&Expr> {
 }
 
 fn col_of(def: &TableDef, name: &str) -> Option<usize> {
-    def.schema.columns.iter().position(|c| c.name.eq_ignore_ascii_case(name))
+    def.schema
+        .columns
+        .iter()
+        .position(|c| c.name.eq_ignore_ascii_case(name))
 }
 
 fn parse_vec_free(s: &str) -> Result<Vec<f32>> {
@@ -1867,7 +2086,11 @@ fn parse_vec_free(s: &str) -> Result<Vec<f32>> {
     inner
         .split(',')
         .filter(|t| !t.trim().is_empty())
-        .map(|t| t.trim().parse::<f32>().map_err(|_| Error::Vector(format!("bad vector element: {t}"))))
+        .map(|t| {
+            t.trim()
+                .parse::<f32>()
+                .map_err(|_| Error::Vector(format!("bad vector element: {t}")))
+        })
         .collect()
 }
 
@@ -1910,7 +2133,9 @@ async fn parallel_aggregate(
     plan: &AggPlan,
 ) -> Result<GroupAggregator> {
     const BATCH: usize = 8192;
-    let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
     let prefix = data_prefix(&def.name);
     let schema = def.schema.clone();
 
@@ -1930,24 +2155,28 @@ async fn parallel_aggregate(
         let mut worker = plan.new_aggregator();
         let f = filter.clone();
         let sch = schema.clone();
-        handles.push(tokio::task::spawn_blocking(move || -> Result<GroupAggregator> {
-            for b in &blobs {
-                let row: Vec<Value> =
-                    bincode::deserialize(b).map_err(|e| Error::Storage(e.to_string()))?;
-                let keep = match &f {
-                    Some(e) => predicate::matches(e, &sch, &row)?,
-                    None => true,
-                };
-                if keep {
-                    worker.feed(&row);
+        handles.push(tokio::task::spawn_blocking(
+            move || -> Result<GroupAggregator> {
+                for b in &blobs {
+                    let row: Vec<Value> =
+                        bincode::deserialize(b).map_err(|e| Error::Storage(e.to_string()))?;
+                    let keep = match &f {
+                        Some(e) => predicate::matches(e, &sch, &row)?,
+                        None => true,
+                    };
+                    if keep {
+                        worker.feed(&row);
+                    }
                 }
-            }
-            Ok(worker)
-        }));
+                Ok(worker)
+            },
+        ));
 
         if handles.len() >= workers || last {
             for h in handles.drain(..) {
-                let part = h.await.map_err(|e| Error::Analytics(format!("worker failed: {e}")))??;
+                let part = h
+                    .await
+                    .map_err(|e| Error::Analytics(format!("worker failed: {e}")))??;
                 result.merge(part);
             }
         }
@@ -1977,11 +2206,7 @@ fn apply_offset_limit(rows: &mut Vec<Vec<Value>>, offset: usize, limit: Option<u
 }
 
 /// Sort full table rows by ORDER BY expressions evaluated against the row.
-fn sort_full_rows(
-    rows: &mut [Vec<Value>],
-    schema: &Schema,
-    order: &[(Expr, bool)],
-) -> Result<()> {
+fn sort_full_rows(rows: &mut [Vec<Value>], schema: &Schema, order: &[(Expr, bool)]) -> Result<()> {
     // Precompute sort keys once per row.
     let mut keyed: Vec<(Vec<Value>, usize)> = Vec::with_capacity(rows.len());
     for (i, row) in rows.iter().enumerate() {
@@ -2008,12 +2233,16 @@ fn order_output_rows(
     // Resolve each order expr to an output column index.
     let mut cols = Vec::with_capacity(order.len());
     for (e, _) in order {
-        let name = ident_name(e).map(|s| s.to_string()).unwrap_or_else(|| e.to_string());
+        let name = ident_name(e)
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| e.to_string());
         let idx = schema
             .columns
             .iter()
             .position(|c| c.name.eq_ignore_ascii_case(&name))
-            .ok_or_else(|| Error::Query(format!("ORDER BY references unknown output column: {name}")))?;
+            .ok_or_else(|| {
+                Error::Query(format!("ORDER BY references unknown output column: {name}"))
+            })?;
         cols.push(idx);
     }
     let mut keyed: Vec<(Vec<Value>, usize)> = rows
@@ -2120,12 +2349,18 @@ fn coerce(v: Value, ty: &ColumnType, col: &str) -> Result<Value> {
         (ColumnType::Decimal(_, sc), Value::Int(i)) => {
             Value::Decimal(i as i128 * 10i128.pow(*sc as u32), *sc)
         }
-        (ColumnType::Decimal(_, sc), Value::Float(f)) => elyra_core::value::parse_decimal(&f.to_string(), *sc)
-            .map(|(u, s)| Value::Decimal(u, s))
-            .ok_or_else(|| Error::Type(format!("invalid DECIMAL value: {f}")))?,
+        (ColumnType::Decimal(_, sc), Value::Float(f)) => {
+            elyra_core::value::parse_decimal(&f.to_string(), *sc)
+                .map(|(u, s)| Value::Decimal(u, s))
+                .ok_or_else(|| Error::Type(format!("invalid DECIMAL value: {f}")))?
+        }
         (ColumnType::Decimal(_, sc), Value::Decimal(u, s)) => {
             // Rescale to the column's declared scale.
-            let v = if s <= *sc { u * 10i128.pow((*sc - s) as u32) } else { u / 10i128.pow((s - *sc) as u32) };
+            let v = if s <= *sc {
+                u * 10i128.pow((*sc - s) as u32)
+            } else {
+                u / 10i128.pow((s - *sc) as u32)
+            };
             Value::Decimal(v, *sc)
         }
         (ColumnType::Time, Value::Time(t)) => Value::Time(t),
@@ -2155,7 +2390,11 @@ fn parse_vector(s: &str, dim: u32) -> Result<Vec<f32>> {
     let vals: Result<Vec<f32>> = inner
         .split(',')
         .filter(|t| !t.trim().is_empty())
-        .map(|t| t.trim().parse::<f32>().map_err(|_| Error::Type(format!("bad vector element: {t}"))))
+        .map(|t| {
+            t.trim()
+                .parse::<f32>()
+                .map_err(|_| Error::Type(format!("bad vector element: {t}")))
+        })
         .collect();
     let vals = vals?;
     if vals.len() as u32 != dim {

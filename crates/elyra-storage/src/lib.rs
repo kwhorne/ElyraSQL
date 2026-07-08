@@ -32,12 +32,20 @@ pub struct Snapshot {
 
 impl Snapshot {
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        let t = self.rtx.open_table(KV).map_err(|e| Error::Storage(e.to_string()))?;
-        Ok(t.get(key).map_err(|e| Error::Storage(e.to_string()))?.map(|v| v.value().to_vec()))
+        let t = self
+            .rtx
+            .open_table(KV)
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        Ok(t.get(key)
+            .map_err(|e| Error::Storage(e.to_string()))?
+            .map(|v| v.value().to_vec()))
     }
 
     pub fn multi_get(&self, keys: &[Vec<u8>]) -> Result<Vec<Option<Vec<u8>>>> {
-        let t = self.rtx.open_table(KV).map_err(|e| Error::Storage(e.to_string()))?;
+        let t = self
+            .rtx
+            .open_table(KV)
+            .map_err(|e| Error::Storage(e.to_string()))?;
         let mut out = Vec::with_capacity(keys.len());
         for k in keys {
             out.push(
@@ -57,7 +65,10 @@ impl Snapshot {
         limit: usize,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         use std::ops::Bound;
-        let t = self.rtx.open_table(KV).map_err(|e| Error::Storage(e.to_string()))?;
+        let t = self
+            .rtx
+            .open_table(KV)
+            .map_err(|e| Error::Storage(e.to_string()))?;
         let upper = match end {
             Some(e) => Bound::Excluded(e),
             None => Bound::Unbounded,
@@ -92,9 +103,12 @@ impl Storage {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let db = Database::create(path).map_err(|e| Error::Storage(e.to_string()))?;
         // Ensure the KV table exists so first reads don't fail.
-        let wtx = db.begin_write().map_err(|e| Error::Storage(e.to_string()))?;
+        let wtx = db
+            .begin_write()
+            .map_err(|e| Error::Storage(e.to_string()))?;
         {
-            wtx.open_table(KV).map_err(|e| Error::Storage(e.to_string()))?;
+            wtx.open_table(KV)
+                .map_err(|e| Error::Storage(e.to_string()))?;
         }
         wtx.commit().map_err(|e| Error::Storage(e.to_string()))?;
         Ok(Self { db })
@@ -102,7 +116,10 @@ impl Storage {
 
     /// Take an MVCC read snapshot of the current committed state.
     pub fn snapshot(&self) -> Result<Snapshot> {
-        let rtx = self.db.begin_read().map_err(|e| Error::Storage(e.to_string()))?;
+        let rtx = self
+            .db
+            .begin_read()
+            .map_err(|e| Error::Storage(e.to_string()))?;
         Ok(Snapshot { rtx: Arc::new(rtx) })
     }
 
@@ -111,9 +128,12 @@ impl Storage {
         let db = Database::builder()
             .create_with_backend(redb::backends::InMemoryBackend::new())
             .map_err(|e| Error::Storage(e.to_string()))?;
-        let wtx = db.begin_write().map_err(|e| Error::Storage(e.to_string()))?;
+        let wtx = db
+            .begin_write()
+            .map_err(|e| Error::Storage(e.to_string()))?;
         {
-            wtx.open_table(KV).map_err(|e| Error::Storage(e.to_string()))?;
+            wtx.open_table(KV)
+                .map_err(|e| Error::Storage(e.to_string()))?;
         }
         wtx.commit().map_err(|e| Error::Storage(e.to_string()))?;
         Ok(Self { db })
@@ -121,10 +141,16 @@ impl Storage {
 
     /// Store a value under a namespaced key.
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        let wtx = self.db.begin_write().map_err(|e| Error::Storage(e.to_string()))?;
+        let wtx = self
+            .db
+            .begin_write()
+            .map_err(|e| Error::Storage(e.to_string()))?;
         {
-            let mut t = wtx.open_table(KV).map_err(|e| Error::Storage(e.to_string()))?;
-            t.insert(key, value).map_err(|e| Error::Storage(e.to_string()))?;
+            let mut t = wtx
+                .open_table(KV)
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            t.insert(key, value)
+                .map_err(|e| Error::Storage(e.to_string()))?;
         }
         wtx.commit().map_err(|e| Error::Storage(e.to_string()))?;
         Ok(())
@@ -132,8 +158,13 @@ impl Storage {
 
     /// Fetch a value by key.
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        let rtx = self.db.begin_read().map_err(|e| Error::Storage(e.to_string()))?;
-        let t = rtx.open_table(KV).map_err(|e| Error::Storage(e.to_string()))?;
+        let rtx = self
+            .db
+            .begin_read()
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        let t = rtx
+            .open_table(KV)
+            .map_err(|e| Error::Storage(e.to_string()))?;
         let out = t
             .get(key)
             .map_err(|e| Error::Storage(e.to_string()))?
@@ -145,8 +176,13 @@ impl Storage {
     /// `keys` (index i -> value for keys[i], `None` if absent). Avoids the
     /// per-call transaction overhead of looping [`Storage::get`].
     pub fn multi_get(&self, keys: &[Vec<u8>]) -> Result<Vec<Option<Vec<u8>>>> {
-        let rtx = self.db.begin_read().map_err(|e| Error::Storage(e.to_string()))?;
-        let t = rtx.open_table(KV).map_err(|e| Error::Storage(e.to_string()))?;
+        let rtx = self
+            .db
+            .begin_read()
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        let t = rtx
+            .open_table(KV)
+            .map_err(|e| Error::Storage(e.to_string()))?;
         let mut out = Vec::with_capacity(keys.len());
         for k in keys {
             out.push(
@@ -160,11 +196,19 @@ impl Storage {
 
     /// Delete a key. Returns whether something was removed.
     pub fn delete(&self, key: &[u8]) -> Result<bool> {
-        let wtx = self.db.begin_write().map_err(|e| Error::Storage(e.to_string()))?;
+        let wtx = self
+            .db
+            .begin_write()
+            .map_err(|e| Error::Storage(e.to_string()))?;
         let existed;
         {
-            let mut t = wtx.open_table(KV).map_err(|e| Error::Storage(e.to_string()))?;
-            existed = t.remove(key).map_err(|e| Error::Storage(e.to_string()))?.is_some();
+            let mut t = wtx
+                .open_table(KV)
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            existed = t
+                .remove(key)
+                .map_err(|e| Error::Storage(e.to_string()))?
+                .is_some();
         }
         wtx.commit().map_err(|e| Error::Storage(e.to_string()))?;
         Ok(existed)
@@ -172,8 +216,13 @@ impl Storage {
 
     /// Iterate all key/value pairs whose key starts with `prefix`.
     pub fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let rtx = self.db.begin_read().map_err(|e| Error::Storage(e.to_string()))?;
-        let t = rtx.open_table(KV).map_err(|e| Error::Storage(e.to_string()))?;
+        let rtx = self
+            .db
+            .begin_read()
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        let t = rtx
+            .open_table(KV)
+            .map_err(|e| Error::Storage(e.to_string()))?;
         let mut out = Vec::new();
         for item in t.iter().map_err(|e| Error::Storage(e.to_string()))? {
             let (k, v) = item.map_err(|e| Error::Storage(e.to_string()))?;
@@ -196,8 +245,13 @@ impl Storage {
         after: Option<&[u8]>,
         limit: usize,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let rtx = self.db.begin_read().map_err(|e| Error::Storage(e.to_string()))?;
-        let t = rtx.open_table(KV).map_err(|e| Error::Storage(e.to_string()))?;
+        let rtx = self
+            .db
+            .begin_read()
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        let t = rtx
+            .open_table(KV)
+            .map_err(|e| Error::Storage(e.to_string()))?;
 
         // Start just after the cursor, or at the prefix itself.
         let lower: Vec<u8> = match after {
@@ -237,15 +291,23 @@ impl Storage {
         limit: usize,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         use std::ops::Bound;
-        let rtx = self.db.begin_read().map_err(|e| Error::Storage(e.to_string()))?;
-        let t = rtx.open_table(KV).map_err(|e| Error::Storage(e.to_string()))?;
+        let rtx = self
+            .db
+            .begin_read()
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        let t = rtx
+            .open_table(KV)
+            .map_err(|e| Error::Storage(e.to_string()))?;
         let lower = Bound::Included(start);
         let upper = match end {
             Some(e) => Bound::Excluded(e),
             None => Bound::Unbounded,
         };
         let mut out = Vec::with_capacity(limit.min(1024));
-        for item in t.range::<&[u8]>((lower, upper)).map_err(|e| Error::Storage(e.to_string()))? {
+        for item in t
+            .range::<&[u8]>((lower, upper))
+            .map_err(|e| Error::Storage(e.to_string()))?
+        {
             let (k, v) = item.map_err(|e| Error::Storage(e.to_string()))?;
             out.push((k.value().to_vec(), v.value().to_vec()));
             if out.len() >= limit {
@@ -259,13 +321,19 @@ impl Storage {
     /// This is the primitive the group-commit writer uses to fold many
     /// pending writes into one commit under high write traffic.
     pub fn apply(&self, puts: &[(Vec<u8>, Vec<u8>)], deletes: &[Vec<u8>]) -> Result<()> {
-        let wtx = self.db.begin_write().map_err(|e| Error::Storage(e.to_string()))?;
+        let wtx = self
+            .db
+            .begin_write()
+            .map_err(|e| Error::Storage(e.to_string()))?;
         {
-            let mut t = wtx.open_table(KV).map_err(|e| Error::Storage(e.to_string()))?;
+            let mut t = wtx
+                .open_table(KV)
+                .map_err(|e| Error::Storage(e.to_string()))?;
             // Deletes first, then puts: a key present in both (e.g. an index
             // entry that is unchanged across an UPDATE) ends up kept.
             for k in deletes {
-                t.remove(k.as_slice()).map_err(|e| Error::Storage(e.to_string()))?;
+                t.remove(k.as_slice())
+                    .map_err(|e| Error::Storage(e.to_string()))?;
             }
             for (k, v) in puts {
                 t.insert(k.as_slice(), v.as_slice())
@@ -285,7 +353,10 @@ mod tests {
     fn put_get_delete_roundtrip() {
         let s = Storage::in_memory().unwrap();
         s.put(b"data::t::1", b"hello").unwrap();
-        assert_eq!(s.get(b"data::t::1").unwrap().as_deref(), Some(&b"hello"[..]));
+        assert_eq!(
+            s.get(b"data::t::1").unwrap().as_deref(),
+            Some(&b"hello"[..])
+        );
         assert!(s.delete(b"data::t::1").unwrap());
         assert_eq!(s.get(b"data::t::1").unwrap(), None);
     }

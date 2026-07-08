@@ -10,7 +10,7 @@ pub mod types;
 pub mod value;
 
 pub use error::{Error, Result};
-pub use types::{ColumnType, ColumnDef, Schema};
+pub use types::{ColumnDef, ColumnType, Schema};
 pub use value::Value;
 
 use serde::{Deserialize, Serialize};

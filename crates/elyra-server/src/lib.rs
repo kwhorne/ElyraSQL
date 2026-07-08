@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use elyra_engine::{Engine, QueryResult, Session};
 use opensrv_mysql::{
-    AsyncMysqlIntermediary, AsyncMysqlShim, Column, ColumnFlags, ColumnType, ErrorKind,
-    InitWriter, OkResponse, ParamParser, QueryResultWriter, StatementMetaWriter,
+    AsyncMysqlIntermediary, AsyncMysqlShim, Column, ColumnFlags, ColumnType, ErrorKind, InitWriter,
+    OkResponse, ParamParser, QueryResultWriter, StatementMetaWriter,
 };
 use tokio::io::AsyncWrite;
 use tokio::net::TcpListener;
@@ -30,10 +30,13 @@ pub struct ServerConfig {
 }
 
 /// Build a rustls server config from PEM certificate and key files.
-pub fn load_tls(cert_path: impl AsRef<Path>, key_path: impl AsRef<Path>) -> std::io::Result<TlsServerConfig> {
+pub fn load_tls(
+    cert_path: impl AsRef<Path>,
+    key_path: impl AsRef<Path>,
+) -> std::io::Result<TlsServerConfig> {
+    use rustls_pki_types::CertificateDer;
     use std::fs::File;
     use std::io::{BufReader, Error, ErrorKind};
-    use rustls_pki_types::CertificateDer;
 
     let certs = rustls_pemfile::certs(&mut BufReader::new(File::open(cert_path)?))
         .collect::<Result<Vec<CertificateDer>, _>>()?;
@@ -153,7 +156,13 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for ElyraShim {
         let param_count = prepared::count_placeholders(query);
         let id = self.next_id;
         self.next_id += 1;
-        self.stmts.insert(id, Prepared { sql: query.to_string(), params: param_count });
+        self.stmts.insert(
+            id,
+            Prepared {
+                sql: query.to_string(),
+                params: param_count,
+            },
+        );
 
         // Generic string parameter descriptors; result columns are described
         // at execute time by the binary resultset.
@@ -189,13 +198,21 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for ElyraShim {
         }
         let sql = match prepared::bind(&stmt.sql, &literals) {
             Ok(s) => s,
-            Err(e) => return results.error(ErrorKind::ER_UNKNOWN_ERROR, e.as_bytes()).await,
+            Err(e) => {
+                return results
+                    .error(ErrorKind::ER_UNKNOWN_ERROR, e.as_bytes())
+                    .await
+            }
         };
 
         let privilege = self.privilege();
         match self.engine.execute(&sql, privilege, &self.session).await {
             Ok(outcomes) => write_outcomes(outcomes, results).await,
-            Err(e) => results.error(ErrorKind::ER_UNKNOWN_ERROR, e.to_string().as_bytes()).await,
+            Err(e) => {
+                results
+                    .error(ErrorKind::ER_UNKNOWN_ERROR, e.to_string().as_bytes())
+                    .await
+            }
         }
     }
 
@@ -220,7 +237,11 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for ElyraShim {
         let privilege = self.privilege();
         match self.engine.execute(query, privilege, &self.session).await {
             Ok(outcomes) => write_outcomes(outcomes, results).await,
-            Err(e) => results.error(ErrorKind::ER_UNKNOWN_ERROR, e.to_string().as_bytes()).await,
+            Err(e) => {
+                results
+                    .error(ErrorKind::ER_UNKNOWN_ERROR, e.to_string().as_bytes())
+                    .await
+            }
         }
     }
 }
@@ -276,7 +297,10 @@ async fn write_outcomes<W: AsyncWrite + Send + Unpin>(
         }
         Some(QueryResult::Affected(n)) => {
             results
-                .completed(OkResponse { affected_rows: n, ..Default::default() })
+                .completed(OkResponse {
+                    affected_rows: n,
+                    ..Default::default()
+                })
                 .await
         }
         None => results.completed(OkResponse::default()).await,
@@ -296,7 +320,11 @@ fn write_cell<W: AsyncWrite + Send + Unpin>(
         Value::Text(s) => rw.write_col(s),
         Value::Bytes(b) => rw.write_col(b),
         Value::Vector(vec) => {
-            let inner = vec.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(",");
+            let inner = vec
+                .iter()
+                .map(|x| x.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
             rw.write_col(format!("[{inner}]"))
         }
         // Date/time/decimal: their canonical string form.

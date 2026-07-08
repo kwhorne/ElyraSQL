@@ -5,8 +5,8 @@
 //! * `meta::rowid::<table>` → u64 counter for hidden rowids
 //! * `data::<table>::<key>` → serialized row (`Vec<Value>`)
 
-use elyra_core::{Error, Result, Schema};
 use crate::session::Session;
+use elyra_core::{Error, Result, Schema};
 use serde::{Deserialize, Serialize};
 
 /// A secondary index over one or more columns.

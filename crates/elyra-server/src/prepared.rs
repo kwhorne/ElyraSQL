@@ -140,9 +140,15 @@ mod tests {
 
     #[test]
     fn counts_placeholders_ignoring_quotes() {
-        assert_eq!(count_placeholders("SELECT * FROM t WHERE a = ? AND b = ?"), 2);
+        assert_eq!(
+            count_placeholders("SELECT * FROM t WHERE a = ? AND b = ?"),
+            2
+        );
         assert_eq!(count_placeholders("SELECT '?' , a FROM t WHERE a = ?"), 1);
-        assert_eq!(count_placeholders("SELECT `we?rd`, a FROM t WHERE a = ?"), 1);
+        assert_eq!(
+            count_placeholders("SELECT `we?rd`, a FROM t WHERE a = ?"),
+            1
+        );
     }
 
     #[test]

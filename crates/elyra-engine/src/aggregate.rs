@@ -84,7 +84,9 @@ fn agg_of(expr: &Expr) -> Option<(AggFunc, &sqlparser::ast::Function)> {
 /// Does this projection contain any aggregate function?
 pub fn projection_has_aggregate(projection: &[SelectItem]) -> bool {
     projection.iter().any(|item| match item {
-        SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => agg_of(e).is_some(),
+        SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
+            agg_of(e).is_some()
+        }
         _ => false,
     })
 }
@@ -106,9 +108,13 @@ fn col_index(schema: &Schema, name: &str) -> Result<usize> {
 fn ident_of(expr: &Expr) -> Option<String> {
     match expr {
         Expr::Identifier(id) => Some(id.value.clone()),
-        Expr::CompoundIdentifier(parts) => {
-            Some(parts.iter().map(|i| i.value.as_str()).collect::<Vec<_>>().join("."))
-        }
+        Expr::CompoundIdentifier(parts) => Some(
+            parts
+                .iter()
+                .map(|i| i.value.as_str())
+                .collect::<Vec<_>>()
+                .join("."),
+        ),
         _ => None,
     }
 }
@@ -125,8 +131,8 @@ fn agg_arg(schema: &Schema, f: &sqlparser::ast::Function) -> Result<(Option<usiz
         None => None,
         Some(FunctionArg::Unnamed(FunctionArgExpr::Wildcard)) => None,
         Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(e))) => {
-            let name =
-                ident_of(e).ok_or_else(|| Error::Unsupported("aggregate arg must be a column".into()))?;
+            let name = ident_of(e)
+                .ok_or_else(|| Error::Unsupported("aggregate arg must be a column".into()))?;
             Some(col_index(schema, &name)?)
         }
         _ => return Err(Error::Unsupported("unsupported aggregate argument".into())),
@@ -135,11 +141,15 @@ fn agg_arg(schema: &Schema, f: &sqlparser::ast::Function) -> Result<(Option<usiz
 }
 
 /// Build an [`AggPlan`] from a projection and `GROUP BY` expressions.
-pub fn build_plan(schema: &Schema, projection: &[SelectItem], group_by: &[Expr]) -> Result<AggPlan> {
+pub fn build_plan(
+    schema: &Schema,
+    projection: &[SelectItem],
+    group_by: &[Expr],
+) -> Result<AggPlan> {
     let mut group_cols = Vec::new();
     for g in group_by {
-        let name =
-            ident_of(g).ok_or_else(|| Error::Unsupported("GROUP BY must reference a column".into()))?;
+        let name = ident_of(g)
+            .ok_or_else(|| Error::Unsupported("GROUP BY must reference a column".into()))?;
         group_cols.push(col_index(schema, &name)?);
     }
 
@@ -157,17 +167,26 @@ pub fn build_plan(schema: &Schema, projection: &[SelectItem], group_by: &[Expr])
             let ty = match func {
                 AggFunc::CountStar | AggFunc::Count => ColumnType::Int,
                 AggFunc::Avg => ColumnType::Float,
-                AggFunc::Sum | AggFunc::Min | AggFunc::Max => {
-                    arg.map(|i| schema.columns[i].ty.clone()).unwrap_or(ColumnType::Float)
-                }
+                AggFunc::Sum | AggFunc::Min | AggFunc::Max => arg
+                    .map(|i| schema.columns[i].ty.clone())
+                    .unwrap_or(ColumnType::Float),
             };
-            out_cols.push(ColumnDef { name: alias.unwrap_or_else(|| expr.to_string()), ty, nullable: true });
+            out_cols.push(ColumnDef {
+                name: alias.unwrap_or_else(|| expr.to_string()),
+                ty,
+                nullable: true,
+            });
             let idx = aggs.len();
-            aggs.push(AggSpec { func, arg_col: arg, distinct });
+            aggs.push(AggSpec {
+                func,
+                arg_col: arg,
+                distinct,
+            });
             plan.push(OutCol::Agg(idx));
         } else {
-            let name = ident_of(expr)
-                .ok_or_else(|| Error::Unsupported("non-aggregated column must be a plain column".into()))?;
+            let name = ident_of(expr).ok_or_else(|| {
+                Error::Unsupported("non-aggregated column must be a plain column".into())
+            })?;
             let idx = col_index(schema, &name)?;
             out_cols.push(ColumnDef {
                 name: alias.unwrap_or_else(|| schema.columns[idx].name.clone()),
@@ -178,7 +197,12 @@ pub fn build_plan(schema: &Schema, projection: &[SelectItem], group_by: &[Expr])
         }
     }
 
-    Ok(AggPlan { group_cols, aggs, plan, out_schema: Schema::new(out_cols) })
+    Ok(AggPlan {
+        group_cols,
+        aggs,
+        plan,
+        out_schema: Schema::new(out_cols),
+    })
 }
 
 /// In-memory aggregation over a fully materialised row set.

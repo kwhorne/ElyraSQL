@@ -20,6 +20,7 @@ pub struct RowStream {
     src: Source,
 }
 
+#[allow(clippy::large_enum_variant)]
 enum Source {
     /// Small, already-computed rows (literal SELECTs, PK point-lookups, ...).
     Literal(std::vec::IntoIter<Vec<Value>>),
@@ -53,7 +54,10 @@ pub struct ScanSpec {
 impl RowStream {
     /// Wrap already-computed rows.
     pub fn literal(schema: Schema, rows: Vec<Vec<Value>>) -> Self {
-        Self { schema, src: Source::Literal(rows.into_iter()) }
+        Self {
+            schema,
+            src: Source::Literal(rows.into_iter()),
+        }
     }
 
     /// Stream a clustered table scan.

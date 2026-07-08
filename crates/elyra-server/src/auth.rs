@@ -22,12 +22,19 @@ pub struct Auth {
 impl Auth {
     /// Open mode: accept any user with full (Admin) privileges (dev only).
     pub fn open() -> Self {
-        Auth { users: HashMap::new(), open: true }
+        Auth {
+            users: HashMap::new(),
+            open: true,
+        }
     }
 
     /// Require exactly the given user/password, with Admin privileges.
     pub fn single(user: &str, password: &str) -> Self {
-        Self::with_users(vec![(user.to_string(), password.to_string(), Privilege::Admin)])
+        Self::with_users(vec![(
+            user.to_string(),
+            password.to_string(),
+            Privilege::Admin,
+        )])
     }
 
     /// Build from explicit `(user, password, privilege)` triples.
@@ -64,8 +71,12 @@ impl Auth {
         if self.open {
             return true;
         }
-        let Ok(user) = std::str::from_utf8(username) else { return false };
-        let Some((stored, _)) = self.users.get(user) else { return false };
+        let Ok(user) = std::str::from_utf8(username) else {
+            return false;
+        };
+        let Some((stored, _)) = self.users.get(user) else {
+            return false;
+        };
 
         if auth_data.is_empty() {
             // Empty password path.
@@ -106,8 +117,14 @@ fn double_sha1(pw: &[u8]) -> [u8; 20] {
 /// recommended hardening for production.
 pub fn generate_salt() -> [u8; 20] {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0);
-    let mut x = nanos ^ (COUNTER.fetch_add(0x9E3779B97F4A7C15, Ordering::Relaxed).wrapping_mul(0xD1B54A32D192ED03));
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let mut x = nanos
+        ^ (COUNTER
+            .fetch_add(0x9E3779B97F4A7C15, Ordering::Relaxed)
+            .wrapping_mul(0xD1B54A32D192ED03));
     let mut salt = [0u8; 20];
     for b in salt.iter_mut() {
         x ^= x >> 12;

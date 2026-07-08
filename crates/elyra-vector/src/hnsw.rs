@@ -23,7 +23,10 @@ struct Visited {
 }
 impl Visited {
     fn new(n: usize) -> Self {
-        Visited { stamp: vec![0; n], epoch: 0 }
+        Visited {
+            stamp: vec![0; n],
+            epoch: 0,
+        }
     }
     fn clear(&mut self) {
         self.epoch = self.epoch.wrapping_add(1);
@@ -218,7 +221,11 @@ impl Hnsw {
             if c.dist > worst && results.len() >= ef {
                 break;
             }
-            if let Some(list) = self.neighbors.get(c.node as usize).and_then(|n| n.get(level)) {
+            if let Some(list) = self
+                .neighbors
+                .get(c.node as usize)
+                .and_then(|n| n.get(level))
+            {
                 for &nb in list {
                     if visited.seen(nb) {
                         continue;
@@ -247,7 +254,10 @@ impl Hnsw {
         let qv = self.vectors[node as usize].clone();
         let mut scored: Vec<Cand> = list
             .iter()
-            .map(|&nb| Cand { dist: self.dist_to(nb, &qv), node: nb })
+            .map(|&nb| Cand {
+                dist: self.dist_to(nb, &qv),
+                node: nb,
+            })
             .collect();
         scored.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap_or(Ordering::Equal));
         scored.truncate(m);

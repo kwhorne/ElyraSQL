@@ -49,23 +49,29 @@ impl Value {
             return None;
         }
         match (self, other) {
-            (Date(_), _) | (_, Date(_)) => to_days(self).zip(to_days(other)).map(|(a, b)| a.cmp(&b)),
-            (DateTime(_), _) | (_, DateTime(_)) => {
-                to_micros(self).zip(to_micros(other)).map(|(a, b)| a.cmp(&b))
+            (Date(_), _) | (_, Date(_)) => {
+                to_days(self).zip(to_days(other)).map(|(a, b)| a.cmp(&b))
             }
+            (DateTime(_), _) | (_, DateTime(_)) => to_micros(self)
+                .zip(to_micros(other))
+                .map(|(a, b)| a.cmp(&b)),
             (Decimal(au, asc), Decimal(bu, bsc)) => Some(cmp_decimal(*au, *asc, *bu, *bsc)),
-            (Decimal(..), _) | (_, Decimal(..)) => {
-                self.as_f64().zip(other.as_f64()).and_then(|(a, b)| a.partial_cmp(&b))
-            }
-            (Time(_), _) | (_, Time(_)) => {
-                to_micros_of_day(self).zip(to_micros_of_day(other)).map(|(a, b)| a.cmp(&b))
-            }
+            (Decimal(..), _) | (_, Decimal(..)) => self
+                .as_f64()
+                .zip(other.as_f64())
+                .and_then(|(a, b)| a.partial_cmp(&b)),
+            (Time(_), _) | (_, Time(_)) => to_micros_of_day(self)
+                .zip(to_micros_of_day(other))
+                .map(|(a, b)| a.cmp(&b)),
             (Text(a), Text(b)) => Some(a.cmp(b)),
             (Json(a), Json(b)) => Some(a.cmp(b)),
             (Json(a), Text(b)) | (Text(b), Json(a)) => Some(a.cmp(b)),
             (Bool(a), Bool(b)) => Some(a.cmp(b)),
             (Bytes(a), Bytes(b)) => Some(a.cmp(b)),
-            _ => self.as_f64().zip(other.as_f64()).and_then(|(a, b)| a.partial_cmp(&b)),
+            _ => self
+                .as_f64()
+                .zip(other.as_f64())
+                .and_then(|(a, b)| a.partial_cmp(&b)),
         }
     }
 
@@ -75,7 +81,9 @@ impl Value {
             (true, true) => Ordering::Equal,
             (true, false) => Ordering::Less,
             (false, true) => Ordering::Greater,
-            _ => self.compare(other).unwrap_or_else(|| format!("{self:?}").cmp(&format!("{other:?}"))),
+            _ => self
+                .compare(other)
+                .unwrap_or_else(|| format!("{self:?}").cmp(&format!("{other:?}"))),
         }
     }
 
@@ -89,7 +97,11 @@ impl Value {
             Value::Text(s) => Some(s.clone()),
             Value::Bytes(b) => Some(String::from_utf8_lossy(b).into_owned()),
             Value::Vector(v) => {
-                let inner = v.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(",");
+                let inner = v
+                    .iter()
+                    .map(|x| x.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
                 Some(format!("[{inner}]"))
             }
             Value::Date(d) => Some(crate::datetime::format_date(*d)),
@@ -299,7 +311,8 @@ pub fn parse_decimal(s: &str, target_scale: u8) -> Option<(i128, u8)> {
         Some((a, b)) => (a, b),
         None => (s, ""),
     };
-    if !int_part.chars().all(|c| c.is_ascii_digit()) || !frac_part.chars().all(|c| c.is_ascii_digit())
+    if !int_part.chars().all(|c| c.is_ascii_digit())
+        || !frac_part.chars().all(|c| c.is_ascii_digit())
     {
         return None;
     }

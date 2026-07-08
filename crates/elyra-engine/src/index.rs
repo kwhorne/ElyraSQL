@@ -9,8 +9,8 @@
 //! `enc(col_values)` is the order-preserving composite encoding of the indexed
 //! columns, so equality and (single-column) range lookups are B-tree scans.
 
-use elyra_core::{Result, Value};
 use crate::session::Session;
+use elyra_core::{Result, Value};
 
 use crate::catalog::{data_prefix, IndexDef, TableDef};
 use crate::keyenc;
@@ -50,19 +50,27 @@ pub fn entries_for_row(
         if values.iter().any(|v| v.is_null()) || keyenc::encode_key(&values).is_err() {
             continue;
         }
-        out.push((entry_key(&def.name, &idx.name, &values, data_key)?, data_key.to_vec()));
+        out.push((
+            entry_key(&def.name, &idx.name, &values, data_key)?,
+            data_key.to_vec(),
+        ));
     }
     Ok(out)
 }
 
 pub fn entry_keys_for_row(def: &TableDef, row: &[Value], data_key: &[u8]) -> Result<Vec<Vec<u8>>> {
-    Ok(entries_for_row(def, row, data_key)?.into_iter().map(|(k, _)| k).collect())
+    Ok(entries_for_row(def, row, data_key)?
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect())
 }
 
 /// A single-column B-tree index on `col`, if one exists (used by the
 /// single-column eq/range fast paths).
-pub fn index_on<'a>(def: &'a TableDef, col: usize) -> Option<&'a IndexDef> {
-    def.indexes.iter().find(|i| !i.vector && i.single_col() == Some(col))
+pub fn index_on(def: &TableDef, col: usize) -> Option<&IndexDef> {
+    def.indexes
+        .iter()
+        .find(|i| !i.vector && i.single_col() == Some(col))
 }
 
 /// Equality lookup on the full set of indexed columns: data keys of rows whose
@@ -128,16 +136,21 @@ pub async fn lookup_range(
 
     let mut keys = Vec::new();
     loop {
-        let batch = db.scan_range(start.clone(), Some(end.clone()), 4096).await?;
+        let batch = db
+            .scan_range(start.clone(), Some(end.clone()), 4096)
+            .await?;
         if batch.is_empty() {
             break;
         }
         let last = batch.len() < 4096;
-        start = batch.last().map(|(k, _)| {
-            let mut n = k.clone();
-            n.push(0);
-            n
-        }).unwrap();
+        start = batch
+            .last()
+            .map(|(k, _)| {
+                let mut n = k.clone();
+                n.push(0);
+                n
+            })
+            .unwrap();
         for (_, data_key) in batch {
             keys.push(data_key);
         }

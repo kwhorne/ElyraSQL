@@ -42,7 +42,13 @@ struct Acc {
 
 impl Acc {
     fn new() -> Self {
-        Acc { count: 0, sum: 0.0, sum_is_int: true, extreme: None, distinct: HashSet::new() }
+        Acc {
+            count: 0,
+            sum: 0.0,
+            sum_is_int: true,
+            extreme: None,
+            distinct: HashSet::new(),
+        }
     }
 }
 
@@ -57,7 +63,12 @@ pub struct GroupAggregator {
 
 impl GroupAggregator {
     pub fn new(group_cols: Vec<usize>, aggs: Vec<AggSpec>) -> Self {
-        GroupAggregator { group_cols, aggs, groups: HashMap::new(), order: Vec::new() }
+        GroupAggregator {
+            group_cols,
+            aggs,
+            groups: HashMap::new(),
+            order: Vec::new(),
+        }
     }
 
     /// Feed one row into the aggregator.
@@ -70,7 +81,9 @@ impl GroupAggregator {
             (row.to_vec(), aggs.iter().map(|_| Acc::new()).collect())
         });
         for (i, spec) in self.aggs.iter().enumerate() {
-            let v = spec.arg_col.map(|c| row.get(c).cloned().unwrap_or(Value::Null));
+            let v = spec
+                .arg_col
+                .map(|c| row.get(c).cloned().unwrap_or(Value::Null));
             update(&mut entry.1[i], spec.func, v, spec.distinct);
         }
     }
@@ -105,7 +118,12 @@ impl GroupAggregator {
     /// Finalise into `(group sample row, aggregate results)` pairs, in first-
     /// seen group order.
     pub fn into_groups(self) -> Vec<(Vec<Value>, Vec<Value>)> {
-        let GroupAggregator { aggs, groups, order, .. } = self;
+        let GroupAggregator {
+            aggs,
+            groups,
+            order,
+            ..
+        } = self;
         order
             .into_iter()
             .map(|k| {
@@ -122,7 +140,10 @@ impl GroupAggregator {
 
     /// Results for an aggregate over zero rows (e.g. `COUNT(*)` -> 0).
     pub fn empty_result(&self) -> Vec<Value> {
-        self.aggs.iter().map(|s| finish(&Acc::new(), s.func)).collect()
+        self.aggs
+            .iter()
+            .map(|s| finish(&Acc::new(), s.func))
+            .collect()
     }
 }
 
@@ -130,7 +151,10 @@ fn group_key(cols: &[usize], row: &[Value]) -> String {
     if cols.is_empty() {
         return String::new();
     }
-    cols.iter().map(|&i| format!("{:?}", row.get(i).unwrap_or(&Value::Null))).collect::<Vec<_>>().join("\u{1}")
+    cols.iter()
+        .map(|&i| format!("{:?}", row.get(i).unwrap_or(&Value::Null)))
+        .collect::<Vec<_>>()
+        .join("\u{1}")
 }
 
 fn update(acc: &mut Acc, func: AggFunc, val: Option<Value>, distinct: bool) {

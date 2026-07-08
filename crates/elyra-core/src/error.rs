@@ -40,8 +40,8 @@ impl Error {
     pub fn mysql_code(&self) -> u16 {
         match self {
             Error::Parse(_) => 1064,
-            Error::Catalog(_) => 1146, // ER_NO_SUCH_TABLE-ish bucket
-            Error::Type(_) => 1366,    // ER_TRUNCATED_WRONG_VALUE
+            Error::Catalog(_) => 1146,     // ER_NO_SUCH_TABLE-ish bucket
+            Error::Type(_) => 1366,        // ER_TRUNCATED_WRONG_VALUE
             Error::Unsupported(_) => 1235, // ER_NOT_SUPPORTED_YET
             _ => 1105,
         }

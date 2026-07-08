@@ -57,7 +57,13 @@ fn parse_auth_spec(spec: &str) -> anyhow::Result<(String, String, elyra_core::Pr
     if parts.len() < 2 {
         anyhow::bail!("--auth must be user:password[:role], got '{spec}'");
     }
-    let role = match parts.get(2).copied().unwrap_or("admin").to_ascii_lowercase().as_str() {
+    let role = match parts
+        .get(2)
+        .copied()
+        .unwrap_or("admin")
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "admin" => elyra_core::Privilege::Admin,
         "write" | "readwrite" => elyra_core::Privilege::Write,
         "read" | "readonly" => elyra_core::Privilege::Read,
@@ -70,17 +76,28 @@ fn parse_auth_spec(spec: &str) -> anyhow::Result<(String, String, elyra_core::Pr
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
     let cli = Cli::parse();
     match cli.command {
         Command::Version => {
-            println!("{} {}", elyra_core::PRODUCT_NAME, elyra_core::SERVER_VERSION);
+            println!(
+                "{} {}",
+                elyra_core::PRODUCT_NAME,
+                elyra_core::SERVER_VERSION
+            );
         }
-        Command::Serve { data, listen, user, password, auth, tls_cert, tls_key } => {
+        Command::Serve {
+            data,
+            listen,
+            user,
+            password,
+            auth,
+            tls_cert,
+            tls_key,
+        } => {
             tracing::info!(?data, "opening ElyraSQL database file");
             let db = Db::open(&data)?;
             let engine = Engine::new(db);
