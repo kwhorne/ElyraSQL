@@ -64,8 +64,13 @@ cargo build --release
 # Run the server (creates elyra.edb if missing)
 ./target/release/elyrasql serve --data elyra.edb --listen 127.0.0.1:3307
 
+# With authentication + TLS
+./target/release/elyrasql serve \
+    --user root --password s3cret \
+    --tls-cert server.crt --tls-key server.key
+
 # Connect with any MySQL client
-mysql -h 127.0.0.1 -P 3307 -u root
+mysql -h 127.0.0.1 -P 3307 -u root -p
 ```
 
 ```sql
@@ -98,8 +103,9 @@ SELECT VERSION();   -- 8.0.0-ElyraSQL-0.1.0
 - [x] Aggregation (`COUNT/SUM/AVG/MIN/MAX`), `GROUP BY`, `ORDER BY`
 - [x] Vector ANN acceleration (HNSW), cached & rebuilt-when-stale
 - [ ] OLAP acceleration (columnar analytics)
-- [ ] Auth, roles, TLS
-- [ ] systemd packaging for Ubuntu 24.04+
+- [x] Authentication (mysql_native_password) + TLS
+- [ ] Roles / per-user privileges
+- [x] systemd packaging for Ubuntu 24.04+
 - [ ] ElyraSQL client (Rust + Svelte on Elyra Framework)
 
 ## License

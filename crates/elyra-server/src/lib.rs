@@ -4,6 +4,7 @@
 //! One TCP connection = one [`ElyraShim`] over the shared [`Engine`].
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 
 use elyra_engine::{Engine, QueryResult};
@@ -13,9 +14,36 @@ use opensrv_mysql::{
 };
 use tokio::io::AsyncWrite;
 use tokio::net::TcpListener;
-use tracing::{error, info};
+use tokio_rustls::rustls::ServerConfig as TlsServerConfig;
+use tracing::{error, info, warn};
 
+pub mod auth;
 mod prepared;
+
+pub use auth::Auth;
+
+/// Runtime configuration for the ElyraSQL server.
+pub struct ServerConfig {
+    pub listen: String,
+    pub auth: Arc<Auth>,
+    pub tls: Option<Arc<TlsServerConfig>>,
+}
+
+/// Build a rustls server config from PEM certificate and key files.
+pub fn load_tls(cert_path: impl AsRef<Path>, key_path: impl AsRef<Path>) -> std::io::Result<TlsServerConfig> {
+    use std::fs::File;
+    use std::io::{BufReader, Error, ErrorKind};
+    use rustls_pki_types::CertificateDer;
+
+    let certs = rustls_pemfile::certs(&mut BufReader::new(File::open(cert_path)?))
+        .collect::<Result<Vec<CertificateDer>, _>>()?;
+    let key = rustls_pemfile::private_key(&mut BufReader::new(File::open(key_path)?))?
+        .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "no private key in key file"))?;
+    TlsServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|e| Error::new(ErrorKind::InvalidInput, e))
+}
 
 // Prepared statements (COM_STMT_PREPARE/EXECUTE) are implemented by counting
 // `?` placeholders and binding parameters as SQL literals at execute time.
@@ -34,13 +62,21 @@ struct Prepared {
 /// Per-connection protocol handler.
 pub struct ElyraShim {
     engine: Engine,
+    auth: Arc<Auth>,
+    salt: [u8; 20],
     stmts: HashMap<u32, Prepared>,
     next_id: u32,
 }
 
 impl ElyraShim {
-    pub fn new(engine: Engine) -> Self {
-        Self { engine, stmts: HashMap::new(), next_id: 1 }
+    pub fn new(engine: Engine, auth: Arc<Auth>) -> Self {
+        Self {
+            engine,
+            auth,
+            salt: auth::generate_salt(),
+            stmts: HashMap::new(),
+            next_id: 1,
+        }
     }
 }
 
@@ -62,6 +98,30 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for ElyraShim {
     /// Version string reported in the MySQL handshake. Branded ElyraSQL.
     fn version(&self) -> String {
         elyra_core::SERVER_VERSION.to_string()
+    }
+
+    fn default_auth_plugin(&self) -> &str {
+        "mysql_native_password"
+    }
+
+    async fn auth_plugin_for_username(&self, _user: &[u8]) -> &str {
+        "mysql_native_password"
+    }
+
+    /// Per-connection salt. Must be stable across calls (opensrv reads it for
+    /// both the handshake and the verification step).
+    fn salt(&self) -> [u8; 20] {
+        self.salt
+    }
+
+    async fn authenticate(
+        &self,
+        _auth_plugin: &str,
+        username: &[u8],
+        salt: &[u8],
+        auth_data: &[u8],
+    ) -> bool {
+        self.auth.verify(username, salt, auth_data)
     }
 
     async fn on_prepare<'a>(
@@ -219,21 +279,51 @@ fn write_cell<W: AsyncWrite + Send + Unpin>(
     }
 }
 
-/// Bind to `addr` and serve ElyraSQL over the MySQL protocol until cancelled.
-pub async fn serve(addr: &str, engine: Engine) -> std::io::Result<()> {
-    let listener = TcpListener::bind(addr).await?;
-    info!(%addr, "ElyraSQL accepting MySQL-protocol connections");
+/// Bind and serve ElyraSQL over the MySQL protocol until cancelled.
+pub async fn serve(config: ServerConfig, engine: Engine) -> std::io::Result<()> {
+    let listener = TcpListener::bind(&config.listen).await?;
+    let tls_enabled = config.tls.is_some();
+    info!(addr = %config.listen, tls = tls_enabled, "ElyraSQL accepting MySQL-protocol connections");
+    if config.auth.is_open() {
+        warn!("authentication is OPEN (no credentials required) - set --user/--password for production");
+    }
 
     let engine = Arc::new(engine);
+    let auth = config.auth;
+    let tls = config.tls;
     loop {
         let (stream, peer) = listener.accept().await?;
         let engine = (*engine).clone();
+        let auth = auth.clone();
+        let tls = tls.clone();
         tokio::spawn(async move {
-            let shim = ElyraShim::new(engine);
-            let (r, w) = stream.into_split();
-            if let Err(e) = AsyncMysqlIntermediary::run_on(shim, r, w).await {
+            if let Err(e) = handle_connection(stream, engine, auth, tls).await {
                 error!(%peer, error = %e, "connection ended with error");
             }
         });
+    }
+}
+
+async fn handle_connection(
+    stream: tokio::net::TcpStream,
+    engine: Engine,
+    auth: Arc<Auth>,
+    tls: Option<Arc<TlsServerConfig>>,
+) -> std::io::Result<()> {
+    use opensrv_mysql::{plain_run_with_options, secure_run_with_options, IntermediaryOptions};
+
+    let (mut r, mut w) = stream.into_split();
+    let mut shim = ElyraShim::new(engine, auth);
+    let opts = IntermediaryOptions::default();
+
+    // Read the handshake first; the client tells us whether it wants TLS.
+    let (is_ssl, init) =
+        AsyncMysqlIntermediary::init_before_ssl(&mut shim, &mut r, &mut w, &tls).await?;
+
+    if is_ssl {
+        let cfg = tls.expect("client negotiated TLS without a server config");
+        secure_run_with_options(shim, w, opts, cfg, init).await
+    } else {
+        plain_run_with_options(shim, w, opts, init).await
     }
 }

@@ -25,6 +25,22 @@ enum Command {
         /// Address to bind the MySQL-compatible listener to.
         #[arg(long, env = "ELYRASQL_LISTEN", default_value = "127.0.0.1:3307")]
         listen: String,
+
+        /// Require this username to connect (enables authentication).
+        #[arg(long, env = "ELYRASQL_USER")]
+        user: Option<String>,
+
+        /// Password for --user.
+        #[arg(long, env = "ELYRASQL_PASSWORD", default_value = "")]
+        password: String,
+
+        /// PEM certificate file to enable TLS.
+        #[arg(long, env = "ELYRASQL_TLS_CERT", requires = "tls_key")]
+        tls_cert: Option<PathBuf>,
+
+        /// PEM private key file to enable TLS.
+        #[arg(long, env = "ELYRASQL_TLS_KEY", requires = "tls_cert")]
+        tls_key: Option<PathBuf>,
     },
     /// Print version and build information.
     Version,
@@ -44,11 +60,24 @@ async fn main() -> anyhow::Result<()> {
         Command::Version => {
             println!("{} {}", elyra_core::PRODUCT_NAME, elyra_core::SERVER_VERSION);
         }
-        Command::Serve { data, listen } => {
+        Command::Serve { data, listen, user, password, tls_cert, tls_key } => {
             tracing::info!(?data, "opening ElyraSQL database file");
             let db = Db::open(&data)?;
             let engine = Engine::new(db);
-            elyra_server::serve(&listen, engine).await?;
+
+            let auth = match user {
+                Some(u) => std::sync::Arc::new(elyra_server::Auth::single(&u, &password)),
+                None => std::sync::Arc::new(elyra_server::Auth::open()),
+            };
+            let tls = match (tls_cert, tls_key) {
+                (Some(cert), Some(key)) => {
+                    Some(std::sync::Arc::new(elyra_server::load_tls(&cert, &key)?))
+                }
+                _ => None,
+            };
+
+            let config = elyra_server::ServerConfig { listen, auth, tls };
+            elyra_server::serve(config, engine).await?;
         }
     }
     Ok(())
