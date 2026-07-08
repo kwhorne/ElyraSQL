@@ -9,30 +9,50 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use elyra_core::Privilege;
 use sha1::{Digest, Sha1};
 
 /// Credential store. When empty (`open`), all logins are accepted — intended
 /// only for local development, and logged loudly by the server.
 pub struct Auth {
-    users: HashMap<String, [u8; 20]>,
+    users: HashMap<String, ([u8; 20], Privilege)>,
     open: bool,
 }
 
 impl Auth {
-    /// Open mode: accept any user (dev only).
+    /// Open mode: accept any user with full (Admin) privileges (dev only).
     pub fn open() -> Self {
         Auth { users: HashMap::new(), open: true }
     }
 
-    /// Require exactly the given user/password.
+    /// Require exactly the given user/password, with Admin privileges.
     pub fn single(user: &str, password: &str) -> Self {
+        Self::with_users(vec![(user.to_string(), password.to_string(), Privilege::Admin)])
+    }
+
+    /// Build from explicit `(user, password, privilege)` triples.
+    pub fn with_users(entries: Vec<(String, String, Privilege)>) -> Self {
         let mut users = HashMap::new();
-        users.insert(user.to_string(), double_sha1(password.as_bytes()));
+        for (u, p, priv_) in entries {
+            users.insert(u, (double_sha1(p.as_bytes()), priv_));
+        }
         Auth { users, open: false }
     }
 
     pub fn is_open(&self) -> bool {
         self.open
+    }
+
+    /// Privilege granted to `username` (Admin in open mode; Read if unknown).
+    pub fn privilege(&self, username: &[u8]) -> Privilege {
+        if self.open {
+            return Privilege::Admin;
+        }
+        std::str::from_utf8(username)
+            .ok()
+            .and_then(|u| self.users.get(u))
+            .map(|(_, p)| *p)
+            .unwrap_or(Privilege::Read)
     }
 
     /// Verify a `mysql_native_password` handshake response.
@@ -45,7 +65,7 @@ impl Auth {
             return true;
         }
         let Ok(user) = std::str::from_utf8(username) else { return false };
-        let Some(stored) = self.users.get(user) else { return false };
+        let Some((stored, _)) = self.users.get(user) else { return false };
 
         if auth_data.is_empty() {
             // Empty password path.

@@ -34,6 +34,11 @@ enum Command {
         #[arg(long, env = "ELYRASQL_PASSWORD", default_value = "")]
         password: String,
 
+        /// Additional user as `user:password:role` (role: admin|write|read).
+        /// Repeatable. Enables authentication.
+        #[arg(long = "auth", value_name = "USER:PASS:ROLE")]
+        auth: Vec<String>,
+
         /// PEM certificate file to enable TLS.
         #[arg(long, env = "ELYRASQL_TLS_CERT", requires = "tls_key")]
         tls_cert: Option<PathBuf>,
@@ -44,6 +49,21 @@ enum Command {
     },
     /// Print version and build information.
     Version,
+}
+
+/// Parse a `user:password:role` auth spec (role optional, defaults to admin).
+fn parse_auth_spec(spec: &str) -> anyhow::Result<(String, String, elyra_core::Privilege)> {
+    let parts: Vec<&str> = spec.splitn(3, ':').collect();
+    if parts.len() < 2 {
+        anyhow::bail!("--auth must be user:password[:role], got '{spec}'");
+    }
+    let role = match parts.get(2).copied().unwrap_or("admin").to_ascii_lowercase().as_str() {
+        "admin" => elyra_core::Privilege::Admin,
+        "write" | "readwrite" => elyra_core::Privilege::Write,
+        "read" | "readonly" => elyra_core::Privilege::Read,
+        other => anyhow::bail!("unknown role '{other}' (use admin|write|read)"),
+    };
+    Ok((parts[0].to_string(), parts[1].to_string(), role))
 }
 
 #[tokio::main]
@@ -60,15 +80,23 @@ async fn main() -> anyhow::Result<()> {
         Command::Version => {
             println!("{} {}", elyra_core::PRODUCT_NAME, elyra_core::SERVER_VERSION);
         }
-        Command::Serve { data, listen, user, password, tls_cert, tls_key } => {
+        Command::Serve { data, listen, user, password, auth, tls_cert, tls_key } => {
             tracing::info!(?data, "opening ElyraSQL database file");
             let db = Db::open(&data)?;
             let engine = Engine::new(db);
 
-            let auth = match user {
-                Some(u) => std::sync::Arc::new(elyra_server::Auth::single(&u, &password)),
-                None => std::sync::Arc::new(elyra_server::Auth::open()),
-            };
+            let mut entries: Vec<(String, String, elyra_core::Privilege)> = Vec::new();
+            if let Some(u) = user {
+                entries.push((u, password, elyra_core::Privilege::Admin));
+            }
+            for spec in auth {
+                entries.push(parse_auth_spec(&spec)?);
+            }
+            let auth = std::sync::Arc::new(if entries.is_empty() {
+                elyra_server::Auth::open()
+            } else {
+                elyra_server::Auth::with_users(entries)
+            });
             let tls = match (tls_cert, tls_key) {
                 (Some(cert), Some(key)) => {
                     Some(std::sync::Arc::new(elyra_server::load_tls(&cert, &key)?))

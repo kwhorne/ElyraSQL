@@ -645,15 +645,7 @@ fn equi_nlj(on: &Expr, driving: &Schema, partner: &Schema) -> Option<(Expr, usiz
     None
 }
 
-fn join_on(op: &JoinOperator) -> Result<(Option<Expr>, bool)> {
-    Ok(match op {
-        JoinOperator::Inner(JoinConstraint::On(e)) => (Some(e.clone()), false),
-        JoinOperator::Inner(JoinConstraint::None) | JoinOperator::CrossJoin => (None, false),
-        JoinOperator::LeftOuter(JoinConstraint::On(e)) => (Some(e.clone()), true),
-        JoinOperator::LeftOuter(JoinConstraint::None) => (None, true),
-        other => return Err(Error::Unsupported(format!("join type not supported: {other:?}"))),
-    })
-}
+
 
 /// Whether `conjunct` is `col = <literal>` on this table's PK or an index.
 fn is_accelerable(def: &TableDef, conjunct: &Expr) -> Result<bool> {
@@ -835,7 +827,7 @@ async fn build_from(
             cur_rows = br;
             first = false;
         } else {
-            let (c, r) = combine(&cur_cols, &cur_rows, &bc, &br, &JoinOperator::CrossJoin)?;
+            let (c, r) = combine(&cur_cols, &cur_rows, &bc, &br, JoinKind::Inner, None)?;
             cur_cols = c;
             cur_rows = r;
         }
@@ -846,10 +838,12 @@ async fn build_from(
             let (pdef, pcols) = resolve_table(db, &join.relation).await?;
             let driving_schema = Schema::new(cur_cols.clone());
             let partner_schema = Schema::new(pcols.clone());
-            let (on, left_outer) = join_on(&join.join_operator)?;
+            let (kind, on) = join_kind(&join.join_operator)?;
+            let left_outer = kind == JoinKind::Left;
 
             let nlj = on
                 .as_ref()
+                .filter(|_| matches!(kind, JoinKind::Inner | JoinKind::Left))
                 .and_then(|e| equi_nlj(e, &driving_schema, &partner_schema))
                 .filter(|(_, pcol)| {
                     cur_rows.len() <= NLJ_MAX_DRIVING
@@ -887,7 +881,7 @@ async fn build_from(
             // Fallback: materialise the partner (with pushdown) and hash/nested join.
             let (jc, mut jr) = load_relation(db, &join.relation, conjuncts).await?;
             jr = apply_pushdown(jr, &jc, conjuncts)?;
-            let (c, r) = combine(&cur_cols, &cur_rows, &jc, &jr, &join.join_operator)?;
+            let (c, r) = combine(&cur_cols, &cur_rows, &jc, &jr, kind, on.as_ref())?;
             cur_cols = c;
             cur_rows = r;
         }
@@ -924,59 +918,93 @@ fn apply_pushdown(
     Ok(out)
 }
 
-/// Combine two materialised relations under a join operator. Uses a hash join
-/// for equi-join `ON`s (`l.x = r.y`), falling back to nested-loop otherwise.
+/// The four supported join kinds.
+#[derive(Clone, Copy, PartialEq)]
+enum JoinKind {
+    Inner,
+    Left,
+    Right,
+    Full,
+}
+
+fn join_kind(op: &JoinOperator) -> Result<(JoinKind, Option<Expr>)> {
+    let on = |c: &JoinConstraint| match c {
+        JoinConstraint::On(e) => Some(e.clone()),
+        _ => None,
+    };
+    Ok(match op {
+        JoinOperator::Inner(c) => (JoinKind::Inner, on(c)),
+        JoinOperator::CrossJoin => (JoinKind::Inner, None),
+        JoinOperator::LeftOuter(c) => (JoinKind::Left, on(c)),
+        JoinOperator::RightOuter(c) => (JoinKind::Right, on(c)),
+        JoinOperator::FullOuter(c) => (JoinKind::Full, on(c)),
+        other => return Err(Error::Unsupported(format!("join type not supported: {other:?}"))),
+    })
+}
+
+/// Combine two materialised relations under a join kind. Equi-`ON` INNER/LEFT
+/// use a hash join; everything else (RIGHT/FULL, non-equi) is nested-loop.
 fn combine(
     lcols: &[ColumnDef],
     lrows: &[Vec<Value>],
     rcols: &[ColumnDef],
     rrows: &[Vec<Value>],
-    op: &JoinOperator,
+    kind: JoinKind,
+    on: Option<&Expr>,
 ) -> Result<(Vec<ColumnDef>, Vec<Vec<Value>>)> {
-    let (on, left_outer) = match op {
-        JoinOperator::Inner(JoinConstraint::On(e)) => (Some(e.clone()), false),
-        JoinOperator::Inner(JoinConstraint::None) | JoinOperator::CrossJoin => (None, false),
-        JoinOperator::LeftOuter(JoinConstraint::On(e)) => (Some(e.clone()), true),
-        JoinOperator::LeftOuter(JoinConstraint::None) => (None, true),
-        other => {
-            return Err(Error::Unsupported(format!("join type not supported: {other:?}")))
-        }
-    };
-
     let mut cols = lcols.to_vec();
     cols.extend_from_slice(rcols);
     let lschema = Schema::new(lcols.to_vec());
     let rschema = Schema::new(rcols.to_vec());
 
-    // Try to plan a hash join from an equi-`ON`.
-    if let Some(e) = &on {
-        if let Some((lkey, rkey)) = equi_keys(e, &lschema, &rschema) {
-            return Ok((cols, hash_join(lrows, rrows, &lschema, &rschema, &lkey, &rkey, left_outer)?));
+    // Hash join for equi INNER/LEFT.
+    if matches!(kind, JoinKind::Inner | JoinKind::Left) {
+        if let Some(e) = on {
+            if let Some((lkey, rkey)) = equi_keys(e, &lschema, &rschema) {
+                let rows = hash_join(
+                    lrows, rrows, &lschema, &rschema, &lkey, &rkey, kind == JoinKind::Left,
+                )?;
+                return Ok((cols, rows));
+            }
         }
     }
 
-    // Nested-loop fallback.
     let schema = Schema::new(cols.clone());
+    let llen = lcols.len();
     let rlen = rcols.len();
     let mut out = Vec::new();
+    let mut right_matched = vec![false; rrows.len()];
+
     for l in lrows {
         let mut matched = false;
-        for r in rrows {
+        for (ri, r) in rrows.iter().enumerate() {
             let mut combined = l.clone();
             combined.extend_from_slice(r);
-            let keep = match &on {
+            let keep = match on {
                 Some(e) => predicate::matches(e, &schema, &combined)?,
                 None => true,
             };
             if keep {
                 out.push(combined);
                 matched = true;
+                right_matched[ri] = true;
             }
         }
-        if left_outer && !matched {
+        if matches!(kind, JoinKind::Left | JoinKind::Full) && !matched {
             let mut combined = l.clone();
             combined.extend(std::iter::repeat(Value::Null).take(rlen));
             out.push(combined);
+        }
+    }
+
+    // RIGHT/FULL: emit right rows that matched nothing, left side NULL-filled.
+    if matches!(kind, JoinKind::Right | JoinKind::Full) {
+        for (ri, r) in rrows.iter().enumerate() {
+            if !right_matched[ri] {
+                let mut combined = vec![Value::Null; llen];
+                combined.extend_from_slice(r);
+                out.push(combined);
+            }
         }
     }
     Ok((cols, out))
@@ -1468,22 +1496,37 @@ fn project_exprs(
         out_rows.push(o);
     }
 
-    // Infer output column types (from the source column, else the first row).
+    // Infer output column types: from the source column when the projection is
+    // a column reference (join-aware), else from the first non-NULL value.
     let mut cols = Vec::with_capacity(projs.len());
     for (ci, (name, p)) in names.iter().zip(&projs).enumerate() {
         let ty = match p {
             Proj::Col(i) => schema.columns[*i].ty.clone(),
-            Proj::Expr(e) => match ident_name(e).and_then(|n| {
-                schema.columns.iter().find(|c| c.name.eq_ignore_ascii_case(n))
-            }) {
-                Some(c) => c.ty.clone(),
-                None => out_rows.first().map(|r| infer_val(&r[ci])).unwrap_or(ColumnType::Text),
+            Proj::Expr(e) => match col_ref_name(e).and_then(|n| predicate::resolve_index(&n, schema).ok()) {
+                Some(idx) => schema.columns[idx].ty.clone(),
+                None => out_rows
+                    .iter()
+                    .map(|r| &r[ci])
+                    .find(|v| !v.is_null())
+                    .map(infer_val)
+                    .unwrap_or(ColumnType::Text),
             },
         };
         cols.push(ColumnDef { name: name.clone(), ty, nullable: true });
     }
 
     Ok((Schema::new(cols), out_rows))
+}
+
+/// The (qualified) name of a plain column reference, if `e` is one.
+fn col_ref_name(e: &Expr) -> Option<String> {
+    match e {
+        Expr::Identifier(id) => Some(id.value.clone()),
+        Expr::CompoundIdentifier(parts) => {
+            Some(parts.iter().map(|i| i.value.as_str()).collect::<Vec<_>>().join("."))
+        }
+        _ => None,
+    }
 }
 
 fn infer_val(v: &Value) -> ColumnType {

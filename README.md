@@ -112,7 +112,9 @@ journalctl -u elyrasql -f
 - [x] MySQL wire-protocol server (handshake + text protocol)
 - [x] SQL frontend (MySQL dialect) + literal/arithmetic `SELECT`
 - [ ] Transactional executor: `CREATE/INSERT/UPDATE/DELETE/SELECT` over storage
-- [x] JOINs (INNER / LEFT / CROSS, multi-table) with qualified columns
+- [x] JOINs (INNER / LEFT / RIGHT / FULL / CROSS, multi-table)
+- [x] Range index scans (`>`, `>=`, `<`, `<=`, `BETWEEN`)
+- [x] Roles / per-user privileges (read / write / admin)
 - [ ] Secondary indexes + query planner
 - [x] Prepared statements (binary protocol): typed params, escaping
       (see caveat on repeated close→prepare cycles under opensrv 0.7)

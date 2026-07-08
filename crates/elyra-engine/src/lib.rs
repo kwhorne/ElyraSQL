@@ -16,7 +16,7 @@ mod predicate;
 mod stream;
 mod vindex;
 
-use elyra_core::{ColumnType, Error, Result, Schema, Value};
+use elyra_core::{ColumnType, Error, Privilege, Result, Schema, Value};
 use elyra_storage::Db;
 use sqlparser::ast::Statement;
 use sqlparser::dialect::MySqlDialect;
@@ -60,10 +60,11 @@ impl Engine {
         Self { db, vindex: vindex::VectorRegistry::new() }
     }
 
-    /// Parse and execute one or more `;`-separated statements.
-    pub async fn execute(&self, sql: &str) -> Result<Vec<QueryResult>> {
+    /// Parse and execute one or more `;`-separated statements, enforcing that
+    /// each statement is permitted at the caller's `privilege` level.
+    pub async fn execute(&self, sql: &str, privilege: Privilege) -> Result<Vec<QueryResult>> {
         if let Some(r) = self.intercept_session(sql) {
-            return Ok(vec![r]);
+            return Ok(vec![r]); // session/introspection: read-level
         }
 
         let dialect = MySqlDialect {};
@@ -72,6 +73,12 @@ impl Engine {
 
         let mut out = Vec::with_capacity(statements.len());
         for stmt in statements {
+            let need = required_privilege(&stmt);
+            if privilege < need {
+                return Err(Error::Query(format!(
+                    "access denied: statement requires {need:?} privilege"
+                )));
+            }
             out.push(self.execute_stmt(stmt).await?);
         }
         Ok(out)
@@ -134,6 +141,17 @@ impl Engine {
             _ if lower.starts_with("set ") => Some(QueryResult::empty_ok()),
             _ => None,
         }
+    }
+}
+
+/// Minimum privilege required to run a statement.
+fn required_privilege(stmt: &Statement) -> Privilege {
+    match stmt {
+        Statement::Query(_)
+        | Statement::SetVariable { .. }
+        | Statement::Use { .. } => Privilege::Read,
+        Statement::Insert(_) | Statement::Update { .. } | Statement::Delete(_) => Privilege::Write,
+        _ => Privilege::Admin, // CREATE / DROP / CREATE INDEX and anything else
     }
 }
 
