@@ -1,35 +1,61 @@
-//! Order-preserving ("memcomparable") key encoding.
+//! Order-preserving ("memcomparable") key encoding, single- and multi-column.
 //!
-//! ElyraSQL stores rows clustered on their key inside the ordered `redb`
-//! B-tree, so the byte ordering of encoded keys must match SQL value order.
-//! That lets PK point-lookups and range scans ride the B-tree directly.
+//! Rows are clustered on their key inside the ordered `redb` B-tree, so the
+//! byte ordering of encoded keys must match SQL value order. Composite keys
+//! concatenate per-component encodings; fixed-width components are inherently
+//! self-delimiting, and text is escaped + terminated so it is too.
 
 use elyra_core::{Error, Result, Value};
 
-/// Encode a clustered-index key value into order-preserving bytes.
-pub fn encode(value: &Value) -> Result<Vec<u8>> {
-    Ok(match value {
-        // Flip the sign bit so negatives sort before positives, big-endian
-        // so lexicographic byte order equals numeric order.
-        Value::Int(i) => (*i as u64 ^ 0x8000_0000_0000_0000).to_be_bytes().to_vec(),
-        // UTF-8 bytes already sort correctly for a single trailing key.
-        Value::Text(s) => s.as_bytes().to_vec(),
-        Value::Bool(b) => vec![*b as u8],
-        Value::Date(d) => (*d as u32 ^ 0x8000_0000).to_be_bytes().to_vec(),
-        Value::DateTime(t) => (*t as u64 ^ 0x8000_0000_0000_0000).to_be_bytes().to_vec(),
-        // Scale is uniform per column, so comparing unscaled values preserves
-        // order. Sign-flip the top bit for correct signed ordering.
-        Value::Decimal(u, _) => (*u as u128 ^ (1u128 << 127)).to_be_bytes().to_vec(),
-        other => {
-            return Err(Error::Unsupported(format!(
-                "value type cannot be used as a primary key: {other:?}"
-            )))
-        }
-    })
+/// Encode a (possibly composite) key from its component values, in key order.
+pub fn encode_key(values: &[Value]) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(values.len() * 8);
+    for v in values {
+        encode_component(v, &mut out)?;
+    }
+    Ok(out)
 }
 
-/// Encode a hidden rowid (used when a table has no primary key). Big-endian
-/// so rowids iterate in insertion/numeric order.
+/// Encode a single value (convenience for one-column keys/bounds).
+pub fn encode(value: &Value) -> Result<Vec<u8>> {
+    encode_key(std::slice::from_ref(value))
+}
+
+fn encode_component(value: &Value, out: &mut Vec<u8>) -> Result<()> {
+    match value {
+        // Flip the sign bit so negatives sort first; big-endian for order.
+        Value::Int(i) => out.extend_from_slice(&(*i as u64 ^ 0x8000_0000_0000_0000).to_be_bytes()),
+        Value::Date(d) => out.extend_from_slice(&(*d as u32 ^ 0x8000_0000).to_be_bytes()),
+        Value::DateTime(t) => {
+            out.extend_from_slice(&(*t as u64 ^ 0x8000_0000_0000_0000).to_be_bytes())
+        }
+        Value::Decimal(u, _) => {
+            out.extend_from_slice(&(*u as u128 ^ (1u128 << 127)).to_be_bytes())
+        }
+        Value::Bool(b) => out.push(*b as u8),
+        // Escape 0x00 as 0x00 0x01, terminate with 0x00 0x00 (< any 0x00 0x01),
+        // making text self-delimiting while preserving byte order.
+        Value::Text(s) => {
+            for &b in s.as_bytes() {
+                if b == 0x00 {
+                    out.extend_from_slice(&[0x00, 0x01]);
+                } else {
+                    out.push(b);
+                }
+            }
+            out.extend_from_slice(&[0x00, 0x00]);
+        }
+        other => {
+            return Err(Error::Unsupported(format!(
+                "value type cannot be used as a key: {other:?}"
+            )))
+        }
+    }
+    Ok(())
+}
+
+/// Encode a hidden rowid (tables without a primary key). Big-endian keeps
+/// rowids in numeric/insertion order.
 pub fn encode_rowid(rowid: u64) -> [u8; 8] {
     rowid.to_be_bytes()
 }

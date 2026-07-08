@@ -89,7 +89,7 @@ pub async fn create_table(db: &Db, txn: &mut Txn, ct: CreateTable) -> Result<Que
     }
 
     let mut columns = Vec::with_capacity(ct.columns.len());
-    let mut pk_col = None;
+    let mut pk_cols: Vec<usize> = Vec::new();
 
     for (idx, col) in ct.columns.iter().enumerate() {
         let ty = map_type(&col.data_type)?;
@@ -98,7 +98,7 @@ pub async fn create_table(db: &Db, txn: &mut Txn, ct: CreateTable) -> Result<Que
             match &opt.option {
                 ColumnOption::NotNull => nullable = false,
                 ColumnOption::Unique { is_primary: true, .. } => {
-                    pk_col = Some(idx);
+                    pk_cols.push(idx);
                     nullable = false;
                 }
                 _ => {}
@@ -107,28 +107,27 @@ pub async fn create_table(db: &Db, txn: &mut Txn, ct: CreateTable) -> Result<Que
         columns.push(ColumnDef { name: col.name.value.clone(), ty, nullable });
     }
 
-    // Table-level PRIMARY KEY (single column supported).
+    // Table-level PRIMARY KEY (single or composite).
     for c in &ct.constraints {
         if let TableConstraint::PrimaryKey { columns: cols, .. } = c {
-            if cols.len() != 1 {
-                return Err(Error::Unsupported(
-                    "composite primary keys are not supported yet".into(),
-                ));
+            pk_cols.clear();
+            for ident in cols {
+                let i = columns
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(&ident.value))
+                    .ok_or_else(|| {
+                        Error::Catalog(format!("unknown primary key column: {}", ident.value))
+                    })?;
+                columns[i].nullable = false;
+                pk_cols.push(i);
             }
-            let pk_name = &cols[0].value;
-            let i = columns
-                .iter()
-                .position(|c| c.name.eq_ignore_ascii_case(pk_name))
-                .ok_or_else(|| Error::Catalog(format!("unknown primary key column: {pk_name}")))?;
-            pk_col = Some(i);
-            columns[i].nullable = false;
         }
     }
 
     let def = TableDef {
         name: name.clone(),
         schema: Schema::new(columns),
-        pk_col,
+        pk_cols,
         indexes: Vec::new(),
     };
     txn.apply(db, vec![(catalog_key(&name), def.encode()?)], vec![]).await?;
@@ -139,22 +138,27 @@ pub async fn create_index(db: &Db, txn: &mut Txn, ci: CreateIndex) -> Result<Que
     let table = table_ident(&ci.table_name)?;
     let mut def = catalog::load(db, &table).await?;
 
-    if ci.columns.len() != 1 {
-        return Err(Error::Unsupported("composite indexes are not supported yet".into()));
+    if ci.columns.is_empty() {
+        return Err(Error::Query("CREATE INDEX requires at least one column".into()));
     }
-    let col_expr = &ci.columns[0].expr;
-    let col_name = ident_name(col_expr)
-        .ok_or_else(|| Error::Unsupported("index column must be a plain column".into()))?;
-    let col = def
-        .schema
-        .columns
-        .iter()
-        .position(|c| c.name.eq_ignore_ascii_case(col_name))
-        .ok_or_else(|| Error::Catalog(format!("unknown column: {col_name}")))?;
+    let mut cols = Vec::with_capacity(ci.columns.len());
+    let mut col_names = Vec::new();
+    for oc in &ci.columns {
+        let col_name = ident_name(&oc.expr)
+            .ok_or_else(|| Error::Unsupported("index column must be a plain column".into()))?;
+        let col = def
+            .schema
+            .columns
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(col_name))
+            .ok_or_else(|| Error::Catalog(format!("unknown column: {col_name}")))?;
+        cols.push(col);
+        col_names.push(col_name.to_string());
+    }
 
     let name = match &ci.name {
         Some(n) => n.0.last().map(|i| i.value.clone()).unwrap_or_default(),
-        None => format!("{table}_{col_name}_idx"),
+        None => format!("{table}_{}_idx", col_names.join("_")),
     };
     if def.indexes.iter().any(|i| i.name.eq_ignore_ascii_case(&name)) {
         if ci.if_not_exists {
@@ -163,8 +167,10 @@ pub async fn create_index(db: &Db, txn: &mut Txn, ci: CreateIndex) -> Result<Que
         return Err(Error::Catalog(format!("index already exists: {name}")));
     }
 
-    let is_vector = matches!(def.schema.columns[col].ty, ColumnType::Vector(_));
-    def.indexes.push(IndexDef { name, col, unique: ci.unique, vector: is_vector });
+    // A vector (HNSW) index is a single VECTOR column; composite must be B-tree.
+    let is_vector =
+        cols.len() == 1 && matches!(def.schema.columns[cols[0]].ty, ColumnType::Vector(_));
+    def.indexes.push(IndexDef { name, cols, unique: ci.unique, vector: is_vector });
 
     // Persist the new catalog and backfill index entries for existing rows.
     let mut puts: Vec<(Vec<u8>, Vec<u8>)> = vec![(catalog_key(&table), def.encode()?)];
@@ -220,11 +226,7 @@ pub async fn insert(db: &Db, txn: &mut Txn, ins: Insert) -> Result<QueryResult> 
     };
 
     // Load rowid counter once for tables without a PK.
-    let mut next_rowid = if def.pk_col.is_none() {
-        read_rowid(db, &name).await?
-    } else {
-        0
-    };
+    let mut next_rowid = if def.has_pk() { 0 } else { read_rowid(db, &name).await? };
 
     let mut puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(value_rows.len());
 
@@ -251,12 +253,12 @@ pub async fn insert(db: &Db, txn: &mut Txn, ins: Insert) -> Result<QueryResult> 
             }
         }
 
-        let key = match def.pk_col {
-            Some(i) => data_key(&name, &keyenc::encode(&row[i])?),
-            None => {
-                next_rowid += 1;
-                data_key(&name, &keyenc::encode_rowid(next_rowid))
-            }
+        let key = if def.has_pk() {
+            let pk_vals: Vec<Value> = def.pk_cols.iter().map(|&i| row[i].clone()).collect();
+            data_key(&name, &keyenc::encode_key(&pk_vals)?)
+        } else {
+            next_rowid += 1;
+            data_key(&name, &keyenc::encode_rowid(next_rowid))
         };
         let encoded = bincode::serialize(&row).map_err(|e| Error::Storage(e.to_string()))?;
         let idx_entries = index::entries_for_row(&def, &row, &key)?;
@@ -267,7 +269,7 @@ pub async fn insert(db: &Db, txn: &mut Txn, ins: Insert) -> Result<QueryResult> 
     let affected = puts.len() as u64;
 
     // Persist the advanced rowid counter in the same atomic commit.
-    if def.pk_col.is_none() {
+    if !def.has_pk() {
         puts.push((rowid_key(&name), next_rowid.to_le_bytes().to_vec()));
     }
     puts.push(bump_wcount(db, &name).await?);
@@ -344,7 +346,7 @@ pub async fn select(
         // HNSW index and no WHERE — search the index instead of scanning all.
         if filter.is_none() && offset == 0 {
             if let Some((col, q, k)) = ann_query(&resolved, limit, &def)? {
-                if def.indexes.iter().any(|i| i.vector && i.col == col) {
+                if def.indexes.iter().any(|i| i.vector && i.single_col() == Some(col)) {
                     let cached = vindex.get(db, &def, col, Metric::L2).await?;
                     let hits = cached.index.search(&q, k, (k * 4).max(64));
                     let keys: Vec<Vec<u8>> =
@@ -416,26 +418,9 @@ pub async fn select(
 
     let out_schema = Schema::new(out_cols);
 
-    // Secondary-index fast path: `WHERE indexed_col = <literal>` retrieves
-    // matching rows via the index instead of scanning the whole table.
-    if let Some((col, _)) = eq_col_literal(&def, filter.as_ref())? {
-        if def.pk_col != Some(col) && index::index_on(&def, col).is_some() {
-            let mut rows: Vec<Vec<Value>> = collect_matches(db, &def, filter.as_ref(), None)
-                .await?
-                .into_iter()
-                .map(|(_, r)| r)
-                .collect();
-            apply_offset_limit(&mut rows, offset, limit);
-            let out: Vec<Vec<Value>> = rows
-                .iter()
-                .map(|r| projection.iter().map(|&i| r[i].clone()).collect())
-                .collect();
-            return Ok(QueryResult::Rows(RowStream::literal(out_schema, out)));
-        }
-    }
-
-    // Range fast path: `WHERE col >|<|BETWEEN` on a PK/indexed column.
-    if range_bounds(&def, filter.as_ref())?.is_some() {
+    // Fast path: PK/index equality (single or composite) or a range on a
+    // PK/indexed column -> fetch via the index and project, instead of a scan.
+    if accelerable(&def, filter.as_ref())? {
         let mut rows: Vec<Vec<Value>> = collect_matches(db, &def, filter.as_ref(), None)
             .await?
             .into_iter()
@@ -449,21 +434,6 @@ pub async fn select(
         return Ok(QueryResult::Rows(RowStream::literal(out_schema, out)));
     }
 
-    // Fast path: `WHERE pk = <literal>` becomes an O(log n) point lookup on
-    // the clustered key instead of a full table scan.
-    if offset == 0 && limit != Some(0) {
-        match try_pk_lookup(db, &def, filter.as_ref()).await? {
-            PkLookup::Found(row) => {
-                let projected = projection.iter().map(|&i| row[i].clone()).collect();
-                return Ok(QueryResult::Rows(RowStream::literal(out_schema, vec![projected])));
-            }
-            PkLookup::NotFound => {
-                return Ok(QueryResult::Rows(RowStream::literal(out_schema, vec![])));
-            }
-            PkLookup::NotApplicable => {}
-        }
-    }
-
     Ok(QueryResult::Rows(RowStream::scan(
         db.clone(),
         &def,
@@ -471,18 +441,6 @@ pub async fn select(
     )))
 }
 
-/// Outcome of attempting the clustered PK point-lookup fast path.
-enum PkLookup {
-    /// The predicate is not `pk = <literal>`; use a normal scan.
-    NotApplicable,
-    /// Point lookup ran, no matching row.
-    NotFound,
-    /// Point lookup ran, here is the row.
-    Found(Vec<Value>),
-}
-
-/// If `filter` is exactly `pk = <literal>` (either operand order), return the
-/// literal to look up directly on the clustered key.
 /// Execute a multi-table / JOIN SELECT: materialise the joined row set, then
 /// apply WHERE, aggregation or ORDER BY, projection and paging.
 async fn join_select(
@@ -602,7 +560,7 @@ async fn lookup_rows_by_eq(
     let deser = |b: Vec<u8>| -> Result<Vec<Value>> {
         bincode::deserialize(&b).map_err(|e| Error::Storage(e.to_string()))
     };
-    if def.pk_col == Some(col) {
+    if def.pk_cols == [col] {
         let key = data_key(&def.name, &keyenc::encode(value)?);
         return Ok(match db.get(key).await? {
             Some(b) => vec![deser(b)?],
@@ -610,7 +568,7 @@ async fn lookup_rows_by_eq(
         });
     }
     if let Some(idx) = index::index_on(def, col) {
-        let dks = index::lookup_eq(db, &def.name, idx, value).await?;
+        let dks = index::lookup_eq(db, &def.name, idx, std::slice::from_ref(value)).await?;
         let blobs = db.multi_get(dks).await?;
         let mut out = Vec::new();
         for b in blobs.into_iter().flatten() {
@@ -659,7 +617,7 @@ fn equi_nlj(on: &Expr, driving: &Schema, partner: &Schema) -> Option<(Expr, usiz
 /// Whether `conjunct` is `col = <literal>` on this table's PK or an index.
 fn is_accelerable(def: &TableDef, conjunct: &Expr) -> Result<bool> {
     Ok(match eq_col_literal(def, Some(conjunct))? {
-        Some((col, _)) => def.pk_col == Some(col) || index::index_on(def, col).is_some(),
+        Some((col, _)) => def.pk_cols == [col] || index::index_on(def, col).is_some(),
         None => false,
     })
 }
@@ -703,7 +661,7 @@ fn range_bounds(def: &TableDef, filter: Option<&Expr>) -> Result<Option<RangeQue
         if lo.is_none() && hi.is_none() {
             continue;
         }
-        let indexed = def.pk_col == Some(col) || index::index_on(def, col).is_some();
+        let indexed = def.pk_cols == [col] || index::index_on(def, col).is_some();
         let encodable = lo.as_ref().map(|(v, _)| keyenc::encode(v).is_ok()).unwrap_or(true)
             && hi.as_ref().map(|(v, _)| keyenc::encode(v).is_ok()).unwrap_or(true);
         if indexed && encodable {
@@ -868,7 +826,7 @@ async fn build_from(
                 .and_then(|e| equi_nlj(e, &driving_schema, &partner_schema))
                 .filter(|(_, pcol)| {
                     cur_rows.len() <= NLJ_MAX_DRIVING
-                        && (pdef.pk_col == Some(*pcol) || index::index_on(&pdef, *pcol).is_some())
+                        && (pdef.pk_cols == [*pcol] || index::index_on(&pdef, *pcol).is_some())
                 });
 
             if let Some((driving_key, pcol)) = nlj {
@@ -1190,25 +1148,52 @@ fn eq_col_literal(def: &TableDef, filter: Option<&Expr>) -> Result<Option<(usize
     }
 }
 
-fn pk_eq_literal(def: &TableDef, filter: Option<&Expr>) -> Result<Option<Value>> {
-    let Some(pk) = def.pk_col else { return Ok(None) };
-    Ok(match eq_col_literal(def, filter)? {
-        Some((idx, lit)) if idx == pk => Some(lit),
-        _ => None,
-    })
+/// Extract equality values for every column in `key_cols` from the filter's
+/// AND-conjuncts (coerced to column type). `None` if any key column lacks an
+/// equality — i.e. the key is not fully specified.
+fn key_eq_values(
+    def: &TableDef,
+    filter: Option<&Expr>,
+    key_cols: &[usize],
+) -> Result<Option<Vec<Value>>> {
+    use std::collections::HashMap;
+    if key_cols.is_empty() {
+        return Ok(None);
+    }
+    let Some(f) = filter else { return Ok(None) };
+    let mut conj = Vec::new();
+    split_and(f, &mut conj);
+    let mut found: HashMap<usize, Value> = HashMap::new();
+    for c in &conj {
+        if let Some((col, val)) = eq_col_literal(def, Some(c))? {
+            found.entry(col).or_insert(val);
+        }
+    }
+    let mut vals = Vec::with_capacity(key_cols.len());
+    for &kc in key_cols {
+        match found.get(&kc) {
+            Some(v) => vals.push(v.clone()),
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(vals))
 }
 
-async fn try_pk_lookup(db: &Db, def: &TableDef, filter: Option<&Expr>) -> Result<PkLookup> {
-    let Some(lit) = pk_eq_literal(def, filter)? else { return Ok(PkLookup::NotApplicable) };
-    let key = data_key(&def.name, &keyenc::encode(&lit)?);
-    match db.get(key).await? {
-        Some(bytes) => {
-            let row: Vec<Value> =
-                bincode::deserialize(&bytes).map_err(|e| Error::Storage(e.to_string()))?;
-            Ok(PkLookup::Found(row))
-        }
-        None => Ok(PkLookup::NotFound),
+/// Whether the filter can be served by a PK/index equality (single or
+/// composite) or a single-column range.
+fn accelerable(def: &TableDef, filter: Option<&Expr>) -> Result<bool> {
+    if filter.is_none() {
+        return Ok(false);
     }
+    if def.has_pk() && key_eq_values(def, filter, &def.pk_cols)?.is_some() {
+        return Ok(true);
+    }
+    for idx in &def.indexes {
+        if !idx.vector && key_eq_values(def, filter, &idx.cols)?.is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(range_bounds(def, filter)?.is_some())
 }
 
 /// Collect `(storage_key, row)` for every row matching `filter`, up to
@@ -1222,27 +1207,46 @@ async fn collect_matches(
 ) -> Result<Vec<(Vec<u8>, Vec<Value>)>> {
     let mut out = Vec::new();
 
-    if pk_eq_literal(def, filter)?.is_some() {
-        if let PkLookup::Found(row) = try_pk_lookup(db, def, filter).await? {
-            let lit = pk_eq_literal(def, filter)?.expect("checked");
-            out.push((data_key(&def.name, &keyenc::encode(&lit)?), row));
+    let recheck = |row: &[Value]| -> Result<bool> {
+        match filter {
+            Some(f) => predicate::matches(f, &def.schema, row),
+            None => Ok(true),
         }
-        return Ok(out);
+    };
+
+    // PK equality (single or composite): direct clustered-key lookup.
+    if def.has_pk() {
+        if let Some(vals) = key_eq_values(def, filter, &def.pk_cols)? {
+            let key = data_key(&def.name, &keyenc::encode_key(&vals)?);
+            if let Some(bytes) = db.get(key.clone()).await? {
+                let row: Vec<Value> =
+                    bincode::deserialize(&bytes).map_err(|e| Error::Storage(e.to_string()))?;
+                if recheck(&row)? {
+                    out.push((key, row));
+                }
+            }
+            return Ok(out);
+        }
     }
 
-    // Secondary-index fast path: `WHERE indexed_col = <literal>`.
-    if let Some((col, lit)) = eq_col_literal(def, filter)? {
-        if let Some(idx) = index::index_on(def, col) {
-            let data_keys = index::lookup_eq(db, &def.name, idx, &lit).await?;
+    // Secondary-index equality (single or composite), full filter re-applied.
+    for idx in &def.indexes {
+        if idx.vector {
+            continue;
+        }
+        if let Some(vals) = key_eq_values(def, filter, &idx.cols)? {
+            let data_keys = index::lookup_eq(db, &def.name, idx, &vals).await?;
             let blobs = db.multi_get(data_keys.clone()).await?;
             for (data_key, blob) in data_keys.into_iter().zip(blobs) {
                 if let Some(bytes) = blob {
                     let row: Vec<Value> =
                         bincode::deserialize(&bytes).map_err(|e| Error::Storage(e.to_string()))?;
-                    out.push((data_key, row));
-                    if let Some(l) = limit {
-                        if out.len() >= l {
-                            return Ok(out);
+                    if recheck(&row)? {
+                        out.push((data_key, row));
+                        if let Some(l) = limit {
+                            if out.len() >= l {
+                                return Ok(out);
+                            }
                         }
                     }
                 }
@@ -1254,7 +1258,7 @@ async fn collect_matches(
     // Range fast path: `col > x` / `BETWEEN` on a PK or indexed column uses an
     // ordered range scan, then re-applies the full filter.
     if let Some(rq) = range_bounds(def, filter)? {
-        let candidates = if def.pk_col == Some(rq.col) {
+        let candidates = if def.pk_cols == [rq.col] {
             clustered_range(db, def, &rq).await?
         } else {
             let idx = index::index_on(def, rq.col).expect("range_bounds checked index");
@@ -1368,9 +1372,11 @@ pub async fn update(
         }
 
         // If the primary key changed, the clustered key moves.
-        let new_key = match def.pk_col {
-            Some(i) => data_key(&name, &keyenc::encode(&new_row[i])?),
-            None => old_key.clone(),
+        let new_key = if def.has_pk() {
+            let pk_vals: Vec<Value> = def.pk_cols.iter().map(|&i| new_row[i].clone()).collect();
+            data_key(&name, &keyenc::encode_key(&pk_vals)?)
+        } else {
+            old_key.clone()
         };
 
         // Index maintenance: drop old entries, write new ones. Deletes are
@@ -1653,7 +1659,7 @@ async fn olap_aggregate(
     if let Some(f) = &filter {
         // Equality or range on a PK/indexed column: aggregate just the matching
         // rows fetched via the index, rather than scanning the whole table.
-        if is_accelerable(def, f).unwrap_or(false) || range_bounds(def, Some(f))?.is_some() {
+        if accelerable(def, Some(f))? {
             let rows = collect_matches(db, def, Some(f), None).await?;
             let mut agg = plan.new_aggregator();
             for (_, row) in rows {

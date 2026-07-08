@@ -1,14 +1,13 @@
-//! Secondary indexes.
+//! Secondary indexes (single- or multi-column).
 //!
-//! Each index entry lives in the one file under:
+//! Entry layout in the one file:
 //!
 //! ```text
-//! index::<table>::<index>::<enc(col_value)>\0<clustered_key>  →  <data_key>
+//! index::<table>::<index>::<enc(col_values)>\0<clustered_key>  →  <data_key>
 //! ```
 //!
-//! The `enc(col_value)` prefix is order-preserving, so equality and range
-//! lookups are B-tree range scans. The trailing clustered key keeps entries
-//! unique for non-unique indexes and lets us walk straight to the row.
+//! `enc(col_values)` is the order-preserving composite encoding of the indexed
+//! columns, so equality and (single-column) range lookups are B-tree scans.
 
 use elyra_core::{Result, Value};
 use elyra_storage::Db;
@@ -20,25 +19,23 @@ fn index_prefix(table: &str, index: &str) -> Vec<u8> {
     format!("index::{table}::{index}::").into_bytes()
 }
 
-/// Prefix for all entries with a given column value (equality lookup).
-fn value_prefix(table: &str, index: &str, value: &Value) -> Result<Vec<u8>> {
+/// Prefix for all entries with a given tuple of column values (equality).
+fn value_prefix(table: &str, index: &str, values: &[Value]) -> Result<Vec<u8>> {
     let mut k = index_prefix(table, index);
-    k.extend_from_slice(&keyenc::encode(value)?);
+    k.extend_from_slice(&keyenc::encode_key(values)?);
     k.push(0);
     Ok(k)
 }
 
-/// Full entry key for a specific row.
-fn entry_key(table: &str, index: &str, value: &Value, data_key: &[u8]) -> Result<Vec<u8>> {
-    let mut k = value_prefix(table, index, value)?;
-    // Append the clustered part of the data key to disambiguate rows.
+fn entry_key(table: &str, index: &str, values: &[Value], data_key: &[u8]) -> Result<Vec<u8>> {
+    let mut k = value_prefix(table, index, values)?;
     let clustered = &data_key[data_prefix(table).len()..];
     k.extend_from_slice(clustered);
     Ok(k)
 }
 
-/// Index entries (key, value) for one row. Skips columns whose value cannot
-/// be indexed (NULL and non-scalar types).
+/// Index entries (key, value) for one row. Skips an index when any of its
+/// columns is NULL or non-encodable.
 pub fn entries_for_row(
     def: &TableDef,
     row: &[Value],
@@ -46,116 +43,37 @@ pub fn entries_for_row(
 ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
     let mut out = Vec::new();
     for idx in &def.indexes {
-        let v = &row[idx.col];
-        if v.is_null() {
+        if idx.vector {
+            continue; // vector indexes are maintained separately
+        }
+        let values: Vec<Value> = idx.cols.iter().map(|&c| row[c].clone()).collect();
+        if values.iter().any(|v| v.is_null()) || keyenc::encode_key(&values).is_err() {
             continue;
         }
-        // Only scalar, order-encodable values get indexed.
-        if keyenc::encode(v).is_err() {
-            continue;
-        }
-        out.push((entry_key(&def.name, &idx.name, v, data_key)?, data_key.to_vec()));
+        out.push((entry_key(&def.name, &idx.name, &values, data_key)?, data_key.to_vec()));
     }
     Ok(out)
 }
 
-/// Just the index entry keys for a row (used when deleting).
 pub fn entry_keys_for_row(def: &TableDef, row: &[Value], data_key: &[u8]) -> Result<Vec<Vec<u8>>> {
-    Ok(entries_for_row(def, row, data_key)?
-        .into_iter()
-        .map(|(k, _)| k)
-        .collect())
+    Ok(entries_for_row(def, row, data_key)?.into_iter().map(|(k, _)| k).collect())
 }
 
-/// Find the index (if any) defined on a given column.
+/// A single-column B-tree index on `col`, if one exists (used by the
+/// single-column eq/range fast paths).
 pub fn index_on<'a>(def: &'a TableDef, col: usize) -> Option<&'a IndexDef> {
-    def.indexes.iter().find(|i| i.col == col)
+    def.indexes.iter().find(|i| !i.vector && i.single_col() == Some(col))
 }
 
-/// Range lookup: data keys for rows whose indexed column is within the given
-/// bounds. Each bound is `(value, inclusive)`. Entries are ordered, so this is
-/// a B-tree range scan.
-pub async fn lookup_range(
-    db: &Db,
-    table: &str,
-    index: &IndexDef,
-    lo: Option<(&Value, bool)>,
-    hi: Option<(&Value, bool)>,
-) -> Result<Vec<Vec<u8>>> {
-    let prefix = index_prefix(table, &index.name);
-
-    // Lower start (inclusive byte position).
-    let mut start = match lo {
-        Some((v, incl)) => {
-            let mut b = prefix.clone();
-            b.extend_from_slice(&keyenc::encode(v)?);
-            if !incl {
-                b.push(0x01); // skip entries equal to v (which are ..\0..)
-            }
-            b
-        }
-        None => prefix.clone(),
-    };
-
-    // Upper end (exclusive byte position).
-    let end = match hi {
-        Some((v, incl)) => {
-            let mut b = prefix.clone();
-            b.extend_from_slice(&keyenc::encode(v)?);
-            if incl {
-                b.push(0x01); // include entries equal to v, exclude the next
-            }
-            b
-        }
-        None => prefix_upper_bound(&prefix),
-    };
-
-    let mut keys = Vec::new();
-    loop {
-        let batch = db.scan_range(start.clone(), Some(end.clone()), 4096).await?;
-        if batch.is_empty() {
-            break;
-        }
-        let last = batch.len() < 4096;
-        // Next start is strictly after the last key seen.
-        start = batch.last().map(|(k, _)| {
-            let mut n = k.clone();
-            n.push(0);
-            n
-        }).unwrap();
-        for (_, data_key) in batch {
-            keys.push(data_key);
-        }
-        if last {
-            break;
-        }
-    }
-    Ok(keys)
-}
-
-/// Smallest key strictly greater than every key with `prefix` (increment the
-/// last byte below 0xFF).
-pub fn prefix_upper_bound(prefix: &[u8]) -> Vec<u8> {
-    let mut end = prefix.to_vec();
-    while let Some(last) = end.last().copied() {
-        if last < 0xFF {
-            *end.last_mut().unwrap() = last + 1;
-            return end;
-        }
-        end.pop();
-    }
-    end // all 0xFF -> empty means unbounded; caller guards by table prefix
-}
-
-/// Equality lookup: return the data keys of all rows where the indexed
-/// column equals `value`.
+/// Equality lookup on the full set of indexed columns: data keys of rows whose
+/// indexed tuple equals `values`.
 pub async fn lookup_eq(
     db: &Db,
     table: &str,
     index: &IndexDef,
-    value: &Value,
+    values: &[Value],
 ) -> Result<Vec<Vec<u8>>> {
-    let prefix = value_prefix(table, &index.name, value)?;
+    let prefix = value_prefix(table, &index.name, values)?;
     let mut cursor: Option<Vec<u8>> = None;
     let mut keys = Vec::new();
     loop {
@@ -173,4 +91,72 @@ pub async fn lookup_eq(
         }
     }
     Ok(keys)
+}
+
+/// Range lookup on a single-column index. Bounds are `(value, inclusive)`.
+pub async fn lookup_range(
+    db: &Db,
+    table: &str,
+    index: &IndexDef,
+    lo: Option<(&Value, bool)>,
+    hi: Option<(&Value, bool)>,
+) -> Result<Vec<Vec<u8>>> {
+    let prefix = index_prefix(table, &index.name);
+
+    let mut start = match lo {
+        Some((v, incl)) => {
+            let mut b = prefix.clone();
+            b.extend_from_slice(&keyenc::encode(v)?);
+            if !incl {
+                b.push(0x01);
+            }
+            b
+        }
+        None => prefix.clone(),
+    };
+    let end = match hi {
+        Some((v, incl)) => {
+            let mut b = prefix.clone();
+            b.extend_from_slice(&keyenc::encode(v)?);
+            if incl {
+                b.push(0x01);
+            }
+            b
+        }
+        None => prefix_upper_bound(&prefix),
+    };
+
+    let mut keys = Vec::new();
+    loop {
+        let batch = db.scan_range(start.clone(), Some(end.clone()), 4096).await?;
+        if batch.is_empty() {
+            break;
+        }
+        let last = batch.len() < 4096;
+        start = batch.last().map(|(k, _)| {
+            let mut n = k.clone();
+            n.push(0);
+            n
+        }).unwrap();
+        for (_, data_key) in batch {
+            keys.push(data_key);
+        }
+        if last {
+            break;
+        }
+    }
+    Ok(keys)
+}
+
+/// Smallest key strictly greater than every key with `prefix`.
+pub fn prefix_upper_bound(prefix: &[u8]) -> Vec<u8> {
+    let mut end = prefix.to_vec();
+    while let Some(last) = end.last().copied() {
+        if last < 0xFF {
+            *end.last_mut().unwrap() = last + 1;
+            return end;
+        }
+        end.pop();
+    }
+    end
 }

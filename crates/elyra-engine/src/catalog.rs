@@ -9,27 +9,40 @@ use elyra_core::{Error, Result, Schema};
 use elyra_storage::Db;
 use serde::{Deserialize, Serialize};
 
-/// A single-column secondary index.
+/// A secondary index over one or more columns.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexDef {
     pub name: String,
-    /// Schema index of the indexed column.
-    pub col: usize,
+    /// Schema indices of the indexed columns (in key order).
+    pub cols: Vec<usize>,
     pub unique: bool,
     /// A vector (HNSW ANN) index rather than a B-tree secondary index.
     #[serde(default)]
     pub vector: bool,
 }
 
-/// Definition of a table. `pk_col` is the schema index of the single-column
-/// primary key (InnoDB-style clustered key); `None` means a hidden rowid.
+impl IndexDef {
+    /// The single indexed column, if this is a one-column index.
+    pub fn single_col(&self) -> Option<usize> {
+        (self.cols.len() == 1).then(|| self.cols[0])
+    }
+}
+
+/// Definition of a table. `pk_cols` are the schema indices of the (possibly
+/// composite) primary key, clustered in key order; empty means a hidden rowid.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableDef {
     pub name: String,
     pub schema: Schema,
-    pub pk_col: Option<usize>,
+    pub pk_cols: Vec<usize>,
     #[serde(default)]
     pub indexes: Vec<IndexDef>,
+}
+
+impl TableDef {
+    pub fn has_pk(&self) -> bool {
+        !self.pk_cols.is_empty()
+    }
 }
 
 pub fn catalog_key(table: &str) -> Vec<u8> {
