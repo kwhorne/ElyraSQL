@@ -68,6 +68,37 @@ pub fn parse_datetime(s: &str) -> Option<i64> {
     Some(micros)
 }
 
+/// Parse `HH:MM:SS[.ffffff]` into microseconds since midnight.
+pub fn parse_time(s: &str) -> Option<i64> {
+    let s = s.trim();
+    let (hms, frac) = match s.split_once('.') {
+        Some((a, b)) => (a, Some(b)),
+        None => (s, None),
+    };
+    let mut it = hms.splitn(3, ':');
+    let h: i64 = it.next()?.parse().ok()?;
+    let mi: i64 = it.next()?.parse().ok()?;
+    let se: i64 = it.next().unwrap_or("0").parse().ok()?;
+    let mut micros = (h * 3600 + mi * 60 + se) * 1_000_000;
+    if let Some(f) = frac {
+        let f = format!("{:0<6}", &f[..f.len().min(6)]);
+        micros += f.parse::<i64>().ok()?;
+    }
+    Some(micros)
+}
+
+/// Format microseconds-since-midnight as `HH:MM:SS[.ffffff]`.
+pub fn format_time(micros: i64) -> String {
+    let secs = micros.div_euclid(1_000_000);
+    let frac = micros.rem_euclid(1_000_000);
+    let (h, mi, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+    if frac == 0 {
+        format!("{h:02}:{mi:02}:{s:02}")
+    } else {
+        format!("{h:02}:{mi:02}:{s:02}.{frac:06}")
+    }
+}
+
 /// Format days-since-epoch as `YYYY-MM-DD`.
 pub fn format_date(days: i32) -> String {
     let (y, m, d) = civil_from_days(days as i64);

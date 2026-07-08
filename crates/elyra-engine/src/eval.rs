@@ -139,6 +139,8 @@ fn infer_type(v: &Value) -> ColumnType {
         Value::Date(_) => ColumnType::Date,
         Value::DateTime(_) => ColumnType::DateTime,
         Value::Decimal(_, s) => ColumnType::Decimal(38, *s),
+        Value::Time(_) => ColumnType::Time,
+        Value::Json(_) => ColumnType::Json,
     }
 }
 

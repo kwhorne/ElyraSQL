@@ -103,6 +103,8 @@ fn column_type(ty: &elyra_core::ColumnType) -> ColumnType {
         elyra_core::ColumnType::Date => ColumnType::MYSQL_TYPE_VAR_STRING,
         elyra_core::ColumnType::DateTime => ColumnType::MYSQL_TYPE_VAR_STRING,
         elyra_core::ColumnType::Decimal(_, _) => ColumnType::MYSQL_TYPE_VAR_STRING,
+        elyra_core::ColumnType::Time => ColumnType::MYSQL_TYPE_VAR_STRING,
+        elyra_core::ColumnType::Json => ColumnType::MYSQL_TYPE_VAR_STRING,
     }
 }
 

@@ -21,6 +21,10 @@ pub enum ColumnType {
     DateTime,
     /// Fixed-point decimal: (precision, scale).
     Decimal(u8, u8),
+    /// Time of day.
+    Time,
+    /// JSON document.
+    Json,
 }
 
 impl ColumnType {
@@ -36,6 +40,8 @@ impl ColumnType {
             ColumnType::Date => "DATE".into(),
             ColumnType::DateTime => "DATETIME".into(),
             ColumnType::Decimal(p, s) => format!("DECIMAL({p},{s})"),
+            ColumnType::Time => "TIME".into(),
+            ColumnType::Json => "JSON".into(),
         }
     }
 }

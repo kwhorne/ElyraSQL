@@ -108,6 +108,9 @@ impl Engine {
             }
             Statement::CreateTable(ct) => exec::create_table(sess, ct).await,
             Statement::CreateIndex(ci) => exec::create_index(sess, ci).await,
+            Statement::AlterTable { name, operations, .. } => {
+                exec::alter_table(sess, &name, &operations).await
+            }
             Statement::Insert(ins) => exec::insert(sess, ins).await,
             Statement::Update { table, assignments, selection, .. } => {
                 exec::update(sess, &table, &assignments, selection.as_ref()).await

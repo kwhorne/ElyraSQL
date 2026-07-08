@@ -126,7 +126,9 @@ journalctl -u elyrasql -f
 - [x] Authentication (mysql_native_password) + TLS
 - [x] Transactions: `BEGIN`/`COMMIT`/`ROLLBACK` with **snapshot isolation**
       (MVCC snapshot + buffered writes)
-- [x] DATE / DATETIME / DECIMAL types; composite (multi-column) PK & indexes
+- [x] DATE / DATETIME / TIME / DECIMAL / JSON types
+- [x] Composite (multi-column) PK & indexes
+- [x] `ALTER TABLE` (ADD/DROP/RENAME COLUMN, RENAME TABLE)
 - [x] systemd packaging for Ubuntu 24.04+
 - [ ] ElyraSQL client (Rust + Svelte on Elyra Framework)
 

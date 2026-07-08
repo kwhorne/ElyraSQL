@@ -32,10 +32,11 @@ fn encode_component(value: &Value, out: &mut Vec<u8>) -> Result<()> {
         Value::Decimal(u, _) => {
             out.extend_from_slice(&(*u as u128 ^ (1u128 << 127)).to_be_bytes())
         }
+        Value::Time(t) => out.extend_from_slice(&(*t as u64 ^ 0x8000_0000_0000_0000).to_be_bytes()),
         Value::Bool(b) => out.push(*b as u8),
         // Escape 0x00 as 0x00 0x01, terminate with 0x00 0x00 (< any 0x00 0x01),
         // making text self-delimiting while preserving byte order.
-        Value::Text(s) => {
+        Value::Text(s) | Value::Json(s) => {
             for &b in s.as_bytes() {
                 if b == 0x00 {
                     out.extend_from_slice(&[0x00, 0x01]);

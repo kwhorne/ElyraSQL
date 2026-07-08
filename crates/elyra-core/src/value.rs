@@ -19,6 +19,10 @@ pub enum Value {
     DateTime(i64),
     /// DECIMAL: unscaled integer value and its scale (digits after the point).
     Decimal(i128, u8),
+    /// TIME: microseconds since midnight.
+    Time(i64),
+    /// JSON document (stored as its text form).
+    Json(String),
 }
 
 impl Value {
@@ -53,7 +57,12 @@ impl Value {
             (Decimal(..), _) | (_, Decimal(..)) => {
                 self.as_f64().zip(other.as_f64()).and_then(|(a, b)| a.partial_cmp(&b))
             }
+            (Time(_), _) | (_, Time(_)) => {
+                to_micros_of_day(self).zip(to_micros_of_day(other)).map(|(a, b)| a.cmp(&b))
+            }
             (Text(a), Text(b)) => Some(a.cmp(b)),
+            (Json(a), Json(b)) => Some(a.cmp(b)),
+            (Json(a), Text(b)) | (Text(b), Json(a)) => Some(a.cmp(b)),
             (Bool(a), Bool(b)) => Some(a.cmp(b)),
             (Bytes(a), Bytes(b)) => Some(a.cmp(b)),
             _ => self.as_f64().zip(other.as_f64()).and_then(|(a, b)| a.partial_cmp(&b)),
@@ -86,6 +95,8 @@ impl Value {
             Value::Date(d) => Some(crate::datetime::format_date(*d)),
             Value::DateTime(t) => Some(crate::datetime::format_datetime(*t)),
             Value::Decimal(units, scale) => Some(format_decimal(*units, *scale)),
+            Value::Time(t) => Some(crate::datetime::format_time(*t)),
+            Value::Json(s) => Some(s.clone()),
         }
     }
 }
@@ -109,11 +120,151 @@ fn to_micros(v: &Value) -> Option<i64> {
     }
 }
 
+fn to_micros_of_day(v: &Value) -> Option<i64> {
+    match v {
+        Value::Time(t) => Some(*t),
+        Value::Text(s) => crate::datetime::parse_time(s),
+        _ => None,
+    }
+}
+
 fn cmp_decimal(au: i128, asc: u8, bu: i128, bsc: u8) -> Ordering {
     let s = asc.max(bsc);
     let a = au.saturating_mul(10i128.saturating_pow((s - asc) as u32));
     let b = bu.saturating_mul(10i128.saturating_pow((s - bsc) as u32));
     a.cmp(&b)
+}
+
+/// Minimal JSON validator (structure only, no dependency).
+pub fn is_valid_json(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let mut pos = 0;
+    skip_ws(bytes, &mut pos);
+    if !parse_json_value(bytes, &mut pos) {
+        return false;
+    }
+    skip_ws(bytes, &mut pos);
+    pos == bytes.len()
+}
+
+fn skip_ws(b: &[u8], p: &mut usize) {
+    while *p < b.len() && matches!(b[*p], b' ' | b'\t' | b'\n' | b'\r') {
+        *p += 1;
+    }
+}
+
+fn parse_json_value(b: &[u8], p: &mut usize) -> bool {
+    skip_ws(b, p);
+    if *p >= b.len() {
+        return false;
+    }
+    match b[*p] {
+        b'{' => parse_json_object(b, p),
+        b'[' => parse_json_array(b, p),
+        b'"' => parse_json_string(b, p),
+        b't' => consume(b, p, "true"),
+        b'f' => consume(b, p, "false"),
+        b'n' => consume(b, p, "null"),
+        _ => parse_json_number(b, p),
+    }
+}
+
+fn consume(b: &[u8], p: &mut usize, lit: &str) -> bool {
+    if b[*p..].starts_with(lit.as_bytes()) {
+        *p += lit.len();
+        true
+    } else {
+        false
+    }
+}
+
+fn parse_json_string(b: &[u8], p: &mut usize) -> bool {
+    if b.get(*p) != Some(&b'"') {
+        return false;
+    }
+    *p += 1;
+    while *p < b.len() {
+        match b[*p] {
+            b'"' => {
+                *p += 1;
+                return true;
+            }
+            b'\\' => *p += 2,
+            _ => *p += 1,
+        }
+    }
+    false
+}
+
+fn parse_json_number(b: &[u8], p: &mut usize) -> bool {
+    let start = *p;
+    while *p < b.len() && matches!(b[*p], b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E') {
+        *p += 1;
+    }
+    *p > start && s_from(b, start, *p).parse::<f64>().is_ok()
+}
+
+fn s_from(b: &[u8], a: usize, z: usize) -> std::borrow::Cow<'_, str> {
+    String::from_utf8_lossy(&b[a..z])
+}
+
+fn parse_json_array(b: &[u8], p: &mut usize) -> bool {
+    *p += 1; // [
+    skip_ws(b, p);
+    if b.get(*p) == Some(&b']') {
+        *p += 1;
+        return true;
+    }
+    loop {
+        if !parse_json_value(b, p) {
+            return false;
+        }
+        skip_ws(b, p);
+        match b.get(*p) {
+            Some(b',') => {
+                *p += 1;
+            }
+            Some(b']') => {
+                *p += 1;
+                return true;
+            }
+            _ => return false,
+        }
+    }
+}
+
+fn parse_json_object(b: &[u8], p: &mut usize) -> bool {
+    *p += 1; // {
+    skip_ws(b, p);
+    if b.get(*p) == Some(&b'}') {
+        *p += 1;
+        return true;
+    }
+    loop {
+        skip_ws(b, p);
+        if !parse_json_string(b, p) {
+            return false;
+        }
+        skip_ws(b, p);
+        if b.get(*p) != Some(&b':') {
+            return false;
+        }
+        *p += 1;
+        if !parse_json_value(b, p) {
+            return false;
+        }
+        skip_ws(b, p);
+        match b.get(*p) {
+            Some(b',') => {
+                *p += 1;
+            }
+            Some(b'}') => {
+                *p += 1;
+                return true;
+            }
+            _ => return false,
+        }
+    }
 }
 
 /// Render an unscaled decimal with its scale, e.g. `(12345, 2)` -> `123.45`.

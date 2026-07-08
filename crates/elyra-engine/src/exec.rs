@@ -6,9 +6,9 @@
 use elyra_core::{ColumnDef, ColumnType, Error, Result, Schema, Value};
 use crate::session::Session;
 use sqlparser::ast::{
-    Assignment, AssignmentTarget, ColumnOption, CreateIndex, CreateTable, DataType, Delete,
-    FromTable, Insert, JoinConstraint, JoinOperator, ObjectName, Select, SetExpr, TableConstraint,
-    TableFactor, TableWithJoins, Query as SqlQuery,
+    AlterTableOperation, Assignment, AssignmentTarget, ColumnOption, CreateIndex, CreateTable,
+    DataType, Delete, FromTable, Insert, JoinConstraint, JoinOperator, ObjectName, Select, SetExpr,
+    TableConstraint, TableFactor, TableWithJoins, Query as SqlQuery,
 };
 
 use crate::aggregate;
@@ -52,6 +52,8 @@ fn map_type(dt: &DataType) -> Result<ColumnType> {
         DataType::Blob(_) | DataType::Bytea => ColumnType::Bytes,
         DataType::Date => ColumnType::Date,
         DataType::Datetime(_) | DataType::Timestamp(_, _) => ColumnType::DateTime,
+        DataType::Time(_, _) => ColumnType::Time,
+        DataType::JSON | DataType::JSONB => ColumnType::Json,
         DataType::Decimal(info) | DataType::Numeric(info) => {
             let (p, s) = match info {
                 sqlparser::ast::ExactNumberInfo::None => (10, 0),
@@ -131,6 +133,220 @@ pub async fn create_table(db: &Session, ct: CreateTable) -> Result<QueryResult> 
     };
     db.commit_write(vec![(catalog_key(&name), def.encode()?)], vec![]).await?;
     Ok(QueryResult::Affected(0))
+}
+
+pub async fn alter_table(
+    db: &Session,
+    name: &ObjectName,
+    ops: &[AlterTableOperation],
+) -> Result<QueryResult> {
+    let tname = table_ident(name)?;
+    let mut def = catalog::load(db, &tname).await?;
+    let mut persist_catalog = true;
+
+    for op in ops {
+        match op {
+            AlterTableOperation::AddColumn { column_def, .. } => {
+                alter_add_column(db, &mut def, column_def).await?
+            }
+            AlterTableOperation::DropColumn { column_name, .. } => {
+                alter_drop_column(db, &mut def, &column_name.value).await?
+            }
+            AlterTableOperation::RenameColumn { old_column_name, new_column_name } => {
+                let i = def
+                    .schema
+                    .columns
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(&old_column_name.value))
+                    .ok_or_else(|| Error::Catalog(format!("unknown column: {old_column_name}")))?;
+                def.schema.columns[i].name = new_column_name.value.clone();
+            }
+            AlterTableOperation::RenameTable { table_name } => {
+                let new = table_ident(table_name)?;
+                alter_rename_table(db, &mut def, &new).await?;
+                persist_catalog = false;
+            }
+            other => {
+                return Err(Error::Unsupported(format!("ALTER operation not supported: {other}")))
+            }
+        }
+    }
+
+    if persist_catalog {
+        db.commit_write(vec![(catalog_key(&def.name), def.encode()?)], vec![]).await?;
+    }
+    Ok(QueryResult::Affected(0))
+}
+
+async fn alter_add_column(
+    db: &Session,
+    def: &mut TableDef,
+    col: &sqlparser::ast::ColumnDef,
+) -> Result<()> {
+    let ty = map_type(&col.data_type)?;
+    let mut nullable = true;
+    let mut default = Value::Null;
+    for opt in &col.options {
+        match &opt.option {
+            ColumnOption::NotNull => nullable = false,
+            ColumnOption::Default(e) => default = coerce(eval_expr(e)?, &ty, &col.name.value)?,
+            _ => {}
+        }
+    }
+    if !nullable && default.is_null() {
+        return Err(Error::Query(format!(
+            "ADD COLUMN '{}' is NOT NULL and needs a DEFAULT",
+            col.name.value
+        )));
+    }
+
+    // Append the default to every existing row.
+    let prefix = data_prefix(&def.name);
+    let mut cursor: Option<Vec<u8>> = None;
+    let mut puts = Vec::new();
+    loop {
+        let chunk = db.scan_batch(prefix.clone(), cursor.clone(), 4096).await?;
+        if chunk.is_empty() {
+            break;
+        }
+        let last = chunk.len() < 4096;
+        cursor = chunk.last().map(|(k, _)| k.clone());
+        for (k, v) in chunk {
+            let mut row: Vec<Value> =
+                bincode::deserialize(&v).map_err(|e| Error::Storage(e.to_string()))?;
+            row.push(default.clone());
+            puts.push((k, bincode::serialize(&row).map_err(|e| Error::Storage(e.to_string()))?));
+        }
+        if last {
+            break;
+        }
+    }
+    def.schema.columns.push(ColumnDef { name: col.name.value.clone(), ty, nullable });
+    if !puts.is_empty() {
+        db.commit_write(puts, vec![]).await?;
+    }
+    Ok(())
+}
+
+async fn alter_drop_column(db: &Session, def: &mut TableDef, name: &str) -> Result<()> {
+    let idx = def
+        .schema
+        .columns
+        .iter()
+        .position(|c| c.name.eq_ignore_ascii_case(name))
+        .ok_or_else(|| Error::Catalog(format!("unknown column: {name}")))?;
+    if def.pk_cols.contains(&idx) {
+        return Err(Error::Unsupported("cannot drop a primary key column".into()));
+    }
+    if def.indexes.iter().any(|i| i.cols.contains(&idx)) {
+        return Err(Error::Unsupported("cannot drop an indexed column; drop the index first".into()));
+    }
+
+    // Rewrite rows without the dropped position.
+    let prefix = data_prefix(&def.name);
+    let mut cursor: Option<Vec<u8>> = None;
+    let mut puts = Vec::new();
+    loop {
+        let chunk = db.scan_batch(prefix.clone(), cursor.clone(), 4096).await?;
+        if chunk.is_empty() {
+            break;
+        }
+        let last = chunk.len() < 4096;
+        cursor = chunk.last().map(|(k, _)| k.clone());
+        for (k, v) in chunk {
+            let mut row: Vec<Value> =
+                bincode::deserialize(&v).map_err(|e| Error::Storage(e.to_string()))?;
+            if idx < row.len() {
+                row.remove(idx);
+            }
+            puts.push((k, bincode::serialize(&row).map_err(|e| Error::Storage(e.to_string()))?));
+        }
+        if last {
+            break;
+        }
+    }
+    def.schema.columns.remove(idx);
+    // Shift key/index column positions above the removed one.
+    let shift = |c: &mut usize| {
+        if *c > idx {
+            *c -= 1;
+        }
+    };
+    def.pk_cols.iter_mut().for_each(shift);
+    for i in &mut def.indexes {
+        i.cols.iter_mut().for_each(shift);
+    }
+    if !puts.is_empty() {
+        db.commit_write(puts, vec![]).await?;
+    }
+    Ok(())
+}
+
+async fn alter_rename_table(db: &Session, def: &mut TableDef, new: &str) -> Result<()> {
+    if catalog::exists(db, new).await? {
+        return Err(Error::Catalog(format!("table already exists: {new}")));
+    }
+    let old = def.name.clone();
+    def.name = new.to_string();
+
+    let mut puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    let mut deletes: Vec<Vec<u8>> = Vec::new();
+
+    // Re-key all data rows and rebuild their index entries under the new name.
+    let old_prefix = data_prefix(&old);
+    let mut cursor: Option<Vec<u8>> = None;
+    loop {
+        let chunk = db.scan_batch(old_prefix.clone(), cursor.clone(), 4096).await?;
+        if chunk.is_empty() {
+            break;
+        }
+        let last = chunk.len() < 4096;
+        cursor = chunk.last().map(|(k, _)| k.clone());
+        for (old_key, v) in chunk {
+            let clustered = &old_key[old_prefix.len()..];
+            let new_key = data_key(new, clustered);
+            let row: Vec<Value> =
+                bincode::deserialize(&v).map_err(|e| Error::Storage(e.to_string()))?;
+            deletes.push(old_key);
+            puts.push((new_key.clone(), v));
+            puts.extend(index::entries_for_row(def, &row, &new_key)?);
+        }
+        if last {
+            break;
+        }
+    }
+
+    // Delete all old index entries (keyed under the old table name).
+    let old_index_prefix = format!("index::{old}::").into_bytes();
+    let mut cursor: Option<Vec<u8>> = None;
+    loop {
+        let chunk = db.scan_batch(old_index_prefix.clone(), cursor.clone(), 4096).await?;
+        if chunk.is_empty() {
+            break;
+        }
+        let last = chunk.len() < 4096;
+        cursor = chunk.last().map(|(k, _)| k.clone());
+        for (k, _) in chunk {
+            deletes.push(k);
+        }
+        if last {
+            break;
+        }
+    }
+
+    // Move catalog + meta counters.
+    deletes.push(catalog_key(&old));
+    puts.push((catalog_key(new), def.encode()?));
+    if let Some(rc) = db.get(rowid_key(&old)).await? {
+        deletes.push(rowid_key(&old));
+        puts.push((rowid_key(new), rc));
+    }
+    if let Some(wc) = db.get(wcount_key(&old)).await? {
+        deletes.push(wcount_key(&old));
+        puts.push((wcount_key(new), wc));
+    }
+    db.commit_write(puts, deletes).await?;
+    Ok(())
 }
 
 pub async fn create_index(db: &Session, ci: CreateIndex) -> Result<QueryResult> {
@@ -1584,6 +1800,8 @@ fn infer_val(v: &Value) -> ColumnType {
         Value::Date(_) => ColumnType::Date,
         Value::DateTime(_) => ColumnType::DateTime,
         Value::Decimal(_, s) => ColumnType::Decimal(38, *s),
+        Value::Time(_) => ColumnType::Time,
+        Value::Json(_) => ColumnType::Json,
         _ => ColumnType::Text,
     }
 }
@@ -1909,6 +2127,18 @@ fn coerce(v: Value, ty: &ColumnType, col: &str) -> Result<Value> {
             // Rescale to the column's declared scale.
             let v = if s <= *sc { u * 10i128.pow((*sc - s) as u32) } else { u / 10i128.pow((s - *sc) as u32) };
             Value::Decimal(v, *sc)
+        }
+        (ColumnType::Time, Value::Time(t)) => Value::Time(t),
+        (ColumnType::Time, Value::Text(s)) => elyra_core::datetime::parse_time(&s)
+            .map(Value::Time)
+            .ok_or_else(|| Error::Type(format!("invalid TIME literal: {s}")))?,
+        (ColumnType::Json, Value::Json(s)) => Value::Json(s),
+        (ColumnType::Json, Value::Text(s)) => {
+            if elyra_core::value::is_valid_json(&s) {
+                Value::Json(s)
+            } else {
+                return Err(Error::Type(format!("invalid JSON literal: {s}")));
+            }
         }
         (ColumnType::Vector(dim), Value::Text(s)) => Value::Vector(parse_vector(&s, *dim)?),
         (want, got) => {
