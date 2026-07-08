@@ -88,6 +88,23 @@ SELECT VERSION();   -- 8.0.0-ElyraSQL-0.1.0
 | `--listen` / `ELYRASQL_LISTEN` | `127.0.0.1:3307` | Bind address (MySQL proto) |
 | `RUST_LOG`               | `info`              | Log level                     |
 
+## Performance
+
+See [BENCHMARKS.md](BENCHMARKS.md) for a reproducible benchmark harness and
+results. Highlights (release, 100k rows): PK lookup ~0.15 ms, selective
+index-nested-loop join ~0.18 ms, cached vector ANN ~0.29 ms, bulk ingest
+~180k rows/s.
+
+## Deploying on Ubuntu 24.04+
+
+```bash
+sudo ./packaging/deploy.sh            # build, install, systemd, start
+# or with credentials + TLS:
+ELYRASQL_USER=root ELYRASQL_PASSWORD=secret \
+  ELYRASQL_LISTEN=0.0.0.0:3307 sudo -E ./packaging/deploy.sh
+journalctl -u elyrasql -f
+```
+
 ## Roadmap
 
 - [x] Cargo workspace + branded core types
