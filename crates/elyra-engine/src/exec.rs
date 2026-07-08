@@ -425,6 +425,21 @@ pub async fn select(
         }
     }
 
+    // Range fast path: `WHERE col >|<|BETWEEN` on a PK/indexed column.
+    if range_bounds(&def, filter.as_ref())?.is_some() {
+        let mut rows: Vec<Vec<Value>> = collect_matches(db, &def, filter.as_ref(), None)
+            .await?
+            .into_iter()
+            .map(|(_, r)| r)
+            .collect();
+        apply_offset_limit(&mut rows, offset, limit);
+        let out: Vec<Vec<Value>> = rows
+            .iter()
+            .map(|r| projection.iter().map(|&i| r[i].clone()).collect())
+            .collect();
+        return Ok(QueryResult::Rows(RowStream::literal(out_schema, out)));
+    }
+
     // Fast path: `WHERE pk = <literal>` becomes an O(log n) point lookup on
     // the clustered key instead of a full table scan.
     if offset == 0 && limit != Some(0) {
@@ -646,6 +661,159 @@ fn is_accelerable(def: &TableDef, conjunct: &Expr) -> Result<bool> {
         Some((col, _)) => def.pk_col == Some(col) || index::index_on(def, col).is_some(),
         None => false,
     })
+}
+
+/// A range constraint on one column, `(value, inclusive)` bounds.
+struct RangeQuery {
+    col: usize,
+    lo: Option<(Value, bool)>,
+    hi: Option<(Value, bool)>,
+}
+
+/// Detect a range over a PK/indexed column from the filter's AND-conjuncts
+/// (`col >|>=|<|<= lit`, `col BETWEEN a AND b`). Only columns with
+/// order-encodable bound values qualify.
+fn range_bounds(def: &TableDef, filter: Option<&Expr>) -> Result<Option<RangeQuery>> {
+    use std::collections::HashMap;
+    let Some(f) = filter else { return Ok(None) };
+    let mut conj = Vec::new();
+    split_and(f, &mut conj);
+
+    type Bounds = (Option<(Value, bool)>, Option<(Value, bool)>);
+    let mut map: HashMap<usize, Bounds> = HashMap::new();
+
+    for c in &conj {
+        if let Some((col, op, val)) = as_range(def, c)? {
+            let e = map.entry(col).or_default();
+            use sqlparser::ast::BinaryOperator::*;
+            match op {
+                Gt => e.0 = Some((val, false)),
+                GtEq => e.0 = Some((val, true)),
+                Lt => e.1 = Some((val, false)),
+                LtEq => e.1 = Some((val, true)),
+                _ => {}
+            }
+        } else if let Some((col, lo, hi)) = as_between(def, c)? {
+            map.insert(col, (Some((lo, true)), Some((hi, true))));
+        }
+    }
+
+    for (col, (lo, hi)) in map {
+        if lo.is_none() && hi.is_none() {
+            continue;
+        }
+        let indexed = def.pk_col == Some(col) || index::index_on(def, col).is_some();
+        let encodable = lo.as_ref().map(|(v, _)| keyenc::encode(v).is_ok()).unwrap_or(true)
+            && hi.as_ref().map(|(v, _)| keyenc::encode(v).is_ok()).unwrap_or(true);
+        if indexed && encodable {
+            return Ok(Some(RangeQuery { col, lo, hi }));
+        }
+    }
+    Ok(None)
+}
+
+/// `col OP literal` (or `literal OP col`) -> `(col, op-relative-to-col, value)`.
+fn as_range(
+    def: &TableDef,
+    expr: &Expr,
+) -> Result<Option<(usize, sqlparser::ast::BinaryOperator, Value)>> {
+    use sqlparser::ast::BinaryOperator::*;
+    let Expr::BinaryOp { left, op, right } = expr else { return Ok(None) };
+    if !matches!(op, Gt | GtEq | Lt | LtEq) {
+        return Ok(None);
+    }
+    let col_of = |n: &str| def.schema.columns.iter().position(|c| c.name.eq_ignore_ascii_case(n));
+    if let Some(col) = ident_name(left).and_then(col_of) {
+        if let Ok(v) = eval_expr(right) {
+            return Ok(Some((col, op.clone(), v)));
+        }
+    }
+    if let Some(col) = ident_name(right).and_then(col_of) {
+        if let Ok(v) = eval_expr(left) {
+            let flipped = match op {
+                Gt => Lt,
+                GtEq => LtEq,
+                Lt => Gt,
+                LtEq => GtEq,
+                _ => unreachable!(),
+            };
+            return Ok(Some((col, flipped, v)));
+        }
+    }
+    Ok(None)
+}
+
+fn as_between(def: &TableDef, expr: &Expr) -> Result<Option<(usize, Value, Value)>> {
+    let Expr::Between { expr: e, negated: false, low, high } = expr else { return Ok(None) };
+    let col_of = |n: &str| def.schema.columns.iter().position(|c| c.name.eq_ignore_ascii_case(n));
+    let Some(col) = ident_name(e).and_then(col_of) else { return Ok(None) };
+    match (eval_expr(low), eval_expr(high)) {
+        (Ok(lo), Ok(hi)) => Ok(Some((col, lo, hi))),
+        _ => Ok(None),
+    }
+}
+
+/// Range scan over the clustered (PK) data keyspace.
+async fn clustered_range(db: &Db, def: &TableDef, rq: &RangeQuery) -> Result<Vec<(Vec<u8>, Vec<Value>)>> {
+    let prefix = data_prefix(&def.name);
+    let mut start = match &rq.lo {
+        Some((v, incl)) => {
+            let mut b = data_key(&def.name, &keyenc::encode(v)?);
+            if !*incl {
+                b.push(0x00); // strictly after the row with pk == v
+            }
+            b
+        }
+        None => prefix.clone(),
+    };
+    let end = match &rq.hi {
+        Some((v, incl)) => {
+            let mut b = data_key(&def.name, &keyenc::encode(v)?);
+            if *incl {
+                b.push(0x00); // include the row with pk == v
+            }
+            b
+        }
+        None => index::prefix_upper_bound(&prefix),
+    };
+
+    let mut out = Vec::new();
+    loop {
+        let batch = db.scan_range(start.clone(), Some(end.clone()), 4096).await?;
+        if batch.is_empty() {
+            break;
+        }
+        let last = batch.len() < 4096;
+        start = batch.last().map(|(k, _)| { let mut n = k.clone(); n.push(0); n }).unwrap();
+        for (k, v) in batch {
+            let row = bincode::deserialize(&v).map_err(|e| Error::Storage(e.to_string()))?;
+            out.push((k, row));
+        }
+        if last {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+/// Range scan via a secondary index, then batch-fetch the rows.
+async fn index_range(
+    db: &Db,
+    def: &TableDef,
+    idx: &IndexDef,
+    rq: &RangeQuery,
+) -> Result<Vec<(Vec<u8>, Vec<Value>)>> {
+    let lo = rq.lo.as_ref().map(|(v, i)| (v, *i));
+    let hi = rq.hi.as_ref().map(|(v, i)| (v, *i));
+    let data_keys = index::lookup_range(db, &def.name, idx, lo, hi).await?;
+    let blobs = db.multi_get(data_keys.clone()).await?;
+    let mut out = Vec::new();
+    for (k, blob) in data_keys.into_iter().zip(blobs) {
+        if let Some(b) = blob {
+            out.push((k, bincode::deserialize(&b).map_err(|e| Error::Storage(e.to_string()))?));
+        }
+    }
+    Ok(out)
 }
 
 /// Build the joined row set from a FROM clause (comma cross-joins + explicit
@@ -1028,6 +1196,31 @@ async fn collect_matches(
         }
     }
 
+    // Range fast path: `col > x` / `BETWEEN` on a PK or indexed column uses an
+    // ordered range scan, then re-applies the full filter.
+    if let Some(rq) = range_bounds(def, filter)? {
+        let candidates = if def.pk_col == Some(rq.col) {
+            clustered_range(db, def, &rq).await?
+        } else {
+            let idx = index::index_on(def, rq.col).expect("range_bounds checked index");
+            index_range(db, def, idx, &rq).await?
+        };
+        for (k, row) in candidates {
+            if let Some(f) = filter {
+                if !predicate::matches(f, &def.schema, &row)? {
+                    continue;
+                }
+            }
+            out.push((k, row));
+            if let Some(l) = limit {
+                if out.len() >= l {
+                    return Ok(out);
+                }
+            }
+        }
+        return Ok(out);
+    }
+
     let prefix = data_prefix(&def.name);
     let mut cursor: Option<Vec<u8>> = None;
     loop {
@@ -1384,7 +1577,9 @@ async fn olap_aggregate(
     plan: &AggPlan,
 ) -> Result<GroupAggregator> {
     if let Some(f) = &filter {
-        if is_accelerable(def, f).unwrap_or(false) {
+        // Equality or range on a PK/indexed column: aggregate just the matching
+        // rows fetched via the index, rather than scanning the whole table.
+        if is_accelerable(def, f).unwrap_or(false) || range_bounds(def, Some(f))?.is_some() {
             let rows = collect_matches(db, def, Some(f), None).await?;
             let mut agg = plan.new_aggregator();
             for (_, row) in rows {

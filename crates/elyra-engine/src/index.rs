@@ -72,6 +72,81 @@ pub fn index_on<'a>(def: &'a TableDef, col: usize) -> Option<&'a IndexDef> {
     def.indexes.iter().find(|i| i.col == col)
 }
 
+/// Range lookup: data keys for rows whose indexed column is within the given
+/// bounds. Each bound is `(value, inclusive)`. Entries are ordered, so this is
+/// a B-tree range scan.
+pub async fn lookup_range(
+    db: &Db,
+    table: &str,
+    index: &IndexDef,
+    lo: Option<(&Value, bool)>,
+    hi: Option<(&Value, bool)>,
+) -> Result<Vec<Vec<u8>>> {
+    let prefix = index_prefix(table, &index.name);
+
+    // Lower start (inclusive byte position).
+    let mut start = match lo {
+        Some((v, incl)) => {
+            let mut b = prefix.clone();
+            b.extend_from_slice(&keyenc::encode(v)?);
+            if !incl {
+                b.push(0x01); // skip entries equal to v (which are ..\0..)
+            }
+            b
+        }
+        None => prefix.clone(),
+    };
+
+    // Upper end (exclusive byte position).
+    let end = match hi {
+        Some((v, incl)) => {
+            let mut b = prefix.clone();
+            b.extend_from_slice(&keyenc::encode(v)?);
+            if incl {
+                b.push(0x01); // include entries equal to v, exclude the next
+            }
+            b
+        }
+        None => prefix_upper_bound(&prefix),
+    };
+
+    let mut keys = Vec::new();
+    loop {
+        let batch = db.scan_range(start.clone(), Some(end.clone()), 4096).await?;
+        if batch.is_empty() {
+            break;
+        }
+        let last = batch.len() < 4096;
+        // Next start is strictly after the last key seen.
+        start = batch.last().map(|(k, _)| {
+            let mut n = k.clone();
+            n.push(0);
+            n
+        }).unwrap();
+        for (_, data_key) in batch {
+            keys.push(data_key);
+        }
+        if last {
+            break;
+        }
+    }
+    Ok(keys)
+}
+
+/// Smallest key strictly greater than every key with `prefix` (increment the
+/// last byte below 0xFF).
+pub fn prefix_upper_bound(prefix: &[u8]) -> Vec<u8> {
+    let mut end = prefix.to_vec();
+    while let Some(last) = end.last().copied() {
+        if last < 0xFF {
+            *end.last_mut().unwrap() = last + 1;
+            return end;
+        }
+        end.pop();
+    }
+    end // all 0xFF -> empty means unbounded; caller guards by table prefix
+}
+
 /// Equality lookup: return the data keys of all rows where the indexed
 /// column equals `value`.
 pub async fn lookup_eq(

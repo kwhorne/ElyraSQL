@@ -165,6 +165,34 @@ impl Storage {
         Ok(out)
     }
 
+    /// Scan keys in `[start, end)` (end exclusive; unbounded when `None`), up
+    /// to `limit` pairs. Backs ordered range lookups on the clustered data
+    /// keyspace and on secondary indexes.
+    pub fn scan_range(
+        &self,
+        start: &[u8],
+        end: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        use std::ops::Bound;
+        let rtx = self.db.begin_read().map_err(|e| Error::Storage(e.to_string()))?;
+        let t = rtx.open_table(KV).map_err(|e| Error::Storage(e.to_string()))?;
+        let lower = Bound::Included(start);
+        let upper = match end {
+            Some(e) => Bound::Excluded(e),
+            None => Bound::Unbounded,
+        };
+        let mut out = Vec::with_capacity(limit.min(1024));
+        for item in t.range::<&[u8]>((lower, upper)).map_err(|e| Error::Storage(e.to_string()))? {
+            let (k, v) = item.map_err(|e| Error::Storage(e.to_string()))?;
+            out.push((k.value().to_vec(), v.value().to_vec()));
+            if out.len() >= limit {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
     /// Atomically apply many puts and deletes in a single write transaction.
     /// This is the primitive the group-commit writer uses to fold many
     /// pending writes into one commit under high write traffic.

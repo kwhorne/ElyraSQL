@@ -95,6 +95,17 @@ impl Db {
         spawn_read(move || storage.scan_batch(&prefix, after.as_deref(), limit)).await
     }
 
+    /// Ordered range scan over `[start, end)` (see [`Storage::scan_range`]).
+    pub async fn scan_range(
+        &self,
+        start: Vec<u8>,
+        end: Option<Vec<u8>>,
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let storage = self.storage.clone();
+        spawn_read(move || storage.scan_range(&start, end.as_deref(), limit)).await
+    }
+
     /// Submit a mutation to the group-commit writer and await durability.
     pub async fn commit(&self, puts: Vec<(Vec<u8>, Vec<u8>)>, deletes: Vec<Vec<u8>>) -> Result<()> {
         let (ack, wait) = oneshot::channel();
