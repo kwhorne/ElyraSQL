@@ -12,8 +12,10 @@ use sqlparser::ast::{
 };
 
 use crate::aggregate;
+use crate::aggregate::AggPlan;
 use crate::index;
 use crate::predicate;
+use elyra_olap::GroupAggregator;
 
 use crate::catalog::{
     self, catalog_key, data_key, data_prefix, rowid_key, wcount_key, IndexDef, TableDef,
@@ -312,11 +314,11 @@ pub async fn select(
     };
     let def = catalog::load(db, &table).await?;
 
-    // Aggregation / grouping path: materialise, aggregate, order, page.
+    // Aggregation / grouping path: parallel streaming aggregation (OLAP).
     if !group_by.is_empty() || aggregate::projection_has_aggregate(&select.projection) {
-        let rows = scan_rows(db, &def, filter.as_ref()).await?;
-        let (schema, mut out_rows) =
-            aggregate::run(&def.schema, &select.projection, &group_by, rows)?;
+        let plan = aggregate::build_plan(&def.schema, &select.projection, &group_by)?;
+        let agg = olap_aggregate(db, &def, filter.clone(), &plan).await?;
+        let (schema, mut out_rows) = plan.finalize(agg);
         order_output_rows(&mut out_rows, &schema, &order_exprs)?;
         apply_offset_limit(&mut out_rows, offset, limit);
         return Ok(QueryResult::Rows(RowStream::literal(schema, out_rows)));
@@ -1371,6 +1373,85 @@ fn parse_vec_free(s: &str) -> Result<Vec<f32>> {
 async fn bump_wcount(db: &Db, table: &str) -> Result<(Vec<u8>, Vec<u8>)> {
     let next = read_wcount(db, table).await? + 1;
     Ok((wcount_key(table), next.to_le_bytes().to_vec()))
+}
+
+/// Aggregate a single table into a [`GroupAggregator`]. Uses the index fast
+/// path for an accelerable equality filter, otherwise parallel streaming.
+async fn olap_aggregate(
+    db: &Db,
+    def: &TableDef,
+    filter: Option<Expr>,
+    plan: &AggPlan,
+) -> Result<GroupAggregator> {
+    if let Some(f) = &filter {
+        if is_accelerable(def, f).unwrap_or(false) {
+            let rows = collect_matches(db, def, Some(f), None).await?;
+            let mut agg = plan.new_aggregator();
+            for (_, row) in rows {
+                agg.feed(&row);
+            }
+            return Ok(agg);
+        }
+    }
+    parallel_aggregate(db, def, filter, plan).await
+}
+
+/// Scan the table in batches and aggregate them across worker threads, merging
+/// partial aggregators. Memory is bounded by (workers x batch), independent of
+/// table size — the core OLAP property.
+async fn parallel_aggregate(
+    db: &Db,
+    def: &TableDef,
+    filter: Option<Expr>,
+    plan: &AggPlan,
+) -> Result<GroupAggregator> {
+    const BATCH: usize = 8192;
+    let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let prefix = data_prefix(&def.name);
+    let schema = def.schema.clone();
+
+    let mut cursor: Option<Vec<u8>> = None;
+    let mut result = plan.new_aggregator();
+    let mut handles = Vec::new();
+
+    loop {
+        let batch = db.scan_batch(prefix.clone(), cursor.clone(), BATCH).await?;
+        if batch.is_empty() {
+            break;
+        }
+        let last = batch.len() < BATCH;
+        cursor = batch.last().map(|(k, _)| k.clone());
+        let blobs: Vec<Vec<u8>> = batch.into_iter().map(|(_, v)| v).collect();
+
+        let mut worker = plan.new_aggregator();
+        let f = filter.clone();
+        let sch = schema.clone();
+        handles.push(tokio::task::spawn_blocking(move || -> Result<GroupAggregator> {
+            for b in &blobs {
+                let row: Vec<Value> =
+                    bincode::deserialize(b).map_err(|e| Error::Storage(e.to_string()))?;
+                let keep = match &f {
+                    Some(e) => predicate::matches(e, &sch, &row)?,
+                    None => true,
+                };
+                if keep {
+                    worker.feed(&row);
+                }
+            }
+            Ok(worker)
+        }));
+
+        if handles.len() >= workers || last {
+            for h in handles.drain(..) {
+                let part = h.await.map_err(|e| Error::Analytics(format!("worker failed: {e}")))??;
+                result.merge(part);
+            }
+        }
+        if last {
+            break;
+        }
+    }
+    Ok(result)
 }
 
 /// Materialise all rows matching `filter` (drops storage keys).

@@ -10,10 +10,9 @@ description = "ElyraSQL query engine: parse, plan and execute SQL"
 elyra-core.workspace = true
 elyra-storage.workspace = true
 elyra-vector.workspace = true
+elyra-olap.workspace = true
 sqlparser.workspace = true
+tokio = { workspace = true }
 bincode.workspace = true
 serde.workspace = true
 tracing.workspace = true
-
-[dev-dependencies]
-tokio = { workspace = true }

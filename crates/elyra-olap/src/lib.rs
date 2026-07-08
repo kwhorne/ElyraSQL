@@ -1,40 +1,260 @@
-//! ElyraSQL analytics (OLAP) acceleration layer.
+//! ElyraSQL analytics (OLAP) kernel.
 //!
-//! ElyraSQL routes heavy analytical queries (large aggregations, scans over
-//! many rows) through a columnar engine that reads the same single-file data
-//! exposed by [`elyra_storage`]. The OLTP path stays row-oriented and
-//! transactional; this layer is read-mostly and vectorised.
-//!
-//! Milestone status: **planned**. The public surface below is the contract
-//! the query engine will call; the columnar backend is wired up in the OLAP
-//! milestone. Nothing here exposes the underlying engine name.
+//! A mergeable, streaming group-aggregation engine. ElyraSQL routes large
+//! aggregations here: the table is scanned in batches and each batch is
+//! aggregated into a partial [`GroupAggregator`]; partials from parallel
+//! workers are then [`merge`](GroupAggregator::merge)d. Because only group
+//! state (not the rows) is retained, aggregation runs in memory proportional
+//! to the number of groups, not the table size.
 
-use elyra_core::Result;
+use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
 
-/// Decides whether a query should be served by the analytical path.
-pub struct OlapRouter;
+use elyra_core::Value;
 
-impl Default for OlapRouter {
-    fn default() -> Self {
-        Self::new()
+/// Aggregate function kinds.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum AggFunc {
+    CountStar,
+    Count,
+    Sum,
+    Avg,
+    Min,
+    Max,
+}
+
+/// One aggregate to compute: function, optional argument column, DISTINCT.
+#[derive(Clone, Debug)]
+pub struct AggSpec {
+    pub func: AggFunc,
+    pub arg_col: Option<usize>,
+    pub distinct: bool,
+}
+
+#[derive(Clone)]
+struct Acc {
+    count: i64,
+    sum: f64,
+    sum_is_int: bool,
+    extreme: Option<Value>,
+    distinct: HashSet<String>,
+}
+
+impl Acc {
+    fn new() -> Self {
+        Acc { count: 0, sum: 0.0, sum_is_int: true, extreme: None, distinct: HashSet::new() }
     }
 }
 
-impl OlapRouter {
-    pub fn new() -> Self {
-        OlapRouter
+/// Streaming, mergeable group aggregator.
+pub struct GroupAggregator {
+    group_cols: Vec<usize>,
+    aggs: Vec<AggSpec>,
+    /// key -> (sample row for group columns, per-agg accumulators)
+    groups: HashMap<String, (Vec<Value>, Vec<Acc>)>,
+    order: Vec<String>,
+}
+
+impl GroupAggregator {
+    pub fn new(group_cols: Vec<usize>, aggs: Vec<AggSpec>) -> Self {
+        GroupAggregator { group_cols, aggs, groups: HashMap::new(), order: Vec::new() }
     }
 
-    /// Heuristic: should this statement go to the analytical engine?
-    /// Always `false` until the OLAP milestone lands.
-    pub fn should_accelerate(&self, _sql: &str) -> bool {
-        false
+    /// Feed one row into the aggregator.
+    pub fn feed(&mut self, row: &[Value]) {
+        let key = group_key(&self.group_cols, row);
+        let aggs = &self.aggs;
+        let order = &mut self.order;
+        let entry = self.groups.entry(key.clone()).or_insert_with(|| {
+            order.push(key);
+            (row.to_vec(), aggs.iter().map(|_| Acc::new()).collect())
+        });
+        for (i, spec) in self.aggs.iter().enumerate() {
+            let v = spec.arg_col.map(|c| row.get(c).cloned().unwrap_or(Value::Null));
+            update(&mut entry.1[i], spec.func, v, spec.distinct);
+        }
     }
 
-    /// Execute an analytical query. Not yet available in this build.
-    pub fn execute(&self, _sql: &str) -> Result<()> {
-        Err(elyra_core::Error::Analytics(
-            "analytical engine not enabled in this build".into(),
-        ))
+    /// Merge another partial aggregator (from a parallel worker) into this one.
+    pub fn merge(&mut self, other: GroupAggregator) {
+        for key in other.order {
+            let (sample, accs) = other.groups.get(&key).expect("key present").clone();
+            match self.groups.get_mut(&key) {
+                Some((_, self_accs)) => {
+                    for (i, (a, b)) in self_accs.iter_mut().zip(accs).enumerate() {
+                        merge_acc(a, b, self.aggs[i].func);
+                    }
+                }
+                None => {
+                    self.order.push(key.clone());
+                    self.groups.insert(key, (sample, accs));
+                }
+            }
+        }
+    }
+
+    /// Number of groups accumulated.
+    pub fn len(&self) -> usize {
+        self.order.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.order.is_empty()
+    }
+
+    /// Finalise into `(group sample row, aggregate results)` pairs, in first-
+    /// seen group order.
+    pub fn into_groups(self) -> Vec<(Vec<Value>, Vec<Value>)> {
+        let GroupAggregator { aggs, groups, order, .. } = self;
+        order
+            .into_iter()
+            .map(|k| {
+                let (sample, accs) = &groups[&k];
+                let results = accs
+                    .iter()
+                    .zip(&aggs)
+                    .map(|(acc, spec)| finish(acc, spec.func))
+                    .collect();
+                (sample.clone(), results)
+            })
+            .collect()
+    }
+
+    /// Results for an aggregate over zero rows (e.g. `COUNT(*)` -> 0).
+    pub fn empty_result(&self) -> Vec<Value> {
+        self.aggs.iter().map(|s| finish(&Acc::new(), s.func)).collect()
+    }
+}
+
+fn group_key(cols: &[usize], row: &[Value]) -> String {
+    if cols.is_empty() {
+        return String::new();
+    }
+    cols.iter().map(|&i| format!("{:?}", row.get(i).unwrap_or(&Value::Null))).collect::<Vec<_>>().join("\u{1}")
+}
+
+fn update(acc: &mut Acc, func: AggFunc, val: Option<Value>, distinct: bool) {
+    match func {
+        AggFunc::CountStar => acc.count += 1,
+        AggFunc::Count => {
+            if let Some(v) = val {
+                if !v.is_null() {
+                    if distinct {
+                        if acc.distinct.insert(format!("{v:?}")) {
+                            acc.count += 1;
+                        }
+                    } else {
+                        acc.count += 1;
+                    }
+                }
+            }
+        }
+        AggFunc::Sum | AggFunc::Avg => {
+            if let Some(v) = val {
+                if let Some(n) = num(&v) {
+                    if distinct && !acc.distinct.insert(format!("{v:?}")) {
+                        return;
+                    }
+                    acc.sum += n;
+                    acc.count += 1;
+                    if !matches!(v, Value::Int(_)) {
+                        acc.sum_is_int = false;
+                    }
+                }
+            }
+        }
+        AggFunc::Min | AggFunc::Max => {
+            if let Some(v) = val {
+                if v.is_null() {
+                    return;
+                }
+                let replace = match &acc.extreme {
+                    None => true,
+                    Some(cur) => {
+                        let ord = value_cmp(&v, cur);
+                        (func == AggFunc::Min && ord == Ordering::Less)
+                            || (func == AggFunc::Max && ord == Ordering::Greater)
+                    }
+                };
+                if replace {
+                    acc.extreme = Some(v);
+                }
+            }
+        }
+    }
+}
+
+fn merge_acc(a: &mut Acc, b: Acc, func: AggFunc) {
+    a.count += b.count;
+    a.sum += b.sum;
+    a.sum_is_int = a.sum_is_int && b.sum_is_int;
+    for d in b.distinct {
+        a.distinct.insert(d);
+    }
+    if let Some(bv) = b.extreme {
+        a.extreme = Some(match a.extreme.take() {
+            None => bv,
+            Some(av) => {
+                let keep_b = match func {
+                    AggFunc::Min => value_cmp(&bv, &av) == Ordering::Less,
+                    _ => value_cmp(&bv, &av) == Ordering::Greater, // MAX (others irrelevant)
+                };
+                if keep_b {
+                    bv
+                } else {
+                    av
+                }
+            }
+        });
+    }
+}
+
+fn finish(acc: &Acc, func: AggFunc) -> Value {
+    match func {
+        AggFunc::CountStar | AggFunc::Count => Value::Int(acc.count),
+        AggFunc::Sum => {
+            if acc.count == 0 {
+                Value::Null
+            } else if acc.sum_is_int && acc.sum.fract() == 0.0 {
+                Value::Int(acc.sum as i64)
+            } else {
+                Value::Float(acc.sum)
+            }
+        }
+        AggFunc::Avg => {
+            if acc.count == 0 {
+                Value::Null
+            } else {
+                Value::Float(acc.sum / acc.count as f64)
+            }
+        }
+        AggFunc::Min | AggFunc::Max => acc.extreme.clone().unwrap_or(Value::Null),
+    }
+}
+
+fn num(v: &Value) -> Option<f64> {
+    match v {
+        Value::Int(i) => Some(*i as f64),
+        Value::Float(f) => Some(*f),
+        Value::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
+        _ => None,
+    }
+}
+
+/// Total order over values: NULL first, then numbers, then text.
+pub fn value_cmp(a: &Value, b: &Value) -> Ordering {
+    match (a, b) {
+        (Value::Null, Value::Null) => Ordering::Equal,
+        (Value::Null, _) => Ordering::Less,
+        (_, Value::Null) => Ordering::Greater,
+        _ => {
+            if let (Some(x), Some(y)) = (num(a), num(b)) {
+                return x.partial_cmp(&y).unwrap_or(Ordering::Equal);
+            }
+            match (a, b) {
+                (Value::Text(x), Value::Text(y)) => x.cmp(y),
+                _ => format!("{a:?}").cmp(&format!("{b:?}")),
+            }
+        }
     }
 }

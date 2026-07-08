@@ -1,44 +1,77 @@
-//! Aggregation, grouping and ordering.
+//! SQL-level aggregation planning over the [`elyra_olap`] kernel.
 //!
-//! `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `GROUP BY`, and `ORDER BY`. These paths
-//! materialise their working set (grouping and sorting inherently need it);
-//! a future columnar OLAP backend takes over for very large aggregations.
-
-use std::cmp::Ordering;
-use std::collections::HashMap;
+//! This module turns a projection + `GROUP BY` into an [`AggPlan`] that can
+//! be executed either in memory (`run`) or by streaming batches into a
+//! [`GroupAggregator`] (the OLAP path in `exec`). The mergeable aggregation
+//! kernel itself lives in `elyra-olap`.
 
 use elyra_core::{ColumnDef, ColumnType, Error, Result, Schema, Value};
-use sqlparser::ast::{
-    Expr, FunctionArg, FunctionArgExpr, FunctionArguments, SelectItem,
-};
+use elyra_olap::{AggFunc, AggSpec, GroupAggregator};
+use sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, FunctionArguments, SelectItem};
 
-#[derive(Clone, Copy, PartialEq)]
-enum AggFunc {
-    CountStar,
-    Count,
-    Sum,
-    Avg,
-    Min,
-    Max,
-}
+pub use elyra_olap::value_cmp;
 
-/// One output column of an aggregating SELECT.
+/// An output column: either a (grouped) source column or an aggregate result.
 enum OutCol {
-    /// A grouped-by (or representative) column value, by schema index.
     Column(usize),
-    /// An aggregate over a column (or `*`).
-    Agg { func: AggFunc, arg: Option<usize>, distinct: bool },
+    Agg(usize),
 }
 
-/// Recognise an aggregate function name, if any.
+/// A planned aggregation: group columns, aggregates, output layout and schema.
+pub struct AggPlan {
+    group_cols: Vec<usize>,
+    aggs: Vec<AggSpec>,
+    plan: Vec<OutCol>,
+    out_schema: Schema,
+}
+
+impl AggPlan {
+    /// A fresh, empty aggregator for this plan (used per parallel worker).
+    pub fn new_aggregator(&self) -> GroupAggregator {
+        GroupAggregator::new(self.group_cols.clone(), self.aggs.clone())
+    }
+
+    /// Finalise an aggregator into output rows in projection order.
+    pub fn finalize(&self, agg: GroupAggregator) -> (Schema, Vec<Vec<Value>>) {
+        let empty = agg.empty_result();
+        let group_by_empty = self.group_cols.is_empty();
+        let groups = agg.into_groups();
+
+        let mut out = Vec::with_capacity(groups.len().max(1));
+        if groups.is_empty() && group_by_empty && !self.aggs.is_empty() {
+            // Bare aggregate over zero rows still yields one row (COUNT(*)->0).
+            out.push(
+                self.plan
+                    .iter()
+                    .map(|o| match o {
+                        OutCol::Column(_) => Value::Null,
+                        OutCol::Agg(j) => empty[*j].clone(),
+                    })
+                    .collect(),
+            );
+        } else {
+            for (sample, results) in groups {
+                out.push(
+                    self.plan
+                        .iter()
+                        .map(|o| match o {
+                            OutCol::Column(i) => sample[*i].clone(),
+                            OutCol::Agg(j) => results[*j].clone(),
+                        })
+                        .collect(),
+                );
+            }
+        }
+        (self.out_schema.clone(), out)
+    }
+}
+
+/// Recognise an aggregate function call.
 fn agg_of(expr: &Expr) -> Option<(AggFunc, &sqlparser::ast::Function)> {
     let Expr::Function(f) = expr else { return None };
     let name = f.name.0.last()?.value.to_ascii_lowercase();
     let func = match name.as_str() {
-        "count" => {
-            // COUNT(*) vs COUNT(expr) is resolved later from the args.
-            AggFunc::Count
-        }
+        "count" => AggFunc::Count,
         "sum" => AggFunc::Sum,
         "avg" => AggFunc::Avg,
         "min" => AggFunc::Min,
@@ -51,9 +84,7 @@ fn agg_of(expr: &Expr) -> Option<(AggFunc, &sqlparser::ast::Function)> {
 /// Does this projection contain any aggregate function?
 pub fn projection_has_aggregate(projection: &[SelectItem]) -> bool {
     projection.iter().any(|item| match item {
-        SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
-            agg_of(e).is_some()
-        }
+        SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => agg_of(e).is_some(),
         _ => false,
     })
 }
@@ -69,11 +100,9 @@ fn item_expr_and_alias(item: &SelectItem) -> Result<(&Expr, Option<String>)> {
 }
 
 fn col_index(schema: &Schema, name: &str) -> Result<usize> {
-    // Join-aware: handles bare and qualified ("table.col") names.
     crate::predicate::resolve_index(name, schema)
 }
 
-/// Column reference as a resolvable name (qualified for `t.col`).
 fn ident_of(expr: &Expr) -> Option<String> {
     match expr {
         Expr::Identifier(id) => Some(id.value.clone()),
@@ -84,7 +113,6 @@ fn ident_of(expr: &Expr) -> Option<String> {
     }
 }
 
-/// Resolve a single aggregate's argument column and DISTINCT flag.
 fn agg_arg(schema: &Schema, f: &sqlparser::ast::Function) -> Result<(Option<usize>, bool)> {
     let FunctionArguments::List(list) = &f.args else {
         return Ok((None, false));
@@ -97,8 +125,8 @@ fn agg_arg(schema: &Schema, f: &sqlparser::ast::Function) -> Result<(Option<usiz
         None => None,
         Some(FunctionArg::Unnamed(FunctionArgExpr::Wildcard)) => None,
         Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(e))) => {
-            let name = ident_of(e)
-                .ok_or_else(|| Error::Unsupported("aggregate arg must be a column".into()))?;
+            let name =
+                ident_of(e).ok_or_else(|| Error::Unsupported("aggregate arg must be a column".into()))?;
             Some(col_index(schema, &name)?)
         }
         _ => return Err(Error::Unsupported("unsupported aggregate argument".into())),
@@ -106,38 +134,19 @@ fn agg_arg(schema: &Schema, f: &sqlparser::ast::Function) -> Result<(Option<usiz
     Ok((arg, distinct))
 }
 
-struct Acc {
-    count: i64,
-    sum: f64,
-    sum_is_int: bool,
-    extreme: Option<Value>,
-    distinct: std::collections::HashSet<String>,
-}
-
-impl Acc {
-    fn new() -> Self {
-        Acc { count: 0, sum: 0.0, sum_is_int: true, extreme: None, distinct: Default::default() }
-    }
-}
-
-/// Run aggregation/grouping over `rows`. Returns the output schema and rows.
-pub fn run(
-    schema: &Schema,
-    projection: &[SelectItem],
-    group_by: &[Expr],
-    rows: Vec<Vec<Value>>,
-) -> Result<(Schema, Vec<Vec<Value>>)> {
-    // Resolve GROUP BY columns (identifiers only).
+/// Build an [`AggPlan`] from a projection and `GROUP BY` expressions.
+pub fn build_plan(schema: &Schema, projection: &[SelectItem], group_by: &[Expr]) -> Result<AggPlan> {
     let mut group_cols = Vec::new();
     for g in group_by {
-        let name = ident_of(g)
-            .ok_or_else(|| Error::Unsupported("GROUP BY must reference a column".into()))?;
+        let name =
+            ident_of(g).ok_or_else(|| Error::Unsupported("GROUP BY must reference a column".into()))?;
         group_cols.push(col_index(schema, &name)?);
     }
 
-    // Build the output plan and schema.
+    let mut aggs = Vec::new();
     let mut plan = Vec::new();
     let mut out_cols = Vec::new();
+
     for item in projection {
         let (expr, alias) = item_expr_and_alias(item)?;
         if let Some((mut func, f)) = agg_of(expr) {
@@ -148,16 +157,14 @@ pub fn run(
             let ty = match func {
                 AggFunc::CountStar | AggFunc::Count => ColumnType::Int,
                 AggFunc::Avg => ColumnType::Float,
-                AggFunc::Sum | AggFunc::Min | AggFunc::Max => arg
-                    .map(|i| schema.columns[i].ty.clone())
-                    .unwrap_or(ColumnType::Float),
+                AggFunc::Sum | AggFunc::Min | AggFunc::Max => {
+                    arg.map(|i| schema.columns[i].ty.clone()).unwrap_or(ColumnType::Float)
+                }
             };
-            out_cols.push(ColumnDef {
-                name: alias.unwrap_or_else(|| expr.to_string()),
-                ty,
-                nullable: true,
-            });
-            plan.push(OutCol::Agg { func, arg, distinct });
+            out_cols.push(ColumnDef { name: alias.unwrap_or_else(|| expr.to_string()), ty, nullable: true });
+            let idx = aggs.len();
+            aggs.push(AggSpec { func, arg_col: arg, distinct });
+            plan.push(OutCol::Agg(idx));
         } else {
             let name = ident_of(expr)
                 .ok_or_else(|| Error::Unsupported("non-aggregated column must be a plain column".into()))?;
@@ -171,165 +178,20 @@ pub fn run(
         }
     }
 
-    // Group rows. No GROUP BY and aggregates present ⇒ one implicit group.
-    let mut groups: HashMap<String, (Vec<Value>, Vec<Acc>)> = HashMap::new();
-    let mut order: Vec<String> = Vec::new();
-    let n_aggs = plan.iter().filter(|o| matches!(o, OutCol::Agg { .. })).count();
+    Ok(AggPlan { group_cols, aggs, plan, out_schema: Schema::new(out_cols) })
+}
 
+/// In-memory aggregation over a fully materialised row set.
+pub fn run(
+    schema: &Schema,
+    projection: &[SelectItem],
+    group_by: &[Expr],
+    rows: Vec<Vec<Value>>,
+) -> Result<(Schema, Vec<Vec<Value>>)> {
+    let plan = build_plan(schema, projection, group_by)?;
+    let mut agg = plan.new_aggregator();
     for row in &rows {
-        let key = group_key(&group_cols, row);
-        let entry = groups.entry(key.clone()).or_insert_with(|| {
-            order.push(key.clone());
-            (row.clone(), (0..n_aggs).map(|_| Acc::new()).collect())
-        });
-
-        let mut ai = 0;
-        for out in &plan {
-            if let OutCol::Agg { func, arg, distinct } = out {
-                let acc = &mut entry.1[ai];
-                ai += 1;
-                let val = arg.map(|i| row[i].clone());
-                update_acc(acc, *func, val, *distinct);
-            }
-        }
+        agg.feed(row);
     }
-
-    // If there were no rows and no GROUP BY, aggregates still produce one row
-    // (e.g. COUNT(*) → 0).
-    if rows.is_empty() && group_by.is_empty() && n_aggs > 0 {
-        let sample = vec![Value::Null; schema.columns.len()];
-        groups.insert(String::new(), (sample, (0..n_aggs).map(|_| Acc::new()).collect()));
-        order.push(String::new());
-    }
-
-    // Emit output rows.
-    let mut out_rows = Vec::with_capacity(order.len());
-    for key in &order {
-        let (sample, accs) = &groups[key];
-        let mut ai = 0;
-        let mut out = Vec::with_capacity(plan.len());
-        for o in &plan {
-            match o {
-                OutCol::Column(i) => out.push(sample[*i].clone()),
-                OutCol::Agg { func, .. } => {
-                    out.push(finish_acc(&accs[ai], *func));
-                    ai += 1;
-                }
-            }
-        }
-        out_rows.push(out);
-    }
-
-    Ok((Schema::new(out_cols), out_rows))
-}
-
-fn group_key(cols: &[usize], row: &[Value]) -> String {
-    if cols.is_empty() {
-        return String::new();
-    }
-    cols.iter()
-        .map(|&i| format!("{:?}", row[i]))
-        .collect::<Vec<_>>()
-        .join("\u{1}")
-}
-
-fn update_acc(acc: &mut Acc, func: AggFunc, val: Option<Value>, distinct: bool) {
-    match func {
-        AggFunc::CountStar => acc.count += 1,
-        AggFunc::Count => {
-            if let Some(v) = val {
-                if !v.is_null() {
-                    if distinct {
-                        if acc.distinct.insert(format!("{v:?}")) {
-                            acc.count += 1;
-                        }
-                    } else {
-                        acc.count += 1;
-                    }
-                }
-            }
-        }
-        AggFunc::Sum | AggFunc::Avg => {
-            if let Some(v) = val {
-                if let Some(n) = num(&v) {
-                    if distinct && !acc.distinct.insert(format!("{v:?}")) {
-                        return;
-                    }
-                    acc.sum += n;
-                    acc.count += 1;
-                    if !matches!(v, Value::Int(_)) {
-                        acc.sum_is_int = false;
-                    }
-                }
-            }
-        }
-        AggFunc::Min | AggFunc::Max => {
-            if let Some(v) = val {
-                if v.is_null() {
-                    return;
-                }
-                let replace = match &acc.extreme {
-                    None => true,
-                    Some(cur) => {
-                        let ord = value_cmp(&v, cur);
-                        (func == AggFunc::Min && ord == Ordering::Less)
-                            || (func == AggFunc::Max && ord == Ordering::Greater)
-                    }
-                };
-                if replace {
-                    acc.extreme = Some(v);
-                }
-            }
-        }
-    }
-}
-
-fn finish_acc(acc: &Acc, func: AggFunc) -> Value {
-    match func {
-        AggFunc::CountStar | AggFunc::Count => Value::Int(acc.count),
-        AggFunc::Sum => {
-            if acc.count == 0 {
-                Value::Null
-            } else if acc.sum_is_int && acc.sum.fract() == 0.0 {
-                Value::Int(acc.sum as i64)
-            } else {
-                Value::Float(acc.sum)
-            }
-        }
-        AggFunc::Avg => {
-            if acc.count == 0 {
-                Value::Null
-            } else {
-                Value::Float(acc.sum / acc.count as f64)
-            }
-        }
-        AggFunc::Min | AggFunc::Max => acc.extreme.clone().unwrap_or(Value::Null),
-    }
-}
-
-fn num(v: &Value) -> Option<f64> {
-    match v {
-        Value::Int(i) => Some(*i as f64),
-        Value::Float(f) => Some(*f),
-        Value::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
-        _ => None,
-    }
-}
-
-/// Total order over values: NULL sorts first, then numbers, then text.
-pub fn value_cmp(a: &Value, b: &Value) -> Ordering {
-    match (a, b) {
-        (Value::Null, Value::Null) => Ordering::Equal,
-        (Value::Null, _) => Ordering::Less,
-        (_, Value::Null) => Ordering::Greater,
-        _ => {
-            if let (Some(x), Some(y)) = (num(a), num(b)) {
-                return x.partial_cmp(&y).unwrap_or(Ordering::Equal);
-            }
-            match (a, b) {
-                (Value::Text(x), Value::Text(y)) => x.cmp(y),
-                _ => format!("{a:?}").cmp(&format!("{b:?}")),
-            }
-        }
-    }
+    Ok(plan.finalize(agg))
 }

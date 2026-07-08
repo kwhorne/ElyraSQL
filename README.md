@@ -13,8 +13,8 @@ file, ACID storage, OLAP-ready and vector-native — all under one brand.
   MySQL driver in any language. No custom client required.
 - **One file** — the entire database lives in a single ACID file (`*.edb`),
   crash-safe with a single-writer / multi-reader model.
-- **OLAP-ready** — heavy analytical queries route to a columnar engine over
-  the same data.
+- **OLAP-ready** — large aggregations run through a parallel, streaming engine
+  with memory proportional to the number of groups, not the table size.
 - **Vector-native** — `VECTOR(n)` columns with ANN search, MySQL-flavoured
   distance functions.
 - **MIT licensed**, targets **Ubuntu 24.04+** for production, develops
@@ -120,7 +120,7 @@ journalctl -u elyrasql -f
 - [x] Secondary indexes (`CREATE INDEX`) with planner integration
 - [x] Aggregation (`COUNT/SUM/AVG/MIN/MAX`), `GROUP BY`, `ORDER BY`
 - [x] Vector ANN acceleration (HNSW), cached & rebuilt-when-stale
-- [ ] OLAP acceleration (columnar analytics)
+- [x] OLAP acceleration: parallel, bounded-memory streaming aggregation
 - [x] Authentication (mysql_native_password) + TLS
 - [ ] Roles / per-user privileges
 - [x] systemd packaging for Ubuntu 24.04+
