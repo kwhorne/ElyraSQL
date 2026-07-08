@@ -1,0 +1,69 @@
+site_name: ElyraSQL
+site_description: A robust, MySQL-compatible SQL server written in Rust.
+site_url: https://kwhorne.github.io/ElyraSQL/
+repo_url: https://github.com/kwhorne/ElyraSQL
+repo_name: kwhorne/ElyraSQL
+copyright: Copyright &copy; 2026 Elyra — MIT licensed
+
+theme:
+  name: material
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+  features:
+    - navigation.instant
+    - navigation.tracking
+    - navigation.sections
+    - navigation.top
+    - content.code.copy
+    - search.suggest
+    - search.highlight
+  icon:
+    repo: fontawesome/brands/github
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.tabbed:
+      alternate_style: true
+  - tables
+  - toc:
+      permalink: true
+
+nav:
+  - Home: index.md
+  - Getting Started: getting-started.md
+  - Installation: installation.md
+  - Configuration: configuration.md
+  - SQL Reference:
+      - Overview: sql/overview.md
+      - Data Types: sql/data-types.md
+      - Tables & DDL: sql/ddl.md
+      - Insert, Update, Delete: sql/dml.md
+      - Queries & Joins: sql/queries.md
+      - Aggregation & OLAP: sql/aggregation.md
+      - Transactions: sql/transactions.md
+      - Vector Search: sql/vector-search.md
+  - Security: security.md
+  - MySQL Compatibility: mysql-compatibility.md
+  - Deployment: deployment.md
+  - Architecture: architecture.md
+  - Performance: performance.md
+  - Limitations & Roadmap: limitations.md
+  - Contributing: contributing.md

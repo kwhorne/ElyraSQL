@@ -3,3 +3,5 @@
 *.edb
 *.edb-lock
 .env
+/site
+.cache
