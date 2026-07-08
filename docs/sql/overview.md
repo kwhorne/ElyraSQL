@@ -38,6 +38,6 @@ qualify columns that appear in more than one table to avoid ambiguity errors.
 - [Tables & DDL](ddl.md)
 - [Insert, Update, Delete](dml.md)
 - [Queries & Joins](queries.md)
-- [Aggregation & OLAP](aggregation.md)
+- [Aggregation](aggregation.md) and [Analytics (OLAP)](../olap.md)
 - [Transactions](transactions.md)
 - [Vector Search](vector-search.md)

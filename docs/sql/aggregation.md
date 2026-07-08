@@ -1,4 +1,7 @@
-# Aggregation & OLAP
+# Aggregation
+
+This page covers aggregate **SQL syntax**. For how large aggregations execute
+(streaming, parallel, index-aware), see [Analytics (OLAP)](../olap.md).
 
 ## Aggregate functions
 
@@ -48,4 +51,5 @@ SELECT region, COUNT(*) FROM sales GROUP BY region;
 !!! note
     This is a row-oriented, parallel streaming aggregator — not a columnar
     engine. It gives bounded memory and multi-core scaling; a columnar store
-    with spill-to-disk is future work.
+    with spill-to-disk is future work. The engine, strategies, and tuning are
+    documented in detail under [Analytics (OLAP)](../olap.md).
