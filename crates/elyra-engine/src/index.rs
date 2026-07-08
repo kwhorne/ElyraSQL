@@ -10,7 +10,7 @@
 //! columns, so equality and (single-column) range lookups are B-tree scans.
 
 use elyra_core::{Result, Value};
-use elyra_storage::Db;
+use crate::session::Session;
 
 use crate::catalog::{data_prefix, IndexDef, TableDef};
 use crate::keyenc;
@@ -68,7 +68,7 @@ pub fn index_on<'a>(def: &'a TableDef, col: usize) -> Option<&'a IndexDef> {
 /// Equality lookup on the full set of indexed columns: data keys of rows whose
 /// indexed tuple equals `values`.
 pub async fn lookup_eq(
-    db: &Db,
+    db: &Session,
     table: &str,
     index: &IndexDef,
     values: &[Value],
@@ -95,7 +95,7 @@ pub async fn lookup_eq(
 
 /// Range lookup on a single-column index. Bounds are `(value, inclusive)`.
 pub async fn lookup_range(
-    db: &Db,
+    db: &Session,
     table: &str,
     index: &IndexDef,
     lo: Option<(&Value, bool)>,

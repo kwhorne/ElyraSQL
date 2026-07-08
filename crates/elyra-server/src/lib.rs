@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use elyra_engine::{Engine, QueryResult, Txn};
+use elyra_engine::{Engine, QueryResult, Session};
 use opensrv_mysql::{
     AsyncMysqlIntermediary, AsyncMysqlShim, Column, ColumnFlags, ColumnType, ErrorKind,
     InitWriter, OkResponse, ParamParser, QueryResultWriter, StatementMetaWriter,
@@ -67,19 +67,20 @@ pub struct ElyraShim {
     /// Privilege of the authenticated user (set during `authenticate`).
     privilege: std::sync::Mutex<elyra_core::Privilege>,
     /// Per-connection transaction state (BEGIN/COMMIT/ROLLBACK).
-    txn: Txn,
+    session: Session,
     stmts: HashMap<u32, Prepared>,
     next_id: u32,
 }
 
 impl ElyraShim {
     pub fn new(engine: Engine, auth: Arc<Auth>) -> Self {
+        let session = engine.session();
         Self {
             engine,
             auth,
             salt: auth::generate_salt(),
             privilege: std::sync::Mutex::new(elyra_core::Privilege::Read),
-            txn: Txn::new(),
+            session,
             stmts: HashMap::new(),
             next_id: 1,
         }
@@ -190,7 +191,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for ElyraShim {
         };
 
         let privilege = self.privilege();
-        match self.engine.execute(&sql, privilege, &mut self.txn).await {
+        match self.engine.execute(&sql, privilege, &self.session).await {
             Ok(outcomes) => write_outcomes(outcomes, results).await,
             Err(e) => results.error(ErrorKind::ER_UNKNOWN_ERROR, e.to_string().as_bytes()).await,
         }
@@ -215,7 +216,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for ElyraShim {
         results: QueryResultWriter<'a, W>,
     ) -> Result<(), Self::Error> {
         let privilege = self.privilege();
-        match self.engine.execute(query, privilege, &mut self.txn).await {
+        match self.engine.execute(query, privilege, &self.session).await {
             Ok(outcomes) => write_outcomes(outcomes, results).await,
             Err(e) => results.error(ErrorKind::ER_UNKNOWN_ERROR, e.to_string().as_bytes()).await,
         }

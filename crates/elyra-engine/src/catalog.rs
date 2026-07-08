@@ -6,7 +6,7 @@
 //! * `data::<table>::<key>` → serialized row (`Vec<Value>`)
 
 use elyra_core::{Error, Result, Schema};
-use elyra_storage::Db;
+use crate::session::Session;
 use serde::{Deserialize, Serialize};
 
 /// A secondary index over one or more columns.
@@ -82,7 +82,7 @@ impl TableDef {
 }
 
 /// Load a table definition, or error if it does not exist.
-pub async fn load(db: &Db, table: &str) -> Result<TableDef> {
+pub async fn load(db: &Session, table: &str) -> Result<TableDef> {
     match db.get(catalog_key(table)).await? {
         Some(bytes) => TableDef::decode(&bytes),
         None => Err(Error::Catalog(format!("no such table: {table}"))),
@@ -90,6 +90,6 @@ pub async fn load(db: &Db, table: &str) -> Result<TableDef> {
 }
 
 /// Check whether a table exists.
-pub async fn exists(db: &Db, table: &str) -> Result<bool> {
+pub async fn exists(db: &Session, table: &str) -> Result<bool> {
     Ok(db.get(catalog_key(table)).await?.is_some())
 }

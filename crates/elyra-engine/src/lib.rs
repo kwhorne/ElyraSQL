@@ -13,11 +13,11 @@ mod exec;
 mod index;
 mod keyenc;
 mod predicate;
+mod session;
 mod stream;
-mod txn;
 mod vindex;
 
-pub use txn::Txn;
+pub use session::Session;
 
 use elyra_core::{ColumnType, Error, Privilege, Result, Schema, Value};
 use elyra_storage::Db;
@@ -65,11 +65,16 @@ impl Engine {
 
     /// Parse and execute one or more `;`-separated statements, enforcing that
     /// each statement is permitted at the caller's `privilege` level.
+    /// Create a per-connection session over the shared database.
+    pub fn session(&self) -> Session {
+        Session::new(self.db.clone())
+    }
+
     pub async fn execute(
         &self,
         sql: &str,
         privilege: Privilege,
-        txn: &mut Txn,
+        sess: &Session,
     ) -> Result<Vec<QueryResult>> {
         if let Some(r) = self.intercept_session(sql) {
             return Ok(vec![r]); // session/introspection: read-level
@@ -87,27 +92,27 @@ impl Engine {
                     "access denied: statement requires {need:?} privilege"
                 )));
             }
-            out.push(self.execute_stmt(stmt, txn).await?);
+            out.push(self.execute_stmt(stmt, sess).await?);
         }
         Ok(out)
     }
 
-    async fn execute_stmt(&self, stmt: Statement, txn: &mut Txn) -> Result<QueryResult> {
+    async fn execute_stmt(&self, stmt: Statement, sess: &Session) -> Result<QueryResult> {
         match stmt {
             Statement::Query(q) => {
                 if query_has_from(&q) {
-                    exec::select(&self.db, &self.vindex, &q).await
+                    exec::select(sess, &self.vindex, &q).await
                 } else {
                     eval::eval_literal_select(&q)
                 }
             }
-            Statement::CreateTable(ct) => exec::create_table(&self.db, txn, ct).await,
-            Statement::CreateIndex(ci) => exec::create_index(&self.db, txn, ci).await,
-            Statement::Insert(ins) => exec::insert(&self.db, txn, ins).await,
+            Statement::CreateTable(ct) => exec::create_table(sess, ct).await,
+            Statement::CreateIndex(ci) => exec::create_index(sess, ci).await,
+            Statement::Insert(ins) => exec::insert(sess, ins).await,
             Statement::Update { table, assignments, selection, .. } => {
-                exec::update(&self.db, txn, &table, &assignments, selection.as_ref()).await
+                exec::update(sess, &table, &assignments, selection.as_ref()).await
             }
-            Statement::Delete(del) => exec::delete(&self.db, txn, &del).await,
+            Statement::Delete(del) => exec::delete(sess, &del).await,
             Statement::Drop { object_type, names, if_exists, .. }
                 if object_type == sqlparser::ast::ObjectType::Table =>
             {
@@ -116,18 +121,18 @@ impl Engine {
                     .and_then(|n| n.0.last())
                     .map(|i| i.value.clone())
                     .ok_or_else(|| Error::Catalog("empty table name".into()))?;
-                exec::drop_table(&self.db, txn, &name, if_exists).await
+                exec::drop_table(sess, &name, if_exists).await
             }
             Statement::StartTransaction { .. } => {
-                txn.begin();
+                sess.begin()?;
                 Ok(QueryResult::empty_ok())
             }
             Statement::Commit { .. } => {
-                txn.commit();
+                sess.commit().await?;
                 Ok(QueryResult::empty_ok())
             }
             Statement::Rollback { .. } => {
-                txn.rollback(&self.db).await?;
+                sess.rollback();
                 Ok(QueryResult::empty_ok())
             }
             Statement::SetVariable { .. } | Statement::Use { .. } => Ok(QueryResult::empty_ok()),

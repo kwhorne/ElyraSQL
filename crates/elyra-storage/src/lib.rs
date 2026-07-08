@@ -17,9 +17,65 @@ mod db;
 pub use db::Db;
 
 use std::path::Path;
+use std::sync::Arc;
 
 use elyra_core::{Error, Result};
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, ReadTransaction, ReadableTable, TableDefinition};
+
+/// A point-in-time MVCC read snapshot. Reads through it always observe the
+/// committed state as of when it was taken, regardless of later commits — the
+/// basis for snapshot-isolated transactions.
+#[derive(Clone)]
+pub struct Snapshot {
+    rtx: Arc<ReadTransaction>,
+}
+
+impl Snapshot {
+    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let t = self.rtx.open_table(KV).map_err(|e| Error::Storage(e.to_string()))?;
+        Ok(t.get(key).map_err(|e| Error::Storage(e.to_string()))?.map(|v| v.value().to_vec()))
+    }
+
+    pub fn multi_get(&self, keys: &[Vec<u8>]) -> Result<Vec<Option<Vec<u8>>>> {
+        let t = self.rtx.open_table(KV).map_err(|e| Error::Storage(e.to_string()))?;
+        let mut out = Vec::with_capacity(keys.len());
+        for k in keys {
+            out.push(
+                t.get(k.as_slice())
+                    .map_err(|e| Error::Storage(e.to_string()))?
+                    .map(|v| v.value().to_vec()),
+            );
+        }
+        Ok(out)
+    }
+
+    /// Ordered range scan over `[start, end)` within the snapshot.
+    pub fn scan_range(
+        &self,
+        start: &[u8],
+        end: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        use std::ops::Bound;
+        let t = self.rtx.open_table(KV).map_err(|e| Error::Storage(e.to_string()))?;
+        let upper = match end {
+            Some(e) => Bound::Excluded(e),
+            None => Bound::Unbounded,
+        };
+        let mut out = Vec::with_capacity(limit.min(1024));
+        for item in t
+            .range::<&[u8]>((Bound::Included(start), upper))
+            .map_err(|e| Error::Storage(e.to_string()))?
+        {
+            let (k, v) = item.map_err(|e| Error::Storage(e.to_string()))?;
+            out.push((k.value().to_vec(), v.value().to_vec()));
+            if out.len() >= limit {
+                break;
+            }
+        }
+        Ok(out)
+    }
+}
 
 /// Key/value blob table. All logical namespaces share this definition; the
 /// key carries the namespace prefix so we keep a single flat keyspace and
@@ -42,6 +98,12 @@ impl Storage {
         }
         wtx.commit().map_err(|e| Error::Storage(e.to_string()))?;
         Ok(Self { db })
+    }
+
+    /// Take an MVCC read snapshot of the current committed state.
+    pub fn snapshot(&self) -> Result<Snapshot> {
+        let rtx = self.db.begin_read().map_err(|e| Error::Storage(e.to_string()))?;
+        Ok(Snapshot { rtx: Arc::new(rtx) })
     }
 
     /// Fully in-memory database (tests, ephemeral sessions).

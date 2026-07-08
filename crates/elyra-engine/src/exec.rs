@@ -4,7 +4,7 @@
 //! Inserts are batched into one group-commit; scans stream.
 
 use elyra_core::{ColumnDef, ColumnType, Error, Result, Schema, Value};
-use elyra_storage::Db;
+use crate::session::Session;
 use sqlparser::ast::{
     Assignment, AssignmentTarget, ColumnOption, CreateIndex, CreateTable, DataType, Delete,
     FromTable, Insert, JoinConstraint, JoinOperator, ObjectName, Select, SetExpr, TableConstraint,
@@ -15,7 +15,6 @@ use crate::aggregate;
 use crate::aggregate::AggPlan;
 use crate::index;
 use crate::predicate;
-use crate::txn::Txn;
 use elyra_olap::GroupAggregator;
 
 use crate::catalog::{
@@ -78,7 +77,7 @@ fn is_tinyint_bool(_dt: &DataType) -> bool {
     false
 }
 
-pub async fn create_table(db: &Db, txn: &mut Txn, ct: CreateTable) -> Result<QueryResult> {
+pub async fn create_table(db: &Session, ct: CreateTable) -> Result<QueryResult> {
     let name = table_ident(&ct.name)?;
 
     if catalog::exists(db, &name).await? {
@@ -130,11 +129,11 @@ pub async fn create_table(db: &Db, txn: &mut Txn, ct: CreateTable) -> Result<Que
         pk_cols,
         indexes: Vec::new(),
     };
-    txn.apply(db, vec![(catalog_key(&name), def.encode()?)], vec![]).await?;
+    db.commit_write(vec![(catalog_key(&name), def.encode()?)], vec![]).await?;
     Ok(QueryResult::Affected(0))
 }
 
-pub async fn create_index(db: &Db, txn: &mut Txn, ci: CreateIndex) -> Result<QueryResult> {
+pub async fn create_index(db: &Session, ci: CreateIndex) -> Result<QueryResult> {
     let table = table_ident(&ci.table_name)?;
     let mut def = catalog::load(db, &table).await?;
 
@@ -192,11 +191,11 @@ pub async fn create_index(db: &Db, txn: &mut Txn, ci: CreateIndex) -> Result<Que
             break;
         }
     }
-    txn.apply(db, puts, vec![]).await?;
+    db.commit_write(puts, vec![]).await?;
     Ok(QueryResult::Affected(0))
 }
 
-pub async fn insert(db: &Db, txn: &mut Txn, ins: Insert) -> Result<QueryResult> {
+pub async fn insert(db: &Session, ins: Insert) -> Result<QueryResult> {
     let name = table_ident(&ins.table_name)?;
     let def = catalog::load(db, &name).await?;
 
@@ -274,12 +273,12 @@ pub async fn insert(db: &Db, txn: &mut Txn, ins: Insert) -> Result<QueryResult> 
     }
     puts.push(bump_wcount(db, &name).await?);
 
-    txn.apply(db, puts, vec![]).await?;
+    db.commit_write(puts, vec![]).await?;
     Ok(QueryResult::Affected(affected))
 }
 
 pub async fn select(
-    db: &Db,
+    db: &Session,
     vindex: &VectorRegistry,
     query: &SqlQuery,
 ) -> Result<QueryResult> {
@@ -434,8 +433,21 @@ pub async fn select(
         return Ok(QueryResult::Rows(RowStream::literal(out_schema, out)));
     }
 
+    // Inside a transaction, reads must observe the snapshot + buffered writes,
+    // so materialise through the session rather than streaming from committed
+    // storage. Autocommit reads stream directly for bounded memory.
+    if db.in_txn() {
+        let mut rows = scan_rows(db, &def, filter.as_ref()).await?;
+        apply_offset_limit(&mut rows, offset, limit);
+        let out: Vec<Vec<Value>> = rows
+            .iter()
+            .map(|r| projection.iter().map(|&i| r[i].clone()).collect())
+            .collect();
+        return Ok(QueryResult::Rows(RowStream::literal(out_schema, out)));
+    }
+
     Ok(QueryResult::Rows(RowStream::scan(
-        db.clone(),
+        db.raw_db(),
         &def,
         ScanSpec { projection, out_schema, filter, offset, limit },
     )))
@@ -444,7 +456,7 @@ pub async fn select(
 /// Execute a multi-table / JOIN SELECT: materialise the joined row set, then
 /// apply WHERE, aggregation or ORDER BY, projection and paging.
 async fn join_select(
-    db: &Db,
+    db: &Session,
     select: &Select,
     filter: Option<Expr>,
     group_by: Vec<Expr>,
@@ -499,7 +511,7 @@ async fn join_select(
 /// a full scan.
 /// Resolve a table reference to its definition and qualified ("alias.col")
 /// columns, without reading any rows.
-async fn resolve_table(db: &Db, tf: &TableFactor) -> Result<(TableDef, Vec<ColumnDef>)> {
+async fn resolve_table(db: &Session, tf: &TableFactor) -> Result<(TableDef, Vec<ColumnDef>)> {
     match tf {
         TableFactor::Table { name, alias, .. } => {
             let tname = table_ident(name)?;
@@ -522,7 +534,7 @@ async fn resolve_table(db: &Db, tf: &TableFactor) -> Result<(TableDef, Vec<Colum
 }
 
 async fn load_relation(
-    db: &Db,
+    db: &Session,
     tf: &TableFactor,
     conjuncts: &[Expr],
 ) -> Result<(Vec<ColumnDef>, Vec<Vec<Value>>)> {
@@ -552,7 +564,7 @@ const NLJ_MAX_DRIVING: usize = 2048;
 
 /// Fetch partner rows where `col == value` via PK/point or secondary index.
 async fn lookup_rows_by_eq(
-    db: &Db,
+    db: &Session,
     def: &TableDef,
     col: usize,
     value: &Value,
@@ -725,7 +737,7 @@ fn as_between(def: &TableDef, expr: &Expr) -> Result<Option<(usize, Value, Value
 }
 
 /// Range scan over the clustered (PK) data keyspace.
-async fn clustered_range(db: &Db, def: &TableDef, rq: &RangeQuery) -> Result<Vec<(Vec<u8>, Vec<Value>)>> {
+async fn clustered_range(db: &Session, def: &TableDef, rq: &RangeQuery) -> Result<Vec<(Vec<u8>, Vec<Value>)>> {
     let prefix = data_prefix(&def.name);
     let mut start = match &rq.lo {
         Some((v, incl)) => {
@@ -769,7 +781,7 @@ async fn clustered_range(db: &Db, def: &TableDef, rq: &RangeQuery) -> Result<Vec
 
 /// Range scan via a secondary index, then batch-fetch the rows.
 async fn index_range(
-    db: &Db,
+    db: &Session,
     def: &TableDef,
     idx: &IndexDef,
     rq: &RangeQuery,
@@ -790,7 +802,7 @@ async fn index_range(
 /// Build the joined row set from a FROM clause (comma cross-joins + explicit
 /// JOINs), pushing single-table `conjuncts` down to each base relation.
 async fn build_from(
-    db: &Db,
+    db: &Session,
     from: &[TableWithJoins],
     conjuncts: &[Expr],
 ) -> Result<(Vec<ColumnDef>, Vec<Vec<Value>>)> {
@@ -1200,7 +1212,7 @@ fn accelerable(def: &TableDef, filter: Option<&Expr>) -> Result<bool> {
 /// `limit`. Uses the PK point-lookup fast path when possible, otherwise a
 /// bounded-batch clustered scan.
 async fn collect_matches(
-    db: &Db,
+    db: &Session,
     def: &TableDef,
     filter: Option<&Expr>,
     limit: Option<usize>,
@@ -1320,8 +1332,7 @@ fn table_of(twj: &TableWithJoins) -> Result<String> {
 }
 
 pub async fn update(
-    db: &Db,
-    txn: &mut Txn,
+    db: &Session,
     table: &TableWithJoins,
     assignments: &[Assignment],
     selection: Option<&Expr>,
@@ -1392,11 +1403,11 @@ pub async fn update(
     }
 
     puts.push(bump_wcount(db, &name).await?);
-    txn.apply(db, puts, deletes).await?;
+    db.commit_write(puts, deletes).await?;
     Ok(QueryResult::Affected(affected))
 }
 
-pub async fn delete(db: &Db, txn: &mut Txn, del: &Delete) -> Result<QueryResult> {
+pub async fn delete(db: &Session, del: &Delete) -> Result<QueryResult> {
     let relations = match &del.from {
         FromTable::WithFromKeyword(v) | FromTable::WithoutKeyword(v) => v,
     };
@@ -1421,7 +1432,7 @@ pub async fn delete(db: &Db, txn: &mut Txn, del: &Delete) -> Result<QueryResult>
     }
 
     let wc = bump_wcount(db, &name).await?;
-    txn.apply(db, vec![wc], deletes).await?;
+    db.commit_write(vec![wc], deletes).await?;
     Ok(QueryResult::Affected(affected))
 }
 
@@ -1643,7 +1654,7 @@ fn parse_vec_free(s: &str) -> Result<Vec<f32>> {
 }
 
 /// Produce the `(key, value)` put that advances a table's write counter.
-async fn bump_wcount(db: &Db, table: &str) -> Result<(Vec<u8>, Vec<u8>)> {
+async fn bump_wcount(db: &Session, table: &str) -> Result<(Vec<u8>, Vec<u8>)> {
     let next = read_wcount(db, table).await? + 1;
     Ok((wcount_key(table), next.to_le_bytes().to_vec()))
 }
@@ -1651,7 +1662,7 @@ async fn bump_wcount(db: &Db, table: &str) -> Result<(Vec<u8>, Vec<u8>)> {
 /// Aggregate a single table into a [`GroupAggregator`]. Uses the index fast
 /// path for an accelerable equality filter, otherwise parallel streaming.
 async fn olap_aggregate(
-    db: &Db,
+    db: &Session,
     def: &TableDef,
     filter: Option<Expr>,
     plan: &AggPlan,
@@ -1675,7 +1686,7 @@ async fn olap_aggregate(
 /// partial aggregators. Memory is bounded by (workers x batch), independent of
 /// table size — the core OLAP property.
 async fn parallel_aggregate(
-    db: &Db,
+    db: &Session,
     def: &TableDef,
     filter: Option<Expr>,
     plan: &AggPlan,
@@ -1730,7 +1741,7 @@ async fn parallel_aggregate(
 }
 
 /// Materialise all rows matching `filter` (drops storage keys).
-async fn scan_rows(db: &Db, def: &TableDef, filter: Option<&Expr>) -> Result<Vec<Vec<Value>>> {
+async fn scan_rows(db: &Session, def: &TableDef, filter: Option<&Expr>) -> Result<Vec<Vec<Value>>> {
     Ok(collect_matches(db, def, filter, None)
         .await?
         .into_iter()
@@ -1817,7 +1828,7 @@ fn reorder(rows: &mut [Vec<Value>], keyed: &[(Vec<Value>, usize)]) {
     }
 }
 
-pub async fn drop_table(db: &Db, txn: &mut Txn, name: &str, if_exists: bool) -> Result<QueryResult> {
+pub async fn drop_table(db: &Session, name: &str, if_exists: bool) -> Result<QueryResult> {
     if !catalog::exists(db, name).await? {
         if if_exists {
             return Ok(QueryResult::Affected(0));
@@ -1841,11 +1852,11 @@ pub async fn drop_table(db: &Db, txn: &mut Txn, name: &str, if_exists: bool) -> 
             break;
         }
     }
-    txn.apply(db, vec![], deletes).await?;
+    db.commit_write(vec![], deletes).await?;
     Ok(QueryResult::Affected(0))
 }
 
-async fn read_rowid(db: &Db, table: &str) -> Result<u64> {
+async fn read_rowid(db: &Session, table: &str) -> Result<u64> {
     Ok(match db.get(rowid_key(table)).await? {
         Some(bytes) if bytes.len() == 8 => {
             u64::from_le_bytes(bytes.try_into().expect("checked length"))

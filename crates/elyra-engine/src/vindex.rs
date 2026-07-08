@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use elyra_core::{Error, Result, Value};
-use elyra_storage::Db;
+use crate::session::Session;
 use elyra_vector::{Hnsw, Metric};
 
 use crate::catalog::{data_prefix, wcount_key, TableDef};
@@ -36,7 +36,7 @@ impl VectorRegistry {
     /// missing or stale.
     pub async fn get(
         &self,
-        db: &Db,
+        db: &Session,
         def: &TableDef,
         col: usize,
         metric: Metric,
@@ -58,7 +58,7 @@ impl VectorRegistry {
     }
 }
 
-pub async fn read_wcount(db: &Db, table: &str) -> Result<u64> {
+pub async fn read_wcount(db: &Session, table: &str) -> Result<u64> {
     Ok(match db.get(wcount_key(table)).await? {
         Some(b) if b.len() == 8 => u64::from_le_bytes(b.try_into().expect("len 8")),
         _ => 0,
@@ -66,7 +66,7 @@ pub async fn read_wcount(db: &Db, table: &str) -> Result<u64> {
 }
 
 async fn build(
-    db: &Db,
+    db: &Session,
     def: &TableDef,
     col: usize,
     metric: Metric,

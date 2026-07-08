@@ -22,7 +22,7 @@ use elyra_core::{Error, Result};
 use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
 
-use crate::Storage;
+use crate::{Snapshot, Storage};
 
 /// Max writes folded into a single group commit.
 const GROUP_COMMIT_MAX: usize = 1024;
@@ -68,6 +68,11 @@ impl Db {
             .map_err(Error::Io)?;
 
         Ok(Self { storage, writer: tx })
+    }
+
+    /// Take an MVCC read snapshot of the current committed state.
+    pub fn snapshot(&self) -> Result<Snapshot> {
+        self.storage.snapshot()
     }
 
     /// Fetch a value by key (concurrent snapshot read).
