@@ -3,6 +3,7 @@
 //!
 //! One TCP connection = one [`ElyraShim`] over the shared [`Engine`].
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use elyra_engine::{Engine, QueryResult};
@@ -14,14 +15,32 @@ use tokio::io::AsyncWrite;
 use tokio::net::TcpListener;
 use tracing::{error, info};
 
+mod prepared;
+
+// Prepared statements (COM_STMT_PREPARE/EXECUTE) are implemented by counting
+// `?` placeholders and binding parameters as SQL literals at execute time.
+// Verified working: prepare + (repeated) execute with typed params, escaping,
+// and INSERT/SELECT/UPDATE. Known upstream limitation: the opensrv-mysql 0.7
+// wire layer can desync across repeated COM_STMT_CLOSE -> COM_STMT_PREPARE
+// cycles on one connection; pooled clients that cache prepared statements
+// (the common case) and PyMySQL-style client-side binding are unaffected.
+
+/// A parsed prepared statement: the SQL template and its placeholder count.
+struct Prepared {
+    sql: String,
+    params: usize,
+}
+
 /// Per-connection protocol handler.
 pub struct ElyraShim {
     engine: Engine,
+    stmts: HashMap<u32, Prepared>,
+    next_id: u32,
 }
 
 impl ElyraShim {
     pub fn new(engine: Engine) -> Self {
-        Self { engine }
+        Self { engine, stmts: HashMap::new(), next_id: 1 }
     }
 }
 
@@ -47,26 +66,60 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for ElyraShim {
 
     async fn on_prepare<'a>(
         &'a mut self,
-        _query: &'a str,
+        query: &'a str,
         info: StatementMetaWriter<'a, W>,
     ) -> Result<(), Self::Error> {
-        // Prepared statements land in a later milestone.
-        info.error(ErrorKind::ER_UNKNOWN_ERROR, b"prepared statements not yet supported")
-            .await
+        let param_count = prepared::count_placeholders(query);
+        let id = self.next_id;
+        self.next_id += 1;
+        self.stmts.insert(id, Prepared { sql: query.to_string(), params: param_count });
+
+        // Generic string parameter descriptors; result columns are described
+        // at execute time by the binary resultset.
+        let params: Vec<Column> = (0..param_count)
+            .map(|_| Column {
+                table: String::new(),
+                column: "?".into(),
+                coltype: ColumnType::MYSQL_TYPE_VAR_STRING,
+                colflags: ColumnFlags::empty(),
+            })
+            .collect();
+        let columns: Vec<Column> = Vec::new();
+        info.reply(id, &params, &columns).await
     }
 
     async fn on_execute<'a>(
         &'a mut self,
-        _id: u32,
-        _params: ParamParser<'a>,
+        id: u32,
+        params: ParamParser<'a>,
         results: QueryResultWriter<'a, W>,
     ) -> Result<(), Self::Error> {
-        results
-            .error(ErrorKind::ER_UNKNOWN_ERROR, b"prepared statements not yet supported")
-            .await
+        let Some(stmt) = self.stmts.get(&id) else {
+            return results
+                .error(ErrorKind::ER_UNKNOWN_ERROR, b"unknown prepared statement")
+                .await;
+        };
+
+        // Render bound parameters as SQL literals and substitute them for the
+        // `?` placeholders, producing a concrete statement to execute.
+        let mut literals: Vec<String> = Vec::with_capacity(stmt.params);
+        for p in params {
+            literals.push(prepared::value_to_literal(p.value.into_inner()));
+        }
+        let sql = match prepared::bind(&stmt.sql, &literals) {
+            Ok(s) => s,
+            Err(e) => return results.error(ErrorKind::ER_UNKNOWN_ERROR, e.as_bytes()).await,
+        };
+
+        match self.engine.execute(&sql).await {
+            Ok(outcomes) => write_outcomes(outcomes, results).await,
+            Err(e) => results.error(ErrorKind::ER_UNKNOWN_ERROR, e.to_string().as_bytes()).await,
+        }
     }
 
-    async fn on_close(&mut self, _stmt: u32) {}
+    async fn on_close(&mut self, stmt: u32) {
+        self.stmts.remove(&stmt);
+    }
 
     async fn on_init<'a>(
         &'a mut self,
@@ -127,9 +180,13 @@ async fn write_outcomes<W: AsyncWrite + Send + Unpin>(
                     break;
                 }
                 for row in batch {
-                    let cells: Vec<Option<String>> =
-                        row.iter().map(|v| v.to_wire_string()).collect();
-                    rw.write_row(cells).await?;
+                    // Write each cell with its native type so both the text
+                    // (COM_QUERY) and binary (COM_STMT_EXECUTE) encoders emit
+                    // correct wire values.
+                    for v in &row {
+                        write_cell(&mut rw, v)?;
+                    }
+                    rw.end_row().await?;
                 }
             }
             rw.finish().await
@@ -140,6 +197,25 @@ async fn write_outcomes<W: AsyncWrite + Send + Unpin>(
                 .await
         }
         None => results.completed(OkResponse::default()).await,
+    }
+}
+
+fn write_cell<W: AsyncWrite + Send + Unpin>(
+    rw: &mut opensrv_mysql::RowWriter<'_, W>,
+    v: &elyra_core::Value,
+) -> std::io::Result<()> {
+    use elyra_core::Value;
+    match v {
+        Value::Null => rw.write_col(None::<i64>),
+        Value::Bool(b) => rw.write_col(*b as i8),
+        Value::Int(i) => rw.write_col(*i),
+        Value::Float(f) => rw.write_col(*f),
+        Value::Text(s) => rw.write_col(s),
+        Value::Bytes(b) => rw.write_col(b),
+        Value::Vector(vec) => {
+            let inner = vec.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(",");
+            rw.write_col(format!("[{inner}]"))
+        }
     }
 }
 

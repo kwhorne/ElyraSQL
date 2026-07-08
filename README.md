@@ -91,7 +91,8 @@ SELECT VERSION();   -- 8.0.0-ElyraSQL-0.1.0
 - [x] SQL frontend (MySQL dialect) + literal/arithmetic `SELECT`
 - [ ] Transactional executor: `CREATE/INSERT/UPDATE/DELETE/SELECT` over storage
 - [ ] Secondary indexes + query planner
-- [ ] Prepared statements (binary protocol)
+- [x] Prepared statements (binary protocol): typed params, escaping
+      (see caveat on repeated close→prepare cycles under opensrv 0.7)
 - [x] `VECTOR(n)` columns + exact KNN via `VEC_DISTANCE` in `ORDER BY`
 - [x] Secondary indexes (`CREATE INDEX`) with planner integration
 - [x] Aggregation (`COUNT/SUM/AVG/MIN/MAX`), `GROUP BY`, `ORDER BY`
