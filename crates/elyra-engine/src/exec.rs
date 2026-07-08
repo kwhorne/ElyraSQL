@@ -508,13 +508,21 @@ async fn join_select(
 
 /// Load a single FROM relation into `(qualified columns, rows)`. Column names
 /// are qualified with the table alias (or name) as "alias.col".
-async fn load_relation(db: &Db, tf: &TableFactor) -> Result<(Vec<ColumnDef>, Vec<Vec<Value>>)> {
+///
+/// If a single-table conjunct is `indexed_col = <literal>` (PK or secondary
+/// index), the base relation is fetched via the O(log n) fast path instead of
+/// a full scan.
+async fn load_relation(
+    db: &Db,
+    tf: &TableFactor,
+    conjuncts: &[Expr],
+) -> Result<(Vec<ColumnDef>, Vec<Vec<Value>>)> {
     match tf {
         TableFactor::Table { name, alias, .. } => {
             let tname = table_ident(name)?;
             let def = catalog::load(db, &tname).await?;
             let a = alias.as_ref().map(|al| al.name.value.clone()).unwrap_or_else(|| tname.clone());
-            let cols = def
+            let cols: Vec<ColumnDef> = def
                 .schema
                 .columns
                 .iter()
@@ -524,11 +532,34 @@ async fn load_relation(db: &Db, tf: &TableFactor) -> Result<(Vec<ColumnDef>, Vec
                     nullable: c.nullable,
                 })
                 .collect();
-            let rows = scan_rows(db, &def, None).await?;
+
+            // Pick an accelerable conjunct (eq on PK / indexed column) that
+            // references only this relation, and route it through the index.
+            let rel_schema = Schema::new(cols.clone());
+            let accel = conjuncts
+                .iter()
+                .find(|c| refs_in_schema(c, &rel_schema) && is_accelerable(&def, c).unwrap_or(false));
+
+            let rows = match accel {
+                Some(c) => collect_matches(db, &def, Some(c), None)
+                    .await?
+                    .into_iter()
+                    .map(|(_, r)| r)
+                    .collect(),
+                None => scan_rows(db, &def, None).await?,
+            };
             Ok((cols, rows))
         }
         _ => Err(Error::Unsupported("only plain table references are supported in joins".into())),
     }
+}
+
+/// Whether `conjunct` is `col = <literal>` on this table's PK or an index.
+fn is_accelerable(def: &TableDef, conjunct: &Expr) -> Result<bool> {
+    Ok(match eq_col_literal(def, Some(conjunct))? {
+        Some((col, _)) => def.pk_col == Some(col) || index::index_on(def, col).is_some(),
+        None => false,
+    })
 }
 
 /// Build the joined row set from a FROM clause (comma cross-joins + explicit
@@ -543,7 +574,7 @@ async fn build_from(
     let mut first = true;
 
     for twj in from {
-        let (bc, mut br) = load_relation(db, &twj.relation).await?;
+        let (bc, mut br) = load_relation(db, &twj.relation, conjuncts).await?;
         br = apply_pushdown(br, &bc, conjuncts)?;
         if first {
             cur_cols = bc;
@@ -555,7 +586,7 @@ async fn build_from(
             cur_rows = r;
         }
         for join in &twj.joins {
-            let (jc, mut jr) = load_relation(db, &join.relation).await?;
+            let (jc, mut jr) = load_relation(db, &join.relation, conjuncts).await?;
             jr = apply_pushdown(jr, &jc, conjuncts)?;
             let (c, r) = combine(&cur_cols, &cur_rows, &jc, &jr, &join.join_operator)?;
             cur_cols = c;
