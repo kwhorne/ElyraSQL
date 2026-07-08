@@ -1,0 +1,7 @@
+target
+.git
+.github
+*.edb
+*.edb-lock
+dist
+bench

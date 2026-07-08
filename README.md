@@ -97,6 +97,29 @@ results. Highlights (release, 100k rows): PK lookup ~0.15 ms, selective
 index-nested-loop join ~0.18 ms, cached vector ANN ~0.29 ms, bulk ingest
 ~180k rows/s.
 
+## Install
+
+Static Linux binaries (x86_64 and aarch64) are attached to each
+[GitHub Release](https://github.com/kwhorne/ElyraSQL/releases):
+
+```bash
+curl -L -o elyrasql.tar.gz \
+  https://github.com/kwhorne/ElyraSQL/releases/download/v0.1.0/elyrasql-0.1.0-linux-x86_64.tar.gz
+tar xzf elyrasql.tar.gz && ./elyrasql-0.1.0-linux-x86_64/elyrasql serve
+```
+
+## Docker
+
+Multi-arch image (amd64 + arm64) on GHCR:
+
+```bash
+docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:0.1.0
+# with auth + a persistent volume:
+docker run -p 3307:3307 -v elyra:/var/lib/elyrasql \
+  -e ELYRASQL_USER=root -e ELYRASQL_PASSWORD=secret \
+  ghcr.io/kwhorne/elyrasql:latest
+```
+
 ## Deploying on Ubuntu 24.04+
 
 ```bash
