@@ -33,6 +33,9 @@ const WRITE_QUEUE_DEPTH: usize = 4096;
 struct WriteJob {
     puts: Vec<(Vec<u8>, Vec<u8>)>,
     deletes: Vec<Vec<u8>>,
+    /// When set, validate these `(key, snapshot-value)` pairs before applying
+    /// (transactional commit); such jobs are applied alone, not merged.
+    expected: Option<Vec<(Vec<u8>, Option<Vec<u8>>)>>,
     ack: oneshot::Sender<Result<()>>,
 }
 
@@ -116,9 +119,34 @@ impl Db {
 
     /// Submit a mutation to the group-commit writer and await durability.
     pub async fn commit(&self, puts: Vec<(Vec<u8>, Vec<u8>)>, deletes: Vec<Vec<u8>>) -> Result<()> {
+        self.submit(puts, deletes, None).await
+    }
+
+    /// Submit a validated (transactional) commit: verify `expected` values
+    /// still hold before applying, else fail with [`elyra_core::Error::Conflict`].
+    pub async fn commit_checked(
+        &self,
+        expected: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+        puts: Vec<(Vec<u8>, Vec<u8>)>,
+        deletes: Vec<Vec<u8>>,
+    ) -> Result<()> {
+        self.submit(puts, deletes, Some(expected)).await
+    }
+
+    async fn submit(
+        &self,
+        puts: Vec<(Vec<u8>, Vec<u8>)>,
+        deletes: Vec<Vec<u8>>,
+        expected: Option<Vec<(Vec<u8>, Option<Vec<u8>>)>>,
+    ) -> Result<()> {
         let (ack, wait) = oneshot::channel();
         self.writer
-            .send(WriteJob { puts, deletes, ack })
+            .send(WriteJob {
+                puts,
+                deletes,
+                expected,
+                ack,
+            })
             .await
             .map_err(|_| Error::Storage("writer thread stopped".into()))?;
         wait.await
@@ -142,25 +170,35 @@ where
 /// commit everything in a single transaction (group commit).
 fn writer_loop(storage: Arc<Storage>, mut rx: mpsc::Receiver<WriteJob>) {
     while let Some(first) = rx.blocking_recv() {
+        // A validated (transactional) commit is applied on its own, so a
+        // conflict fails only that transaction, not batched neighbours.
+        if let Some(expected) = &first.expected {
+            let result = storage.apply_checked(expected, &first.puts, &first.deletes);
+            let _ = first.ack.send(result);
+            continue;
+        }
+
+        // Group consecutive plain writes into one transaction.
         let mut jobs = vec![first];
+        let mut pending: Option<WriteJob> = None;
         while jobs.len() < GROUP_COMMIT_MAX {
             match rx.try_recv() {
-                Ok(job) => jobs.push(job),
+                Ok(job) if job.expected.is_none() => jobs.push(job),
+                Ok(job) => {
+                    pending = Some(job); // validated: handle after this group
+                    break;
+                }
                 Err(_) => break,
             }
         }
 
-        // Merge all pending writes into one transaction.
         let mut puts = Vec::new();
         let mut deletes = Vec::new();
         for j in &jobs {
             puts.extend_from_slice(&j.puts);
             deletes.extend_from_slice(&j.deletes);
         }
-
         let result = storage.apply(&puts, &deletes);
-
-        // Fan the shared outcome back to every waiter.
         for job in jobs {
             let r = match &result {
                 Ok(()) => Ok(()),
@@ -169,6 +207,11 @@ fn writer_loop(storage: Arc<Storage>, mut rx: mpsc::Receiver<WriteJob>) {
             if job.ack.send(r).is_err() {
                 warn!("write submitter dropped before commit acknowledgement");
             }
+        }
+
+        if let Some(job) = pending {
+            let r = storage.apply_checked(job.expected.as_ref().unwrap(), &job.puts, &job.deletes);
+            let _ = job.ack.send(r);
         }
     }
 }

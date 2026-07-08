@@ -23,9 +23,10 @@ implemented, so you can judge fit.
 
 ## Transactions
 
-- **Snapshot isolation** is implemented, but there is **no write-conflict
-  detection**: concurrent writes to the same row are last-writer-wins on commit
-  (write skew is possible). Serializable isolation is future work.
+- **Snapshot isolation** with **first-committer-wins** write-conflict detection
+  (conflicting commits fail with error `1213`). It is not fully serializable:
+  only the write set is validated, so **write skew** is still possible.
+  Serializable isolation is future work.
 - `SET autocommit=0` is accepted but not honoured; use explicit `BEGIN`.
 
 ## Analytics
@@ -45,9 +46,9 @@ implemented, so you can judge fit.
 
 Candidate next steps, roughly in order of value:
 
-1. Write-conflict detection (stronger isolation).
-2. JSON path functions.
-3. Subqueries and `HAVING`.
+1. Subqueries and `HAVING`.
+2. Serializable isolation (read-set validation).
+3. More JSON functions (`JSON_SET`, `JSON_ARRAY`, containment).
 4. Secondary-index range on composite keys; merge joins.
 5. Columnar OLAP with spill-to-disk.
 6. Richer `information_schema` / `SHOW`.

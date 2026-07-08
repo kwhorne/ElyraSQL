@@ -19,6 +19,19 @@ COMMIT;                      -- or ROLLBACK to discard
   `COMMIT`. There are **no dirty reads**.
 - **Atomicity.** `COMMIT` applies all buffered writes atomically; `ROLLBACK`
   discards them, leaving storage untouched.
+- **Write-conflict detection.** On `COMMIT`, ElyraSQL verifies that every row
+  the transaction wrote is unchanged since its snapshot. If another transaction
+  committed a change to one of those rows first, the commit is **rejected** with
+  a serialization failure (MySQL error `1213`) and the transaction is aborted
+  (first-committer-wins). Retry the transaction.
+
+```sql
+-- If another connection commits a change to id = 1 first, this COMMIT fails
+-- with error 1213 and must be retried.
+BEGIN;
+UPDATE accounts SET balance = balance - 100 WHERE id = 1;
+COMMIT;
+```
 
 ## Example: isolation between connections
 
@@ -37,8 +50,11 @@ COMMIT;                      -- or ROLLBACK to discard
 Statements outside an explicit transaction commit immediately. Each connection
 has its own transaction state.
 
-!!! warning "Known limitations"
-    - There is **no write-conflict detection**: two transactions that modify
-      the same row follow last-writer-wins on commit (write skew is possible).
-      True serializable isolation is future work.
-    - `SET autocommit=0` is accepted but not honoured; use explicit `BEGIN`.
+!!! note "Isolation level"
+    This is **snapshot isolation with first-committer-wins** write-conflict
+    detection — stronger than read-committed and free of lost updates and dirty
+    reads. It is not fully serializable: because only the write set is checked
+    (not the read set), **write skew** remains possible. Full serializability is
+    future work.
+
+    `SET autocommit=0` is accepted but not honoured; use explicit `BEGIN`.

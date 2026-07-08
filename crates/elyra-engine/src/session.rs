@@ -58,12 +58,32 @@ impl Session {
 
     pub async fn commit(&self) -> Result<()> {
         let staged = self.txn.lock().unwrap().take();
-        if let Some(tx) = staged {
-            let puts: Vec<(Vec<u8>, Vec<u8>)> = tx.puts.into_iter().collect();
-            let deletes: Vec<Vec<u8>> = tx.deletes.into_iter().collect();
-            self.db.commit(puts, deletes).await?;
-        }
-        Ok(())
+        let Some(tx) = staged else { return Ok(()) };
+        let TxnState {
+            snapshot,
+            puts,
+            deletes,
+        } = tx;
+
+        // Expected value of every written key at snapshot time. The commit is
+        // rejected (Conflict) if any of these changed in the meantime.
+        // Validate data/index/catalog keys, but not the per-table monotonic
+        // counters (`meta::…`): those are bumped by every write and would cause
+        // false conflicts between transactions on the same table. Real row
+        // collisions are still caught via their data keys.
+        let is_meta = |k: &[u8]| k.starts_with(b"meta::");
+        let mut keys: Vec<Vec<u8>> = Vec::with_capacity(puts.len() + deletes.len());
+        keys.extend(puts.keys().filter(|k| !is_meta(k)).cloned());
+        keys.extend(deletes.iter().filter(|k| !is_meta(k)).cloned());
+        let snap = snapshot.clone();
+        let kq = keys.clone();
+        let snap_vals = spawn(move || snap.multi_get(&kq)).await?;
+        let expected: Vec<(Vec<u8>, Option<Vec<u8>>)> = keys.into_iter().zip(snap_vals).collect();
+
+        let put_vec: Vec<(Vec<u8>, Vec<u8>)> = puts.into_iter().collect();
+        let del_vec: Vec<Vec<u8>> = deletes.into_iter().collect();
+        // On conflict the transaction is already cleared above -> aborted.
+        self.db.commit_checked(expected, put_vec, del_vec).await
     }
 
     pub fn rollback(&self) {

@@ -18,6 +18,9 @@ pub enum Error {
     #[error("query error: {0}")]
     Query(String),
 
+    #[error("serialization failure: {0}")]
+    Conflict(String),
+
     #[error("type error: {0}")]
     Type(String),
 
@@ -43,6 +46,7 @@ impl Error {
             Error::Catalog(_) => 1146,     // ER_NO_SUCH_TABLE-ish bucket
             Error::Type(_) => 1366,        // ER_TRUNCATED_WRONG_VALUE
             Error::Unsupported(_) => 1235, // ER_NOT_SUPPORTED_YET
+            Error::Conflict(_) => 1213,    // ER_LOCK_DEADLOCK (serialization failure)
             _ => 1105,
         }
     }

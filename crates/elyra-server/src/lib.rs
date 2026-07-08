@@ -94,6 +94,12 @@ impl ElyraShim {
     }
 }
 
+/// Map an ElyraSQL error to the MySQL error code the wire should report
+/// (e.g. 1064 parse, 1146 no-such-table, 1213 serialization failure).
+fn elyra_kind(e: &elyra_core::Error) -> ErrorKind {
+    ErrorKind::from(e.mysql_code())
+}
+
 fn column_type(ty: &elyra_core::ColumnType) -> ColumnType {
     match ty {
         elyra_core::ColumnType::Bool => ColumnType::MYSQL_TYPE_TINY,
@@ -210,7 +216,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for ElyraShim {
             Ok(outcomes) => write_outcomes(outcomes, results).await,
             Err(e) => {
                 results
-                    .error(ErrorKind::ER_UNKNOWN_ERROR, e.to_string().as_bytes())
+                    .error(elyra_kind(&e), e.to_string().as_bytes())
                     .await
             }
         }
@@ -239,7 +245,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for ElyraShim {
             Ok(outcomes) => write_outcomes(outcomes, results).await,
             Err(e) => {
                 results
-                    .error(ErrorKind::ER_UNKNOWN_ERROR, e.to_string().as_bytes())
+                    .error(elyra_kind(&e), e.to_string().as_bytes())
                     .await
             }
         }
@@ -277,7 +283,7 @@ async fn write_outcomes<W: AsyncWrite + Send + Unpin>(
                     Err(e) => {
                         // Mid-stream engine error: surface it and stop.
                         let msg = e.to_string().into_bytes();
-                        return rw.finish_error(ErrorKind::ER_UNKNOWN_ERROR, &msg).await;
+                        return rw.finish_error(elyra_kind(&e), &msg).await;
                     }
                 };
                 if batch.is_empty() {

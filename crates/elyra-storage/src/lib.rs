@@ -317,6 +317,50 @@ impl Storage {
         Ok(out)
     }
 
+    /// Like [`Storage::apply`], but first validate that each key in `expected`
+    /// currently holds the given value (its value at the transaction's
+    /// snapshot). If any differs, another transaction changed it since the
+    /// snapshot: return [`Error::Conflict`] and commit nothing. This is the
+    /// write-write conflict check behind snapshot isolation.
+    pub fn apply_checked(
+        &self,
+        expected: &[(Vec<u8>, Option<Vec<u8>>)],
+        puts: &[(Vec<u8>, Vec<u8>)],
+        deletes: &[Vec<u8>],
+    ) -> Result<()> {
+        let wtx = self
+            .db
+            .begin_write()
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        {
+            let mut t = wtx
+                .open_table(KV)
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            for (k, exp) in expected {
+                let current = t
+                    .get(k.as_slice())
+                    .map_err(|e| Error::Storage(e.to_string()))?
+                    .map(|v| v.value().to_vec());
+                if &current != exp {
+                    // Abort: drop the write transaction without committing.
+                    return Err(Error::Conflict(
+                        "row modified by another transaction since snapshot".into(),
+                    ));
+                }
+            }
+            for k in deletes {
+                t.remove(k.as_slice())
+                    .map_err(|e| Error::Storage(e.to_string()))?;
+            }
+            for (k, v) in puts {
+                t.insert(k.as_slice(), v.as_slice())
+                    .map_err(|e| Error::Storage(e.to_string()))?;
+            }
+        }
+        wtx.commit().map_err(|e| Error::Storage(e.to_string()))?;
+        Ok(())
+    }
+
     /// Atomically apply many puts and deletes in a single write transaction.
     /// This is the primitive the group-commit writer uses to fold many
     /// pending writes into one commit under high write traffic.
