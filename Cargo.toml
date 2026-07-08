@@ -1,0 +1,55 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/elyra-core",
+    "crates/elyra-storage",
+    "crates/elyra-engine",
+    "crates/elyra-olap",
+    "crates/elyra-vector",
+    "crates/elyra-server",
+    "crates/elyra-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "MIT"
+authors = ["Elyra"]
+repository = "https://github.com/elyra/elyra-sql"
+homepage = "https://elyra.dev"
+description = "ElyraSQL — a robust server SQL database written in Rust"
+
+[workspace.dependencies]
+# Internal crates
+elyra-core = { path = "crates/elyra-core" }
+elyra-storage = { path = "crates/elyra-storage" }
+elyra-engine = { path = "crates/elyra-engine" }
+elyra-olap = { path = "crates/elyra-olap" }
+elyra-vector = { path = "crates/elyra-vector" }
+elyra-server = { path = "crates/elyra-server" }
+
+# SQL frontend (shared parser)
+sqlparser = "0.53"
+
+# Single-file ACID storage engine
+redb = "2.2"
+
+# Async runtime + MySQL wire protocol
+tokio = { version = "1", features = ["full"] }
+opensrv-mysql = "0.7"
+async-trait = "0.1"
+
+# Errors, logging, serialization
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

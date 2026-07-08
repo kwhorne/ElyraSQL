@@ -1,0 +1,13 @@
+[package]
+name = "elyra-vector"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "ElyraSQL native vector search (ANN)"
+
+[dependencies]
+elyra-core.workspace = true
+
+# NOTE: the ANN index (HNSW) backend is added here in the vector milestone.
+# hnsw_rs = "0.3"

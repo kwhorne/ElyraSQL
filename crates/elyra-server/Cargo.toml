@@ -1,0 +1,16 @@
+[package]
+name = "elyra-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "ElyraSQL MySQL-compatible wire protocol server"
+
+[dependencies]
+elyra-core.workspace = true
+elyra-engine.workspace = true
+elyra-storage.workspace = true
+opensrv-mysql.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+tracing.workspace = true

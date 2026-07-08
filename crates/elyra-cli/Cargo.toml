@@ -1,0 +1,22 @@
+[package]
+name = "elyra-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "ElyraSQL command-line server and admin tool"
+
+[[bin]]
+name = "elyrasql"
+path = "src/main.rs"
+
+[dependencies]
+elyra-core.workspace = true
+elyra-engine.workspace = true
+elyra-storage.workspace = true
+elyra-server.workspace = true
+tokio.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

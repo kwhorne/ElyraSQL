@@ -1,0 +1,5 @@
+/target
+**/*.rs.bk
+*.edb
+*.edb-lock
+.env

@@ -1,0 +1,15 @@
+[package]
+name = "elyra-olap"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "ElyraSQL analytical (OLAP) query acceleration"
+
+[dependencies]
+elyra-core.workspace = true
+elyra-storage.workspace = true
+
+# NOTE: the columnar analytics engine (DataFusion/Arrow) is added here in the
+# OLAP milestone. Kept out of the initial build to keep compile times low.
+# datafusion = "43"

@@ -1,0 +1,11 @@
+[package]
+name = "elyra-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "ElyraSQL core types, errors and catalog primitives"
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true

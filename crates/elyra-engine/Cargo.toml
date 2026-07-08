@@ -1,0 +1,13 @@
+[package]
+name = "elyra-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "ElyraSQL query engine: parse, plan and execute SQL"
+
+[dependencies]
+elyra-core.workspace = true
+elyra-storage.workspace = true
+sqlparser.workspace = true
+tracing.workspace = true

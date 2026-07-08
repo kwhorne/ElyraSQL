@@ -1,0 +1,35 @@
+# ElyraSQL systemd service — Ubuntu 24.04+
+#
+# Install:
+#   sudo useradd --system --home /var/lib/elyrasql --shell /usr/sbin/nologin elyrasql
+#   sudo install -m 0755 target/release/elyrasql /usr/local/bin/elyrasql
+#   sudo install -d -o elyrasql -g elyrasql /var/lib/elyrasql
+#   sudo cp packaging/elyrasql.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now elyrasql
+
+[Unit]
+Description=ElyraSQL — robust MySQL-compatible SQL server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=elyrasql
+Group=elyrasql
+Environment=RUST_LOG=info
+Environment=ELYRASQL_DATA=/var/lib/elyrasql/elyra.edb
+Environment=ELYRASQL_LISTEN=0.0.0.0:3307
+ExecStart=/usr/local/bin/elyrasql serve
+Restart=on-failure
+RestartSec=2
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/elyrasql
+StateDirectory=elyrasql
+
+[Install]
+WantedBy=multi-user.target
