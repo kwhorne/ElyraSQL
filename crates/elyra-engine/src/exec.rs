@@ -595,10 +595,25 @@ pub async fn select(
         None => Vec::new(),
     };
 
-    // Multi-table / JOIN queries take a dedicated materialised path.
-    let is_join = select.from.len() > 1 || select.from.iter().any(|t| !t.joins.is_empty());
+    // Multi-table / JOIN queries, and any query over a derived table
+    // (FROM (SELECT ...)), take the materialised path.
+    let is_join = select.from.len() > 1
+        || select
+            .from
+            .iter()
+            .any(|t| !t.joins.is_empty() || matches!(t.relation, TableFactor::Derived { .. }));
     if is_join {
-        return join_select(db, select, filter, group_by, order_exprs, offset, limit).await;
+        return join_select(
+            db,
+            vindex,
+            select,
+            filter,
+            group_by,
+            order_exprs,
+            offset,
+            limit,
+        )
+        .await;
     }
 
     if select.from.len() != 1 {
@@ -689,12 +704,12 @@ pub async fn select(
         let mut idxs = Vec::new();
         let mut cols = Vec::new();
         for item in &select.projection {
-            let ident = match item {
-                SelectItem::UnnamedExpr(sqlparser::ast::Expr::Identifier(id)) => &id.value,
+            let (ident, alias) = match item {
+                SelectItem::UnnamedExpr(sqlparser::ast::Expr::Identifier(id)) => (&id.value, None),
                 SelectItem::ExprWithAlias {
                     expr: sqlparser::ast::Expr::Identifier(id),
-                    ..
-                } => &id.value,
+                    alias,
+                } => (&id.value, Some(alias.value.clone())),
                 other => {
                     return Err(Error::Unsupported(format!(
                         "projection not supported over table scan: {other}"
@@ -708,7 +723,11 @@ pub async fn select(
                 .position(|c| c.name.eq_ignore_ascii_case(ident))
                 .ok_or_else(|| Error::Catalog(format!("unknown column: {ident}")))?;
             idxs.push(i);
-            cols.push(def.schema.columns[i].clone());
+            let mut col = def.schema.columns[i].clone();
+            if let Some(a) = alias {
+                col.name = a; // honor `col AS alias` in the output schema
+            }
+            cols.push(col);
         }
         (idxs, cols)
     };
@@ -759,8 +778,10 @@ pub async fn select(
 
 /// Execute a multi-table / JOIN SELECT: materialise the joined row set, then
 /// apply WHERE, aggregation or ORDER BY, projection and paging.
+#[allow(clippy::too_many_arguments)]
 async fn join_select(
     db: &Session,
+    vindex: &VectorRegistry,
     select: &Select,
     filter: Option<Expr>,
     group_by: Vec<Expr>,
@@ -775,7 +796,7 @@ async fn join_select(
         split_and(f, &mut conjuncts);
     }
 
-    let (cols, mut rows) = build_from(db, &select.from, &conjuncts).await?;
+    let (cols, mut rows) = build_from(db, vindex, &select.from, &conjuncts).await?;
     let schema = Schema::new(cols);
 
     // WHERE over the joined rows.
@@ -844,9 +865,34 @@ async fn resolve_table(db: &Session, tf: &TableFactor) -> Result<(TableDef, Vec<
 
 async fn load_relation(
     db: &Session,
+    vindex: &VectorRegistry,
     tf: &TableFactor,
     conjuncts: &[Expr],
 ) -> Result<(Vec<ColumnDef>, Vec<Vec<Value>>)> {
+    // Derived table: materialise the subquery and qualify its columns.
+    if let TableFactor::Derived {
+        subquery, alias, ..
+    } = tf
+    {
+        let alias = alias
+            .as_ref()
+            .map(|a| a.name.value.clone())
+            .ok_or_else(|| {
+                Error::Query("a derived table (FROM (SELECT ...)) needs an alias".into())
+            })?;
+        let (schema, rows) = run_subquery_schema(db, vindex, subquery).await?;
+        let cols = schema
+            .columns
+            .iter()
+            .map(|c| ColumnDef {
+                name: format!("{alias}.{}", c.name),
+                ty: c.ty.clone(),
+                nullable: c.nullable,
+            })
+            .collect();
+        return Ok((cols, rows));
+    }
+
     let (def, cols) = resolve_table(db, tf).await?;
 
     // Pick an accelerable conjunct (eq on PK / indexed column) that references
@@ -1164,6 +1210,7 @@ async fn index_range(
 /// JOINs), pushing single-table `conjuncts` down to each base relation.
 async fn build_from(
     db: &Session,
+    vindex: &VectorRegistry,
     from: &[TableWithJoins],
     conjuncts: &[Expr],
 ) -> Result<(Vec<ColumnDef>, Vec<Vec<Value>>)> {
@@ -1172,7 +1219,7 @@ async fn build_from(
     let mut first = true;
 
     for twj in from {
-        let (bc, mut br) = load_relation(db, &twj.relation, conjuncts).await?;
+        let (bc, mut br) = load_relation(db, vindex, &twj.relation, conjuncts).await?;
         br = apply_pushdown(br, &bc, conjuncts)?;
         if first {
             cur_cols = bc;
@@ -1187,22 +1234,28 @@ async fn build_from(
             // Index nested-loop join: when the driving side is small and the
             // partner is indexed on the join key, probe the partner per row
             // instead of materialising it in full.
-            let (pdef, pcols) = resolve_table(db, &join.relation).await?;
             let driving_schema = Schema::new(cur_cols.clone());
-            let partner_schema = Schema::new(pcols.clone());
             let (kind, on) = join_kind(&join.join_operator)?;
             let left_outer = kind == JoinKind::Left;
 
-            let nlj = on
-                .as_ref()
-                .filter(|_| matches!(kind, JoinKind::Inner | JoinKind::Left))
-                .and_then(|e| equi_nlj(e, &driving_schema, &partner_schema))
-                .filter(|(_, pcol)| {
-                    cur_rows.len() <= NLJ_MAX_DRIVING
-                        && (pdef.pk_cols == [*pcol] || index::index_on(&pdef, *pcol).is_some())
-                });
+            // Index nested-loop join only applies to a plain (indexed) table
+            // partner, not a derived table.
+            let nlj = if let TableFactor::Table { .. } = &join.relation {
+                let (pdef, pcols) = resolve_table(db, &join.relation).await?;
+                let partner_schema = Schema::new(pcols.clone());
+                on.as_ref()
+                    .filter(|_| matches!(kind, JoinKind::Inner | JoinKind::Left))
+                    .and_then(|e| equi_nlj(e, &driving_schema, &partner_schema))
+                    .filter(|(_, pcol)| {
+                        cur_rows.len() <= NLJ_MAX_DRIVING
+                            && (pdef.pk_cols == [*pcol] || index::index_on(&pdef, *pcol).is_some())
+                    })
+                    .map(|(k, pcol)| (k, pcol, pdef, pcols))
+            } else {
+                None
+            };
 
-            if let Some((driving_key, pcol)) = nlj {
+            if let Some((driving_key, pcol, pdef, pcols)) = nlj {
                 let plen = pcols.len();
                 let mut out = Vec::new();
                 for l in &cur_rows {
@@ -1231,7 +1284,7 @@ async fn build_from(
             }
 
             // Fallback: materialise the partner (with pushdown) and hash/nested join.
-            let (jc, mut jr) = load_relation(db, &join.relation, conjuncts).await?;
+            let (jc, mut jr) = load_relation(db, vindex, &join.relation, conjuncts).await?;
             jr = apply_pushdown(jr, &jc, conjuncts)?;
             let (c, r) = combine(&cur_cols, &cur_rows, &jc, &jr, kind, on.as_ref())?;
             cur_cols = c;
@@ -2035,6 +2088,29 @@ async fn run_subquery(
             Ok(rows)
         }
         QueryResult::Affected(_) => Ok(Vec::new()),
+    }
+}
+
+/// Execute a subquery and return both its schema and rows (for derived tables).
+async fn run_subquery_schema(
+    db: &Session,
+    vindex: &VectorRegistry,
+    q: &SqlQuery,
+) -> Result<(Schema, Vec<Vec<Value>>)> {
+    match Box::pin(select(db, vindex, q)).await? {
+        QueryResult::Rows(mut stream) => {
+            let schema = stream.schema.clone();
+            let mut rows = Vec::new();
+            loop {
+                let batch = stream.next_batch(4096).await?;
+                if batch.is_empty() {
+                    break;
+                }
+                rows.extend(batch);
+            }
+            Ok((schema, rows))
+        }
+        QueryResult::Affected(_) => Ok((Schema::new(Vec::new()), Vec::new())),
     }
 }
 
