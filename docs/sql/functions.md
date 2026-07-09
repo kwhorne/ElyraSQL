@@ -14,6 +14,30 @@ expressions (SELECT list, WHERE, DEFAULT, generated columns, etc.).
 
 The niladic forms work with or without parentheses.
 
+### Extracting and formatting
+
+| Function | Result |
+|----------|--------|
+| `YEAR`, `MONTH`, `DAY`/`DAYOFMONTH`, `HOUR`, `MINUTE`, `SECOND` | component |
+| `QUARTER`, `DAYOFWEEK`, `WEEKDAY`, `DAYOFYEAR` | component |
+| `EXTRACT(unit FROM d)` | component |
+| `DATE(dt)`, `TIME(dt)` | date / time part |
+| `DATEDIFF(a, b)` | whole days between |
+| `LAST_DAY(d)` | last day of the month |
+| `DATE_FORMAT(d, fmt)` | formatted string (`%Y %m %d %H %i %s %M %b %W %a %j %p ...`) |
+
+### Date arithmetic
+
+```sql
+DATE_ADD('2024-01-31', INTERVAL 1 MONTH)   -- 2024-02-29 (day clamped)
+DATE_SUB('2024-03-15', INTERVAL 10 DAY)
+ADDDATE(d, 7)                              -- numeric day form
+```
+
+Units: `MICROSECOND`, `SECOND`, `MINUTE`, `HOUR`, `DAY`, `WEEK`, `MONTH`,
+`QUARTER`, `YEAR`. (`INTERVAL` arithmetic is supported inside `DATE_ADD`/
+`DATE_SUB`, not yet as a bare `d + INTERVAL ...` operator.)
+
 ## String
 
 `CONCAT`, `CONCAT_WS`, `UPPER`/`UCASE`, `LOWER`/`LCASE`, `LENGTH`/`CHAR_LENGTH`,
