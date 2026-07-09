@@ -5,7 +5,7 @@
 //! concatenate per-component encodings; fixed-width components are inherently
 //! self-delimiting, and text is escaped + terminated so it is too.
 
-use elyra_core::{Error, Result, Value};
+use elyra_core::{fold, Error, Result, Value};
 
 /// Encode a (possibly composite) key from its component values, in key order.
 pub fn encode_key(values: &[Value]) -> Result<Vec<u8>> {
@@ -33,8 +33,11 @@ fn encode_component(value: &Value, out: &mut Vec<u8>) -> Result<()> {
         Value::Time(t) => out.extend_from_slice(&(*t as u64 ^ 0x8000_0000_0000_0000).to_be_bytes()),
         Value::Bool(b) => out.push(*b as u8),
         // Escape 0x00 as 0x00 0x01, terminate with 0x00 0x00 (< any 0x00 0x01),
-        // making text self-delimiting while preserving byte order.
+        // making text self-delimiting while preserving byte order. Text is
+        // case-folded so index/PK order and uniqueness match the default
+        // case-insensitive collation.
         Value::Text(s) | Value::Json(s) => {
+            let s = fold(s);
             for &b in s.as_bytes() {
                 if b == 0x00 {
                     out.extend_from_slice(&[0x00, 0x01]);

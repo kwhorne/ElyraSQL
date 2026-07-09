@@ -13,7 +13,7 @@ pub mod value;
 
 pub use error::{Error, Result};
 pub use types::{ColumnDef, ColumnType, Schema};
-pub use value::Value;
+pub use value::{fold, Value};
 
 use serde::{Deserialize, Serialize};
 

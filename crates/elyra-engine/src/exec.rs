@@ -3055,7 +3055,8 @@ fn key_str(v: &Value) -> Option<String> {
     if v.is_null() {
         None
     } else {
-        Some(format!("{v:?}"))
+        // Collation-folded so equi-joins match the default collation.
+        Some(String::from_utf8_lossy(&v.collation_key()).into_owned())
     }
 }
 
@@ -4427,7 +4428,13 @@ fn compute_window(rows: &[Vec<Value>], schema: &Schema, func: &Expr) -> Result<V
     for (i, row) in rows.iter().enumerate() {
         let mut key = String::new();
         for p in &spec.partition_by {
-            key.push_str(&format!("{:?}\u{1}", predicate::eval_row(p, schema, row)?));
+            key.extend(
+                predicate::eval_row(p, schema, row)?
+                    .collation_key()
+                    .iter()
+                    .map(|b| *b as char),
+            );
+            key.push('\u{1}');
         }
         let slot = *index.entry(key.clone()).or_insert_with(|| {
             partitions.push((key, Vec::new()));
@@ -4970,7 +4977,7 @@ async fn materialize_recursive(
     let schema = apply_col_aliases(schema, alias_cols);
     create_temp_table(db, temp, &schema).await?;
 
-    let row_key = |r: &[Value]| -> Vec<u8> { bincode::serialize(r).unwrap_or_default() };
+    let row_key = |r: &[Value]| -> Vec<u8> { Value::row_collation_key(r) };
     let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
     let mut all_rows: Vec<Vec<Value>> = Vec::new();
     let mut frontier: Vec<Vec<Value>> = Vec::new();
@@ -5419,7 +5426,7 @@ async fn execute_set_query(
         set_quantifier,
         SetQuantifier::All | SetQuantifier::AllByName
     );
-    let key = |r: &[Value]| -> Vec<u8> { bincode::serialize(r).unwrap_or_default() };
+    let key = |r: &[Value]| -> Vec<u8> { Value::row_collation_key(r) };
 
     let mut out: Vec<Vec<Value>> = Vec::new();
     match op {

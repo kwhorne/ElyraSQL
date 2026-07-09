@@ -4,6 +4,38 @@ use std::cmp::Ordering;
 
 use serde::{Deserialize, Serialize};
 
+/// Case-fold text for the default case-insensitive collation. Applied at every
+/// point text is compared, ordered, indexed, grouped, or de-duplicated, so all
+/// paths agree that e.g. `'Foo' = 'foo'`.
+pub fn fold(s: &str) -> String {
+    if s.is_ascii() {
+        let mut o = s.to_string();
+        o.make_ascii_lowercase();
+        o
+    } else {
+        s.to_lowercase()
+    }
+}
+
+/// Case-insensitive ordering of two strings under the default collation, with
+/// an allocation-free fast path for the common all-ASCII case.
+pub fn fold_cmp(a: &str, b: &str) -> Ordering {
+    if a.is_ascii() && b.is_ascii() {
+        let (ab, bb) = (a.as_bytes(), b.as_bytes());
+        let n = ab.len().min(bb.len());
+        for i in 0..n {
+            let x = ab[i].to_ascii_lowercase();
+            let y = bb[i].to_ascii_lowercase();
+            if x != y {
+                return x.cmp(&y);
+            }
+        }
+        ab.len().cmp(&bb.len())
+    } else {
+        a.to_lowercase().cmp(&b.to_lowercase())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Value {
     Null,
@@ -63,9 +95,10 @@ impl Value {
             (Time(_), _) | (_, Time(_)) => to_micros_of_day(self)
                 .zip(to_micros_of_day(other))
                 .map(|(a, b)| a.cmp(&b)),
-            (Text(a), Text(b)) => Some(a.cmp(b)),
-            (Json(a), Json(b)) => Some(a.cmp(b)),
-            (Json(a), Text(b)) | (Text(b), Json(a)) => Some(a.cmp(b)),
+            // Text compares under the default case-insensitive collation.
+            (Text(a), Text(b)) => Some(fold_cmp(a, b)),
+            (Json(a), Json(b)) => Some(fold_cmp(a, b)),
+            (Json(a), Text(b)) | (Text(b), Json(a)) => Some(fold_cmp(a, b)),
             (Bool(a), Bool(b)) => Some(a.cmp(b)),
             (Bytes(a), Bytes(b)) => Some(a.cmp(b)),
             _ => self
@@ -73,6 +106,56 @@ impl Value {
                 .zip(other.as_f64())
                 .and_then(|(a, b)| a.partial_cmp(&b)),
         }
+    }
+
+    /// A canonical, type-tagged, collation-folded key for grouping, DISTINCT,
+    /// hash joins, and set-operation de-duplication. Two values that compare
+    /// equal under the default collation produce the same key; values of
+    /// different types never collide.
+    pub fn collation_key(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.push_collation_key(&mut out);
+        out
+    }
+
+    /// Append this value's collation key to `out` (self-delimiting).
+    pub fn push_collation_key(&self, out: &mut Vec<u8>) {
+        match self {
+            Value::Null => out.push(0),
+            Value::Int(i) => {
+                out.push(1);
+                out.extend_from_slice(&i.to_le_bytes());
+            }
+            Value::Bool(b) => {
+                out.push(2);
+                out.push(*b as u8);
+            }
+            Value::Float(f) => {
+                out.push(3);
+                out.extend_from_slice(&f.to_bits().to_le_bytes());
+            }
+            Value::Text(s) | Value::Json(s) => {
+                out.push(4);
+                let f = fold(s);
+                out.extend_from_slice(&(f.len() as u32).to_le_bytes());
+                out.extend_from_slice(f.as_bytes());
+            }
+            other => {
+                out.push(5);
+                let s = format!("{other:?}");
+                out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                out.extend_from_slice(s.as_bytes());
+            }
+        }
+    }
+
+    /// Collation key for a whole row (self-delimiting concatenation).
+    pub fn row_collation_key(row: &[Value]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(row.len() * 9);
+        for v in row {
+            v.push_collation_key(&mut out);
+        }
+        out
     }
 
     /// Total order for sorting/extremes: NULL sorts first, then `compare`.
@@ -331,4 +414,32 @@ pub fn parse_decimal(s: &str, target_scale: u8) -> Option<(i128, u8)> {
         v = -v;
     }
     Some((v, target_scale))
+}
+
+#[cfg(test)]
+mod collation_tests {
+    use super::*;
+
+    #[test]
+    fn text_compares_case_insensitively() {
+        assert_eq!(
+            Value::Text("Foo".into()).compare(&Value::Text("foo".into())),
+            Some(Ordering::Equal)
+        );
+        assert_eq!(fold_cmp("Apple", "apple"), Ordering::Equal);
+        assert_eq!(fold_cmp("apple", "Banana"), Ordering::Less);
+        assert_eq!(fold_cmp("ÆØÅ", "æøå"), Ordering::Equal);
+    }
+
+    #[test]
+    fn collation_key_folds_and_tags() {
+        assert_eq!(
+            Value::Text("Foo".into()).collation_key(),
+            Value::Text("foo".into()).collation_key()
+        );
+        assert_ne!(
+            Value::Text("5".into()).collation_key(),
+            Value::Int(5).collation_key()
+        );
+    }
 }

@@ -178,6 +178,8 @@ fn group_key(cols: &[usize], row: &[Value]) -> Vec<u8> {
                 out.extend_from_slice(&f.to_bits().to_le_bytes());
             }
             Some(Value::Text(s)) | Some(Value::Json(s)) => {
+                // Case-fold so GROUP BY matches the default collation.
+                let s = elyra_core::fold(s);
                 out.push(4);
                 out.extend_from_slice(&(s.len() as u32).to_le_bytes());
                 out.extend_from_slice(s.as_bytes());
@@ -200,7 +202,10 @@ fn update(acc: &mut Acc, func: AggFunc, val: Option<Value>, distinct: bool) {
             if let Some(v) = val {
                 if !v.is_null() {
                     if distinct {
-                        if acc.distinct.insert(format!("{v:?}")) {
+                        if acc
+                            .distinct
+                            .insert(String::from_utf8_lossy(&v.collation_key()).into_owned())
+                        {
                             acc.count += 1;
                         }
                     } else {
@@ -212,7 +217,11 @@ fn update(acc: &mut Acc, func: AggFunc, val: Option<Value>, distinct: bool) {
         AggFunc::Sum | AggFunc::Avg => {
             if let Some(v) = val {
                 if let Some(n) = num(&v) {
-                    if distinct && !acc.distinct.insert(format!("{v:?}")) {
+                    if distinct
+                        && !acc
+                            .distinct
+                            .insert(String::from_utf8_lossy(&v.collation_key()).into_owned())
+                    {
                         return;
                     }
                     acc.sum += n;
