@@ -208,8 +208,19 @@ impl Engine {
                 sess.commit().await?;
                 Ok(QueryResult::empty_ok())
             }
-            Statement::Rollback { .. } => {
-                sess.rollback();
+            Statement::Rollback { savepoint, .. } => {
+                match savepoint {
+                    Some(name) => sess.rollback_to(&name.value)?,
+                    None => sess.rollback(),
+                }
+                Ok(QueryResult::empty_ok())
+            }
+            Statement::Savepoint { name } => {
+                sess.savepoint(&name.value)?;
+                Ok(QueryResult::empty_ok())
+            }
+            Statement::ReleaseSavepoint { name } => {
+                sess.release_savepoint(&name.value)?;
                 Ok(QueryResult::empty_ok())
             }
             Statement::ShowTables { .. } => exec::show_tables(sess).await,
@@ -294,6 +305,8 @@ fn required_privilege(stmt: &Statement) -> Privilege {
         Statement::StartTransaction { .. }
         | Statement::Commit { .. }
         | Statement::Rollback { .. }
+        | Statement::Savepoint { .. }
+        | Statement::ReleaseSavepoint { .. }
         | Statement::ShowTables { .. }
         | Statement::ShowColumns { .. }
         | Statement::ShowCreate { .. }

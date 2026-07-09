@@ -33,6 +33,17 @@ struct TxnState {
     serializable: bool,
     reads: BTreeSet<Vec<u8>>,
     ranges: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+    /// Named savepoints (overlay snapshots), innermost last.
+    savepoints: Vec<Savepoint>,
+}
+
+#[derive(Clone)]
+struct Savepoint {
+    name: String,
+    puts: BTreeMap<Vec<u8>, Vec<u8>>,
+    deletes: BTreeSet<Vec<u8>>,
+    reads: BTreeSet<Vec<u8>>,
+    ranges: Vec<(Vec<u8>, Option<Vec<u8>>)>,
 }
 
 pub struct Session {
@@ -80,7 +91,70 @@ impl Session {
             serializable,
             reads: BTreeSet::new(),
             ranges: Vec::new(),
+            savepoints: Vec::new(),
         });
+        Ok(())
+    }
+
+    /// Establish (or redefine) a savepoint within the current transaction.
+    pub fn savepoint(&self, name: &str) -> Result<()> {
+        let mut g = self.txn.lock().unwrap();
+        let tx = g
+            .as_mut()
+            .ok_or_else(|| Error::Query("SAVEPOINT outside a transaction".into()))?;
+        tx.savepoints.retain(|s| s.name != name);
+        tx.savepoints.push(Savepoint {
+            name: name.to_string(),
+            puts: tx.puts.clone(),
+            deletes: tx.deletes.clone(),
+            reads: tx.reads.clone(),
+            ranges: tx.ranges.clone(),
+        });
+        Ok(())
+    }
+
+    /// Roll the transaction's buffered state back to a savepoint (which
+    /// remains); savepoints established after it are discarded.
+    pub fn rollback_to(&self, name: &str) -> Result<()> {
+        let mut g = self.txn.lock().unwrap();
+        let tx = g
+            .as_mut()
+            .ok_or_else(|| Error::Query("ROLLBACK TO SAVEPOINT outside a transaction".into()))?;
+        let pos = tx
+            .savepoints
+            .iter()
+            .position(|s| s.name == name)
+            .ok_or_else(|| Error::Query(format!("no such savepoint: {name}")))?;
+        let (p, d, r, rg) = {
+            let sp = &tx.savepoints[pos];
+            (
+                sp.puts.clone(),
+                sp.deletes.clone(),
+                sp.reads.clone(),
+                sp.ranges.clone(),
+            )
+        };
+        tx.puts = p;
+        tx.deletes = d;
+        tx.reads = r;
+        tx.ranges = rg;
+        tx.savepoints.truncate(pos + 1);
+        Ok(())
+    }
+
+    /// Release (forget) a savepoint and any established after it, without
+    /// rolling back.
+    pub fn release_savepoint(&self, name: &str) -> Result<()> {
+        let mut g = self.txn.lock().unwrap();
+        let tx = g
+            .as_mut()
+            .ok_or_else(|| Error::Query("RELEASE SAVEPOINT outside a transaction".into()))?;
+        let pos = tx
+            .savepoints
+            .iter()
+            .position(|s| s.name == name)
+            .ok_or_else(|| Error::Query(format!("no such savepoint: {name}")))?;
+        tx.savepoints.truncate(pos);
         Ok(())
     }
 
@@ -94,6 +168,7 @@ impl Session {
             serializable,
             reads,
             ranges,
+            savepoints: _,
         } = tx;
 
         // Keys to validate = written keys, plus (serializable) read keys.
