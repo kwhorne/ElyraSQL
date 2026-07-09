@@ -6,8 +6,9 @@ drivers connect without modification.
 ## What works
 
 - **Text protocol** (`COM_QUERY`) — the common path for most clients and CLIs.
-- **Prepared statements** (`COM_STMT_PREPARE`/`EXECUTE`) — typed parameters,
-  value escaping, statement reuse; used by many ORMs and drivers.
+- **Prepared statements** (`COM_STMT_PREPARE`/`EXECUTE`) — typed parameters
+  (including `DATE`/`DATETIME`/`TIME` from the binary protocol), value escaping,
+  statement reuse; used by many ORMs and drivers.
 - **Authentication** — `mysql_native_password`.
 - **TLS** — clients may negotiate SSL.
 - **Handshake** — reports a MySQL-looking version, e.g. `8.0.0-ElyraSQL-0.1.0`,

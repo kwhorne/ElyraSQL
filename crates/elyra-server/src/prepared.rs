@@ -58,8 +58,58 @@ pub fn value_to_literal(v: ValueInner<'_>) -> String {
         ValueInner::UInt(u) => u.to_string(),
         ValueInner::Double(d) => d.to_string(),
         ValueInner::Bytes(b) => quote(b),
-        // Temporal types are not yet modelled by the engine.
-        ValueInner::Date(_) | ValueInner::Time(_) | ValueInner::Datetime(_) => "NULL".to_string(),
+        // Temporal parameters arrive as MySQL binary encodings; decode them to
+        // string literals the engine can coerce.
+        ValueInner::Date(b) | ValueInner::Datetime(b) => datetime_literal(b),
+        ValueInner::Time(b) => time_literal(b),
+    }
+}
+
+/// MySQL binary DATE/DATETIME encoding -> `'YYYY-MM-DD[ HH:MM:SS[.ffffff]]'`.
+fn datetime_literal(b: &[u8]) -> String {
+    if b.len() < 4 {
+        return "'0000-00-00'".to_string();
+    }
+    let y = u16::from_le_bytes([b[0], b[1]]);
+    let (mo, d) = (b[2], b[3]);
+    let (h, mi, s) = if b.len() >= 7 {
+        (b[4], b[5], b[6])
+    } else {
+        (0, 0, 0)
+    };
+    let us = if b.len() >= 11 {
+        u32::from_le_bytes([b[7], b[8], b[9], b[10]])
+    } else {
+        0
+    };
+    if b.len() < 7 {
+        format!("'{y:04}-{mo:02}-{d:02}'")
+    } else if us > 0 {
+        format!("'{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}.{us:06}'")
+    } else {
+        format!("'{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}'")
+    }
+}
+
+/// MySQL binary TIME encoding -> `'[-]HH:MM:SS[.ffffff]'`.
+fn time_literal(b: &[u8]) -> String {
+    if b.len() < 8 {
+        return "'00:00:00'".to_string();
+    }
+    let neg = b[0] != 0;
+    let days = u32::from_le_bytes([b[1], b[2], b[3], b[4]]);
+    let hours = b[5] as u32 + days * 24;
+    let (mins, secs) = (b[6], b[7]);
+    let us = if b.len() >= 12 {
+        u32::from_le_bytes([b[8], b[9], b[10], b[11]])
+    } else {
+        0
+    };
+    let sign = if neg { "-" } else { "" };
+    if us > 0 {
+        format!("'{sign}{hours:02}:{mins:02}:{secs:02}.{us:06}'")
+    } else {
+        format!("'{sign}{hours:02}:{mins:02}:{secs:02}'")
     }
 }
 
@@ -168,5 +218,28 @@ mod tests {
     fn count_mismatch_errors() {
         assert!(bind("SELECT ?", &[]).is_err());
         assert!(bind("SELECT ?", &["1".into(), "2".into()]).is_err());
+    }
+
+    #[test]
+    fn decodes_temporal_params() {
+        // DATE 2024-03-15 -> [0xE8,0x07, 3, 15]
+        assert_eq!(datetime_literal(&[0xE8, 0x07, 3, 15]), "'2024-03-15'");
+        // DATETIME 2024-03-15 13:45:30
+        assert_eq!(
+            datetime_literal(&[0xE8, 0x07, 3, 15, 13, 45, 30]),
+            "'2024-03-15 13:45:30'"
+        );
+        // DATETIME with microseconds
+        assert_eq!(
+            datetime_literal(&[0xE8, 0x07, 3, 15, 13, 45, 30, 0xE8, 0x03, 0x00, 0x00]),
+            "'2024-03-15 13:45:30.001000'"
+        );
+        // TIME 02:30:00 (no days)
+        assert_eq!(time_literal(&[0, 0, 0, 0, 0, 2, 30, 0]), "'02:30:00'");
+        // TIME with a day rolls into hours: 1 day + 02:00:00 -> 26:00:00
+        assert_eq!(time_literal(&[0, 1, 0, 0, 0, 2, 0, 0]), "'26:00:00'");
+        // Empty encodings.
+        assert_eq!(datetime_literal(&[]), "'0000-00-00'");
+        assert_eq!(time_literal(&[]), "'00:00:00'");
     }
 }
