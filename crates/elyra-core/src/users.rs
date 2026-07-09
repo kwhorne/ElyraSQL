@@ -35,6 +35,23 @@ pub fn table_grant_prefix(user: &str) -> Vec<u8> {
     format!("sys::tgrant::{user}::").into_bytes()
 }
 
+/// Key prefix for the roles granted to one user.
+pub fn role_member_prefix(user: &str) -> Vec<u8> {
+    format!("sys::rolemember::{user}::").into_bytes()
+}
+
+/// Storage key for "`user` is a member of `role`".
+pub fn role_member_key(user: &str, role: &str) -> Vec<u8> {
+    let mut k = role_member_prefix(user);
+    k.extend_from_slice(role.as_bytes());
+    k
+}
+
+/// Marker key prefix distinguishing a principal that is a role (vs a login user).
+pub fn role_flag_key(role: &str) -> Vec<u8> {
+    format!("sys::role::{role}").into_bytes()
+}
+
 /// Storage key for a user's grant on a specific table.
 pub fn table_grant_key(user: &str, table: &str) -> Vec<u8> {
     let mut k = table_grant_prefix(user);

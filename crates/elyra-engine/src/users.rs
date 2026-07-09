@@ -8,7 +8,8 @@
 
 use elyra_core::users::{
     decode_privilege, decode_user, encode_privilege, encode_user, password_digest,
-    privilege_from_actions, table_grant_key, table_grant_prefix, user_key, UserRecord, USER_PREFIX,
+    privilege_from_actions, role_flag_key, role_member_key, role_member_prefix, table_grant_key,
+    table_grant_prefix, user_key, UserRecord, USER_PREFIX,
 };
 use elyra_core::{Error, Privilege, Result, Schema, Value};
 
@@ -113,11 +114,61 @@ pub fn is_user_stmt(head: &str) -> bool {
     starts("create user")
         || starts("drop user")
         || starts("alter user")
+        || starts("create role")
+        || starts("drop role")
         || starts("set password")
         || starts("grant ")
         || starts("revoke ")
         || starts("show grants")
         || h.eq_ignore_ascii_case("show grants")
+}
+
+/// The role names granted (directly) to `user`.
+pub async fn roles_of(sess: &Session, user: &str) -> Result<Vec<String>> {
+    let prefix = role_member_prefix(user);
+    let batch = sess.scan_batch(prefix.clone(), None, 4096).await?;
+    Ok(batch
+        .iter()
+        .map(|(k, _)| String::from_utf8_lossy(&k[prefix.len()..]).into_owned())
+        .collect())
+}
+
+/// A principal's own global privilege (`Read` if unknown).
+async fn own_privilege(sess: &Session, name: &str) -> Result<Privilege> {
+    Ok(sess
+        .get(user_key(name))
+        .await?
+        .and_then(|b| decode_user(&b))
+        .map(|r| r.privilege)
+        .unwrap_or(Privilege::Read))
+}
+
+/// Effective global privilege of `user`: their own level raised by every role
+/// granted to them.
+pub async fn effective_global(sess: &Session, user: &str) -> Result<Privilege> {
+    let mut p = own_privilege(sess, user).await?;
+    for role in roles_of(sess, user).await? {
+        p = p.max(own_privilege(sess, &role).await?);
+    }
+    Ok(p)
+}
+
+/// A principal's own grant on one table (`Read` default).
+async fn own_table_grant(sess: &Session, name: &str, table: &str) -> Result<Privilege> {
+    Ok(sess
+        .get(table_grant_key(name, table))
+        .await?
+        .and_then(|b| decode_privilege(&b))
+        .unwrap_or(Privilege::Read))
+}
+
+/// Effective per-table privilege of `user` on `table`, including roles.
+pub async fn effective_table_grant(sess: &Session, user: &str, table: &str) -> Result<Privilege> {
+    let mut p = own_table_grant(sess, user, table).await?;
+    for role in roles_of(sess, user).await? {
+        p = p.max(own_table_grant(sess, &role, table).await?);
+    }
+    Ok(p)
 }
 
 pub async fn execute(sql: &str, sess: &Session, privilege: Privilege) -> Result<QueryResult> {
@@ -137,6 +188,75 @@ pub async fn execute(sql: &str, sess: &Session, privilege: Privilege) -> Result<
         return Err(Error::Query(
             "access denied: user management requires ADMIN privilege".into(),
         ));
+    }
+
+    // CREATE ROLE [IF NOT EXISTS] name [, name ...]
+    if toks.first().map(|t| t.is_word("create")).unwrap_or(false)
+        && toks.get(1).map(|t| t.is_word("role")).unwrap_or(false)
+    {
+        let mut i = 2;
+        if toks.get(i).map(|t| t.is_word("if")).unwrap_or(false) {
+            i += 3; // IF NOT EXISTS
+        }
+        let mut puts = Vec::new();
+        while let Some((name, j)) = parse_userspec(&toks, i) {
+            // A role is a principal (empty password) plus a role marker.
+            let rec = UserRecord {
+                digest: password_digest(b""),
+                privilege: Privilege::Read,
+            };
+            puts.push((user_key(&name), encode_user(&rec)));
+            puts.push((role_flag_key(&name), vec![1]));
+            i = j;
+            if matches!(toks.get(i), Some(Tok::Sym(','))) {
+                i += 1;
+            } else {
+                break;
+            }
+        }
+        if puts.is_empty() {
+            return Err(Error::Parse("CREATE ROLE: expected a role name".into()));
+        }
+        sess.commit_write(puts, vec![]).await?;
+        return Ok(QueryResult::Affected(0));
+    }
+
+    // DROP ROLE [IF EXISTS] name [, name ...]
+    if toks.first().map(|t| t.is_word("drop")).unwrap_or(false)
+        && toks.get(1).map(|t| t.is_word("role")).unwrap_or(false)
+    {
+        let mut i = 2;
+        if toks.get(i).map(|t| t.is_word("if")).unwrap_or(false) {
+            i += 2;
+        }
+        let mut deletes = Vec::new();
+        while let Some((name, j)) = parse_userspec(&toks, i) {
+            deletes.push(user_key(&name));
+            deletes.push(role_flag_key(&name));
+            i = j;
+            if matches!(toks.get(i), Some(Tok::Sym(','))) {
+                i += 1;
+            } else {
+                break;
+            }
+        }
+        if deletes.is_empty() {
+            return Err(Error::Parse("DROP ROLE: expected a role name".into()));
+        }
+        sess.commit_write(vec![], deletes).await?;
+        return Ok(QueryResult::Affected(0));
+    }
+
+    // Role membership: GRANT <role...> TO <user...>  /  REVOKE <role...> FROM
+    // <user...> — distinguished from privilege grants by the absence of ON.
+    let has_on = toks.iter().any(|t| t.is_word("on"));
+    if !has_on {
+        if toks.first().map(|t| t.is_word("grant")).unwrap_or(false) {
+            return role_membership(&toks, sess, true).await;
+        }
+        if toks.first().map(|t| t.is_word("revoke")).unwrap_or(false) {
+            return role_membership(&toks, sess, false).await;
+        }
     }
 
     // CREATE USER [IF NOT EXISTS] spec IDENTIFIED BY 'pw'
@@ -360,6 +480,63 @@ async fn grant_revoke(toks: &[Tok], sess: &Session, grant: bool) -> Result<Query
     if applied == 0 {
         return Err(Error::Parse("no grantee specified".into()));
     }
+    Ok(QueryResult::Affected(0))
+}
+
+/// GRANT role[, role] TO user[, user]  /  REVOKE role[, role] FROM user[, user].
+async fn role_membership(toks: &[Tok], sess: &Session, grant: bool) -> Result<QueryResult> {
+    let sep = if grant { "to" } else { "from" };
+    // Roles named between the verb and TO/FROM.
+    let mut i = 1;
+    let mut roles: Vec<String> = Vec::new();
+    while i < toks.len() && !toks[i].is_word(sep) {
+        if let Tok::Word(s) | Tok::Str(s) = &toks[i] {
+            roles.push(s.clone());
+        }
+        i += 1;
+    }
+    if i >= toks.len() {
+        return Err(Error::Parse(format!(
+            "{} <role> {} <user>",
+            if grant { "GRANT" } else { "REVOKE" },
+            sep.to_uppercase()
+        )));
+    }
+    i += 1; // past TO/FROM
+            // Verify the roles exist.
+    for r in &roles {
+        if sess.get(role_flag_key(r)).await?.is_none() {
+            return Err(Error::Query(format!("role '{r}' does not exist")));
+        }
+    }
+    let mut puts = Vec::new();
+    let mut deletes = Vec::new();
+    let mut applied = 0u64;
+    while let Some((user, j)) = parse_userspec(toks, i) {
+        if sess.get(user_key(&user)).await?.is_none() {
+            return Err(Error::Query(format!("user '{user}' does not exist")));
+        }
+        for r in &roles {
+            if grant {
+                puts.push((role_member_key(&user, r), vec![1]));
+            } else {
+                deletes.push(role_member_key(&user, r));
+            }
+        }
+        applied += 1;
+        i = j;
+        if matches!(toks.get(i), Some(Tok::Sym(','))) {
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    if applied == 0 || roles.is_empty() {
+        return Err(Error::Parse(
+            "role membership: expected roles and users".into(),
+        ));
+    }
+    sess.commit_write(puts, deletes).await?;
     Ok(QueryResult::Affected(0))
 }
 

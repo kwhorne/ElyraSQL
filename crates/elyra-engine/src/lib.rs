@@ -745,20 +745,6 @@ impl Engine {
         Ok(out)
     }
 
-    /// A user's granted privilege on one table (default `Read`).
-    async fn table_grant(&self, user: &str, table: &str, sess: &Session) -> Result<Privilege> {
-        if user.is_empty() {
-            return Ok(Privilege::Read);
-        }
-        match sess
-            .get(elyra_core::users::table_grant_key(user, table))
-            .await?
-        {
-            Some(b) => Ok(elyra_core::users::decode_privilege(&b).unwrap_or(Privilege::Read)),
-            None => Ok(Privilege::Read),
-        }
-    }
-
     /// Effective privilege for a statement: the global level, raised by any
     /// per-table grant on the statement's target tables. Reads are always
     /// allowed at the global baseline; when a write/DDL target cannot be
@@ -771,6 +757,12 @@ impl Engine {
         sess: &Session,
     ) -> Result<Privilege> {
         let need = required_privilege(stmt);
+        // Raise the connection's baseline by any roles granted to the user.
+        let global = if user.is_empty() {
+            global
+        } else {
+            global.max(users::effective_global(sess, user).await?)
+        };
         if need <= Privilege::Read {
             return Ok(global.max(Privilege::Read));
         }
@@ -779,10 +771,11 @@ impl Engine {
             return Ok(global);
         }
         // The statement is allowed only if every target satisfies `need`, so the
-        // effective level is the minimum of per-target max(global, grant).
+        // effective level is the minimum of per-target max(global, grant). Grants
+        // include those inherited from the user's roles.
         let mut eff = Privilege::Admin;
         for t in targets {
-            let e = global.max(self.table_grant(user, &t, sess).await?);
+            let e = global.max(users::effective_table_grant(sess, user, &t).await?);
             if e < eff {
                 eff = e;
             }

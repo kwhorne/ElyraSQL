@@ -55,6 +55,10 @@ enum Command {
         #[arg(long, env = "ELYRASQL_METRICS_LISTEN")]
         metrics_listen: Option<String>,
 
+        /// Append every executed statement to this audit log file.
+        #[arg(long, env = "ELYRASQL_AUDIT_LOG")]
+        audit_log: Option<PathBuf>,
+
         /// Serve the replication stream at this address (makes this a primary).
         #[arg(long, env = "ELYRASQL_REPLICATION_LISTEN")]
         replication_listen: Option<String>,
@@ -255,6 +259,7 @@ async fn run() -> anyhow::Result<()> {
             tls_key,
             slow_query_ms,
             metrics_listen,
+            audit_log,
             replication_listen,
             binlog,
             semi_sync_ms,
@@ -312,6 +317,7 @@ async fn run() -> anyhow::Result<()> {
                 tls,
                 slow_query_ms,
                 metrics_listen,
+                audit_log,
                 replication_listen,
                 read_only: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             };
@@ -376,6 +382,7 @@ async fn run() -> anyhow::Result<()> {
                 tls: None,
                 slow_query_ms: 0,
                 metrics_listen: None,
+                audit_log: None,
                 replication_listen: Some(replication_listen),
                 read_only,
             };
@@ -408,6 +415,7 @@ async fn run() -> anyhow::Result<()> {
                 tls: None,
                 slow_query_ms: 0,
                 metrics_listen: None,
+                audit_log: None,
                 replication_listen: None,
                 read_only: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             };

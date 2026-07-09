@@ -25,7 +25,7 @@ mod prepared;
 pub mod repl;
 
 pub use auth::Auth;
-pub use observ::{Metrics, ProcRegistry};
+pub use observ::{AuditLog, Metrics, ProcRegistry};
 pub use repl::{run_replica, serve_replication};
 
 /// Runtime configuration for the ElyraSQL server.
@@ -37,6 +37,8 @@ pub struct ServerConfig {
     pub slow_query_ms: u128,
     /// Optional address for the Prometheus metrics HTTP endpoint.
     pub metrics_listen: Option<String>,
+    /// Optional path for the append-only audit log.
+    pub audit_log: Option<std::path::PathBuf>,
     /// Optional address for the replication endpoint (makes this a primary).
     pub replication_listen: Option<String>,
     /// When set, reject all writes (used by replicas / non-leaders). Dynamic so
@@ -95,9 +97,12 @@ pub struct ElyraShim {
     user: std::sync::Mutex<String>,
     /// Replica/non-leader mode: cap every connection at read-only (dynamic).
     read_only: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Optional audit log.
+    audit: Option<Arc<AuditLog>>,
 }
 
 impl ElyraShim {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         engine: Engine,
         auth: Arc<Auth>,
@@ -105,6 +110,7 @@ impl ElyraShim {
         procs: Arc<ProcRegistry>,
         conn_id: u32,
         read_only: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        audit: Option<Arc<AuditLog>>,
     ) -> Self {
         let session = engine.session();
         Self {
@@ -120,6 +126,7 @@ impl ElyraShim {
             conn_id,
             user: std::sync::Mutex::new(String::new()),
             read_only,
+            audit,
         }
     }
 
@@ -301,6 +308,9 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for ElyraShim {
             .await;
         self.metrics.record(&sql, res.is_ok(), start.elapsed());
         self.procs.end_query(self.conn_id);
+        if let Some(a) = &self.audit {
+            a.record(self.conn_id, &user, &sql, res.is_ok());
+        }
         match res {
             Ok(outcomes) => write_outcomes(outcomes, results).await,
             Err(e) => {
@@ -342,6 +352,9 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for ElyraShim {
             .await;
         self.metrics.record(query, res.is_ok(), start.elapsed());
         self.procs.end_query(self.conn_id);
+        if let Some(a) = &self.audit {
+            a.record(self.conn_id, &user, query, res.is_ok());
+        }
         match res {
             Ok(outcomes) => write_outcomes(outcomes, results).await,
             Err(e) => {
@@ -478,6 +491,19 @@ pub async fn serve(config: ServerConfig, engine: Engine) -> std::io::Result<()> 
     let tls = config.tls;
     let metrics = Arc::new(Metrics::new(config.slow_query_ms));
     let procs = Arc::new(ProcRegistry::new());
+    let audit = match &config.audit_log {
+        Some(p) => match AuditLog::open(p) {
+            Ok(a) => {
+                info!(path = %p.display(), "audit logging enabled");
+                Some(Arc::new(a))
+            }
+            Err(e) => {
+                error!(error = %e, "failed to open audit log; auditing disabled");
+                None
+            }
+        },
+        None => None,
+    };
     if config.slow_query_ms > 0 {
         info!(
             threshold_ms = config.slow_query_ms as u64,
@@ -511,6 +537,7 @@ pub async fn serve(config: ServerConfig, engine: Engine) -> std::io::Result<()> 
         let procs = procs.clone();
         let conn_id = CONN_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
         let read_only = read_only.clone();
+        let audit = audit.clone();
         tokio::spawn(async move {
             metrics.connect();
             procs.register(conn_id, peer.ip().to_string());
@@ -523,6 +550,7 @@ pub async fn serve(config: ServerConfig, engine: Engine) -> std::io::Result<()> 
                 procs.clone(),
                 conn_id,
                 read_only,
+                audit,
             )
             .await;
             procs.deregister(conn_id);
@@ -586,11 +614,12 @@ async fn handle_connection(
     procs: Arc<ProcRegistry>,
     conn_id: u32,
     read_only: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    audit: Option<Arc<AuditLog>>,
 ) -> std::io::Result<()> {
     use opensrv_mysql::{plain_run_with_options, secure_run_with_options, IntermediaryOptions};
 
     let (mut r, mut w) = stream.into_split();
-    let mut shim = ElyraShim::new(engine, auth, metrics, procs, conn_id, read_only);
+    let mut shim = ElyraShim::new(engine, auth, metrics, procs, conn_id, read_only, audit);
     let opts = IntermediaryOptions::default();
 
     // Read the handshake first; the client tells us whether it wants TLS.

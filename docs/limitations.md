@@ -120,9 +120,15 @@ implemented, so you can judge fit.
 ## Security & operations
 
 - Multiple persistent accounts with `CREATE USER`/`GRANT`/`REVOKE`, with coarse
-  (read/write/admin) privileges granted **globally** or **per table**. No
-  per-database, per-column, or routine privileges; reads are always allowed at
-  the global baseline (table grants only raise write/admin).
+  (read/write/admin) privileges granted **globally** or **per table**.
+  **Roles** are supported: `CREATE ROLE` / `DROP ROLE`, `GRANT <role> TO <user>`
+  / `REVOKE <role> FROM <user>`; a user inherits the global and per-table grants
+  of every role granted to them. `GRANT ... ON db.*` is accepted and maps to a
+  global grant (single default database). Reads are always allowed at the global
+  baseline (grants only raise write/admin). **Per-column** privileges
+  (column masking) are not yet enforced.
+- An optional **audit log** (`--audit-log <path>`) appends one tab-separated
+  line per executed statement (`timestamp  conn_id  user  OK|ERR  sql`).
 - Hot and offline backup/restore, plus an append-only binlog for point-in-time
   recovery (`--binlog` + `elyrasql binlog-replay`). Binlog rotation/pruning is
   manual; there is no incremental (block-level) backup.

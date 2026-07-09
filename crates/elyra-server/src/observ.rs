@@ -293,3 +293,44 @@ pub fn epoch_ms() -> u128 {
         .map(|d| d.as_millis())
         .unwrap_or(0)
 }
+
+/// Append-only audit log: one tab-separated line per executed statement
+/// (`ts_ms  conn_id  user  OK|ERR  sql`). Opt-in via `--audit-log`.
+pub struct AuditLog {
+    file: Mutex<std::fs::File>,
+}
+
+impl AuditLog {
+    /// Open (create/append) the audit log at `path`.
+    pub fn open(path: &std::path::Path) -> std::io::Result<Self> {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        Ok(AuditLog {
+            file: Mutex::new(file),
+        })
+    }
+
+    /// Record one executed statement. Newlines in `sql` are flattened and the
+    /// text is truncated so each entry stays a single line.
+    pub fn record(&self, conn_id: u32, user: &str, sql: &str, ok: bool) {
+        use std::io::Write;
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let mut flat: String = sql
+            .chars()
+            .map(|c| if c == '\n' || c == '\t' { ' ' } else { c })
+            .collect();
+        if flat.len() > 2000 {
+            flat.truncate(2000);
+        }
+        let status = if ok { "OK" } else { "ERR" };
+        let user = if user.is_empty() { "-" } else { user };
+        if let Ok(mut f) = self.file.lock() {
+            let _ = writeln!(f, "{ts}\t{conn_id}\t{user}\t{status}\t{flat}");
+        }
+    }
+}
