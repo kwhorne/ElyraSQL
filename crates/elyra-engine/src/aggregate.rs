@@ -36,6 +36,10 @@ impl AggPlan {
     }
 
     /// The aggregate-argument expressions to append as virtual columns.
+    pub fn group_cols(&self) -> &[usize] {
+        &self.group_cols
+    }
+
     pub fn arg_exprs(&self) -> &[Expr] {
         &self.arg_exprs
     }

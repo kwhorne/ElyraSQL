@@ -7,6 +7,7 @@
 //! under high traffic.
 
 mod aggregate;
+mod aggspill;
 mod catalog;
 mod eval;
 mod exec;

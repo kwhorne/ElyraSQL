@@ -21,8 +21,8 @@ variable fallback (handy for systemd and containers).
 
 | Environment | Default | Description |
 |-------------|---------|-------------|
-| `ELYRASQL_SORT_MAX_ROWS` | `1000000` | Rows an `ORDER BY` holds in memory before spilling a sorted run to a temp file (external merge sort). |
-| `ELYRASQL_GROUP_MAX_GROUPS` | `5000000` | Max distinct `GROUP BY` groups before the query fails gracefully instead of risking OOM (0 = unlimited). |
+| `ELYRASQL_SORT_MAX_ROWS` | `1000000` | Rows buffered before spilling to a temp file, for both `ORDER BY` (external merge sort) and partitioned `GROUP BY` spill. |
+| `ELYRASQL_GROUP_MAX_GROUPS` | `5000000` | Distinct-group cap: in-memory `GROUP BY` past this falls back to partitioned spill; a single spill partition past it errors (0 = unlimited). |
 
 `RUST_LOG` controls log verbosity (`error`, `warn`, `info`, `debug`, `trace`;
 default `info`).

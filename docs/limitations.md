@@ -30,10 +30,13 @@ implemented, so you can judge fit.
   fast paths.
 - `ORDER BY` is memory-bounded: `ORDER BY ... LIMIT` uses a top-N heap, and
   large unbounded sorts spill sorted runs to temp files (external merge sort,
-  `ELYRASQL_SORT_MAX_ROWS`). `GROUP BY` holds groups in memory but fails
-  gracefully past `ELYRASQL_GROUP_MAX_GROUPS` rather than risking OOM; it does
-  not yet spill (partitioned aggregation is future work). In-transaction reads
-  still materialize their working set.
+  `ELYRASQL_SORT_MAX_ROWS`). `GROUP BY` with many distinct groups falls back to
+  **partitioned spill** aggregation (rows routed to partitions by group-key
+  hash, spilled to temp files, aggregated per partition) so memory stays
+  bounded; a single skewed partition past `ELYRASQL_GROUP_MAX_GROUPS` still
+  errors. In-transaction reads materialize their working set.
+- Spilled `GROUP BY` output is ordered per partition (add `ORDER BY` for a
+  defined order).
 
 ## Transactions & locking
 

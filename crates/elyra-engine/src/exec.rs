@@ -2061,7 +2061,13 @@ pub async fn select(
     if !group_by.is_empty() || aggregate::projection_has_aggregate(&select.projection) {
         let plan = aggregate::build_plan(&def.schema, &select.projection, &group_by)?;
         let agg = olap_aggregate(db, &def, filter.clone(), &plan).await?;
-        let (schema, out_rows) = plan.finalize(agg);
+        let (schema, out_rows) = if agg.overflowed() {
+            // Too many distinct groups for memory: fall back to partitioned
+            // spill aggregation (bounded memory).
+            partitioned_aggregate(db, &def, filter.clone(), &plan).await?
+        } else {
+            plan.finalize(agg)
+        };
         let mut out_rows = apply_having(
             select.having.as_ref(),
             &select.projection,
@@ -6020,23 +6026,84 @@ async fn olap_aggregate(
                     agg.feed(&row);
                 }
             }
-            agg_overflow_check(&agg)?;
             return Ok(agg);
         }
     }
     parallel_aggregate(db, def, filter, plan).await
 }
 
-/// Error out (rather than OOM) when a GROUP BY exceeded the distinct-group cap.
-fn agg_overflow_check(agg: &GroupAggregator) -> Result<()> {
-    if agg.overflowed() {
-        return Err(Error::Query(format!(
-            "GROUP BY produced too many distinct groups (limit {}); add a more \
-             selective WHERE or raise ELYRASQL_GROUP_MAX_GROUPS",
-            elyra_olap::default_max_groups()
-        )));
+/// Partitioned, spill-to-disk aggregation used when the in-memory aggregation
+/// overflows the group cap. Rows are routed to partitions by group-key hash and
+/// spilled to temp files; each partition is then aggregated independently in
+/// bounded memory. Returns finalized output rows.
+async fn partitioned_aggregate(
+    db: &Session,
+    def: &TableDef,
+    filter: Option<Expr>,
+    plan: &AggPlan,
+) -> Result<(Schema, Vec<Vec<Value>>)> {
+    const PARTS: usize = 256;
+    let budget = crate::sort::sort_max_rows();
+    let group_cols = plan.group_cols().to_vec();
+    let mut parts = crate::aggspill::Partitions::new(PARTS, budget);
+
+    // Phase 1: scan and route rows to partitions (spilling past the budget).
+    let prefix = data_prefix(&def.name);
+    let mut cursor: Option<Vec<u8>> = None;
+    loop {
+        let batch = db.scan_batch(prefix.clone(), cursor.clone(), 8192).await?;
+        if batch.is_empty() {
+            break;
+        }
+        let last = batch.len() < 8192;
+        cursor = batch.last().map(|(k, _)| k.clone());
+        for (_, v) in batch {
+            let row: Vec<Value> =
+                bincode::deserialize(&v).map_err(|e| Error::Storage(e.to_string()))?;
+            if let Some(f) = &filter {
+                if !predicate::matches(f, &def.schema, &row)? {
+                    continue;
+                }
+            }
+            let gk: Vec<Value> = group_cols
+                .iter()
+                .map(|&c| row.get(c).cloned().unwrap_or(Value::Null))
+                .collect();
+            let p = crate::aggspill::partition_of(&Value::row_collation_key(&gk), PARTS);
+            parts.route(p, row)?;
+        }
+        if last {
+            break;
+        }
     }
-    Ok(())
+
+    // Phase 2: aggregate each partition independently and concatenate.
+    let extend = !plan.arg_exprs().is_empty();
+    let mut out_rows: Vec<Vec<Value>> = Vec::new();
+    let mut schema: Option<Schema> = None;
+    for p in 0..parts.len() {
+        let mut agg = plan.new_aggregator();
+        parts.drain_each(p, |row| {
+            if extend {
+                agg.feed(&plan.extend_row(&row)?);
+            } else {
+                agg.feed(&row);
+            }
+            Ok(())
+        })?;
+        if agg.overflowed() {
+            return Err(Error::Query(format!(
+                "GROUP BY partition still exceeds the group limit ({}); raise \
+                 ELYRASQL_GROUP_MAX_GROUPS",
+                elyra_olap::default_max_groups()
+            )));
+        }
+        let (s, rows) = plan.finalize(agg);
+        schema = Some(s);
+        out_rows.extend(rows);
+    }
+    let schema = schema.unwrap_or_else(|| plan.finalize(plan.new_aggregator()).0);
+    Ok((schema, out_rows))
 }
 
 /// Scan the table in batches and aggregate them across worker threads, merging
@@ -6109,7 +6176,6 @@ async fn parallel_aggregate(
             break;
         }
     }
-    agg_overflow_check(&result)?;
     Ok(result)
 }
 
