@@ -64,11 +64,22 @@ systemctl start elyrasql
 ## Point-in-time recovery (binlog)
 
 Enable the binary log to record every committed write-set for point-in-time
-recovery:
+recovery. `--binlog` is a **directory** of rotating segment files
+(`binlog.000001`, ...):
 
 ```bash
-elyrasql serve --data elyra.edb --binlog /var/lib/elyrasql/elyra.binlog
+elyrasql serve --data elyra.edb --binlog /var/lib/elyrasql/binlog
 ```
+
+Segments rotate at `ELYRASQL_BINLOG_SEGMENT_MB` (default 128 MB). Inspect and
+prune them with SQL:
+
+```sql
+SHOW BINARY LOGS;                       -- Log_name, File_size
+PURGE BINARY LOGS TO 'binlog.000010';   -- delete segments before this one
+```
+
+Prune segments that predate your most recent full backup.
 
 Each record carries an LSN and a millisecond timestamp. Because write-sets are
 absolute key/value changes, replaying the log in order onto a base is
@@ -79,7 +90,7 @@ idempotent. To recover:
 elyrasql restore --input /var/backups/elyra.edb --data /var/lib/elyrasql/recovered.edb
 
 # 2. Replay the binlog up to the desired point (LSN or timestamp).
-elyrasql binlog-replay --data recovered.edb --binlog elyra.binlog --until-time-ms 1783619354469
+elyrasql binlog-replay --data recovered.edb --binlog /var/lib/elyrasql/binlog --until-time-ms 1783619354469
 # or --until-lsn 421   (omit both to replay everything)
 ```
 
@@ -88,5 +99,5 @@ from genesis. Combine periodic full backups with a continuous binlog for
 recovery to any moment.
 
 !!! note "Not yet available"
-    Binlog rotation/pruning is manual, and there is no incremental (block-level)
-    backup. See [Limitations](limitations.md).
+    There is no incremental (block-level) backup. See
+    [Limitations](limitations.md).

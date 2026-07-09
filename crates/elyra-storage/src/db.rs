@@ -109,6 +109,8 @@ pub struct Db {
     acked: Arc<tokio::sync::watch::Sender<u64>>,
     /// Semi-sync commit wait in ms (0 = asynchronous).
     sync_timeout_ms: Arc<AtomicU64>,
+    /// Binlog directory, if point-in-time recovery is enabled.
+    binlog_dir: Option<std::path::PathBuf>,
 }
 
 impl Db {
@@ -138,6 +140,7 @@ impl Db {
         let (acked, _) = tokio::sync::watch::channel(0u64);
         let acked = Arc::new(acked);
         let sync_timeout_ms = Arc::new(AtomicU64::new(0));
+        let binlog_dir = binlog.clone();
         let binlog = match binlog {
             Some(p) => Some(crate::binlog::BinlogWriter::open(p)?),
             None => None,
@@ -164,7 +167,13 @@ impl Db {
             repl_tx,
             acked,
             sync_timeout_ms,
+            binlog_dir,
         })
+    }
+
+    /// The binlog directory, if point-in-time recovery is enabled.
+    pub fn binlog_dir(&self) -> Option<&std::path::Path> {
+        self.binlog_dir.as_deref()
     }
 
     /// Enable semi-synchronous replication: a commit waits up to `ms` for a

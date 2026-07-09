@@ -160,6 +160,26 @@ impl Engine {
             return Ok(vec![QueryResult::Affected(n)]);
         }
 
+        // Binlog administration (not standard SQL).
+        if head.starts_with("show binary logs") || head.starts_with("show master logs") {
+            return Ok(vec![exec::show_binary_logs(sess).await?]);
+        }
+        if head.starts_with("purge binary") || head.starts_with("purge master") {
+            if privilege < Privilege::Admin {
+                return Err(Error::Query(
+                    "access denied: PURGE BINARY LOGS requires ADMIN privilege".into(),
+                ));
+            }
+            let toks: Vec<&str> = trimmed.split_whitespace().collect();
+            let to = toks
+                .iter()
+                .position(|t| t.eq_ignore_ascii_case("to"))
+                .and_then(|i| toks.get(i + 1))
+                .map(|s| s.trim_matches(['`', '"', '\'', ';']).to_string())
+                .ok_or_else(|| Error::Parse("usage: PURGE BINARY LOGS TO '<name>'".into()))?;
+            return Ok(vec![exec::purge_binary_logs(sess, &to).await?]);
+        }
+
         // User management (CREATE USER / GRANT / REVOKE / ...): parsed and
         // executed here, not by the SQL frontend.
         if users::is_user_stmt(trimmed) {

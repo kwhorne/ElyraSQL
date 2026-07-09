@@ -6455,6 +6455,33 @@ pub async fn analyze_table(db: &Session, name: &str) -> Result<QueryResult> {
     Ok(QueryResult::Rows(RowStream::literal(schema, vec![row])))
 }
 
+/// `SHOW BINARY LOGS`: list binlog segments and their sizes.
+pub async fn show_binary_logs(db: &Session) -> Result<QueryResult> {
+    let handle = db.raw_db();
+    let schema = Schema::new(vec![
+        ColumnDef::new("Log_name", ColumnType::Text, false),
+        ColumnDef::new("File_size", ColumnType::Int, false),
+    ]);
+    let rows = match handle.binlog_dir() {
+        Some(dir) => elyra_storage::binlog::list_segments(dir)?
+            .into_iter()
+            .map(|(name, size)| vec![Value::Text(name), Value::Int(size as i64)])
+            .collect(),
+        None => Vec::new(),
+    };
+    Ok(QueryResult::Rows(RowStream::literal(schema, rows)))
+}
+
+/// `PURGE BINARY LOGS TO '<name>'`: delete segments before `name`.
+pub async fn purge_binary_logs(db: &Session, to: &str) -> Result<QueryResult> {
+    let handle = db.raw_db();
+    let dir = handle
+        .binlog_dir()
+        .ok_or_else(|| Error::Query("binary logging is not enabled".into()))?;
+    let n = elyra_storage::binlog::purge(dir, to)?;
+    Ok(QueryResult::Affected(n))
+}
+
 pub async fn drop_table(db: &Session, name: &str, if_exists: bool) -> Result<QueryResult> {
     if !catalog::exists(db, name).await? {
         if if_exists {
