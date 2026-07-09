@@ -18,7 +18,8 @@ use crate::predicate;
 use elyra_olap::GroupAggregator;
 
 use crate::catalog::{
-    self, catalog_key, data_key, data_prefix, rowid_key, wcount_key, IndexDef, TableDef,
+    self, autoinc_key, catalog_key, data_key, data_prefix, index_table_prefix, rowid_key,
+    wcount_key, ColMeta, IndexDef, TableDef,
 };
 use crate::eval::eval_expr;
 use crate::keyenc;
@@ -88,7 +89,11 @@ fn is_tinyint_bool(_dt: &DataType) -> bool {
     false
 }
 
-pub async fn create_table(db: &Session, ct: CreateTable) -> Result<QueryResult> {
+pub async fn create_table(
+    db: &Session,
+    vindex: &VectorRegistry,
+    ct: CreateTable,
+) -> Result<QueryResult> {
     let name = table_ident(&ct.name)?;
 
     if catalog::exists(db, &name).await? {
@@ -98,12 +103,33 @@ pub async fn create_table(db: &Session, ct: CreateTable) -> Result<QueryResult> 
         return Err(Error::Catalog(format!("table already exists: {name}")));
     }
 
+    // CREATE TABLE ... LIKE source: copy the structure, no data.
+    if let Some(src) = &ct.like {
+        let sname = src
+            .0
+            .last()
+            .map(|i| i.value.clone())
+            .ok_or_else(|| Error::Catalog("empty source table".into()))?;
+        let mut def = catalog::load(db, &sname).await?;
+        def.name = name.clone();
+        db.commit_write(vec![(catalog_key(&name), def.encode()?)], vec![])
+            .await?;
+        return Ok(QueryResult::Affected(0));
+    }
+
+    // CREATE TABLE ... AS SELECT: derive structure from the query, copy rows.
+    if let Some(q) = &ct.query {
+        return create_table_as(db, vindex, &name, &ct, q).await;
+    }
+
     let mut columns = Vec::with_capacity(ct.columns.len());
+    let mut col_meta: Vec<ColMeta> = Vec::with_capacity(ct.columns.len());
     let mut pk_cols: Vec<usize> = Vec::new();
 
     for (idx, col) in ct.columns.iter().enumerate() {
         let ty = map_type(&col.data_type)?;
         let mut nullable = true;
+        let mut meta = ColMeta::default();
         for opt in &col.options {
             match &opt.option {
                 ColumnOption::NotNull => nullable = false,
@@ -113,6 +139,18 @@ pub async fn create_table(db: &Session, ct: CreateTable) -> Result<QueryResult> 
                     pk_cols.push(idx);
                     nullable = false;
                 }
+                ColumnOption::Default(e) => meta.default = Some(e.to_string()),
+                ColumnOption::Generated {
+                    generation_expr: Some(e),
+                    ..
+                } => meta.generated = Some(e.to_string()),
+                ColumnOption::DialectSpecific(tokens)
+                    if tokens
+                        .iter()
+                        .any(|t| t.to_string().eq_ignore_ascii_case("AUTO_INCREMENT")) =>
+                {
+                    meta.auto_increment = true;
+                }
                 _ => {}
             }
         }
@@ -121,6 +159,7 @@ pub async fn create_table(db: &Session, ct: CreateTable) -> Result<QueryResult> 
             ty,
             nullable,
         });
+        col_meta.push(meta);
     }
 
     // Table-level PRIMARY KEY (single or composite).
@@ -145,9 +184,101 @@ pub async fn create_table(db: &Session, ct: CreateTable) -> Result<QueryResult> 
         schema: Schema::new(columns),
         pk_cols,
         indexes: Vec::new(),
+        col_meta,
     };
     db.commit_write(vec![(catalog_key(&name), def.encode()?)], vec![])
         .await?;
+    Ok(QueryResult::Affected(0))
+}
+
+/// CREATE TABLE ... AS SELECT: build a rowid table from the query's output
+/// schema (or an explicit column list) and copy the result rows.
+async fn create_table_as(
+    db: &Session,
+    vindex: &VectorRegistry,
+    name: &str,
+    ct: &CreateTable,
+    q: &SqlQuery,
+) -> Result<QueryResult> {
+    let (qschema, rows) = run_subquery_schema(db, vindex, q).await?;
+    let columns: Vec<ColumnDef> = if ct.columns.is_empty() {
+        qschema
+            .columns
+            .iter()
+            .map(|c| ColumnDef {
+                name: c.name.rsplit('.').next().unwrap_or(&c.name).to_string(),
+                ty: c.ty.clone(),
+                nullable: true,
+            })
+            .collect()
+    } else {
+        let mut v = Vec::with_capacity(ct.columns.len());
+        for c in &ct.columns {
+            v.push(ColumnDef {
+                name: c.name.value.clone(),
+                ty: map_type(&c.data_type)?,
+                nullable: true,
+            });
+        }
+        v
+    };
+    if columns.len() != qschema.columns.len() {
+        return Err(Error::Query(
+            "CREATE TABLE AS: column count does not match the query".into(),
+        ));
+    }
+
+    let def = TableDef {
+        name: name.to_string(),
+        schema: Schema::new(columns),
+        pk_cols: Vec::new(),
+        indexes: Vec::new(),
+        col_meta: Vec::new(),
+    };
+    let mut puts = vec![(catalog_key(name), def.encode()?)];
+    let mut rowid = 0u64;
+    for row in &rows {
+        rowid += 1;
+        let mut r = vec![Value::Null; def.schema.columns.len()];
+        for (i, col) in def.schema.columns.iter().enumerate() {
+            if let Some(v) = row.get(i) {
+                r[i] = coerce(v.clone(), &col.ty, &col.name)?;
+            }
+        }
+        let enc = bincode::serialize(&r).map_err(|e| Error::Storage(e.to_string()))?;
+        puts.push((data_key(name, &keyenc::encode_rowid(rowid)), enc));
+    }
+    if rowid > 0 {
+        puts.push((rowid_key(name), rowid.to_le_bytes().to_vec()));
+    }
+    let affected = rows.len() as u64;
+    db.commit_write(puts, vec![]).await?;
+    Ok(QueryResult::Affected(affected))
+}
+
+/// TRUNCATE TABLE: remove all rows and index entries, reset counters.
+pub async fn truncate(db: &Session, name: &str) -> Result<QueryResult> {
+    if !catalog::exists(db, name).await? {
+        return Err(Error::Catalog(format!("no such table: {name}")));
+    }
+    let mut deletes = vec![rowid_key(name), autoinc_key(name)];
+    for prefix in [data_prefix(name), index_table_prefix(name)] {
+        let mut cursor: Option<Vec<u8>> = None;
+        loop {
+            let batch = db.scan_batch(prefix.clone(), cursor.clone(), 4096).await?;
+            if batch.is_empty() {
+                break;
+            }
+            cursor = batch.last().map(|(k, _)| k.clone());
+            let last = batch.len() < 4096;
+            deletes.extend(batch.into_iter().map(|(k, _)| k));
+            if last {
+                break;
+            }
+        }
+    }
+    let wc = bump_wcount(db, name).await?;
+    db.commit_write(vec![wc], deletes).await?;
     Ok(QueryResult::Affected(0))
 }
 
@@ -3821,6 +3952,7 @@ async fn create_temp_table(db: &Session, name: &str, schema: &Schema) -> Result<
         schema: schema.clone(),
         pk_cols: Vec::new(),
         indexes: Vec::new(),
+        col_meta: Vec::new(),
     };
     db.commit_write(vec![(catalog_key(name), def.encode()?)], vec![])
         .await?;
@@ -4662,20 +4794,21 @@ pub async fn drop_table(db: &Session, name: &str, if_exists: bool) -> Result<Que
         return Err(Error::Catalog(format!("no such table: {name}")));
     }
 
-    // Collect the table's data keys in batches to avoid unbounded memory.
-    let prefix = data_prefix(name);
-    let mut deletes = vec![catalog_key(name), rowid_key(name)];
-    let mut cursor: Option<Vec<u8>> = None;
-    loop {
-        let batch = db.scan_batch(prefix.clone(), cursor.clone(), 4096).await?;
-        if batch.is_empty() {
-            break;
-        }
-        cursor = batch.last().map(|(k, _)| k.clone());
-        let last = batch.len() < 4096;
-        deletes.extend(batch.into_iter().map(|(k, _)| k));
-        if last {
-            break;
+    // Collect the table's data and index keys in batches.
+    let mut deletes = vec![catalog_key(name), rowid_key(name), autoinc_key(name)];
+    for prefix in [data_prefix(name), index_table_prefix(name)] {
+        let mut cursor: Option<Vec<u8>> = None;
+        loop {
+            let batch = db.scan_batch(prefix.clone(), cursor.clone(), 4096).await?;
+            if batch.is_empty() {
+                break;
+            }
+            cursor = batch.last().map(|(k, _)| k.clone());
+            let last = batch.len() < 4096;
+            deletes.extend(batch.into_iter().map(|(k, _)| k));
+            if last {
+                break;
+            }
         }
     }
     db.commit_write(vec![], deletes).await?;

@@ -28,6 +28,18 @@ impl IndexDef {
     }
 }
 
+/// Per-column defaults, auto-increment, and (stored) generated expressions.
+/// Stored as SQL text and evaluated by the engine at write time.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct ColMeta {
+    #[serde(default)]
+    pub default: Option<String>,
+    #[serde(default)]
+    pub auto_increment: bool,
+    #[serde(default)]
+    pub generated: Option<String>,
+}
+
 /// Definition of a table. `pk_cols` are the schema indices of the (possibly
 /// composite) primary key, clustered in key order; empty means a hidden rowid.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,12 +49,37 @@ pub struct TableDef {
     pub pk_cols: Vec<usize>,
     #[serde(default)]
     pub indexes: Vec<IndexDef>,
+    /// Column metadata, parallel to `schema.columns`. May be shorter/empty for
+    /// older catalogs or tables with no special columns.
+    #[serde(default)]
+    pub col_meta: Vec<ColMeta>,
 }
 
 impl TableDef {
     pub fn has_pk(&self) -> bool {
         !self.pk_cols.is_empty()
     }
+
+    /// Column metadata for column `i` (empty default if unset).
+    pub fn meta(&self, i: usize) -> ColMeta {
+        self.col_meta.get(i).cloned().unwrap_or_default()
+    }
+
+    /// True if any column has a default, auto-increment, or generated value.
+    pub fn has_col_meta(&self) -> bool {
+        self.col_meta
+            .iter()
+            .any(|m| m.default.is_some() || m.auto_increment || m.generated.is_some())
+    }
+}
+
+pub fn autoinc_key(table: &str) -> Vec<u8> {
+    format!("meta::autoinc::{table}").into_bytes()
+}
+
+/// Prefix under which all secondary-index entries of a table live.
+pub fn index_table_prefix(table: &str) -> Vec<u8> {
+    format!("index::{table}::").into_bytes()
 }
 
 pub fn catalog_key(table: &str) -> Vec<u8> {

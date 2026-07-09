@@ -123,7 +123,15 @@ impl Engine {
                     eval::eval_literal_select(&q)
                 }
             }
-            Statement::CreateTable(ct) => exec::create_table(sess, ct).await,
+            Statement::CreateTable(ct) => exec::create_table(sess, &self.vindex, ct).await,
+            Statement::Truncate { table_names, .. } => {
+                let name = table_names
+                    .first()
+                    .and_then(|t| t.name.0.last())
+                    .map(|i| i.value.clone())
+                    .ok_or_else(|| Error::Catalog("empty table name".into()))?;
+                exec::truncate(sess, &name).await
+            }
             Statement::CreateView {
                 name,
                 columns,

@@ -61,6 +61,35 @@ ALTER TABLE users RENAME TO members;
 - **RENAME COLUMN** is a metadata-only change.
 - **RENAME TABLE** re-keys the data and rebuilds index entries.
 
+## CREATE TABLE ... AS SELECT
+
+```sql
+CREATE TABLE big_sales AS SELECT id, amount FROM sales WHERE amount >= 100;
+CREATE TABLE totals AS SELECT region, SUM(amount) AS total FROM sales GROUP BY region;
+```
+
+The new table's columns are derived from the query's output (or an explicit
+column list) and the result rows are copied in. The table has no primary key or
+indexes.
+
+## CREATE TABLE ... LIKE
+
+```sql
+CREATE TABLE sales_archive LIKE sales;
+```
+
+Copies the structure (columns, primary key, indexes) of an existing table
+without copying any rows.
+
+## TRUNCATE TABLE
+
+```sql
+TRUNCATE TABLE logs;
+```
+
+Removes all rows and index entries and resets the auto-increment counter,
+keeping the table definition.
+
 ## Views
 
 ```sql
