@@ -251,6 +251,124 @@ pub async fn show_columns(db: &Session, table: &str) -> Result<QueryResult> {
     Ok(QueryResult::Rows(RowStream::literal(schema, rows)))
 }
 
+/// SHOW CREATE TABLE: reconstruct the DDL from the catalog definition.
+pub async fn show_create_table(db: &Session, name: &str) -> Result<QueryResult> {
+    let def = catalog::load(db, name).await?;
+    let mut lines: Vec<String> = Vec::new();
+    for (i, c) in def.schema.columns.iter().enumerate() {
+        let meta = def.meta(i);
+        let mut s = format!("  `{}` {}", c.name, c.ty.display_name());
+        if !c.nullable {
+            s.push_str(" NOT NULL");
+        }
+        if let Some(d) = &meta.default {
+            s.push_str(&format!(" DEFAULT {d}"));
+        }
+        if meta.auto_increment {
+            s.push_str(" AUTO_INCREMENT");
+        }
+        if let Some(g) = &meta.generated {
+            s.push_str(&format!(" GENERATED ALWAYS AS ({g}) STORED"));
+        }
+        lines.push(s);
+    }
+    if !def.pk_cols.is_empty() {
+        let cols = def
+            .pk_cols
+            .iter()
+            .map(|&i| format!("`{}`", def.schema.columns[i].name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        lines.push(format!("  PRIMARY KEY ({cols})"));
+    }
+    for idx in &def.indexes {
+        let kind = if idx.vector {
+            "VECTOR KEY"
+        } else if idx.unique {
+            "UNIQUE KEY"
+        } else {
+            "KEY"
+        };
+        let cols = idx
+            .cols
+            .iter()
+            .map(|&i| format!("`{}`", def.schema.columns[i].name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        lines.push(format!("  {kind} `{}` ({cols})", idx.name));
+    }
+    let ddl = format!("CREATE TABLE `{name}` (\n{}\n)", lines.join(",\n"));
+    let schema = Schema::new(vec![
+        ColumnDef {
+            name: "Table".into(),
+            ty: ColumnType::Text,
+            nullable: false,
+        },
+        ColumnDef {
+            name: "Create Table".into(),
+            ty: ColumnType::Text,
+            nullable: false,
+        },
+    ]);
+    let rows = vec![vec![Value::Text(name.to_string()), Value::Text(ddl)]];
+    Ok(QueryResult::Rows(RowStream::literal(schema, rows)))
+}
+
+/// SHOW INDEX FROM table: one row per index column.
+pub async fn show_index(db: &Session, name: &str) -> Result<QueryResult> {
+    let def = catalog::load(db, name).await?;
+    let head = [
+        "Table",
+        "Non_unique",
+        "Key_name",
+        "Seq_in_index",
+        "Column_name",
+        "Collation",
+        "Cardinality",
+        "Null",
+        "Index_type",
+    ];
+    let schema = Schema::new(
+        head.iter()
+            .map(|n| ColumnDef {
+                name: (*n).to_string(),
+                ty: if matches!(*n, "Non_unique" | "Seq_in_index" | "Cardinality") {
+                    ColumnType::Int
+                } else {
+                    ColumnType::Text
+                },
+                nullable: true,
+            })
+            .collect(),
+    );
+    let mk = |non_unique: i64, key: &str, seq: usize, ci: usize, itype: &str| -> Vec<Value> {
+        let c = &def.schema.columns[ci];
+        vec![
+            Value::Text(name.to_string()),
+            Value::Int(non_unique),
+            Value::Text(key.to_string()),
+            Value::Int(seq as i64),
+            Value::Text(c.name.clone()),
+            Value::Text("A".into()),
+            Value::Null,
+            Value::Text(if c.nullable { "YES" } else { "" }.into()),
+            Value::Text(itype.to_string()),
+        ]
+    };
+    let mut rows = Vec::new();
+    for (seq, &ci) in def.pk_cols.iter().enumerate() {
+        rows.push(mk(0, "PRIMARY", seq + 1, ci, "BTREE"));
+    }
+    for idx in &def.indexes {
+        let non_unique = if idx.unique { 0 } else { 1 };
+        let itype = if idx.vector { "HNSW" } else { "BTREE" };
+        for (seq, &ci) in idx.cols.iter().enumerate() {
+            rows.push(mk(non_unique, &idx.name, seq + 1, ci, itype));
+        }
+    }
+    Ok(QueryResult::Rows(RowStream::literal(schema, rows)))
+}
+
 /// If `tf` is `information_schema.<view>`, return the lowercase view name.
 fn information_schema_view(tf: &TableFactor) -> Option<String> {
     if let TableFactor::Table { name, .. } = tf {

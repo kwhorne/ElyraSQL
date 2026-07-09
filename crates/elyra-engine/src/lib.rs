@@ -93,6 +93,21 @@ impl Engine {
             return Ok(vec![QueryResult::empty_ok()]);
         }
 
+        // SHOW INDEX / SHOW KEYS is not parsed by the SQL frontend; handle it here.
+        if lower.starts_with("show index")
+            || lower.starts_with("show indexes")
+            || lower.starts_with("show keys")
+        {
+            let toks: Vec<&str> = lower.split_whitespace().collect();
+            let name = toks
+                .iter()
+                .position(|t| *t == "from" || *t == "in")
+                .and_then(|i| toks.get(i + 1))
+                .map(|s| s.trim_matches(['`', '"', '\'', ';']).to_string())
+                .ok_or_else(|| Error::Parse("SHOW INDEX requires FROM <table>".into()))?;
+            return Ok(vec![exec::show_index(sess, &name).await?]);
+        }
+
         if let Some(r) = self.intercept_session(sql) {
             return Ok(vec![r]); // session/introspection: read-level
         }
@@ -190,6 +205,17 @@ impl Engine {
                 Ok(QueryResult::empty_ok())
             }
             Statement::ShowTables { .. } => exec::show_tables(sess).await,
+            Statement::ShowCreate {
+                obj_type: sqlparser::ast::ShowCreateObject::Table,
+                obj_name,
+            } => {
+                let name = obj_name
+                    .0
+                    .last()
+                    .map(|i| i.value.clone())
+                    .ok_or_else(|| Error::Catalog("empty table name".into()))?;
+                exec::show_create_table(sess, &name).await
+            }
             Statement::ShowColumns { show_options, .. } => {
                 let name = show_options
                     .show_in
@@ -254,6 +280,7 @@ fn required_privilege(stmt: &Statement) -> Privilege {
         | Statement::Rollback { .. }
         | Statement::ShowTables { .. }
         | Statement::ShowColumns { .. }
+        | Statement::ShowCreate { .. }
         | Statement::ExplainTable { .. } => Privilege::Read,
         _ => Privilege::Admin, // CREATE / DROP / CREATE INDEX and anything else
     }

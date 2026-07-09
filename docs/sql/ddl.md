@@ -128,7 +128,14 @@ keeping the table definition.
 SHOW TABLES;
 SHOW COLUMNS FROM users;
 DESCRIBE users;   -- or DESC users
+SHOW CREATE TABLE users;
+SHOW INDEX FROM users;   -- or SHOW KEYS FROM users
 ```
+
+`SHOW CREATE TABLE` reconstructs the `CREATE TABLE` DDL (columns, defaults,
+auto-increment, generated columns, primary key, and indexes). `SHOW INDEX` /
+`SHOW KEYS` lists one row per index column
+(`Table | Non_unique | Key_name | Seq_in_index | Column_name | ... | Index_type`).
 
 `SHOW COLUMNS` / `DESCRIBE` return the familiar
 `Field | Type | Null | Key | Default | Extra` layout, where `Key` is `PRI`
