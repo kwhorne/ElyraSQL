@@ -47,6 +47,9 @@ file, ACID storage, OLAP-ready and vector-native — all under one brand.
   (optimistic row locking).
 - **Backup** — hot, consistent `BACKUP TO '<path>'` while serving, plus offline
   `elyrasql backup`/`restore` CLI commands.
+- **Users & access control** — persistent accounts via `CREATE USER`/`DROP USER`,
+  `GRANT`/`REVOKE`, `SET PASSWORD`, `SHOW GRANTS`; coarse `read`/`write`/`admin`
+  privileges; `mysql_native_password` auth; optional TLS.
 - **Introspection** — `SHOW TABLES`/`COLUMNS`/`INDEX`, `SHOW CREATE TABLE`,
   `DESCRIBE`, and a queryable `INFORMATION_SCHEMA`.
 

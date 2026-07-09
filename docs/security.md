@@ -38,6 +38,39 @@ minimum privilege per statement.
 
 A denied statement returns an access-denied error and is not executed.
 
+## Managing users with SQL
+
+Besides the startup `--auth` flags (which define bootstrap accounts that always
+work), accounts can be created at runtime and are **persisted in the database
+file**, so they survive restarts:
+
+```sql
+CREATE USER 'app'@'%' IDENTIFIED BY 's3cret';   -- created read-only
+GRANT SELECT, INSERT, UPDATE, DELETE ON *.* TO 'app';  -- promote to write
+GRANT ALL PRIVILEGES ON *.* TO 'admin_user';          -- promote to admin
+REVOKE ALL PRIVILEGES ON *.* FROM 'app';              -- back to read-only
+SET PASSWORD FOR 'app' = 'newsecret';
+SHOW GRANTS FOR 'app';
+DROP USER 'app';
+```
+
+Notes and current limitations:
+
+- New accounts start **read-only**; use `GRANT` to raise them.
+- Privileges are **global** and coarse: they map to the `read`/`write`/`admin`
+  levels above. The object clause (`ON *.*`, `ON db.*`, `ON table`) is parsed
+  but not scoped — a grant applies to the whole server. `GRANT ALL` (or
+  `GRANT OPTION`/`SUPER`) → admin; any write action (`INSERT`, `UPDATE`,
+  `DELETE`, `CREATE`, ...) → write; `SELECT`-only → read. `REVOKE` lowers an
+  account back to read.
+- The host part of `'user'@'host'` is accepted but ignored (accounts are
+  host-independent).
+- Passwords are stored only as `SHA1(SHA1(password))`.
+- A privilege change takes effect on the account's **next connection**.
+- Managing users requires the **admin** privilege. Creating the first account
+  (in an otherwise open/dev server) turns authentication on for subsequent
+  connections — keep a bootstrap `--auth` admin so you don't lock yourself out.
+
 ## TLS
 
 Provide a PEM certificate and key to enable TLS. Clients that request SSL are

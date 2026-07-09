@@ -485,7 +485,9 @@ dependencies = [
 name = "elyra-core"
 version = "0.3.0"
 dependencies = [
+ "bincode",
  "serde",
+ "sha1",
  "thiserror 2.0.18",
 ]
 

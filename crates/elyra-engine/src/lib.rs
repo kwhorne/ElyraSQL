@@ -15,6 +15,7 @@ mod keyenc;
 mod predicate;
 mod session;
 mod stream;
+mod users;
 mod vindex;
 
 pub use session::{Isolation, Session};
@@ -137,6 +138,12 @@ impl Engine {
                 .backup_to(std::path::PathBuf::from(path))
                 .await?;
             return Ok(vec![QueryResult::Affected(n)]);
+        }
+
+        // User management (CREATE USER / GRANT / REVOKE / ...): parsed and
+        // executed here, not by the SQL frontend.
+        if users::is_user_stmt(trimmed) {
+            return Ok(vec![users::execute(sql, sess, privilege).await?]);
         }
 
         if let Some(r) = self.intercept_session(sql) {

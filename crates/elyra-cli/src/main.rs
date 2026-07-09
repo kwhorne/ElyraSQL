@@ -148,7 +148,7 @@ async fn main() -> anyhow::Result<()> {
         } => {
             tracing::info!(?data, "opening ElyraSQL database file");
             let db = Db::open(&data)?;
-            let engine = Engine::new(db);
+            let engine = Engine::new(db.clone());
 
             let mut entries: Vec<(String, String, elyra_core::Privilege)> = Vec::new();
             if let Some(u) = user {
@@ -157,11 +157,14 @@ async fn main() -> anyhow::Result<()> {
             for spec in auth {
                 entries.push(parse_auth_spec(&spec)?);
             }
-            let auth = std::sync::Arc::new(if entries.is_empty() {
-                elyra_server::Auth::open()
-            } else {
-                elyra_server::Auth::with_users(entries)
-            });
+            let auth = std::sync::Arc::new(
+                if entries.is_empty() {
+                    elyra_server::Auth::open()
+                } else {
+                    elyra_server::Auth::with_users(entries)
+                }
+                .with_db(db.clone()),
+            );
             let tls = match (tls_cert, tls_key) {
                 (Some(cert), Some(key)) => {
                     Some(std::sync::Arc::new(elyra_server::load_tls(&cert, &key)?))

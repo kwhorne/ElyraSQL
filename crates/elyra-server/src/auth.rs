@@ -9,22 +9,28 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use elyra_core::users::{decode_user, user_key, UserRecord, USER_PREFIX};
 use elyra_core::Privilege;
+use elyra_storage::Db;
 use sha1::{Digest, Sha1};
 
-/// Credential store. When empty (`open`), all logins are accepted — intended
-/// only for local development, and logged loudly by the server.
+/// Credential store. Accounts come from two places: a `bootstrap` map supplied
+/// at startup (the CLI `--user` / `--auth` flags, always valid) and persistent
+/// accounts stored in the database under `sys::user::` (created with
+/// `CREATE USER` / `GRANT`). When neither exists, all logins are accepted —
+/// intended only for local development, and logged loudly by the server.
 pub struct Auth {
-    users: HashMap<String, ([u8; 20], Privilege)>,
-    open: bool,
+    bootstrap: HashMap<String, ([u8; 20], Privilege)>,
+    db: Option<Db>,
 }
 
 impl Auth {
-    /// Open mode: accept any user with full (Admin) privileges (dev only).
+    /// Open mode: no bootstrap accounts. Accepts all logins as Admin until a
+    /// persistent account exists.
     pub fn open() -> Self {
         Auth {
-            users: HashMap::new(),
-            open: true,
+            bootstrap: HashMap::new(),
+            db: None,
         }
     }
 
@@ -39,26 +45,66 @@ impl Auth {
 
     /// Build from explicit `(user, password, privilege)` triples.
     pub fn with_users(entries: Vec<(String, String, Privilege)>) -> Self {
-        let mut users = HashMap::new();
+        let mut bootstrap = HashMap::new();
         for (u, p, priv_) in entries {
-            users.insert(u, (double_sha1(p.as_bytes()), priv_));
+            bootstrap.insert(u, (double_sha1(p.as_bytes()), priv_));
         }
-        Auth { users, open: false }
+        Auth {
+            bootstrap,
+            db: None,
+        }
     }
 
+    /// Attach the persistent user store (the live database) so `CREATE USER` /
+    /// `GRANT` accounts are honoured.
+    pub fn with_db(mut self, db: Db) -> Self {
+        self.db = Some(db);
+        self
+    }
+
+    /// A persistent account, if one exists for `user`.
+    fn persistent(&self, user: &str) -> Option<UserRecord> {
+        let db = self.db.as_ref()?;
+        let snap = db.snapshot().ok()?;
+        let bytes = snap.get(&user_key(user)).ok()??;
+        decode_user(&bytes)
+    }
+
+    /// Whether any persistent account exists (turns off dev open mode).
+    fn any_persistent(&self) -> bool {
+        let Some(db) = &self.db else {
+            return false;
+        };
+        let Ok(snap) = db.snapshot() else {
+            return false;
+        };
+        snap.scan_range(USER_PREFIX, None, 1)
+            .map(|rows| rows.iter().any(|(k, _)| k.starts_with(USER_PREFIX)))
+            .unwrap_or(false)
+    }
+
+    /// Look up an account's stored digest and privilege from either source.
+    fn lookup(&self, user: &str) -> Option<([u8; 20], Privilege)> {
+        if let Some((d, p)) = self.bootstrap.get(user) {
+            return Some((*d, *p));
+        }
+        self.persistent(user).map(|r| (r.digest, r.privilege))
+    }
+
+    /// True when authentication is disabled (no accounts at all).
     pub fn is_open(&self) -> bool {
-        self.open
+        self.bootstrap.is_empty() && !self.any_persistent()
     }
 
     /// Privilege granted to `username` (Admin in open mode; Read if unknown).
     pub fn privilege(&self, username: &[u8]) -> Privilege {
-        if self.open {
+        if self.is_open() {
             return Privilege::Admin;
         }
         std::str::from_utf8(username)
             .ok()
-            .and_then(|u| self.users.get(u))
-            .map(|(_, p)| *p)
+            .and_then(|u| self.lookup(u))
+            .map(|(_, p)| p)
             .unwrap_or(Privilege::Read)
     }
 
@@ -68,15 +114,16 @@ impl Auth {
     /// We recover `SHA1(pw)` and confirm `SHA1(SHA1(pw))` matches the stored
     /// digest.
     pub fn verify(&self, username: &[u8], salt: &[u8], auth_data: &[u8]) -> bool {
-        if self.open {
+        if self.is_open() {
             return true;
         }
         let Ok(user) = std::str::from_utf8(username) else {
             return false;
         };
-        let Some((stored, _)) = self.users.get(user) else {
+        let Some((stored, _)) = self.lookup(user) else {
             return false;
         };
+        let stored = &stored;
 
         if auth_data.is_empty() {
             // Empty password path.
