@@ -85,6 +85,40 @@ pub fn eval_row(expr: &Expr, schema: &Schema, row: &[Value]) -> Result<Value> {
             BinaryOperator::LongArrow => {
                 json_path(eval_row(left, schema, row)?, right, schema, row, true)
             }
+            // Date +/- INTERVAL, and INTERVAL + Date.
+            BinaryOperator::Plus | BinaryOperator::Minus
+                if matches!(right.as_ref(), Expr::Interval(_)) =>
+            {
+                let Expr::Interval(iv) = right.as_ref() else {
+                    unreachable!()
+                };
+                let sign = if matches!(op, BinaryOperator::Minus) {
+                    -1
+                } else {
+                    1
+                };
+                let base = eval_row(left, schema, row)?;
+                let n = eval_row(&iv.value, schema, row)?.as_f64().unwrap_or(0.0) as i64;
+                let unit = iv
+                    .leading_field
+                    .as_ref()
+                    .map(|u| u.to_string().to_ascii_uppercase())
+                    .unwrap_or_else(|| "DAY".into());
+                Ok(apply_interval(base, sign * n, &unit))
+            }
+            BinaryOperator::Plus if matches!(left.as_ref(), Expr::Interval(_)) => {
+                let Expr::Interval(iv) = left.as_ref() else {
+                    unreachable!()
+                };
+                let base = eval_row(right, schema, row)?;
+                let n = eval_row(&iv.value, schema, row)?.as_f64().unwrap_or(0.0) as i64;
+                let unit = iv
+                    .leading_field
+                    .as_ref()
+                    .map(|u| u.to_string().to_ascii_uppercase())
+                    .unwrap_or_else(|| "DAY".into());
+                Ok(apply_interval(base, n, &unit))
+            }
             _ => binary(
                 eval_row(left, schema, row)?,
                 op,
@@ -318,6 +352,20 @@ fn eval_function(f: &sqlparser::ast::Function, schema: &Schema, row: &[Value]) -
             let c = truthy(&eval_row(args_exprs[0], schema, row)?);
             let branch = if c { args_exprs[1] } else { args_exprs[2] };
             return eval_row(branch, schema, row);
+        }
+        "timestampdiff" if args_exprs.len() == 3 => {
+            let unit = unit_name(args_exprs[0]);
+            let a = eval_row(args_exprs[1], schema, row)?;
+            let b = eval_row(args_exprs[2], schema, row)?;
+            return Ok(timestampdiff(&unit, &a, &b));
+        }
+        "timestampadd" if args_exprs.len() == 3 => {
+            let unit = unit_name(args_exprs[0]);
+            let n = eval_row(args_exprs[1], schema, row)?
+                .as_f64()
+                .unwrap_or(0.0) as i64;
+            let base = eval_row(args_exprs[2], schema, row)?;
+            return Ok(apply_interval(base, n, &unit));
         }
         "date_add" | "adddate" | "date_sub" | "subdate" if args_exprs.len() == 2 => {
             let base = eval_row(args_exprs[0], schema, row)?;
@@ -614,6 +662,25 @@ fn eval_scalar(name: &str, a: &[Value]) -> Result<Option<Value>> {
         },
         "date_format" => match (to_micros(&a[0]), sstr(a, 1)) {
             (Some(m), Some(fmt)) => Value::Text(format_dt(m, &fmt)),
+            _ => Value::Null,
+        },
+        "week" => match to_micros(&a[0]) {
+            Some(m) => {
+                let mode = nnum(a, 1).unwrap_or(0.0) as i64;
+                Value::Int(calc_week(m.div_euclid(86_400_000_000), mode).1)
+            }
+            None => Value::Null,
+        },
+        "yearweek" => match to_micros(&a[0]) {
+            Some(m) => {
+                let mode = (nnum(a, 1).unwrap_or(0.0) as i64) | 2;
+                let (y, w) = calc_week(m.div_euclid(86_400_000_000), mode);
+                Value::Int(y * 100 + w)
+            }
+            None => Value::Null,
+        },
+        "str_to_date" => match (sstr(a, 0), sstr(a, 1)) {
+            (Some(s), Some(fmt)) => str_to_date(&s, &fmt),
             _ => Value::Null,
         },
         // ---- string ----
@@ -1003,6 +1070,256 @@ fn add_months(micros: i64, months: i64) -> i64 {
     let nm = (total.rem_euclid(12) + 1) as u32;
     let nd = d.min(days_in_month(ny, nm));
     elyra_core::datetime::days_from_civil(ny, nm, nd) * 86_400_000_000 + day_micros
+}
+
+fn unit_name(e: &Expr) -> String {
+    match e {
+        Expr::Identifier(id) => id.value.clone(),
+        Expr::Interval(iv) => iv
+            .leading_field
+            .as_ref()
+            .map(|u| u.to_string())
+            .unwrap_or_default(),
+        other => other.to_string(),
+    }
+    .to_ascii_uppercase()
+}
+
+fn comps(m: i64) -> (i64, u32, u32, u32, u32, u32) {
+    let days = m.div_euclid(86_400_000_000);
+    let secs = m.rem_euclid(86_400_000_000) / 1_000_000;
+    let (y, mo, d) = elyra_core::datetime::civil_from_days(days);
+    (
+        y,
+        mo,
+        d,
+        (secs / 3600) as u32,
+        ((secs % 3600) / 60) as u32,
+        (secs % 60) as u32,
+    )
+}
+
+/// Whole months between two instants (MySQL TIMESTAMPDIFF semantics).
+fn months_between(ma: i64, mb: i64) -> i64 {
+    let (ya, moa, da, ha, mia, sa) = comps(ma);
+    let (yb, mob, db, hb, mib, sb) = comps(mb);
+    let mut months = (yb - ya) * 12 + (mob as i64 - moa as i64);
+    let a_tod = (da, ha, mia, sa);
+    let b_tod = (db, hb, mib, sb);
+    if months > 0 && b_tod < a_tod {
+        months -= 1;
+    } else if months < 0 && b_tod > a_tod {
+        months += 1;
+    }
+    months
+}
+
+fn timestampdiff(unit: &str, a: &Value, b: &Value) -> Value {
+    let (ma, mb) = match (to_micros(a), to_micros(b)) {
+        (Some(x), Some(y)) => (x, y),
+        _ => return Value::Null,
+    };
+    let diff = mb - ma;
+    Value::Int(match unit {
+        "MICROSECOND" => diff,
+        "SECOND" => diff / 1_000_000,
+        "MINUTE" => diff / 60_000_000,
+        "HOUR" => diff / 3_600_000_000,
+        "DAY" => diff / 86_400_000_000,
+        "WEEK" => diff / (7 * 86_400_000_000),
+        "MONTH" => months_between(ma, mb),
+        "QUARTER" => months_between(ma, mb) / 3,
+        "YEAR" => months_between(ma, mb) / 12,
+        _ => return Value::Null,
+    })
+}
+
+fn days_in_year(y: i64) -> i64 {
+    if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 {
+        366
+    } else {
+        365
+    }
+}
+
+/// Weekday of `days` (since epoch): 0-based, Monday-first unless `sunday_first`.
+fn calc_weekday(days: i64, sunday_first: bool) -> i64 {
+    (days + 3 + if sunday_first { 1 } else { 0 }).rem_euclid(7)
+}
+
+/// MySQL `calc_week`: returns `(year, week)` for the given mode bits.
+fn calc_week(days: i64, mode: i64) -> (i64, i64) {
+    let (y, m, d) = elyra_core::datetime::civil_from_days(days);
+    let monday_first = (mode & 1) != 0;
+    let mut week_year = (mode & 2) != 0;
+    let first_weekday = (mode & 4) != 0;
+    let mut year = y;
+    let mut first_daynr = elyra_core::datetime::days_from_civil(y, 1, 1);
+    let mut weekday = calc_weekday(first_daynr, !monday_first);
+
+    if m == 1 && (d as i64) <= 7 - weekday {
+        if !week_year && ((first_weekday && weekday != 0) || (!first_weekday && weekday >= 4)) {
+            return (year, 0);
+        }
+        week_year = true;
+        year -= 1;
+        let diy = days_in_year(year);
+        first_daynr -= diy;
+        weekday = (weekday + 53 * 7 - diy).rem_euclid(7);
+    }
+
+    let mut wdays = if (first_weekday && weekday != 0) || (!first_weekday && weekday >= 4) {
+        days - (first_daynr + (7 - weekday))
+    } else {
+        days - (first_daynr - weekday)
+    };
+
+    if week_year && wdays >= 52 * 7 {
+        weekday = (weekday + days_in_year(year)).rem_euclid(7);
+        if (!first_weekday && weekday < 4) || (first_weekday && weekday == 0) {
+            return (year + 1, 1);
+        }
+    }
+    if wdays < 0 {
+        wdays = 0;
+    }
+    (year, wdays / 7 + 1)
+}
+
+/// Parse a string per a MySQL `DATE_FORMAT`-style pattern (STR_TO_DATE).
+fn str_to_date(s: &str, fmt: &str) -> Value {
+    match parse_with_format(s, fmt) {
+        Some((micros, has_time)) => {
+            if has_time {
+                Value::DateTime(micros)
+            } else {
+                Value::Date(micros.div_euclid(86_400_000_000) as i32)
+            }
+        }
+        None => Value::Null,
+    }
+}
+
+fn parse_with_format(s: &str, fmt: &str) -> Option<(i64, bool)> {
+    const MON: [&str; 12] = [
+        "january",
+        "february",
+        "march",
+        "april",
+        "may",
+        "june",
+        "july",
+        "august",
+        "september",
+        "october",
+        "november",
+        "december",
+    ];
+    let sb: Vec<char> = s.chars().collect();
+    let mut si = 0usize;
+    let (mut y, mut mo, mut d) = (1970i64, 1u32, 1u32);
+    let (mut h, mut mi, mut se) = (0u32, 0u32, 0u32);
+    let mut has_time = false;
+    let mut pm: Option<bool> = None;
+    let read_num = |sb: &[char], si: &mut usize, maxlen: usize| -> Option<i64> {
+        while *si < sb.len() && sb[*si].is_whitespace() {
+            *si += 1;
+        }
+        let start = *si;
+        let mut n = 0i64;
+        let mut cnt = 0;
+        while *si < sb.len() && sb[*si].is_ascii_digit() && cnt < maxlen {
+            n = n * 10 + (sb[*si] as i64 - '0' as i64);
+            *si += 1;
+            cnt += 1;
+        }
+        if *si == start {
+            None
+        } else {
+            Some(n)
+        }
+    };
+    let mut fi = fmt.chars();
+    while let Some(c) = fi.next() {
+        if c != '%' {
+            if c.is_whitespace() {
+                while si < sb.len() && sb[si].is_whitespace() {
+                    si += 1;
+                }
+            } else if si < sb.len() && sb[si] == c {
+                si += 1;
+            }
+            continue;
+        }
+        match fi.next() {
+            Some('Y') => y = read_num(&sb, &mut si, 4)?,
+            Some('y') => {
+                let v = read_num(&sb, &mut si, 2)?;
+                y = if v < 70 { 2000 + v } else { 1900 + v };
+            }
+            Some('m') | Some('c') => mo = read_num(&sb, &mut si, 2)? as u32,
+            Some('d') | Some('e') => d = read_num(&sb, &mut si, 2)? as u32,
+            Some('H') | Some('k') => {
+                h = read_num(&sb, &mut si, 2)? as u32;
+                has_time = true;
+            }
+            Some('h') | Some('I') | Some('l') => {
+                h = read_num(&sb, &mut si, 2)? as u32;
+                has_time = true;
+            }
+            Some('i') => {
+                mi = read_num(&sb, &mut si, 2)? as u32;
+                has_time = true;
+            }
+            Some('s') | Some('S') => {
+                se = read_num(&sb, &mut si, 2)? as u32;
+                has_time = true;
+            }
+            Some('p') => {
+                while si < sb.len() && sb[si].is_whitespace() {
+                    si += 1;
+                }
+                let a: String = sb.iter().skip(si).take(2).collect();
+                pm = match a.to_ascii_uppercase().as_str() {
+                    "PM" => Some(true),
+                    "AM" => Some(false),
+                    _ => return None,
+                };
+                si += 2;
+            }
+            Some('M') | Some('b') => {
+                while si < sb.len() && sb[si].is_whitespace() {
+                    si += 1;
+                }
+                let start = si;
+                while si < sb.len() && sb[si].is_alphabetic() {
+                    si += 1;
+                }
+                let name: String = sb[start..si]
+                    .iter()
+                    .collect::<String>()
+                    .to_ascii_lowercase();
+                mo = (MON
+                    .iter()
+                    .position(|m| m.starts_with(&name) || name.starts_with(*m))?
+                    + 1) as u32;
+            }
+            Some('%') if si < sb.len() && sb[si] == '%' => si += 1,
+            _ => {}
+        }
+    }
+    if let Some(is_pm) = pm {
+        h %= 12;
+        if is_pm {
+            h += 12;
+        }
+    }
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) {
+        return None;
+    }
+    let days = elyra_core::datetime::days_from_civil(y, mo, d);
+    let micros = days * 86_400_000_000 + (h as i64 * 3600 + mi as i64 * 60 + se as i64) * 1_000_000;
+    Some((micros, has_time))
 }
 
 /// Add/subtract an interval to a date/datetime value.

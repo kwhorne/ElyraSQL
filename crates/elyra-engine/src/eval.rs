@@ -67,6 +67,20 @@ pub fn eval_expr(expr: &Expr) -> Result<Value> {
             }
         }
         Expr::BinaryOp { left, op, right } => {
+            // Comparisons, date arithmetic (INTERVAL), and anything non-numeric
+            // go through the full evaluator; keep the fast path for plain math.
+            let simple = matches!(
+                op,
+                BinaryOperator::Plus
+                    | BinaryOperator::Minus
+                    | BinaryOperator::Multiply
+                    | BinaryOperator::Divide
+                    | BinaryOperator::Modulo
+            ) && !matches!(left.as_ref(), Expr::Interval(_))
+                && !matches!(right.as_ref(), Expr::Interval(_));
+            if !simple {
+                return crate::predicate::eval_row(expr, &elyra_core::Schema::new(Vec::new()), &[]);
+            }
             let l = eval_expr(left)?;
             let r = eval_expr(right)?;
             eval_binary(l, op, r)

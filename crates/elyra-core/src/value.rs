@@ -116,8 +116,11 @@ impl Value {
 fn to_days(v: &Value) -> Option<i64> {
     match v {
         Value::Date(d) => Some(*d as i64),
+        Value::DateTime(m) => Some(m.div_euclid(86_400_000_000)),
         Value::Int(i) => Some(*i),
-        Value::Text(s) => crate::datetime::parse_date(s).map(|d| d as i64),
+        Value::Text(s) => crate::datetime::parse_date(s)
+            .map(|d| d as i64)
+            .or_else(|| crate::datetime::parse_datetime(s).map(|m| m.div_euclid(86_400_000_000))),
         _ => None,
     }
 }
