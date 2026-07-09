@@ -4,6 +4,41 @@ All notable changes to ElyraSQL are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.8.3] - 2026-07-09
+
+Scalability & robustness release — hardening the write path and high availability.
+
+### Pessimistic locking
+
+- `LOCK TABLES t READ|WRITE` / `UNLOCK TABLES` take real **blocking** table
+  locks (a `WRITE` lock blocks other readers and writers; a `READ` lock blocks
+  writers). Conflicting statements from other sessions block until release, or
+  fail with `1205` (lock wait timeout). `LOCK IN SHARE MODE` is accepted as a
+  synonym for `FOR SHARE`. Zero overhead when no explicit lock is held.
+
+### Quorum / synchronous replication
+
+- `--sync-replicas N` makes each commit wait for `N` replica acknowledgements;
+  `--sync-strict` fails the commit-confirmation on timeout instead of silently
+  degrading to asynchronous (no silent data-loss window). Per-replica ack
+  tracking replaces the single high-water mark.
+
+### Incremental replica catch-up
+
+- A reconnecting replica streams only the **binlog delta** since its last applied
+  LSN instead of re-copying the whole database, falling back to a full snapshot
+  only when the binlog is disabled or the needed segments were purged. Replicas
+  reconnect transparently on stream drops. The LSN counter is resumed from the
+  binlog across restarts (correct binlog ordering + working catch-up).
+
+### Write throughput
+
+- Validated **transactional** commits are now **group-committed**: many
+  concurrent transactions fold into one write transaction (one fsync) instead of
+  one fsync each, while preserving first-committer-wins ordering and write-write
+  conflict detection. (The single writer remains inherent to the ACID
+  single-file design; there are no parallel writers or sharding.)
+
 ## [0.8.2] - 2026-07-09
 
 High-availability & feature-completeness release.
@@ -349,6 +384,7 @@ core CRUD with `WHERE`/`ORDER BY`/`LIMIT`, indexes, aggregation and `GROUP BY`,
 joins, prepared statements, authentication and TLS, vector search (exact +
 HNSW), parallel OLAP aggregation, and transactions with snapshot isolation.
 
+[0.8.3]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.8.3
 [0.8.2]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.8.2
 [0.8.1]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.8.1
 [0.8.0]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.8.0

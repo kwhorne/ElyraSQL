@@ -142,13 +142,22 @@ implemented, so you can judge fit.
 
 Candidate next steps, roughly in order of value:
 
-1. Per-column `COLLATE` and a binary (case-sensitive) collation opt-out.
-2. Scoped privileges (per-database / per-table `GRANT`).
-3. Multi-level (recursive) cascades and deferred constraints.
-4. Spill-to-disk for large sorts/aggregations.
-5. Cost-based planning with statistics; hash/merge joins.
-6. Observability: slow-query log and metrics.
-7. Synchronous/quorum commit (zero-data-loss failover).
+1. Pre-commit (2-phase) synchronous replication for true zero-data-loss failover
+   (today's quorum barrier runs after the local commit).
+2. Cost-based JOIN reordering for explicit join chains; a merge join.
+3. Cursors and condition handlers in stored procedures.
+4. Multi-level (recursive) cascades and deferred constraints.
+5. Per-column `_bin` in `ORDER BY` / `GROUP BY` / `DISTINCT` / join keys.
+6. A persistent spatial index (R-tree) and polygon/geodesic operations.
+7. Dynamic cluster membership (online add/remove nodes).
+8. Roles and per-database / per-column privileges; audit logging.
+9. `caching_sha2_password` and `LOAD DATA INFILE`.
+
+Many earlier roadmap items have shipped: per-column `COLLATE`/`_bin`, scoped
+(per-table) privileges, spill-to-disk sorts/aggregations, cost-based hash joins
+with statistics, slow-query log + Prometheus metrics, pessimistic table locking,
+quorum/synchronous replication, and automatic failover with incremental
+catch-up.
 
 Have a need that isn't listed? Open an issue on
 [GitHub](https://github.com/kwhorne/ElyraSQL/issues).
