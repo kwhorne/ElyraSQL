@@ -5350,8 +5350,13 @@ async fn olap_aggregate(
         if accelerable(def, Some(f))? {
             let rows = collect_matches(db, def, Some(f), None).await?;
             let mut agg = plan.new_aggregator();
+            let extend = !plan.arg_exprs().is_empty();
             for (_, row) in rows {
-                agg.feed(&row);
+                if extend {
+                    agg.feed(&plan.extend_row(&row)?);
+                } else {
+                    agg.feed(&row);
+                }
             }
             return Ok(agg);
         }
@@ -5391,6 +5396,7 @@ async fn parallel_aggregate(
         let mut worker = plan.new_aggregator();
         let f = filter.clone();
         let sch = schema.clone();
+        let arg_exprs = plan.arg_exprs().to_vec();
         handles.push(tokio::task::spawn_blocking(
             move || -> Result<GroupAggregator> {
                 for b in &blobs {
@@ -5401,7 +5407,15 @@ async fn parallel_aggregate(
                         None => true,
                     };
                     if keep {
-                        worker.feed(&row);
+                        if arg_exprs.is_empty() {
+                            worker.feed(&row);
+                        } else {
+                            let mut r = row.clone();
+                            for e in &arg_exprs {
+                                r.push(predicate::eval_row(e, &sch, &row)?);
+                            }
+                            worker.feed(&r);
+                        }
                     }
                 }
                 Ok(worker)

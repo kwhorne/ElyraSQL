@@ -23,12 +23,30 @@ pub struct AggPlan {
     aggs: Vec<AggSpec>,
     plan: Vec<OutCol>,
     out_schema: Schema,
+    /// Aggregate-argument expressions appended as virtual columns after the
+    /// input schema (for conditional aggregates like `SUM(CASE ...)`).
+    arg_exprs: Vec<Expr>,
+    input_schema: Schema,
 }
 
 impl AggPlan {
     /// A fresh, empty aggregator for this plan (used per parallel worker).
     pub fn new_aggregator(&self) -> GroupAggregator {
         GroupAggregator::new(self.group_cols.clone(), self.aggs.clone())
+    }
+
+    /// The aggregate-argument expressions to append as virtual columns.
+    pub fn arg_exprs(&self) -> &[Expr] {
+        &self.arg_exprs
+    }
+
+    /// Append the evaluated argument expressions to a row (if any).
+    pub fn extend_row(&self, row: &[Value]) -> Result<Vec<Value>> {
+        let mut r = row.to_vec();
+        for e in &self.arg_exprs {
+            r.push(crate::predicate::eval_row(e, &self.input_schema, row)?);
+        }
+        Ok(r)
     }
 
     /// Finalise an aggregator into output rows in projection order.
@@ -137,25 +155,19 @@ fn agg_separator(f: &sqlparser::ast::Function) -> Option<String> {
     None
 }
 
-fn agg_arg(schema: &Schema, f: &sqlparser::ast::Function) -> Result<(Option<usize>, bool)> {
+fn agg_arg(f: &sqlparser::ast::Function) -> (Option<&Expr>, bool) {
     let FunctionArguments::List(list) = &f.args else {
-        return Ok((None, false));
+        return (None, false);
     };
     let distinct = matches!(
         list.duplicate_treatment,
         Some(sqlparser::ast::DuplicateTreatment::Distinct)
     );
     let arg = match list.args.first() {
-        None => None,
-        Some(FunctionArg::Unnamed(FunctionArgExpr::Wildcard)) => None,
-        Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(e))) => {
-            let name = ident_of(e)
-                .ok_or_else(|| Error::Unsupported("aggregate arg must be a column".into()))?;
-            Some(col_index(schema, &name)?)
-        }
-        _ => return Err(Error::Unsupported("unsupported aggregate argument".into())),
+        Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(e))) => Some(e),
+        _ => None,
     };
-    Ok((arg, distinct))
+    (arg, distinct)
 }
 
 /// Build an [`AggPlan`] from a projection and `GROUP BY` expressions.
@@ -174,11 +186,25 @@ pub fn build_plan(
     let mut aggs = Vec::new();
     let mut plan = Vec::new();
     let mut out_cols = Vec::new();
+    let mut arg_exprs: Vec<Expr> = Vec::new();
 
     for item in projection {
         let (expr, alias) = item_expr_and_alias(item)?;
         if let Some((mut func, f)) = agg_of(expr) {
-            let (arg, distinct) = agg_arg(schema, f)?;
+            let (arg_expr, distinct) = agg_arg(f);
+            // Resolve the argument to a real column, or append it as a virtual
+            // column (conditional aggregates: SUM(CASE ...), COUNT(DISTINCT x+y)).
+            let (arg, arg_ty): (Option<usize>, Option<ColumnType>) = match arg_expr {
+                None => (None, None),
+                Some(e) => match ident_of(e).and_then(|n| col_index(schema, &n).ok()) {
+                    Some(ci) => (Some(ci), Some(schema.columns[ci].ty.clone())),
+                    None => {
+                        let ci = schema.columns.len() + arg_exprs.len();
+                        arg_exprs.push(e.clone());
+                        (Some(ci), None)
+                    }
+                },
+            };
             if func == AggFunc::Count && arg.is_none() {
                 func = AggFunc::CountStar;
             }
@@ -186,9 +212,9 @@ pub fn build_plan(
                 AggFunc::CountStar | AggFunc::Count => ColumnType::Int,
                 AggFunc::Avg => ColumnType::Float,
                 AggFunc::GroupConcat => ColumnType::Text,
-                AggFunc::Sum | AggFunc::Min | AggFunc::Max => arg
-                    .map(|i| schema.columns[i].ty.clone())
-                    .unwrap_or(ColumnType::Float),
+                AggFunc::Sum | AggFunc::Min | AggFunc::Max => {
+                    arg_ty.clone().unwrap_or(ColumnType::Float)
+                }
             };
             out_cols.push(ColumnDef {
                 name: alias.unwrap_or_else(|| expr.to_string()),
@@ -223,6 +249,8 @@ pub fn build_plan(
         aggs,
         plan,
         out_schema: Schema::new(out_cols),
+        arg_exprs,
+        input_schema: schema.clone(),
     })
 }
 
@@ -235,8 +263,14 @@ pub fn run(
 ) -> Result<(Schema, Vec<Vec<Value>>)> {
     let plan = build_plan(schema, projection, group_by)?;
     let mut agg = plan.new_aggregator();
-    for row in &rows {
-        agg.feed(row);
+    if plan.arg_exprs().is_empty() {
+        for row in &rows {
+            agg.feed(row);
+        }
+    } else {
+        for row in &rows {
+            agg.feed(&plan.extend_row(row)?);
+        }
     }
     Ok(plan.finalize(agg))
 }
