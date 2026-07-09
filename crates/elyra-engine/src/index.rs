@@ -13,7 +13,65 @@ use crate::session::Session;
 use elyra_core::{Collation, Result, Value};
 
 use crate::catalog::{data_prefix, IndexDef, TableDef};
+use crate::ft;
 use crate::keyenc;
+
+/// Entry keys for a full-text index over `row`: one per unique stemmed term of
+/// the indexed text columns, suffixed with the clustered key.
+fn fulltext_entry_keys(
+    def: &TableDef,
+    idx: &IndexDef,
+    row: &[Value],
+    data_key: &[u8],
+) -> Vec<Vec<u8>> {
+    let mut text = String::new();
+    for &c in &idx.cols {
+        if let Some(s) = row.get(c).and_then(|v| v.to_wire_string()) {
+            text.push(' ');
+            text.push_str(&s);
+        }
+    }
+    let clustered = &data_key[data_prefix(&def.name).len()..];
+    ft::unique_terms(&text)
+        .into_iter()
+        .map(|term| {
+            let mut k = format!("index::{}::{}::", def.name, idx.name).into_bytes();
+            k.extend_from_slice(term.as_bytes());
+            k.push(0);
+            k.extend_from_slice(clustered);
+            k
+        })
+        .collect()
+}
+
+/// Data keys of rows whose full-text index contains `term` (already stemmed).
+pub async fn fulltext_lookup(
+    db: &Session,
+    table: &str,
+    index: &str,
+    term: &str,
+) -> Result<Vec<Vec<u8>>> {
+    let mut prefix = format!("index::{table}::{index}::").into_bytes();
+    prefix.extend_from_slice(term.as_bytes());
+    prefix.push(0);
+    let mut cursor: Option<Vec<u8>> = None;
+    let mut keys = Vec::new();
+    loop {
+        let chunk = db.scan_batch(prefix.clone(), cursor.clone(), 4096).await?;
+        if chunk.is_empty() {
+            break;
+        }
+        let last = chunk.len() < 4096;
+        cursor = chunk.last().map(|(k, _)| k.clone());
+        for (_, data_key) in chunk {
+            keys.push(data_key);
+        }
+        if last {
+            break;
+        }
+    }
+    Ok(keys)
+}
 
 /// A stored key/value pair.
 type Entry = (Vec<u8>, Vec<u8>);
@@ -80,6 +138,12 @@ pub fn partition_entries_for_row(
         if idx.vector {
             continue;
         }
+        if idx.fulltext {
+            for k in fulltext_entry_keys(def, idx, row, data_key) {
+                nonuniq.push((k, data_key.to_vec()));
+            }
+            continue;
+        }
         let values: Vec<Value> = idx.cols.iter().map(|&c| row[c].clone()).collect();
         if values.iter().any(|v| v.is_null()) || keyenc::encode_key(&values).is_err() {
             continue;
@@ -142,6 +206,12 @@ pub fn entries_for_row(
     for idx in &def.indexes {
         if idx.vector {
             continue; // vector indexes are maintained separately
+        }
+        if idx.fulltext {
+            for k in fulltext_entry_keys(def, idx, row, data_key) {
+                out.push((k, data_key.to_vec()));
+            }
+            continue;
         }
         let values: Vec<Value> = idx.cols.iter().map(|&c| row[c].clone()).collect();
         if values.iter().any(|v| v.is_null()) || keyenc::encode_key(&values).is_err() {

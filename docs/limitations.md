@@ -78,9 +78,12 @@ implemented, so you can judge fit.
   keys (these still use the default case-insensitive collation). Accent
   sensitivity and alternate charsets are not implemented.
 - Full-text search: `MATCH(col, ...) AGAINST('terms' [IN BOOLEAN MODE])`
-  evaluates a relevance score by exact word match (natural-language OR-of-terms,
-  or boolean `+`/`-`). It is **scan-based** (no persistent full-text index) and
-  does no stemming/synonyms. Vector (ANN) search is also available.
+  (natural-language OR-of-terms, or boolean `+`/`-`, with relevance scoring).
+  `CREATE FULLTEXT INDEX` builds a persistent inverted index that is maintained
+  on INSERT/UPDATE/DELETE and used to accelerate MATCH; without one, MATCH falls
+  back to a scan. Light stemming folds regular forms (dogs->dog, foxes->fox) but
+  not irregular ones (wolves), and there are no synonyms. Vector (ANN) search is
+  also available.
 - `ENUM`/`SET` are stored as text and not value-checked.
 - Basic spatial support: `POINT`/`GEOMETRY` columns are stored as WKT text, with
   `POINT(x,y)`, `ST_X`, `ST_Y`, `ST_Distance` (Euclidean), `ST_AsText`, and

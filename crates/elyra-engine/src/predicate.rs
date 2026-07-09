@@ -159,12 +159,8 @@ pub fn eval_row(expr: &Expr, schema: &Schema, row: &[Value]) -> Result<Value> {
                     }
                 }
             }
-            let words: std::collections::HashSet<String> = doc
-                .to_lowercase()
-                .split(|c: char| !c.is_alphanumeric())
-                .filter(|w| !w.is_empty())
-                .map(|w| w.to_string())
-                .collect();
+            let words: std::collections::HashSet<String> =
+                crate::ft::tokenize(&doc).into_iter().collect();
             let query = match match_value {
                 sqlparser::ast::Value::SingleQuotedString(s)
                 | sqlparser::ast::Value::DoubleQuotedString(s) => s.clone(),
@@ -184,14 +180,11 @@ pub fn eval_row(expr: &Expr, schema: &Schema, row: &[Value]) -> Result<Value> {
                 } else {
                     (false, false, raw)
                 };
-                let term: String = term
-                    .chars()
-                    .filter(|c| c.is_alphanumeric())
-                    .collect::<String>()
-                    .to_lowercase();
-                if term.is_empty() {
+                let cleaned: String = term.chars().filter(|c| c.is_alphanumeric()).collect();
+                if cleaned.is_empty() {
                     continue;
                 }
+                let term = crate::ft::stem(&cleaned);
                 let present = words.contains(&term);
                 if (excluded && present) || (required && !present) {
                     ok = false;

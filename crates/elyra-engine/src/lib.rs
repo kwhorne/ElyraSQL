@@ -11,6 +11,7 @@ mod aggspill;
 mod catalog;
 mod eval;
 mod exec;
+mod ft;
 mod index;
 mod keyenc;
 mod predicate;
@@ -318,6 +319,42 @@ impl Engine {
                 .backup_to(std::path::PathBuf::from(path))
                 .await?;
             return Ok(vec![QueryResult::Affected(n)]);
+        }
+
+        // CREATE FULLTEXT INDEX (not reliably parsed by the frontend).
+        if head.starts_with("create fulltext index") {
+            if privilege < Privilege::Admin {
+                return Err(Error::Query(
+                    "access denied: CREATE FULLTEXT INDEX requires ADMIN privilege".into(),
+                ));
+            }
+            let toks: Vec<&str> = trimmed.split_whitespace().collect();
+            let name = toks
+                .iter()
+                .position(|t| t.eq_ignore_ascii_case("index"))
+                .and_then(|i| toks.get(i + 1))
+                .map(|s| s.trim_matches(['`', '"']).to_string())
+                .ok_or_else(|| Error::Parse("CREATE FULLTEXT INDEX requires a name".into()))?;
+            let on = trimmed
+                .to_ascii_lowercase()
+                .find(" on ")
+                .ok_or_else(|| Error::Parse("CREATE FULLTEXT INDEX requires ON".into()))?;
+            let rest = trimmed[on + 4..].trim();
+            let open = rest
+                .find('(')
+                .ok_or_else(|| Error::Parse("CREATE FULLTEXT INDEX requires (columns)".into()))?;
+            let table = rest[..open].trim().trim_matches(['`', '"']).to_string();
+            let close = rest
+                .rfind(')')
+                .ok_or_else(|| Error::Parse("CREATE FULLTEXT INDEX requires (columns)".into()))?;
+            let cols: Vec<String> = rest[open + 1..close]
+                .split(',')
+                .map(|c| c.trim().trim_matches(['`', '"']).to_string())
+                .filter(|c| !c.is_empty())
+                .collect();
+            return Ok(vec![
+                exec::create_fulltext_index(sess, &name, &table, &cols).await?,
+            ]);
         }
 
         // Triggers (MySQL CREATE/DROP TRIGGER, not parsed by the frontend).

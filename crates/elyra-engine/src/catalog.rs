@@ -19,6 +19,9 @@ pub struct IndexDef {
     /// A vector (HNSW ANN) index rather than a B-tree secondary index.
     #[serde(default)]
     pub vector: bool,
+    /// A full-text (inverted, tokenized) index over a text column.
+    #[serde(default)]
+    pub fulltext: bool,
     /// Per-column text collation, positional with `cols` (empty ⇒ all `Ci`).
     #[serde(default)]
     pub col_collations: Vec<elyra_core::Collation>,

@@ -179,6 +179,7 @@ pub async fn create_table(
                             cols: vec![idx],
                             unique: true,
                             vector: false,
+                            fulltext: false,
                             col_collations: vec![collation],
                         });
                     }
@@ -255,6 +256,7 @@ pub async fn create_table(
                     cols: idxs,
                     unique: true,
                     vector: false,
+                    fulltext: false,
                     col_collations: ucolls,
                 });
             }
@@ -288,6 +290,7 @@ pub async fn create_table(
                         cols: fk_cols.clone(),
                         unique: false,
                         vector: false,
+                        fulltext: false,
                         col_collations: fkcolls,
                     });
                 }
@@ -1288,6 +1291,75 @@ async fn alter_rename_table(db: &Session, def: &mut TableDef, new: &str) -> Resu
     Ok(())
 }
 
+/// `CREATE FULLTEXT INDEX name ON table(col, ...)` — builds an inverted,
+/// tokenized index (maintained thereafter via the normal index machinery).
+pub async fn create_fulltext_index(
+    db: &Session,
+    name: &str,
+    table: &str,
+    cols: &[String],
+) -> Result<QueryResult> {
+    let mut def = catalog::load(db, table).await?;
+    if def
+        .indexes
+        .iter()
+        .any(|i| i.name.eq_ignore_ascii_case(name))
+    {
+        return Err(Error::Catalog(format!("index already exists: {name}")));
+    }
+    let col_idx: Vec<usize> = cols
+        .iter()
+        .map(|c| {
+            def.schema
+                .columns
+                .iter()
+                .position(|d| d.name.eq_ignore_ascii_case(c))
+                .ok_or_else(|| Error::Catalog(format!("unknown column: {c}")))
+        })
+        .collect::<Result<_>>()?;
+    def.indexes.push(IndexDef {
+        name: name.to_string(),
+        cols: col_idx,
+        unique: false,
+        vector: false,
+        fulltext: true,
+        col_collations: Vec::new(),
+    });
+    let idx = def.indexes.last().unwrap().clone();
+
+    // Persist the catalog and backfill index entries for existing rows.
+    let mut puts: Vec<(Vec<u8>, Vec<u8>)> = vec![(catalog_key(table), def.encode()?)];
+    let prefix = data_prefix(table);
+    let mut cursor: Option<Vec<u8>> = None;
+    loop {
+        let chunk = db.scan_batch(prefix.clone(), cursor.clone(), 4096).await?;
+        if chunk.is_empty() {
+            break;
+        }
+        let last = chunk.len() < 4096;
+        cursor = chunk.last().map(|(k, _)| k.clone());
+        for (k, v) in chunk {
+            let row: Vec<Value> =
+                bincode::deserialize(&v).map_err(|e| Error::Storage(e.to_string()))?;
+            for (ek, ev) in index::entries_for_row(
+                &TableDef {
+                    indexes: vec![idx.clone()],
+                    ..def.clone()
+                },
+                &row,
+                &k,
+            )? {
+                puts.push((ek, ev));
+            }
+        }
+        if last {
+            break;
+        }
+    }
+    db.commit_write(puts, vec![]).await?;
+    Ok(QueryResult::Affected(0))
+}
+
 pub async fn create_index(db: &Session, ci: CreateIndex) -> Result<QueryResult> {
     let table = table_ident(&ci.table_name)?;
     let mut def = catalog::load(db, &table).await?;
@@ -1337,6 +1409,7 @@ pub async fn create_index(db: &Session, ci: CreateIndex) -> Result<QueryResult> 
         cols,
         unique: ci.unique,
         vector: is_vector,
+        fulltext: false,
         col_collations,
     });
 
@@ -3735,8 +3808,32 @@ fn key_eq_values(
 /// Whether the filter can be served by a PK/index equality (single or
 /// composite) or a single-column range.
 fn accelerable(def: &TableDef, filter: Option<&Expr>) -> Result<bool> {
-    if filter.is_none() {
+    let Some(f) = filter else {
         return Ok(false);
+    };
+    // A MATCH on a FULLTEXT-indexed column can use the inverted index.
+    if let Some((mcols, _, _)) = match_conjunct(f) {
+        let cidx: Option<Vec<usize>> = mcols
+            .iter()
+            .map(|n| {
+                def.schema
+                    .columns
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(n))
+            })
+            .collect();
+        if let Some(mut cidx) = cidx {
+            cidx.sort_unstable();
+            if def.indexes.iter().any(|i| {
+                i.fulltext && {
+                    let mut ic = i.cols.clone();
+                    ic.sort_unstable();
+                    ic == cidx
+                }
+            }) {
+                return Ok(true);
+            }
+        }
     }
     if def.has_pk() && key_eq_values(def, filter, &def.pk_cols)?.is_some() {
         return Ok(true);
@@ -3752,6 +3849,30 @@ fn accelerable(def: &TableDef, filter: Option<&Expr>) -> Result<bool> {
 /// Collect `(storage_key, row)` for every row matching `filter`, up to
 /// `limit`. Uses the PK point-lookup fast path when possible, otherwise a
 /// bounded-batch clustered scan.
+/// Extract a `MATCH(cols) AGAINST('query' [boolean])` conjunct from a WHERE.
+fn match_conjunct(f: &Expr) -> Option<(Vec<String>, String, bool)> {
+    use sqlparser::ast::{SearchModifier, Value as SqlValue};
+    let mut cs = Vec::new();
+    split_and(f, &mut cs);
+    for c in &cs {
+        if let Expr::MatchAgainst {
+            columns,
+            match_value,
+            opt_search_modifier,
+        } = c
+        {
+            let cols = columns.iter().map(|i| i.value.clone()).collect();
+            let query = match match_value {
+                SqlValue::SingleQuotedString(s) | SqlValue::DoubleQuotedString(s) => s.clone(),
+                other => other.to_string(),
+            };
+            let boolean = matches!(opt_search_modifier, Some(SearchModifier::InBooleanMode));
+            return Some((cols, query, boolean));
+        }
+    }
+    None
+}
+
 async fn collect_matches(
     db: &Session,
     def: &TableDef,
@@ -3766,6 +3887,71 @@ async fn collect_matches(
             None => Ok(true),
         }
     };
+
+    // Full-text fast path: a MATCH(col) AGAINST(...) conjunct on a column with a
+    // FULLTEXT index -> fetch candidates from the inverted index (union of the
+    // stemmed query terms' postings), then re-check the full predicate.
+    if let Some(f) = filter {
+        if let Some((mcols, query, boolean)) = match_conjunct(f) {
+            let cidx: Option<Vec<usize>> = mcols
+                .iter()
+                .map(|n| {
+                    def.schema
+                        .columns
+                        .iter()
+                        .position(|c| c.name.eq_ignore_ascii_case(n))
+                })
+                .collect();
+            if let Some(mut cidx) = cidx {
+                cidx.sort_unstable();
+                if let Some(idx) = def.indexes.iter().find(|i| {
+                    i.fulltext && {
+                        let mut ic = i.cols.clone();
+                        ic.sort_unstable();
+                        ic == cidx
+                    }
+                }) {
+                    let mut seen = std::collections::HashSet::new();
+                    let mut cand = Vec::new();
+                    for raw in query.split_whitespace() {
+                        if boolean && raw.starts_with('-') {
+                            continue;
+                        }
+                        let cleaned: String = raw
+                            .trim_start_matches(['+', '-'])
+                            .chars()
+                            .filter(|c| c.is_alphanumeric())
+                            .collect();
+                        if cleaned.is_empty() {
+                            continue;
+                        }
+                        let stem = crate::ft::stem(&cleaned);
+                        for dk in index::fulltext_lookup(db, &def.name, &idx.name, &stem).await? {
+                            if seen.insert(dk.clone()) {
+                                cand.push(dk);
+                            }
+                        }
+                    }
+                    let blobs = db.multi_get(cand.clone()).await?;
+                    for (k, b) in cand.into_iter().zip(blobs) {
+                        if let Some(bytes) = b {
+                            let row: Vec<Value> = bincode::deserialize(&bytes)
+                                .map_err(|e| Error::Storage(e.to_string()))?;
+                            if recheck(&row)? {
+                                out.push((k, row));
+                                if let Some(l) = limit {
+                                    if out.len() >= l {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    return Ok(out);
+                }
+            }
+        }
+    }
 
     // PK equality (single or composite): direct clustered-key lookup.
     if def.has_pk() {
