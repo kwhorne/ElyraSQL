@@ -83,6 +83,28 @@ fn map_type(dt: &DataType) -> Result<ColumnType> {
                 })?;
             ColumnType::Vector(dim)
         }
+        // Spatial geometry columns are stored as WKT text.
+        DataType::Custom(name, _)
+            if name
+                .0
+                .last()
+                .map(|i| {
+                    matches!(
+                        i.value.to_ascii_lowercase().as_str(),
+                        "point"
+                            | "geometry"
+                            | "linestring"
+                            | "polygon"
+                            | "geometrycollection"
+                            | "multipoint"
+                            | "multilinestring"
+                            | "multipolygon"
+                    )
+                })
+                .unwrap_or(false) =>
+        {
+            ColumnType::Text
+        }
         other => {
             return Err(Error::Unsupported(format!(
                 "column type not supported: {other}"

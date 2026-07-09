@@ -82,7 +82,11 @@ implemented, so you can judge fit.
   evaluates a relevance score by exact word match (natural-language OR-of-terms,
   or boolean `+`/`-`). It is **scan-based** (no persistent full-text index) and
   does no stemming/synonyms. Vector (ANN) search is also available.
-- `ENUM`/`SET` are stored as text and not value-checked; no spatial types.
+- `ENUM`/`SET` are stored as text and not value-checked.
+- Basic spatial support: `POINT`/`GEOMETRY` columns are stored as WKT text, with
+  `POINT(x,y)`, `ST_X`, `ST_Y`, `ST_Distance` (Euclidean), `ST_AsText`, and
+  `ST_GeomFromText`. Only 2D points are supported; there is no spatial index or
+  SRID/geodesic distance.
 
 ## Security & operations
 

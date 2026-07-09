@@ -962,9 +962,55 @@ fn eval_scalar(name: &str, a: &[Value]) -> Result<Option<Value>> {
                 best
             }
         }
+        // ---- spatial (WKT POINT geometry) ----
+        "point" => match (nnum(a, 0), nnum(a, 1)) {
+            (Some(x), Some(y)) => Value::Text(format!("POINT({x} {y})")),
+            _ => Value::Null,
+        },
+        "st_x" | "st_y" => match sstr(a, 0).as_deref().and_then(parse_point) {
+            Some((x, y)) => Value::Float(if name == "st_x" { x } else { y }),
+            None => Value::Null,
+        },
+        "st_distance" => {
+            match (
+                sstr(a, 0).as_deref().and_then(parse_point),
+                sstr(a, 1).as_deref().and_then(parse_point),
+            ) {
+                (Some((x1, y1)), Some((x2, y2))) => {
+                    Value::Float(((x1 - x2).powi(2) + (y1 - y2).powi(2)).sqrt())
+                }
+                _ => Value::Null,
+            }
+        }
+        "st_astext" | "st_aswkt" => match sstr(a, 0) {
+            Some(s) => Value::Text(s),
+            None => Value::Null,
+        },
+        "st_geomfromtext" | "st_geometryfromtext" | "st_pointfromtext" | "st_geomfromwkt" => {
+            match sstr(a, 0) {
+                Some(s) if parse_point(&s).is_some() => Value::Text(s),
+                Some(_) => return Err(Error::Query("invalid geometry WKT".into())),
+                None => Value::Null,
+            }
+        }
         _ => return Ok(None),
     };
     Ok(Some(out))
+}
+
+/// Parse a WKT `POINT(x y)` into its coordinates.
+fn parse_point(s: &str) -> Option<(f64, f64)> {
+    let s = s.trim();
+    if !s.to_ascii_lowercase().starts_with("point") {
+        return None;
+    }
+    let open = s.find('(')?;
+    let close = s.rfind(')')?;
+    let inner = &s[open + 1..close];
+    let mut it = inner.split_whitespace();
+    let x = it.next()?.parse().ok()?;
+    let y = it.next()?.parse().ok()?;
+    Some((x, y))
 }
 
 fn substring(a: &[Value]) -> Value {
