@@ -4,6 +4,42 @@ All notable changes to ElyraSQL are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.5.0] - 2026-07-09
+
+Operations & data-model release: observability, memory-bounded sorts, per-column
+collation, and scoped privileges.
+
+### Observability
+
+- `SHOW STATUS` / `SHOW GLOBAL STATUS` counters (uptime, connections,
+  Questions/Queries, `Com_*`, Errors, Slow_queries), with `LIKE 'prefix%'`.
+- `SHOW [FULL] PROCESSLIST` listing live connections and their current query.
+- Slow-query log: `--slow-query-ms` / `ELYRASQL_SLOW_QUERY_MS` logs statements
+  at or above the threshold with their duration.
+
+### Memory safety
+
+- `ORDER BY` is now memory-bounded: a top-N heap for `ORDER BY ... LIMIT`, and an
+  external merge sort that spills to temp files for large sorts
+  (`ELYRASQL_SORT_MAX_ROWS`).
+- `GROUP BY` fails gracefully past `ELYRASQL_GROUP_MAX_GROUPS` instead of risking
+  an out-of-memory crash.
+
+### Collation
+
+- Per-column `COLLATE ..._bin` / `BINARY` opt-in to case-sensitive behavior for
+  `WHERE` comparisons, `UNIQUE`, `PRIMARY KEY` and secondary indexes (text is
+  still case-insensitive by default). `ORDER BY`/`GROUP BY`/joins still use the
+  default collation.
+
+### Access control & integrity
+
+- Per-table `GRANT`/`REVOKE` (`ON <table>`): raises a read-only account's level
+  for specific tables; reads stay globally allowed. Deny-safe when a target is
+  indeterminate. `SHOW GRANTS` lists global and per-table grants.
+- `ON UPDATE` referential actions enforced (CASCADE / SET NULL / RESTRICT) when
+  a parent's referenced key changes.
+
 ## [0.4.0] - 2026-07-09
 
 Production-readiness release: backup, real user management, and a MySQL-style
@@ -182,6 +218,7 @@ core CRUD with `WHERE`/`ORDER BY`/`LIMIT`, indexes, aggregation and `GROUP BY`,
 joins, prepared statements, authentication and TLS, vector search (exact +
 HNSW), parallel OLAP aggregation, and transactions with snapshot isolation.
 
+[0.5.0]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.5.0
 [0.4.0]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.4.0
 [0.3.0]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.3.0
 [0.2.1]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.2.1
