@@ -46,17 +46,21 @@ implemented, so you can judge fit.
 
 ## Types & text
 
-- No charset/collation handling: text compares and sorts bytewise (no
-  case-insensitive `_ci` collation, no `COLLATE`).
+- Text uses a **default case-insensitive collation**: comparisons, sorting,
+  indexing, grouping, joins, `DISTINCT`, and `UNIQUE`/`PRIMARY KEY` all treat
+  `'Foo'` and `'foo'` as equal. Not yet: accent-insensitivity, per-column
+  `COLLATE`, a binary (`_bin`, case-sensitive) opt-out, or alternate charsets.
 - `ENUM`/`SET` are stored as text and not value-checked; no spatial types;
   full-text search is vector-only.
 
 ## Security & operations
 
-- One user with a role (read/write/admin); no `GRANT`/`REVOKE`, multiple users,
-  or per-object privileges.
-- No replication/HA, no built-in backup/restore tooling, and no metrics /
-  slow-query log yet.
+- Multiple persistent accounts with `CREATE USER`/`GRANT`/`REVOKE` exist, but
+  privileges are **global and coarse** (read/write/admin) — no per-database or
+  per-table scoping, and no column/routine privileges.
+- Hot and offline backup/restore exist, but there is no incremental backup or
+  point-in-time recovery.
+- No replication/HA, and no metrics / slow-query log yet.
 
 ## Wire protocol
 
@@ -70,12 +74,12 @@ implemented, so you can judge fit.
 
 Candidate next steps, roughly in order of value:
 
-1. `charset`/`collation` (at least a case-insensitive default).
-2. Backup/restore and a consistent logical dump.
-3. `GRANT`/`REVOKE` and multiple users.
-4. `ON UPDATE` referential actions and multi-level cascades.
-5. Spill-to-disk for large sorts/aggregations.
-6. Cost-based planning with statistics; hash/merge joins.
+1. Per-column `COLLATE` and a binary (case-sensitive) collation opt-out.
+2. Scoped privileges (per-database / per-table `GRANT`).
+3. `ON UPDATE` referential actions and multi-level cascades.
+4. Spill-to-disk for large sorts/aggregations.
+5. Cost-based planning with statistics; hash/merge joins.
+6. Observability: slow-query log and metrics.
 7. Replication for HA.
 
 Have a need that isn't listed? Open an issue on

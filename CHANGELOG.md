@@ -4,6 +4,37 @@ All notable changes to ElyraSQL are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.4.0] - 2026-07-09
+
+Production-readiness release: backup, real user management, and a MySQL-style
+case-insensitive default collation.
+
+### Backup & restore
+
+- **Hot backup** with `BACKUP TO '<path>'` (admin): copies the whole database
+  from a consistent MVCC snapshot into a fresh file without blocking writers.
+- **Offline** `elyrasql backup` and `elyrasql restore` CLI subcommands.
+- The backup is a complete database file — start a server on it or copy it back.
+
+### Users & access control
+
+- Persistent accounts stored in the database file (survive restarts):
+  `CREATE USER`, `DROP USER`, `ALTER USER` / `SET PASSWORD`, `GRANT`, `REVOKE`,
+  `SHOW GRANTS`.
+- New accounts start read-only; `GRANT` raises them, `REVOKE` lowers them.
+  Privileges map to the coarse global read/write/admin levels (the object
+  clause is parsed but not scoped). Passwords stored as `SHA1(SHA1(pw))`.
+- Authentication consults startup bootstrap accounts plus persistent accounts;
+  open dev mode applies only when no account exists.
+
+### Collation
+
+- **Default case-insensitive collation** for text, applied consistently across
+  comparisons, `ORDER BY`, indexing, `GROUP BY`, `DISTINCT`, joins, set
+  operations, and `UNIQUE`/`PRIMARY KEY`.
+- **On-disk change:** text key encoding is now case-folded. Databases created
+  before 0.4.0 that use text primary keys or text indexes should be reloaded.
+
 ## [0.3.0] - 2026-07-09
 
 Data-integrity release: the constraints a production database must enforce.
@@ -151,6 +182,7 @@ core CRUD with `WHERE`/`ORDER BY`/`LIMIT`, indexes, aggregation and `GROUP BY`,
 joins, prepared statements, authentication and TLS, vector search (exact +
 HNSW), parallel OLAP aggregation, and transactions with snapshot isolation.
 
+[0.4.0]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.4.0
 [0.3.0]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.3.0
 [0.2.1]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.2.1
 [0.2.0]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.2.0
