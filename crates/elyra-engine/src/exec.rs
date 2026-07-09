@@ -3534,6 +3534,7 @@ pub async fn update(
 
     let mut puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     let mut deletes: Vec<Vec<u8>> = Vec::new();
+    let mut fk_parent_changes: Vec<(Vec<Value>, Vec<Value>)> = Vec::new();
     let check_uniq = index::has_unique(&def);
     let check_fk = !def.foreign_keys.is_empty();
     let mut uniq_batch: Vec<(Vec<u8>, Vec<Value>)> = Vec::new();
@@ -3585,6 +3586,7 @@ pub async fn update(
             deletes.push(old_key);
         }
         let encoded = bincode::serialize(&new_row).map_err(|e| Error::Storage(e.to_string()))?;
+        fk_parent_changes.push((old_row, new_row.clone()));
         puts.push((new_key, encoded));
         puts.extend(new_index_entries);
     }
@@ -3596,7 +3598,21 @@ pub async fn update(
         check_fk_batch(db, &def, &uniq_batch).await?;
     }
 
-    puts.push(bump_wcount(db, &name).await?);
+    // Parent-side ON UPDATE referential actions for children referencing a
+    // changed key (RESTRICT/CASCADE/SET NULL, single level).
+    let mut wcounts: Vec<String> = vec![name.clone()];
+    cascade_parent_update(
+        db,
+        &def,
+        &fk_parent_changes,
+        &mut puts,
+        &mut deletes,
+        &mut wcounts,
+    )
+    .await?;
+    for t in wcounts {
+        puts.push(bump_wcount(db, &t).await?);
+    }
     db.commit_write(puts, deletes).await?;
     Ok(QueryResult::Affected(affected))
 }
@@ -3728,6 +3744,91 @@ async fn cascade_parent_delete(
                     _ => {
                         return Err(Error::ForeignKey(format!(
                             "cannot delete from '{}': rows in '{}' reference it (constraint '{}')",
+                            parent.name, child.name, fk.name
+                        )));
+                    }
+                }
+            }
+        }
+        if touched {
+            wcounts.push(child.name.clone());
+        }
+    }
+    Ok(())
+}
+
+/// Apply ON UPDATE referential actions when a parent's referenced key changes.
+/// `changes` are `(old_row, new_row)` pairs for the updated parent rows.
+/// (Single level — does not recurse into grandchildren.)
+async fn cascade_parent_update(
+    db: &Session,
+    parent: &TableDef,
+    changes: &[(Vec<Value>, Vec<Value>)],
+    puts: &mut Vec<(Vec<u8>, Vec<u8>)>,
+    deletes: &mut Vec<Vec<u8>>,
+    wcounts: &mut Vec<String>,
+) -> Result<()> {
+    let children = referencing_children(db, &parent.name).await?;
+    if children.is_empty() || changes.is_empty() {
+        return Ok(());
+    }
+    let refvals = |row: &[Value], fk: &ForeignKey| -> Option<Vec<Value>> {
+        let vals: Vec<Value> = fk
+            .ref_columns
+            .iter()
+            .filter_map(|rc| {
+                parent
+                    .schema
+                    .columns
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(rc))
+                    .map(|i| row[i].clone())
+            })
+            .collect();
+        (vals.len() == fk.ref_columns.len()).then_some(vals)
+    };
+    for child in &children {
+        let mut touched = false;
+        for fk in child
+            .foreign_keys
+            .iter()
+            .filter(|fk| fk.ref_table.eq_ignore_ascii_case(&parent.name))
+        {
+            for (old_row, new_row) in changes {
+                let (Some(oldv), Some(newv)) = (refvals(old_row, fk), refvals(new_row, fk)) else {
+                    continue;
+                };
+                // Only act when the referenced key actually changed.
+                if oldv.iter().zip(&newv).all(|(a, b)| a == b) || oldv.iter().any(|v| v.is_null()) {
+                    continue;
+                }
+                let child_rows = lookup_child_rows(db, child, &fk.columns, &oldv).await?;
+                if child_rows.is_empty() {
+                    continue;
+                }
+                match fk.on_update {
+                    RefAction::Cascade | RefAction::SetNull => {
+                        let set_null = matches!(fk.on_update, RefAction::SetNull);
+                        for (ck, crow) in child_rows {
+                            let mut nrow = crow.clone();
+                            for (k, &fc) in fk.columns.iter().enumerate() {
+                                nrow[fc] = if set_null {
+                                    Value::Null
+                                } else {
+                                    newv[k].clone()
+                                };
+                            }
+                            deletes.extend(index::entry_keys_for_row(child, &crow, &ck)?);
+                            let enc = bincode::serialize(&nrow)
+                                .map_err(|e| Error::Storage(e.to_string()))?;
+                            puts.push((ck.clone(), enc));
+                            puts.extend(index::entries_for_row(child, &nrow, &ck)?);
+                        }
+                        touched = true;
+                    }
+                    _ => {
+                        return Err(Error::ForeignKey(format!(
+                            "cannot update '{}': rows in '{}' reference it (constraint '{}')",
                             parent.name, child.name, fk.name
                         )));
                     }
