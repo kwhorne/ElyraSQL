@@ -53,6 +53,35 @@ pub struct TableDef {
     /// older catalogs or tables with no special columns.
     #[serde(default)]
     pub col_meta: Vec<ColMeta>,
+    /// CHECK constraint expressions (SQL text), evaluated on INSERT/UPDATE.
+    #[serde(default)]
+    pub checks: Vec<String>,
+    /// FOREIGN KEY constraints.
+    #[serde(default)]
+    pub foreign_keys: Vec<ForeignKey>,
+}
+
+/// A FOREIGN KEY: `columns` in this table reference `ref_columns` of
+/// `ref_table`, with the given referential actions.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct ForeignKey {
+    pub name: String,
+    pub columns: Vec<usize>,
+    pub ref_table: String,
+    pub ref_columns: Vec<String>,
+    #[serde(default)]
+    pub on_delete: RefAction,
+    #[serde(default)]
+    pub on_update: RefAction,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq)]
+pub enum RefAction {
+    #[default]
+    NoAction,
+    Restrict,
+    Cascade,
+    SetNull,
 }
 
 impl TableDef {

@@ -19,7 +19,7 @@ use elyra_olap::GroupAggregator;
 
 use crate::catalog::{
     self, autoinc_key, catalog_key, data_key, data_prefix, index_table_prefix, rowid_key,
-    wcount_key, ColMeta, IndexDef, TableDef,
+    wcount_key, ColMeta, ForeignKey, IndexDef, RefAction, TableDef,
 };
 use crate::eval::eval_expr;
 use crate::keyenc;
@@ -132,6 +132,8 @@ pub async fn create_table(
     let mut col_meta: Vec<ColMeta> = Vec::with_capacity(ct.columns.len());
     let mut pk_cols: Vec<usize> = Vec::new();
     let mut indexes: Vec<IndexDef> = Vec::new();
+    let mut checks: Vec<String> = Vec::new();
+    let mut foreign_keys: Vec<ForeignKey> = Vec::new();
 
     for (idx, col) in ct.columns.iter().enumerate() {
         let ty = map_type(&col.data_type)?;
@@ -165,6 +167,7 @@ pub async fn create_table(
                 {
                     meta.auto_increment = true;
                 }
+                ColumnOption::Check(e) => checks.push(e.to_string()),
                 _ => {}
             }
         }
@@ -223,6 +226,42 @@ pub async fn create_table(
                     vector: false,
                 });
             }
+            TableConstraint::Check { expr, .. } => checks.push(expr.to_string()),
+            TableConstraint::ForeignKey {
+                name: fname,
+                columns: cols,
+                foreign_table,
+                referred_columns,
+                on_delete,
+                on_update,
+                ..
+            } => {
+                let mut fk_cols = Vec::new();
+                for ident in cols {
+                    let i = columns
+                        .iter()
+                        .position(|c| c.name.eq_ignore_ascii_case(&ident.value))
+                        .ok_or_else(|| {
+                            Error::Catalog(format!("unknown foreign key column: {}", ident.value))
+                        })?;
+                    fk_cols.push(i);
+                }
+                foreign_keys.push(ForeignKey {
+                    name: fname
+                        .as_ref()
+                        .map(|n| n.value.clone())
+                        .unwrap_or_else(|| format!("fk_{name}_{}", foreign_keys.len())),
+                    columns: fk_cols,
+                    ref_table: foreign_table
+                        .0
+                        .last()
+                        .map(|i| i.value.clone())
+                        .unwrap_or_default(),
+                    ref_columns: referred_columns.iter().map(|i| i.value.clone()).collect(),
+                    on_delete: map_ref_action(on_delete),
+                    on_update: map_ref_action(on_update),
+                });
+            }
             _ => {}
         }
     }
@@ -233,6 +272,8 @@ pub async fn create_table(
         pk_cols,
         indexes,
         col_meta,
+        checks,
+        foreign_keys,
     };
     db.commit_write(vec![(catalog_key(&name), def.encode()?)], vec![])
         .await?;
@@ -696,6 +737,8 @@ async fn create_table_as(
         pk_cols: Vec::new(),
         indexes: Vec::new(),
         col_meta: Vec::new(),
+        checks: Vec::new(),
+        foreign_keys: Vec::new(),
     };
     let mut puts = vec![(catalog_key(name), def.encode()?)];
     let mut rowid = 0u64;
@@ -1362,6 +1405,7 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
     // Pass 1: build every row (coerce, defaults, AUTO_INCREMENT, generated,
     // NOT NULL) and its clustered key — no per-row storage reads.
     let mut built: Vec<(Vec<u8>, Vec<Value>)> = Vec::with_capacity(rows.len());
+    let checks = parse_checks(&def)?;
     for vals in rows {
         if vals.len() != target.len() {
             return Err(Error::Query(format!(
@@ -1417,6 +1461,7 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
                 )));
             }
         }
+        check_row(&def, &checks, &row)?;
 
         let key = if has_pk {
             let pk_vals: Vec<Value> = def.pk_cols.iter().map(|&i| row[i].clone()).collect();
@@ -1564,6 +1609,41 @@ fn bind_values(expr: &Expr, insert_row: &[Value], schema: &Schema) -> Expr {
         }
         None
     })
+}
+
+fn map_ref_action(a: &Option<sqlparser::ast::ReferentialAction>) -> RefAction {
+    use sqlparser::ast::ReferentialAction as RA;
+    match a {
+        Some(RA::Cascade) => RefAction::Cascade,
+        Some(RA::SetNull) => RefAction::SetNull,
+        Some(RA::Restrict) => RefAction::Restrict,
+        _ => RefAction::NoAction,
+    }
+}
+
+/// Parse a table's CHECK expressions once (for a whole statement).
+fn parse_checks(def: &TableDef) -> Result<Vec<Expr>> {
+    def.checks.iter().map(|s| parse_scalar_expr(s)).collect()
+}
+
+/// A CHECK is satisfied unless it evaluates to FALSE (NULL/UNKNOWN passes).
+fn check_row(def: &TableDef, checks: &[Expr], row: &[Value]) -> Result<()> {
+    for c in checks {
+        let fails = match predicate::eval_row(c, &def.schema, row)? {
+            Value::Null => false,
+            Value::Bool(b) => !b,
+            Value::Int(i) => i == 0,
+            Value::Float(f) => f == 0.0,
+            _ => false,
+        };
+        if fails {
+            return Err(Error::Query(format!(
+                "CHECK constraint violated for '{}'",
+                def.name
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Verify that no row in `batch` collides on a unique index, either with
@@ -3293,6 +3373,7 @@ pub async fn update(
     let mut deletes: Vec<Vec<u8>> = Vec::new();
     let check_uniq = index::has_unique(&def);
     let mut uniq_batch: Vec<(Vec<u8>, Vec<Value>)> = Vec::new();
+    let checks = parse_checks(&def)?;
 
     for (old_key, old_row) in matches {
         let mut new_row = old_row.clone();
@@ -3315,6 +3396,7 @@ pub async fn update(
                 )));
             }
         }
+        check_row(&def, &checks, &new_row)?;
 
         // If the primary key changed, the clustered key moves.
         let new_key = if def.has_pk() {
@@ -4824,6 +4906,8 @@ async fn create_temp_table(db: &Session, name: &str, schema: &Schema) -> Result<
         pk_cols: Vec::new(),
         indexes: Vec::new(),
         col_meta: Vec::new(),
+        checks: Vec::new(),
+        foreign_keys: Vec::new(),
     };
     db.commit_write(vec![(catalog_key(name), def.encode()?)], vec![])
         .await?;

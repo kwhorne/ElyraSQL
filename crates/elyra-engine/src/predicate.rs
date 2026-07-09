@@ -1656,6 +1656,12 @@ fn binary(
         _ => {}
     }
     let r = eval_right()?;
+    // Three-valued logic: a comparison with a NULL operand is NULL (UNKNOWN).
+    // In WHERE this is falsy (row excluded); in CHECK it passes; in SELECT it
+    // shows NULL — all matching SQL semantics.
+    if matches!(op, Eq | NotEq | Lt | LtEq | Gt | GtEq) && (l.is_null() || r.is_null()) {
+        return Ok(Value::Null);
+    }
     match op {
         Eq => Ok(Value::Bool(
             cmp(&l, &r)?.map(|o| o.is_eq()).unwrap_or(false),
