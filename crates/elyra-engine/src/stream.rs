@@ -5,7 +5,7 @@
 //! `LIMIT`/`OFFSET`, then project — all with bounded memory. The server
 //! drains batches straight to the wire.
 
-use elyra_core::{Error, Result, Schema, Value};
+use elyra_core::{ColumnType, Error, Result, Schema, Value};
 use elyra_storage::Db;
 use sqlparser::ast::Expr;
 
@@ -51,9 +51,47 @@ pub struct ScanSpec {
     pub limit: Option<usize>,
 }
 
+/// Reconcile declared `Int`/`Float` column types with the actual values:
+/// narrow `Float`->`Int` when every non-null value is an integer, and widen
+/// `Int`->`Float` when any value is a float/decimal. Non-numeric columns are
+/// left untouched.
+fn reconcile_numeric_types(schema: &mut Schema, rows: &[Vec<Value>]) {
+    for (i, col) in schema.columns.iter_mut().enumerate() {
+        if !matches!(col.ty, ColumnType::Int | ColumnType::Float) {
+            continue;
+        }
+        let mut has_float = false;
+        let mut has_int = false;
+        let mut bail = false;
+        for r in rows {
+            match r.get(i) {
+                Some(Value::Float(_)) | Some(Value::Decimal(..)) => has_float = true,
+                Some(Value::Int(_)) | Some(Value::Bool(_)) => has_int = true,
+                Some(Value::Null) | None => {}
+                Some(_) => {
+                    bail = true;
+                    break;
+                }
+            }
+        }
+        if bail {
+            continue;
+        }
+        if has_float {
+            col.ty = ColumnType::Float;
+        } else if has_int {
+            col.ty = ColumnType::Int;
+        }
+    }
+}
+
 impl RowStream {
-    /// Wrap already-computed rows.
-    pub fn literal(schema: Schema, rows: Vec<Vec<Value>>) -> Self {
+    /// Wrap already-computed rows. The declared numeric column types are
+    /// reconciled with the actual values so computed columns (aggregates,
+    /// expressions) report the right wire type (e.g. an integer conditional
+    /// SUM is sent as an integer, not a double).
+    pub fn literal(mut schema: Schema, rows: Vec<Vec<Value>>) -> Self {
+        reconcile_numeric_types(&mut schema, &rows);
         Self {
             schema,
             src: Source::Literal(rows.into_iter()),
