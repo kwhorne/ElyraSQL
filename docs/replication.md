@@ -55,11 +55,33 @@ Each commit waits up to `--semi-sync-ms` for a replica to acknowledge the write.
 If no replica acknowledges in time (or none is connected), the commit proceeds
 anyway (degrading to asynchronous), so a lost replica never blocks the primary.
 
-## Failover
+## Automatic failover (cluster mode)
 
-Failover is manual. A replica's data file is a complete ElyraSQL database, so to
-promote it, stop the replica and start it as a normal primary against the same
-file:
+Run nodes in `cluster` mode for **automatic failover** via Raft-style leader
+election. The elected leader accepts writes and serves the replication endpoint;
+followers are read-only and replicate from the current leader. If the leader
+fails, a surviving node is elected (given a majority) and starts accepting
+writes — no manual intervention.
+
+```bash
+# 3-node cluster (each node lists the others as peers by control address)
+elyrasql cluster --id 1 --data /var/lib/elyrasql/n1.edb \
+  --listen 0.0.0.0:3307 --control-listen 0.0.0.0:4501 --replication-listen 0.0.0.0:5501 \
+  --peer 2@node2:4502 --peer 3@node3:4503
+```
+
+A write is only accepted while a node believes it is the leader for the current
+term (fencing). Election needs a **majority**, so run an odd number of nodes
+(3 or 5) to tolerate 1 or 2 failures without split-brain.
+
+Because replication is asynchronous, a newly elected leader may be missing the
+old leader's last unreplicated writes; on a leadership change a follower
+re-bootstraps from the new leader. There is no synchronous/quorum commit.
+
+## Manual failover
+
+A replica's data file is a complete ElyraSQL database, so to promote it manually,
+stop the replica and start it as a normal primary against the same file:
 
 ```bash
 elyrasql serve --data /var/lib/elyrasql/replica.edb --listen 0.0.0.0:3307

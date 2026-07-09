@@ -19,6 +19,7 @@ use tokio_rustls::rustls::ServerConfig as TlsServerConfig;
 use tracing::{error, info, warn};
 
 pub mod auth;
+pub mod cluster;
 mod observ;
 mod prepared;
 pub mod repl;
@@ -38,8 +39,9 @@ pub struct ServerConfig {
     pub metrics_listen: Option<String>,
     /// Optional address for the replication endpoint (makes this a primary).
     pub replication_listen: Option<String>,
-    /// When true, reject all writes (used by replicas).
-    pub read_only: bool,
+    /// When set, reject all writes (used by replicas / non-leaders). Dynamic so
+    /// a cluster node can flip it on role change.
+    pub read_only: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Build a rustls server config from PEM certificate and key files.
@@ -91,8 +93,8 @@ pub struct ElyraShim {
     conn_id: u32,
     /// Authenticated user name (for per-table grant checks).
     user: std::sync::Mutex<String>,
-    /// Replica mode: cap every connection at read-only.
-    read_only: bool,
+    /// Replica/non-leader mode: cap every connection at read-only (dynamic).
+    read_only: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ElyraShim {
@@ -102,7 +104,7 @@ impl ElyraShim {
         metrics: Arc<Metrics>,
         procs: Arc<ProcRegistry>,
         conn_id: u32,
-        read_only: bool,
+        read_only: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
         let session = engine.session();
         Self {
@@ -126,7 +128,7 @@ impl ElyraShim {
     }
 
     fn privilege(&self) -> elyra_core::Privilege {
-        if self.read_only {
+        if self.read_only.load(std::sync::atomic::Ordering::Relaxed) {
             return elyra_core::Privilege::Read;
         }
         *self.privilege.lock().unwrap()
@@ -508,6 +510,7 @@ pub async fn serve(config: ServerConfig, engine: Engine) -> std::io::Result<()> 
         let metrics = metrics.clone();
         let procs = procs.clone();
         let conn_id = CONN_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+        let read_only = read_only.clone();
         tokio::spawn(async move {
             metrics.connect();
             procs.register(conn_id, peer.ip().to_string());
@@ -582,7 +585,7 @@ async fn handle_connection(
     metrics: Arc<Metrics>,
     procs: Arc<ProcRegistry>,
     conn_id: u32,
-    read_only: bool,
+    read_only: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> std::io::Result<()> {
     use opensrv_mysql::{plain_run_with_options, secure_run_with_options, IntermediaryOptions};
 

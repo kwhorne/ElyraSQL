@@ -85,6 +85,29 @@ enum Command {
         #[arg(long)]
         until_time_ms: Option<u64>,
     },
+    /// Run as a cluster node with automatic failover (Raft-style leader
+    /// election). The elected leader accepts writes; followers are read-only and
+    /// replicate from the leader.
+    Cluster {
+        /// This node's numeric id (unique in the cluster).
+        #[arg(long)]
+        id: u64,
+        /// Local database file.
+        #[arg(long, env = "ELYRASQL_DATA", default_value = "elyra.edb")]
+        data: PathBuf,
+        /// MySQL listener address.
+        #[arg(long, env = "ELYRASQL_LISTEN", default_value = "127.0.0.1:3307")]
+        listen: String,
+        /// Control-plane (election) listen address.
+        #[arg(long)]
+        control_listen: String,
+        /// Replication endpoint address (advertised to followers).
+        #[arg(long)]
+        replication_listen: String,
+        /// Peer nodes as `id@host:port` (control addresses). Repeatable.
+        #[arg(long = "peer", value_name = "ID@HOST:PORT")]
+        peers: Vec<String>,
+    },
     /// Run as a read-only replica of a primary. The --data file is disposable:
     /// it is recreated and re-bootstrapped from the primary on start.
     Replica {
@@ -251,7 +274,7 @@ async fn run() -> anyhow::Result<()> {
                 slow_query_ms,
                 metrics_listen,
                 replication_listen,
-                read_only: false,
+                read_only: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             };
             elyra_server::serve(config, engine).await?;
         }
@@ -264,6 +287,46 @@ async fn run() -> anyhow::Result<()> {
             let db = Db::open(&data)?;
             let n = elyra_storage::binlog::replay(&binlog, &db, until_lsn, until_time_ms).await?;
             println!("replayed {n} write-sets into {}", data.display());
+        }
+        Command::Cluster {
+            id,
+            data,
+            listen,
+            control_listen,
+            replication_listen,
+            peers,
+        } => {
+            let db = Db::open(&data)?;
+            let engine = Engine::new(db.clone());
+            let read_only = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let peers = peers
+                .iter()
+                .map(|p| elyra_server::cluster::parse_peer(p))
+                .collect::<std::io::Result<Vec<_>>>()?;
+            let node = elyra_server::cluster::Node::new(elyra_server::cluster::ClusterConfig {
+                id,
+                control_listen,
+                replication_addr: replication_listen.clone(),
+                peers,
+            });
+            tokio::spawn(node.clone().run());
+            tokio::spawn(elyra_server::cluster::follow_leadership(
+                node.clone(),
+                db.clone(),
+                read_only.clone(),
+                id,
+            ));
+            let auth = std::sync::Arc::new(elyra_server::Auth::open().with_db(db));
+            let config = elyra_server::ServerConfig {
+                listen,
+                auth,
+                tls: None,
+                slow_query_ms: 0,
+                metrics_listen: None,
+                replication_listen: Some(replication_listen),
+                read_only,
+            };
+            elyra_server::serve(config, engine).await?;
         }
         Command::Replica {
             primary,
@@ -293,7 +356,7 @@ async fn run() -> anyhow::Result<()> {
                 slow_query_ms: 0,
                 metrics_listen: None,
                 replication_listen: None,
-                read_only: true,
+                read_only: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             };
             elyra_server::serve(config, engine).await?;
         }
