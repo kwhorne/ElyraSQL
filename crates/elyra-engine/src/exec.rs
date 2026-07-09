@@ -478,6 +478,84 @@ async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec
             }
             Ok((schema, rows))
         }
+        "statistics" => {
+            let schema = Schema::new(vec![
+                text("TABLE_SCHEMA"),
+                text("TABLE_NAME"),
+                int("NON_UNIQUE"),
+                text("INDEX_NAME"),
+                int("SEQ_IN_INDEX"),
+                text("COLUMN_NAME"),
+                text("COLLATION"),
+                int("CARDINALITY"),
+                text("NULLABLE"),
+                text("INDEX_TYPE"),
+            ]);
+            let mut rows = Vec::new();
+            for tname in names {
+                let def = catalog::load(db, &tname).await?;
+                let mut push = |non_unique: i64, iname: &str, seq: usize, ci: usize, itype: &str| {
+                    let c = &def.schema.columns[ci];
+                    rows.push(vec![
+                        Value::Text("elyra".into()),
+                        Value::Text(tname.clone()),
+                        Value::Int(non_unique),
+                        Value::Text(iname.to_string()),
+                        Value::Int(seq as i64 + 1),
+                        Value::Text(c.name.clone()),
+                        Value::Text("A".into()),
+                        Value::Null,
+                        Value::Text(if c.nullable { "YES" } else { "" }.into()),
+                        Value::Text(itype.to_string()),
+                    ]);
+                };
+                for (seq, &ci) in def.pk_cols.iter().enumerate() {
+                    push(0, "PRIMARY", seq, ci, "BTREE");
+                }
+                for idx in &def.indexes {
+                    let nu = if idx.unique { 0 } else { 1 };
+                    let itype = if idx.vector { "HNSW" } else { "BTREE" };
+                    let iname = idx.name.clone();
+                    for (seq, &ci) in idx.cols.iter().enumerate() {
+                        push(nu, &iname, seq, ci, itype);
+                    }
+                }
+            }
+            Ok((schema, rows))
+        }
+        "key_column_usage" => {
+            let schema = Schema::new(vec![
+                text("CONSTRAINT_SCHEMA"),
+                text("CONSTRAINT_NAME"),
+                text("TABLE_SCHEMA"),
+                text("TABLE_NAME"),
+                text("COLUMN_NAME"),
+                int("ORDINAL_POSITION"),
+            ]);
+            let mut rows = Vec::new();
+            for tname in names {
+                let def = catalog::load(db, &tname).await?;
+                let mut push = |cname: &str, seq: usize, ci: usize| {
+                    rows.push(vec![
+                        Value::Text("elyra".into()),
+                        Value::Text(cname.to_string()),
+                        Value::Text("elyra".into()),
+                        Value::Text(tname.clone()),
+                        Value::Text(def.schema.columns[ci].name.clone()),
+                        Value::Int(seq as i64 + 1),
+                    ]);
+                };
+                for (seq, &ci) in def.pk_cols.iter().enumerate() {
+                    push("PRIMARY", seq, ci);
+                }
+                for idx in def.indexes.iter().filter(|i| i.unique) {
+                    for (seq, &ci) in idx.cols.iter().enumerate() {
+                        push(&idx.name, seq, ci);
+                    }
+                }
+            }
+            Ok((schema, rows))
+        }
         other => Err(Error::Unsupported(format!(
             "information_schema.{other} is not available"
         ))),
