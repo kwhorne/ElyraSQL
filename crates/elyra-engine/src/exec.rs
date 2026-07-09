@@ -6,9 +6,9 @@
 use crate::session::Session;
 use elyra_core::{ColumnDef, ColumnType, Error, Result, Schema, Value};
 use sqlparser::ast::{
-    AlterTableOperation, Assignment, AssignmentTarget, ColumnOption, CreateIndex, CreateTable,
-    DataType, Delete, FromTable, Insert, JoinConstraint, JoinOperator, ObjectName,
-    Query as SqlQuery, Select, SetExpr, TableConstraint, TableFactor, TableWithJoins,
+    AlterColumnOperation, AlterTableOperation, Assignment, AssignmentTarget, ColumnOption,
+    CreateIndex, CreateTable, DataType, Delete, FromTable, Insert, JoinConstraint, JoinOperator,
+    ObjectName, Query as SqlQuery, Select, SetExpr, TableConstraint, TableFactor, TableWithJoins,
 };
 
 use crate::aggregate;
@@ -316,6 +316,35 @@ pub async fn alter_table(
                 alter_rename_table(db, &mut def, &new).await?;
                 persist_catalog = false;
             }
+            AlterTableOperation::ChangeColumn {
+                old_name,
+                new_name,
+                data_type,
+                options,
+                ..
+            } => {
+                alter_change_column(
+                    db,
+                    &mut def,
+                    &old_name.value,
+                    Some(&new_name.value),
+                    data_type,
+                    options,
+                )
+                .await?;
+            }
+            AlterTableOperation::ModifyColumn {
+                col_name,
+                data_type,
+                options,
+                ..
+            } => {
+                alter_change_column(db, &mut def, &col_name.value, None, data_type, options)
+                    .await?;
+            }
+            AlterTableOperation::AlterColumn { column_name, op } => {
+                alter_column_op(db, &mut def, &column_name.value, op).await?;
+            }
             other => {
                 return Err(Error::Unsupported(format!(
                     "ALTER operation not supported: {other}"
@@ -329,6 +358,147 @@ pub async fn alter_table(
             .await?;
     }
     Ok(QueryResult::Affected(0))
+}
+
+fn ensure_col_meta(def: &mut TableDef) {
+    if def.col_meta.len() < def.schema.columns.len() {
+        def.col_meta
+            .resize(def.schema.columns.len(), ColMeta::default());
+    }
+}
+
+/// Build a column's nullability and metadata from its options.
+fn options_to_meta(options: &[ColumnOption]) -> (bool, ColMeta) {
+    let mut nullable = true;
+    let mut meta = ColMeta::default();
+    for opt in options {
+        match opt {
+            ColumnOption::NotNull => nullable = false,
+            ColumnOption::Unique {
+                is_primary: true, ..
+            } => nullable = false,
+            ColumnOption::Default(e) => meta.default = Some(e.to_string()),
+            ColumnOption::Generated {
+                generation_expr: Some(e),
+                ..
+            } => meta.generated = Some(e.to_string()),
+            ColumnOption::DialectSpecific(tokens)
+                if tokens
+                    .iter()
+                    .any(|t| t.to_string().eq_ignore_ascii_case("AUTO_INCREMENT")) =>
+            {
+                meta.auto_increment = true;
+            }
+            _ => {}
+        }
+    }
+    (nullable, meta)
+}
+
+/// `MODIFY COLUMN` / `CHANGE COLUMN`: retype, rename, and reset options.
+async fn alter_change_column(
+    db: &Session,
+    def: &mut TableDef,
+    old: &str,
+    new_name: Option<&str>,
+    data_type: &DataType,
+    options: &[ColumnOption],
+) -> Result<()> {
+    ensure_col_meta(def);
+    let i = def
+        .schema
+        .columns
+        .iter()
+        .position(|c| c.name.eq_ignore_ascii_case(old))
+        .ok_or_else(|| Error::Catalog(format!("unknown column: {old}")))?;
+
+    let new_ty = map_type(data_type)?;
+    let old_ty = def.schema.columns[i].ty.clone();
+    if def.pk_cols.contains(&i) && new_ty != old_ty {
+        return Err(Error::Unsupported(
+            "cannot change the type of a primary key column".into(),
+        ));
+    }
+    if let Some(nn) = new_name {
+        def.schema.columns[i].name = nn.to_string();
+    }
+    let (nullable, meta) = options_to_meta(options);
+    def.schema.columns[i].nullable = nullable;
+    def.schema.columns[i].ty = new_ty.clone();
+    def.col_meta[i] = meta;
+    if new_ty != old_ty {
+        recoerce_column(db, def, i).await?;
+    }
+    Ok(())
+}
+
+/// `ALTER COLUMN ... SET/DROP DEFAULT | SET/DROP NOT NULL | SET DATA TYPE`.
+async fn alter_column_op(
+    db: &Session,
+    def: &mut TableDef,
+    name: &str,
+    op: &AlterColumnOperation,
+) -> Result<()> {
+    ensure_col_meta(def);
+    let i = def
+        .schema
+        .columns
+        .iter()
+        .position(|c| c.name.eq_ignore_ascii_case(name))
+        .ok_or_else(|| Error::Catalog(format!("unknown column: {name}")))?;
+    match op {
+        AlterColumnOperation::SetDefault { value } => {
+            def.col_meta[i].default = Some(value.to_string())
+        }
+        AlterColumnOperation::DropDefault => def.col_meta[i].default = None,
+        AlterColumnOperation::SetNotNull => def.schema.columns[i].nullable = false,
+        AlterColumnOperation::DropNotNull => def.schema.columns[i].nullable = true,
+        AlterColumnOperation::SetDataType { data_type, .. } => {
+            let new_ty = map_type(data_type)?;
+            let old_ty = def.schema.columns[i].ty.clone();
+            if def.pk_cols.contains(&i) && new_ty != old_ty {
+                return Err(Error::Unsupported(
+                    "cannot change the type of a primary key column".into(),
+                ));
+            }
+            def.schema.columns[i].ty = new_ty.clone();
+            if new_ty != old_ty {
+                recoerce_column(db, def, i).await?;
+            }
+        }
+        other => {
+            return Err(Error::Unsupported(format!(
+                "ALTER COLUMN operation not supported: {other}"
+            )))
+        }
+    }
+    Ok(())
+}
+
+/// Re-coerce column `i` of every row to its (new) type, maintaining indexes.
+async fn recoerce_column(db: &Session, def: &TableDef, i: usize) -> Result<()> {
+    let all = collect_matches(db, def, None, None).await?;
+    let col = &def.schema.columns[i];
+    let mut puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    let mut deletes: Vec<Vec<u8>> = Vec::new();
+    for (key, old_row) in all {
+        let coerced = coerce(old_row[i].clone(), &col.ty, &col.name)?;
+        if coerced == old_row[i] {
+            continue;
+        }
+        let mut new_row = old_row.clone();
+        new_row[i] = coerced;
+        deletes.extend(index::entry_keys_for_row(def, &old_row, &key)?);
+        let entries = index::entries_for_row(def, &new_row, &key)?;
+        let enc = bincode::serialize(&new_row).map_err(|e| Error::Storage(e.to_string()))?;
+        puts.push((key, enc));
+        puts.extend(entries);
+    }
+    if !puts.is_empty() {
+        puts.push(bump_wcount(db, &def.name).await?);
+        db.commit_write(puts, deletes).await?;
+    }
+    Ok(())
 }
 
 async fn alter_add_column(
@@ -404,6 +574,9 @@ async fn alter_drop_column(db: &Session, def: &mut TableDef, name: &str) -> Resu
         return Err(Error::Unsupported(
             "cannot drop an indexed column; drop the index first".into(),
         ));
+    }
+    if idx < def.col_meta.len() {
+        def.col_meta.remove(idx);
     }
 
     // Rewrite rows without the dropped position.
@@ -4996,6 +5169,22 @@ fn coerce(v: Value, ty: &ColumnType, col: &str) -> Result<Value> {
             }
         }
         (ColumnType::Vector(dim), Value::Text(s)) => Value::Vector(parse_vector(&s, *dim)?),
+        // Lenient (MySQL-style) conversions.
+        (ColumnType::Int, Value::Float(f)) => Value::Int(f as i64),
+        (ColumnType::Int, Value::Text(s)) => s
+            .trim()
+            .parse::<i64>()
+            .or_else(|_| s.trim().parse::<f64>().map(|f| f as i64))
+            .map(Value::Int)
+            .map_err(|_| Error::Type(format!("invalid INTEGER value: {s}")))?,
+        (ColumnType::Float, Value::Text(s)) => s
+            .trim()
+            .parse::<f64>()
+            .map(Value::Float)
+            .map_err(|_| Error::Type(format!("invalid FLOAT value: {s}")))?,
+        (ColumnType::Date, Value::DateTime(m)) => Value::Date(m.div_euclid(86_400_000_000) as i32),
+        (ColumnType::DateTime, Value::Date(d)) => Value::DateTime(d as i64 * 86_400_000_000),
+        (ColumnType::Text, other) => Value::Text(other.to_wire_string().unwrap_or_default()),
         (want, got) => {
             return Err(Error::Type(format!(
                 "value {got:?} is not compatible with column '{col}' of type {}",

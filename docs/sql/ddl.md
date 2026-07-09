@@ -52,6 +52,11 @@ ALTER TABLE users ADD COLUMN status TEXT NOT NULL DEFAULT 'active';
 ALTER TABLE users DROP COLUMN age;
 ALTER TABLE users RENAME COLUMN email TO email_address;
 ALTER TABLE users RENAME TO members;
+ALTER TABLE users MODIFY COLUMN qty BIGINT;
+ALTER TABLE users CHANGE COLUMN note remark TEXT;
+ALTER TABLE users ALTER COLUMN status SET DEFAULT 'new';
+ALTER TABLE users ALTER COLUMN status DROP DEFAULT;
+ALTER TABLE users ALTER COLUMN status SET NOT NULL;
 ```
 
 - **ADD COLUMN** backfills existing rows with the default (or `NULL`). Adding a
@@ -59,6 +64,12 @@ ALTER TABLE users RENAME TO members;
 - **DROP COLUMN** rewrites rows and remaps key/index positions. A primary-key
   or indexed column cannot be dropped (drop the index first).
 - **RENAME COLUMN** is a metadata-only change.
+- **MODIFY / CHANGE COLUMN** retypes a column (existing values are converted),
+  renames it (`CHANGE`), and resets its options (nullability, default). The
+  type of a primary-key column cannot be changed.
+- **ALTER COLUMN** sets or drops a `DEFAULT`, or toggles `NOT NULL`.
+- Type conversions follow MySQL-style leniency (e.g. `'10'` → `10`, `99` →
+  `'99'`).
 - **RENAME TABLE** re-keys the data and rebuilds index entries.
 
 ## Column defaults, AUTO_INCREMENT, and generated columns
