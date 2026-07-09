@@ -185,5 +185,18 @@ SELECT v FROM a UNION SELECT v FROM b ORDER BY v DESC LIMIT 10;
 `ORDER BY`/`LIMIT`/`OFFSET` applies to the combined result. Both sides must
 produce the same number of columns.
 
-!!! note "Not yet supported"
-    Correlated subqueries combined with joins are not supported yet.
+### Correlated subqueries over joins
+
+Correlated subqueries (in `WHERE` and the SELECT list) work over joins, too:
+
+```sql
+SELECT u.name, d.dname,
+       (SELECT COUNT(*) FROM orders o WHERE o.uid = u.id) AS orders
+FROM users u
+JOIN departments d ON u.dept = d.id
+WHERE EXISTS (SELECT 1 FROM orders o WHERE o.uid = u.id);
+```
+
+The subquery is evaluated per joined row with the outer columns bound.
+Correlated subqueries combined with **aggregation** over a join are not
+supported.

@@ -5,11 +5,12 @@ implemented, so you can judge fit.
 
 ## SQL surface
 
-- Subqueries (`WHERE` and SELECT-list, uncorrelated **and** correlated),
-  derived tables, CTEs (`WITH`, including `WITH RECURSIVE`), `HAVING`, window
-  functions with explicit `ROWS`/`RANGE` frames, and `FROM`-less `SELECT` are
-  supported. Not yet: named windows, `RANGE`/`GROUPS` numeric-offset frames,
-  and correlated subqueries combined with joins.
+- Subqueries (`WHERE` and SELECT-list, uncorrelated **and** correlated,
+  including over joins), derived tables, CTEs (`WITH`, including `WITH
+  RECURSIVE`), `HAVING`, window functions with explicit `ROWS`/`RANGE` frames,
+  set operations, and `FROM`-less `SELECT` are supported. Not yet: named
+  windows, `RANGE`/`GROUPS` numeric-offset frames, and correlated subqueries
+  combined with aggregation over a join.
 - No views, triggers, stored procedures, or user-defined functions.
 - `ALTER TABLE` covers add/drop/rename column and rename table — not
   `MODIFY`/`CHANGE` (column type changes) or `ADD/DROP INDEX` via `ALTER`.
@@ -54,7 +55,7 @@ Candidate next steps, roughly in order of value:
 
 1. Named windows; `RANGE`/`GROUPS` numeric-offset frames.
 2. Triggers, stored procedures, materialized views.
-3. Correlated subqueries combined with joins.
+3. `UPDATE`/`DELETE` with subqueries or joins.
 4. Secondary-index range on composite keys; merge joins.
 5. Columnar OLAP with spill-to-disk.
 6. Richer `information_schema` / `SHOW`.

@@ -761,6 +761,26 @@ pub async fn select(
             .iter()
             .any(|t| !t.joins.is_empty() || matches!(t.relation, TableFactor::Derived { .. }));
     if is_join {
+        // A subquery that references one of the join's tables is correlated;
+        // evaluate it per joined row.
+        let quals = join_qualifiers(&select.from);
+        let correlated = raw_filter
+            .as_ref()
+            .is_some_and(|f| filter_correlated_any(f, &quals))
+            || projection_correlated_any(&select.projection, &quals);
+        if correlated {
+            return join_correlated_select(
+                db,
+                vindex,
+                select,
+                raw_filter.clone(),
+                group_by,
+                order_exprs,
+                offset,
+                limit,
+            )
+            .await;
+        }
         let filter = match raw_filter {
             Some(f) => Some(resolve_subqueries(db, vindex, f).await?),
             None => None,
@@ -992,6 +1012,15 @@ pub async fn select(
                     expr: sqlparser::ast::Expr::Identifier(id),
                     alias,
                 } => (&id.value, Some(alias.value.clone())),
+                SelectItem::UnnamedExpr(sqlparser::ast::Expr::CompoundIdentifier(parts))
+                    if !parts.is_empty() =>
+                {
+                    (&parts.last().unwrap().value, None)
+                }
+                SelectItem::ExprWithAlias {
+                    expr: sqlparser::ast::Expr::CompoundIdentifier(parts),
+                    alias,
+                } if !parts.is_empty() => (&parts.last().unwrap().value, Some(alias.value.clone())),
                 other => {
                     return Err(Error::Unsupported(format!(
                         "projection not supported over table scan: {other}"
@@ -1109,6 +1138,162 @@ async fn join_select(
     apply_offset_limit(&mut rows, offset, limit);
     let (osch, out) = project_exprs(&select.projection, &schema, &rows)?;
     Ok(QueryResult::Rows(RowStream::literal(osch, out)))
+}
+
+/// The table qualifiers (alias or name) of every relation in a FROM clause.
+fn join_qualifiers(from: &[TableWithJoins]) -> Vec<String> {
+    let mut q = Vec::new();
+    for twj in from {
+        if let Some(n) = factor_qualifier(&twj.relation) {
+            q.push(n);
+        }
+        for j in &twj.joins {
+            if let Some(n) = factor_qualifier(&j.relation) {
+                q.push(n);
+            }
+        }
+    }
+    q
+}
+
+fn factor_qualifier(tf: &TableFactor) -> Option<String> {
+    match tf {
+        TableFactor::Table { name, alias, .. } => alias
+            .as_ref()
+            .map(|a| a.name.value.clone())
+            .or_else(|| name.0.last().map(|i| i.value.clone())),
+        TableFactor::Derived { alias, .. } => alias.as_ref().map(|a| a.name.value.clone()),
+        _ => None,
+    }
+}
+
+fn filter_correlated_any(f: &Expr, quals: &[String]) -> bool {
+    quals.iter().any(|q| filter_correlated(f, q))
+}
+
+fn projection_correlated_any(projection: &[sqlparser::ast::SelectItem], quals: &[String]) -> bool {
+    quals.iter().any(|q| projection_correlated(projection, q))
+}
+
+/// Bind every qualified column reference (`alias.col`) that resolves in the
+/// joined `schema` to its literal value from `row`, including inside
+/// subqueries. Outer references in correlated subqueries become literals; the
+/// subquery's own columns are left untouched.
+fn bind_row(expr: &Expr, schema: &Schema, row: &[Value]) -> Expr {
+    map_expr(expr, &|e| {
+        if let Expr::CompoundIdentifier(parts) = e {
+            if parts.len() >= 2 {
+                let qual = format!(
+                    "{}.{}",
+                    parts[parts.len() - 2].value,
+                    parts[parts.len() - 1].value
+                );
+                if let Some(i) = schema
+                    .columns
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(&qual))
+                {
+                    return Some(value_to_expr(&row[i]));
+                }
+            }
+        }
+        None
+    })
+}
+
+/// Execute a join whose WHERE or SELECT list has a correlated subquery: build
+/// the joined rows, then bind outer references and resolve the subqueries per
+/// row for both the filter and the projection.
+#[allow(clippy::too_many_arguments)]
+async fn join_correlated_select(
+    db: &Session,
+    vindex: &VectorRegistry,
+    select: &Select,
+    raw_filter: Option<Expr>,
+    group_by: Vec<Expr>,
+    order_exprs: Vec<(Expr, bool)>,
+    offset: usize,
+    limit: Option<usize>,
+) -> Result<QueryResult> {
+    if !group_by.is_empty() || aggregate::projection_has_aggregate(&select.projection) {
+        return Err(Error::Unsupported(
+            "correlated subqueries combined with aggregation over joins are not supported".into(),
+        ));
+    }
+
+    let (cols, rows) = build_from(db, vindex, &select.from, &[]).await?;
+    let schema = Schema::new(cols);
+
+    let mut kept: Vec<Vec<Value>> = Vec::new();
+    for row in rows {
+        if let Some(f) = &raw_filter {
+            let bound = bind_row(f, &schema, &row);
+            let resolved = resolve_subqueries(db, vindex, bound).await?;
+            if !predicate::matches(&resolved, &schema, &row)? {
+                continue;
+            }
+        }
+        kept.push(row);
+    }
+
+    let resolved_order = resolve_order_aliases(&order_exprs, &select.projection, &schema);
+    if !resolved_order.is_empty() {
+        sort_full_rows(&mut kept, &schema, &resolved_order)?;
+    }
+    apply_offset_limit(&mut kept, offset, limit);
+
+    // Plain projection when no SELECT-list subqueries.
+    if !projection_has_subquery(&select.projection) {
+        let (osch, out) = project_exprs(&select.projection, &schema, &kept)?;
+        return Ok(QueryResult::Rows(RowStream::literal(osch, out)));
+    }
+
+    // Per-row projection with correlated SELECT-list subqueries.
+    use sqlparser::ast::SelectItem;
+    let mut out_rows: Vec<Vec<Value>> = Vec::with_capacity(kept.len());
+    for row in &kept {
+        let mut vals = Vec::with_capacity(select.projection.len());
+        for item in &select.projection {
+            let expr = match item {
+                SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => e,
+                other => {
+                    return Err(Error::Unsupported(format!(
+                        "projection item not supported with correlated subquery: {other}"
+                    )))
+                }
+            };
+            let bound = bind_row(expr, &schema, row);
+            let resolved = resolve_subqueries(db, vindex, bound).await?;
+            vals.push(predicate::eval_row(&resolved, &schema, row)?);
+        }
+        out_rows.push(vals);
+    }
+
+    let mut outcols = Vec::with_capacity(select.projection.len());
+    for (ci, item) in select.projection.iter().enumerate() {
+        let name = match item {
+            SelectItem::ExprWithAlias { alias, .. } => alias.value.clone(),
+            SelectItem::UnnamedExpr(e) => ident_name(e)
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| e.to_string()),
+            _ => format!("col{ci}"),
+        };
+        let ty = out_rows
+            .iter()
+            .map(|r| &r[ci])
+            .find(|v| !v.is_null())
+            .map(infer_val)
+            .unwrap_or(ColumnType::Text);
+        outcols.push(ColumnDef {
+            name,
+            ty,
+            nullable: true,
+        });
+    }
+    Ok(QueryResult::Rows(RowStream::literal(
+        Schema::new(outcols),
+        out_rows,
+    )))
 }
 
 /// Load a single FROM relation into `(qualified columns, rows)`. Column names
