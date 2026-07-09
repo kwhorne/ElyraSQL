@@ -713,6 +713,7 @@ async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec
                 int("NULLS"),
                 text("MIN_VALUE"),
                 text("MAX_VALUE"),
+                text("HISTOGRAM"),
             ]);
             let mut rows = Vec::new();
             for tname in names {
@@ -720,6 +721,17 @@ async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec
                     continue;
                 };
                 for c in &stats.columns {
+                    let hist = if c.hist.is_empty() {
+                        Value::Null
+                    } else {
+                        // MySQL-style: buckets as a JSON array of boundaries.
+                        let items: Vec<String> = c
+                            .hist
+                            .iter()
+                            .map(|b| format!("\"{}\"", b.replace('"', "\\\"")))
+                            .collect();
+                        Value::Text(format!("{{\"buckets\":[{}]}}", items.join(",")))
+                    };
                     rows.push(vec![
                         Value::Text(tname.clone()),
                         Value::Text(c.name.clone()),
@@ -727,6 +739,7 @@ async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec
                         Value::Int(c.nulls as i64),
                         c.min.clone().map(Value::Text).unwrap_or(Value::Null),
                         c.max.clone().map(Value::Text).unwrap_or(Value::Null),
+                        hist,
                     ]);
                 }
             }
@@ -3359,10 +3372,12 @@ async fn build_from(
             let est = match &t.relation {
                 TableFactor::Table { name, .. } => {
                     let n = name.0.last().map(|i| i.value.clone()).unwrap_or_default();
-                    catalog::load_stats(db, &n)
-                        .await?
-                        .map(|s| s.rows)
-                        .unwrap_or(u64::MAX)
+                    match catalog::load_stats(db, &n).await? {
+                        // Histogram-based estimate: table rows scaled by the
+                        // selectivity of the WHERE predicates on this table.
+                        Some(s) => estimate_filtered_rows(&s, conjuncts),
+                        None => u64::MAX,
+                    }
                 }
                 _ => u64::MAX,
             };
@@ -3448,6 +3463,71 @@ async fn build_from(
         }
     }
     Ok((cur_cols, cur_rows))
+}
+
+/// Estimate how many rows of a table survive the applicable WHERE predicates,
+/// using per-column histograms (falling back to the raw row count).
+fn estimate_filtered_rows(stats: &catalog::TableStats, conjuncts: &[Expr]) -> u64 {
+    let mut sel = 1.0f64;
+    for c in conjuncts {
+        if let Some((col, op, val)) = simple_pred(c) {
+            if let Some(cs) = stats
+                .columns
+                .iter()
+                .find(|s| s.name.eq_ignore_ascii_case(&col))
+            {
+                if let Some(s) = cs.selectivity(op, &val) {
+                    sel *= s.clamp(0.0, 1.0);
+                }
+            }
+        }
+    }
+    ((stats.rows as f64) * sel).round().max(0.0) as u64
+}
+
+/// Extract `(column, op, literal)` from a simple `col <op> literal` predicate
+/// (for histogram selectivity). Returns the unqualified column name.
+fn simple_pred(e: &Expr) -> Option<(String, catalog::SelOp, String)> {
+    use sqlparser::ast::BinaryOperator as B;
+    let Expr::BinaryOp { left, op, right } = e else {
+        return None;
+    };
+    let selop = match op {
+        B::Lt => catalog::SelOp::Lt,
+        B::LtEq => catalog::SelOp::Le,
+        B::Gt => catalog::SelOp::Gt,
+        B::GtEq => catalog::SelOp::Ge,
+        B::Eq => catalog::SelOp::Eq,
+        _ => return None,
+    };
+    // Accept `col OP literal` or `literal OP col` (flipping the operator).
+    let col_of = |x: &Expr| -> Option<String> {
+        match x {
+            Expr::Identifier(i) => Some(i.value.clone()),
+            Expr::CompoundIdentifier(parts) => parts.last().map(|i| i.value.clone()),
+            _ => None,
+        }
+    };
+    let lit_of = |x: &Expr| -> Option<String> {
+        match x {
+            Expr::Value(v) => Some(v.to_string().trim_matches('\'').to_string()),
+            _ => None,
+        }
+    };
+    if let (Some(c), Some(v)) = (col_of(left), lit_of(right)) {
+        return Some((c, selop, v));
+    }
+    if let (Some(c), Some(v)) = (col_of(right), lit_of(left)) {
+        let flipped = match selop {
+            catalog::SelOp::Lt => catalog::SelOp::Gt,
+            catalog::SelOp::Le => catalog::SelOp::Ge,
+            catalog::SelOp::Gt => catalog::SelOp::Lt,
+            catalog::SelOp::Ge => catalog::SelOp::Le,
+            catalog::SelOp::Eq => catalog::SelOp::Eq,
+        };
+        return Some((c, flipped, v));
+    }
+    None
 }
 
 /// Execute an all-INNER join chain over base tables in a cost-based order.
@@ -7156,6 +7236,28 @@ fn reorder(rows: &mut [Vec<Value>], keyed: &[(Vec<Value>, usize)]) {
 
 /// `ANALYZE TABLE`: count rows and persist statistics used for reporting
 /// (`information_schema.tables.TABLE_ROWS`) and planning.
+/// Build equi-height histogram boundaries (B+1 sorted wire-string values) from a
+/// column sample. Returns empty if the sample is too small to be useful.
+fn equi_height_hist(sample: &mut [Value], buckets: usize) -> Vec<String> {
+    if sample.len() < buckets * 2 {
+        return Vec::new();
+    }
+    sample.sort_by(|a, b| a.compare(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n = sample.len();
+    let mut out = Vec::with_capacity(buckets + 1);
+    for k in 0..=buckets {
+        let idx = (k * (n - 1)) / buckets;
+        if let Some(s) = sample[idx].to_wire_string() {
+            out.push(s);
+        }
+    }
+    // Only keep a monotonic, useful histogram.
+    if out.len() < 2 {
+        return Vec::new();
+    }
+    out
+}
+
 pub async fn analyze_table(db: &Session, name: &str) -> Result<QueryResult> {
     if !catalog::exists(db, name).await? {
         return Err(Error::Catalog(format!("no such table: {name}")));
@@ -7168,6 +7270,12 @@ pub async fn analyze_table(db: &Session, name: &str) -> Result<QueryResult> {
     let mut nulls = vec![0u64; ncols];
     let mut mins: Vec<Option<Value>> = vec![None; ncols];
     let mut maxs: Vec<Option<Value>> = vec![None; ncols];
+    // Reservoir sample per column for equi-height histograms.
+    const SAMPLE_CAP: usize = 20_000;
+    const HIST_BUCKETS: usize = 32;
+    let mut sample: Vec<Vec<Value>> = vec![Vec::new(); ncols];
+    let mut seen: Vec<u64> = vec![0; ncols];
+    let mut rng: u64 = 0x9E37_79B9_7F4A_7C15;
 
     let prefix = data_prefix(name);
     let mut cursor: Option<Vec<u8>> = None;
@@ -7207,6 +7315,19 @@ pub async fn analyze_table(db: &Session, name: &str) -> Result<QueryResult> {
                 {
                     maxs[i] = Some(val.clone());
                 }
+                // Reservoir sampling for the histogram.
+                seen[i] += 1;
+                if sample[i].len() < SAMPLE_CAP {
+                    sample[i].push(val.clone());
+                } else {
+                    rng ^= rng << 13;
+                    rng ^= rng >> 7;
+                    rng ^= rng << 17;
+                    let j = (rng % seen[i]) as usize;
+                    if j < SAMPLE_CAP {
+                        sample[i][j] = val.clone();
+                    }
+                }
             }
         }
         if last {
@@ -7221,6 +7342,7 @@ pub async fn analyze_table(db: &Session, name: &str) -> Result<QueryResult> {
             nulls: nulls[i],
             min: mins[i].as_ref().and_then(|v| v.to_wire_string()),
             max: maxs[i].as_ref().and_then(|v| v.to_wire_string()),
+            hist: equi_height_hist(&mut sample[i], HIST_BUCKETS),
         })
         .collect();
     let stats = catalog::TableStats { rows, columns };

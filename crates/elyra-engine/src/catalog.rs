@@ -152,6 +152,60 @@ pub struct ColStat {
     pub nulls: u64,
     pub min: Option<String>,
     pub max: Option<String>,
+    /// Equi-height histogram boundaries (B+1 sorted values as wire strings; the
+    /// B buckets each hold roughly `rows/B` values). Empty if not collected.
+    #[serde(default)]
+    pub hist: Vec<String>,
+}
+
+/// Numeric-aware comparison of two wire-string values (falls back to byte order).
+fn cmp_wire(a: &str, b: &str) -> std::cmp::Ordering {
+    match (a.parse::<f64>(), b.parse::<f64>()) {
+        (Ok(x), Ok(y)) => x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal),
+        _ => a.cmp(b),
+    }
+}
+
+impl ColStat {
+    /// Estimated fraction (0..=1) of non-null values strictly below `target`,
+    /// from the equi-height histogram. `None` if no histogram is available.
+    pub fn frac_below(&self, target: &str) -> Option<f64> {
+        if self.hist.len() < 2 {
+            return None;
+        }
+        let buckets = (self.hist.len() - 1) as f64;
+        let below = self
+            .hist
+            .iter()
+            .take_while(|b| cmp_wire(b, target) == std::cmp::Ordering::Less)
+            .count();
+        Some(((below as f64) / buckets).clamp(0.0, 1.0))
+    }
+
+    /// Estimated selectivity (0..=1) of `<column> op value` on this column.
+    pub fn selectivity(&self, op: SelOp, value: &str) -> Option<f64> {
+        match op {
+            SelOp::Lt | SelOp::Le => self.frac_below(value),
+            SelOp::Gt | SelOp::Ge => self.frac_below(value).map(|f| 1.0 - f),
+            SelOp::Eq => {
+                if self.ndv > 0 {
+                    Some(1.0 / self.ndv as f64)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+}
+
+/// Comparison kind for selectivity estimation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelOp {
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Eq,
 }
 
 /// Persisted table statistics (from `ANALYZE TABLE`).

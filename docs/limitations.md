@@ -53,11 +53,13 @@ implemented, so you can judge fit.
   outer joins, non-equi/multi-condition ON, and derived tables keep the
   written order.
 - `ANALYZE TABLE` records row-count and per-column statistics (NDV, null count,
-  min/max), surfaced as `information_schema.tables.TABLE_ROWS` and
-  `information_schema.column_statistics`. The planner drives a comma cross-join
-  from the smallest analyzed table and picks hash-join build sides by live size;
-  automatic reordering of explicit multi-table JOIN chains and full histogram-
-  based cardinality estimation are not yet implemented.
+  min/max, and an **equi-height histogram** built from a reservoir sample),
+  surfaced as `information_schema.tables.TABLE_ROWS` and
+  `information_schema.column_statistics` (including a JSON `HISTOGRAM`). The
+  planner estimates WHERE-predicate selectivity from the histograms to order
+  comma cross-joins by estimated (not just raw) row counts, reorders explicit
+  INNER-join chains cost-based, and picks hash-join build sides by live size.
+  Multi-column/correlated histograms are not modelled.
 - `ORDER BY` is memory-bounded: `ORDER BY ... LIMIT` uses a top-N heap, and
   large unbounded sorts spill sorted runs to temp files (external merge sort,
   `ELYRASQL_SORT_MAX_ROWS`). `GROUP BY` with many distinct groups falls back to
