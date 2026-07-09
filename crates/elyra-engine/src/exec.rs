@@ -1215,7 +1215,7 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
     let rows: Vec<Vec<Value>> = match source_rows(source)? {
         Some(expr_rows) => {
             let mut out = Vec::with_capacity(expr_rows.len());
-            for exprs in &expr_rows {
+            for exprs in expr_rows {
                 out.push(exprs.iter().map(eval_expr).collect::<Result<Vec<_>>>()?);
             }
             out
@@ -1260,9 +1260,10 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
         None => Vec::new(),
     };
     let on_dup = !dup_sets.is_empty();
+    let has_pk = def.has_pk();
 
     // Load rowid counter once for tables without a PK.
-    let mut next_rowid = if def.has_pk() {
+    let mut next_rowid = if has_pk {
         0
     } else {
         read_rowid(db, &name).await?
@@ -1316,6 +1317,9 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
         Ok(merged)
     };
 
+    // Pass 1: build every row (coerce, defaults, AUTO_INCREMENT, generated,
+    // NOT NULL) and its clustered key — no per-row storage reads.
+    let mut built: Vec<(Vec<u8>, Vec<Value>)> = Vec::with_capacity(rows.len());
     for vals in rows {
         if vals.len() != target.len() {
             return Err(Error::Query(format!(
@@ -1332,17 +1336,14 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
         }
 
         if has_meta {
-            // Defaults for columns not supplied (and not generated).
             for i in 0..ncols {
                 if !provided[i] && generated_exprs[i].is_none() {
                     if let Some(de) = &default_exprs[i] {
-                        let v = eval_expr(de)?;
                         let col = &def.schema.columns[i];
-                        row[i] = coerce(v, &col.ty, &col.name)?;
+                        row[i] = coerce(eval_expr(de)?, &col.ty, &col.name)?;
                     }
                 }
             }
-            // AUTO_INCREMENT: assign the next value when omitted / NULL / 0.
             if let Some(ai) = auto_col {
                 let need = !provided[ai] || row[ai].is_null() || matches!(row[ai], Value::Int(0));
                 if need {
@@ -1354,17 +1355,18 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
                     }
                 }
             }
-            // Stored generated columns, computed after the rest.
             for i in 0..ncols {
                 if let Some(ge) = &generated_exprs[i] {
-                    let v = predicate::eval_row(ge, &def.schema, &row)?;
                     let col = &def.schema.columns[i];
-                    row[i] = coerce(v, &col.ty, &col.name)?;
+                    row[i] = coerce(
+                        predicate::eval_row(ge, &def.schema, &row)?,
+                        &col.ty,
+                        &col.name,
+                    )?;
                 }
             }
         }
 
-        // Enforce NOT NULL.
         for (i, col) in def.schema.columns.iter().enumerate() {
             if !col.nullable && row[i].is_null() {
                 return Err(Error::Query(format!(
@@ -1374,15 +1376,32 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
             }
         }
 
-        if !def.has_pk() {
+        let key = if has_pk {
+            let pk_vals: Vec<Value> = def.pk_cols.iter().map(|&i| row[i].clone()).collect();
+            data_key(&name, &keyenc::encode_key(&pk_vals)?)
+        } else {
             next_rowid += 1;
-            batch.push((data_key(&name, &keyenc::encode_rowid(next_rowid)), row));
+            data_key(&name, &keyenc::encode_rowid(next_rowid))
+        };
+        built.push((key, row));
+    }
+
+    // One batched existence read for the whole statement (PK tables) instead of
+    // a read per row — the bulk-insert hot path.
+    let existing: Vec<Option<Vec<u8>>> = if has_pk {
+        let keys: Vec<Vec<u8>> = built.iter().map(|(k, _)| k.clone()).collect();
+        db.multi_get(keys).await?
+    } else {
+        Vec::new()
+    };
+
+    // Pass 2: apply INSERT / upsert semantics using the batched existence info.
+    for (i, (key, row)) in built.into_iter().enumerate() {
+        if !has_pk {
+            batch.push((key, row));
             affected += 1;
             continue;
         }
-
-        let pk_vals: Vec<Value> = def.pk_cols.iter().map(|&i| row[i].clone()).collect();
-        let key = data_key(&name, &keyenc::encode_key(&pk_vals)?);
 
         // Coalesce with an earlier row in the same statement.
         if let Some(&pos) = pos_of.get(&key) {
@@ -1401,7 +1420,7 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
         }
 
         // Coalesce with an existing row in storage.
-        if let Some(old_enc) = db.get(key.clone()).await? {
+        if let Some(old_enc) = existing.get(i).and_then(|o| o.as_ref()) {
             if !replace && !on_dup {
                 if ignore {
                     continue;
@@ -1411,8 +1430,7 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
                 )));
             }
             let old_row: Vec<Value> =
-                bincode::deserialize(&old_enc).map_err(|e| Error::Storage(e.to_string()))?;
-            // The old row's index entries must go (data key is overwritten).
+                bincode::deserialize(old_enc).map_err(|e| Error::Storage(e.to_string()))?;
             deletes.extend(index::entry_keys_for_row(&def, &old_row, &key)?);
             let new_row = if replace {
                 row
@@ -1428,7 +1446,6 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
             affected += 1;
         }
     }
-
     // Materialise the batch into data + index puts.
     let mut puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(batch.len() + 2);
     for (key, row) in &batch {
@@ -5574,9 +5591,9 @@ async fn read_rowid(db: &Session, table: &str) -> Result<u64> {
 }
 
 /// Extract literal value rows from an `INSERT ... VALUES` source.
-fn source_rows(source: &SqlQuery) -> Result<Option<Vec<Vec<sqlparser::ast::Expr>>>> {
+fn source_rows(source: &SqlQuery) -> Result<Option<&[Vec<sqlparser::ast::Expr>]>> {
     match source.body.as_ref() {
-        SetExpr::Values(values) => Ok(Some(values.rows.clone())),
+        SetExpr::Values(values) => Ok(Some(&values.rows)),
         _ => Ok(None),
     }
 }

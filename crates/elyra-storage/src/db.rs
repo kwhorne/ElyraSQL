@@ -200,13 +200,18 @@ fn writer_loop(storage: Arc<Storage>, mut rx: mpsc::Receiver<WriteJob>) {
             }
         }
 
-        let mut puts = Vec::new();
-        let mut deletes = Vec::new();
-        for j in &jobs {
-            puts.extend_from_slice(&j.puts);
-            deletes.extend_from_slice(&j.deletes);
-        }
-        let result = storage.apply(&puts, &deletes);
+        // Fast path: a single job applies its own buffers with no copying.
+        let result = if jobs.len() == 1 {
+            storage.apply(&jobs[0].puts, &jobs[0].deletes)
+        } else {
+            let mut puts = Vec::new();
+            let mut deletes = Vec::new();
+            for j in &jobs {
+                puts.extend_from_slice(&j.puts);
+                deletes.extend_from_slice(&j.deletes);
+            }
+            storage.apply(&puts, &deletes)
+        };
         for job in jobs {
             let r = match &result {
                 Ok(()) => Ok(()),
