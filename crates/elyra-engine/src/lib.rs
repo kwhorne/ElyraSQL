@@ -180,6 +180,58 @@ impl Engine {
             return Ok(vec![exec::purge_binary_logs(sess, &to).await?]);
         }
 
+        // Stored procedures (CREATE/DROP PROCEDURE, CALL): the MySQL BEGIN..END
+        // body is not parsed by the SQL frontend, so handle it here.
+        if head.starts_with("create procedure") || head.starts_with("create or replace procedure") {
+            if privilege < Privilege::Admin {
+                return Err(Error::Query(
+                    "access denied: CREATE PROCEDURE requires ADMIN privilege".into(),
+                ));
+            }
+            let (name, body) = parse_create_procedure(trimmed)?;
+            sess.commit_write(vec![(catalog::proc_key(&name), body.into_bytes())], vec![])
+                .await?;
+            return Ok(vec![QueryResult::empty_ok()]);
+        }
+        if head.starts_with("drop procedure") {
+            if privilege < Privilege::Admin {
+                return Err(Error::Query(
+                    "access denied: DROP PROCEDURE requires ADMIN privilege".into(),
+                ));
+            }
+            let toks: Vec<&str> = trimmed.split_whitespace().collect();
+            let name = toks
+                .iter()
+                .position(|t| t.eq_ignore_ascii_case("procedure"))
+                .and_then(|i| toks.get(i + 1))
+                .map(|s| s.trim_matches(['`', '"', ';', '(']).to_string())
+                .filter(|s| !s.eq_ignore_ascii_case("if"))
+                .ok_or_else(|| Error::Parse("DROP PROCEDURE requires a name".into()))?;
+            sess.commit_write(vec![], vec![catalog::proc_key(&name)])
+                .await?;
+            return Ok(vec![QueryResult::empty_ok()]);
+        }
+        if head.starts_with("call ") {
+            let name = trimmed[4..]
+                .trim()
+                .split(['(', ' ', ';'])
+                .next()
+                .unwrap_or("")
+                .trim_matches(['`', '"'])
+                .to_string();
+            let body = match sess.get(catalog::proc_key(&name)).await? {
+                Some(b) => String::from_utf8_lossy(&b).into_owned(),
+                None => return Err(Error::Query(format!("procedure does not exist: {name}"))),
+            };
+            sess.enter_call()?;
+            let r = Box::pin(self.execute_as(&body, privilege, user, sess)).await;
+            sess.leave_call();
+            return r.map(|mut out| {
+                // Return the last statement's result (empty if none).
+                out.pop().map(|last| vec![last]).unwrap_or_default()
+            });
+        }
+
         // User management (CREATE USER / GRANT / REVOKE / ...): parsed and
         // executed here, not by the SQL frontend.
         if users::is_user_stmt(trimmed) {
@@ -474,6 +526,37 @@ fn stmt_targets(stmt: &Statement) -> Vec<String> {
         } => names.iter().filter_map(object_name_last).collect(),
         _ => vec![],
     }
+}
+
+/// Parse `CREATE [OR REPLACE] PROCEDURE name(...) BEGIN <body> END` into the
+/// procedure name and the body (the statements between BEGIN and END).
+fn parse_create_procedure(sql: &str) -> Result<(String, String)> {
+    let lower = sql.to_ascii_lowercase();
+    let after_proc = lower
+        .find("procedure")
+        .map(|i| i + "procedure".len())
+        .ok_or_else(|| Error::Parse("malformed CREATE PROCEDURE".into()))?;
+    // Name: from after PROCEDURE up to '(' or whitespace.
+    let rest = sql[after_proc..].trim_start();
+    let name: String = rest
+        .chars()
+        .take_while(|c| !c.is_whitespace() && *c != '(')
+        .collect();
+    let name = name.trim_matches(['`', '"']).to_string();
+    if name.is_empty() {
+        return Err(Error::Parse("CREATE PROCEDURE requires a name".into()));
+    }
+    // Body: between the first BEGIN and the last END.
+    let begin = lower
+        .find("begin")
+        .map(|i| i + "begin".len())
+        .ok_or_else(|| Error::Parse("CREATE PROCEDURE requires a BEGIN ... END body".into()))?;
+    let end = lower
+        .rfind("end")
+        .filter(|e| *e >= begin)
+        .ok_or_else(|| Error::Parse("CREATE PROCEDURE requires a BEGIN ... END body".into()))?;
+    let body = sql[begin..end].trim().to_string();
+    Ok((name, body))
 }
 
 fn required_privilege(stmt: &Statement) -> Privilege {

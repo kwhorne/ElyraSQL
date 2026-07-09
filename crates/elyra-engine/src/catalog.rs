@@ -165,6 +165,11 @@ pub fn stats_key(table: &str) -> Vec<u8> {
     format!("stats::{table}").into_bytes()
 }
 
+/// Key under which a stored procedure's body is stored.
+pub fn proc_key(name: &str) -> Vec<u8> {
+    format!("sys::proc::{}", name.to_ascii_lowercase()).into_bytes()
+}
+
 /// Load a table's statistics, if it has been analyzed.
 pub async fn load_stats(db: &Session, table: &str) -> Result<Option<TableStats>> {
     match db.get(stats_key(table)).await? {

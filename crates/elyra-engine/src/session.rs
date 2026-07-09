@@ -54,6 +54,8 @@ pub struct Session {
     db: Db,
     txn: Mutex<Option<TxnState>>,
     isolation: Mutex<Isolation>,
+    /// Nested `CALL` depth (guards against runaway procedure recursion).
+    call_depth: std::sync::atomic::AtomicUsize,
 }
 
 fn is_meta(k: &[u8]) -> bool {
@@ -66,7 +68,26 @@ impl Session {
             db,
             txn: Mutex::new(None),
             isolation: Mutex::new(Isolation::Snapshot),
+            call_depth: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    /// Enter a `CALL`; errors if procedure recursion is too deep.
+    pub fn enter_call(&self) -> Result<()> {
+        use std::sync::atomic::Ordering;
+        const MAX_CALL_DEPTH: usize = 32;
+        let d = self.call_depth.fetch_add(1, Ordering::SeqCst);
+        if d >= MAX_CALL_DEPTH {
+            self.call_depth.fetch_sub(1, Ordering::SeqCst);
+            return Err(Error::Query("stored procedure recursion too deep".into()));
+        }
+        Ok(())
+    }
+
+    /// Leave a `CALL`.
+    pub fn leave_call(&self) {
+        self.call_depth
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub fn set_isolation(&self, level: Isolation) {

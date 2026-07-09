@@ -9,9 +9,12 @@ implemented, so you can judge fit.
   including over joins), derived tables, CTEs (`WITH`, including
   `WITH RECURSIVE`), `HAVING`, window functions with explicit `ROWS`/`RANGE`
   frames, set operations, and `FROM`-less `SELECT` are supported.
+- Stored procedures are supported as statement-list macros: `CREATE PROCEDURE
+  name() BEGIN ...; END`, `CALL name()`, `DROP PROCEDURE` (recursion-guarded).
+  Parameters, variables, and control flow (IF/LOOP/WHILE) are not yet supported.
 - Not yet: named windows, `RANGE`/`GROUPS` numeric-offset frames, correlated
-  subqueries combined with aggregation over a join, triggers, stored
-  procedures, user-defined functions, and events.
+  subqueries combined with aggregation over a join, triggers, user-defined
+  functions, and events.
 
 ## Constraints & integrity
 
