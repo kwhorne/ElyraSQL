@@ -30,14 +30,14 @@ elyra-vector = { path = "crates/elyra-vector" }
 elyra-server = { path = "crates/elyra-server" }
 
 # SQL frontend (shared parser)
-sqlparser = "0.53"
+sqlparser = "0.62"
 
 # Regular expressions (REGEXP / RLIKE)
 regex = "1"
 
 # Single-file ACID storage engine
-redb = "2.2"
-bincode = "1.3"
+redb = "4.1"
+bincode = "3.0"
 
 # Async runtime + MySQL wire protocol
 tokio = { version = "1", features = ["full"] }
