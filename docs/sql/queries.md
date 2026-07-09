@@ -144,8 +144,31 @@ SELECT region, total FROM regional WHERE total > 1000 ORDER BY total DESC;
 ```
 
 CTEs are inlined as derived tables. Multiple, chained CTEs (a later CTE
-referencing an earlier one) work; `WITH RECURSIVE` is not supported.
+referencing an earlier one) work.
+
+### Recursive CTEs (WITH RECURSIVE)
+
+```sql
+WITH RECURSIVE seq(n) AS (
+    SELECT 1
+    UNION ALL
+    SELECT n + 1 FROM seq WHERE n < 10
+)
+SELECT n FROM seq;
+
+-- graph reachability (UNION deduplicates, so cycles terminate)
+WITH RECURSIVE reach(node) AS (
+    SELECT 1
+    UNION
+    SELECT e.dst FROM edges e JOIN reach r ON e.src = r.node
+)
+SELECT node FROM reach ORDER BY node;
+```
+
+The recursive body must be `anchor UNION [ALL] recursive`, with exactly one
+self-referencing branch. `UNION` deduplicates (so cyclic graphs terminate);
+`UNION ALL` does not and is capped at 1000 iterations. `FROM`-less anchors
+(`SELECT 1`) are supported.
 
 !!! note "Not yet supported"
-    Window functions, `WITH RECURSIVE`, and correlated subqueries combined with
-    joins are not supported yet.
+    Correlated subqueries combined with joins are not supported yet.

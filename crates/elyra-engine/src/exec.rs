@@ -560,8 +560,12 @@ pub async fn select(
     vindex: &VectorRegistry,
     query: &SqlQuery,
 ) -> Result<QueryResult> {
-    // Expand CTEs (WITH ...) into derived tables, then execute.
-    if query.with.is_some() {
+    // Expand CTEs (WITH ...) into derived tables, then execute. Recursive CTEs
+    // take a fixpoint-materialisation path via temporary relations.
+    if let Some(w) = &query.with {
+        if w.recursive {
+            return Box::pin(execute_recursive_cte(db, vindex, query)).await;
+        }
         let expanded = expand_ctes(query)?;
         return Box::pin(select(db, vindex, &expanded)).await;
     }
@@ -623,6 +627,52 @@ pub async fn select(
             limit,
         )
         .await;
+    }
+
+    // FROM-less SELECT (e.g. `SELECT 1`, recursive-CTE anchors): one row.
+    if select.from.is_empty() {
+        use sqlparser::ast::SelectItem;
+        let empty = Schema::new(Vec::new());
+        let empty_row: Vec<Value> = Vec::new();
+        let pass = match &raw_filter {
+            Some(f) => {
+                let rf = resolve_subqueries(db, vindex, f.clone()).await?;
+                predicate::matches(&rf, &empty, &empty_row)?
+            }
+            None => true,
+        };
+        let mut cols = Vec::with_capacity(select.projection.len());
+        let mut vals = Vec::with_capacity(select.projection.len());
+        for (ci, item) in select.projection.iter().enumerate() {
+            let expr = match item {
+                SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => e,
+                other => {
+                    return Err(Error::Unsupported(format!(
+                        "projection item not supported without FROM: {other}"
+                    )))
+                }
+            };
+            let e = resolve_subqueries(db, vindex, expr.clone()).await?;
+            let v = predicate::eval_row(&e, &empty, &empty_row)?;
+            let name = match item {
+                SelectItem::ExprWithAlias { alias, .. } => alias.value.clone(),
+                SelectItem::UnnamedExpr(e) => ident_name(e)
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| e.to_string()),
+                _ => format!("col{ci}"),
+            };
+            cols.push(ColumnDef {
+                name,
+                ty: infer_val(&v),
+                nullable: true,
+            });
+            vals.push(v);
+        }
+        let rows = if pass { vec![vals] } else { Vec::new() };
+        return Ok(QueryResult::Rows(RowStream::literal(
+            Schema::new(cols),
+            rows,
+        )));
     }
 
     if select.from.len() != 1 {
@@ -2236,9 +2286,6 @@ fn expand_ctes(query: &SqlQuery) -> Result<SqlQuery> {
     let Some(with) = &query.with else {
         return Ok(query.clone());
     };
-    if with.recursive {
-        return Err(Error::Unsupported("WITH RECURSIVE is not supported".into()));
-    }
 
     let mut map: HashMap<String, SqlQuery> = HashMap::new();
     for cte in &with.cte_tables {
@@ -2744,6 +2791,297 @@ fn agg_over(name: &str, vals: &[Value], count_star: usize) -> Value {
             Value::Null
         }
     }
+}
+
+static TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn unique_temp_name(base: &str) -> String {
+    let n = TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let clean: String = base.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+    format!("__cte_{n}_{clean}")
+}
+
+/// Execute a `WITH RECURSIVE` query. Each CTE is materialised into a temporary
+/// relation (recursive ones by fixpoint iteration); references are rewritten to
+/// the temp relations; the outer query is then run and the temps dropped.
+async fn execute_recursive_cte(
+    db: &Session,
+    vindex: &VectorRegistry,
+    query: &SqlQuery,
+) -> Result<QueryResult> {
+    let with = query.with.as_ref().expect("with present");
+    let mut temp_names: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let mut created: Vec<String> = Vec::new();
+
+    let result = async {
+        for cte in &with.cte_tables {
+            let cname = cte.alias.name.value.clone();
+            let temp = unique_temp_name(&cname);
+            // Rewrite references to earlier CTEs in this body.
+            let body = rewrite_table_refs((*cte.query).clone(), &temp_names);
+            let alias_cols: Vec<String> = cte
+                .alias
+                .columns
+                .iter()
+                .map(|c| c.name.value.clone())
+                .collect();
+
+            if query_refs_table(&body, &cname) {
+                materialize_recursive(db, vindex, &temp, &cname, &body, &alias_cols).await?;
+            } else {
+                let (schema, rows) = run_subquery_schema(db, vindex, &body).await?;
+                let schema = apply_col_aliases(schema, &alias_cols);
+                create_temp_table(db, &temp, &schema).await?;
+                fill_table(db, &temp, &schema, &rows).await?;
+            }
+            created.push(temp.clone());
+            temp_names.insert(cname.to_ascii_lowercase(), temp);
+        }
+
+        // Run the outer query against the temp relations, fully materialised.
+        let mut outer = query.clone();
+        outer.with = None;
+        let outer = rewrite_table_refs(outer, &temp_names);
+        run_subquery_schema(db, vindex, &outer).await
+    }
+    .await;
+
+    // Always drop the temporary relations.
+    for t in &created {
+        let _ = drop_table(db, t, true).await;
+    }
+
+    let (schema, rows) = result?;
+    Ok(QueryResult::Rows(RowStream::literal(schema, rows)))
+}
+
+/// Fixpoint materialisation of a recursive CTE into temp table `temp`.
+async fn materialize_recursive(
+    db: &Session,
+    vindex: &VectorRegistry,
+    temp: &str,
+    cname: &str,
+    body: &SqlQuery,
+    alias_cols: &[String],
+) -> Result<()> {
+    const MAX_ITERS: usize = 1000;
+    let (distinct, anchor_q, rec_q) = split_recursive(body, cname)?;
+
+    let (schema, anchor_rows) = run_subquery_schema(db, vindex, &anchor_q).await?;
+    let schema = apply_col_aliases(schema, alias_cols);
+    create_temp_table(db, temp, &schema).await?;
+
+    let row_key = |r: &[Value]| -> Vec<u8> { bincode::serialize(r).unwrap_or_default() };
+    let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+    let mut all_rows: Vec<Vec<Value>> = Vec::new();
+    let mut frontier: Vec<Vec<Value>> = Vec::new();
+    for r in anchor_rows {
+        if !distinct || seen.insert(row_key(&r)) {
+            all_rows.push(r.clone());
+            frontier.push(r);
+        }
+    }
+
+    // Rewrite the recursive term's self-reference to the temp relation.
+    let mut self_map = std::collections::HashMap::new();
+    self_map.insert(cname.to_ascii_lowercase(), temp.to_string());
+    let rec_q = rewrite_table_refs(rec_q, &self_map);
+
+    let mut iters = 0;
+    while !frontier.is_empty() {
+        iters += 1;
+        if iters > MAX_ITERS {
+            return Err(Error::Query(format!(
+                "recursive CTE '{cname}' exceeded {MAX_ITERS} iterations"
+            )));
+        }
+        // The recursive term sees only the previous iteration's rows.
+        clear_table(db, temp).await?;
+        fill_table(db, temp, &schema, &frontier).await?;
+
+        let new_rows = run_subquery(db, vindex, &rec_q).await?;
+        let mut fresh: Vec<Vec<Value>> = Vec::new();
+        for r in new_rows {
+            if !distinct || seen.insert(row_key(&r)) {
+                fresh.push(r);
+            }
+        }
+        if fresh.is_empty() {
+            break;
+        }
+        all_rows.extend(fresh.iter().cloned());
+        frontier = fresh;
+    }
+
+    // Final contents: the full accumulated set.
+    clear_table(db, temp).await?;
+    fill_table(db, temp, &schema, &all_rows).await?;
+    Ok(())
+}
+
+/// Split a recursive CTE body `anchor UNION [ALL] recursive` into its parts.
+/// Returns `(distinct, anchor_query, recursive_query)`.
+fn split_recursive(body: &SqlQuery, cname: &str) -> Result<(bool, SqlQuery, SqlQuery)> {
+    use sqlparser::ast::{SetOperator, SetQuantifier};
+    let SetExpr::SetOperation {
+        op: SetOperator::Union,
+        set_quantifier,
+        left,
+        right,
+    } = body.body.as_ref()
+    else {
+        return Err(Error::Unsupported(
+            "recursive CTE must be an anchor UNION [ALL] recursive query".into(),
+        ));
+    };
+    let distinct = !matches!(
+        set_quantifier,
+        SetQuantifier::All | SetQuantifier::AllByName
+    );
+
+    let wrap = |b: &SetExpr| -> SqlQuery {
+        let mut q = body.clone();
+        q.body = Box::new(b.clone());
+        q.with = None;
+        q
+    };
+    let left_rec = setexpr_refs_table(left, cname);
+    let right_rec = setexpr_refs_table(right, cname);
+    match (left_rec, right_rec) {
+        (false, true) => Ok((distinct, wrap(left), wrap(right))),
+        (true, false) => Ok((distinct, wrap(right), wrap(left))),
+        _ => Err(Error::Unsupported(
+            "recursive CTE must have exactly one self-referencing branch".into(),
+        )),
+    }
+}
+
+/// Rename plain table references matching a CTE name to its temp relation,
+/// aliased back to the CTE name so `cte.col` references keep resolving.
+fn rewrite_table_refs(
+    mut query: SqlQuery,
+    map: &std::collections::HashMap<String, String>,
+) -> SqlQuery {
+    fn fix(tf: &mut TableFactor, map: &std::collections::HashMap<String, String>) {
+        if let TableFactor::Table { name, alias, .. } = tf {
+            if let Some(last) = name.0.last() {
+                if let Some(temp) = map.get(&last.value.to_ascii_lowercase()) {
+                    let orig = last.value.clone();
+                    *name = ObjectName(vec![sqlparser::ast::Ident::new(temp.clone())]);
+                    if alias.is_none() {
+                        *alias = Some(sqlparser::ast::TableAlias {
+                            name: sqlparser::ast::Ident::new(orig),
+                            columns: Vec::new(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    fn walk(body: &mut SetExpr, map: &std::collections::HashMap<String, String>) {
+        match body {
+            SetExpr::Select(s) => {
+                for twj in &mut s.from {
+                    fix(&mut twj.relation, map);
+                    for j in &mut twj.joins {
+                        fix(&mut j.relation, map);
+                    }
+                }
+            }
+            SetExpr::SetOperation { left, right, .. } => {
+                walk(left, map);
+                walk(right, map);
+            }
+            SetExpr::Query(q) => walk(&mut q.body, map),
+            _ => {}
+        }
+    }
+    walk(&mut query.body, map);
+    query
+}
+
+fn query_refs_table(query: &SqlQuery, name: &str) -> bool {
+    setexpr_refs_table(&query.body, name)
+}
+
+fn setexpr_refs_table(body: &SetExpr, name: &str) -> bool {
+    match body {
+        SetExpr::Select(s) => s.from.iter().any(|twj| {
+            factor_refs(&twj.relation, name)
+                || twj.joins.iter().any(|j| factor_refs(&j.relation, name))
+        }),
+        SetExpr::SetOperation { left, right, .. } => {
+            setexpr_refs_table(left, name) || setexpr_refs_table(right, name)
+        }
+        SetExpr::Query(q) => setexpr_refs_table(&q.body, name),
+        _ => false,
+    }
+}
+
+fn factor_refs(tf: &TableFactor, name: &str) -> bool {
+    matches!(tf, TableFactor::Table { name: n, .. }
+        if n.0.last().is_some_and(|i| i.value.eq_ignore_ascii_case(name)))
+}
+
+fn apply_col_aliases(mut schema: Schema, alias_cols: &[String]) -> Schema {
+    if !alias_cols.is_empty() {
+        for (col, new) in schema.columns.iter_mut().zip(alias_cols.iter()) {
+            col.name = new.clone();
+        }
+    }
+    schema
+}
+
+async fn create_temp_table(db: &Session, name: &str, schema: &Schema) -> Result<()> {
+    let def = TableDef {
+        name: name.to_string(),
+        schema: schema.clone(),
+        pk_cols: Vec::new(),
+        indexes: Vec::new(),
+    };
+    db.commit_write(vec![(catalog_key(name), def.encode()?)], vec![])
+        .await?;
+    Ok(())
+}
+
+async fn fill_table(db: &Session, name: &str, schema: &Schema, rows: &[Vec<Value>]) -> Result<()> {
+    let mut puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(rows.len() + 1);
+    let mut rowid = read_rowid(db, name).await?;
+    for r in rows {
+        rowid += 1;
+        let mut row = vec![Value::Null; schema.columns.len()];
+        for (i, col) in schema.columns.iter().enumerate() {
+            if let Some(v) = r.get(i) {
+                row[i] = coerce(v.clone(), &col.ty, &col.name)?;
+            }
+        }
+        let encoded = bincode::serialize(&row).map_err(|e| Error::Storage(e.to_string()))?;
+        puts.push((data_key(name, &keyenc::encode_rowid(rowid)), encoded));
+    }
+    puts.push((rowid_key(name), rowid.to_le_bytes().to_vec()));
+    db.commit_write(puts, vec![]).await?;
+    Ok(())
+}
+
+async fn clear_table(db: &Session, name: &str) -> Result<()> {
+    let prefix = data_prefix(name);
+    let mut deletes = vec![rowid_key(name)];
+    let mut cursor: Option<Vec<u8>> = None;
+    loop {
+        let batch = db.scan_batch(prefix.clone(), cursor.clone(), 4096).await?;
+        if batch.is_empty() {
+            break;
+        }
+        cursor = batch.last().map(|(k, _)| k.clone());
+        let last = batch.len() < 4096;
+        deletes.extend(batch.into_iter().map(|(k, _)| k));
+        if last {
+            break;
+        }
+    }
+    db.commit_write(vec![], deletes).await?;
+    Ok(())
 }
 
 /// True if a projection contains any subquery (scalar/IN/EXISTS).
