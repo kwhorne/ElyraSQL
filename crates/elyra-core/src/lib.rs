@@ -12,7 +12,7 @@ pub mod users;
 pub mod value;
 
 pub use error::{Error, Result};
-pub use types::{ColumnDef, ColumnType, Schema};
+pub use types::{Collation, ColumnDef, ColumnType, Schema};
 pub use value::{fold, Value};
 
 use serde::{Deserialize, Serialize};

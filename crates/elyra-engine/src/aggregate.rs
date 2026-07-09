@@ -220,6 +220,7 @@ pub fn build_plan(
                 name: alias.unwrap_or_else(|| expr.to_string()),
                 ty,
                 nullable: true,
+                collation: elyra_core::Collation::Ci,
             });
             let separator = agg_separator(f);
             let idx = aggs.len();
@@ -239,6 +240,7 @@ pub fn build_plan(
                 name: alias.unwrap_or_else(|| schema.columns[idx].name.clone()),
                 ty: schema.columns[idx].ty.clone(),
                 nullable: schema.columns[idx].nullable,
+                collation: elyra_core::Collation::Ci,
             });
             plan.push(OutCol::Column(idx));
         }

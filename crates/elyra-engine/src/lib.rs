@@ -49,6 +49,7 @@ impl QueryResult {
             name: col.into(),
             ty,
             nullable: true,
+            collation: elyra_core::Collation::Ci,
         }]);
         QueryResult::Rows(RowStream::literal(schema, vec![vec![value]]))
     }

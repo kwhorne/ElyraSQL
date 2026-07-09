@@ -76,9 +76,26 @@ impl Value {
     /// SQL comparison with implicit cross-type coercion. `None` when either
     /// operand is NULL (three-valued logic) or the types are incomparable.
     pub fn compare(&self, other: &Value) -> Option<Ordering> {
+        self.compare_coll(other, crate::Collation::Ci)
+    }
+
+    /// Compare under an explicit text collation (`Bin` = case-sensitive).
+    pub fn compare_coll(&self, other: &Value, coll: crate::Collation) -> Option<Ordering> {
         use Value::*;
         if self.is_null() || other.is_null() {
             return None;
+        }
+        // Case-sensitive text comparison for the binary collation.
+        if coll.is_bin() {
+            match (self, other) {
+                (Text(a), Text(b))
+                | (Json(a), Json(b))
+                | (Json(a), Text(b))
+                | (Text(b), Json(a)) => {
+                    return Some(a.cmp(b));
+                }
+                _ => {}
+            }
         }
         match (self, other) {
             (Date(_), _) | (_, Date(_)) => {

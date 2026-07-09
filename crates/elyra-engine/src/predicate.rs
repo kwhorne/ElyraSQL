@@ -3,7 +3,7 @@
 //! Unlike [`crate::eval`] (literals only), this evaluates expressions that
 //! reference columns, resolved against a row + its schema.
 
-use elyra_core::{Error, Result, Schema, Value};
+use elyra_core::{Collation, Error, Result, Schema, Value};
 use sqlparser::ast::{BinaryOperator, Expr, UnaryOperator, Value as SqlValue};
 
 /// Evaluate `expr` against a row. Column identifiers resolve via `schema`.
@@ -78,8 +78,9 @@ pub fn eval_row(expr: &Expr, schema: &Schema, row: &[Value]) -> Result<Value> {
             let v = eval_row(expr, schema, row)?;
             let lo = eval_row(low, schema, row)?;
             let hi = eval_row(high, schema, row)?;
-            let inside = cmp(&v, &lo)?.map(|o| o.is_ge()).unwrap_or(false)
-                && cmp(&v, &hi)?.map(|o| o.is_le()).unwrap_or(false);
+            let coll = expr_collation(expr, schema).unwrap_or(Collation::Ci);
+            let inside = cmp(&v, &lo, coll)?.map(|o| o.is_ge()).unwrap_or(false)
+                && cmp(&v, &hi, coll)?.map(|o| o.is_le()).unwrap_or(false);
             Ok(Value::Bool(if *negated { !inside } else { inside }))
         }
         Expr::BinaryOp { left, op, right } => match op {
@@ -1643,9 +1644,9 @@ fn binary(
     l: Value,
     op: &BinaryOperator,
     eval_right: impl FnOnce() -> Result<Value>,
-    _lexpr: &Expr,
-    _rexpr: &Expr,
-    _schema: &Schema,
+    lexpr: &Expr,
+    rexpr: &Expr,
+    schema: &Schema,
     _row: &[Value],
 ) -> Result<Value> {
     use BinaryOperator::*;
@@ -1662,22 +1663,26 @@ fn binary(
     if matches!(op, Eq | NotEq | Lt | LtEq | Gt | GtEq) && (l.is_null() || r.is_null()) {
         return Ok(Value::Null);
     }
+    // A binary-collation column operand makes the text comparison case-sensitive.
+    let coll = cmp_collation(lexpr, rexpr, schema);
     match op {
         Eq => Ok(Value::Bool(
-            cmp(&l, &r)?.map(|o| o.is_eq()).unwrap_or(false),
+            cmp(&l, &r, coll)?.map(|o| o.is_eq()).unwrap_or(false),
         )),
-        NotEq => Ok(Value::Bool(cmp(&l, &r)?.map(|o| o.is_ne()).unwrap_or(true))),
+        NotEq => Ok(Value::Bool(
+            cmp(&l, &r, coll)?.map(|o| o.is_ne()).unwrap_or(true),
+        )),
         Lt => Ok(Value::Bool(
-            cmp(&l, &r)?.map(|o| o.is_lt()).unwrap_or(false),
+            cmp(&l, &r, coll)?.map(|o| o.is_lt()).unwrap_or(false),
         )),
         LtEq => Ok(Value::Bool(
-            cmp(&l, &r)?.map(|o| o.is_le()).unwrap_or(false),
+            cmp(&l, &r, coll)?.map(|o| o.is_le()).unwrap_or(false),
         )),
         Gt => Ok(Value::Bool(
-            cmp(&l, &r)?.map(|o| o.is_gt()).unwrap_or(false),
+            cmp(&l, &r, coll)?.map(|o| o.is_gt()).unwrap_or(false),
         )),
         GtEq => Ok(Value::Bool(
-            cmp(&l, &r)?.map(|o| o.is_ge()).unwrap_or(false),
+            cmp(&l, &r, coll)?.map(|o| o.is_ge()).unwrap_or(false),
         )),
         Plus | Minus | Multiply | Divide | Modulo => arith(l, op, r),
         BitwiseAnd | BitwiseOr | BitwiseXor | PGBitwiseShiftLeft | PGBitwiseShiftRight => {
@@ -1736,9 +1741,31 @@ fn arith(l: Value, op: &BinaryOperator, r: Value) -> Result<Value> {
 }
 
 /// Three-way compare with SQL cross-type coercion; `None` when either side is
-/// NULL. Delegates to the shared [`Value::compare`].
-fn cmp(l: &Value, r: &Value) -> Result<Option<std::cmp::Ordering>> {
-    Ok(l.compare(r))
+/// NULL. Delegates to the shared [`Value::compare_coll`].
+fn cmp(l: &Value, r: &Value, coll: Collation) -> Result<Option<std::cmp::Ordering>> {
+    Ok(l.compare_coll(r, coll))
+}
+
+/// Collation of a bare/qualified column reference, if it is one.
+fn expr_collation(e: &Expr, schema: &Schema) -> Option<Collation> {
+    let name = match e {
+        Expr::Identifier(id) => id.value.as_str(),
+        Expr::CompoundIdentifier(parts) => parts.last()?.value.as_str(),
+        _ => return None,
+    };
+    schema.column(name).map(|c| c.collation)
+}
+
+/// The comparison collation for two operands: case-sensitive if either is a
+/// binary-collation column, else the default case-insensitive collation.
+fn cmp_collation(l: &Expr, r: &Expr, schema: &Schema) -> Collation {
+    if matches!(expr_collation(l, schema), Some(Collation::Bin))
+        || matches!(expr_collation(r, schema), Some(Collation::Bin))
+    {
+        Collation::Bin
+    } else {
+        Collation::Ci
+    }
 }
 
 fn num(v: &Value) -> Option<f64> {

@@ -10,7 +10,7 @@
 //! columns, so equality and (single-column) range lookups are B-tree scans.
 
 use crate::session::Session;
-use elyra_core::{Result, Value};
+use elyra_core::{Collation, Result, Value};
 
 use crate::catalog::{data_prefix, IndexDef, TableDef};
 use crate::keyenc;
@@ -22,10 +22,16 @@ fn index_prefix(table: &str, index: &str) -> Vec<u8> {
     format!("index::{table}::{index}::").into_bytes()
 }
 
-/// Prefix for all entries with a given tuple of column values (equality).
-fn value_prefix(table: &str, index: &str, values: &[Value]) -> Result<Vec<u8>> {
+/// Prefix for all entries with a given tuple of column values (equality),
+/// honoring each column's collation.
+fn value_prefix(
+    table: &str,
+    index: &str,
+    values: &[Value],
+    colls: &[Collation],
+) -> Result<Vec<u8>> {
     let mut k = index_prefix(table, index);
-    k.extend_from_slice(&keyenc::encode_key(values)?);
+    k.extend_from_slice(&keyenc::encode_key_coll(values, colls)?);
     k.push(0);
     Ok(k)
 }
@@ -34,10 +40,11 @@ fn entry_key(
     table: &str,
     index: &str,
     values: &[Value],
+    colls: &[Collation],
     data_key: &[u8],
     unique: bool,
 ) -> Result<Vec<u8>> {
-    let mut k = value_prefix(table, index, values)?;
+    let mut k = value_prefix(table, index, values, colls)?;
     // A UNIQUE index keys purely on the indexed values, so two rows with the
     // same value collide (enforcing uniqueness). A non-unique index appends the
     // clustered key so rows with equal values coexist.
@@ -50,8 +57,13 @@ fn entry_key(
 
 /// The probe key for a unique index's value tuple (== its entry key). A stored
 /// value at this key means some row already holds the tuple.
-pub fn unique_probe_key(table: &str, index: &str, values: &[Value]) -> Result<Vec<u8>> {
-    value_prefix(table, index, values)
+pub fn unique_probe_key(
+    table: &str,
+    index: &str,
+    values: &[Value],
+    colls: &[Collation],
+) -> Result<Vec<u8>> {
+    value_prefix(table, index, values, colls)
 }
 
 /// Split a row's index entries into (non-unique, unique). Unique entries
@@ -73,7 +85,14 @@ pub fn partition_entries_for_row(
             continue;
         }
         let entry = (
-            entry_key(&def.name, &idx.name, &values, data_key, idx.unique)?,
+            entry_key(
+                &def.name,
+                &idx.name,
+                &values,
+                &idx.col_collations,
+                data_key,
+                idx.unique,
+            )?,
             data_key.to_vec(),
         );
         if idx.unique {
@@ -97,7 +116,12 @@ pub fn unique_probe_keys(def: &TableDef, row: &[Value]) -> Result<Vec<Vec<u8>>> 
         if values.iter().any(|v| v.is_null()) || keyenc::encode_key(&values).is_err() {
             continue;
         }
-        out.push(unique_probe_key(&def.name, &idx.name, &values)?);
+        out.push(unique_probe_key(
+            &def.name,
+            &idx.name,
+            &values,
+            &idx.col_collations,
+        )?);
     }
     Ok(out)
 }
@@ -124,7 +148,14 @@ pub fn entries_for_row(
             continue;
         }
         out.push((
-            entry_key(&def.name, &idx.name, &values, data_key, idx.unique)?,
+            entry_key(
+                &def.name,
+                &idx.name,
+                &values,
+                &idx.col_collations,
+                data_key,
+                idx.unique,
+            )?,
             data_key.to_vec(),
         ));
     }
@@ -154,7 +185,7 @@ pub async fn lookup_eq(
     index: &IndexDef,
     values: &[Value],
 ) -> Result<Vec<Vec<u8>>> {
-    let prefix = value_prefix(table, &index.name, values)?;
+    let prefix = value_prefix(table, &index.name, values, &index.col_collations)?;
     let mut cursor: Option<Vec<u8>> = None;
     let mut keys = Vec::new();
     loop {
@@ -184,10 +215,11 @@ pub async fn lookup_range(
 ) -> Result<Vec<Vec<u8>>> {
     let prefix = index_prefix(table, &index.name);
 
+    let coll = index.col_collations.first().copied().unwrap_or_default();
     let mut start = match lo {
         Some((v, incl)) => {
             let mut b = prefix.clone();
-            b.extend_from_slice(&keyenc::encode(v)?);
+            b.extend_from_slice(&keyenc::encode_coll(v, coll)?);
             if !incl {
                 b.push(0x01);
             }
@@ -198,7 +230,7 @@ pub async fn lookup_range(
     let end = match hi {
         Some((v, incl)) => {
             let mut b = prefix.clone();
-            b.extend_from_slice(&keyenc::encode(v)?);
+            b.extend_from_slice(&keyenc::encode_coll(v, coll)?);
             if incl {
                 b.push(0x01);
             }

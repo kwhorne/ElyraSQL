@@ -98,6 +98,24 @@ CREATE TABLE orders (
   blocks), `CASCADE` (deletes children), and `SET NULL`. Referencing columns
   are automatically indexed.
 
+## Collation (case sensitivity)
+
+Text is **case-insensitive by default** (`'Foo' = 'foo'`). Declare a column with
+a binary collation to make it case-sensitive:
+
+```sql
+CREATE TABLE tokens (
+    id    BIGINT PRIMARY KEY,
+    token TEXT COLLATE utf8mb4_bin UNIQUE   -- case-sensitive unique
+);
+```
+
+A `COLLATE ..._bin` (or `BINARY`) column compares case-sensitively in `WHERE`
+(equality and ranges, with or without an index) and enforces case-sensitive
+`UNIQUE` / `PRIMARY KEY`. Note: `ORDER BY`, `GROUP BY`, `DISTINCT` and join keys
+currently still use the default case-insensitive collation even for `_bin`
+columns — see [Limitations](../limitations.md).
+
 ## Column defaults, AUTO_INCREMENT, and generated columns
 
 ```sql

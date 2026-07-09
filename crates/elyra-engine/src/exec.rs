@@ -139,6 +139,11 @@ pub async fn create_table(
         let ty = map_type(&col.data_type)?;
         let mut nullable = true;
         let mut meta = ColMeta::default();
+        let collation = col
+            .collation
+            .as_ref()
+            .map(|c| elyra_core::Collation::from_name(&c.to_string()))
+            .unwrap_or_default();
         for opt in &col.options {
             match &opt.option {
                 ColumnOption::NotNull => nullable = false,
@@ -152,6 +157,7 @@ pub async fn create_table(
                             cols: vec![idx],
                             unique: true,
                             vector: false,
+                            col_collations: vec![collation],
                         });
                     }
                 }
@@ -175,6 +181,7 @@ pub async fn create_table(
             name: col.name.value.clone(),
             ty,
             nullable,
+            collation,
         });
         col_meta.push(meta);
     }
@@ -219,11 +226,14 @@ pub async fn create_table(
                             .join("_")
                     )
                 });
+                let ucolls: Vec<elyra_core::Collation> =
+                    idxs.iter().map(|&i| columns[i].collation).collect();
                 indexes.push(IndexDef {
                     name: iname,
                     cols: idxs,
                     unique: true,
                     vector: false,
+                    col_collations: ucolls,
                 });
             }
             TableConstraint::Check { expr, .. } => checks.push(expr.to_string()),
@@ -249,11 +259,14 @@ pub async fn create_table(
                 // Index the referencing columns so parent-side checks (RESTRICT
                 // / CASCADE / SET NULL) can find child rows efficiently.
                 if !indexes.iter().any(|ix| ix.cols == fk_cols) && pk_cols != fk_cols {
+                    let fkcolls: Vec<elyra_core::Collation> =
+                        fk_cols.iter().map(|&i| columns[i].collation).collect();
                     indexes.push(IndexDef {
                         name: format!("fk_{name}_{}", foreign_keys.len()),
                         cols: fk_cols.clone(),
                         unique: false,
                         vector: false,
+                        col_collations: fkcolls,
                     });
                 }
                 foreign_keys.push(ForeignKey {
@@ -297,6 +310,7 @@ pub async fn show_tables(db: &Session) -> Result<QueryResult> {
         name: "Tables_in_elyra".into(),
         ty: ColumnType::Text,
         nullable: false,
+        collation: elyra_core::Collation::Ci,
     }]);
     let rows = names.into_iter().map(|n| vec![Value::Text(n)]).collect();
     Ok(QueryResult::Rows(RowStream::literal(schema, rows)))
@@ -312,6 +326,7 @@ pub async fn show_columns(db: &Session, table: &str) -> Result<QueryResult> {
                 name: (*n).to_string(),
                 ty: ColumnType::Text,
                 nullable: *n == "Default",
+                collation: elyra_core::Collation::Ci,
             })
             .collect(),
     );
@@ -402,11 +417,13 @@ pub async fn show_create_table(db: &Session, name: &str) -> Result<QueryResult> 
             name: "Table".into(),
             ty: ColumnType::Text,
             nullable: false,
+            collation: elyra_core::Collation::Ci,
         },
         ColumnDef {
             name: "Create Table".into(),
             ty: ColumnType::Text,
             nullable: false,
+            collation: elyra_core::Collation::Ci,
         },
     ]);
     let rows = vec![vec![Value::Text(name.to_string()), Value::Text(ddl)]];
@@ -437,6 +454,7 @@ pub async fn show_index(db: &Session, name: &str) -> Result<QueryResult> {
                     ColumnType::Text
                 },
                 nullable: true,
+                collation: elyra_core::Collation::Ci,
             })
             .collect(),
     );
@@ -511,11 +529,13 @@ async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec
         name: n.to_string(),
         ty: ColumnType::Text,
         nullable: true,
+        collation: elyra_core::Collation::Ci,
     };
     let int = |n: &str| ColumnDef {
         name: n.to_string(),
         ty: ColumnType::Int,
         nullable: true,
+        collation: elyra_core::Collation::Ci,
     };
     let names = catalog::list_tables(db).await?;
     match view {
@@ -722,6 +742,7 @@ async fn create_table_as(
                 name: c.name.rsplit('.').next().unwrap_or(&c.name).to_string(),
                 ty: c.ty.clone(),
                 nullable: true,
+                collation: elyra_core::Collation::Ci,
             })
             .collect()
     } else {
@@ -731,6 +752,7 @@ async fn create_table_as(
                 name: c.name.value.clone(),
                 ty: map_type(&c.data_type)?,
                 nullable: true,
+                collation: elyra_core::Collation::Ci,
             });
         }
         v
@@ -1066,6 +1088,11 @@ async fn alter_add_column(
         name: col.name.value.clone(),
         ty,
         nullable,
+        collation: col
+            .collation
+            .as_ref()
+            .map(|c| elyra_core::Collation::from_name(&c.to_string()))
+            .unwrap_or_default(),
     });
     if !puts.is_empty() {
         db.commit_write(puts, vec![]).await?;
@@ -1250,11 +1277,14 @@ pub async fn create_index(db: &Session, ci: CreateIndex) -> Result<QueryResult> 
     // A vector (HNSW) index is a single VECTOR column; composite must be B-tree.
     let is_vector =
         cols.len() == 1 && matches!(def.schema.columns[cols[0]].ty, ColumnType::Vector(_));
+    let col_collations: Vec<elyra_core::Collation> =
+        cols.iter().map(|&c| def.collation_of(c)).collect();
     def.indexes.push(IndexDef {
         name,
         cols,
         unique: ci.unique,
         vector: is_vector,
+        col_collations,
     });
 
     // Persist the new catalog and backfill index entries for existing rows.
@@ -1356,6 +1386,7 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
     };
     let on_dup = !dup_sets.is_empty();
     let has_pk = def.has_pk();
+    let pk_colls = def.pk_collations();
 
     // Load rowid counter once for tables without a PK.
     let mut next_rowid = if has_pk {
@@ -1475,7 +1506,7 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
 
         let key = if has_pk {
             let pk_vals: Vec<Value> = def.pk_cols.iter().map(|&i| row[i].clone()).collect();
-            data_key(&name, &keyenc::encode_key(&pk_vals)?)
+            data_key(&name, &keyenc::encode_key_coll(&pk_vals, &pk_colls)?)
         } else {
             next_rowid += 1;
             data_key(&name, &keyenc::encode_rowid(next_rowid))
@@ -1673,11 +1704,14 @@ fn fk_probe_key(parent: &TableDef, ref_cols: &[String], vals: &[Value]) -> Resul
                 .all(|(&i, rc)| parent.schema.columns[i].name.eq_ignore_ascii_case(rc))
     };
     if !parent.pk_cols.is_empty() && name_match(&parent.pk_cols) {
-        return Ok(data_key(&parent.name, &keyenc::encode_key(vals)?));
+        return Ok(data_key(
+            &parent.name,
+            &keyenc::encode_key_coll(vals, &parent.pk_collations())?,
+        ));
     }
     for idx in &parent.indexes {
         if idx.unique && !idx.vector && name_match(&idx.cols) {
-            return index::unique_probe_key(&parent.name, &idx.name, vals);
+            return index::unique_probe_key(&parent.name, &idx.name, vals, &idx.col_collations);
         }
     }
     Err(Error::Query(format!(
@@ -1902,6 +1936,7 @@ pub async fn select(
                 name,
                 ty: infer_val(&v),
                 nullable: true,
+                collation: elyra_core::Collation::Ci,
             });
             vals.push(v);
         }
@@ -2418,6 +2453,7 @@ async fn join_correlated_select(
             name,
             ty,
             nullable: true,
+            collation: elyra_core::Collation::Ci,
         });
     }
     Ok(QueryResult::Rows(RowStream::literal(
@@ -2451,6 +2487,7 @@ async fn resolve_table(db: &Session, tf: &TableFactor) -> Result<(TableDef, Vec<
                     name: format!("{a}.{}", c.name),
                     ty: c.ty.clone(),
                     nullable: c.nullable,
+                    collation: elyra_core::Collation::Ci,
                 })
                 .collect();
             Ok((def, cols))
@@ -2478,6 +2515,7 @@ async fn load_relation(
                 name: format!("{qual}.{}", c.name),
                 ty: c.ty.clone(),
                 nullable: c.nullable,
+                collation: elyra_core::Collation::Ci,
             })
             .collect();
         return Ok((cols, rows));
@@ -2502,6 +2540,7 @@ async fn load_relation(
                 name: format!("{alias}.{}", c.name),
                 ty: c.ty.clone(),
                 nullable: c.nullable,
+                collation: elyra_core::Collation::Ci,
             })
             .collect();
         return Ok((cols, rows));
@@ -2542,7 +2581,10 @@ async fn lookup_rows_by_eq(
         bincode::deserialize(&b).map_err(|e| Error::Storage(e.to_string()))
     };
     if def.pk_cols == [col] {
-        let key = data_key(&def.name, &keyenc::encode(value)?);
+        let key = data_key(
+            &def.name,
+            &keyenc::encode_coll(value, def.collation_of(col))?,
+        );
         return Ok(match db.get(key).await? {
             Some(b) => vec![deser(b)?],
             None => vec![],
@@ -2748,9 +2790,10 @@ async fn clustered_range(
     rq: &RangeQuery,
 ) -> Result<Vec<(Vec<u8>, Vec<Value>)>> {
     let prefix = data_prefix(&def.name);
+    let coll = def.pk_collations().first().copied().unwrap_or_default();
     let mut start = match &rq.lo {
         Some((v, incl)) => {
-            let mut b = data_key(&def.name, &keyenc::encode(v)?);
+            let mut b = data_key(&def.name, &keyenc::encode_coll(v, coll)?);
             if !*incl {
                 b.push(0x00); // strictly after the row with pk == v
             }
@@ -2760,7 +2803,7 @@ async fn clustered_range(
     };
     let end = match &rq.hi {
         Some((v, incl)) => {
-            let mut b = data_key(&def.name, &keyenc::encode(v)?);
+            let mut b = data_key(&def.name, &keyenc::encode_coll(v, coll)?);
             if *incl {
                 b.push(0x00); // include the row with pk == v
             }
@@ -3292,7 +3335,10 @@ async fn collect_matches(
     // PK equality (single or composite): direct clustered-key lookup.
     if def.has_pk() {
         if let Some(vals) = key_eq_values(def, filter, &def.pk_cols)? {
-            let key = data_key(&def.name, &keyenc::encode_key(&vals)?);
+            let key = data_key(
+                &def.name,
+                &keyenc::encode_key_coll(&vals, &def.pk_collations())?,
+            );
             if let Some(bytes) = db.get(key.clone()).await? {
                 let row: Vec<Value> =
                     bincode::deserialize(&bytes).map_err(|e| Error::Storage(e.to_string()))?;
@@ -3519,7 +3565,10 @@ pub async fn update(
         // If the primary key changed, the clustered key moves.
         let new_key = if def.has_pk() {
             let pk_vals: Vec<Value> = def.pk_cols.iter().map(|&i| new_row[i].clone()).collect();
-            data_key(&name, &keyenc::encode_key(&pk_vals)?)
+            data_key(
+                &name,
+                &keyenc::encode_key_coll(&pk_vals, &def.pk_collations())?,
+            )
         } else {
             old_key.clone()
         };
@@ -3878,7 +3927,10 @@ async fn multi_update(
             }
             let base = extract_base_row(&joined, &info.col_idx);
             let pk_vals: Vec<Value> = info.def.pk_cols.iter().map(|&i| base[i].clone()).collect();
-            let pk_key = data_key(&info.name, &keyenc::encode_key(&pk_vals)?);
+            let pk_key = data_key(
+                &info.name,
+                &keyenc::encode_key_coll(&pk_vals, &info.def.pk_collations())?,
+            );
             let entry = updated.entry(qual.clone()).or_default();
             if entry.contains_key(&pk_key) {
                 continue;
@@ -3915,7 +3967,10 @@ async fn multi_update(
                 .iter()
                 .map(|&i| new_base[i].clone())
                 .collect();
-            let new_key = data_key(&info.name, &keyenc::encode_key(&new_pk)?);
+            let new_key = data_key(
+                &info.name,
+                &keyenc::encode_key_coll(&new_pk, &info.def.pk_collations())?,
+            );
             deletes.extend(index::entry_keys_for_row(&info.def, old_base, pk_key)?);
             let new_entries = index::entries_for_row(&info.def, new_base, &new_key)?;
             if &new_key != pk_key {
@@ -3986,7 +4041,10 @@ async fn multi_delete(
             let info = &targets[q];
             let base = extract_base_row(&joined, &info.col_idx);
             let pk_vals: Vec<Value> = info.def.pk_cols.iter().map(|&i| base[i].clone()).collect();
-            let pk_key = data_key(&info.name, &keyenc::encode_key(&pk_vals)?);
+            let pk_key = data_key(
+                &info.name,
+                &keyenc::encode_key_coll(&pk_vals, &info.def.pk_collations())?,
+            );
             let entry = per_table.entry(q.clone()).or_default();
             if entry.insert(pk_key, base).is_none() {
                 affected += 1;
@@ -4146,6 +4204,7 @@ fn project_exprs(
             name: name.clone(),
             ty,
             nullable: true,
+            collation: elyra_core::Collation::Ci,
         });
     }
 
@@ -4429,6 +4488,7 @@ async fn window_select(
             name,
             ty,
             nullable: true,
+            collation: elyra_core::Collation::Ci,
         });
     }
     let out_schema = Schema::new(cols);
@@ -5369,6 +5429,7 @@ async fn correlated_select(
             name,
             ty,
             nullable: true,
+            collation: elyra_core::Collation::Ci,
         });
     }
     Ok(QueryResult::Rows(RowStream::literal(

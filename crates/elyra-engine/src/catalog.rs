@@ -19,6 +19,9 @@ pub struct IndexDef {
     /// A vector (HNSW ANN) index rather than a B-tree secondary index.
     #[serde(default)]
     pub vector: bool,
+    /// Per-column text collation, positional with `cols` (empty ⇒ all `Ci`).
+    #[serde(default)]
+    pub col_collations: Vec<elyra_core::Collation>,
 }
 
 impl IndexDef {
@@ -87,6 +90,25 @@ pub enum RefAction {
 impl TableDef {
     pub fn has_pk(&self) -> bool {
         !self.pk_cols.is_empty()
+    }
+
+    /// Collation of column `i` (default `Ci`).
+    pub fn collation_of(&self, i: usize) -> elyra_core::Collation {
+        self.schema
+            .columns
+            .get(i)
+            .map(|c| c.collation)
+            .unwrap_or_default()
+    }
+
+    /// Collations of the given columns, in order.
+    pub fn collations_of(&self, cols: &[usize]) -> Vec<elyra_core::Collation> {
+        cols.iter().map(|&c| self.collation_of(c)).collect()
+    }
+
+    /// Collations of the primary-key columns, in key order.
+    pub fn pk_collations(&self) -> Vec<elyra_core::Collation> {
+        self.collations_of(&self.pk_cols)
     }
 
     /// Column metadata for column `i` (empty default if unset).

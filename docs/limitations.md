@@ -50,10 +50,12 @@ implemented, so you can judge fit.
 
 ## Types & text
 
-- Text uses a **default case-insensitive collation**: comparisons, sorting,
-  indexing, grouping, joins, `DISTINCT`, and `UNIQUE`/`PRIMARY KEY` all treat
-  `'Foo'` and `'foo'` as equal. Not yet: accent-insensitivity, per-column
-  `COLLATE`, a binary (`_bin`, case-sensitive) opt-out, or alternate charsets.
+- Text is **case-insensitive by default**. A column can opt into case-sensitive
+  behavior with `COLLATE ..._bin` / `BINARY`, which applies to equality/range
+  comparisons (`WHERE`), `UNIQUE`, `PRIMARY KEY`, and secondary indexes. Not
+  yet honoring per-column `_bin`: `ORDER BY`, `GROUP BY`, `DISTINCT` and join
+  keys (these still use the default case-insensitive collation). Accent
+  sensitivity and alternate charsets are not implemented.
 - `ENUM`/`SET` are stored as text and not value-checked; no spatial types;
   full-text search is vector-only.
 

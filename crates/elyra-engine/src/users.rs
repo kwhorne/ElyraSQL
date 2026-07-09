@@ -339,6 +339,7 @@ async fn show_grants(toks: &[Tok], sess: &Session) -> Result<QueryResult> {
         name: "Grants".into(),
         ty: elyra_core::ColumnType::Text,
         nullable: false,
+        collation: elyra_core::Collation::Ci,
     }]);
     let mut rows = Vec::new();
     let emit = |rows: &mut Vec<Vec<Value>>, user: &str, p: Privilege| {
