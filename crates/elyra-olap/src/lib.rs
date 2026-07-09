@@ -42,6 +42,11 @@ struct Acc {
     extreme: Option<Value>,
     distinct: HashSet<String>,
     concat: Vec<String>,
+    /// Exact decimal running sum (unscaled) and its scale.
+    dsum: i128,
+    dscale: u8,
+    has_decimal: bool,
+    float_sum: bool,
 }
 
 impl Acc {
@@ -53,6 +58,10 @@ impl Acc {
             extreme: None,
             distinct: HashSet::new(),
             concat: Vec::new(),
+            dsum: 0,
+            dscale: 0,
+            has_decimal: false,
+            float_sum: false,
         }
     }
 }
@@ -183,8 +192,29 @@ fn update(acc: &mut Acc, func: AggFunc, val: Option<Value>, distinct: bool) {
                     }
                     acc.sum += n;
                     acc.count += 1;
-                    if !matches!(v, Value::Int(_)) {
-                        acc.sum_is_int = false;
+                    match &v {
+                        Value::Int(i) => {
+                            acc.dsum = acc.dsum.saturating_add(
+                                (*i as i128).saturating_mul(10i128.pow(acc.dscale as u32)),
+                            );
+                        }
+                        Value::Decimal(u, s) => {
+                            acc.sum_is_int = false;
+                            let s = *s;
+                            if s > acc.dscale {
+                                acc.dsum =
+                                    acc.dsum.saturating_mul(10i128.pow((s - acc.dscale) as u32));
+                                acc.dscale = s;
+                            }
+                            acc.dsum = acc.dsum.saturating_add(
+                                u.saturating_mul(10i128.pow((acc.dscale - s) as u32)),
+                            );
+                            acc.has_decimal = true;
+                        }
+                        _ => {
+                            acc.sum_is_int = false;
+                            acc.float_sum = true;
+                        }
                     }
                 }
             }
@@ -228,6 +258,18 @@ fn merge_acc(a: &mut Acc, b: Acc, func: AggFunc) {
     a.count += b.count;
     a.sum += b.sum;
     a.sum_is_int = a.sum_is_int && b.sum_is_int;
+    // Merge exact decimal sums, aligning to the larger scale.
+    let target = a.dscale.max(b.dscale);
+    let av = a
+        .dsum
+        .saturating_mul(10i128.pow((target - a.dscale) as u32));
+    let bv = b
+        .dsum
+        .saturating_mul(10i128.pow((target - b.dscale) as u32));
+    a.dsum = av.saturating_add(bv);
+    a.dscale = target;
+    a.has_decimal |= b.has_decimal;
+    a.float_sum |= b.float_sum;
     a.concat.extend(b.concat);
     for d in b.distinct {
         a.distinct.insert(d);
@@ -264,6 +306,8 @@ fn finish(acc: &Acc, spec: &AggSpec) -> Value {
         AggFunc::Sum => {
             if acc.count == 0 {
                 Value::Null
+            } else if acc.has_decimal && !acc.float_sum {
+                Value::Decimal(acc.dsum, acc.dscale)
             } else if acc.sum_is_int && acc.sum.fract() == 0.0 {
                 Value::Int(acc.sum as i64)
             } else {

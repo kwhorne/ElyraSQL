@@ -51,7 +51,11 @@ fn map_type(dt: &DataType) -> Result<ColumnType> {
         }
         // ENUM/SET are stored as their string value.
         DataType::Enum(..) | DataType::Set(_) => ColumnType::Text,
-        DataType::Blob(_) | DataType::Bytea => ColumnType::Bytes,
+        DataType::Blob(_) | DataType::Bytea | DataType::Binary(_) | DataType::Varbinary(_) => {
+            ColumnType::Bytes
+        }
+        // BIT(n) is stored as an integer.
+        DataType::Bit(_) | DataType::BitVarying(_) => ColumnType::Int,
         DataType::Date => ColumnType::Date,
         DataType::Datetime(_) | DataType::Timestamp(_, _) => ColumnType::DateTime,
         DataType::Time(_, _) => ColumnType::Time,

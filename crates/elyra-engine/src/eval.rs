@@ -5,9 +5,7 @@
 //! scans, joins and aggregation land once the storage executor is wired up.
 
 use elyra_core::{ColumnDef, ColumnType, Error, Result, Schema, Value};
-use sqlparser::ast::{
-    BinaryOperator, Expr, Query, SelectItem, SetExpr, UnaryOperator, Value as SqlValue,
-};
+use sqlparser::ast::{Expr, Query, SelectItem, SetExpr, UnaryOperator, Value as SqlValue};
 
 use crate::stream::RowStream;
 use crate::QueryResult;
@@ -73,66 +71,14 @@ pub fn eval_expr(expr: &Expr) -> Result<Value> {
                 }
             }
         }
-        Expr::BinaryOp { left, op, right } => {
-            // Comparisons, date arithmetic (INTERVAL), and anything non-numeric
-            // go through the full evaluator; keep the fast path for plain math.
-            let simple = matches!(
-                op,
-                BinaryOperator::Plus
-                    | BinaryOperator::Minus
-                    | BinaryOperator::Multiply
-                    | BinaryOperator::Divide
-                    | BinaryOperator::Modulo
-            ) && !matches!(left.as_ref(), Expr::Interval(_))
-                && !matches!(right.as_ref(), Expr::Interval(_));
-            if !simple {
-                return crate::predicate::eval_row(expr, &elyra_core::Schema::new(Vec::new()), &[]);
-            }
-            let l = eval_expr(left)?;
-            let r = eval_expr(right)?;
-            eval_binary(l, op, r)
+        // Binary operators (arithmetic, comparison, bitwise, INTERVAL, JSON,
+        // exact decimal) all go through the full evaluator.
+        Expr::BinaryOp { .. } => {
+            crate::predicate::eval_row(expr, &elyra_core::Schema::new(Vec::new()), &[])
         }
         // Delegate anything else (functions, JSON operators, ...) to the full
         // row evaluator with an empty schema/row.
         other => crate::predicate::eval_row(other, &elyra_core::Schema::new(Vec::new()), &[]),
-    }
-}
-
-fn eval_binary(l: Value, op: &BinaryOperator, r: Value) -> Result<Value> {
-    use BinaryOperator::*;
-    let (lf, rf) = (as_f64(&l), as_f64(&r));
-    match (lf, rf) {
-        (Some(a), Some(b)) => {
-            let both_int = matches!(l, Value::Int(_)) && matches!(r, Value::Int(_));
-            let res = match op {
-                Plus => a + b,
-                Minus => a - b,
-                Multiply => a * b,
-                Divide => {
-                    if b == 0.0 {
-                        return Ok(Value::Null); // MySQL: x/0 -> NULL
-                    }
-                    a / b
-                }
-                Modulo => a % b,
-                _ => return Err(Error::Unsupported("unsupported binary operator".into())),
-            };
-            if both_int && matches!(op, Plus | Minus | Multiply | Modulo) {
-                Ok(Value::Int(res as i64))
-            } else {
-                Ok(Value::Float(res))
-            }
-        }
-        _ => Err(Error::Type("arithmetic on non-numeric value".into())),
-    }
-}
-
-fn as_f64(v: &Value) -> Option<f64> {
-    match v {
-        Value::Int(i) => Some(*i as f64),
-        Value::Float(f) => Some(*f),
-        Value::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
-        _ => None,
     }
 }
 

@@ -79,7 +79,9 @@ not currently parse `<<`, `>>`, or the unary `~`.)
 
 - `UUID()` — a random version-4 UUID string.
 - `CAST(x AS <type>)` / `CONVERT` — to `CHAR`/text, `SIGNED`/integer,
-  `DECIMAL`/floating point, `DATE`, `DATETIME`, `TIME`.
+  `DECIMAL(p,s)` (exact, rescaled), `BINARY`/bytes, `DATE`, `DATETIME`, `TIME`.
+
+Decimal arithmetic (`+`, `-`, `*`) and `SUM(DECIMAL)` are computed exactly.
 
 ## JSON
 

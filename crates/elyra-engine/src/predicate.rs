@@ -972,8 +972,43 @@ fn pad(a: &[Value], left: bool) -> Value {
 
 fn cast_value(v: Value, ty: &sqlparser::ast::DataType) -> Result<Value> {
     use elyra_core::datetime as dt;
+    use sqlparser::ast::{DataType as D, ExactNumberInfo};
     if v.is_null() {
         return Ok(Value::Null);
+    }
+    // Precise DECIMAL / binary casts need the DataType directly.
+    match ty {
+        D::Decimal(info) | D::Numeric(info) | D::Dec(info) => {
+            let scale = match info {
+                ExactNumberInfo::PrecisionAndScale(_, s) => *s as u8,
+                _ => 0,
+            };
+            return Ok(match &v {
+                Value::Decimal(u, s) => {
+                    let rescaled = if *s <= scale {
+                        u * 10i128.pow((scale - *s) as u32)
+                    } else {
+                        u / 10i128.pow((*s - scale) as u32)
+                    };
+                    Value::Decimal(rescaled, scale)
+                }
+                Value::Int(i) => Value::Decimal(*i as i128 * 10i128.pow(scale as u32), scale),
+                other => match other
+                    .to_wire_string()
+                    .and_then(|s| elyra_core::value::parse_decimal(&s, scale))
+                {
+                    Some((u, s)) => Value::Decimal(u, s),
+                    None => Value::Null,
+                },
+            });
+        }
+        D::Binary(_) | D::Varbinary(_) | D::Blob(_) | D::Bytea => {
+            return Ok(match v {
+                Value::Bytes(b) => Value::Bytes(b),
+                other => Value::Bytes(other.to_wire_string().unwrap_or_default().into_bytes()),
+            });
+        }
+        _ => {}
     }
     let tn = ty.to_string().to_ascii_uppercase();
     let out = if tn.starts_with("CHAR")
@@ -1664,6 +1699,12 @@ fn bitwise(l: Value, op: &BinaryOperator, r: Value) -> Result<Value> {
 
 fn arith(l: Value, op: &BinaryOperator, r: Value) -> Result<Value> {
     use BinaryOperator::*;
+    // Exact DECIMAL arithmetic for +, -, * (division/modulo fall back to float).
+    if matches!(l, Value::Decimal(..)) || matches!(r, Value::Decimal(..)) {
+        if let Some(v) = decimal_arith(&l, op, &r) {
+            return Ok(v);
+        }
+    }
     let (Some(a), Some(b)) = (num(&l), num(&r)) else {
         return Err(Error::Type("arithmetic on non-numeric value".into()));
     };
@@ -1696,6 +1737,32 @@ fn cmp(l: &Value, r: &Value) -> Result<Option<std::cmp::Ordering>> {
 
 fn num(v: &Value) -> Option<f64> {
     v.as_f64()
+}
+
+/// Exact decimal `+`/`-`/`*`. Returns `None` (fall back to float) for division,
+/// modulo, or when a non-decimal/non-integer operand is involved.
+fn decimal_arith(l: &Value, op: &BinaryOperator, r: &Value) -> Option<Value> {
+    use BinaryOperator::*;
+    let to_dec = |v: &Value| -> Option<(i128, u8)> {
+        match v {
+            Value::Decimal(u, s) => Some((*u, *s)),
+            Value::Int(i) => Some((*i as i128, 0)),
+            Value::Bool(b) => Some((*b as i128, 0)),
+            _ => None,
+        }
+    };
+    let (a, asc) = to_dec(l)?;
+    let (b, bsc) = to_dec(r)?;
+    Some(match op {
+        Plus | Minus => {
+            let sc = asc.max(bsc);
+            let aa = a.checked_mul(10i128.pow((sc - asc) as u32))?;
+            let bb = b.checked_mul(10i128.pow((sc - bsc) as u32))?;
+            Value::Decimal(if matches!(op, Plus) { aa + bb } else { aa - bb }, sc)
+        }
+        Multiply => Value::Decimal(a.checked_mul(b)?, asc.saturating_add(bsc)),
+        _ => return None,
+    })
 }
 
 fn truthy(v: &Value) -> bool {
