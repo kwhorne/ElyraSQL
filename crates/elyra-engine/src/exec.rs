@@ -643,30 +643,49 @@ pub async fn select(
         _ => table.clone(),
     };
 
-    // A WHERE subquery that references `outer.<col>` is correlated: evaluate it
-    // per outer row with the outer columns bound to literals.
-    if let Some(f) = &raw_filter {
-        if filter_correlated(f, &outer) {
-            return correlated_select(
-                db,
-                vindex,
-                select,
-                &def,
-                &outer,
-                f,
-                &group_by,
-                &order_exprs,
-                offset,
-                limit,
-            )
-            .await;
-        }
+    // A WHERE or SELECT-list subquery that references `outer.<col>` is
+    // correlated: evaluate per outer row with the outer columns bound.
+    let correlated = raw_filter
+        .as_ref()
+        .is_some_and(|f| filter_correlated(f, &outer))
+        || projection_correlated(&select.projection, &outer);
+    if correlated {
+        let corr_filter = raw_filter
+            .clone()
+            .unwrap_or(Expr::Value(sqlparser::ast::Value::Boolean(true)));
+        return correlated_select(
+            db,
+            vindex,
+            select,
+            &def,
+            &outer,
+            &corr_filter,
+            &group_by,
+            &order_exprs,
+            offset,
+            limit,
+        )
+        .await;
     }
 
-    // Otherwise resolve uncorrelated subqueries into literals.
+    // Otherwise resolve uncorrelated WHERE subqueries into literals.
     let filter = match raw_filter {
         Some(f) => Some(resolve_subqueries(db, vindex, f).await?),
         None => None,
+    };
+
+    // Resolve uncorrelated subqueries in the SELECT list; work with the
+    // resolved projection thereafter.
+    let resolved_select;
+    let select = if projection_has_subquery(&select.projection) {
+        let mut s = select.clone();
+        for item in &mut s.projection {
+            *item = resolve_item(db, vindex, item).await?;
+        }
+        resolved_select = s;
+        &resolved_select
+    } else {
+        select
     };
 
     // Aggregation / grouping path: parallel streaming aggregation (OLAP).
@@ -2189,6 +2208,61 @@ fn query_refs_qualifier(q: &SqlQuery, qualifier: &str) -> bool {
     found.get()
 }
 
+/// True if a projection contains any subquery (scalar/IN/EXISTS).
+fn projection_has_subquery(projection: &[sqlparser::ast::SelectItem]) -> bool {
+    use sqlparser::ast::SelectItem;
+    projection.iter().any(|it| match it {
+        SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
+            expr_has_subquery(e)
+        }
+        _ => false,
+    })
+}
+
+fn expr_has_subquery(e: &Expr) -> bool {
+    let found = std::cell::Cell::new(false);
+    let _ = map_expr(e, &|x| {
+        if matches!(
+            x,
+            Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists { .. }
+        ) {
+            found.set(true);
+        }
+        None
+    });
+    found.get()
+}
+
+/// True if a projection item references `outer.<col>` inside a subquery.
+fn projection_correlated(projection: &[sqlparser::ast::SelectItem], outer: &str) -> bool {
+    use sqlparser::ast::SelectItem;
+    projection.iter().any(|it| match it {
+        SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
+            filter_correlated(e, outer)
+        }
+        _ => false,
+    })
+}
+
+/// Resolve the subqueries in a projection item's expression (uncorrelated).
+async fn resolve_item(
+    db: &Session,
+    vindex: &VectorRegistry,
+    item: &sqlparser::ast::SelectItem,
+) -> Result<sqlparser::ast::SelectItem> {
+    use sqlparser::ast::SelectItem;
+    Ok(match item {
+        SelectItem::UnnamedExpr(e) => {
+            SelectItem::UnnamedExpr(resolve_subqueries(db, vindex, e.clone()).await?)
+        }
+        SelectItem::ExprWithAlias { expr, alias } => SelectItem::ExprWithAlias {
+            expr: resolve_subqueries(db, vindex, expr.clone()).await?,
+            alias: alias.clone(),
+        },
+        other => other.clone(),
+    })
+}
+
 /// Evaluate a query whose WHERE has a correlated subquery: materialise the
 /// outer rows, and for each row bind outer column references (qualified with
 /// `outer`, or bare columns of the outer table) into the subqueries, resolve
@@ -2210,33 +2284,7 @@ async fn correlated_select(
     let mut matched: Vec<Vec<Value>> = Vec::new();
 
     for row in all {
-        let subst = |e: &Expr| -> Option<Expr> {
-            match e {
-                Expr::CompoundIdentifier(parts) if parts.len() >= 2 => {
-                    let tbl = &parts[parts.len() - 2].value;
-                    let col = &parts[parts.len() - 1].value;
-                    if tbl.eq_ignore_ascii_case(outer) {
-                        if let Some(i) = def
-                            .schema
-                            .columns
-                            .iter()
-                            .position(|c| c.name.eq_ignore_ascii_case(col))
-                        {
-                            return Some(value_to_expr(&row[i]));
-                        }
-                    }
-                    None
-                }
-                Expr::Identifier(id) => def
-                    .schema
-                    .columns
-                    .iter()
-                    .position(|c| c.name.eq_ignore_ascii_case(&id.value))
-                    .map(|i| value_to_expr(&row[i])),
-                _ => None,
-            }
-        };
-        let bound = map_expr(corr_filter, &subst);
+        let bound = bind_outer(corr_filter, outer, &def.schema, &row);
         let resolved = resolve_subqueries(db, vindex, bound).await?;
         if predicate::matches(&resolved, &def.schema, &row)? {
             matched.push(row);
@@ -2250,13 +2298,90 @@ async fn correlated_select(
         apply_offset_limit(&mut out, offset, limit);
         return Ok(QueryResult::Rows(RowStream::literal(schema, out)));
     }
+
     let resolved = resolve_order_aliases(order_exprs, &select.projection, &def.schema);
     if !resolved.is_empty() {
         sort_full_rows(&mut matched, &def.schema, &resolved)?;
     }
     apply_offset_limit(&mut matched, offset, limit);
-    let (schema, out) = project_exprs(&select.projection, &def.schema, &matched)?;
-    Ok(QueryResult::Rows(RowStream::literal(schema, out)))
+
+    // No SELECT-list subqueries: plain projection.
+    if !projection_has_subquery(&select.projection) {
+        let (schema, out) = project_exprs(&select.projection, &def.schema, &matched)?;
+        return Ok(QueryResult::Rows(RowStream::literal(schema, out)));
+    }
+
+    // Correlated SELECT-list subqueries: resolve the projection per row.
+    use sqlparser::ast::SelectItem;
+    let mut out_rows: Vec<Vec<Value>> = Vec::with_capacity(matched.len());
+    for row in &matched {
+        let mut vals = Vec::with_capacity(select.projection.len());
+        for item in &select.projection {
+            let expr = match item {
+                SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => e,
+                other => {
+                    return Err(Error::Unsupported(format!(
+                        "projection item not supported with correlated subquery: {other}"
+                    )))
+                }
+            };
+            let bound = bind_outer(expr, outer, &def.schema, row);
+            let resolved = resolve_subqueries(db, vindex, bound).await?;
+            vals.push(predicate::eval_row(&resolved, &def.schema, row)?);
+        }
+        out_rows.push(vals);
+    }
+
+    // Output schema: names from the projection, types from the first row.
+    let mut cols = Vec::with_capacity(select.projection.len());
+    for (ci, item) in select.projection.iter().enumerate() {
+        let name = match item {
+            SelectItem::ExprWithAlias { alias, .. } => alias.value.clone(),
+            SelectItem::UnnamedExpr(e) => ident_name(e)
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| e.to_string()),
+            _ => format!("col{ci}"),
+        };
+        let ty = out_rows
+            .first()
+            .map(|r| infer_val(&r[ci]))
+            .unwrap_or(ColumnType::Text);
+        cols.push(ColumnDef {
+            name,
+            ty,
+            nullable: true,
+        });
+    }
+    Ok(QueryResult::Rows(RowStream::literal(
+        Schema::new(cols),
+        out_rows,
+    )))
+}
+
+/// Rewrite outer column references (`outer.col`, or a bare outer column) in
+/// `expr` to literals from `row`, including inside subqueries.
+fn bind_outer(expr: &Expr, outer: &str, schema: &Schema, row: &[Value]) -> Expr {
+    map_expr(expr, &|e| match e {
+        Expr::CompoundIdentifier(parts) if parts.len() >= 2 => {
+            let tbl = &parts[parts.len() - 2].value;
+            let col = &parts[parts.len() - 1].value;
+            if tbl.eq_ignore_ascii_case(outer) {
+                schema
+                    .columns
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(col))
+                    .map(|i| value_to_expr(&row[i]))
+            } else {
+                None
+            }
+        }
+        Expr::Identifier(id) => schema
+            .columns
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(&id.value))
+            .map(|i| value_to_expr(&row[i])),
+        _ => None,
+    })
 }
 
 /// Materialise a subquery's rows by executing it through the query engine.
