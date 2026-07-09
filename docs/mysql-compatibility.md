@@ -11,7 +11,7 @@ drivers connect without modification.
   statement reuse; used by many ORMs and drivers.
 - **Authentication** — `mysql_native_password`.
 - **TLS** — clients may negotiate SSL.
-- **Handshake** — reports a MySQL-looking version, e.g. `8.0.0-ElyraSQL-0.6.0`,
+- **Handshake** — reports a MySQL-looking version, e.g. `8.0.0-ElyraSQL-0.7.0`,
   and answers the session/introspection queries clients send on connect
   (`SELECT @@version_comment`, `SELECT VERSION()`, `SET ...`, etc.).
 

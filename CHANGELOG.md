@@ -4,6 +4,32 @@ All notable changes to ElyraSQL are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.7.0] - 2026-07-09
+
+Durability & recovery release: point-in-time recovery, richer statistics, and
+semi-synchronous replication.
+
+### Point-in-time recovery
+
+- Optional append-only **binlog** (`--binlog`) records every committed write-set
+  with an LSN and timestamp.
+- `elyrasql binlog-replay --data <f> --binlog <f> [--until-lsn N |
+  --until-time-ms T]` replays onto a restored backup (or an empty file) up to a
+  chosen point — exact, idempotent recovery.
+
+### Statistics
+
+- `ANALYZE TABLE` now collects per-column statistics (distinct-value count, null
+  count, min/max), exposed via `information_schema.column_statistics`.
+- The planner drives a comma cross-join from the smallest analyzed table.
+
+### Replication
+
+- **Semi-synchronous** mode (`--semi-sync-ms`): a commit waits for a replica to
+  acknowledge before returning, degrading to asynchronous on timeout or when no
+  replica is attached. Replication is now bidirectional (replicas acknowledge
+  applied LSNs).
+
 ## [0.6.0] - 2026-07-09
 
 Scale & availability release: replication, partitioned aggregation spill,
@@ -249,6 +275,7 @@ core CRUD with `WHERE`/`ORDER BY`/`LIMIT`, indexes, aggregation and `GROUP BY`,
 joins, prepared statements, authentication and TLS, vector search (exact +
 HNSW), parallel OLAP aggregation, and transactions with snapshot isolation.
 
+[0.7.0]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.7.0
 [0.6.0]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.6.0
 [0.5.0]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.5.0
 [0.4.0]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.4.0
