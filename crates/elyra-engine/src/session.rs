@@ -58,6 +58,8 @@ pub struct Session {
     call_depth: std::sync::atomic::AtomicUsize,
     /// Ready-to-run trigger-body SQL queued by the last DML, fired by the engine.
     pending_triggers: Mutex<Vec<String>>,
+    /// Session user variables (`@name`).
+    user_vars: Mutex<std::collections::HashMap<String, elyra_core::Value>>,
 }
 
 fn is_meta(k: &[u8]) -> bool {
@@ -72,7 +74,31 @@ impl Session {
             isolation: Mutex::new(Isolation::Snapshot),
             call_depth: std::sync::atomic::AtomicUsize::new(0),
             pending_triggers: Mutex::new(Vec::new()),
+            user_vars: Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// Set a session user variable (`@name`).
+    pub fn set_user_var(&self, name: &str, value: elyra_core::Value) {
+        self.user_vars
+            .lock()
+            .unwrap()
+            .insert(name.to_ascii_lowercase(), value);
+    }
+
+    /// Get a session user variable (NULL if unset).
+    pub fn user_var(&self, name: &str) -> elyra_core::Value {
+        self.user_vars
+            .lock()
+            .unwrap()
+            .get(&name.to_ascii_lowercase())
+            .cloned()
+            .unwrap_or(elyra_core::Value::Null)
+    }
+
+    /// Snapshot of all user variables (for substitution).
+    pub fn user_vars_snapshot(&self) -> std::collections::HashMap<String, elyra_core::Value> {
+        self.user_vars.lock().unwrap().clone()
     }
 
     /// Queue a trigger body (already rendered to concrete SQL) to run after the

@@ -1808,6 +1808,61 @@ pub(crate) fn substitute_vars(sql: &str, env: &std::collections::HashMap<String,
     out
 }
 
+/// Replace `@user` variable references with their SQL literals (unset = NULL),
+/// leaving `@@system` variables and string literals untouched.
+pub(crate) fn substitute_uvars(
+    sql: &str,
+    vars: &std::collections::HashMap<String, Value>,
+) -> String {
+    let cs: Vec<char> = sql.chars().collect();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0;
+    while i < cs.len() {
+        let c = cs[i];
+        if c == '\'' {
+            out.push(c);
+            i += 1;
+            while i < cs.len() {
+                out.push(cs[i]);
+                if cs[i] == '\'' {
+                    if i + 1 < cs.len() && cs[i + 1] == '\'' {
+                        out.push(cs[i + 1]);
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if c == '@' {
+            if i + 1 < cs.len() && cs[i + 1] == '@' {
+                out.push('@');
+                out.push('@');
+                i += 2;
+                continue;
+            }
+            let start = i + 1;
+            let mut j = start;
+            while j < cs.len() && (cs[j].is_ascii_alphanumeric() || cs[j] == '_') {
+                j += 1;
+            }
+            if j > start {
+                let name = cs[start..j].iter().collect::<String>().to_ascii_lowercase();
+                let v = vars.get(&name).cloned().unwrap_or(Value::Null);
+                out.push_str(&value_sql_literal(&v));
+                i = j;
+                continue;
+            }
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
 /// Render a value as a SQL literal (for splicing NEW/OLD into trigger bodies).
 pub(crate) fn value_sql_literal(v: &Value) -> String {
     match v {

@@ -9,12 +9,11 @@ implemented, so you can judge fit.
   including over joins), derived tables, CTEs (`WITH`, including
   `WITH RECURSIVE`), `HAVING`, window functions with explicit `ROWS`/`RANGE`
   frames, set operations, and `FROM`-less `SELECT` are supported.
-- Stored procedures support parameters (`IN`), local variables (`DECLARE`,
-  `SET`), and control flow (`IF`/`ELSEIF`/`ELSE`/`END IF`, `WHILE`/`END WHILE`),
-  plus arbitrary SQL statements, via `CREATE PROCEDURE name(params) BEGIN ...;
-  END` and `CALL`. Variables are referenced by bare name (avoid names that clash
-  with columns). `OUT`/`INOUT` params, `LOOP`/`REPEAT`, cursors and handlers are
-  not yet supported.
+- Stored procedures support `IN`/`OUT`/`INOUT` parameters, session `@user`
+  variables (`SET @x = ...`), local variables (`DECLARE`, `SET`), and control
+  flow: `IF`/`ELSEIF`/`ELSE`, `WHILE`, `LOOP`, `REPEAT ... UNTIL`, with labeled
+  `LEAVE`/`ITERATE`. `OUT`/`INOUT` arguments must be `@user` variables (written
+  back on return). Cursors and condition handlers are not yet supported.
 - Row-level triggers are supported: `CREATE TRIGGER name {BEFORE|AFTER}
   {INSERT|UPDATE|DELETE} ON t FOR EACH ROW <body>`, with `NEW.col`/`OLD.col`.
   BEFORE bodies support `SET NEW.col = expr`; AFTER bodies run arbitrary DML.

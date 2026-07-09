@@ -10,11 +10,27 @@
 use elyra_core::{Error, Result};
 use serde::{Deserialize, Serialize};
 
-/// A stored procedure: its parameter names (in order) and body text.
+/// Parameter passing mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ParamMode {
+    In,
+    Out,
+    Inout,
+}
+
+/// A stored procedure: its parameters (name + mode, in order) and body text.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcDef {
-    pub params: Vec<String>,
+    pub params: Vec<(String, ParamMode)>,
     pub body: String,
+}
+
+/// Control-flow signal returned by executing a procedural statement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Flow {
+    Normal,
+    Leave(String),
+    Iterate(String),
 }
 
 /// A parsed procedural statement.
@@ -33,9 +49,21 @@ pub enum ProcStmt {
         els: Option<Vec<ProcStmt>>,
     },
     While {
+        label: Option<String>,
         cond: String,
         body: Vec<ProcStmt>,
     },
+    Loop {
+        label: Option<String>,
+        body: Vec<ProcStmt>,
+    },
+    Repeat {
+        label: Option<String>,
+        body: Vec<ProcStmt>,
+        until: String,
+    },
+    Leave(String),
+    Iterate(String),
     Sql(String),
 }
 
@@ -82,9 +110,96 @@ fn kw_at(s: &str, kw: &str) -> bool {
     s.len() >= kw.len() && s[..kw.len()].eq_ignore_ascii_case(kw)
 }
 
+/// Classify an inline statement (after THEN/ELSE/DO/LOOP) into a ProcStmt.
+fn inline_stmt(s: &str) -> ProcStmt {
+    let low = s.to_ascii_lowercase();
+    if low.starts_with("leave ") {
+        ProcStmt::Leave(s[6..].trim().to_string())
+    } else if low.starts_with("iterate ") {
+        ProcStmt::Iterate(s[8..].trim().to_string())
+    } else if low.starts_with("set ") {
+        let rest = &s[4..];
+        if let Some(eq) = rest.find('=') {
+            ProcStmt::Set {
+                name: rest[..eq].trim().to_string(),
+                expr: rest[eq + 1..].trim().to_string(),
+            }
+        } else {
+            ProcStmt::Sql(s.to_string())
+        }
+    } else {
+        ProcStmt::Sql(s.to_string())
+    }
+}
+
+/// Insert `;` boundaries around control-flow keywords so that block headers and
+/// their first inner statement are separate parts (outside string literals).
+fn normalize(body: &str) -> String {
+    // Keyword lists (lowercase, whole-word).
+    const AFTER: &[&str] = &["then", "do", "begin", "loop", "else"];
+    const BEFORE: &[&str] = &["elseif", "until", "end", "else"];
+    let cs: Vec<char> = body.chars().collect();
+    let mut out = String::with_capacity(body.len() + 16);
+    let ensure_semi = |out: &mut String| {
+        let t = out.trim_end();
+        if !t.is_empty() && !t.ends_with(';') {
+            out.truncate(t.len());
+            out.push(';');
+        }
+    };
+    let mut i = 0;
+    let mut prev = String::new();
+    while i < cs.len() {
+        let c = cs[i];
+        if c == '\'' {
+            out.push(c);
+            i += 1;
+            while i < cs.len() {
+                out.push(cs[i]);
+                if cs[i] == '\'' {
+                    if i + 1 < cs.len() && cs[i + 1] == '\'' {
+                        out.push('\'');
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if c.is_ascii_alphabetic() {
+            let start = i;
+            while i < cs.len() && (cs[i].is_ascii_alphanumeric() || cs[i] == '_') {
+                i += 1;
+            }
+            let word: String = cs[start..i].iter().collect();
+            let low = word.to_ascii_lowercase();
+            if BEFORE.contains(&low.as_str()) && prev != "end" {
+                ensure_semi(&mut out);
+                out.push(' ');
+            }
+            out.push_str(&word);
+            // Don't break `END LOOP`/`END REPEAT` (a closing keyword after END).
+            if AFTER.contains(&low.as_str()) && prev != "end" {
+                out.push(';');
+            }
+            prev = low;
+            continue;
+        }
+        if !c.is_whitespace() {
+            prev.clear();
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
 /// Parse a procedure body into procedural statements.
 pub fn parse(body: &str) -> Result<Vec<ProcStmt>> {
-    let parts = split_parts(body);
+    let parts = split_parts(&normalize(body));
     let mut i = 0;
     parse_block(&parts, &mut i, &[])
 }
@@ -99,7 +214,79 @@ fn parse_block(parts: &[String], i: &mut usize, terminators: &[&str]) -> Result<
         if terminators.iter().any(|t| low.starts_with(t)) {
             return Ok(out);
         }
-        if kw_at(&part, "declare ") {
+        // Optional statement label: `name: WHILE|LOOP|REPEAT ...`.
+        let (label, part) = match part.find(':') {
+            Some(cp)
+                if !part[..cp].trim().is_empty()
+                    && part[..cp]
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    && {
+                        let after = part[cp + 1..].trim_start().to_ascii_lowercase();
+                        after.starts_with("while")
+                            || after.starts_with("loop")
+                            || after.starts_with("repeat")
+                    } =>
+            {
+                (
+                    Some(part[..cp].trim().to_string()),
+                    part[cp + 1..].trim_start().to_string(),
+                )
+            }
+            _ => (None, part),
+        };
+        if kw_at(&part, "loop") && (part.len() == 4 || part[4..].starts_with(char::is_whitespace)) {
+            let inline = part[4..].trim().to_string();
+            *i += 1;
+            let mut body = Vec::new();
+            if !inline.is_empty() {
+                body.push(inline_stmt(&inline));
+            }
+            let mut rest = parse_block(parts, i, &["end loop"])?;
+            body.append(&mut rest);
+            if *i >= parts.len() {
+                return Err(Error::Parse("LOOP without END LOOP".into()));
+            }
+            *i += 1;
+            out.push(ProcStmt::Loop { label, body });
+        } else if kw_at(&part, "repeat") {
+            *i += 1;
+            // REPEAT may have an inline first statement after the keyword.
+            let mut body = Vec::new();
+            let inline = part[6..].trim();
+            if !inline.is_empty() {
+                body.push(inline_stmt(inline));
+            }
+            let mut rest = parse_block(parts, i, &["until"])?;
+            body.append(&mut rest);
+            if *i >= parts.len() || !parts[*i].to_ascii_lowercase().starts_with("until") {
+                return Err(Error::Parse("REPEAT without UNTIL".into()));
+            }
+            // `UNTIL <cond> END REPEAT` may be one part.
+            let up = &parts[*i];
+            let ulow = up.to_ascii_lowercase();
+            let until = match ulow.find("end repeat") {
+                Some(e) => up[5..e].trim().to_string(),
+                None => up[5..].trim().to_string(),
+            };
+            if ulow.contains("end repeat") {
+                *i += 1;
+            } else {
+                *i += 1;
+                if *i < parts.len() && parts[*i].to_ascii_lowercase().starts_with("end repeat") {
+                    *i += 1;
+                }
+            }
+            out.push(ProcStmt::Repeat { label, body, until });
+        } else if kw_at(&part, "while ") {
+            out.push(parse_while(parts, i, label, &part)?);
+        } else if kw_at(&part, "leave ") {
+            out.push(ProcStmt::Leave(part[6..].trim().to_string()));
+            *i += 1;
+        } else if kw_at(&part, "iterate ") {
+            out.push(ProcStmt::Iterate(part[8..].trim().to_string()));
+            *i += 1;
+        } else if kw_at(&part, "declare ") {
             let rest = part[8..].trim();
             // name type [DEFAULT expr]
             let name = rest
@@ -124,8 +311,6 @@ fn parse_block(parts: &[String], i: &mut usize, terminators: &[&str]) -> Result<
             *i += 1;
         } else if kw_at(&part, "if ") {
             out.push(parse_if(parts, i)?);
-        } else if kw_at(&part, "while ") {
-            out.push(parse_while(parts, i)?);
         } else {
             out.push(ProcStmt::Sql(part));
             *i += 1;
@@ -155,7 +340,7 @@ fn parse_if(parts: &[String], i: &mut usize) -> Result<ProcStmt> {
     let mut cur_cond = cond;
     let mut cur_body: Vec<ProcStmt> = Vec::new();
     if let Some(s) = inline {
-        cur_body.push(ProcStmt::Sql(s));
+        cur_body.push(inline_stmt(&s));
     }
     loop {
         let mut body = parse_block(parts, i, &["elseif ", "elseif", "else", "end if"])?;
@@ -169,7 +354,7 @@ fn parse_if(parts: &[String], i: &mut usize) -> Result<ProcStmt> {
             let (c, inline) = split_header(&parts[*i], "elseif ", " then")?;
             cur_cond = c;
             if let Some(s) = inline {
-                cur_body.push(ProcStmt::Sql(s));
+                cur_body.push(inline_stmt(&s));
             }
             *i += 1;
         } else if low.starts_with("else") && !low.starts_with("elseif") {
@@ -179,7 +364,7 @@ fn parse_if(parts: &[String], i: &mut usize) -> Result<ProcStmt> {
             *i += 1;
             let mut eb = Vec::new();
             if !after.is_empty() {
-                eb.push(ProcStmt::Sql(after));
+                eb.push(inline_stmt(&after));
             }
             let mut rest = parse_block(parts, i, &["end if"])?;
             eb.append(&mut rest);
@@ -196,12 +381,17 @@ fn parse_if(parts: &[String], i: &mut usize) -> Result<ProcStmt> {
     Ok(ProcStmt::If { branches, els })
 }
 
-fn parse_while(parts: &[String], i: &mut usize) -> Result<ProcStmt> {
-    let (cond, inline) = split_header(&parts[*i], "while ", " do")?;
+fn parse_while(
+    parts: &[String],
+    i: &mut usize,
+    label: Option<String>,
+    header: &str,
+) -> Result<ProcStmt> {
+    let (cond, inline) = split_header(header, "while ", " do")?;
     *i += 1;
     let mut body = Vec::new();
     if let Some(s) = inline {
-        body.push(ProcStmt::Sql(s));
+        body.push(inline_stmt(&s));
     }
     let mut rest = parse_block(parts, i, &["end while"])?;
     body.append(&mut rest);
@@ -209,5 +399,5 @@ fn parse_while(parts: &[String], i: &mut usize) -> Result<ProcStmt> {
         return Err(Error::Parse("WHILE without END WHILE".into()));
     }
     *i += 1; // consume END WHILE
-    Ok(ProcStmt::While { cond, body })
+    Ok(ProcStmt::While { label, cond, body })
 }

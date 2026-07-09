@@ -84,7 +84,8 @@ impl Engine {
         self.db.clone()
     }
 
-    /// Interpret a parsed procedure body against a variable environment.
+    /// Interpret a parsed procedure body against a variable environment,
+    /// returning any control-flow signal that escaped it.
     async fn run_proc(
         &self,
         stmts: &[proc::ProcStmt],
@@ -92,9 +93,26 @@ impl Engine {
         privilege: Privilege,
         user: &str,
         sess: &Session,
-    ) -> Result<()> {
-        use proc::ProcStmt;
+    ) -> Result<proc::Flow> {
+        use proc::{Flow, ProcStmt};
         const MAX_LOOP: u64 = 10_000_000;
+        let cond = |c: &str, env: &std::collections::HashMap<String, Value>| -> Result<bool> {
+            Ok(truthy(&exec::eval_scalar(&exec::substitute_vars(c, env))?))
+        };
+        // How a loop body's escape signal is handled by a loop with `label`.
+        enum Act {
+            Continue,
+            Break,
+            Bubble(Flow),
+        }
+        let act = |f: Flow, label: &Option<String>| -> Act {
+            match f {
+                Flow::Normal => Act::Continue,
+                Flow::Iterate(ref l) if label.as_deref() == Some(l.as_str()) => Act::Continue,
+                Flow::Leave(ref l) if label.as_deref() == Some(l.as_str()) => Act::Break,
+                other => Act::Bubble(other),
+            }
+        };
         for stmt in stmts {
             match stmt {
                 ProcStmt::Declare { name, default } => {
@@ -108,30 +126,80 @@ impl Engine {
                     let v = exec::eval_scalar(&exec::substitute_vars(expr, env))?;
                     env.insert(name.to_ascii_lowercase(), v);
                 }
+                ProcStmt::Leave(l) => return Ok(Flow::Leave(l.clone())),
+                ProcStmt::Iterate(l) => return Ok(Flow::Iterate(l.clone())),
                 ProcStmt::If { branches, els } => {
                     let mut ran = false;
-                    for (cond, body) in branches {
-                        if truthy(&exec::eval_scalar(&exec::substitute_vars(cond, env))?) {
-                            Box::pin(self.run_proc(body, env, privilege, user, sess)).await?;
+                    for (c, body) in branches {
+                        if cond(c, env)? {
+                            let f =
+                                Box::pin(self.run_proc(body, env, privilege, user, sess)).await?;
+                            if f != Flow::Normal {
+                                return Ok(f);
+                            }
                             ran = true;
                             break;
                         }
                     }
                     if !ran {
                         if let Some(body) = els {
-                            Box::pin(self.run_proc(body, env, privilege, user, sess)).await?;
+                            let f =
+                                Box::pin(self.run_proc(body, env, privilege, user, sess)).await?;
+                            if f != Flow::Normal {
+                                return Ok(f);
+                            }
                         }
                     }
                 }
-                ProcStmt::While { cond, body } => {
-                    let mut iters = 0u64;
-                    while truthy(&exec::eval_scalar(&exec::substitute_vars(cond, env))?) {
-                        Box::pin(self.run_proc(body, env, privilege, user, sess)).await?;
-                        iters += 1;
-                        if iters >= MAX_LOOP {
-                            return Err(Error::Query(
-                                "procedure WHILE loop exceeded iteration limit".into(),
-                            ));
+                ProcStmt::While {
+                    label,
+                    cond: c,
+                    body,
+                } => {
+                    let mut n = 0u64;
+                    while cond(c, env)? {
+                        let f = Box::pin(self.run_proc(body, env, privilege, user, sess)).await?;
+                        match act(f, label) {
+                            Act::Continue => {}
+                            Act::Break => break,
+                            Act::Bubble(o) => return Ok(o),
+                        }
+                        n += 1;
+                        if n >= MAX_LOOP {
+                            return Err(Error::Query("WHILE exceeded iteration limit".into()));
+                        }
+                    }
+                }
+                ProcStmt::Loop { label, body } => {
+                    let mut n = 0u64;
+                    loop {
+                        let f = Box::pin(self.run_proc(body, env, privilege, user, sess)).await?;
+                        match act(f, label) {
+                            Act::Continue => {}
+                            Act::Break => break,
+                            Act::Bubble(o) => return Ok(o),
+                        }
+                        n += 1;
+                        if n >= MAX_LOOP {
+                            return Err(Error::Query("LOOP exceeded iteration limit".into()));
+                        }
+                    }
+                }
+                ProcStmt::Repeat { label, body, until } => {
+                    let mut n = 0u64;
+                    loop {
+                        let f = Box::pin(self.run_proc(body, env, privilege, user, sess)).await?;
+                        match act(f, label) {
+                            Act::Continue => {}
+                            Act::Break => break,
+                            Act::Bubble(o) => return Ok(o),
+                        }
+                        if cond(until, env)? {
+                            break;
+                        }
+                        n += 1;
+                        if n >= MAX_LOOP {
+                            return Err(Error::Query("REPEAT exceeded iteration limit".into()));
                         }
                     }
                 }
@@ -141,7 +209,7 @@ impl Engine {
                 }
             }
         }
-        Ok(())
+        Ok(Flow::Normal)
     }
 
     /// Run any trigger bodies queued by the last DML (with definer/admin rights),
@@ -202,6 +270,18 @@ impl Engine {
                 };
                 sess.set_isolation(level);
                 return Ok(vec![QueryResult::empty_ok()]);
+            }
+            // SET @user = expr
+            let after = trimmed[3..].trim_start();
+            if let Some(rest) = after.strip_prefix('@') {
+                if let Some(eq) = rest.find('=') {
+                    let name = rest[..eq].trim().to_string();
+                    let expr = rest[eq + 1..].trim().trim_end_matches(';');
+                    let subst = exec::substitute_uvars(expr, &sess.user_vars_snapshot());
+                    let v = exec::eval_scalar(&subst)?;
+                    sess.set_user_var(&name, v);
+                    return Ok(vec![QueryResult::empty_ok()]);
+                }
             }
         }
 
@@ -350,9 +430,12 @@ impl Engine {
                 Some(b) => bincode::deserialize(&b).map_err(|e| Error::Storage(e.to_string()))?,
                 None => return Err(Error::Query(format!("procedure does not exist: {name}"))),
             };
-            // Bind arguments (evaluated as scalar expressions) to parameters.
+            // Bind arguments to parameters (IN evaluated; OUT/INOUT bound to a
+            // @user variable to write back).
             let mut env: std::collections::HashMap<String, Value> =
                 std::collections::HashMap::new();
+            let mut writeback: Vec<(String, String)> = Vec::new();
+            let uvars = sess.user_vars_snapshot();
             if let (Some(open), Some(close)) = (call.find('('), call.rfind(')')) {
                 let args_s = &call[open + 1..close];
                 let args: Vec<&str> = if args_s.trim().is_empty() {
@@ -361,8 +444,29 @@ impl Engine {
                     args_s.split(',').collect()
                 };
                 for (i, a) in args.iter().enumerate() {
-                    if let Some(p) = def.params.get(i) {
-                        env.insert(p.clone(), exec::eval_scalar(a.trim())?);
+                    let Some((pname, mode)) = def.params.get(i) else {
+                        continue;
+                    };
+                    let a = a.trim();
+                    match mode {
+                        proc::ParamMode::In => {
+                            env.insert(
+                                pname.clone(),
+                                exec::eval_scalar(&exec::substitute_uvars(a, &uvars))?,
+                            );
+                        }
+                        proc::ParamMode::Out | proc::ParamMode::Inout => {
+                            let var = a.trim_start_matches('@').to_string();
+                            if a.starts_with('@') {
+                                writeback.push((pname.clone(), var.clone()));
+                            }
+                            let init = if *mode == proc::ParamMode::Inout {
+                                sess.user_var(&var)
+                            } else {
+                                Value::Null
+                            };
+                            env.insert(pname.clone(), init);
+                        }
                     }
                 }
             }
@@ -371,6 +475,9 @@ impl Engine {
             let r = Box::pin(self.run_proc(&stmts, &mut env, privilege, user, sess)).await;
             sess.leave_call();
             r?;
+            for (pname, var) in writeback {
+                sess.set_user_var(&var, env.get(&pname).cloned().unwrap_or(Value::Null));
+            }
             return Ok(vec![QueryResult::empty_ok()]);
         }
 
@@ -385,8 +492,14 @@ impl Engine {
         }
 
         let dialect = MySqlDialect {};
+        // Substitute @user variables (leaving @@system vars) before parsing.
+        let subst_sql = if sql.contains('@') {
+            exec::substitute_uvars(sql, &sess.user_vars_snapshot())
+        } else {
+            sql.to_string()
+        };
         let statements =
-            Parser::parse_sql(&dialect, sql).map_err(|e| Error::Parse(e.to_string()))?;
+            Parser::parse_sql(&dialect, &subst_sql).map_err(|e| Error::Parse(e.to_string()))?;
 
         let mut out = Vec::with_capacity(statements.len());
         for stmt in statements {
@@ -786,18 +899,17 @@ fn parse_create_procedure(sql: &str) -> Result<(String, proc::ProcDef)> {
             for p in inner.split(',') {
                 // [IN|OUT|INOUT] name type -> take the name token.
                 let toks: Vec<&str> = p.split_whitespace().collect();
-                let nm = match toks.as_slice() {
+                let (mode, nm) = match toks.as_slice() {
                     [] => continue,
-                    [a] => *a,
-                    [a, b, ..] => {
-                        if matches!(a.to_ascii_lowercase().as_str(), "in" | "out" | "inout") {
-                            b
-                        } else {
-                            a
-                        }
-                    }
+                    [a] => (proc::ParamMode::In, *a),
+                    [a, b, ..] => match a.to_ascii_lowercase().as_str() {
+                        "out" => (proc::ParamMode::Out, *b),
+                        "inout" => (proc::ParamMode::Inout, *b),
+                        "in" => (proc::ParamMode::In, *b),
+                        _ => (proc::ParamMode::In, *a),
+                    },
                 };
-                params.push(nm.trim_matches(['`', '"']).to_ascii_lowercase());
+                params.push((nm.trim_matches(['`', '"']).to_ascii_lowercase(), mode));
             }
         }
     }
