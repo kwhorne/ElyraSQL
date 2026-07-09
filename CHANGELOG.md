@@ -4,6 +4,39 @@ All notable changes to ElyraSQL are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.8.4] - 2026-07-09
+
+High-availability & query-planner release.
+
+### Zero-data-loss failover (election restriction)
+
+- Cluster leader election now enforces the **Raft election restriction**: a node
+  only votes for a candidate at least as up-to-date (by LSN) as itself, so an
+  elected leader holds every quorum-acknowledged write. Together with
+  `--sync-strict` this makes failover no-data-loss for acknowledged writes. (The
+  sync barrier still runs after the local commit; this is not a pre-commit
+  2-phase protocol.)
+
+### Dynamic cluster membership
+
+- Add/remove cluster members at runtime with `elyrasql cluster-ctl --node
+  <addr> --action add|remove --peer id@host:port`. The leader advertises the
+  membership in heartbeats and followers adopt it. Add one node at a time and
+  start it before adding.
+
+### Cost-based JOIN reordering + merge join
+
+- Explicit INNER-join chains over base tables are reordered cost-based (drive
+  from the smallest relation, extend along equi-join predicates; alias-aware).
+- Large INNER equi-joins whose inputs are already sorted on the join key
+  (clustered primary-key scans) use a streaming merge join.
+
+### Stored procedures: cursors & handlers
+
+- `DECLARE ... CURSOR FOR`, `OPEN`, `FETCH ... INTO`, `CLOSE`, and
+  `DECLARE {CONTINUE|EXIT} HANDLER FOR {NOT FOUND | SQLEXCEPTION | SQLSTATE '...'
+  | <code>} <action>`.
+
 ## [0.8.3] - 2026-07-09
 
 Scalability & robustness release — hardening the write path and high availability.
@@ -384,6 +417,7 @@ core CRUD with `WHERE`/`ORDER BY`/`LIMIT`, indexes, aggregation and `GROUP BY`,
 joins, prepared statements, authentication and TLS, vector search (exact +
 HNSW), parallel OLAP aggregation, and transactions with snapshot isolation.
 
+[0.8.4]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.8.4
 [0.8.3]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.8.3
 [0.8.2]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.8.2
 [0.8.1]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.8.1
