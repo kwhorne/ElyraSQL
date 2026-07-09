@@ -7,7 +7,9 @@
 //! bare name (avoid names that clash with column names), and control-flow
 //! keywords are matched case-insensitively.
 
-use elyra_core::{Error, Result};
+use std::collections::HashMap;
+
+use elyra_core::{Error, Result, Value};
 use serde::{Deserialize, Serialize};
 
 /// Parameter passing mode.
@@ -31,6 +33,58 @@ pub enum Flow {
     Normal,
     Leave(String),
     Iterate(String),
+    /// An EXIT handler fired: unwind the whole procedure body.
+    Exit,
+}
+
+/// A condition a handler responds to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Cond {
+    NotFound,
+    SqlException,
+    SqlState(String),
+    Code(u64),
+}
+
+/// What a handler does after running its action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandlerKind {
+    Continue,
+    Exit,
+}
+
+/// A declared condition handler.
+#[derive(Debug, Clone)]
+pub struct Handler {
+    pub kind: HandlerKind,
+    pub conds: Vec<Cond>,
+    pub action: Box<ProcStmt>,
+}
+
+impl Handler {
+    /// Whether this handler responds to the given condition (`not_found` picks
+    /// NOT FOUND / SQLSTATE 02000; otherwise any SQL error).
+    pub fn matches(&self, not_found: bool) -> bool {
+        self.conds.iter().any(|c| match c {
+            Cond::NotFound => not_found,
+            Cond::SqlState(s) => (s == "02000") == not_found,
+            Cond::SqlException | Cond::Code(_) => !not_found,
+        })
+    }
+}
+
+/// An open cursor's materialized result set and read position.
+pub struct Cursor {
+    pub rows: Vec<Vec<Value>>,
+    pub pos: usize,
+}
+
+/// Mutable procedure runtime context: declared cursors and handlers.
+#[derive(Default)]
+pub struct ProcCtx {
+    pub cursor_defs: HashMap<String, String>,
+    pub cursors: HashMap<String, Cursor>,
+    pub handlers: Vec<Handler>,
 }
 
 /// A parsed procedural statement.
@@ -64,6 +118,22 @@ pub enum ProcStmt {
     },
     Leave(String),
     Iterate(String),
+    /// `DECLARE cur CURSOR FOR <select>`
+    DeclareCursor {
+        name: String,
+        query: String,
+    },
+    /// `OPEN cur`
+    OpenCursor(String),
+    /// `FETCH cur INTO a, b`
+    Fetch {
+        cursor: String,
+        vars: Vec<String>,
+    },
+    /// `CLOSE cur`
+    CloseCursor(String),
+    /// `DECLARE {CONTINUE|EXIT} HANDLER FOR <cond>[, ...] <action>`
+    DeclareHandler(Handler),
     Sql(String),
 }
 
@@ -130,6 +200,70 @@ fn inline_stmt(s: &str) -> ProcStmt {
     } else {
         ProcStmt::Sql(s.to_string())
     }
+}
+
+/// Parse `DECLARE {CONTINUE|EXIT} HANDLER FOR <cond>[, ...] <action>`.
+fn parse_handler(part: &str) -> Result<ProcStmt> {
+    let rest = part["declare".len()..].trim();
+    let low = rest.to_ascii_lowercase();
+    let kind = if low.starts_with("exit") {
+        HandlerKind::Exit
+    } else {
+        HandlerKind::Continue
+    };
+    let for_pos = low
+        .find(" for ")
+        .ok_or_else(|| Error::Parse("HANDLER requires FOR".into()))?;
+    let after = rest[for_pos + " for ".len()..].trim();
+    // Consume condition tokens; the first token that is not part of a condition
+    // (nor a comma) begins the action.
+    let bytes: Vec<&str> = after.split_whitespace().collect();
+    let mut conds = Vec::new();
+    let mut k = 0;
+    while k < bytes.len() {
+        let w = bytes[k].trim_end_matches(',').to_ascii_lowercase();
+        match w.as_str() {
+            "not"
+                if k + 1 < bytes.len()
+                    && bytes[k + 1]
+                        .trim_end_matches(',')
+                        .eq_ignore_ascii_case("found") =>
+            {
+                conds.push(Cond::NotFound);
+                k += 2;
+            }
+            "sqlexception" => {
+                conds.push(Cond::SqlException);
+                k += 1;
+            }
+            "sqlwarning" => {
+                conds.push(Cond::SqlException);
+                k += 1;
+            }
+            "sqlstate" if k + 1 < bytes.len() => {
+                let s = bytes[k + 1].trim_matches(['\'', '"', ',']).to_string();
+                conds.push(Cond::SqlState(s));
+                k += 2;
+            }
+            other if other.parse::<u64>().is_ok() => {
+                conds.push(Cond::Code(other.parse().unwrap()));
+                k += 1;
+            }
+            _ => break,
+        }
+    }
+    if conds.is_empty() {
+        return Err(Error::Parse("HANDLER requires a condition".into()));
+    }
+    let action_text = bytes[k..].join(" ");
+    if action_text.trim().is_empty() {
+        return Err(Error::Parse("HANDLER requires an action".into()));
+    }
+    Ok(ProcStmt::DeclareHandler(Handler {
+        kind,
+        conds,
+        action: Box::new(inline_stmt(action_text.trim())),
+    }))
 }
 
 /// Insert `;` boundaries around control-flow keywords so that block headers and
@@ -285,6 +419,48 @@ fn parse_block(parts: &[String], i: &mut usize, terminators: &[&str]) -> Result<
             *i += 1;
         } else if kw_at(&part, "iterate ") {
             out.push(ProcStmt::Iterate(part[8..].trim().to_string()));
+            *i += 1;
+        } else if kw_at(&part, "declare ") && low.contains(" cursor ") {
+            // DECLARE <name> CURSOR FOR <select>
+            let rest = part[8..].trim();
+            let cpos = rest.to_ascii_lowercase().find(" cursor ").unwrap();
+            let name = rest[..cpos].trim().to_string();
+            let after = rest[cpos + " cursor ".len()..].trim();
+            let query = match after.to_ascii_lowercase().strip_prefix("for ") {
+                Some(_) => after[4..].trim().to_string(),
+                None => after.to_string(),
+            };
+            out.push(ProcStmt::DeclareCursor { name, query });
+            *i += 1;
+        } else if kw_at(&part, "declare ") && low.contains(" handler ") {
+            out.push(parse_handler(&part)?);
+            *i += 1;
+        } else if kw_at(&part, "open ") {
+            out.push(ProcStmt::OpenCursor(part[5..].trim().to_string()));
+            *i += 1;
+        } else if kw_at(&part, "close ") {
+            out.push(ProcStmt::CloseCursor(part[6..].trim().to_string()));
+            *i += 1;
+        } else if kw_at(&part, "fetch ") {
+            // FETCH [NEXT FROM] cur INTO a, b
+            let rest = part[6..].trim();
+            let into = rest
+                .to_ascii_lowercase()
+                .find(" into ")
+                .ok_or_else(|| Error::Parse("FETCH requires INTO".into()))?;
+            let head = rest[..into].trim();
+            let cursor = head
+                .split_whitespace()
+                .last()
+                .unwrap_or(head)
+                .trim_matches(['`', '"'])
+                .to_string();
+            let vars = rest[into + " into ".len()..]
+                .split(',')
+                .map(|v| v.trim().trim_start_matches('@').to_string())
+                .filter(|v| !v.is_empty())
+                .collect();
+            out.push(ProcStmt::Fetch { cursor, vars });
             *i += 1;
         } else if kw_at(&part, "declare ") {
             let rest = part[8..].trim();

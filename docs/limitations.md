@@ -13,7 +13,11 @@ implemented, so you can judge fit.
   variables (`SET @x = ...`), local variables (`DECLARE`, `SET`), and control
   flow: `IF`/`ELSEIF`/`ELSE`, `WHILE`, `LOOP`, `REPEAT ... UNTIL`, with labeled
   `LEAVE`/`ITERATE`. `OUT`/`INOUT` arguments must be `@user` variables (written
-  back on return). Cursors and condition handlers are not yet supported.
+  back on return). **Cursors** (`DECLARE ... CURSOR FOR`, `OPEN`, `FETCH ...
+  INTO`, `CLOSE`) and **condition handlers** (`DECLARE {CONTINUE|EXIT} HANDLER
+  FOR {NOT FOUND | SQLEXCEPTION | SQLSTATE '...' | <code>} <action>`) are
+  supported; a handler action is a single statement (not a `BEGIN ... END`
+  block), and handlers are scoped to the whole procedure body.
 - Row-level triggers are supported: `CREATE TRIGGER name {BEFORE|AFTER}
   {INSERT|UPDATE|DELETE} ON t FOR EACH ROW <body>`, with `NEW.col`/`OLD.col`.
   BEFORE bodies support `SET NEW.col = expr`; AFTER bodies run arbitrary DML.

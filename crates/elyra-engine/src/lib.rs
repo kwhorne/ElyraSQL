@@ -94,6 +94,7 @@ impl Engine {
         &self,
         stmts: &[proc::ProcStmt],
         env: &mut std::collections::HashMap<String, Value>,
+        ctx: &mut proc::ProcCtx,
         privilege: Privilege,
         user: &str,
         sess: &Session,
@@ -136,8 +137,8 @@ impl Engine {
                     let mut ran = false;
                     for (c, body) in branches {
                         if cond(c, env)? {
-                            let f =
-                                Box::pin(self.run_proc(body, env, privilege, user, sess)).await?;
+                            let f = Box::pin(self.run_proc(body, env, ctx, privilege, user, sess))
+                                .await?;
                             if f != Flow::Normal {
                                 return Ok(f);
                             }
@@ -147,8 +148,8 @@ impl Engine {
                     }
                     if !ran {
                         if let Some(body) = els {
-                            let f =
-                                Box::pin(self.run_proc(body, env, privilege, user, sess)).await?;
+                            let f = Box::pin(self.run_proc(body, env, ctx, privilege, user, sess))
+                                .await?;
                             if f != Flow::Normal {
                                 return Ok(f);
                             }
@@ -162,7 +163,8 @@ impl Engine {
                 } => {
                     let mut n = 0u64;
                     while cond(c, env)? {
-                        let f = Box::pin(self.run_proc(body, env, privilege, user, sess)).await?;
+                        let f =
+                            Box::pin(self.run_proc(body, env, ctx, privilege, user, sess)).await?;
                         match act(f, label) {
                             Act::Continue => {}
                             Act::Break => break,
@@ -177,7 +179,8 @@ impl Engine {
                 ProcStmt::Loop { label, body } => {
                     let mut n = 0u64;
                     loop {
-                        let f = Box::pin(self.run_proc(body, env, privilege, user, sess)).await?;
+                        let f =
+                            Box::pin(self.run_proc(body, env, ctx, privilege, user, sess)).await?;
                         match act(f, label) {
                             Act::Continue => {}
                             Act::Break => break,
@@ -192,7 +195,8 @@ impl Engine {
                 ProcStmt::Repeat { label, body, until } => {
                     let mut n = 0u64;
                     loop {
-                        let f = Box::pin(self.run_proc(body, env, privilege, user, sess)).await?;
+                        let f =
+                            Box::pin(self.run_proc(body, env, ctx, privilege, user, sess)).await?;
                         match act(f, label) {
                             Act::Continue => {}
                             Act::Break => break,
@@ -207,13 +211,137 @@ impl Engine {
                         }
                     }
                 }
+                ProcStmt::DeclareHandler(h) => {
+                    ctx.handlers.push(h.clone());
+                }
+                ProcStmt::DeclareCursor { name, query } => {
+                    ctx.cursor_defs
+                        .insert(name.to_ascii_lowercase(), query.clone());
+                }
+                ProcStmt::OpenCursor(name) => {
+                    let key = name.to_ascii_lowercase();
+                    let query =
+                        ctx.cursor_defs.get(&key).cloned().ok_or_else(|| {
+                            Error::Query(format!("cursor '{name}' is not declared"))
+                        })?;
+                    let sql = exec::substitute_vars(&query, env);
+                    let rows = self.materialize_rows(&sql, privilege, user, sess).await?;
+                    ctx.cursors.insert(key, proc::Cursor { rows, pos: 0 });
+                }
+                ProcStmt::CloseCursor(name) => {
+                    ctx.cursors.remove(&name.to_ascii_lowercase());
+                }
+                ProcStmt::Fetch { cursor, vars } => {
+                    let key = cursor.to_ascii_lowercase();
+                    let row = {
+                        let cur = ctx.cursors.get_mut(&key).ok_or_else(|| {
+                            Error::Query(format!("cursor '{cursor}' is not open"))
+                        })?;
+                        if cur.pos < cur.rows.len() {
+                            let r = cur.rows[cur.pos].clone();
+                            cur.pos += 1;
+                            Some(r)
+                        } else {
+                            None
+                        }
+                    };
+                    match row {
+                        Some(r) => {
+                            for (v, val) in vars.iter().zip(r) {
+                                env.insert(v.to_ascii_lowercase(), val);
+                            }
+                        }
+                        None => {
+                            // NOT FOUND: run a matching handler if one is declared.
+                            if let Some(flow) = self
+                                .run_handler(ctx, env, true, privilege, user, sess)
+                                .await?
+                            {
+                                if flow == Flow::Exit {
+                                    return Ok(Flow::Exit);
+                                }
+                            }
+                        }
+                    }
+                }
                 ProcStmt::Sql(s) => {
                     let sql = exec::substitute_vars(s, env);
-                    Box::pin(self.execute_as(&sql, privilege, user, sess)).await?;
+                    match Box::pin(self.execute_as(&sql, privilege, user, sess)).await {
+                        Ok(_) => {}
+                        Err(e) => {
+                            match self
+                                .run_handler(ctx, env, false, privilege, user, sess)
+                                .await?
+                            {
+                                Some(Flow::Exit) => return Ok(Flow::Exit),
+                                Some(_) => {} // CONTINUE handler ran: swallow the error
+                                None => return Err(e),
+                            }
+                        }
+                    }
                 }
             }
         }
         Ok(Flow::Normal)
+    }
+
+    /// Find and run a declared handler matching the current condition. Returns
+    /// `Some(Flow)` if a handler ran (its kind decides continue vs exit), or
+    /// `None` if no handler matched.
+    async fn run_handler(
+        &self,
+        ctx: &mut proc::ProcCtx,
+        env: &mut std::collections::HashMap<String, Value>,
+        not_found: bool,
+        privilege: Privilege,
+        user: &str,
+        sess: &Session,
+    ) -> Result<Option<proc::Flow>> {
+        let found = ctx
+            .handlers
+            .iter()
+            .rev()
+            .find(|h| h.matches(not_found))
+            .map(|h| (h.kind, (*h.action).clone()));
+        let Some((kind, action)) = found else {
+            return Ok(None);
+        };
+        Box::pin(self.run_proc(
+            std::slice::from_ref(&action),
+            env,
+            ctx,
+            privilege,
+            user,
+            sess,
+        ))
+        .await?;
+        Ok(Some(match kind {
+            proc::HandlerKind::Exit => proc::Flow::Exit,
+            proc::HandlerKind::Continue => proc::Flow::Normal,
+        }))
+    }
+
+    /// Execute a query and materialize all of its rows (for a cursor OPEN).
+    async fn materialize_rows(
+        &self,
+        sql: &str,
+        privilege: Privilege,
+        user: &str,
+        sess: &Session,
+    ) -> Result<Vec<Vec<Value>>> {
+        let mut out = Vec::new();
+        for res in Box::pin(self.execute_as(sql, privilege, user, sess)).await? {
+            if let QueryResult::Rows(mut rs) = res {
+                loop {
+                    let batch = rs.next_batch(1024).await?;
+                    if batch.is_empty() {
+                        break;
+                    }
+                    out.extend(batch);
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Run any trigger bodies queued by the last DML (with definer/admin rights),
@@ -545,10 +673,12 @@ impl Engine {
                 }
             }
             let stmts = proc::parse(&def.body)?;
+            let mut ctx = proc::ProcCtx::default();
             sess.enter_call()?;
-            let r = Box::pin(self.run_proc(&stmts, &mut env, privilege, user, sess)).await;
+            let r =
+                Box::pin(self.run_proc(&stmts, &mut env, &mut ctx, privilege, user, sess)).await;
             sess.leave_call();
-            r?;
+            r?; // Flow::Exit from an EXIT handler is normal completion
             for (pname, var) in writeback {
                 sess.set_user_var(&var, env.get(&pname).cloned().unwrap_or(Value::Null));
             }
