@@ -61,6 +61,27 @@ ALTER TABLE users RENAME TO members;
 - **RENAME COLUMN** is a metadata-only change.
 - **RENAME TABLE** re-keys the data and rebuilds index entries.
 
+## Column defaults, AUTO_INCREMENT, and generated columns
+
+```sql
+CREATE TABLE items (
+    id     BIGINT PRIMARY KEY AUTO_INCREMENT,
+    name   TEXT,
+    status TEXT   DEFAULT 'active',
+    qty    BIGINT DEFAULT 1,
+    price  BIGINT,
+    total  BIGINT GENERATED ALWAYS AS (price * qty) STORED
+);
+```
+
+- **`DEFAULT <expr>`** — used when the column is omitted from an `INSERT`.
+- **`AUTO_INCREMENT`** — when the column is omitted, `NULL`, or `0`, the next
+  value from a per-table counter is assigned. An explicit larger value advances
+  the counter. The counter persists in the database file.
+- **`GENERATED ALWAYS AS (<expr>) STORED`** — computed from other columns on
+  every `INSERT` and `UPDATE`; any supplied value is ignored. `VIRTUAL`
+  generated columns are treated as stored.
+
 ## CREATE TABLE ... AS SELECT
 
 ```sql

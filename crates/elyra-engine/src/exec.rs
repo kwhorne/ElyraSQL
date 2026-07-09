@@ -675,6 +675,36 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
         read_rowid(db, &name).await?
     };
 
+    // Column defaults, AUTO_INCREMENT, and (stored) generated columns.
+    let ncols = def.schema.columns.len();
+    let has_meta = def.has_col_meta();
+    let mut provided = vec![false; ncols];
+    for &s in &target {
+        provided[s] = true;
+    }
+    let mut default_exprs: Vec<Option<Expr>> = vec![None; ncols];
+    let mut generated_exprs: Vec<Option<Expr>> = vec![None; ncols];
+    let mut auto_col: Option<usize> = None;
+    if has_meta {
+        for i in 0..ncols {
+            let m = def.meta(i);
+            if let Some(d) = &m.default {
+                default_exprs[i] = Some(parse_scalar_expr(d)?);
+            }
+            if let Some(g) = &m.generated {
+                generated_exprs[i] = Some(parse_scalar_expr(g)?);
+            }
+            if m.auto_increment {
+                auto_col = Some(i);
+            }
+        }
+    }
+    let mut autoinc: i64 = if auto_col.is_some() {
+        read_autoinc(db, &name).await?
+    } else {
+        0
+    };
+
     let mut deletes: Vec<Vec<u8>> = Vec::new();
     let mut affected: u64 = 0;
     // PK rows coalesce by clustered key so within-statement duplicates merge;
@@ -706,6 +736,39 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
         for (slot, v) in target.iter().zip(vals) {
             let col = &def.schema.columns[*slot];
             row[*slot] = coerce(v, &col.ty, &col.name)?;
+        }
+
+        if has_meta {
+            // Defaults for columns not supplied (and not generated).
+            for i in 0..ncols {
+                if !provided[i] && generated_exprs[i].is_none() {
+                    if let Some(de) = &default_exprs[i] {
+                        let v = eval_expr(de)?;
+                        let col = &def.schema.columns[i];
+                        row[i] = coerce(v, &col.ty, &col.name)?;
+                    }
+                }
+            }
+            // AUTO_INCREMENT: assign the next value when omitted / NULL / 0.
+            if let Some(ai) = auto_col {
+                let need = !provided[ai] || row[ai].is_null() || matches!(row[ai], Value::Int(0));
+                if need {
+                    autoinc += 1;
+                    row[ai] = Value::Int(autoinc);
+                } else if let Value::Int(n) = row[ai] {
+                    if n > autoinc {
+                        autoinc = n;
+                    }
+                }
+            }
+            // Stored generated columns, computed after the rest.
+            for i in 0..ncols {
+                if let Some(ge) = &generated_exprs[i] {
+                    let v = predicate::eval_row(ge, &def.schema, &row)?;
+                    let col = &def.schema.columns[i];
+                    row[i] = coerce(v, &col.ty, &col.name)?;
+                }
+            }
         }
 
         // Enforce NOT NULL.
@@ -781,9 +844,12 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
         puts.extend(index::entries_for_row(&def, row, key)?);
     }
 
-    // Persist the advanced rowid counter in the same atomic commit.
+    // Persist the advanced rowid / auto-increment counters in the same commit.
     if !def.has_pk() {
         puts.push((rowid_key(&name), next_rowid.to_le_bytes().to_vec()));
+    }
+    if auto_col.is_some() {
+        puts.push((autoinc_key(&name), autoinc.to_le_bytes().to_vec()));
     }
     puts.push(bump_wcount(db, &name).await?);
 
@@ -2457,6 +2523,19 @@ pub async fn update(
     let matches = mutation_matches(db, vindex, &def, &qualifier, selection, None).await?;
     let affected = matches.len() as u64;
 
+    // Stored generated columns are recomputed after each update.
+    let generated: Vec<(usize, Expr)> = if def.has_col_meta() {
+        let mut v = Vec::new();
+        for i in 0..def.schema.columns.len() {
+            if let Some(g) = def.meta(i).generated {
+                v.push((i, parse_scalar_expr(&g)?));
+            }
+        }
+        v
+    } else {
+        Vec::new()
+    };
+
     let mut puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     let mut deletes: Vec<Vec<u8>> = Vec::new();
 
@@ -2467,6 +2546,11 @@ pub async fn update(
             let v = predicate::eval_row(expr, &def.schema, &old_row)?;
             let col = &def.schema.columns[*idx];
             new_row[*idx] = coerce(v, &col.ty, &col.name)?;
+        }
+        for (i, ge) in &generated {
+            let v = predicate::eval_row(ge, &def.schema, &new_row)?;
+            let col = &def.schema.columns[*i];
+            new_row[*i] = coerce(v, &col.ty, &col.name)?;
         }
         for (i, col) in def.schema.columns.iter().enumerate() {
             if !col.nullable && new_row[i].is_null() {
@@ -3704,6 +3788,30 @@ fn parse_query(sql: &str) -> Result<SqlQuery> {
         Some(sqlparser::ast::Statement::Query(q)) => Ok(*q),
         _ => Err(Error::Query("view definition is not a query".into())),
     }
+}
+
+/// Parse a scalar expression (for stored defaults / generated columns).
+fn parse_scalar_expr(sql: &str) -> Result<Expr> {
+    use sqlparser::ast::SelectItem;
+    let q = parse_query(&format!("SELECT {sql}"))?;
+    if let SetExpr::Select(sel) = q.body.as_ref() {
+        match sel.projection.first() {
+            Some(SelectItem::UnnamedExpr(e)) | Some(SelectItem::ExprWithAlias { expr: e, .. }) => {
+                return Ok(e.clone())
+            }
+            _ => {}
+        }
+    }
+    Err(Error::Query(format!("cannot parse expression: {sql}")))
+}
+
+async fn read_autoinc(db: &Session, table: &str) -> Result<i64> {
+    Ok(match db.get(autoinc_key(table)).await? {
+        Some(bytes) if bytes.len() == 8 => {
+            i64::from_le_bytes(bytes.try_into().expect("checked length"))
+        }
+        _ => 0,
+    })
 }
 
 static TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
