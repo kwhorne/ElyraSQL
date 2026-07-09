@@ -24,6 +24,10 @@ implemented, so you can judge fit.
   Firing is depth-guarded against runaway recursion. Triggers fire on
   single-table INSERT/UPDATE/DELETE (not on multi-table or the upsert variants
   REPLACE/ON DUPLICATE/IGNORE).
+- **Materialized views**: `CREATE MATERIALIZED VIEW v AS <select>` stores the
+  result as a real table; `REFRESH MATERIALIZED VIEW v` recomputes it; `DROP
+  MATERIALIZED VIEW v` removes it. The view is not auto-refreshed on base-table
+  changes (refresh is explicit).
 - Not yet: named windows, `RANGE`/`GROUPS` numeric-offset frames, correlated
   subqueries combined with aggregation over a join, user-defined functions, and
   events.

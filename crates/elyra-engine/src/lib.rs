@@ -321,6 +321,80 @@ impl Engine {
         }))
     }
 
+    /// Handle CREATE / REFRESH / DROP MATERIALIZED VIEW by driving ordinary
+    /// CTAS / DROP / catalog writes.
+    async fn materialized_view(
+        &self,
+        sql: &str,
+        privilege: Privilege,
+        user: &str,
+        sess: &Session,
+    ) -> Result<Vec<QueryResult>> {
+        let lower = sql.to_ascii_lowercase();
+        // Position just after "... materialized view".
+        let head_end = lower.find("materialized view").unwrap() + "materialized view".len();
+        let rest = sql[head_end..].trim_start();
+        let verb = lower.trim_start();
+
+        if verb.starts_with("create") {
+            let as_pos = rest.to_ascii_lowercase().find(" as ").ok_or_else(|| {
+                Error::Parse("CREATE MATERIALIZED VIEW requires AS <query>".into())
+            })?;
+            let name = rest[..as_pos].trim().trim_matches(['`', '"']).to_string();
+            let query = rest[as_pos + 4..].trim().trim_end_matches(';').to_string();
+            if name.is_empty() || query.is_empty() {
+                return Err(Error::Parse(
+                    "CREATE MATERIALIZED VIEW: name and query required".into(),
+                ));
+            }
+            let ctas = format!("CREATE TABLE `{name}` AS {query}");
+            Box::pin(self.execute_as(&ctas, privilege, user, sess)).await?;
+            sess.commit_write(
+                vec![(catalog::matview_key(&name), query.into_bytes())],
+                vec![],
+            )
+            .await?;
+            return Ok(vec![QueryResult::empty_ok()]);
+        }
+
+        if verb.starts_with("refresh") {
+            let name = rest
+                .trim()
+                .trim_end_matches(';')
+                .trim_matches(['`', '"'])
+                .to_string();
+            let query = match sess.get(catalog::matview_key(&name)).await? {
+                Some(b) => String::from_utf8_lossy(&b).into_owned(),
+                None => return Err(Error::Catalog(format!("no such materialized view: {name}"))),
+            };
+            Box::pin(self.execute_as(&format!("DROP TABLE `{name}`"), privilege, user, sess))
+                .await?;
+            Box::pin(self.execute_as(
+                &format!("CREATE TABLE `{name}` AS {query}"),
+                privilege,
+                user,
+                sess,
+            ))
+            .await?;
+            return Ok(vec![QueryResult::empty_ok()]);
+        }
+
+        // DROP [IF EXISTS] <name>
+        let mut name = rest.trim().trim_end_matches(';');
+        if let Some(stripped) = name.to_ascii_lowercase().strip_prefix("if exists") {
+            let cut = name.len() - stripped.len();
+            name = name[cut..].trim();
+        }
+        let name = name.trim_matches(['`', '"']).to_string();
+        if sess.get(catalog::matview_key(&name)).await?.is_none() {
+            return Err(Error::Catalog(format!("no such materialized view: {name}")));
+        }
+        Box::pin(self.execute_as(&format!("DROP TABLE `{name}`"), privilege, user, sess)).await?;
+        sess.commit_write(vec![], vec![catalog::matview_key(&name)])
+            .await?;
+        Ok(vec![QueryResult::empty_ok()])
+    }
+
     /// Execute a query and materialize all of its rows (for a cursor OPEN).
     async fn materialize_rows(
         &self,
@@ -486,6 +560,21 @@ impl Engine {
             return Ok(vec![
                 exec::create_fulltext_index(sess, &name, &table, &cols).await?,
             ]);
+        }
+
+        // Materialized views: CREATE / REFRESH / DROP MATERIALIZED VIEW. The data
+        // lives in a normal table of the same name (built via CREATE TABLE AS
+        // SELECT); matview:: stores the defining query for REFRESH.
+        if head.starts_with("create materialized")
+            || head.starts_with("refresh materialized")
+            || head.starts_with("drop materialized")
+        {
+            if privilege < Privilege::Write {
+                return Err(Error::Query(
+                    "access denied: materialized views require WRITE privilege".into(),
+                ));
+            }
+            return self.materialized_view(trimmed, privilege, user, sess).await;
         }
 
         // LOAD DATA INFILE '<server-side path>' INTO TABLE t ... — reads a file on

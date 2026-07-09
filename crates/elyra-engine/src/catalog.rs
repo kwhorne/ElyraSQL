@@ -299,6 +299,12 @@ pub fn view_key(name: &str) -> Vec<u8> {
     format!("view::{name}").into_bytes()
 }
 
+/// Storage key for a materialized view's defining query (the data itself lives
+/// in a normal table of the same name).
+pub fn matview_key(name: &str) -> Vec<u8> {
+    format!("matview::{name}").into_bytes()
+}
+
 /// Load a view's stored SELECT text, if it exists.
 pub async fn load_view(db: &Session, name: &str) -> Result<Option<String>> {
     match db.get(view_key(name)).await? {
