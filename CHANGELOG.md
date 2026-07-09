@@ -4,6 +4,27 @@ All notable changes to ElyraSQL are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.8.7] - 2026-07-09
+
+SQL-surface & usability release.
+
+### Named windows
+
+- `SELECT ... OVER w ... WINDOW w AS (PARTITION BY ... ORDER BY ...)`, including
+  `OVER (w ...)` that inherits a named window and adds local clauses.
+
+### Materialized-view auto-refresh
+
+- Materialized views now **auto-refresh on read** when a base table has changed
+  since the last refresh (detected via per-table write counters). This is a full
+  recompute, not incremental delta maintenance.
+
+### Notes
+
+- `caching_sha2_password` remains unimplemented: the latest published
+  `opensrv-mysql` (0.7.0, what we use) does not drive its multi-round auth
+  exchange. MySQL 8 clients negotiate down to `mysql_native_password`.
+
 ## [0.8.6] - 2026-07-09
 
 Programmability, security & consensus-foundation release.
@@ -482,6 +503,7 @@ core CRUD with `WHERE`/`ORDER BY`/`LIMIT`, indexes, aggregation and `GROUP BY`,
 joins, prepared statements, authentication and TLS, vector search (exact +
 HNSW), parallel OLAP aggregation, and transactions with snapshot isolation.
 
+[0.8.7]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.8.7
 [0.8.6]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.8.6
 [0.8.5]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.8.5
 [0.8.4]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.8.4
