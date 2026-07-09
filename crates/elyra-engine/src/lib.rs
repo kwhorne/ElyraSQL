@@ -189,6 +189,23 @@ impl Engine {
                 sess.rollback();
                 Ok(QueryResult::empty_ok())
             }
+            Statement::ShowTables { .. } => exec::show_tables(sess).await,
+            Statement::ShowColumns { show_options, .. } => {
+                let name = show_options
+                    .show_in
+                    .and_then(|si| si.parent_name)
+                    .and_then(|n| n.0.last().map(|i| i.value.clone()))
+                    .ok_or_else(|| Error::Catalog("SHOW COLUMNS requires a table".into()))?;
+                exec::show_columns(sess, &name).await
+            }
+            Statement::ExplainTable { table_name, .. } => {
+                let name = table_name
+                    .0
+                    .last()
+                    .map(|i| i.value.clone())
+                    .ok_or_else(|| Error::Catalog("empty table name".into()))?;
+                exec::show_columns(sess, &name).await
+            }
             Statement::SetVariable { .. } | Statement::Use { .. } => Ok(QueryResult::empty_ok()),
             other => Err(Error::Unsupported(format!(
                 "statement not yet implemented: {other}"
@@ -234,7 +251,10 @@ fn required_privilege(stmt: &Statement) -> Privilege {
         Statement::Insert(_) | Statement::Update { .. } | Statement::Delete(_) => Privilege::Write,
         Statement::StartTransaction { .. }
         | Statement::Commit { .. }
-        | Statement::Rollback { .. } => Privilege::Read,
+        | Statement::Rollback { .. }
+        | Statement::ShowTables { .. }
+        | Statement::ShowColumns { .. }
+        | Statement::ExplainTable { .. } => Privilege::Read,
         _ => Privilege::Admin, // CREATE / DROP / CREATE INDEX and anything else
     }
 }

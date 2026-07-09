@@ -139,6 +139,34 @@ pub async fn load(db: &Session, table: &str) -> Result<TableDef> {
     }
 }
 
+/// List all user table names (excluding internal temp relations), sorted.
+pub async fn list_tables(db: &Session) -> Result<Vec<String>> {
+    let prefix = b"catalog::".to_vec();
+    let mut names = Vec::new();
+    let mut cursor: Option<Vec<u8>> = None;
+    loop {
+        let batch = db.scan_batch(prefix.clone(), cursor.clone(), 4096).await?;
+        if batch.is_empty() {
+            break;
+        }
+        cursor = batch.last().map(|(k, _)| k.clone());
+        let last = batch.len() < 4096;
+        for (k, _) in &batch {
+            if let Some(rest) = k.strip_prefix(prefix.as_slice()) {
+                let name = String::from_utf8_lossy(rest).into_owned();
+                if !name.starts_with("__cte_") {
+                    names.push(name);
+                }
+            }
+        }
+        if last {
+            break;
+        }
+    }
+    names.sort();
+    Ok(names)
+}
+
 /// Check whether a table exists.
 pub async fn exists(db: &Session, table: &str) -> Result<bool> {
     Ok(db.get(catalog_key(table)).await?.is_some())

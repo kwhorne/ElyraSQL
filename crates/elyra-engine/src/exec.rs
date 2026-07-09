@@ -191,6 +191,66 @@ pub async fn create_table(
     Ok(QueryResult::Affected(0))
 }
 
+/// SHOW TABLES: one column of user table names.
+pub async fn show_tables(db: &Session) -> Result<QueryResult> {
+    let names = catalog::list_tables(db).await?;
+    let schema = Schema::new(vec![ColumnDef {
+        name: "Tables_in_elyra".into(),
+        ty: ColumnType::Text,
+        nullable: false,
+    }]);
+    let rows = names.into_iter().map(|n| vec![Value::Text(n)]).collect();
+    Ok(QueryResult::Rows(RowStream::literal(schema, rows)))
+}
+
+/// SHOW COLUMNS / DESCRIBE: column metadata (Field/Type/Null/Key/Default/Extra).
+pub async fn show_columns(db: &Session, table: &str) -> Result<QueryResult> {
+    let def = catalog::load(db, table).await?;
+    let head = ["Field", "Type", "Null", "Key", "Default", "Extra"];
+    let schema = Schema::new(
+        head.iter()
+            .map(|n| ColumnDef {
+                name: (*n).to_string(),
+                ty: ColumnType::Text,
+                nullable: *n == "Default",
+            })
+            .collect(),
+    );
+    let mut rows = Vec::with_capacity(def.schema.columns.len());
+    for (i, c) in def.schema.columns.iter().enumerate() {
+        let meta = def.meta(i);
+        let key = if def.pk_cols.contains(&i) {
+            "PRI"
+        } else if def.indexes.iter().any(|idx| idx.unique && idx.cols == [i]) {
+            "UNI"
+        } else if def.indexes.iter().any(|idx| idx.cols.first() == Some(&i)) {
+            "MUL"
+        } else {
+            ""
+        };
+        let default = match &meta.default {
+            Some(d) => Value::Text(d.clone()),
+            None => Value::Null,
+        };
+        let extra = if meta.auto_increment {
+            "auto_increment"
+        } else if meta.generated.is_some() {
+            "STORED GENERATED"
+        } else {
+            ""
+        };
+        rows.push(vec![
+            Value::Text(c.name.clone()),
+            Value::Text(c.ty.display_name()),
+            Value::Text(if c.nullable { "YES" } else { "NO" }.to_string()),
+            Value::Text(key.to_string()),
+            default,
+            Value::Text(extra.to_string()),
+        ]);
+    }
+    Ok(QueryResult::Rows(RowStream::literal(schema, rows)))
+}
+
 /// CREATE TABLE ... AS SELECT: build a rowid table from the query's output
 /// schema (or an explicit column list) and copy the result rows.
 async fn create_table_as(

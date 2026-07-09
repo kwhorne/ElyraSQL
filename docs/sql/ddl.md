@@ -122,6 +122,19 @@ TRUNCATE TABLE logs;
 Removes all rows and index entries and resets the auto-increment counter,
 keeping the table definition.
 
+## Introspection
+
+```sql
+SHOW TABLES;
+SHOW COLUMNS FROM users;
+DESCRIBE users;   -- or DESC users
+```
+
+`SHOW COLUMNS` / `DESCRIBE` return the familiar
+`Field | Type | Null | Key | Default | Extra` layout, where `Key` is `PRI`
+(primary key), `UNI` (unique index), or `MUL` (leading column of a secondary
+index), and `Extra` shows `auto_increment` or `STORED GENERATED`.
+
 ## Views
 
 ```sql
