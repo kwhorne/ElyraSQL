@@ -46,6 +46,10 @@ enum Command {
         /// PEM private key file to enable TLS.
         #[arg(long, env = "ELYRASQL_TLS_KEY", requires = "tls_cert")]
         tls_key: Option<PathBuf>,
+
+        /// Log queries taking at least this many milliseconds (0 disables).
+        #[arg(long, env = "ELYRASQL_SLOW_QUERY_MS", default_value_t = 0)]
+        slow_query_ms: u128,
     },
     /// Back up a database file to a new file (offline; the server must not be
     /// running against --data). For hot backups while serving, use the SQL
@@ -145,6 +149,7 @@ async fn main() -> anyhow::Result<()> {
             auth,
             tls_cert,
             tls_key,
+            slow_query_ms,
         } => {
             tracing::info!(?data, "opening ElyraSQL database file");
             let db = Db::open(&data)?;
@@ -172,7 +177,12 @@ async fn main() -> anyhow::Result<()> {
                 _ => None,
             };
 
-            let config = elyra_server::ServerConfig { listen, auth, tls };
+            let config = elyra_server::ServerConfig {
+                listen,
+                auth,
+                tls,
+                slow_query_ms,
+            };
             elyra_server::serve(config, engine).await?;
         }
     }

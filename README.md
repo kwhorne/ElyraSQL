@@ -50,6 +50,8 @@ file, ACID storage, OLAP-ready and vector-native — all under one brand.
 - **Users & access control** — persistent accounts via `CREATE USER`/`DROP USER`,
   `GRANT`/`REVOKE`, `SET PASSWORD`, `SHOW GRANTS`; coarse `read`/`write`/`admin`
   privileges; `mysql_native_password` auth; optional TLS.
+- **Observability** — `SHOW STATUS` counters, `SHOW PROCESSLIST`, and an
+  optional slow-query log (`--slow-query-ms`).
 - **Introspection** — `SHOW TABLES`/`COLUMNS`/`INDEX`, `SHOW CREATE TABLE`,
   `DESCRIBE`, and a queryable `INFORMATION_SCHEMA`.
 

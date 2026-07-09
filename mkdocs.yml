@@ -66,6 +66,7 @@ nav:
   - MySQL Compatibility: mysql-compatibility.md
   - Deployment: deployment.md
   - Backup & Restore: backup.md
+  - Observability: observability.md
   - Architecture: architecture.md
   - Performance: performance.md
   - Limitations & Roadmap: limitations.md

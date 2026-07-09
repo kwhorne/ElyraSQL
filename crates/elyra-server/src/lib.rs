@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use elyra_engine::{Engine, QueryResult, Session};
@@ -18,15 +19,19 @@ use tokio_rustls::rustls::ServerConfig as TlsServerConfig;
 use tracing::{error, info, warn};
 
 pub mod auth;
+mod observ;
 mod prepared;
 
 pub use auth::Auth;
+pub use observ::{Metrics, ProcRegistry};
 
 /// Runtime configuration for the ElyraSQL server.
 pub struct ServerConfig {
     pub listen: String,
     pub auth: Arc<Auth>,
     pub tls: Option<Arc<TlsServerConfig>>,
+    /// Queries at or above this many milliseconds are logged as slow. 0 = off.
+    pub slow_query_ms: u128,
 }
 
 /// Build a rustls server config from PEM certificate and key files.
@@ -73,10 +78,19 @@ pub struct ElyraShim {
     session: Session,
     stmts: HashMap<u32, Prepared>,
     next_id: u32,
+    metrics: Arc<Metrics>,
+    procs: Arc<ProcRegistry>,
+    conn_id: u32,
 }
 
 impl ElyraShim {
-    pub fn new(engine: Engine, auth: Arc<Auth>) -> Self {
+    pub fn new(
+        engine: Engine,
+        auth: Arc<Auth>,
+        metrics: Arc<Metrics>,
+        procs: Arc<ProcRegistry>,
+        conn_id: u32,
+    ) -> Self {
         let session = engine.session();
         Self {
             engine,
@@ -86,11 +100,50 @@ impl ElyraShim {
             session,
             stmts: HashMap::new(),
             next_id: 1,
+            metrics,
+            procs,
+            conn_id,
         }
     }
 
     fn privilege(&self) -> elyra_core::Privilege {
         *self.privilege.lock().unwrap()
+    }
+
+    /// Intercept the observability queries (`SHOW STATUS` / `SHOW PROCESSLIST`)
+    /// and return their column names and rows, if this is one.
+    fn observ_result(&self, query: &str) -> Option<(Vec<&'static str>, Vec<Vec<String>>)> {
+        let t = query.trim().trim_end_matches(';').trim();
+        if t.len() > 96 {
+            return None;
+        }
+        let lower = t.to_ascii_lowercase();
+        let l = lower.as_str();
+        if l == "show processlist" || l == "show full processlist" {
+            return Some((
+                vec![
+                    "Id", "User", "Host", "db", "Command", "Time", "State", "Info",
+                ],
+                self.procs.rows(),
+            ));
+        }
+        if l.starts_with("show status")
+            || l.starts_with("show global status")
+            || l.starts_with("show session status")
+        {
+            let mut rows = self.metrics.status_rows();
+            if let Some(pos) = l.find("like") {
+                let pat = t[pos + 4..]
+                    .trim()
+                    .trim_matches(['\'', '"', ';', ' '])
+                    .trim_end_matches('%')
+                    .to_ascii_lowercase();
+                rows.retain(|(k, _)| k.to_ascii_lowercase().starts_with(&pat));
+            }
+            let out = rows.into_iter().map(|(k, v)| vec![k, v]).collect();
+            return Some((vec!["Variable_name", "Value"], out));
+        }
+        None
     }
 }
 
@@ -150,6 +203,8 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for ElyraShim {
         let ok = self.auth.verify(username, salt, auth_data);
         if ok {
             *self.privilege.lock().unwrap() = self.auth.privilege(username);
+            let name = String::from_utf8_lossy(username).into_owned();
+            self.procs.set_user(self.conn_id, name);
         }
         ok
     }
@@ -212,7 +267,12 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for ElyraShim {
         };
 
         let privilege = self.privilege();
-        match self.engine.execute(&sql, privilege, &self.session).await {
+        self.procs.begin_query(self.conn_id, &sql);
+        let start = std::time::Instant::now();
+        let res = self.engine.execute(&sql, privilege, &self.session).await;
+        self.metrics.record(&sql, res.is_ok(), start.elapsed());
+        self.procs.end_query(self.conn_id);
+        match res {
             Ok(outcomes) => write_outcomes(outcomes, results).await,
             Err(e) => {
                 results
@@ -240,8 +300,16 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for ElyraShim {
         query: &'a str,
         results: QueryResultWriter<'a, W>,
     ) -> Result<(), Self::Error> {
+        if let Some((cols, rows)) = self.observ_result(query) {
+            return write_string_rows(results, &cols, rows).await;
+        }
         let privilege = self.privilege();
-        match self.engine.execute(query, privilege, &self.session).await {
+        self.procs.begin_query(self.conn_id, query);
+        let start = std::time::Instant::now();
+        let res = self.engine.execute(query, privilege, &self.session).await;
+        self.metrics.record(query, res.is_ok(), start.elapsed());
+        self.procs.end_query(self.conn_id);
+        match res {
             Ok(outcomes) => write_outcomes(outcomes, results).await,
             Err(e) => {
                 results
@@ -250,6 +318,31 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for ElyraShim {
             }
         }
     }
+}
+
+/// Write a simple string-typed result set (used for `SHOW STATUS`/`PROCESSLIST`).
+async fn write_string_rows<W: AsyncWrite + Send + Unpin>(
+    results: QueryResultWriter<'_, W>,
+    col_names: &[&str],
+    rows: Vec<Vec<String>>,
+) -> Result<(), std::io::Error> {
+    let cols: Vec<Column> = col_names
+        .iter()
+        .map(|n| Column {
+            table: String::new(),
+            column: (*n).to_string(),
+            coltype: ColumnType::MYSQL_TYPE_VAR_STRING,
+            colflags: ColumnFlags::empty(),
+        })
+        .collect();
+    let mut rw = results.start(&cols).await?;
+    for row in rows {
+        for cell in &row {
+            rw.write_col(cell)?;
+        }
+        rw.end_row().await?;
+    }
+    rw.finish().await
 }
 
 /// Rows pulled from storage per batch while streaming a result set. Bounds
@@ -350,29 +443,59 @@ pub async fn serve(config: ServerConfig, engine: Engine) -> std::io::Result<()> 
     let engine = Arc::new(engine);
     let auth = config.auth;
     let tls = config.tls;
+    let metrics = Arc::new(Metrics::new(config.slow_query_ms));
+    let procs = Arc::new(ProcRegistry::new());
+    if config.slow_query_ms > 0 {
+        info!(
+            threshold_ms = config.slow_query_ms as u64,
+            "slow-query logging enabled"
+        );
+    }
+    static CONN_SEQ: AtomicU32 = AtomicU32::new(0);
     loop {
         let (stream, peer) = listener.accept().await?;
         let engine = (*engine).clone();
         let auth = auth.clone();
         let tls = tls.clone();
+        let metrics = metrics.clone();
+        let procs = procs.clone();
+        let conn_id = CONN_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, engine, auth, tls).await {
+            metrics.connect();
+            procs.register(conn_id, peer.ip().to_string());
+            let res = handle_connection(
+                stream,
+                engine,
+                auth,
+                tls,
+                metrics.clone(),
+                procs.clone(),
+                conn_id,
+            )
+            .await;
+            procs.deregister(conn_id);
+            metrics.disconnect();
+            if let Err(e) = res {
                 error!(%peer, error = %e, "connection ended with error");
             }
         });
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     stream: tokio::net::TcpStream,
     engine: Engine,
     auth: Arc<Auth>,
     tls: Option<Arc<TlsServerConfig>>,
+    metrics: Arc<Metrics>,
+    procs: Arc<ProcRegistry>,
+    conn_id: u32,
 ) -> std::io::Result<()> {
     use opensrv_mysql::{plain_run_with_options, secure_run_with_options, IntermediaryOptions};
 
     let (mut r, mut w) = stream.into_split();
-    let mut shim = ElyraShim::new(engine, auth);
+    let mut shim = ElyraShim::new(engine, auth, metrics, procs, conn_id);
     let opts = IntermediaryOptions::default();
 
     // Read the handshake first; the client tells us whether it wants TLS.
