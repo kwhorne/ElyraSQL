@@ -13,6 +13,7 @@
 //!
 //! Callers only ever see ElyraSQL types; `redb` never leaks past this crate.
 
+pub mod binlog;
 mod db;
 pub use db::{Db, Validation, WriteEvent};
 

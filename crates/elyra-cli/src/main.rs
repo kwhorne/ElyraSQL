@@ -58,6 +58,27 @@ enum Command {
         /// Serve the replication stream at this address (makes this a primary).
         #[arg(long, env = "ELYRASQL_REPLICATION_LISTEN")]
         replication_listen: Option<String>,
+
+        /// Append every committed write-set to this binlog for point-in-time
+        /// recovery.
+        #[arg(long, env = "ELYRASQL_BINLOG")]
+        binlog: Option<PathBuf>,
+    },
+    /// Replay a binlog onto a database for point-in-time recovery. Apply onto a
+    /// restored backup (or an empty file) up to a target LSN or timestamp.
+    BinlogReplay {
+        /// Target database file (a restored backup, or a fresh file).
+        #[arg(long, env = "ELYRASQL_DATA", default_value = "elyra.edb")]
+        data: PathBuf,
+        /// Binlog file to replay.
+        #[arg(long)]
+        binlog: PathBuf,
+        /// Stop after this LSN (inclusive).
+        #[arg(long)]
+        until_lsn: Option<u64>,
+        /// Stop at this Unix timestamp in milliseconds (inclusive).
+        #[arg(long)]
+        until_time_ms: Option<u64>,
     },
     /// Run as a read-only replica of a primary. The --data file is disposable:
     /// it is recreated and re-bootstrapped from the primary on start.
@@ -173,9 +194,13 @@ async fn main() -> anyhow::Result<()> {
             slow_query_ms,
             metrics_listen,
             replication_listen,
+            binlog,
         } => {
             tracing::info!(?data, "opening ElyraSQL database file");
-            let db = Db::open(&data)?;
+            if binlog.is_some() {
+                tracing::info!(?binlog, "binlog (point-in-time recovery) enabled");
+            }
+            let db = Db::open_with_binlog(&data, binlog)?;
             let engine = Engine::new(db.clone());
 
             let mut entries: Vec<(String, String, elyra_core::Privilege)> = Vec::new();
@@ -210,6 +235,16 @@ async fn main() -> anyhow::Result<()> {
                 read_only: false,
             };
             elyra_server::serve(config, engine).await?;
+        }
+        Command::BinlogReplay {
+            data,
+            binlog,
+            until_lsn,
+            until_time_ms,
+        } => {
+            let db = Db::open(&data)?;
+            let n = elyra_storage::binlog::replay(&binlog, &db, until_lsn, until_time_ms).await?;
+            println!("replayed {n} write-sets into {}", data.display());
         }
         Command::Replica {
             primary,

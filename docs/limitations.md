@@ -73,8 +73,9 @@ implemented, so you can judge fit.
   (read/write/admin) privileges granted **globally** or **per table**. No
   per-database, per-column, or routine privileges; reads are always allowed at
   the global baseline (table grants only raise write/admin).
-- Hot and offline backup/restore exist, but there is no incremental backup or
-  point-in-time recovery.
+- Hot and offline backup/restore, plus an append-only binlog for point-in-time
+  recovery (`--binlog` + `elyrasql binlog-replay`). Binlog rotation/pruning is
+  manual; there is no incremental (block-level) backup.
 - Asynchronous primary → replica replication (read replicas, warm standby,
   manual failover) is supported. There is no synchronous/quorum commit,
   automatic leader election/failover, or multi-primary.

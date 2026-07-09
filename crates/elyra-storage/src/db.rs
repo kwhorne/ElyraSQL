@@ -34,26 +34,36 @@ pub struct WriteEvent {
     pub deletes: Vec<Vec<u8>>,
 }
 
-/// Replication publisher shared with the writer thread.
-#[derive(Clone)]
+/// Commit-log sink owned by the writer thread: assigns LSNs, appends to the
+/// binlog (for point-in-time recovery) and broadcasts to replicas.
 struct Repl {
     lsn: Arc<AtomicU64>,
     tx: broadcast::Sender<Arc<WriteEvent>>,
+    binlog: Option<crate::binlog::BinlogWriter>,
 }
 
 impl Repl {
-    /// Whether any replica is currently attached (avoids cloning write-sets when
-    /// there is nothing to replicate).
+    /// Whether any replica is currently attached.
     fn has_replicas(&self) -> bool {
         self.tx.receiver_count() > 0
     }
 
-    /// Assign the next LSN and broadcast a committed write-set.
-    fn publish(&self, puts: Vec<(Vec<u8>, Vec<u8>)>, deletes: Vec<Vec<u8>>) {
+    /// True when a committed write-set must be recorded (binlog or replicas).
+    fn active(&self) -> bool {
+        self.binlog.is_some() || self.has_replicas()
+    }
+
+    /// Assign the next LSN, append to the binlog, and broadcast a write-set.
+    fn publish(&mut self, puts: Vec<(Vec<u8>, Vec<u8>)>, deletes: Vec<Vec<u8>>) {
         if puts.is_empty() && deletes.is_empty() {
             return;
         }
         let lsn = self.lsn.fetch_add(1, Ordering::SeqCst) + 1;
+        if let Some(bl) = &mut self.binlog {
+            if let Err(e) = bl.append(lsn, &puts, &deletes) {
+                tracing::error!(error = %e, "binlog append failed");
+            }
+        }
         // Ignore send errors: no subscribers is fine.
         let _ = self.tx.send(Arc::new(WriteEvent { lsn, puts, deletes }));
     }
@@ -100,22 +110,35 @@ pub struct Db {
 impl Db {
     /// Open the single ElyraSQL file and start the writer thread.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        Self::from_storage(Storage::open(path)?)
+        Self::from_storage(Storage::open(path)?, None)
+    }
+
+    /// Open with an append-only binlog for point-in-time recovery.
+    pub fn open_with_binlog(
+        path: impl AsRef<Path>,
+        binlog: Option<std::path::PathBuf>,
+    ) -> Result<Self> {
+        Self::from_storage(Storage::open(path)?, binlog)
     }
 
     /// In-memory database (tests / ephemeral).
     pub fn in_memory() -> Result<Self> {
-        Self::from_storage(Storage::in_memory()?)
+        Self::from_storage(Storage::in_memory()?, None)
     }
 
-    fn from_storage(storage: Storage) -> Result<Self> {
+    fn from_storage(storage: Storage, binlog: Option<std::path::PathBuf>) -> Result<Self> {
         let storage = Arc::new(storage);
         let (tx, rx) = mpsc::channel::<WriteJob>(WRITE_QUEUE_DEPTH);
         let lsn = Arc::new(AtomicU64::new(0));
         let (repl_tx, _) = broadcast::channel::<Arc<WriteEvent>>(REPL_CAPACITY);
+        let binlog = match binlog {
+            Some(p) => Some(crate::binlog::BinlogWriter::open(p)?),
+            None => None,
+        };
         let repl = Repl {
             lsn: lsn.clone(),
             tx: repl_tx.clone(),
+            binlog,
         };
 
         // Dedicated OS thread owns all writes. redb is single-writer, so
@@ -269,13 +292,13 @@ where
 
 /// The writer thread: block for one job, then greedily drain the queue and
 /// commit everything in a single transaction (group commit).
-fn writer_loop(storage: Arc<Storage>, mut rx: mpsc::Receiver<WriteJob>, repl: Repl) {
+fn writer_loop(storage: Arc<Storage>, mut rx: mpsc::Receiver<WriteJob>, mut repl: Repl) {
     while let Some(first) = rx.blocking_recv() {
         // A validated (transactional) commit is applied on its own, so a
         // conflict fails only that transaction, not batched neighbours.
         if let Some(v) = &first.validation {
             let r = storage.apply_validated(&v.keys, &v.ranges, &first.puts, &first.deletes);
-            if r.is_ok() && repl.has_replicas() {
+            if r.is_ok() && repl.active() {
                 repl.publish(first.puts.clone(), first.deletes.clone());
             }
             let _ = first.ack.send(r);
@@ -298,12 +321,12 @@ fn writer_loop(storage: Arc<Storage>, mut rx: mpsc::Receiver<WriteJob>, repl: Re
             }
         }
 
-        apply_job_group(&storage, jobs, &repl);
+        apply_job_group(&storage, jobs, &mut repl);
 
         if let Some(job) = pending {
             let v = job.validation.as_ref().unwrap();
             let r = storage.apply_validated(&v.keys, &v.ranges, &job.puts, &job.deletes);
-            if r.is_ok() && repl.has_replicas() {
+            if r.is_ok() && repl.active() {
                 repl.publish(job.puts.clone(), job.deletes.clone());
             }
             let _ = job.ack.send(r);
@@ -327,7 +350,7 @@ fn job_puts(j: &WriteJob) -> Vec<(Vec<u8>, Vec<u8>)> {
 /// The common case is one commit for the whole group. If the group contains an
 /// INSERT whose key already exists, the combined transaction aborts and the
 /// jobs are retried individually so only the offending statement fails.
-fn apply_job_group(storage: &Arc<Storage>, jobs: Vec<WriteJob>, repl: &Repl) {
+fn apply_job_group(storage: &Arc<Storage>, jobs: Vec<WriteJob>, repl: &mut Repl) {
     let apply_one = |j: &WriteJob| match &j.insert_new {
         Some(new) => storage.apply_insert(new, &j.puts, &j.deletes),
         None => storage.apply(&j.puts, &j.deletes),
@@ -335,7 +358,7 @@ fn apply_job_group(storage: &Arc<Storage>, jobs: Vec<WriteJob>, repl: &Repl) {
 
     if jobs.len() == 1 {
         let r = apply_one(&jobs[0]);
-        if r.is_ok() && repl.has_replicas() {
+        if r.is_ok() && repl.active() {
             repl.publish(job_puts(&jobs[0]), jobs[0].deletes.clone());
         }
         let _ = jobs.into_iter().next().unwrap().ack.send(r);
@@ -355,7 +378,7 @@ fn apply_job_group(storage: &Arc<Storage>, jobs: Vec<WriteJob>, repl: &Repl) {
 
     match storage.apply_insert(&new, &puts, &deletes) {
         Ok(()) => {
-            if repl.has_replicas() {
+            if repl.active() {
                 let mut all_puts = new.clone();
                 all_puts.extend_from_slice(&puts);
                 repl.publish(all_puts, deletes.clone());
@@ -369,7 +392,7 @@ fn apply_job_group(storage: &Arc<Storage>, jobs: Vec<WriteJob>, repl: &Repl) {
             // only the statement with the duplicate fails.
             for job in jobs {
                 let r = apply_one(&job);
-                if r.is_ok() && repl.has_replicas() {
+                if r.is_ok() && repl.active() {
                     repl.publish(job_puts(&job), job.deletes.clone());
                 }
                 let _ = job.ack.send(r);
