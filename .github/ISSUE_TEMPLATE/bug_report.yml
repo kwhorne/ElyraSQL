@@ -31,7 +31,7 @@ body:
     attributes:
       label: ElyraSQL version
       description: Output of `elyrasql version` (or image tag / commit).
-      placeholder: 8.0.0-ElyraSQL-0.1.0
+      placeholder: 8.0.0-ElyraSQL-0.2.0
     validations:
       required: true
   - type: dropdown
