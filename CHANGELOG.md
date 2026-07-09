@@ -4,6 +4,33 @@ All notable changes to ElyraSQL are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.8.1] - 2026-07-09
+
+Programmability release: triggers, procedural stored procedures, and full-text
+search.
+
+### Triggers
+
+- Row-level `CREATE TRIGGER name {BEFORE|AFTER} {INSERT|UPDATE|DELETE} ON t FOR
+  EACH ROW <body>` / `DROP TRIGGER`, with `NEW.col` / `OLD.col`. BEFORE bodies
+  support `SET NEW.col = expr`; AFTER bodies run arbitrary DML per affected row.
+  Firing is depth-guarded against runaway recursion.
+
+### Stored procedures
+
+- Parameters (`IN`), local variables (`DECLARE`, `SET`), and control flow
+  (`IF`/`ELSEIF`/`ELSE`, `WHILE`), interpreted over the procedure body.
+
+### Full-text search
+
+- `MATCH(col, ...) AGAINST('terms' [IN BOOLEAN MODE])` — scan-based relevance
+  scoring (natural-language OR-of-terms, or boolean `+`/`-`).
+
+### Fixed
+
+- The fast INSERT path now persists the `AUTO_INCREMENT` counter, so consecutive
+  auto-increment inserts no longer reuse ids.
+
 ## [0.8.0] - 2026-07-09
 
 Programmability & log-management release.
@@ -293,6 +320,7 @@ core CRUD with `WHERE`/`ORDER BY`/`LIMIT`, indexes, aggregation and `GROUP BY`,
 joins, prepared statements, authentication and TLS, vector search (exact +
 HNSW), parallel OLAP aggregation, and transactions with snapshot isolation.
 
+[0.8.1]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.8.1
 [0.8.0]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.8.0
 [0.7.0]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.7.0
 [0.6.0]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.6.0
