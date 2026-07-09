@@ -4,6 +4,37 @@ All notable changes to ElyraSQL are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.8.6] - 2026-07-09
+
+Programmability, security & consensus-foundation release.
+
+### Materialized views
+
+- `CREATE MATERIALIZED VIEW v AS <select>` materializes the result into a real
+  table; `REFRESH MATERIALIZED VIEW v` recomputes it; `DROP MATERIALIZED VIEW v`
+  removes it. Refresh is explicit (no auto-refresh).
+
+### Per-column privileges
+
+- `GRANT SELECT(col, ...) ON t TO u` restricts a user to reading only those
+  columns of `t`; querying an ungranted column (via the projection, `SELECT *`,
+  or a `WHERE`/`ORDER BY` reference) is denied. Enforced for single-base-table
+  selects; a restricted table in a join/subquery is denied (deny-safe).
+
+### Raft log core (consensus foundation)
+
+- New unit-tested `raftlog`: an ordered persistent log with the AppendEntries
+  consistency check + conflicting-suffix truncation, the quorum/current-term
+  commit rule, apply-only-when-committed, and the §5.4.1 election restriction.
+  Routing the live cluster write path through it (for pre-commit 2-phase
+  durability) is the remaining integration step.
+
+### Notes
+
+- `caching_sha2_password` remains unimplemented: the MySQL-protocol library does
+  not drive its multi-round auth exchange. MySQL 8 clients negotiate down to
+  `mysql_native_password`.
+
 ## [0.8.5] - 2026-07-09
 
 Planner, security, and durability release.
@@ -451,6 +482,7 @@ core CRUD with `WHERE`/`ORDER BY`/`LIMIT`, indexes, aggregation and `GROUP BY`,
 joins, prepared statements, authentication and TLS, vector search (exact +
 HNSW), parallel OLAP aggregation, and transactions with snapshot isolation.
 
+[0.8.6]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.8.6
 [0.8.5]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.8.5
 [0.8.4]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.8.4
 [0.8.3]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.8.3
