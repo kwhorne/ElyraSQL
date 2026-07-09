@@ -32,6 +32,9 @@ elyra-server = { path = "crates/elyra-server" }
 # SQL frontend (shared parser)
 sqlparser = "0.53"
 
+# Regular expressions (REGEXP / RLIKE)
+regex = "1"
+
 # Single-file ACID storage engine
 redb = "2.2"
 bincode = "1.3"

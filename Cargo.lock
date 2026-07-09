@@ -498,6 +498,7 @@ dependencies = [
  "elyra-olap",
  "elyra-storage",
  "elyra-vector",
+ "regex",
  "serde",
  "sqlparser",
  "tokio",

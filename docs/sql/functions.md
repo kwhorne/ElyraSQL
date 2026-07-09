@@ -50,9 +50,13 @@ operator.
 ## String
 
 `CONCAT`, `CONCAT_WS`, `UPPER`/`UCASE`, `LOWER`/`LCASE`, `LENGTH`/`CHAR_LENGTH`,
-`OCTET_LENGTH`, `SUBSTRING`/`SUBSTR`/`MID`, `LEFT`, `RIGHT`, `TRIM`/`LTRIM`/`RTRIM`
-(incl. `TRIM(LEADING/TRAILING 'x' FROM s)`), `REPLACE`, `REVERSE`, `REPEAT`,
-`SPACE`, `LPAD`, `RPAD`, `INSTR`, `LOCATE`/`POSITION`, `ASCII`.
+`OCTET_LENGTH`, `SUBSTRING`/`SUBSTR`/`MID`, `SUBSTRING_INDEX`, `LEFT`, `RIGHT`,
+`TRIM`/`LTRIM`/`RTRIM` (incl. `TRIM(LEADING/TRAILING 'x' FROM s)`), `REPLACE`,
+`REVERSE`, `REPEAT`, `SPACE`, `LPAD`, `RPAD`, `INSTR`, `LOCATE`/`POSITION`,
+`ASCII`, `FIELD`, `ELT`.
+
+Pattern matching: `str LIKE pattern`, and `str REGEXP pattern` / `str RLIKE
+pattern` (POSIX-style regular expressions, with `NOT REGEXP`).
 
 ## Math
 

@@ -133,6 +133,25 @@ pub fn eval_row(expr: &Expr, schema: &Schema, row: &[Value]) -> Result<Value> {
             let v = eval_row(expr, schema, row)?;
             Ok(date_part(&v, &field.to_string()))
         }
+        Expr::RLike {
+            negated,
+            expr,
+            pattern,
+            ..
+        } => {
+            let text = eval_row(expr, schema, row)?;
+            let pat = eval_row(pattern, schema, row)?;
+            if text.is_null() || pat.is_null() {
+                return Ok(Value::Null);
+            }
+            let (t, p) = (
+                text.to_wire_string().unwrap_or_default(),
+                pat.to_wire_string().unwrap_or_default(),
+            );
+            let re = regex::Regex::new(&p)
+                .map_err(|e| Error::Query(format!("invalid regular expression: {e}")))?;
+            Ok(Value::Bool(re.is_match(&t) != *negated))
+        }
         Expr::Substring {
             expr,
             substring_from,
@@ -683,6 +702,33 @@ fn eval_scalar(name: &str, a: &[Value]) -> Result<Option<Value>> {
             (Some(s), Some(fmt)) => str_to_date(&s, &fmt),
             _ => Value::Null,
         },
+        "substring_index" => match (sstr(a, 0), sstr(a, 1), nnum(a, 2)) {
+            (Some(s), Some(delim), Some(count)) => {
+                Value::Text(substring_index(&s, &delim, count as i64))
+            }
+            _ => Value::Null,
+        },
+        "field" => {
+            if a.is_empty() || a[0].is_null() {
+                Value::Int(0)
+            } else {
+                let pos = a[1..]
+                    .iter()
+                    .position(|v| a[0].compare(v) == Some(std::cmp::Ordering::Equal));
+                Value::Int(pos.map(|p| p as i64 + 1).unwrap_or(0))
+            }
+        }
+        "elt" => match nnum(a, 0) {
+            Some(n) => {
+                let idx = n as usize;
+                if idx >= 1 && idx < a.len() {
+                    a[idx].clone()
+                } else {
+                    Value::Null
+                }
+            }
+            None => Value::Null,
+        },
         // ---- string ----
         "concat" => {
             let mut s = String::new();
@@ -876,6 +922,22 @@ fn substring(a: &[Value]) -> Value {
         None => chars.len().saturating_sub(start),
     };
     Value::Text(chars[start..].iter().take(take).collect())
+}
+
+/// SUBSTRING_INDEX(str, delim, count): substring before the count-th delimiter
+/// (from the left if positive, from the right if negative).
+fn substring_index(s: &str, delim: &str, count: i64) -> String {
+    if delim.is_empty() || count == 0 {
+        return String::new();
+    }
+    let parts: Vec<&str> = s.split(delim).collect();
+    if count > 0 {
+        let n = (count as usize).min(parts.len());
+        parts[..n].join(delim)
+    } else {
+        let n = ((-count) as usize).min(parts.len());
+        parts[parts.len() - n..].join(delim)
+    }
 }
 
 fn pad(a: &[Value], left: bool) -> Value {
