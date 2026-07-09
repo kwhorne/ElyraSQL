@@ -47,6 +47,30 @@ enum Command {
         #[arg(long, env = "ELYRASQL_TLS_KEY", requires = "tls_cert")]
         tls_key: Option<PathBuf>,
     },
+    /// Back up a database file to a new file (offline; the server must not be
+    /// running against --data). For hot backups while serving, use the SQL
+    /// command `BACKUP TO '<path>'` instead.
+    Backup {
+        /// Path to the source ElyraSQL database file.
+        #[arg(long, env = "ELYRASQL_DATA", default_value = "elyra.edb")]
+        data: PathBuf,
+        /// Destination file (must not already exist).
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Restore a database file from a backup (offline). Copies the backup into
+    /// place; refuses to overwrite an existing target unless --force.
+    Restore {
+        /// Backup file to restore from.
+        #[arg(long)]
+        input: PathBuf,
+        /// Target ElyraSQL database file to write.
+        #[arg(long, env = "ELYRASQL_DATA", default_value = "elyra.edb")]
+        data: PathBuf,
+        /// Overwrite the target if it already exists.
+        #[arg(long)]
+        force: bool,
+    },
     /// Print version and build information.
     Version,
 }
@@ -88,6 +112,30 @@ async fn main() -> anyhow::Result<()> {
                 elyra_core::PRODUCT_NAME,
                 elyra_core::SERVER_VERSION
             );
+        }
+        Command::Backup { data, out } => {
+            if out.exists() {
+                anyhow::bail!("backup target already exists: {}", out.display());
+            }
+            let db = Db::open(&data)?;
+            let n = db.backup_to(out.clone()).await?;
+            println!("backed up {n} rows to {}", out.display());
+        }
+        Command::Restore { input, data, force } => {
+            if !input.exists() {
+                anyhow::bail!("backup file not found: {}", input.display());
+            }
+            if data.exists() && !force {
+                anyhow::bail!(
+                    "target {} already exists (use --force to overwrite)",
+                    data.display()
+                );
+            }
+            // Validate that the backup opens as an ElyraSQL database before we
+            // put it in place.
+            Db::open(&input)?;
+            std::fs::copy(&input, &data)?;
+            println!("restored {} -> {}", input.display(), data.display());
         }
         Command::Serve {
             data,

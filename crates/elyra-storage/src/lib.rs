@@ -66,6 +66,60 @@ impl Snapshot {
         Ok(out)
     }
 
+    /// Copy this consistent snapshot's entire keyspace into a fresh ElyraSQL
+    /// database file at `dest`, returning the number of key/value pairs written.
+    /// The snapshot is a point-in-time view, so the backup is consistent even
+    /// while the source is being written concurrently. Refuses to overwrite an
+    /// existing file. Writes are flushed in bounded batches to cap memory.
+    pub fn backup_to(&self, dest: &Path) -> Result<u64> {
+        if dest.exists() {
+            return Err(Error::Storage(format!(
+                "backup target already exists: {}",
+                dest.display()
+            )));
+        }
+        const BATCH: usize = 50_000;
+        let out = Database::create(dest).map_err(|e| Error::Storage(e.to_string()))?;
+        let src = self
+            .rtx
+            .open_table(KV)
+            .map_err(|e| Error::Storage(e.to_string()))?;
+
+        let flush = |batch: &mut Vec<(Vec<u8>, Vec<u8>)>| -> Result<()> {
+            if batch.is_empty() {
+                return Ok(());
+            }
+            let wtx = out
+                .begin_write()
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            {
+                let mut t = wtx
+                    .open_table(KV)
+                    .map_err(|e| Error::Storage(e.to_string()))?;
+                for (k, v) in batch.iter() {
+                    t.insert(k.as_slice(), v.as_slice())
+                        .map_err(|e| Error::Storage(e.to_string()))?;
+                }
+            }
+            wtx.commit().map_err(|e| Error::Storage(e.to_string()))?;
+            batch.clear();
+            Ok(())
+        };
+
+        let mut count = 0u64;
+        let mut batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(BATCH);
+        for item in src.iter().map_err(|e| Error::Storage(e.to_string()))? {
+            let (k, v) = item.map_err(|e| Error::Storage(e.to_string()))?;
+            batch.push((k.value().to_vec(), v.value().to_vec()));
+            count += 1;
+            if batch.len() >= BATCH {
+                flush(&mut batch)?;
+            }
+        }
+        flush(&mut batch)?;
+        Ok(count)
+    }
+
     /// Ordered range scan over `[start, end)` within the snapshot.
     pub fn scan_range(
         &self,

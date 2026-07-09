@@ -45,6 +45,8 @@ file, ACID storage, OLAP-ready and vector-native — all under one brand.
 - **Transactions** — `BEGIN`/`COMMIT`/`ROLLBACK`, `SAVEPOINT`, snapshot and
   opt-in serializable isolation, and `SELECT ... FOR UPDATE`/`FOR SHARE`
   (optimistic row locking).
+- **Backup** — hot, consistent `BACKUP TO '<path>'` while serving, plus offline
+  `elyrasql backup`/`restore` CLI commands.
 - **Introspection** — `SHOW TABLES`/`COLUMNS`/`INDEX`, `SHOW CREATE TABLE`,
   `DESCRIBE`, and a queryable `INFORMATION_SCHEMA`.
 

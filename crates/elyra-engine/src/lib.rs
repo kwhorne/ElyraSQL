@@ -116,6 +116,29 @@ impl Engine {
             return Ok(vec![exec::show_index(sess, &name).await?]);
         }
 
+        // BACKUP [DATABASE] TO '<path>' — hot, consistent copy of the whole
+        // database to a new file. Not standard SQL, so handled here.
+        if head.starts_with("backup") {
+            if privilege < Privilege::Admin {
+                return Err(Error::Query(
+                    "access denied: BACKUP requires ADMIN privilege".into(),
+                ));
+            }
+            let toks: Vec<&str> = trimmed.split_whitespace().collect();
+            let path = toks
+                .iter()
+                .position(|t| t.eq_ignore_ascii_case("to"))
+                .and_then(|i| toks.get(i + 1))
+                .map(|s| s.trim_matches(['`', '"', '\'', ';']).to_string())
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| Error::Parse("usage: BACKUP [DATABASE] TO '<path>'".into()))?;
+            let n = sess
+                .raw_db()
+                .backup_to(std::path::PathBuf::from(path))
+                .await?;
+            return Ok(vec![QueryResult::Affected(n)]);
+        }
+
         if let Some(r) = self.intercept_session(sql) {
             return Ok(vec![r]); // session/introspection: read-level
         }

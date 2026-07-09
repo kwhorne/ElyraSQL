@@ -91,6 +91,13 @@ impl Db {
         self.storage.snapshot()
     }
 
+    /// Hot-copy the whole database to a fresh file at `dest` from a consistent
+    /// point-in-time snapshot, without blocking writers. Returns rows copied.
+    pub async fn backup_to(&self, dest: std::path::PathBuf) -> Result<u64> {
+        let snap = self.storage.snapshot()?;
+        spawn_read(move || snap.backup_to(&dest)).await
+    }
+
     /// Fetch a value by key (concurrent snapshot read).
     pub async fn get(&self, key: Vec<u8>) -> Result<Option<Vec<u8>>> {
         let storage = self.storage.clone();

@@ -65,6 +65,7 @@ nav:
   - Security: security.md
   - MySQL Compatibility: mysql-compatibility.md
   - Deployment: deployment.md
+  - Backup & Restore: backup.md
   - Architecture: architecture.md
   - Performance: performance.md
   - Limitations & Roadmap: limitations.md
