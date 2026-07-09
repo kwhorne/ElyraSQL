@@ -12,8 +12,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 
+use std::sync::Arc;
+
 use elyra_core::{Error, Result};
 use elyra_storage::{Db, RangeSnapshot, Snapshot, Validation};
+
+use crate::lockmgr::{LockGuard, LockManager, LockMode};
 
 /// Transaction isolation level.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -60,6 +64,10 @@ pub struct Session {
     pending_triggers: Mutex<Vec<String>>,
     /// Session user variables (`@name`).
     user_vars: Mutex<std::collections::HashMap<String, elyra_core::Value>>,
+    /// Shared pessimistic table-lock manager.
+    locks: Arc<LockManager>,
+    /// Explicit `LOCK TABLES` guards held until `UNLOCK TABLES` or disconnect.
+    held_locks: Mutex<Vec<LockGuard>>,
 }
 
 fn is_meta(k: &[u8]) -> bool {
@@ -67,7 +75,7 @@ fn is_meta(k: &[u8]) -> bool {
 }
 
 impl Session {
-    pub fn new(db: Db) -> Self {
+    pub fn new(db: Db, locks: Arc<LockManager>) -> Self {
         Session {
             db,
             txn: Mutex::new(None),
@@ -75,7 +83,43 @@ impl Session {
             call_depth: std::sync::atomic::AtomicUsize::new(0),
             pending_triggers: Mutex::new(Vec::new()),
             user_vars: Mutex::new(std::collections::HashMap::new()),
+            locks,
+            held_locks: Mutex::new(Vec::new()),
         }
+    }
+
+    /// The shared lock manager (engine-wide).
+    pub fn lock_manager(&self) -> &Arc<LockManager> {
+        &self.locks
+    }
+
+    /// Whether this session already holds an explicit lock on `table`.
+    pub fn holds_lock(&self, table: &str) -> bool {
+        self.held_locks
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|g| g.table().eq_ignore_ascii_case(table))
+    }
+
+    /// Acquire an explicit `LOCK TABLES` lock, held until `UNLOCK TABLES` or the
+    /// session ends.
+    pub async fn lock_table(&self, table: &str, mode: LockMode) -> Result<()> {
+        // Re-locking a table the session already holds is a no-op upgrade-free.
+        if self.holds_lock(table) {
+            return Ok(());
+        }
+        let guard = self
+            .locks
+            .acquire(table, mode, true, std::time::Duration::from_secs(10))
+            .await?;
+        self.held_locks.lock().unwrap().push(guard);
+        Ok(())
+    }
+
+    /// Release all explicit locks held by this session (`UNLOCK TABLES`).
+    pub fn unlock_tables(&self) {
+        self.held_locks.lock().unwrap().clear();
     }
 
     /// Set a session user variable (`@name`).

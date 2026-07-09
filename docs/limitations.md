@@ -63,9 +63,15 @@ implemented, so you can judge fit.
   error `1213` rather than blocking).
 - `SAVEPOINT` / `ROLLBACK TO SAVEPOINT` / `RELEASE SAVEPOINT` are supported.
 - `SELECT ... FOR UPDATE` / `FOR SHARE` provide **optimistic** row locking: a
-  locked row that another transaction changes aborts your commit. There is no
-  pessimistic blocking; `LOCK IN SHARE MODE` and `LOCK TABLES` are not parsed
-  (use `FOR SHARE`). Row locking is applied to single-table locking selects.
+  locked row that another transaction changes aborts your commit. Row locking is
+  applied to single-table locking selects.
+- **Pessimistic table locking** is also available: `LOCK TABLES t READ|WRITE` /
+  `UNLOCK TABLES` take blocking table locks (a `WRITE` lock blocks other readers
+  and writers; a `READ` lock blocks writers). While an explicit lock is held,
+  conflicting statements from other sessions block until it is released, or fail
+  with `1205` (lock wait timeout). `LOCK IN SHARE MODE` is accepted as a synonym
+  for `FOR SHARE`. MVCC reads are not blocked by table locks (they read a
+  consistent snapshot). When no explicit lock is held, locking adds no overhead.
 - A single writer serializes all commits (redb); write concurrency is bounded
   by that writer plus group commit.
 

@@ -14,6 +14,7 @@ mod exec;
 mod ft;
 mod index;
 mod keyenc;
+pub mod lockmgr;
 mod predicate;
 mod proc;
 mod session;
@@ -63,6 +64,7 @@ impl QueryResult {
 pub struct Engine {
     db: Db,
     vindex: vindex::VectorRegistry,
+    locks: std::sync::Arc<lockmgr::LockManager>,
 }
 
 impl Engine {
@@ -70,6 +72,7 @@ impl Engine {
         Self {
             db,
             vindex: vindex::VectorRegistry::new(),
+            locks: std::sync::Arc::new(lockmgr::LockManager::new()),
         }
     }
 
@@ -77,7 +80,7 @@ impl Engine {
     /// each statement is permitted at the caller's `privilege` level.
     /// Create a per-connection session over the shared database.
     pub fn session(&self) -> Session {
-        Session::new(self.db.clone())
+        Session::new(self.db.clone(), self.locks.clone())
     }
 
     /// The underlying database handle (used for replication).
@@ -357,6 +360,40 @@ impl Engine {
             ]);
         }
 
+        // Pessimistic table locking (LOCK TABLES / UNLOCK TABLES) — not parsed by
+        // the SQL frontend.
+        if head.starts_with("lock tables") || head.starts_with("lock table ") {
+            let rest = {
+                let lower = trimmed.to_ascii_lowercase();
+                let pos = lower
+                    .find("tables")
+                    .or_else(|| lower.find("table"))
+                    .unwrap();
+                trimmed[pos..]
+                    .split_once(char::is_whitespace)
+                    .map(|x| x.1)
+                    .unwrap_or("")
+            };
+            for entry in rest.trim_end_matches(';').split(',') {
+                let toks: Vec<&str> = entry.split_whitespace().collect();
+                if toks.is_empty() {
+                    continue;
+                }
+                let table = toks[0].trim_matches(['`', '"']).to_string();
+                let mode = if entry.to_ascii_lowercase().contains("write") {
+                    lockmgr::LockMode::Exclusive
+                } else {
+                    lockmgr::LockMode::Shared
+                };
+                sess.lock_table(&table, mode).await?;
+            }
+            return Ok(vec![QueryResult::empty_ok()]);
+        }
+        if head.starts_with("unlock tables") || head.starts_with("unlock table") {
+            sess.unlock_tables();
+            return Ok(vec![QueryResult::empty_ok()]);
+        }
+
         // Triggers (MySQL CREATE/DROP TRIGGER, not parsed by the frontend).
         if head.starts_with("create trigger") || head.starts_with("create or replace trigger") {
             if privilege < Privilege::Admin {
@@ -530,11 +567,19 @@ impl Engine {
 
         let dialect = MySqlDialect {};
         // Substitute @user variables (leaving @@system vars) before parsing.
-        let subst_sql = if sql.contains('@') {
+        let mut subst_sql = if sql.contains('@') {
             exec::substitute_uvars(sql, &sess.user_vars_snapshot())
         } else {
             sql.to_string()
         };
+        // `LOCK IN SHARE MODE` is a synonym for `FOR SHARE` (not parsed by the
+        // MySQL dialect on its own).
+        if subst_sql
+            .to_ascii_lowercase()
+            .contains("lock in share mode")
+        {
+            subst_sql = replace_ci(&subst_sql, "lock in share mode", "for share");
+        }
         let statements =
             Parser::parse_sql(&dialect, &subst_sql).map_err(|e| Error::Parse(e.to_string()))?;
 
@@ -548,6 +593,22 @@ impl Engine {
                 return Err(Error::Query(format!(
                     "access denied: statement requires {need:?} privilege"
                 )));
+            }
+            // Pessimistic locking: while another session holds an explicit
+            // LOCK TABLES, acquire a transient lock on this statement's target
+            // tables for the statement's duration (skipped entirely otherwise).
+            let mut _guards: Vec<lockmgr::LockGuard> = Vec::new();
+            if self.locks.explicit_active() {
+                let mode = if need >= Privilege::Write {
+                    lockmgr::LockMode::Exclusive
+                } else {
+                    lockmgr::LockMode::Shared
+                };
+                for t in stmt_targets(&stmt) {
+                    if !sess.holds_lock(&t) {
+                        _guards.push(lockmgr::transient(&self.locks, &t, mode).await?);
+                    }
+                }
             }
             out.push(self.execute_stmt(stmt, sess).await?);
         }
@@ -792,6 +853,21 @@ fn truthy(v: &Value) -> bool {
 
 fn object_name_last(name: &sqlparser::ast::ObjectName) -> Option<String> {
     name.0.last().map(|i| i.value.clone())
+}
+
+/// Case-insensitive substring replace (used to normalize `LOCK IN SHARE MODE`).
+fn replace_ci(haystack: &str, needle: &str, replacement: &str) -> String {
+    let (hl, nl) = (haystack.to_ascii_lowercase(), needle.to_ascii_lowercase());
+    let mut out = String::with_capacity(haystack.len());
+    let mut i = 0;
+    while let Some(pos) = hl[i..].find(&nl) {
+        let at = i + pos;
+        out.push_str(&haystack[i..at]);
+        out.push_str(replacement);
+        i = at + needle.len();
+    }
+    out.push_str(&haystack[i..]);
+    out
 }
 
 /// A single plain (unjoined) base table in `twj`, if that's what it is.
