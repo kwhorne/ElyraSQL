@@ -123,6 +123,29 @@ WHERE x.total > 1000;
 
 A derived table must have an alias. It works standalone and in joins.
 
+### Scalar subqueries in the SELECT list
+
+```sql
+SELECT name,
+       (SELECT COUNT(*) FROM orders o WHERE o.uid = u.id) AS order_count
+FROM users u;
+```
+
+Both uncorrelated and correlated scalar subqueries are supported in the
+projection.
+
+### Common table expressions (WITH)
+
+```sql
+WITH regional AS (
+    SELECT region, SUM(amount) AS total FROM sales GROUP BY region
+)
+SELECT region, total FROM regional WHERE total > 1000 ORDER BY total DESC;
+```
+
+CTEs are inlined as derived tables. Multiple, chained CTEs (a later CTE
+referencing an earlier one) work; `WITH RECURSIVE` is not supported.
+
 !!! note "Not yet supported"
-    Scalar subqueries in the **SELECT list**, CTEs (`WITH`), and correlated
-    subqueries combined with joins are not supported yet.
+    Window functions, `WITH RECURSIVE`, and correlated subqueries combined with
+    joins are not supported yet.

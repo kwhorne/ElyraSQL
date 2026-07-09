@@ -560,6 +560,12 @@ pub async fn select(
     vindex: &VectorRegistry,
     query: &SqlQuery,
 ) -> Result<QueryResult> {
+    // Expand CTEs (WITH ...) into derived tables, then execute.
+    if query.with.is_some() {
+        let expanded = expand_ctes(query)?;
+        return Box::pin(select(db, vindex, &expanded)).await;
+    }
+
     let select = match query.body.as_ref() {
         SetExpr::Select(s) => s,
         _ => return Err(Error::Unsupported("only simple SELECT is supported".into())),
@@ -2206,6 +2212,67 @@ fn query_refs_qualifier(q: &SqlQuery, qualifier: &str) -> bool {
     };
     let _ = rewrite_query(q, &check);
     found.get()
+}
+
+/// Expand a query's `WITH` clause by inlining each CTE as a derived table
+/// wherever it is referenced in a top-level `FROM`. CTEs may reference earlier
+/// CTEs in the same `WITH`. `WITH RECURSIVE` is not supported.
+fn expand_ctes(query: &SqlQuery) -> Result<SqlQuery> {
+    use std::collections::HashMap;
+    let Some(with) = &query.with else {
+        return Ok(query.clone());
+    };
+    if with.recursive {
+        return Err(Error::Unsupported("WITH RECURSIVE is not supported".into()));
+    }
+
+    let mut map: HashMap<String, SqlQuery> = HashMap::new();
+    for cte in &with.cte_tables {
+        // Expand this CTE's body against the CTEs defined before it.
+        let body = replace_from_ctes((*cte.query).clone(), &map);
+        map.insert(cte.alias.name.value.to_ascii_lowercase(), body);
+    }
+
+    let mut q = query.clone();
+    q.with = None;
+    Ok(replace_from_ctes(q, &map))
+}
+
+fn replace_from_ctes(
+    mut query: SqlQuery,
+    map: &std::collections::HashMap<String, SqlQuery>,
+) -> SqlQuery {
+    if let SetExpr::Select(select) = query.body.as_mut() {
+        for twj in &mut select.from {
+            twj.relation = replace_cte_relation(&twj.relation, map);
+            for join in &mut twj.joins {
+                join.relation = replace_cte_relation(&join.relation, map);
+            }
+        }
+    }
+    query
+}
+
+fn replace_cte_relation(
+    tf: &TableFactor,
+    map: &std::collections::HashMap<String, SqlQuery>,
+) -> TableFactor {
+    if let TableFactor::Table { name, alias, .. } = tf {
+        if let Some(tname) = name.0.last() {
+            if let Some(body) = map.get(&tname.value.to_ascii_lowercase()) {
+                let al = alias.clone().unwrap_or_else(|| sqlparser::ast::TableAlias {
+                    name: sqlparser::ast::Ident::new(tname.value.clone()),
+                    columns: Vec::new(),
+                });
+                return TableFactor::Derived {
+                    lateral: false,
+                    subquery: Box::new(body.clone()),
+                    alias: Some(al),
+                };
+            }
+        }
+    }
+    tf.clone()
 }
 
 /// True if a projection contains any subquery (scalar/IN/EXISTS).
