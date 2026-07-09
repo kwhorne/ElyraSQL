@@ -39,10 +39,9 @@ implemented, so you can judge fit.
 ## Constraints & integrity
 
 - Enforced: `PRIMARY KEY`, `UNIQUE`, `NOT NULL`, `CHECK`, and `FOREIGN KEY`.
-- Foreign keys reference a primary key or unique index; `ON DELETE`
-  `RESTRICT`/`NO ACTION`/`CASCADE`/`SET NULL` are enforced.
-- Not yet: `ON UPDATE` referential actions when a referenced key changes,
-  multi-level (recursive) cascades, and deferred constraint checking.
+- Foreign keys reference a primary key or unique index; both `ON DELETE` and
+  `ON UPDATE` `RESTRICT`/`NO ACTION`/`CASCADE`/`SET NULL` are enforced.
+- Not yet: multi-level (recursive) cascades, and deferred constraint checking.
 
 ## Query planning
 
@@ -77,6 +76,19 @@ implemented, so you can judge fit.
   errors. In-transaction reads materialize their working set.
 - Spilled `GROUP BY` output is ordered per partition (add `ORDER BY` for a
   defined order).
+
+## Partitioning
+
+- `CREATE TABLE ... PARTITION BY RANGE|LIST|HASH (<pk column>) (...)` records a
+  partitioning scheme over the primary key, exposed in
+  `information_schema.partitions`. Partitions are **managed primary-key ranges**
+  (metadata over the clustered PK), not physically separate files:
+  `ALTER TABLE t DROP PARTITION p` / `TRUNCATE PARTITION p` cheaply delete a
+  partition's rows (a range/`IN` delete, with index cleanup), and queries with a
+  PK predicate prune automatically via clustered range scans. Boundaries are not
+  enforced on INSERT, and this is single-node (partitioning does **not** shard
+  writes across nodes — horizontal write scale-out would require distributed
+  sharding, which is out of scope by design).
 
 ## Transactions & locking
 

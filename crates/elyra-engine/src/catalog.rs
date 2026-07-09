@@ -311,6 +311,41 @@ pub fn matdep_key(name: &str) -> Vec<u8> {
     format!("matdep::{name}").into_bytes()
 }
 
+/// One partition of a partitioned table.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PartitionDef {
+    pub name: String,
+    /// RANGE upper bound (exclusive); `None` = `MAXVALUE`.
+    pub less_than: Option<i64>,
+    /// LIST membership values.
+    #[serde(default)]
+    pub list_values: Vec<i64>,
+}
+
+/// A table's partitioning scheme (over the primary-key column).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PartitionSpec {
+    /// `RANGE`, `LIST`, or `HASH` (upper-cased).
+    pub method: String,
+    pub column: String,
+    pub parts: Vec<PartitionDef>,
+    /// HASH partition count (0 for RANGE/LIST).
+    #[serde(default)]
+    pub hash_count: u32,
+}
+
+pub fn partmeta_key(table: &str) -> Vec<u8> {
+    format!("partmeta::{table}").into_bytes()
+}
+
+/// Load a table's partitioning scheme, if partitioned.
+pub async fn load_partspec(db: &Session, table: &str) -> Result<Option<PartitionSpec>> {
+    match db.get(partmeta_key(table)).await? {
+        Some(b) => Ok(bincode::deserialize(&b).ok()),
+        None => Ok(None),
+    }
+}
+
 /// Load a view's stored SELECT text, if it exists.
 pub async fn load_view(db: &Session, name: &str) -> Result<Option<String>> {
     match db.get(view_key(name)).await? {

@@ -746,6 +746,53 @@ async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec
             }
             Ok((schema, rows))
         }
+        "partitions" => {
+            let schema = Schema::new(vec![
+                text("TABLE_NAME"),
+                text("PARTITION_NAME"),
+                text("PARTITION_METHOD"),
+                text("PARTITION_EXPRESSION"),
+                text("PARTITION_DESCRIPTION"),
+            ]);
+            let mut rows = Vec::new();
+            for tname in names {
+                let Some(spec) = catalog::load_partspec(db, &tname).await? else {
+                    continue;
+                };
+                if spec.parts.is_empty() && spec.method == "HASH" {
+                    for i in 0..spec.hash_count {
+                        rows.push(vec![
+                            Value::Text(tname.clone()),
+                            Value::Text(format!("p{i}")),
+                            Value::Text(spec.method.clone()),
+                            Value::Text(spec.column.clone()),
+                            Value::Null,
+                        ]);
+                    }
+                }
+                for p in &spec.parts {
+                    let desc = if let Some(v) = p.less_than {
+                        v.to_string()
+                    } else if !p.list_values.is_empty() {
+                        p.list_values
+                            .iter()
+                            .map(|v| v.to_string())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    } else {
+                        "MAXVALUE".to_string()
+                    };
+                    rows.push(vec![
+                        Value::Text(tname.clone()),
+                        Value::Text(p.name.clone()),
+                        Value::Text(spec.method.clone()),
+                        Value::Text(spec.column.clone()),
+                        Value::Text(desc),
+                    ]);
+                }
+            }
+            Ok((schema, rows))
+        }
         other => Err(Error::Unsupported(format!(
             "information_schema.{other} is not available"
         ))),
@@ -3529,6 +3576,147 @@ fn simple_pred(e: &Expr) -> Option<(String, catalog::SelOp, String)> {
         return Some((c, flipped, v));
     }
     None
+}
+
+/// Extract the table name from a `CREATE TABLE [IF NOT EXISTS] name (...)`.
+pub fn create_table_name(sql: &str) -> Result<String> {
+    let lower = sql.to_ascii_lowercase();
+    let after = lower
+        .find("table")
+        .map(|p| p + "table".len())
+        .ok_or_else(|| Error::Parse("expected CREATE TABLE".into()))?;
+    let mut rest = sql[after..].trim_start();
+    if rest.to_ascii_lowercase().starts_with("if not exists") {
+        rest = rest["if not exists".len()..].trim_start();
+    }
+    let name = rest
+        .split(|ch: char| ch.is_whitespace() || ch == '(')
+        .next()
+        .unwrap_or("")
+        .trim_matches(['`', '"']);
+    if name.is_empty() {
+        return Err(Error::Parse("CREATE TABLE: empty name".into()));
+    }
+    Ok(name.to_string())
+}
+
+/// Parse a `PARTITION BY ...` clause (the text after `PARTITION BY`).
+pub fn parse_partition_clause(clause: &str) -> Result<catalog::PartitionSpec> {
+    let c = clause.trim();
+    let lower = c.to_ascii_lowercase();
+    let method = c
+        .split(|ch: char| ch.is_whitespace() || ch == '(')
+        .next()
+        .unwrap_or("")
+        .to_ascii_uppercase();
+    if !matches!(method.as_str(), "RANGE" | "LIST" | "HASH") {
+        return Err(Error::Unsupported(format!(
+            "unsupported partition method: {method}"
+        )));
+    }
+    // Column inside the first (...).
+    let open = c
+        .find('(')
+        .ok_or_else(|| Error::Parse("PARTITION BY requires a column".into()))?;
+    let close = c[open..]
+        .find(')')
+        .ok_or_else(|| Error::Parse("PARTITION BY requires a column".into()))?
+        + open;
+    let column = c[open + 1..close]
+        .trim()
+        .trim_matches(['`', '"'])
+        .to_string();
+
+    let mut parts = Vec::new();
+    let mut hash_count = 0u32;
+    if method == "HASH" {
+        if let Some(p) = lower.find("partitions") {
+            hash_count = c[p + "partitions".len()..]
+                .split_whitespace()
+                .next()
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(0);
+        }
+    } else {
+        // Parse the `(PARTITION name VALUES ...)` list after the column group.
+        let rest = &c[close + 1..];
+        for seg in rest.split("PARTITION").skip(1) {
+            let seg = seg.trim().trim_end_matches([',', ')']).trim();
+            if seg.is_empty() {
+                continue;
+            }
+            let name = seg.split_whitespace().next().unwrap_or("").to_string();
+            let seg_low = seg.to_ascii_lowercase();
+            let mut less_than = None;
+            let mut list_values = Vec::new();
+            if let Some(lt) = seg_low.find("less than") {
+                let after = seg[lt + "less than".len()..].trim();
+                let inner = after.trim_start_matches('(').trim_end_matches(')').trim();
+                if !inner.eq_ignore_ascii_case("maxvalue") {
+                    less_than = inner.parse::<i64>().ok();
+                }
+            } else if let Some(iv) = seg_low.find(" in ") {
+                let after = &seg[iv + 4..];
+                if let (Some(o), Some(cl)) = (after.find('('), after.rfind(')')) {
+                    list_values = after[o + 1..cl]
+                        .split(',')
+                        .filter_map(|v| v.trim().parse::<i64>().ok())
+                        .collect();
+                }
+            }
+            parts.push(catalog::PartitionDef {
+                name,
+                less_than,
+                list_values,
+            });
+        }
+    }
+    Ok(catalog::PartitionSpec {
+        method,
+        column,
+        parts,
+        hash_count,
+    })
+}
+
+/// The `WHERE` predicate selecting a partition's rows (for DROP/TRUNCATE
+/// PARTITION). Returns `None` for HASH (not contiguous).
+pub fn partition_where(spec: &catalog::PartitionSpec, name: &str) -> Option<String> {
+    let col = &spec.column;
+    let idx = spec
+        .parts
+        .iter()
+        .position(|p| p.name.eq_ignore_ascii_case(name))?;
+    let p = &spec.parts[idx];
+    match spec.method.as_str() {
+        "RANGE" => {
+            let lower = if idx > 0 {
+                spec.parts[idx - 1].less_than
+            } else {
+                None
+            };
+            let mut conds = Vec::new();
+            if let Some(lo) = lower {
+                conds.push(format!("`{col}` >= {lo}"));
+            }
+            if let Some(hi) = p.less_than {
+                conds.push(format!("`{col}` < {hi}"));
+            }
+            Some(if conds.is_empty() {
+                "1=1".to_string()
+            } else {
+                conds.join(" AND ")
+            })
+        }
+        "LIST" => {
+            if p.list_values.is_empty() {
+                return None;
+            }
+            let vals: Vec<String> = p.list_values.iter().map(|v| v.to_string()).collect();
+            Some(format!("`{col}` IN ({})", vals.join(", ")))
+        }
+        _ => None,
+    }
 }
 
 /// Base tables referenced in the FROM of a (materialized view) query.

@@ -702,6 +702,73 @@ impl Engine {
             ]);
         }
 
+        // CREATE TABLE ... PARTITION BY ... — sqlparser doesn't parse MySQL
+        // partitioning, so strip the clause, create the base table, and store the
+        // partition scheme as managed primary-key ranges (metadata + cheap
+        // DROP/TRUNCATE PARTITION; scan pruning comes free from PK range scans).
+        if head.starts_with("create table") {
+            let lower = trimmed.to_ascii_lowercase();
+            if let Some(pb) = lower.find(" partition by ") {
+                let base = trimmed[..pb].trim_end().trim_end_matches(';').to_string();
+                let clause = trimmed[pb + " partition by ".len()..]
+                    .trim()
+                    .trim_end_matches(';');
+                let spec = exec::parse_partition_clause(clause)?;
+                Box::pin(self.execute_as(&base, privilege, user, sess)).await?;
+                // Table name follows CREATE TABLE [IF NOT EXISTS].
+                let table = exec::create_table_name(&base)?;
+                let enc = bincode::serialize(&spec).map_err(|e| Error::Storage(e.to_string()))?;
+                sess.commit_write(vec![(catalog::partmeta_key(&table), enc)], vec![])
+                    .await?;
+                return Ok(vec![QueryResult::empty_ok()]);
+            }
+        }
+        // ALTER TABLE t DROP|TRUNCATE PARTITION p
+        if head.starts_with("alter table") {
+            let lower = trimmed.to_ascii_lowercase();
+            let op = if lower.contains("drop partition") {
+                Some(("drop partition", true))
+            } else if lower.contains("truncate partition") {
+                Some(("truncate partition", false))
+            } else {
+                None
+            };
+            if let Some((kw, drop_meta)) = op {
+                if privilege < Privilege::Write {
+                    return Err(Error::Query(
+                        "access denied: ALTER TABLE requires WRITE privilege".into(),
+                    ));
+                }
+                let toks: Vec<&str> = trimmed.split_whitespace().collect();
+                let table = toks
+                    .get(2)
+                    .map(|s| s.trim_matches(['`', '"']))
+                    .unwrap_or("");
+                let pname = lower
+                    .find(kw)
+                    .and_then(|p| trimmed[p + kw.len()..].split_whitespace().next())
+                    .map(|s| s.trim_matches(['`', '"', ';']))
+                    .unwrap_or("");
+                let spec = catalog::load_partspec(sess, table)
+                    .await?
+                    .ok_or_else(|| Error::Catalog(format!("table '{table}' is not partitioned")))?;
+                let where_ = exec::partition_where(&spec, pname).ok_or_else(|| {
+                    Error::Query(format!("cannot drop partition '{pname}' (unknown or HASH)"))
+                })?;
+                let del = format!("DELETE FROM `{table}` WHERE {where_}");
+                let r = Box::pin(self.execute_as(&del, privilege, user, sess)).await?;
+                if drop_meta {
+                    let mut spec2 = spec;
+                    spec2.parts.retain(|p| !p.name.eq_ignore_ascii_case(pname));
+                    let enc =
+                        bincode::serialize(&spec2).map_err(|e| Error::Storage(e.to_string()))?;
+                    sess.commit_write(vec![(catalog::partmeta_key(table), enc)], vec![])
+                        .await?;
+                }
+                return Ok(r);
+            }
+        }
+
         // Materialized views: CREATE / REFRESH / DROP MATERIALIZED VIEW. The data
         // lives in a normal table of the same name (built via CREATE TABLE AS
         // SELECT); matview:: stores the defining query for REFRESH.
