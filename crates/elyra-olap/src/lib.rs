@@ -71,8 +71,8 @@ pub struct GroupAggregator {
     group_cols: Vec<usize>,
     aggs: Vec<AggSpec>,
     /// key -> (sample row for group columns, per-agg accumulators)
-    groups: HashMap<String, (Vec<Value>, Vec<Acc>)>,
-    order: Vec<String>,
+    groups: HashMap<Vec<u8>, (Vec<Value>, Vec<Acc>)>,
+    order: Vec<Vec<u8>>,
 }
 
 impl GroupAggregator {
@@ -158,14 +158,39 @@ impl GroupAggregator {
     }
 }
 
-fn group_key(cols: &[usize], row: &[Value]) -> String {
-    if cols.is_empty() {
-        return String::new();
+/// Compact, collision-free binary encoding of a group's key columns. Much
+/// cheaper than formatting each value with `Debug` (hot path for GROUP BY).
+fn group_key(cols: &[usize], row: &[Value]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(cols.len() * 9);
+    for &i in cols {
+        match row.get(i) {
+            None | Some(Value::Null) => out.push(0),
+            Some(Value::Int(v)) => {
+                out.push(1);
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            Some(Value::Bool(b)) => {
+                out.push(2);
+                out.push(*b as u8);
+            }
+            Some(Value::Float(f)) => {
+                out.push(3);
+                out.extend_from_slice(&f.to_bits().to_le_bytes());
+            }
+            Some(Value::Text(s)) | Some(Value::Json(s)) => {
+                out.push(4);
+                out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                out.extend_from_slice(s.as_bytes());
+            }
+            Some(other) => {
+                out.push(5);
+                let s = format!("{other:?}");
+                out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                out.extend_from_slice(s.as_bytes());
+            }
+        }
     }
-    cols.iter()
-        .map(|&i| format!("{:?}", row.get(i).unwrap_or(&Value::Null)))
-        .collect::<Vec<_>>()
-        .join("\u{1}")
+    out
 }
 
 fn update(acc: &mut Acc, func: AggFunc, val: Option<Value>, distinct: bool) {
