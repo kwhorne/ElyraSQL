@@ -80,28 +80,36 @@ impl Engine {
         privilege: Privilege,
         sess: &Session,
     ) -> Result<Vec<QueryResult>> {
+        // Cheap keyword dispatch on a short prefix — statements can be huge
+        // (bulk INSERT), so never lowercase the whole thing here.
+        let trimmed = sql.trim_start();
+        let head: String = trimmed
+            .chars()
+            .take(24)
+            .collect::<String>()
+            .to_ascii_lowercase();
+
         // Transaction isolation level (SET [SESSION] TRANSACTION ISOLATION
         // LEVEL ...) — handled by string match since not all forms parse.
-        let lower = sql.trim().to_ascii_lowercase();
-        if lower.starts_with("set") && lower.contains("isolation level") {
-            let level = if lower.contains("serializable") {
-                Isolation::Serializable
-            } else {
-                Isolation::Snapshot
-            };
-            sess.set_isolation(level);
-            return Ok(vec![QueryResult::empty_ok()]);
+        if head.starts_with("set") {
+            let lower = trimmed.to_ascii_lowercase();
+            if lower.contains("isolation level") {
+                let level = if lower.contains("serializable") {
+                    Isolation::Serializable
+                } else {
+                    Isolation::Snapshot
+                };
+                sess.set_isolation(level);
+                return Ok(vec![QueryResult::empty_ok()]);
+            }
         }
 
         // SHOW INDEX / SHOW KEYS is not parsed by the SQL frontend; handle it here.
-        if lower.starts_with("show index")
-            || lower.starts_with("show indexes")
-            || lower.starts_with("show keys")
-        {
-            let toks: Vec<&str> = lower.split_whitespace().collect();
+        if head.starts_with("show index") || head.starts_with("show key") {
+            let toks: Vec<&str> = trimmed.split_whitespace().collect();
             let name = toks
                 .iter()
-                .position(|t| *t == "from" || *t == "in")
+                .position(|t| t.eq_ignore_ascii_case("from") || t.eq_ignore_ascii_case("in"))
                 .and_then(|i| toks.get(i + 1))
                 .map(|s| s.trim_matches(['`', '"', '\'', ';']).to_string())
                 .ok_or_else(|| Error::Parse("SHOW INDEX requires FROM <table>".into()))?;
@@ -242,6 +250,14 @@ impl Engine {
     /// Handle the well-known session/introspection queries MySQL drivers send.
     fn intercept_session(&self, sql: &str) -> Option<QueryResult> {
         let t = sql.trim().trim_end_matches(';').trim();
+        // Every intercepted query is short; skip large statements cheaply
+        // (a long `SET ...` is still swallowed).
+        if t.len() > 48 {
+            return t
+                .get(..4)
+                .filter(|h| h.eq_ignore_ascii_case("set "))
+                .map(|_| QueryResult::empty_ok());
+        }
         let lower = t.to_ascii_lowercase();
 
         match lower.as_str() {

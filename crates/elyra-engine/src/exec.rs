@@ -1386,6 +1386,26 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
         built.push((key, row));
     }
 
+    // Fast path: a plain INSERT (no IGNORE/REPLACE/ON DUPLICATE) into a PK
+    // table outside a transaction detects duplicates inside the write
+    // transaction itself (redb returns the previous value), avoiding any
+    // existence read. This is the bulk-load hot path.
+    if !replace && !on_dup && !ignore && has_pk && !db.in_txn() {
+        let mut new_puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(built.len());
+        let mut aux_puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for (key, row) in &built {
+            let enc = bincode::serialize(row).map_err(|e| Error::Storage(e.to_string()))?;
+            aux_puts.extend(index::entries_for_row(&def, row, key)?);
+            new_puts.push((key.clone(), enc));
+        }
+        aux_puts.push(bump_wcount(db, &name).await?);
+        let affected = built.len() as u64;
+        db.raw_db()
+            .commit_insert(new_puts, aux_puts, Vec::new())
+            .await?;
+        return Ok(QueryResult::Affected(affected));
+    }
+
     // One batched existence read for the whole statement (PK tables) instead of
     // a read per row — the bulk-insert hot path.
     let existing: Vec<Option<Vec<u8>>> = if has_pk {

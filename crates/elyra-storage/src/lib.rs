@@ -416,6 +416,47 @@ impl Storage {
         wtx.commit().map_err(|e| Error::Storage(e.to_string()))?;
         Ok(())
     }
+
+    /// Insert `new` keys that must not already exist (plain `INSERT`), plus
+    /// `aux` puts (index entries, counters) that may overwrite. If any `new`
+    /// key is already present the whole transaction is aborted and a duplicate
+    /// error is returned — detecting duplicates in the write transaction itself,
+    /// with no separate read.
+    pub fn apply_insert(
+        &self,
+        new: &[(Vec<u8>, Vec<u8>)],
+        aux: &[(Vec<u8>, Vec<u8>)],
+        deletes: &[Vec<u8>],
+    ) -> Result<()> {
+        let wtx = self
+            .db
+            .begin_write()
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        {
+            let mut t = wtx
+                .open_table(KV)
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            for k in deletes {
+                t.remove(k.as_slice())
+                    .map_err(|e| Error::Storage(e.to_string()))?;
+            }
+            for (k, v) in new {
+                let existed = t
+                    .insert(k.as_slice(), v.as_slice())
+                    .map_err(|e| Error::Storage(e.to_string()))?
+                    .is_some();
+                if existed {
+                    return Err(Error::Duplicate("Duplicate entry for key 'PRIMARY'".into()));
+                }
+            }
+            for (k, v) in aux {
+                t.insert(k.as_slice(), v.as_slice())
+                    .map_err(|e| Error::Storage(e.to_string()))?;
+            }
+        }
+        wtx.commit().map_err(|e| Error::Storage(e.to_string()))?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

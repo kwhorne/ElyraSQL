@@ -20,7 +20,6 @@ use std::thread;
 
 use elyra_core::{Error, Result};
 use tokio::sync::{mpsc, oneshot};
-use tracing::warn;
 
 use crate::{RangeSnapshot, Snapshot, Storage};
 
@@ -44,6 +43,9 @@ struct WriteJob {
     /// When set, validate these `(key, snapshot-value)` pairs before applying
     /// (transactional commit); such jobs are applied alone, not merged.
     validation: Option<Validation>,
+    /// When set, these keys must not already exist (plain `INSERT`); the write
+    /// transaction detects duplicates itself. Applied alone, not merged.
+    insert_new: Option<Vec<(Vec<u8>, Vec<u8>)>>,
     ack: oneshot::Sender<Result<()>>,
 }
 
@@ -141,6 +143,30 @@ impl Db {
         self.submit(puts, deletes, Some(validation)).await
     }
 
+    /// Submit a plain `INSERT`: `new` keys must not already exist (duplicate
+    /// detection happens in the write transaction), `aux` puts (index entries,
+    /// counters) may overwrite. No separate existence read.
+    pub async fn commit_insert(
+        &self,
+        new: Vec<(Vec<u8>, Vec<u8>)>,
+        aux: Vec<(Vec<u8>, Vec<u8>)>,
+        deletes: Vec<Vec<u8>>,
+    ) -> Result<()> {
+        let (ack, wait) = oneshot::channel();
+        self.writer
+            .send(WriteJob {
+                puts: aux,
+                deletes,
+                validation: None,
+                insert_new: Some(new),
+                ack,
+            })
+            .await
+            .map_err(|_| Error::Storage("writer thread stopped".into()))?;
+        wait.await
+            .map_err(|_| Error::Storage("write acknowledgement lost".into()))?
+    }
+
     async fn submit(
         &self,
         puts: Vec<(Vec<u8>, Vec<u8>)>,
@@ -153,6 +179,7 @@ impl Db {
                 puts,
                 deletes,
                 validation,
+                insert_new: None,
                 ack,
             })
             .await
@@ -181,51 +208,82 @@ fn writer_loop(storage: Arc<Storage>, mut rx: mpsc::Receiver<WriteJob>) {
         // A validated (transactional) commit is applied on its own, so a
         // conflict fails only that transaction, not batched neighbours.
         if let Some(v) = &first.validation {
-            let result = storage.apply_validated(&v.keys, &v.ranges, &first.puts, &first.deletes);
-            let _ = first.ack.send(result);
+            let r = storage.apply_validated(&v.keys, &v.ranges, &first.puts, &first.deletes);
+            let _ = first.ack.send(r);
             continue;
         }
 
-        // Group consecutive plain writes into one transaction.
+        // Group consecutive plain / INSERT writes into one transaction (one
+        // fsync). INSERT jobs carry keys that must be new; duplicates are
+        // detected inside the shared transaction.
         let mut jobs = vec![first];
         let mut pending: Option<WriteJob> = None;
         while jobs.len() < GROUP_COMMIT_MAX {
             match rx.try_recv() {
                 Ok(job) if job.validation.is_none() => jobs.push(job),
                 Ok(job) => {
-                    pending = Some(job); // validated: handle after this group
+                    pending = Some(job); // validated: handled alone below
                     break;
                 }
                 Err(_) => break,
             }
         }
 
-        // Fast path: a single job applies its own buffers with no copying.
-        let result = if jobs.len() == 1 {
-            storage.apply(&jobs[0].puts, &jobs[0].deletes)
-        } else {
-            let mut puts = Vec::new();
-            let mut deletes = Vec::new();
-            for j in &jobs {
-                puts.extend_from_slice(&j.puts);
-                deletes.extend_from_slice(&j.deletes);
-            }
-            storage.apply(&puts, &deletes)
-        };
-        for job in jobs {
-            let r = match &result {
-                Ok(()) => Ok(()),
-                Err(e) => Err(Error::Storage(e.to_string())),
-            };
-            if job.ack.send(r).is_err() {
-                warn!("write submitter dropped before commit acknowledgement");
-            }
-        }
+        apply_job_group(&storage, jobs);
 
         if let Some(job) = pending {
             let v = job.validation.as_ref().unwrap();
             let r = storage.apply_validated(&v.keys, &v.ranges, &job.puts, &job.deletes);
             let _ = job.ack.send(r);
+        }
+    }
+}
+
+/// Apply a group of plain / INSERT jobs in a single transaction (group commit).
+/// The common case is one commit for the whole group. If the group contains an
+/// INSERT whose key already exists, the combined transaction aborts and the
+/// jobs are retried individually so only the offending statement fails.
+fn apply_job_group(storage: &Arc<Storage>, jobs: Vec<WriteJob>) {
+    let apply_one = |j: &WriteJob| match &j.insert_new {
+        Some(new) => storage.apply_insert(new, &j.puts, &j.deletes),
+        None => storage.apply(&j.puts, &j.deletes),
+    };
+
+    if jobs.len() == 1 {
+        let r = apply_one(&jobs[0]);
+        let _ = jobs.into_iter().next().unwrap().ack.send(r);
+        return;
+    }
+
+    let mut new = Vec::new();
+    let mut puts = Vec::new();
+    let mut deletes = Vec::new();
+    for j in &jobs {
+        if let Some(n) = &j.insert_new {
+            new.extend_from_slice(n);
+        }
+        puts.extend_from_slice(&j.puts);
+        deletes.extend_from_slice(&j.deletes);
+    }
+
+    match storage.apply_insert(&new, &puts, &deletes) {
+        Ok(()) => {
+            for job in jobs {
+                let _ = job.ack.send(Ok(()));
+            }
+        }
+        Err(Error::Duplicate(_)) => {
+            // A duplicate somewhere in the group: redo each job on its own so
+            // only the statement with the duplicate fails.
+            for job in jobs {
+                let r = apply_one(&job);
+                let _ = job.ack.send(r);
+            }
+        }
+        Err(e) => {
+            for job in jobs {
+                let _ = job.ack.send(Err(Error::Storage(e.to_string())));
+            }
         }
     }
 }
