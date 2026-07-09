@@ -15,6 +15,7 @@ variable fallback (handy for systemd and containers).
 | `--tls-cert <file>` | `ELYRASQL_TLS_CERT` | — | PEM certificate; enables TLS (requires `--tls-key`). |
 | `--tls-key <file>` | `ELYRASQL_TLS_KEY` | — | PEM private key. |
 | `--slow-query-ms <n>` | `ELYRASQL_SLOW_QUERY_MS` | `0` | Log queries at or above this many ms (0 = off). See [Observability](observability.md). |
+| `--metrics-listen <addr>` | `ELYRASQL_METRICS_LISTEN` | — | Serve Prometheus metrics at `http://<addr>/metrics`. |
 
 ## Memory limits (environment-only)
 

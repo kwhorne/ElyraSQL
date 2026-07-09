@@ -95,6 +95,76 @@ impl Metrics {
         }
     }
 
+    /// Render all counters in the Prometheus text exposition format.
+    pub fn render_prometheus(&self) -> String {
+        let g = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        let mut s = String::with_capacity(1024);
+        let gauge = |s: &mut String, name: &str, help: &str, v: u64| {
+            s.push_str(&format!(
+                "# HELP {name} {help}\n# TYPE {name} gauge\n{name} {v}\n"
+            ));
+        };
+        let counter = |s: &mut String, name: &str, help: &str, v: u64| {
+            s.push_str(&format!(
+                "# HELP {name} {help}\n# TYPE {name} counter\n{name} {v}\n"
+            ));
+        };
+        gauge(
+            &mut s,
+            "elyrasql_uptime_seconds",
+            "Seconds since the server started",
+            self.start.elapsed().as_secs(),
+        );
+        gauge(
+            &mut s,
+            "elyrasql_connections_current",
+            "Currently open connections",
+            g(&self.conns_current),
+        );
+        counter(
+            &mut s,
+            "elyrasql_connections_total",
+            "Total connections since start",
+            g(&self.conns_total),
+        );
+        counter(
+            &mut s,
+            "elyrasql_questions_total",
+            "Total statements executed",
+            g(&self.questions),
+        );
+        // Per-command counters as a labelled family.
+        s.push_str(
+            "# HELP elyrasql_commands_total Statements executed by type\n\
+             # TYPE elyrasql_commands_total counter\n",
+        );
+        for (label, a) in [
+            ("select", &self.com_select),
+            ("insert", &self.com_insert),
+            ("update", &self.com_update),
+            ("delete", &self.com_delete),
+            ("other", &self.com_other),
+        ] {
+            s.push_str(&format!(
+                "elyrasql_commands_total{{command=\"{label}\"}} {}\n",
+                g(a)
+            ));
+        }
+        counter(
+            &mut s,
+            "elyrasql_errors_total",
+            "Statements that returned an error",
+            g(&self.errors),
+        );
+        counter(
+            &mut s,
+            "elyrasql_slow_queries_total",
+            "Statements at or above the slow threshold",
+            g(&self.slow),
+        );
+        s
+    }
+
     /// `(Variable_name, Value)` rows for `SHOW STATUS`.
     pub fn status_rows(&self) -> Vec<(String, String)> {
         let g = |a: &AtomicU64| a.load(Ordering::Relaxed).to_string();

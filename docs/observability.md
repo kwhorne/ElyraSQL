@@ -57,6 +57,39 @@ WARN elyra_server::observ: slow query duration_ms=1636 sql=SELECT COUNT(*) FROM 
 `--slow-query-ms 0` (the default) disables slow-query logging. Logs go through
 the standard `tracing` subscriber; set `RUST_LOG` to adjust verbosity.
 
+## Prometheus metrics endpoint
+
+Start the server with `--metrics-listen` to expose the same counters over HTTP in
+the Prometheus text exposition format:
+
+```bash
+elyrasql serve --data elyra.edb --metrics-listen 0.0.0.0:9464
+# or ELYRASQL_METRICS_LISTEN=0.0.0.0:9464
+```
+
+`GET /metrics` returns metrics such as:
+
+```
+elyrasql_uptime_seconds 3600
+elyrasql_connections_current 2
+elyrasql_connections_total 57
+elyrasql_questions_total 12045
+elyrasql_commands_total{command="select"} 9001
+elyrasql_commands_total{command="insert"} 2003
+elyrasql_errors_total 4
+elyrasql_slow_queries_total 12
+```
+
+`GET /health` returns `200 OK` for liveness probes. Point a Prometheus scrape
+job at the endpoint:
+
+```yaml
+scrape_configs:
+  - job_name: elyrasql
+    static_configs:
+      - targets: ['elyra-host:9464']
+```
+
 !!! note "Not yet available"
-    There is no Prometheus/OpenMetrics endpoint or `performance_schema` yet;
-    counters are exposed through `SHOW STATUS`. See [Limitations](limitations.md).
+    There is no `performance_schema`; per-query histograms and connection-level
+    metrics beyond the process list are not exposed yet.

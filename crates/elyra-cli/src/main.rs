@@ -50,6 +50,10 @@ enum Command {
         /// Log queries taking at least this many milliseconds (0 disables).
         #[arg(long, env = "ELYRASQL_SLOW_QUERY_MS", default_value_t = 0)]
         slow_query_ms: u128,
+
+        /// Serve Prometheus metrics at http://<addr>/metrics (e.g. 0.0.0.0:9090).
+        #[arg(long, env = "ELYRASQL_METRICS_LISTEN")]
+        metrics_listen: Option<String>,
     },
     /// Back up a database file to a new file (offline; the server must not be
     /// running against --data). For hot backups while serving, use the SQL
@@ -150,6 +154,7 @@ async fn main() -> anyhow::Result<()> {
             tls_cert,
             tls_key,
             slow_query_ms,
+            metrics_listen,
         } => {
             tracing::info!(?data, "opening ElyraSQL database file");
             let db = Db::open(&data)?;
@@ -182,6 +187,7 @@ async fn main() -> anyhow::Result<()> {
                 auth,
                 tls,
                 slow_query_ms,
+                metrics_listen,
             };
             elyra_server::serve(config, engine).await?;
         }

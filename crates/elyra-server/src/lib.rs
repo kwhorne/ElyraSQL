@@ -32,6 +32,8 @@ pub struct ServerConfig {
     pub tls: Option<Arc<TlsServerConfig>>,
     /// Queries at or above this many milliseconds are logged as slow. 0 = off.
     pub slow_query_ms: u128,
+    /// Optional address for the Prometheus metrics HTTP endpoint.
+    pub metrics_listen: Option<String>,
 }
 
 /// Build a rustls server config from PEM certificate and key files.
@@ -467,6 +469,14 @@ pub async fn serve(config: ServerConfig, engine: Engine) -> std::io::Result<()> 
             "slow-query logging enabled"
         );
     }
+    if let Some(maddr) = config.metrics_listen.clone() {
+        let m = metrics.clone();
+        tokio::spawn(async move {
+            if let Err(e) = serve_metrics(maddr, m).await {
+                error!(error = %e, "metrics endpoint stopped");
+            }
+        });
+    }
     static CONN_SEQ: AtomicU32 = AtomicU32::new(0);
     loop {
         let (stream, peer) = listener.accept().await?;
@@ -499,6 +509,47 @@ pub async fn serve(config: ServerConfig, engine: Engine) -> std::io::Result<()> 
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Serve Prometheus metrics over a minimal HTTP/1.1 endpoint (`GET /metrics`).
+async fn serve_metrics(addr: String, metrics: Arc<Metrics>) -> std::io::Result<()> {
+    let listener = TcpListener::bind(&addr).await?;
+    info!(%addr, "ElyraSQL Prometheus metrics at /metrics");
+    loop {
+        let (mut stream, _) = listener.accept().await?;
+        let metrics = metrics.clone();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut buf = [0u8; 2048];
+            let n = stream.read(&mut buf).await.unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]);
+            let path = req
+                .lines()
+                .next()
+                .and_then(|l| l.split_whitespace().nth(1))
+                .unwrap_or("/");
+            let (status, ctype, body) = if path.starts_with("/metrics") {
+                (
+                    "200 OK",
+                    "text/plain; version=0.0.4",
+                    metrics.render_prometheus(),
+                )
+            } else if path == "/" || path.starts_with("/health") {
+                (
+                    "200 OK",
+                    "text/plain",
+                    "ElyraSQL metrics: GET /metrics\n".to_string(),
+                )
+            } else {
+                ("404 Not Found", "text/plain", "not found\n".to_string())
+            };
+            let resp = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(resp.as_bytes()).await;
+        });
+    }
+}
+
 async fn handle_connection(
     stream: tokio::net::TcpStream,
     engine: Engine,
