@@ -447,15 +447,35 @@ where
 /// The writer thread: block for one job, then greedily drain the queue and
 /// commit everything in a single transaction (group commit).
 fn writer_loop(storage: Arc<Storage>, mut rx: mpsc::Receiver<WriteJob>, mut repl: Repl) {
-    while let Some(first) = rx.blocking_recv() {
-        // A validated (transactional) commit is applied on its own, so a
-        // conflict fails only that transaction, not batched neighbours.
-        if let Some(v) = &first.validation {
-            let r = storage.apply_validated(&v.keys, &v.ranges, &first.puts, &first.deletes);
-            if r.is_ok() && repl.active() {
-                repl.publish(first.puts.clone(), first.deletes.clone());
+    // A job pulled from the queue that belongs to the *other* batch kind is
+    // carried to the next iteration instead of being pushed back.
+    let mut carry: Option<WriteJob> = None;
+    loop {
+        let first = match carry.take() {
+            Some(j) => j,
+            None => match rx.blocking_recv() {
+                Some(j) => j,
+                None => break,
+            },
+        };
+
+        if first.validation.is_some() {
+            // Group consecutive validated (transactional) commits into one
+            // transaction (one fsync). Each is validated in turn against the
+            // running state, so first-committer-wins ordering is preserved and a
+            // conflict fails only that transaction.
+            let mut jobs = vec![first];
+            while jobs.len() < GROUP_COMMIT_MAX {
+                match rx.try_recv() {
+                    Ok(job) if job.validation.is_some() => jobs.push(job),
+                    Ok(job) => {
+                        carry = Some(job); // plain/insert: next iteration
+                        break;
+                    }
+                    Err(_) => break,
+                }
             }
-            let _ = first.ack.send(r);
+            apply_validated_group(&storage, jobs, &mut repl);
             continue;
         }
 
@@ -463,27 +483,61 @@ fn writer_loop(storage: Arc<Storage>, mut rx: mpsc::Receiver<WriteJob>, mut repl
         // fsync). INSERT jobs carry keys that must be new; duplicates are
         // detected inside the shared transaction.
         let mut jobs = vec![first];
-        let mut pending: Option<WriteJob> = None;
         while jobs.len() < GROUP_COMMIT_MAX {
             match rx.try_recv() {
                 Ok(job) if job.validation.is_none() => jobs.push(job),
                 Ok(job) => {
-                    pending = Some(job); // validated: handled alone below
+                    carry = Some(job); // validated: next iteration
                     break;
                 }
                 Err(_) => break,
             }
         }
-
         apply_job_group(&storage, jobs, &mut repl);
+    }
+}
 
-        if let Some(job) = pending {
-            let v = job.validation.as_ref().unwrap();
-            let r = storage.apply_validated(&v.keys, &v.ranges, &job.puts, &job.deletes);
-            if r.is_ok() && repl.active() {
-                repl.publish(job.puts.clone(), job.deletes.clone());
+/// Apply a group of validated (transactional) commits in one write transaction,
+/// acking each with its individual result and replicating those that committed.
+fn apply_validated_group(storage: &Arc<Storage>, jobs: Vec<WriteJob>, repl: &mut Repl) {
+    // Fast path: a single transaction avoids building the borrow vector.
+    if jobs.len() == 1 {
+        let job = jobs.into_iter().next().unwrap();
+        let v = job.validation.as_ref().unwrap();
+        let r = storage.apply_validated(&v.keys, &v.ranges, &job.puts, &job.deletes);
+        if r.is_ok() && repl.active() {
+            repl.publish(job.puts.clone(), job.deletes.clone());
+        }
+        let _ = job.ack.send(r);
+        return;
+    }
+
+    let commits: Vec<crate::ValidatedCommit> = jobs
+        .iter()
+        .map(|j| {
+            let v = j.validation.as_ref().unwrap();
+            crate::ValidatedCommit {
+                keys: &v.keys,
+                ranges: &v.ranges,
+                puts: &j.puts,
+                deletes: &j.deletes,
             }
-            let _ = job.ack.send(r);
+        })
+        .collect();
+
+    match storage.apply_validated_batch(&commits) {
+        Ok(results) => {
+            for (job, r) in jobs.into_iter().zip(results) {
+                if r.is_ok() && repl.active() {
+                    repl.publish(job.puts.clone(), job.deletes.clone());
+                }
+                let _ = job.ack.send(r);
+            }
+        }
+        Err(e) => {
+            for job in jobs {
+                let _ = job.ack.send(Err(Error::Storage(e.to_string())));
+            }
         }
     }
 }

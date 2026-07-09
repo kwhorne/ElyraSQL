@@ -72,8 +72,15 @@ implemented, so you can judge fit.
   with `1205` (lock wait timeout). `LOCK IN SHARE MODE` is accepted as a synonym
   for `FOR SHARE`. MVCC reads are not blocked by table locks (they read a
   consistent snapshot). When no explicit lock is held, locking adds no overhead.
-- A single writer serializes all commits (redb); write concurrency is bounded
-  by that writer plus group commit.
+- A single writer serializes all commits (an inherent property of the ACID
+  single-file engine — there are no parallel writers or write sharding).
+  Throughput under high write concurrency comes from **group commit**: many
+  pending writes — now including validated **transactional** commits — are folded
+  into one transaction (one fsync), so N concurrent transactions cost one fsync
+  rather than N. First-committer-wins ordering and write-write conflict detection
+  are preserved within a batch. The expensive per-statement work (parsing,
+  constraint checks, encoding, index maintenance) runs in the connection tasks
+  in parallel; only the final commit is serialized.
 
 ## Types & text
 

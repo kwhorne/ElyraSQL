@@ -32,6 +32,15 @@ pub struct RangeSnapshot {
     pub content: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
+/// One validated (transactional) commit, borrowed for group-commit batching
+/// (see [`Storage::apply_validated_batch`]).
+pub struct ValidatedCommit<'a> {
+    pub keys: &'a [(Vec<u8>, Option<Vec<u8>>)],
+    pub ranges: &'a [RangeSnapshot],
+    pub puts: &'a [(Vec<u8>, Vec<u8>)],
+    pub deletes: &'a [Vec<u8>],
+}
+
 /// A point-in-time MVCC read snapshot. Reads through it always observe the
 /// committed state as of when it was taken, regardless of later commits — the
 /// basis for snapshot-isolated transactions.
@@ -383,6 +392,80 @@ impl Storage {
 
     /// Like [`Storage::apply`], but first validate that each key in `expected`
     /// currently holds the given value (its value at the transaction's
+    /// Group-commit several validated (transactional) commits in **one** write
+    /// transaction (one fsync), instead of one transaction each. Each job is
+    /// validated in turn against the current state *including earlier jobs in
+    /// this batch*, so first-committer-wins ordering (and write-write conflict
+    /// detection) is preserved: a job that read/wrote a key an earlier job in
+    /// the batch has since changed conflicts. Returns a per-job result (Ok or
+    /// `Error::Conflict`); only non-conflicting jobs are applied.
+    ///
+    /// This amortises the single writer's fsync across many concurrent
+    /// transactions, which is the throughput win under high write concurrency.
+    pub fn apply_validated_batch(&self, jobs: &[ValidatedCommit]) -> Result<Vec<Result<()>>> {
+        use std::ops::Bound;
+        let wtx = self
+            .db
+            .begin_write()
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        let mut results = Vec::with_capacity(jobs.len());
+        {
+            let mut t = wtx
+                .open_table(KV)
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            for job in jobs {
+                let mut ok = true;
+                for (k, exp) in job.keys {
+                    let current = t
+                        .get(k.as_slice())
+                        .map_err(|e| Error::Storage(e.to_string()))?
+                        .map(|v| v.value().to_vec());
+                    if &current != exp {
+                        ok = false;
+                        break;
+                    }
+                }
+                if ok {
+                    for r in job.ranges {
+                        let upper = match &r.end {
+                            Some(e) => Bound::Excluded(e.as_slice()),
+                            None => Bound::Unbounded,
+                        };
+                        let mut current = Vec::with_capacity(r.content.len());
+                        for item in t
+                            .range::<&[u8]>((Bound::Included(r.start.as_slice()), upper))
+                            .map_err(|e| Error::Storage(e.to_string()))?
+                        {
+                            let (k, v) = item.map_err(|e| Error::Storage(e.to_string()))?;
+                            current.push((k.value().to_vec(), v.value().to_vec()));
+                        }
+                        if current != r.content {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if ok {
+                    for k in job.deletes {
+                        t.remove(k.as_slice())
+                            .map_err(|e| Error::Storage(e.to_string()))?;
+                    }
+                    for (k, v) in job.puts {
+                        t.insert(k.as_slice(), v.as_slice())
+                            .map_err(|e| Error::Storage(e.to_string()))?;
+                    }
+                    results.push(Ok(()));
+                } else {
+                    results.push(Err(Error::Conflict(
+                        "row modified by another transaction since snapshot".into(),
+                    )));
+                }
+            }
+        }
+        wtx.commit().map_err(|e| Error::Storage(e.to_string()))?;
+        Ok(results)
+    }
+
     /// snapshot). If any differs, another transaction changed it since the
     /// snapshot: return [`Error::Conflict`] and commit nothing. This is the
     /// write-write conflict check behind snapshot isolation.
