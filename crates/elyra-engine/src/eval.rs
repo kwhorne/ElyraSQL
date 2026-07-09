@@ -71,9 +71,9 @@ pub fn eval_expr(expr: &Expr) -> Result<Value> {
             let r = eval_expr(right)?;
             eval_binary(l, op, r)
         }
-        other => Err(Error::Unsupported(format!(
-            "expression not supported in this build: {other}"
-        ))),
+        // Delegate anything else (functions, JSON operators, ...) to the full
+        // row evaluator with an empty schema/row.
+        other => crate::predicate::eval_row(other, &elyra_core::Schema::new(Vec::new()), &[]),
     }
 }
 

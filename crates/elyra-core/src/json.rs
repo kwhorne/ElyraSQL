@@ -90,6 +90,177 @@ impl Json {
         }
         Some(cur.clone())
     }
+
+    /// MySQL `JSON_TYPE` name.
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            Json::Null => "NULL",
+            Json::Bool(_) => "BOOLEAN",
+            Json::Num(n) => {
+                if n.contains('.') || n.contains('e') || n.contains('E') {
+                    "DOUBLE"
+                } else {
+                    "INTEGER"
+                }
+            }
+            Json::Str(_) => "STRING",
+            Json::Arr(_) => "ARRAY",
+            Json::Obj(_) => "OBJECT",
+        }
+    }
+
+    /// `JSON_LENGTH`: element count for arrays/objects, else 1.
+    pub fn length(&self) -> usize {
+        match self {
+            Json::Arr(a) => a.len(),
+            Json::Obj(o) => o.len(),
+            _ => 1,
+        }
+    }
+
+    /// `JSON_KEYS`: object keys, or `None` for non-objects.
+    pub fn keys(&self) -> Option<Vec<String>> {
+        match self {
+            Json::Obj(o) => Some(o.iter().map(|(k, _)| k.clone()).collect()),
+            _ => None,
+        }
+    }
+
+    /// `JSON_CONTAINS`: does `self` contain `candidate` (MySQL semantics)?
+    pub fn contains(&self, candidate: &Json) -> bool {
+        match (self, candidate) {
+            (Json::Obj(t), Json::Obj(c)) => c.iter().all(|(ck, cv)| {
+                t.iter()
+                    .find(|(tk, _)| tk == ck)
+                    .is_some_and(|(_, tv)| tv.contains(cv))
+            }),
+            (Json::Arr(t), Json::Arr(c)) => c.iter().all(|ce| t.iter().any(|te| te.contains(ce))),
+            (Json::Arr(t), c) => t.iter().any(|te| te.contains(c)),
+            (t, c) => t == c,
+        }
+    }
+
+    /// Build a JSON value from a SQL value (for `JSON_ARRAY`/`JSON_OBJECT`/...).
+    pub fn from_value(v: &crate::value::Value) -> Json {
+        use crate::value::Value;
+        match v {
+            Value::Null => Json::Null,
+            Value::Bool(b) => Json::Bool(*b),
+            Value::Int(i) => Json::Num(i.to_string()),
+            Value::Float(f) => Json::Num(f.to_string()),
+            Value::Text(s) => Json::Str(s.clone()),
+            Value::Json(s) => parse(s).unwrap_or_else(|| Json::Str(s.clone())),
+            other => Json::Str(other.to_wire_string().unwrap_or_default()),
+        }
+    }
+
+    /// `JSON_SET`/`JSON_INSERT`/`JSON_REPLACE` at `path`. Returns whether the
+    /// document changed.
+    pub fn set_path(&mut self, path: &str, val: Json, mode: SetMode) -> bool {
+        let Some(steps) = parse_path(path) else {
+            return false;
+        };
+        if steps.is_empty() {
+            if mode != SetMode::Insert {
+                *self = val;
+                return true;
+            }
+            return false;
+        }
+        set_recurse(self, &steps, val, mode)
+    }
+
+    /// `JSON_REMOVE` at `path`. Returns whether the document changed.
+    pub fn remove_path(&mut self, path: &str) -> bool {
+        let Some(steps) = parse_path(path) else {
+            return false;
+        };
+        if steps.is_empty() {
+            return false;
+        }
+        remove_recurse(self, &steps)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetMode {
+    Set,
+    Insert,
+    Replace,
+}
+
+fn set_recurse(cur: &mut Json, steps: &[Step], val: Json, mode: SetMode) -> bool {
+    if steps.len() == 1 {
+        return match (cur, &steps[0]) {
+            (Json::Obj(pairs), Step::Key(k)) => {
+                if let Some(slot) = pairs.iter_mut().find(|p| &p.0 == k) {
+                    if mode != SetMode::Insert {
+                        slot.1 = val;
+                        return true;
+                    }
+                    false
+                } else if mode != SetMode::Replace {
+                    pairs.push((k.clone(), val));
+                    true
+                } else {
+                    false
+                }
+            }
+            (Json::Arr(items), Step::Index(i)) => {
+                if *i < items.len() {
+                    if mode != SetMode::Insert {
+                        items[*i] = val;
+                        return true;
+                    }
+                    false
+                } else if mode != SetMode::Replace {
+                    items.push(val);
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        };
+    }
+    let next = match (cur, &steps[0]) {
+        (Json::Obj(pairs), Step::Key(k)) => pairs.iter_mut().find(|p| &p.0 == k).map(|p| &mut p.1),
+        (Json::Arr(items), Step::Index(i)) => items.get_mut(*i),
+        _ => None,
+    };
+    match next {
+        Some(n) => set_recurse(n, &steps[1..], val, mode),
+        None => false,
+    }
+}
+
+fn remove_recurse(cur: &mut Json, steps: &[Step]) -> bool {
+    if steps.len() == 1 {
+        return match (cur, &steps[0]) {
+            (Json::Obj(pairs), Step::Key(k)) => {
+                if let Some(pos) = pairs.iter().position(|p| &p.0 == k) {
+                    pairs.remove(pos);
+                    true
+                } else {
+                    false
+                }
+            }
+            (Json::Arr(items), Step::Index(i)) if *i < items.len() => {
+                items.remove(*i);
+                true
+            }
+            _ => false,
+        };
+    }
+    let next = match (cur, &steps[0]) {
+        (Json::Obj(pairs), Step::Key(k)) => pairs.iter_mut().find(|p| &p.0 == k).map(|p| &mut p.1),
+        (Json::Arr(items), Step::Index(i)) => items.get_mut(*i),
+        _ => None,
+    };
+    match next {
+        Some(n) => remove_recurse(n, &steps[1..]),
+        None => false,
+    }
 }
 
 enum Step {

@@ -57,6 +57,32 @@ FROM docs;
 `JSON_UNQUOTE` returns the raw scalar of a JSON value. A missing path yields
 `NULL`.
 
+### JSON functions
+
+| Function | Description |
+|----------|-------------|
+| `JSON_ARRAY(v, ...)` | Build a JSON array |
+| `JSON_OBJECT(k, v, ...)` | Build a JSON object from key/value pairs |
+| `JSON_SET(doc, path, val, ...)` | Insert or update at each path |
+| `JSON_INSERT(doc, path, val, ...)` | Set only paths that do not exist |
+| `JSON_REPLACE(doc, path, val, ...)` | Set only paths that already exist |
+| `JSON_REMOVE(doc, path, ...)` | Remove values at paths |
+| `JSON_CONTAINS(doc, candidate[, path])` | Containment test (`1`/`0`) |
+| `JSON_LENGTH(doc[, path])` | Element count (arrays/objects) |
+| `JSON_KEYS(doc[, path])` | Object keys as a JSON array |
+| `JSON_TYPE(val)` | `OBJECT`/`ARRAY`/`STRING`/`INTEGER`/`DOUBLE`/`BOOLEAN`/`NULL` |
+| `JSON_VALID(str)` | Whether a string parses as JSON |
+| `JSON_QUOTE(str)` | Wrap a string as a JSON string literal |
+
+```sql
+SELECT JSON_SET('{"a":1}', '$.a', 10, '$.b', 2);   -- {"a": 10, "b": 2}
+UPDATE docs SET doc = JSON_SET(doc, '$.seen', 1) WHERE id = 5;
+SELECT id FROM docs WHERE JSON_LENGTH(doc, '$.tags') >= 2;
+```
+
+Nested paths (`$.a.b`, `$.a[0]`) are supported for setting, removing, and
+inspecting.
+
 !!! warning "Parenthesize in `WHERE`/`ORDER BY`"
     The parser binds `=` tighter than `->>`, so wrap the extraction in
     parentheses when comparing:

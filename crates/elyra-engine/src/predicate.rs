@@ -162,6 +162,20 @@ fn eval_function(f: &sqlparser::ast::Function, schema: &Schema, row: &[Value]) -
         });
     }
 
+    match name.as_str() {
+        "json_array" | "json_object" | "json_quote" | "json_valid" | "json_type"
+        | "json_length" | "json_keys" | "json_contains" | "json_set" | "json_insert"
+        | "json_replace" | "json_remove" => {
+            let args = function_arg_exprs(f)?;
+            let vals: Vec<Value> = args
+                .iter()
+                .map(|e| eval_row(e, schema, row))
+                .collect::<Result<_>>()?;
+            return eval_json_fn(&name, &vals);
+        }
+        _ => {}
+    }
+
     let metric = match name.as_str() {
         "vec_distance" | "vec_l2_distance" | "vec_distance_l2" => Metric::L2,
         "vec_cosine_distance" | "vec_distance_cosine" => Metric::Cosine,
@@ -181,6 +195,130 @@ fn eval_function(f: &sqlparser::ast::Function, schema: &Schema, row: &[Value]) -
             "vector dimension mismatch: {} vs {}",
             a.len(),
             b.len()
+        ))),
+    }
+}
+
+/// Evaluate the JSON construction / manipulation / inspection functions.
+fn eval_json_fn(name: &str, vals: &[Value]) -> Result<Value> {
+    use elyra_core::json::{self, Json, SetMode};
+
+    // Parse a value as a JSON document (NULL propagates).
+    let get_doc = |v: &Value| -> Result<Option<Json>> {
+        match v {
+            Value::Null => Ok(None),
+            Value::Json(s) | Value::Text(s) => json::parse(s)
+                .map(Some)
+                .ok_or_else(|| Error::Type("invalid JSON document".into())),
+            other => Err(Error::Type(format!("not a JSON document: {other:?}"))),
+        }
+    };
+    let as_str = |v: &Value| -> Result<String> {
+        match v {
+            Value::Text(s) | Value::Json(s) => Ok(s.clone()),
+            other => other
+                .to_wire_string()
+                .ok_or_else(|| Error::Type(format!("expected a string, got {other:?}"))),
+        }
+    };
+
+    match name {
+        "json_array" => Ok(Value::Json(
+            Json::Arr(vals.iter().map(Json::from_value).collect()).to_json_string(),
+        )),
+        "json_object" => {
+            if vals.len() % 2 != 0 {
+                return Err(Error::Query("JSON_OBJECT expects key/value pairs".into()));
+            }
+            let mut pairs = Vec::with_capacity(vals.len() / 2);
+            for kv in vals.chunks(2) {
+                pairs.push((as_str(&kv[0])?, Json::from_value(&kv[1])));
+            }
+            Ok(Value::Json(Json::Obj(pairs).to_json_string()))
+        }
+        "json_quote" => match &vals[0] {
+            Value::Null => Ok(Value::Null),
+            v => Ok(Value::Json(Json::Str(as_str(v)?).to_json_string())),
+        },
+        "json_valid" => match &vals[0] {
+            Value::Null => Ok(Value::Null),
+            v => Ok(Value::Bool(json::parse(&as_str(v)?).is_some())),
+        },
+        "json_type" => match get_doc(&vals[0])? {
+            None => Ok(Value::Null),
+            Some(j) => Ok(Value::Text(j.type_name().to_string())),
+        },
+        "json_length" => match get_doc(&vals[0])? {
+            None => Ok(Value::Null),
+            Some(j) => {
+                let target = match vals.get(1) {
+                    Some(p) => j.extract(&as_str(p)?),
+                    None => Some(j),
+                };
+                Ok(target.map_or(Value::Null, |t| Value::Int(t.length() as i64)))
+            }
+        },
+        "json_keys" => match get_doc(&vals[0])? {
+            None => Ok(Value::Null),
+            Some(j) => {
+                let target = match vals.get(1) {
+                    Some(p) => j.extract(&as_str(p)?),
+                    None => Some(j),
+                };
+                Ok(match target.and_then(|t| t.keys()) {
+                    Some(keys) => Value::Json(
+                        Json::Arr(keys.into_iter().map(Json::Str).collect()).to_json_string(),
+                    ),
+                    None => Value::Null,
+                })
+            }
+        },
+        "json_contains" => {
+            let (target, candidate) = (get_doc(&vals[0])?, get_doc(&vals[1])?);
+            match (target, candidate) {
+                (Some(mut t), Some(c)) => {
+                    if let Some(p) = vals.get(2) {
+                        match t.extract(&as_str(p)?) {
+                            Some(sub) => t = sub,
+                            None => return Ok(Value::Null),
+                        }
+                    }
+                    Ok(Value::Bool(t.contains(&c)))
+                }
+                _ => Ok(Value::Null),
+            }
+        }
+        "json_set" | "json_insert" | "json_replace" => {
+            let mode = match name {
+                "json_insert" => SetMode::Insert,
+                "json_replace" => SetMode::Replace,
+                _ => SetMode::Set,
+            };
+            let Some(mut doc) = get_doc(&vals[0])? else {
+                return Ok(Value::Null);
+            };
+            if vals[1..].len() % 2 != 0 {
+                return Err(Error::Query(format!(
+                    "{} expects (doc, path, val, ...)",
+                    name.to_ascii_uppercase()
+                )));
+            }
+            for pv in vals[1..].chunks(2) {
+                doc.set_path(&as_str(&pv[0])?, Json::from_value(&pv[1]), mode);
+            }
+            Ok(Value::Json(doc.to_json_string()))
+        }
+        "json_remove" => {
+            let Some(mut doc) = get_doc(&vals[0])? else {
+                return Ok(Value::Null);
+            };
+            for p in &vals[1..] {
+                doc.remove_path(&as_str(p)?);
+            }
+            Ok(Value::Json(doc.to_json_string()))
+        }
+        other => Err(Error::Unsupported(format!(
+            "unknown JSON function: {other}"
         ))),
     }
 }
