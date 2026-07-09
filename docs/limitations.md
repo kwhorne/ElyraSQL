@@ -75,7 +75,9 @@ implemented, so you can judge fit.
   the global baseline (table grants only raise write/admin).
 - Hot and offline backup/restore exist, but there is no incremental backup or
   point-in-time recovery.
-- No replication/HA, and no metrics / slow-query log yet.
+- Asynchronous primary → replica replication (read replicas, warm standby,
+  manual failover) is supported. There is no synchronous/quorum commit,
+  automatic leader election/failover, or multi-primary.
 
 ## Wire protocol
 
@@ -95,7 +97,7 @@ Candidate next steps, roughly in order of value:
 4. Spill-to-disk for large sorts/aggregations.
 5. Cost-based planning with statistics; hash/merge joins.
 6. Observability: slow-query log and metrics.
-7. Replication for HA.
+7. Synchronous/quorum replication and automatic failover.
 
 Have a need that isn't listed? Open an issue on
 [GitHub](https://github.com/kwhorne/ElyraSQL/issues).

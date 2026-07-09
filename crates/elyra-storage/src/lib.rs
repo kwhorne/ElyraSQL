@@ -14,7 +14,7 @@
 //! Callers only ever see ElyraSQL types; `redb` never leaks past this crate.
 
 mod db;
-pub use db::{Db, Validation};
+pub use db::{Db, Validation, WriteEvent};
 
 use std::path::Path;
 use std::sync::Arc;

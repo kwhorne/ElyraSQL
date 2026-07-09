@@ -78,6 +78,11 @@ impl Engine {
         Session::new(self.db.clone())
     }
 
+    /// The underlying database handle (used for replication).
+    pub fn db(&self) -> Db {
+        self.db.clone()
+    }
+
     pub async fn execute(
         &self,
         sql: &str,

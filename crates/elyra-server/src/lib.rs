@@ -21,9 +21,11 @@ use tracing::{error, info, warn};
 pub mod auth;
 mod observ;
 mod prepared;
+pub mod repl;
 
 pub use auth::Auth;
 pub use observ::{Metrics, ProcRegistry};
+pub use repl::{run_replica, serve_replication};
 
 /// Runtime configuration for the ElyraSQL server.
 pub struct ServerConfig {
@@ -34,6 +36,10 @@ pub struct ServerConfig {
     pub slow_query_ms: u128,
     /// Optional address for the Prometheus metrics HTTP endpoint.
     pub metrics_listen: Option<String>,
+    /// Optional address for the replication endpoint (makes this a primary).
+    pub replication_listen: Option<String>,
+    /// When true, reject all writes (used by replicas).
+    pub read_only: bool,
 }
 
 /// Build a rustls server config from PEM certificate and key files.
@@ -85,6 +91,8 @@ pub struct ElyraShim {
     conn_id: u32,
     /// Authenticated user name (for per-table grant checks).
     user: std::sync::Mutex<String>,
+    /// Replica mode: cap every connection at read-only.
+    read_only: bool,
 }
 
 impl ElyraShim {
@@ -94,6 +102,7 @@ impl ElyraShim {
         metrics: Arc<Metrics>,
         procs: Arc<ProcRegistry>,
         conn_id: u32,
+        read_only: bool,
     ) -> Self {
         let session = engine.session();
         Self {
@@ -108,6 +117,7 @@ impl ElyraShim {
             procs,
             conn_id,
             user: std::sync::Mutex::new(String::new()),
+            read_only,
         }
     }
 
@@ -116,6 +126,9 @@ impl ElyraShim {
     }
 
     fn privilege(&self) -> elyra_core::Privilege {
+        if self.read_only {
+            return elyra_core::Privilege::Read;
+        }
         *self.privilege.lock().unwrap()
     }
 
@@ -477,6 +490,15 @@ pub async fn serve(config: ServerConfig, engine: Engine) -> std::io::Result<()> 
             }
         });
     }
+    if let Some(raddr) = config.replication_listen.clone() {
+        let rdb = engine.db();
+        tokio::spawn(async move {
+            if let Err(e) = repl::serve_replication(raddr, rdb).await {
+                error!(error = %e, "replication endpoint stopped");
+            }
+        });
+    }
+    let read_only = config.read_only;
     static CONN_SEQ: AtomicU32 = AtomicU32::new(0);
     loop {
         let (stream, peer) = listener.accept().await?;
@@ -497,6 +519,7 @@ pub async fn serve(config: ServerConfig, engine: Engine) -> std::io::Result<()> 
                 metrics.clone(),
                 procs.clone(),
                 conn_id,
+                read_only,
             )
             .await;
             procs.deregister(conn_id);
@@ -550,6 +573,7 @@ async fn serve_metrics(addr: String, metrics: Arc<Metrics>) -> std::io::Result<(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     stream: tokio::net::TcpStream,
     engine: Engine,
@@ -558,11 +582,12 @@ async fn handle_connection(
     metrics: Arc<Metrics>,
     procs: Arc<ProcRegistry>,
     conn_id: u32,
+    read_only: bool,
 ) -> std::io::Result<()> {
     use opensrv_mysql::{plain_run_with_options, secure_run_with_options, IntermediaryOptions};
 
     let (mut r, mut w) = stream.into_split();
-    let mut shim = ElyraShim::new(engine, auth, metrics, procs, conn_id);
+    let mut shim = ElyraShim::new(engine, auth, metrics, procs, conn_id, read_only);
     let opts = IntermediaryOptions::default();
 
     // Read the handshake first; the client tells us whether it wants TLS.

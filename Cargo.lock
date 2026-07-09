@@ -520,12 +520,14 @@ name = "elyra-server"
 version = "0.5.0"
 dependencies = [
  "async-trait",
+ "bincode",
  "elyra-core",
  "elyra-engine",
  "elyra-storage",
  "opensrv-mysql",
  "rustls-pemfile",
  "rustls-pki-types",
+ "serde",
  "sha1",
  "tokio",
  "tokio-rustls",

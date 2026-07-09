@@ -54,6 +54,23 @@ enum Command {
         /// Serve Prometheus metrics at http://<addr>/metrics (e.g. 0.0.0.0:9090).
         #[arg(long, env = "ELYRASQL_METRICS_LISTEN")]
         metrics_listen: Option<String>,
+
+        /// Serve the replication stream at this address (makes this a primary).
+        #[arg(long, env = "ELYRASQL_REPLICATION_LISTEN")]
+        replication_listen: Option<String>,
+    },
+    /// Run as a read-only replica of a primary. The --data file is disposable:
+    /// it is recreated and re-bootstrapped from the primary on start.
+    Replica {
+        /// Address of the primary's replication endpoint.
+        #[arg(long, env = "ELYRASQL_PRIMARY")]
+        primary: String,
+        /// Local database file (recreated on start).
+        #[arg(long, env = "ELYRASQL_DATA", default_value = "elyra-replica.edb")]
+        data: PathBuf,
+        /// Address to bind the (read-only) MySQL listener to.
+        #[arg(long, env = "ELYRASQL_LISTEN", default_value = "127.0.0.1:3307")]
+        listen: String,
     },
     /// Back up a database file to a new file (offline; the server must not be
     /// running against --data). For hot backups while serving, use the SQL
@@ -155,6 +172,7 @@ async fn main() -> anyhow::Result<()> {
             tls_key,
             slow_query_ms,
             metrics_listen,
+            replication_listen,
         } => {
             tracing::info!(?data, "opening ElyraSQL database file");
             let db = Db::open(&data)?;
@@ -188,6 +206,40 @@ async fn main() -> anyhow::Result<()> {
                 tls,
                 slow_query_ms,
                 metrics_listen,
+                replication_listen,
+                read_only: false,
+            };
+            elyra_server::serve(config, engine).await?;
+        }
+        Command::Replica {
+            primary,
+            data,
+            listen,
+        } => {
+            // Fresh local file: a replica re-bootstraps its whole state.
+            let _ = std::fs::remove_file(&data);
+            tracing::info!(?data, %primary, "starting ElyraSQL replica");
+            let db = Db::open(&data)?;
+            let engine = Engine::new(db.clone());
+
+            // Apply the primary's stream in the background; exit if it ends.
+            let rdb = db.clone();
+            tokio::spawn(async move {
+                if let Err(e) = elyra_server::run_replica(primary, rdb).await {
+                    tracing::error!(error = %e, "replication stopped; exiting for restart");
+                    std::process::exit(1);
+                }
+            });
+
+            let auth = std::sync::Arc::new(elyra_server::Auth::open().with_db(db));
+            let config = elyra_server::ServerConfig {
+                listen,
+                auth,
+                tls: None,
+                slow_query_ms: 0,
+                metrics_listen: None,
+                replication_listen: None,
+                read_only: true,
             };
             elyra_server::serve(config, engine).await?;
         }
