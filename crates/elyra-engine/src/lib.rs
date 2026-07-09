@@ -321,6 +321,95 @@ impl Engine {
         }))
     }
 
+    /// Enforce per-column SELECT masking: if `user` has column grants on a table
+    /// referenced by a `SELECT`, they may only read those columns. Enforced for
+    /// single-base-table selects; a restricted table used in a more complex
+    /// query (joins/subqueries) is denied (deny-safe).
+    async fn enforce_column_masking(
+        &self,
+        user: &str,
+        stmt: &Statement,
+        sess: &Session,
+    ) -> Result<()> {
+        use sqlparser::ast::{SelectItem, SetExpr};
+        let Statement::Query(q) = stmt else {
+            return Ok(());
+        };
+        let SetExpr::Select(select) = q.body.as_ref() else {
+            return Ok(());
+        };
+        // Base tables referenced in FROM.
+        let mut tables: Vec<String> = Vec::new();
+        for twj in &select.from {
+            if let Some(t) = single_base_table(twj) {
+                tables.push(t);
+            }
+            for j in &twj.joins {
+                if let sqlparser::ast::TableFactor::Table { name, .. } = &j.relation {
+                    if let Some(t) = object_name_last(name) {
+                        tables.push(t);
+                    }
+                }
+            }
+        }
+        let simple = select.from.len() == 1 && select.from[0].joins.is_empty() && tables.len() == 1;
+        for t in &tables {
+            let Some(granted) = users::column_grants(sess, user, t).await? else {
+                continue; // not column-restricted on this table
+            };
+            let granted: std::collections::HashSet<String> = granted
+                .into_iter()
+                .map(|c| c.to_ascii_lowercase())
+                .collect();
+            if !simple {
+                return Err(Error::Query(format!(
+                    "access denied: column-restricted table '{t}' cannot be used in this query"
+                )));
+            }
+            // Collect referenced columns; a wildcard means all table columns.
+            let mut refs: Vec<String> = Vec::new();
+            let mut ok = true;
+            let mut all = false;
+            for item in &select.projection {
+                match item {
+                    SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => all = true,
+                    SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
+                        ok &= collect_col_refs(e, &mut refs);
+                    }
+                }
+            }
+            if let Some(w) = &select.selection {
+                ok &= collect_col_refs(w, &mut refs);
+            }
+            if let Some(ob) = &q.order_by {
+                for o in &ob.exprs {
+                    ok &= collect_col_refs(&o.expr, &mut refs);
+                }
+            }
+            if all {
+                // SELECT * requires every column of the table to be granted.
+                let def = catalog::load(sess, t).await?;
+                for c in &def.schema.columns {
+                    refs.push(c.name.to_ascii_lowercase());
+                }
+            }
+            if !ok {
+                return Err(Error::Query(format!(
+                    "access denied: query on column-restricted table '{t}' uses an \
+                     expression that cannot be verified"
+                )));
+            }
+            for r in &refs {
+                if !granted.contains(r) {
+                    return Err(Error::Query(format!(
+                        "access denied: no SELECT privilege on column '{t}.{r}'"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Handle CREATE / REFRESH / DROP MATERIALIZED VIEW by driving ordinary
     /// CTAS / DROP / catalog writes.
     async fn materialized_view(
@@ -837,6 +926,12 @@ impl Engine {
                     "access denied: statement requires {need:?} privilege"
                 )));
             }
+            // Per-column masking: a column-restricted user may only read the
+            // columns granted to them on a table.
+            if !user.is_empty() {
+                self.enforce_column_masking(user, &stmt, sess).await?;
+            }
+
             // Pessimistic locking: while another session holds an explicit
             // LOCK TABLES, acquire a transient lock on this statement's target
             // tables for the statement's duration (skipped entirely otherwise).
@@ -1089,6 +1184,93 @@ fn truthy(v: &Value) -> bool {
 
 fn object_name_last(name: &sqlparser::ast::ObjectName) -> Option<String> {
     name.0.last().map(|i| i.value.clone())
+}
+
+/// Collect the column names referenced by an expression. Returns `false` if it
+/// hits a node it doesn't understand (so the caller can be deny-safe).
+fn collect_col_refs(e: &sqlparser::ast::Expr, out: &mut Vec<String>) -> bool {
+    use sqlparser::ast::Expr::*;
+    match e {
+        Identifier(i) => {
+            out.push(i.value.to_ascii_lowercase());
+            true
+        }
+        CompoundIdentifier(parts) => {
+            if let Some(last) = parts.last() {
+                out.push(last.value.to_ascii_lowercase());
+            }
+            true
+        }
+        Value(_) => true,
+        Nested(inner)
+        | UnaryOp { expr: inner, .. }
+        | Cast { expr: inner, .. }
+        | IsNull(inner)
+        | IsNotNull(inner) => collect_col_refs(inner, out),
+        BinaryOp { left, right, .. } => collect_col_refs(left, out) && collect_col_refs(right, out),
+        Between {
+            expr, low, high, ..
+        } => {
+            collect_col_refs(expr, out) && collect_col_refs(low, out) && collect_col_refs(high, out)
+        }
+        InList { expr, list, .. } => {
+            collect_col_refs(expr, out) && list.iter().all(|x| collect_col_refs(x, out))
+        }
+        Like { expr, pattern, .. } | ILike { expr, pattern, .. } => {
+            collect_col_refs(expr, out) && collect_col_refs(pattern, out)
+        }
+        Function(f) => {
+            use sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArguments};
+            if let FunctionArguments::List(list) = &f.args {
+                for a in &list.args {
+                    match a {
+                        FunctionArg::Unnamed(FunctionArgExpr::Expr(x))
+                        | FunctionArg::Named {
+                            arg: FunctionArgExpr::Expr(x),
+                            ..
+                        } => {
+                            if !collect_col_refs(x, out) {
+                                return false;
+                            }
+                        }
+                        // A `*` argument (COUNT(*)) references no specific column.
+                        FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => {}
+                        _ => return false,
+                    }
+                }
+                true
+            } else {
+                false
+            }
+        }
+        Case {
+            operand,
+            conditions,
+            results,
+            else_result,
+        } => {
+            if let Some(o) = operand {
+                if !collect_col_refs(o, out) {
+                    return false;
+                }
+            }
+            for c in conditions {
+                if !collect_col_refs(c, out) {
+                    return false;
+                }
+            }
+            for r in results {
+                if !collect_col_refs(r, out) {
+                    return false;
+                }
+            }
+            if let Some(er) = else_result {
+                return collect_col_refs(er, out);
+            }
+            true
+        }
+        _ => false, // unknown node: be conservative
+    }
 }
 
 /// Case-insensitive substring replace (used to normalize `LOCK IN SHARE MODE`).

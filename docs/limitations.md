@@ -129,8 +129,12 @@ implemented, so you can judge fit.
   / `REVOKE <role> FROM <user>`; a user inherits the global and per-table grants
   of every role granted to them. `GRANT ... ON db.*` is accepted and maps to a
   global grant (single default database). Reads are always allowed at the global
-  baseline (grants only raise write/admin). **Per-column** privileges
-  (column masking) are not yet enforced.
+  baseline (grants only raise write/admin). **Per-column** SELECT grants are
+  enforced (`GRANT SELECT(col, ...) ON t TO u`): a column-restricted user may
+  only read those columns of `t` — querying an ungranted column (including via
+  `SELECT *` or a `WHERE`/`ORDER BY` reference) is denied. Enforcement covers
+  single-base-table selects; a column-restricted table used in a join or
+  subquery is denied (deny-safe).
 - An optional **audit log** (`--audit-log <path>`) appends one tab-separated
   line per executed statement (`timestamp  conn_id  user  OK|ERR  sql`).
 - Hot and offline backup/restore, plus an append-only binlog for point-in-time

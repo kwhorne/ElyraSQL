@@ -123,6 +123,26 @@ pub fn is_user_stmt(head: &str) -> bool {
         || h.eq_ignore_ascii_case("show grants")
 }
 
+/// A user's per-column SELECT grants on `table`. `None` means the user is not
+/// column-restricted on this table (no column grants); `Some(cols)` restricts
+/// reads to exactly those columns.
+pub async fn column_grants(sess: &Session, user: &str, table: &str) -> Result<Option<Vec<String>>> {
+    if user.is_empty() {
+        return Ok(None);
+    }
+    let prefix = elyra_core::users::col_grant_prefix(user, table);
+    let batch = sess.scan_batch(prefix.clone(), None, 4096).await?;
+    if batch.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(
+        batch
+            .iter()
+            .map(|(k, _)| String::from_utf8_lossy(&k[prefix.len()..]).into_owned())
+            .collect(),
+    ))
+}
+
 /// The role names granted (directly) to `user`.
 pub async fn roles_of(sess: &Session, user: &str) -> Result<Vec<String>> {
     let prefix = role_member_prefix(user);
@@ -391,12 +411,24 @@ async fn set_password(
 }
 
 async fn grant_revoke(toks: &[Tok], sess: &Session, grant: bool) -> Result<QueryResult> {
-    // Collect action words up to ON.
+    // Collect action words up to ON, capturing any `ACTION(col, col)` column list
+    // (per-column grants).
     let mut i = 1;
     let mut actions: Vec<String> = Vec::new();
+    let mut cols: Vec<String> = Vec::new();
     while i < toks.len() && !toks[i].is_word("on") {
-        if let Tok::Word(s) = &toks[i] {
-            actions.push(s.clone());
+        match &toks[i] {
+            Tok::Word(s) => actions.push(s.clone()),
+            Tok::Sym('(') => {
+                i += 1;
+                while i < toks.len() && !matches!(toks[i], Tok::Sym(')')) {
+                    if let Tok::Word(s) | Tok::Str(s) = &toks[i] {
+                        cols.push(s.clone());
+                    }
+                    i += 1;
+                }
+            }
+            _ => {}
         }
         i += 1;
     }
@@ -441,6 +473,28 @@ async fn grant_revoke(toks: &[Tok], sess: &Session, grant: bool) -> Result<Query
                 "user '{name}' does not exist (CREATE USER first)"
             )));
         };
+        if let (Some(table), false) = (&scoped_table, cols.is_empty()) {
+            // Per-column grant: SELECT(col, ...) ON table.
+            let mut puts = Vec::new();
+            let mut dels = Vec::new();
+            for col in &cols {
+                let key = elyra_core::users::col_grant_key(&name, table, col);
+                if grant {
+                    puts.push((key, encode_privilege(Privilege::Read)));
+                } else {
+                    dels.push(key);
+                }
+            }
+            sess.commit_write(puts, dels).await?;
+            applied += 1;
+            i = j;
+            if matches!(toks.get(i), Some(Tok::Sym(','))) {
+                i += 1;
+                continue;
+            } else {
+                break;
+            }
+        }
         if let Some(table) = &scoped_table {
             // Per-table grant: raise (GRANT) or clear (REVOKE) the table level.
             let key = table_grant_key(&name, table);

@@ -40,6 +40,18 @@ pub fn role_member_prefix(user: &str) -> Vec<u8> {
     format!("sys::rolemember::{user}::").into_bytes()
 }
 
+/// Key prefix for a user's per-column SELECT grants on one table.
+pub fn col_grant_prefix(user: &str, table: &str) -> Vec<u8> {
+    format!("sys::colgrant::{user}::{}::", table.to_ascii_lowercase()).into_bytes()
+}
+
+/// Storage key for a user's SELECT grant on `table.column`.
+pub fn col_grant_key(user: &str, table: &str, column: &str) -> Vec<u8> {
+    let mut k = col_grant_prefix(user, table);
+    k.extend_from_slice(column.to_ascii_lowercase().as_bytes());
+    k
+}
+
 /// Storage key for "`user` is a member of `role`".
 pub fn role_member_key(user: &str, role: &str) -> Vec<u8> {
     let mut k = role_member_prefix(user);
