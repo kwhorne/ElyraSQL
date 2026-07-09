@@ -251,6 +251,163 @@ pub async fn show_columns(db: &Session, table: &str) -> Result<QueryResult> {
     Ok(QueryResult::Rows(RowStream::literal(schema, rows)))
 }
 
+/// If `tf` is `information_schema.<view>`, return the lowercase view name.
+fn information_schema_view(tf: &TableFactor) -> Option<String> {
+    if let TableFactor::Table { name, .. } = tf {
+        if name.0.len() >= 2
+            && name.0[name.0.len() - 2]
+                .value
+                .eq_ignore_ascii_case("information_schema")
+        {
+            return name.0.last().map(|i| i.value.to_ascii_lowercase());
+        }
+    }
+    None
+}
+
+/// The `Key` letter (PRI/UNI/MUL/empty) for column `i` of a table.
+fn column_key(def: &TableDef, i: usize) -> &'static str {
+    if def.pk_cols.contains(&i) {
+        "PRI"
+    } else if def.indexes.iter().any(|idx| idx.unique && idx.cols == [i]) {
+        "UNI"
+    } else if def.indexes.iter().any(|idx| idx.cols.first() == Some(&i)) {
+        "MUL"
+    } else {
+        ""
+    }
+}
+
+fn column_extra(meta: &ColMeta) -> &'static str {
+    if meta.auto_increment {
+        "auto_increment"
+    } else if meta.generated.is_some() {
+        "STORED GENERATED"
+    } else {
+        ""
+    }
+}
+
+/// Build the rows of an `information_schema` view (`tables` or `columns`).
+async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec<Value>>)> {
+    let text = |n: &str| ColumnDef {
+        name: n.to_string(),
+        ty: ColumnType::Text,
+        nullable: true,
+    };
+    let int = |n: &str| ColumnDef {
+        name: n.to_string(),
+        ty: ColumnType::Int,
+        nullable: true,
+    };
+    let names = catalog::list_tables(db).await?;
+    match view {
+        "tables" => {
+            let schema = Schema::new(vec![
+                text("TABLE_SCHEMA"),
+                text("TABLE_NAME"),
+                text("TABLE_TYPE"),
+                text("ENGINE"),
+            ]);
+            let rows = names
+                .into_iter()
+                .map(|n| {
+                    vec![
+                        Value::Text("elyra".into()),
+                        Value::Text(n),
+                        Value::Text("BASE TABLE".into()),
+                        Value::Text("ElyraSQL".into()),
+                    ]
+                })
+                .collect();
+            Ok((schema, rows))
+        }
+        "columns" => {
+            let schema = Schema::new(vec![
+                text("TABLE_SCHEMA"),
+                text("TABLE_NAME"),
+                text("COLUMN_NAME"),
+                int("ORDINAL_POSITION"),
+                text("COLUMN_DEFAULT"),
+                text("IS_NULLABLE"),
+                text("DATA_TYPE"),
+                text("COLUMN_TYPE"),
+                text("COLUMN_KEY"),
+                text("EXTRA"),
+            ]);
+            let mut rows = Vec::new();
+            for tname in names {
+                let def = catalog::load(db, &tname).await?;
+                for (i, c) in def.schema.columns.iter().enumerate() {
+                    let meta = def.meta(i);
+                    let ty = c.ty.display_name();
+                    rows.push(vec![
+                        Value::Text("elyra".into()),
+                        Value::Text(tname.clone()),
+                        Value::Text(c.name.clone()),
+                        Value::Int(i as i64 + 1),
+                        match &meta.default {
+                            Some(d) => Value::Text(d.clone()),
+                            None => Value::Null,
+                        },
+                        Value::Text(if c.nullable { "YES" } else { "NO" }.into()),
+                        Value::Text(ty.clone()),
+                        Value::Text(ty),
+                        Value::Text(column_key(&def, i).into()),
+                        Value::Text(column_extra(&meta).into()),
+                    ]);
+                }
+            }
+            Ok((schema, rows))
+        }
+        other => Err(Error::Unsupported(format!(
+            "information_schema.{other} is not available"
+        ))),
+    }
+}
+
+/// Filter / aggregate / project / order a pre-materialised relation (used by
+/// information_schema virtual tables).
+#[allow(clippy::too_many_arguments)]
+async fn run_virtual_select(
+    db: &Session,
+    vindex: &VectorRegistry,
+    select: &Select,
+    schema: Schema,
+    mut rows: Vec<Vec<Value>>,
+    group_by: &[Expr],
+    order_exprs: &[(Expr, bool)],
+    offset: usize,
+    limit: Option<usize>,
+) -> Result<QueryResult> {
+    if let Some(f) = &select.selection {
+        let rf = resolve_subqueries(db, vindex, f.clone()).await?;
+        let mut kept = Vec::with_capacity(rows.len());
+        for r in rows {
+            if predicate::matches(&rf, &schema, &r)? {
+                kept.push(r);
+            }
+        }
+        rows = kept;
+    }
+
+    if !group_by.is_empty() || aggregate::projection_has_aggregate(&select.projection) {
+        let (osch, orows) = aggregate::run(&schema, &select.projection, group_by, rows)?;
+        let mut orows = apply_having(select.having.as_ref(), &select.projection, &osch, orows)?;
+        order_output_rows(&mut orows, &osch, order_exprs)?;
+        apply_offset_limit(&mut orows, offset, limit);
+        return Ok(QueryResult::Rows(RowStream::literal(osch, orows)));
+    }
+
+    let resolved = resolve_order_aliases(order_exprs, &select.projection, &schema);
+    if !resolved.is_empty() {
+        sort_full_rows(&mut rows, &schema, &resolved)?;
+    }
+    apply_offset_limit(&mut rows, offset, limit);
+    let (osch, out) = project_exprs(&select.projection, &schema, &rows)?;
+    Ok(QueryResult::Rows(RowStream::literal(osch, out)))
+}
+
 /// CREATE TABLE ... AS SELECT: build a rowid table from the query's output
 /// schema (or an explicit column list) and copy the result rows.
 async fn create_table_as(
@@ -1279,6 +1436,24 @@ pub async fn select(
             "exactly one table in FROM is supported".into(),
         ));
     }
+
+    // information_schema.<view> as a single virtual relation.
+    if let Some(view) = information_schema_view(&select.from[0].relation) {
+        let (schema, rows) = information_schema(db, &view).await?;
+        return run_virtual_select(
+            db,
+            vindex,
+            select,
+            schema,
+            rows,
+            &group_by,
+            &order_exprs,
+            offset,
+            limit,
+        )
+        .await;
+    }
+
     let table = match &select.from[0].relation {
         TableFactor::Table { name, .. } => table_ident(name)?,
         _ => {
@@ -1767,6 +1942,22 @@ async fn load_relation(
     tf: &TableFactor,
     conjuncts: &[Expr],
 ) -> Result<(Vec<ColumnDef>, Vec<Vec<Value>>)> {
+    // information_schema.<view>: synthesize a virtual relation.
+    if let Some(view) = information_schema_view(tf) {
+        let (schema, rows) = information_schema(db, &view).await?;
+        let qual = factor_qualifier(tf).unwrap_or(view);
+        let cols = schema
+            .columns
+            .iter()
+            .map(|c| ColumnDef {
+                name: format!("{qual}.{}", c.name),
+                ty: c.ty.clone(),
+                nullable: c.nullable,
+            })
+            .collect();
+        return Ok((cols, rows));
+    }
+
     // Derived table: materialise the subquery and qualify its columns.
     if let TableFactor::Derived {
         subquery, alias, ..

@@ -331,7 +331,9 @@ fn eval_function(f: &sqlparser::ast::Function, schema: &Schema, row: &[Value]) -
                     .unwrap_or_else(|| "DAY".into());
                 return Ok(apply_interval(base, if sub { -n } else { n }, &unit));
             }
-            let n = eval_row(args_exprs[1], schema, row)?.as_f64().unwrap_or(0.0) as i64;
+            let n = eval_row(args_exprs[1], schema, row)?
+                .as_f64()
+                .unwrap_or(0.0) as i64;
             return Ok(apply_interval(base, if sub { -n } else { n }, "DAY"));
         }
         _ => {}
@@ -602,8 +604,11 @@ fn eval_scalar(name: &str, a: &[Value]) -> Result<Option<Value>> {
         },
         "last_day" => match to_micros(&a[0]) {
             Some(m) => {
-                let (y, mo, _) = elyra_core::datetime::civil_from_days(m.div_euclid(86_400_000_000));
-                Value::Date(elyra_core::datetime::days_from_civil(y, mo, days_in_month(y, mo)) as i32)
+                let (y, mo, _) =
+                    elyra_core::datetime::civil_from_days(m.div_euclid(86_400_000_000));
+                Value::Date(
+                    elyra_core::datetime::days_from_civil(y, mo, days_in_month(y, mo)) as i32,
+                )
             }
             None => Value::Null,
         },

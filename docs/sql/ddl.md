@@ -135,6 +135,23 @@ DESCRIBE users;   -- or DESC users
 (primary key), `UNI` (unique index), or `MUL` (leading column of a secondary
 index), and `Extra` shows `auto_increment` or `STORED GENERATED`.
 
+### INFORMATION_SCHEMA
+
+`information_schema.tables` and `information_schema.columns` are queryable
+virtual tables, so you can filter, group, and aggregate over the catalog:
+
+```sql
+SELECT table_name FROM information_schema.tables;
+
+SELECT column_name, data_type, is_nullable, column_key, extra
+FROM information_schema.columns
+WHERE table_name = 'users'
+ORDER BY ordinal_position;
+
+SELECT table_name, COUNT(*) AS columns
+FROM information_schema.columns GROUP BY table_name;
+```
+
 ## Views
 
 ```sql
