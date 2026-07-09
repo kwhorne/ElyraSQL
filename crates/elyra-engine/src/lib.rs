@@ -438,8 +438,9 @@ impl Engine {
             }
             let ctas = format!("CREATE TABLE `{name}` AS {query}");
             Box::pin(self.execute_as(&ctas, privilege, user, sess)).await?;
+            let dep = exec::matview_deps_put(sess, &name, &query).await?;
             sess.commit_write(
-                vec![(catalog::matview_key(&name), query.into_bytes())],
+                vec![(catalog::matview_key(&name), query.into_bytes()), dep],
                 vec![],
             )
             .await?;
@@ -452,19 +453,7 @@ impl Engine {
                 .trim_end_matches(';')
                 .trim_matches(['`', '"'])
                 .to_string();
-            let query = match sess.get(catalog::matview_key(&name)).await? {
-                Some(b) => String::from_utf8_lossy(&b).into_owned(),
-                None => return Err(Error::Catalog(format!("no such materialized view: {name}"))),
-            };
-            Box::pin(self.execute_as(&format!("DROP TABLE `{name}`"), privilege, user, sess))
-                .await?;
-            Box::pin(self.execute_as(
-                &format!("CREATE TABLE `{name}` AS {query}"),
-                privilege,
-                user,
-                sess,
-            ))
-            .await?;
+            self.refresh_matview(&name, privilege, user, sess).await?;
             return Ok(vec![QueryResult::empty_ok()]);
         }
 
@@ -479,9 +468,71 @@ impl Engine {
             return Err(Error::Catalog(format!("no such materialized view: {name}")));
         }
         Box::pin(self.execute_as(&format!("DROP TABLE `{name}`"), privilege, user, sess)).await?;
-        sess.commit_write(vec![], vec![catalog::matview_key(&name)])
-            .await?;
+        sess.commit_write(
+            vec![],
+            vec![catalog::matview_key(&name), catalog::matdep_key(&name)],
+        )
+        .await?;
         Ok(vec![QueryResult::empty_ok()])
+    }
+
+    /// Recompute a materialized view (DROP + CTAS) and refresh its dependency
+    /// write-counters. Used by explicit REFRESH and by auto-refresh.
+    async fn refresh_matview(
+        &self,
+        name: &str,
+        privilege: Privilege,
+        user: &str,
+        sess: &Session,
+    ) -> Result<()> {
+        let query = match sess.get(catalog::matview_key(name)).await? {
+            Some(b) => String::from_utf8_lossy(&b).into_owned(),
+            None => return Err(Error::Catalog(format!("no such materialized view: {name}"))),
+        };
+        Box::pin(self.execute_as(&format!("DROP TABLE `{name}`"), privilege, user, sess)).await?;
+        Box::pin(self.execute_as(
+            &format!("CREATE TABLE `{name}` AS {query}"),
+            privilege,
+            user,
+            sess,
+        ))
+        .await?;
+        let dep = exec::matview_deps_put(sess, name, &query).await?;
+        sess.commit_write(vec![dep], vec![]).await?;
+        Ok(())
+    }
+
+    /// Before reading, auto-refresh any stale materialized view the query reads.
+    async fn auto_refresh_matviews(
+        &self,
+        stmt: &Statement,
+        privilege: Privilege,
+        user: &str,
+        sess: &Session,
+    ) -> Result<()> {
+        use sqlparser::ast::SetExpr;
+        let Statement::Query(q) = stmt else {
+            return Ok(());
+        };
+        let SetExpr::Select(select) = q.body.as_ref() else {
+            return Ok(());
+        };
+        for twj in &select.from {
+            for factor in
+                std::iter::once(&twj.relation).chain(twj.joins.iter().map(|j| &j.relation))
+            {
+                if let sqlparser::ast::TableFactor::Table { name, .. } = factor {
+                    if let Some(t) = object_name_last(name) {
+                        if sess.get(catalog::matview_key(&t)).await?.is_some()
+                            && exec::matview_is_stale(sess, &t).await?
+                        {
+                            self.refresh_matview(&t, privilege, user, sess).await?;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Execute a query and materialize all of its rows (for a cursor OPEN).
@@ -926,6 +977,10 @@ impl Engine {
                     "access denied: statement requires {need:?} privilege"
                 )));
             }
+            // Auto-refresh any stale materialized view this statement reads.
+            self.auto_refresh_matviews(&stmt, privilege, user, sess)
+                .await?;
+
             // Per-column masking: a column-restricted user may only read the
             // columns granted to them on a table.
             if !user.is_empty() {

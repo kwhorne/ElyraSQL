@@ -26,11 +26,15 @@ implemented, so you can judge fit.
   REPLACE/ON DUPLICATE/IGNORE).
 - **Materialized views**: `CREATE MATERIALIZED VIEW v AS <select>` stores the
   result as a real table; `REFRESH MATERIALIZED VIEW v` recomputes it; `DROP
-  MATERIALIZED VIEW v` removes it. The view is not auto-refreshed on base-table
-  changes (refresh is explicit).
-- Not yet: named windows, `RANGE`/`GROUPS` numeric-offset frames, correlated
-  subqueries combined with aggregation over a join, user-defined functions, and
-  events.
+  MATERIALIZED VIEW v` removes it. Views **auto-refresh on read** when a base
+  table has changed since the last refresh (detected via per-table write
+  counters); this is a full recompute, not incremental delta maintenance.
+- **Named windows** are supported: `... OVER w ... WINDOW w AS (PARTITION BY ...
+  ORDER BY ...)`, including `OVER (w ...)` inheriting a named window.
+- Not yet: `RANGE`/`GROUPS` numeric value-offset frames (only
+  `UNBOUNDED PRECEDING .. CURRENT ROW`/`UNBOUNDED FOLLOWING` for `RANGE`),
+  correlated subqueries combined with aggregation over a join, user-defined
+  functions, and events.
 
 ## Constraints & integrity
 

@@ -8,7 +8,8 @@ use elyra_core::{ColumnDef, ColumnType, Error, Result, Schema, Value};
 use sqlparser::ast::{
     AlterColumnOperation, AlterTableOperation, Assignment, AssignmentTarget, ColumnOption,
     CreateIndex, CreateTable, DataType, Delete, FromTable, Insert, JoinConstraint, JoinOperator,
-    ObjectName, Query as SqlQuery, Select, SetExpr, TableConstraint, TableFactor, TableWithJoins,
+    ObjectName, Query as SqlQuery, Select, SetExpr, Statement, TableConstraint, TableFactor,
+    TableWithJoins,
 };
 
 use crate::aggregate;
@@ -3530,6 +3531,64 @@ fn simple_pred(e: &Expr) -> Option<(String, catalog::SelOp, String)> {
     None
 }
 
+/// Base tables referenced in the FROM of a (materialized view) query.
+pub fn matview_base_tables(query: &str) -> Vec<String> {
+    use sqlparser::dialect::MySqlDialect;
+    use sqlparser::parser::Parser;
+    let Ok(stmts) = Parser::parse_sql(&MySqlDialect {}, query) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for stmt in &stmts {
+        if let Statement::Query(q) = stmt {
+            if let SetExpr::Select(select) = q.body.as_ref() {
+                for twj in &select.from {
+                    if let TableFactor::Table { name, .. } = &twj.relation {
+                        if let Some(n) = name.0.last() {
+                            out.push(n.value.clone());
+                        }
+                    }
+                    for j in &twj.joins {
+                        if let TableFactor::Table { name, .. } = &j.relation {
+                            if let Some(n) = name.0.last() {
+                                out.push(n.value.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Encode `(matdep_key, value)` capturing each base table's current write count,
+/// so staleness can be detected later.
+pub async fn matview_deps_put(db: &Session, name: &str, query: &str) -> Result<(Vec<u8>, Vec<u8>)> {
+    let mut deps: Vec<(String, u64)> = Vec::new();
+    for t in matview_base_tables(query) {
+        let wc = crate::vindex::read_wcount(db, &t).await?;
+        deps.push((t, wc));
+    }
+    let enc = bincode::serialize(&deps).map_err(|e| Error::Storage(e.to_string()))?;
+    Ok((catalog::matdep_key(name), enc))
+}
+
+/// Whether a materialized view is stale (a base table changed since last refresh).
+pub async fn matview_is_stale(db: &Session, name: &str) -> Result<bool> {
+    let Some(b) = db.get(catalog::matdep_key(name)).await? else {
+        return Ok(false);
+    };
+    let deps: Vec<(String, u64)> =
+        bincode::deserialize(&b).map_err(|e| Error::Storage(e.to_string()))?;
+    for (t, wc) in deps {
+        if crate::vindex::read_wcount(db, &t).await? != wc {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// A parsed `LOAD DATA INFILE` statement.
 pub struct LoadSpec {
     pub path: String,
@@ -5646,6 +5705,10 @@ async fn window_select(
     limit: Option<usize>,
 ) -> Result<QueryResult> {
     use sqlparser::ast::SelectItem;
+    // Resolve any named windows (`WINDOW w AS (...)` + `OVER w`) into inline
+    // window specs, so the rest of the pipeline only sees WindowSpecs.
+    let resolved = resolve_named_windows(select)?;
+    let select = &resolved;
     let rows = scan_rows(db, def, filter).await?;
     let schema = &def.schema;
 
@@ -5714,6 +5777,92 @@ async fn window_select(
     order_output_rows(&mut out_rows, &out_schema, order_exprs)?;
     apply_offset_limit(&mut out_rows, offset, limit);
     Ok(QueryResult::Rows(RowStream::literal(out_schema, out_rows)))
+}
+
+/// Replace `OVER w` / `OVER (w ...)` named-window references in a SELECT's
+/// projection with inline window specs from its `WINDOW` clause.
+fn resolve_named_windows(select: &Select) -> Result<Select> {
+    if select.named_window.is_empty() {
+        return Ok(select.clone());
+    }
+    // Build name -> definition, following NamedWindow chains (bounded).
+    let mut defs: WindowDefs = std::collections::HashMap::new();
+    for nw in &select.named_window {
+        defs.insert(nw.0.value.to_ascii_lowercase(), nw.1.clone());
+    }
+    use sqlparser::ast::SelectItem;
+    let mut out = select.clone();
+    for item in out.projection.iter_mut() {
+        match item {
+            SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
+                resolve_over_in_expr(e, &defs)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(out)
+}
+
+type WindowDefs = std::collections::HashMap<String, sqlparser::ast::NamedWindowExpr>;
+
+/// Resolve a named window to a concrete spec, following NamedWindow chains.
+fn resolve_window_spec(
+    name: &str,
+    defs: &WindowDefs,
+    depth: u32,
+) -> Result<sqlparser::ast::WindowSpec> {
+    use sqlparser::ast::NamedWindowExpr;
+    if depth > 16 {
+        return Err(Error::Query("named window reference cycle".into()));
+    }
+    match defs.get(&name.to_ascii_lowercase()) {
+        Some(NamedWindowExpr::WindowSpec(s)) => Ok(s.clone()),
+        Some(NamedWindowExpr::NamedWindow(other)) => {
+            resolve_window_spec(&other.value, defs, depth + 1)
+        }
+        None => Err(Error::Query(format!("undefined window: {name}"))),
+    }
+}
+
+/// Rewrite window-function `.over` references (named windows) to inline specs.
+fn resolve_over_in_expr(e: &mut Expr, defs: &WindowDefs) -> Result<()> {
+    use sqlparser::ast::WindowType;
+    match e {
+        Expr::Function(f) => {
+            match &f.over {
+                Some(WindowType::NamedWindow(name)) => {
+                    let spec = resolve_window_spec(&name.value, defs, 0)?;
+                    f.over = Some(WindowType::WindowSpec(spec));
+                }
+                Some(WindowType::WindowSpec(s)) if s.window_name.is_some() => {
+                    // `OVER (w ...)`: inherit the base window, add local clauses.
+                    let base =
+                        resolve_window_spec(&s.window_name.as_ref().unwrap().value, defs, 0)?;
+                    let merged = sqlparser::ast::WindowSpec {
+                        window_name: None,
+                        partition_by: base.partition_by,
+                        order_by: if s.order_by.is_empty() {
+                            base.order_by
+                        } else {
+                            s.order_by.clone()
+                        },
+                        window_frame: s.window_frame.clone().or(base.window_frame),
+                    };
+                    f.over = Some(WindowType::WindowSpec(merged));
+                }
+                _ => {}
+            }
+            Ok(())
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            resolve_over_in_expr(left, defs)?;
+            resolve_over_in_expr(right, defs)
+        }
+        Expr::UnaryOp { expr, .. } | Expr::Nested(expr) | Expr::Cast { expr, .. } => {
+            resolve_over_in_expr(expr, defs)
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Compute a window function's value for every input row (indexed by original
