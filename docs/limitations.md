@@ -154,7 +154,13 @@ implemented, so you can judge fit.
   --action add|remove` changes membership at runtime (send to the leader, which
   propagates it to followers via heartbeats); add one node at a time and start a
   new node before adding it. An even-node cluster can, rarely, need an extra
-  election round to break a tie — run an odd number of nodes.
+  election round to break a tie — run an odd number of nodes. Election state
+  (current term + vote) is persisted to a `<data>.raftstate` file so a restarted
+  node never double-votes in a term (a Raft safety requirement). Full **Raft log
+  replication** — a replicated, apply-on-commit log with uncommitted-entry
+  truncation for pre-commit (2-phase) durability — is a dedicated future
+  milestone; today durability is async by default, with quorum/strict-sync plus
+  the election restriction giving no-data-loss for acknowledged writes.
 
 ## Wire protocol
 

@@ -365,6 +365,7 @@ async fn run() -> anyhow::Result<()> {
                     control_listen,
                     replication_addr: replication_listen.clone(),
                     peers,
+                    state_path: Some(data.with_extension("raftstate")),
                 },
                 std::sync::Arc::new(move || lsn_db.current_lsn()),
             );

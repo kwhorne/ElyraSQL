@@ -37,6 +37,42 @@ pub struct ClusterConfig {
     /// This node's replication endpoint, advertised to followers.
     pub replication_addr: String,
     pub peers: Vec<Peer>,
+    /// File where the persistent election state (term + vote) is stored, so it
+    /// survives restarts (a Raft safety requirement). `None` = in-memory only.
+    pub state_path: Option<std::path::PathBuf>,
+}
+
+/// Load `(current_term, voted_for)` persisted by a previous run.
+fn load_state(path: &Option<std::path::PathBuf>) -> (u64, Option<u64>) {
+    let Some(p) = path else { return (0, None) };
+    let Ok(s) = std::fs::read_to_string(p) else {
+        return (0, None);
+    };
+    let mut lines = s.lines();
+    let term = lines
+        .next()
+        .and_then(|l| l.trim().parse().ok())
+        .unwrap_or(0);
+    let voted_for = lines.next().and_then(|l| {
+        l.trim()
+            .parse::<u64>()
+            .ok()
+            .filter(|_| !l.trim().is_empty())
+    });
+    (term, voted_for)
+}
+
+/// Durably persist `(current_term, voted_for)` before responding to any RPC.
+fn persist_state(path: &Option<std::path::PathBuf>, term: u64, voted_for: Option<u64>) {
+    if let Some(p) = path {
+        let body = format!(
+            "{term}\n{}\n",
+            voted_for.map(|v| v.to_string()).unwrap_or_default()
+        );
+        if let Err(e) = std::fs::write(p, body) {
+            warn!(error = %e, "failed to persist election state");
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -146,12 +182,14 @@ impl Node {
         let cfg_id = cfg.id;
         let peers = Mutex::new(cfg.peers.clone());
         let (leader_tx, leader_rx) = watch::channel(None);
+        // Resume persistent election state (term + vote) across restarts.
+        let (term, voted_for) = load_state(&cfg.state_path);
         Arc::new(Node {
             cfg: Arc::new(cfg),
             peers,
             state: Arc::new(Mutex::new(State {
-                term: 0,
-                voted_for: None,
+                term,
+                voted_for,
                 role: Role::Follower,
                 leader: None,
                 election_deadline: Instant::now() + election_timeout(cfg_id),
@@ -252,9 +290,12 @@ impl Node {
         // Compute the reply (and any leader to publish) entirely under the lock,
         // then release it before doing any IO.
         let mut adopt: Option<Vec<(u64, String)>> = None;
+        let before;
+        let after;
         let (reply, publish) = {
             let mut s = self.state.lock().unwrap();
-            match msg {
+            before = (s.term, s.voted_for);
+            let r = match msg {
                 Msg::RequestVote {
                     term,
                     candidate,
@@ -309,8 +350,14 @@ impl Node {
                     }
                 }
                 _ => (Msg::HeartbeatAck { term: s.term }, None),
-            }
+            };
+            after = (s.term, s.voted_for);
+            r
         };
+        // Persist term/vote before responding whenever they changed (Raft safety).
+        if after != before {
+            persist_state(&self.cfg.state_path, after.0, after.1);
+        }
         if let Some(m) = adopt {
             self.adopt_members(&m);
         }
@@ -353,6 +400,8 @@ impl Node {
             s.election_deadline = Instant::now() + election_timeout(self.cfg.id);
             s.term
         };
+        // Persist the incremented term + self-vote before soliciting votes.
+        persist_state(&self.cfg.state_path, term, Some(self.cfg.id));
         let last_lsn = (self.lsn_source)();
         info!(id = self.cfg.id, term, last_lsn, "standing for election");
         let mut votes = 1; // vote for self
@@ -549,6 +598,7 @@ mod tests {
                     control_listen: String::new(),
                     replication_addr: String::new(),
                     peers,
+                    state_path: None,
                 },
                 Arc::new(|| 0),
             )
