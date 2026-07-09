@@ -312,6 +312,14 @@ impl Engine {
                 sess.savepoint(&name.value)?;
                 Ok(QueryResult::empty_ok())
             }
+            Statement::Analyze { table_name, .. } => {
+                let name = table_name
+                    .0
+                    .last()
+                    .map(|i| i.value.clone())
+                    .ok_or_else(|| Error::Catalog("empty table name".into()))?;
+                exec::analyze_table(sess, &name).await
+            }
             Statement::ReleaseSavepoint { name } => {
                 sess.release_savepoint(&name.value)?;
                 Ok(QueryResult::empty_ok())

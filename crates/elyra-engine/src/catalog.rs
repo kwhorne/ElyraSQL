@@ -137,6 +137,25 @@ pub fn catalog_key(table: &str) -> Vec<u8> {
     format!("catalog::{table}").into_bytes()
 }
 
+/// Persisted table statistics (from `ANALYZE TABLE`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TableStats {
+    /// Row count at the last ANALYZE.
+    pub rows: u64,
+}
+
+pub fn stats_key(table: &str) -> Vec<u8> {
+    format!("stats::{table}").into_bytes()
+}
+
+/// Load a table's statistics, if it has been analyzed.
+pub async fn load_stats(db: &Session, table: &str) -> Result<Option<TableStats>> {
+    match db.get(stats_key(table)).await? {
+        Some(b) => Ok(bincode::deserialize(&b).ok()),
+        None => Ok(None),
+    }
+}
+
 pub fn rowid_key(table: &str) -> Vec<u8> {
     format!("meta::rowid::{table}").into_bytes()
 }

@@ -25,9 +25,14 @@ implemented, so you can judge fit.
 
 - Range scans and index nested-loop joins are **single-column**; composite
   ranges fall back to a scan.
-- `RIGHT`/`FULL` and non-equi joins use nested-loop (no hash/merge).
-- There is no cost-based optimizer or statistics; the planner uses heuristic
-  fast paths.
+- Equi joins (INNER/LEFT/RIGHT) use a hash join with a cost-based build side
+  (the smaller relation for INNER; an index nested-loop join when the driving
+  side is small and the partner is indexed). `FULL` and non-equi joins use
+  nested-loop; there is no merge join.
+- `ANALYZE TABLE` records row-count statistics (surfaced as
+  `information_schema.tables.TABLE_ROWS`). Join build-side selection uses live
+  materialized sizes; there is not yet a full cost-based optimizer with
+  per-column histograms or automatic join reordering.
 - `ORDER BY` is memory-bounded: `ORDER BY ... LIMIT` uses a top-N heap, and
   large unbounded sorts spill sorted runs to temp files (external merge sort,
   `ELYRASQL_SORT_MAX_ROWS`). `GROUP BY` with many distinct groups falls back to

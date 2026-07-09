@@ -545,18 +545,22 @@ async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec
                 text("TABLE_NAME"),
                 text("TABLE_TYPE"),
                 text("ENGINE"),
+                int("TABLE_ROWS"),
             ]);
-            let rows = names
-                .into_iter()
-                .map(|n| {
-                    vec![
-                        Value::Text("elyra".into()),
-                        Value::Text(n),
-                        Value::Text("BASE TABLE".into()),
-                        Value::Text("ElyraSQL".into()),
-                    ]
-                })
-                .collect();
+            let mut rows = Vec::with_capacity(names.len());
+            for n in names {
+                let table_rows = match catalog::load_stats(db, &n).await? {
+                    Some(s) => Value::Int(s.rows as i64),
+                    None => Value::Null,
+                };
+                rows.push(vec![
+                    Value::Text("elyra".into()),
+                    Value::Text(n),
+                    Value::Text("BASE TABLE".into()),
+                    Value::Text("ElyraSQL".into()),
+                    table_rows,
+                ]);
+            }
             Ok((schema, rows))
         }
         "columns" => {
@@ -3031,19 +3035,11 @@ fn combine(
     let lschema = Schema::new(lcols.to_vec());
     let rschema = Schema::new(rcols.to_vec());
 
-    // Hash join for equi INNER/LEFT.
-    if matches!(kind, JoinKind::Inner | JoinKind::Left) {
+    // Hash join for equi INNER/LEFT/RIGHT (cost-based build side).
+    if matches!(kind, JoinKind::Inner | JoinKind::Left | JoinKind::Right) {
         if let Some(e) = on {
             if let Some((lkey, rkey)) = equi_keys(e, &lschema, &rschema) {
-                let rows = hash_join(
-                    lrows,
-                    rrows,
-                    &lschema,
-                    &rschema,
-                    &lkey,
-                    &rkey,
-                    kind == JoinKind::Left,
-                )?;
+                let rows = hash_join(lrows, rrows, &lschema, &rschema, &lkey, &rkey, kind)?;
                 return Ok((cols, rows));
             }
         }
@@ -3090,7 +3086,9 @@ fn combine(
     Ok((cols, out))
 }
 
-/// Hash join: build a map on the right key, probe with the left key.
+/// Equi hash join for INNER / LEFT / RIGHT, always emitting `[left.., right..]`.
+/// The build side is chosen by cost: an outer join must build on its
+/// non-preserved side; an INNER join builds on the smaller relation.
 #[allow(clippy::too_many_arguments)]
 fn hash_join(
     lrows: &[Vec<Value>],
@@ -3099,36 +3097,77 @@ fn hash_join(
     rschema: &Schema,
     lkey: &Expr,
     rkey: &Expr,
-    left_outer: bool,
+    kind: JoinKind,
 ) -> Result<Vec<Vec<Value>>> {
     use std::collections::HashMap;
+    let llen = lschema.columns.len();
     let rlen = rschema.columns.len();
-    let mut table: HashMap<String, Vec<usize>> = HashMap::new();
-    for (i, r) in rrows.iter().enumerate() {
-        let k = key_str(&predicate::eval_row(rkey, rschema, r)?);
-        if let Some(k) = k {
-            table.entry(k).or_default().push(i);
-        }
-    }
 
+    // Which side to build the hash table on:
+    //   LEFT  → build right, probe left  (emit every left row)
+    //   RIGHT → build left,  probe right (emit every right row)
+    //   INNER → build the smaller side
+    let build_left = match kind {
+        JoinKind::Left => false,
+        JoinKind::Right => true,
+        _ => lrows.len() <= rrows.len(),
+    };
+    let outer = !matches!(kind, JoinKind::Inner);
     let mut out = Vec::new();
-    for l in lrows {
-        let probe = key_str(&predicate::eval_row(lkey, lschema, l)?);
-        let mut matched = false;
-        if let Some(k) = probe {
-            if let Some(idxs) = table.get(&k) {
-                for &i in idxs {
-                    let mut combined = l.clone();
-                    combined.extend_from_slice(&rrows[i]);
-                    out.push(combined);
-                    matched = true;
-                }
+
+    if build_left {
+        let mut table: HashMap<String, Vec<usize>> = HashMap::new();
+        for (i, l) in lrows.iter().enumerate() {
+            if let Some(k) = key_str(&predicate::eval_row(lkey, lschema, l)?) {
+                table.entry(k).or_default().push(i);
             }
         }
-        if left_outer && !matched {
-            let mut combined = l.clone();
-            combined.extend(std::iter::repeat_n(Value::Null, rlen));
-            out.push(combined);
+        for r in rrows {
+            let probe = key_str(&predicate::eval_row(rkey, rschema, r)?);
+            let mut matched = false;
+            if let Some(k) = probe {
+                if let Some(idxs) = table.get(&k) {
+                    for &i in idxs {
+                        let mut combined = lrows[i].clone();
+                        combined.extend_from_slice(r);
+                        out.push(combined);
+                        matched = true;
+                    }
+                }
+            }
+            // RIGHT outer: unmatched right row, left side NULL-filled.
+            if outer && !matched {
+                let mut combined = vec![Value::Null; llen];
+                combined.extend_from_slice(r);
+                out.push(combined);
+            }
+        }
+    } else {
+        let mut table: HashMap<String, Vec<usize>> = HashMap::new();
+        for (i, r) in rrows.iter().enumerate() {
+            if let Some(k) = key_str(&predicate::eval_row(rkey, rschema, r)?) {
+                table.entry(k).or_default().push(i);
+            }
+        }
+        for l in lrows {
+            let probe = key_str(&predicate::eval_row(lkey, lschema, l)?);
+            let mut matched = false;
+            if let Some(k) = probe {
+                if let Some(idxs) = table.get(&k) {
+                    for &i in idxs {
+                        let mut combined = l.clone();
+                        combined.extend_from_slice(&rrows[i]);
+                        out.push(combined);
+                        matched = true;
+                    }
+                }
+            }
+            // LEFT outer: unmatched left row, right side NULL-filled.
+            if outer && !matched {
+                let mut combined = l.clone();
+                combined.extend(std::iter::repeat_n(Value::Null, rlen));
+                out.push(combined);
+            }
         }
     }
     Ok(out)
@@ -6269,6 +6308,48 @@ fn reorder(rows: &mut [Vec<Value>], keyed: &[(Vec<Value>, usize)]) {
     for (slot, row) in rows.iter_mut().zip(snapshot) {
         *slot = row;
     }
+}
+
+/// `ANALYZE TABLE`: count rows and persist statistics used for reporting
+/// (`information_schema.tables.TABLE_ROWS`) and planning.
+pub async fn analyze_table(db: &Session, name: &str) -> Result<QueryResult> {
+    if !catalog::exists(db, name).await? {
+        return Err(Error::Catalog(format!("no such table: {name}")));
+    }
+    let prefix = data_prefix(name);
+    let mut cursor: Option<Vec<u8>> = None;
+    let mut rows = 0u64;
+    loop {
+        let batch = db.scan_batch(prefix.clone(), cursor.clone(), 8192).await?;
+        if batch.is_empty() {
+            break;
+        }
+        rows += batch.len() as u64;
+        let last = batch.len() < 8192;
+        cursor = batch.last().map(|(k, _)| k.clone());
+        if last {
+            break;
+        }
+    }
+    let stats = catalog::TableStats { rows };
+    let enc = bincode::serialize(&stats).map_err(|e| Error::Storage(e.to_string()))?;
+    db.commit_write(vec![(catalog::stats_key(name), enc)], vec![])
+        .await?;
+
+    // MySQL-style ANALYZE result set.
+    let schema = Schema::new(vec![
+        ColumnDef::new("Table", ColumnType::Text, false),
+        ColumnDef::new("Op", ColumnType::Text, false),
+        ColumnDef::new("Msg_type", ColumnType::Text, false),
+        ColumnDef::new("Msg_text", ColumnType::Text, false),
+    ]);
+    let row = vec![
+        Value::Text(name.to_string()),
+        Value::Text("analyze".into()),
+        Value::Text("status".into()),
+        Value::Text("OK".into()),
+    ];
+    Ok(QueryResult::Rows(RowStream::literal(schema, vec![row])))
 }
 
 pub async fn drop_table(db: &Session, name: &str, if_exists: bool) -> Result<QueryResult> {
