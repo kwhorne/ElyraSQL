@@ -62,6 +62,10 @@ pub fn eval_row(expr: &Expr, schema: &Schema, row: &[Value]) -> Result<Value> {
                 (UnaryOperator::Minus, Value::Int(i)) => Ok(Value::Int(-i)),
                 (UnaryOperator::Minus, Value::Float(f)) => Ok(Value::Float(-f)),
                 (UnaryOperator::Plus, v) => Ok(v),
+                (UnaryOperator::PGBitwiseNot, v) => Ok(match v.as_f64() {
+                    Some(x) => Value::Int(!(x as i64)),
+                    None => Value::Null,
+                }),
                 _ => Err(Error::Unsupported("unsupported unary operator".into())),
             }
         }
@@ -1635,8 +1639,27 @@ fn binary(
             cmp(&l, &r)?.map(|o| o.is_ge()).unwrap_or(false),
         )),
         Plus | Minus | Multiply | Divide | Modulo => arith(l, op, r),
+        BitwiseAnd | BitwiseOr | BitwiseXor | PGBitwiseShiftLeft | PGBitwiseShiftRight => {
+            bitwise(l, op, r)
+        }
         _ => Err(Error::Unsupported(format!("operator not supported: {op}"))),
     }
+}
+
+fn bitwise(l: Value, op: &BinaryOperator, r: Value) -> Result<Value> {
+    use BinaryOperator::*;
+    let (a, b) = match (l.as_f64(), r.as_f64()) {
+        (Some(a), Some(b)) => (a as i64, b as i64),
+        _ => return Ok(Value::Null),
+    };
+    Ok(Value::Int(match op {
+        BitwiseAnd => a & b,
+        BitwiseOr => a | b,
+        BitwiseXor => a ^ b,
+        PGBitwiseShiftLeft => a.wrapping_shl(b as u32),
+        PGBitwiseShiftRight => a.wrapping_shr(b as u32),
+        _ => return Err(Error::Unsupported(format!("operator not supported: {op}"))),
+    }))
 }
 
 fn arith(l: Value, op: &BinaryOperator, r: Value) -> Result<Value> {

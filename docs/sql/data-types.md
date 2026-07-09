@@ -39,6 +39,8 @@ INSERT INTO t VALUES
   strings (`WHERE d >= '2024-01-01'`).
 - **JSON** must be structurally valid; invalid JSON is rejected.
 - **VECTOR** accepts a `'[a,b,c]'` string literal of the declared dimension.
+- **ENUM** and **SET** are accepted and stored as their string value (the
+  allowed-value list is parsed but not enforced).
 
 ## JSON access
 

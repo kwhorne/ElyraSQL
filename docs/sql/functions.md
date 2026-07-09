@@ -64,6 +64,12 @@ pattern` (POSIX-style regular expressions, with `NOT REGEXP`).
 `SQRT`, `EXP`, `LN`/`LOG`, `LOG10`, `LOG2`, `POWER`/`POW`, `MOD`, `PI()`,
 `RAND()`, `GREATEST`, `LEAST`.
 
+## Bitwise operators
+
+`a & b` (AND), `a | b` (OR), and `a ^ b` (XOR) operate on integers and are
+usable anywhere, e.g. flag masks: `WHERE flags & 4 > 0`. (The SQL frontend does
+not currently parse `<<`, `>>`, or the unary `~`.)
+
 ## Conditional & null
 
 `COALESCE`, `IFNULL`/`NVL`, `NULLIF`, `IF(cond, a, b)`, and `CASE` expressions

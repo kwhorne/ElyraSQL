@@ -49,6 +49,8 @@ fn map_type(dt: &DataType) -> Result<ColumnType> {
         DataType::Text | DataType::String(_) | DataType::Varchar(_) | DataType::Char(_) => {
             ColumnType::Text
         }
+        // ENUM/SET are stored as their string value.
+        DataType::Enum(..) | DataType::Set(_) => ColumnType::Text,
         DataType::Blob(_) | DataType::Bytea => ColumnType::Bytes,
         DataType::Date => ColumnType::Date,
         DataType::Datetime(_) | DataType::Timestamp(_, _) => ColumnType::DateTime,

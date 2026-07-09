@@ -63,7 +63,14 @@ pub fn eval_expr(expr: &Expr) -> Result<Value> {
                 (UnaryOperator::Minus, Value::Int(i)) => Ok(Value::Int(-i)),
                 (UnaryOperator::Minus, Value::Float(f)) => Ok(Value::Float(-f)),
                 (UnaryOperator::Plus, v) => Ok(v),
-                _ => Err(Error::Unsupported("unsupported unary operator".into())),
+                // Bitwise NOT and other operators via the full evaluator.
+                (op, _) => {
+                    let full = Expr::UnaryOp {
+                        op: *op,
+                        expr: expr.clone(),
+                    };
+                    crate::predicate::eval_row(&full, &elyra_core::Schema::new(Vec::new()), &[])
+                }
             }
         }
         Expr::BinaryOp { left, op, right } => {
