@@ -7,8 +7,8 @@
 //! under `sys::user::` — the same records the authenticator reads.
 
 use elyra_core::users::{
-    decode_user, encode_user, password_digest, privilege_from_actions, user_key, UserRecord,
-    USER_PREFIX,
+    decode_privilege, decode_user, encode_privilege, encode_user, password_digest,
+    privilege_from_actions, table_grant_key, table_grant_prefix, user_key, UserRecord, USER_PREFIX,
 };
 use elyra_core::{Error, Privilege, Result, Schema, Value};
 
@@ -280,8 +280,25 @@ async fn grant_revoke(toks: &[Tok], sess: &Session, grant: bool) -> Result<Query
         }
         i += 1;
     }
-    // Skip the object clause (ON ... TO/FROM). We enforce privileges globally.
+    // Parse the object clause (ON <obj>). `*`/`*.*`/`db.*` → global; otherwise
+    // the last dotted component names a specific table (scoped grant).
     let sep = if grant { "to" } else { "from" };
+    let mut obj = String::new();
+    if i < toks.len() && toks[i].is_word("on") {
+        i += 1;
+        while i < toks.len() && !toks[i].is_word(sep) {
+            match &toks[i] {
+                Tok::Word(s) | Tok::Str(s) => obj.push_str(s),
+                Tok::Sym(c) => obj.push(*c),
+            }
+            i += 1;
+        }
+    }
+    let scoped_table: Option<String> = if obj.is_empty() || obj.contains('*') {
+        None
+    } else {
+        obj.rsplit('.').next().map(|s| s.trim().to_string())
+    };
     while i < toks.len() && !toks[i].is_word(sep) {
         i += 1;
     }
@@ -304,6 +321,24 @@ async fn grant_revoke(toks: &[Tok], sess: &Session, grant: bool) -> Result<Query
                 "user '{name}' does not exist (CREATE USER first)"
             )));
         };
+        if let Some(table) = &scoped_table {
+            // Per-table grant: raise (GRANT) or clear (REVOKE) the table level.
+            let key = table_grant_key(&name, table);
+            if grant {
+                sess.commit_write(vec![(key, encode_privilege(level))], vec![])
+                    .await?;
+            } else {
+                sess.commit_write(vec![], vec![key]).await?;
+            }
+            applied += 1;
+            i = j;
+            if matches!(toks.get(i), Some(Tok::Sym(','))) {
+                i += 1;
+                continue;
+            } else {
+                break;
+            }
+        }
         let mut rec =
             decode_user(&bytes).ok_or_else(|| Error::Storage("corrupt user record".into()))?;
         rec.privilege = if grant {
@@ -352,6 +387,29 @@ async fn show_grants(toks: &[Tok], sess: &Session) -> Result<QueryResult> {
             "GRANT {privs} ON *.* TO '{user}'"
         ))]);
     };
+    // Append per-table (scoped) grants for a user.
+    async fn emit_table_grants(
+        sess: &Session,
+        user: &str,
+        rows: &mut Vec<Vec<Value>>,
+    ) -> Result<()> {
+        let prefix = table_grant_prefix(user);
+        let batch = sess.scan_batch(prefix.clone(), None, 4096).await?;
+        for (k, v) in &batch {
+            let table = String::from_utf8_lossy(&k[prefix.len()..]).to_string();
+            let p = decode_privilege(v).unwrap_or(Privilege::Read);
+            let privs = match p {
+                Privilege::Admin => "ALL PRIVILEGES",
+                Privilege::Write => "SELECT, INSERT, UPDATE, DELETE",
+                Privilege::Read => "SELECT",
+            };
+            rows.push(vec![Value::Text(format!(
+                "GRANT {privs} ON `{table}` TO '{user}'"
+            ))]);
+        }
+        Ok(())
+    }
+
     match name {
         Some(n) => {
             let bytes = sess.get(user_key(&n)).await?;
@@ -360,10 +418,12 @@ async fn show_grants(toks: &[Tok], sess: &Session) -> Result<QueryResult> {
                 .and_then(decode_user)
                 .ok_or_else(|| Error::Query(format!("user '{n}' does not exist")))?;
             emit(&mut rows, &n, rec.privilege);
+            emit_table_grants(sess, &n, &mut rows).await?;
         }
         None => {
             // All users.
             let mut after: Option<Vec<u8>> = None;
+            let mut names: Vec<(String, Privilege)> = Vec::new();
             loop {
                 let batch = sess
                     .scan_batch(USER_PREFIX.to_vec(), after.clone(), 512)
@@ -374,13 +434,17 @@ async fn show_grants(toks: &[Tok], sess: &Session) -> Result<QueryResult> {
                 for (k, v) in &batch {
                     let user = String::from_utf8_lossy(&k[USER_PREFIX.len()..]).to_string();
                     if let Some(rec) = decode_user(v) {
-                        emit(&mut rows, &user, rec.privilege);
+                        names.push((user, rec.privilege));
                     }
                 }
                 after = batch.last().map(|(k, _)| k.clone());
                 if batch.len() < 512 {
                     break;
                 }
+            }
+            for (user, p) in &names {
+                emit(&mut rows, user, *p);
+                emit_table_grants(sess, user, &mut rows).await?;
             }
         }
     }

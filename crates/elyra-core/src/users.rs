@@ -30,6 +30,37 @@ pub fn user_key(name: &str) -> Vec<u8> {
     k
 }
 
+/// Key prefix for per-table grants of one user.
+pub fn table_grant_prefix(user: &str) -> Vec<u8> {
+    format!("sys::tgrant::{user}::").into_bytes()
+}
+
+/// Storage key for a user's grant on a specific table.
+pub fn table_grant_key(user: &str, table: &str) -> Vec<u8> {
+    let mut k = table_grant_prefix(user);
+    k.extend_from_slice(table.to_ascii_lowercase().as_bytes());
+    k
+}
+
+/// Encode a privilege level as a single byte.
+pub fn encode_privilege(p: Privilege) -> Vec<u8> {
+    vec![match p {
+        Privilege::Read => 0,
+        Privilege::Write => 1,
+        Privilege::Admin => 2,
+    }]
+}
+
+/// Decode a privilege level from a single byte.
+pub fn decode_privilege(bytes: &[u8]) -> Option<Privilege> {
+    match bytes.first()? {
+        0 => Some(Privilege::Read),
+        1 => Some(Privilege::Write),
+        2 => Some(Privilege::Admin),
+        _ => None,
+    }
+}
+
 /// `SHA1(SHA1(password))`.
 pub fn password_digest(password: &[u8]) -> [u8; 20] {
     let mut out = [0u8; 20];

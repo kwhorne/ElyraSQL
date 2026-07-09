@@ -81,6 +81,8 @@ pub struct ElyraShim {
     metrics: Arc<Metrics>,
     procs: Arc<ProcRegistry>,
     conn_id: u32,
+    /// Authenticated user name (for per-table grant checks).
+    user: std::sync::Mutex<String>,
 }
 
 impl ElyraShim {
@@ -103,7 +105,12 @@ impl ElyraShim {
             metrics,
             procs,
             conn_id,
+            user: std::sync::Mutex::new(String::new()),
         }
+    }
+
+    fn user(&self) -> String {
+        self.user.lock().unwrap().clone()
     }
 
     fn privilege(&self) -> elyra_core::Privilege {
@@ -204,6 +211,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for ElyraShim {
         if ok {
             *self.privilege.lock().unwrap() = self.auth.privilege(username);
             let name = String::from_utf8_lossy(username).into_owned();
+            *self.user.lock().unwrap() = name.clone();
             self.procs.set_user(self.conn_id, name);
         }
         ok
@@ -267,9 +275,13 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for ElyraShim {
         };
 
         let privilege = self.privilege();
+        let user = self.user();
         self.procs.begin_query(self.conn_id, &sql);
         let start = std::time::Instant::now();
-        let res = self.engine.execute(&sql, privilege, &self.session).await;
+        let res = self
+            .engine
+            .execute_as(&sql, privilege, &user, &self.session)
+            .await;
         self.metrics.record(&sql, res.is_ok(), start.elapsed());
         self.procs.end_query(self.conn_id);
         match res {
@@ -304,9 +316,13 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for ElyraShim {
             return write_string_rows(results, &cols, rows).await;
         }
         let privilege = self.privilege();
+        let user = self.user();
         self.procs.begin_query(self.conn_id, query);
         let start = std::time::Instant::now();
-        let res = self.engine.execute(query, privilege, &self.session).await;
+        let res = self
+            .engine
+            .execute_as(query, privilege, &user, &self.session)
+            .await;
         self.metrics.record(query, res.is_ok(), start.elapsed());
         self.procs.end_query(self.conn_id);
         match res {

@@ -83,6 +83,18 @@ impl Engine {
         privilege: Privilege,
         sess: &Session,
     ) -> Result<Vec<QueryResult>> {
+        self.execute_as(sql, privilege, "", sess).await
+    }
+
+    /// Execute with the connection's user name, so per-table (scoped) grants can
+    /// raise the effective privilege for the statement's target tables.
+    pub async fn execute_as(
+        &self,
+        sql: &str,
+        privilege: Privilege,
+        user: &str,
+        sess: &Session,
+    ) -> Result<Vec<QueryResult>> {
         // Cheap keyword dispatch on a short prefix — statements can be huge
         // (bulk INSERT), so never lowercase the whole thing here.
         let trimmed = sql.trim_start();
@@ -159,7 +171,10 @@ impl Engine {
         let mut out = Vec::with_capacity(statements.len());
         for stmt in statements {
             let need = required_privilege(&stmt);
-            if privilege < need {
+            let effective = self
+                .effective_privilege(privilege, user, &stmt, sess)
+                .await?;
+            if effective < need {
                 return Err(Error::Query(format!(
                     "access denied: statement requires {need:?} privilege"
                 )));
@@ -167,6 +182,51 @@ impl Engine {
             out.push(self.execute_stmt(stmt, sess).await?);
         }
         Ok(out)
+    }
+
+    /// A user's granted privilege on one table (default `Read`).
+    async fn table_grant(&self, user: &str, table: &str, sess: &Session) -> Result<Privilege> {
+        if user.is_empty() {
+            return Ok(Privilege::Read);
+        }
+        match sess
+            .get(elyra_core::users::table_grant_key(user, table))
+            .await?
+        {
+            Some(b) => Ok(elyra_core::users::decode_privilege(&b).unwrap_or(Privilege::Read)),
+            None => Ok(Privilege::Read),
+        }
+    }
+
+    /// Effective privilege for a statement: the global level, raised by any
+    /// per-table grant on the statement's target tables. Reads are always
+    /// allowed at the global baseline; when a write/DDL target cannot be
+    /// determined, the global level is required (deny-safe).
+    async fn effective_privilege(
+        &self,
+        global: Privilege,
+        user: &str,
+        stmt: &Statement,
+        sess: &Session,
+    ) -> Result<Privilege> {
+        let need = required_privilege(stmt);
+        if need <= Privilege::Read {
+            return Ok(global.max(Privilege::Read));
+        }
+        let targets = stmt_targets(stmt);
+        if targets.is_empty() {
+            return Ok(global);
+        }
+        // The statement is allowed only if every target satisfies `need`, so the
+        // effective level is the minimum of per-target max(global, grant).
+        let mut eff = Privilege::Admin;
+        for t in targets {
+            let e = global.max(self.table_grant(user, &t, sess).await?);
+            if e < eff {
+                eff = e;
+            }
+        }
+        Ok(eff)
     }
 
     async fn execute_stmt(&self, stmt: Statement, sess: &Session) -> Result<QueryResult> {
@@ -328,6 +388,60 @@ impl Engine {
 }
 
 /// Minimum privilege required to run a statement.
+fn object_name_last(name: &sqlparser::ast::ObjectName) -> Option<String> {
+    name.0.last().map(|i| i.value.clone())
+}
+
+/// A single plain (unjoined) base table in `twj`, if that's what it is.
+fn single_base_table(twj: &sqlparser::ast::TableWithJoins) -> Option<String> {
+    if !twj.joins.is_empty() {
+        return None;
+    }
+    match &twj.relation {
+        sqlparser::ast::TableFactor::Table { name, .. } => object_name_last(name),
+        _ => None,
+    }
+}
+
+/// The base tables a write/DDL statement targets (that must satisfy its
+/// privilege). An empty result means "undetermined" — the caller then requires
+/// the global privilege (deny-safe).
+fn stmt_targets(stmt: &Statement) -> Vec<String> {
+    use sqlparser::ast::*;
+    match stmt {
+        Statement::Insert(ins) => object_name_last(&ins.table_name).into_iter().collect(),
+        Statement::Update {
+            table, from: None, ..
+        } => single_base_table(table).into_iter().collect(),
+        Statement::Delete(del) => {
+            // Only a simple single-table DELETE has a determinable target.
+            if !del.tables.is_empty() {
+                return vec![];
+            }
+            let froms = match &del.from {
+                FromTable::WithFromKeyword(v) | FromTable::WithoutKeyword(v) => v,
+            };
+            match froms.as_slice() {
+                [one] => single_base_table(one).into_iter().collect(),
+                _ => vec![],
+            }
+        }
+        Statement::CreateTable(ct) => object_name_last(&ct.name).into_iter().collect(),
+        Statement::AlterTable { name, .. } => object_name_last(name).into_iter().collect(),
+        Statement::CreateIndex(ci) => object_name_last(&ci.table_name).into_iter().collect(),
+        Statement::Truncate { table_names, .. } => table_names
+            .iter()
+            .filter_map(|t| object_name_last(&t.name))
+            .collect(),
+        Statement::Drop {
+            object_type: ObjectType::Table,
+            names,
+            ..
+        } => names.iter().filter_map(object_name_last).collect(),
+        _ => vec![],
+    }
+}
+
 fn required_privilege(stmt: &Statement) -> Privilege {
     match stmt {
         Statement::Query(_) | Statement::SetVariable { .. } | Statement::Use { .. } => {

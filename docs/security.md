@@ -57,12 +57,18 @@ DROP USER 'app';
 Notes and current limitations:
 
 - New accounts start **read-only**; use `GRANT` to raise them.
-- Privileges are **global** and coarse: they map to the `read`/`write`/`admin`
-  levels above. The object clause (`ON *.*`, `ON db.*`, `ON table`) is parsed
-  but not scoped — a grant applies to the whole server. `GRANT ALL` (or
+- Privileges are coarse (`read`/`write`/`admin`). `GRANT ALL` (or
   `GRANT OPTION`/`SUPER`) → admin; any write action (`INSERT`, `UPDATE`,
-  `DELETE`, `CREATE`, ...) → write; `SELECT`-only → read. `REVOKE` lowers an
-  account back to read.
+  `DELETE`, `CREATE`, ...) → write; `SELECT`-only → read.
+- **Scope:** `GRANT ... ON *.*` (or `db.*`) sets the account's **global** level;
+  `GRANT ... ON <table>` (or `db.table`) is a **per-table** grant that *raises*
+  the level for that table only. Reads are always allowed at the global
+  baseline, so table grants are used to give a read-only account write/admin on
+  specific tables. `REVOKE ON *.*` lowers the global level to read; `REVOKE ON
+  <table>` removes a table grant.
+- Enforcement is deny-safe: a write/DDL statement whose target table can't be
+  determined (e.g. a multi-table `UPDATE`) requires the **global** privilege.
+  `SHOW GRANTS` lists the global grant and each table grant.
 - The host part of `'user'@'host'` is accepted but ignored (accounts are
   host-independent).
 - Passwords are stored only as `SHA1(SHA1(password))`.

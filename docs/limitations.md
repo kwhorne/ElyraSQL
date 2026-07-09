@@ -61,9 +61,10 @@ implemented, so you can judge fit.
 
 ## Security & operations
 
-- Multiple persistent accounts with `CREATE USER`/`GRANT`/`REVOKE` exist, but
-  privileges are **global and coarse** (read/write/admin) — no per-database or
-  per-table scoping, and no column/routine privileges.
+- Multiple persistent accounts with `CREATE USER`/`GRANT`/`REVOKE`, with coarse
+  (read/write/admin) privileges granted **globally** or **per table**. No
+  per-database, per-column, or routine privileges; reads are always allowed at
+  the global baseline (table grants only raise write/admin).
 - Hot and offline backup/restore exist, but there is no incremental backup or
   point-in-time recovery.
 - No replication/HA, and no metrics / slow-query log yet.
@@ -82,7 +83,7 @@ Candidate next steps, roughly in order of value:
 
 1. Per-column `COLLATE` and a binary (case-sensitive) collation opt-out.
 2. Scoped privileges (per-database / per-table `GRANT`).
-3. `ON UPDATE` referential actions and multi-level cascades.
+3. Multi-level (recursive) cascades and deferred constraints.
 4. Spill-to-disk for large sorts/aggregations.
 5. Cost-based planning with statistics; hash/merge joins.
 6. Observability: slow-query log and metrics.
