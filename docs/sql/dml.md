@@ -14,6 +14,16 @@ INSERT INTO users (id, name, email) VALUES
 - Values are coerced to the target column type; type mismatches and `NOT NULL`
   violations are rejected.
 
+### INSERT ... SELECT
+
+```sql
+INSERT INTO archive SELECT id, name, email FROM users WHERE active = 0;
+INSERT INTO combined (id, v) SELECT id, v FROM a UNION SELECT id, v FROM b;
+```
+
+The source may be any query (including joins, aggregation, and set operations).
+The selected columns map positionally to the target columns.
+
 ## UPDATE
 
 ```sql

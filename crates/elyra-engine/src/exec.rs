@@ -462,7 +462,7 @@ pub async fn create_index(db: &Session, ci: CreateIndex) -> Result<QueryResult> 
     Ok(QueryResult::Affected(0))
 }
 
-pub async fn insert(db: &Session, ins: Insert) -> Result<QueryResult> {
+pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Result<QueryResult> {
     let name = table_ident(&ins.table_name)?;
     let def = catalog::load(db, &name).await?;
 
@@ -486,13 +486,17 @@ pub async fn insert(db: &Session, ins: Insert) -> Result<QueryResult> {
         .source
         .as_ref()
         .ok_or_else(|| Error::Unsupported("INSERT without VALUES is not supported".into()))?;
-    let value_rows = match source_rows(source)? {
-        Some(rows) => rows,
-        None => {
-            return Err(Error::Unsupported(
-                "only INSERT ... VALUES is supported".into(),
-            ))
+    // Rows come either from `VALUES (...)` (literal expressions, evaluated
+    // here) or from `INSERT ... SELECT` (executed through the query engine).
+    let rows: Vec<Vec<Value>> = match source_rows(source)? {
+        Some(expr_rows) => {
+            let mut out = Vec::with_capacity(expr_rows.len());
+            for exprs in &expr_rows {
+                out.push(exprs.iter().map(eval_expr).collect::<Result<Vec<_>>>()?);
+            }
+            out
         }
+        None => run_subquery(db, vindex, source).await?,
     };
 
     // Load rowid counter once for tables without a PK.
@@ -502,20 +506,19 @@ pub async fn insert(db: &Session, ins: Insert) -> Result<QueryResult> {
         read_rowid(db, &name).await?
     };
 
-    let mut puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(value_rows.len());
+    let mut puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(rows.len());
 
-    for exprs in value_rows {
-        if exprs.len() != target.len() {
+    for vals in rows {
+        if vals.len() != target.len() {
             return Err(Error::Query(format!(
                 "column count mismatch: {} values for {} columns",
-                exprs.len(),
+                vals.len(),
                 target.len()
             )));
         }
 
         let mut row = vec![Value::Null; def.schema.columns.len()];
-        for (slot, expr) in target.iter().zip(exprs.iter()) {
-            let v = eval_expr(expr)?;
+        for (slot, v) in target.iter().zip(vals) {
             let col = &def.schema.columns[*slot];
             row[*slot] = coerce(v, &col.ty, &col.name)?;
         }
@@ -578,6 +581,15 @@ pub async fn select(
     } else {
         query
     };
+
+    // Top-level set operations (UNION / INTERSECT / EXCEPT).
+    if matches!(query.body.as_ref(), SetExpr::SetOperation { .. }) {
+        return Box::pin(execute_set_query(db, vindex, query)).await;
+    }
+    // A parenthesised subquery as the whole body.
+    if let SetExpr::Query(inner) = query.body.as_ref() {
+        return Box::pin(select(db, vindex, inner)).await;
+    }
 
     let select = match query.body.as_ref() {
         SetExpr::Select(s) => s,
@@ -3419,6 +3431,104 @@ async fn run_subquery(
         }
         QueryResult::Affected(_) => Ok(Vec::new()),
     }
+}
+
+/// Execute a top-level set operation (`UNION`/`INTERSECT`/`EXCEPT`), applying
+/// the outer query's `ORDER BY` and `LIMIT`/`OFFSET` to the combined result.
+async fn execute_set_query(
+    db: &Session,
+    vindex: &VectorRegistry,
+    query: &SqlQuery,
+) -> Result<QueryResult> {
+    use sqlparser::ast::{SetOperator, SetQuantifier};
+    let SetExpr::SetOperation {
+        op,
+        set_quantifier,
+        left,
+        right,
+    } = query.body.as_ref()
+    else {
+        return Err(Error::Unsupported("expected a set operation".into()));
+    };
+
+    let wrap = |b: &SetExpr| -> SqlQuery {
+        let mut q = query.clone();
+        q.body = Box::new(b.clone());
+        q.with = None;
+        q.order_by = None;
+        q.limit = None;
+        q.offset = None;
+        q
+    };
+
+    let (schema, mut left_rows) = run_subquery_schema(db, vindex, &wrap(left)).await?;
+    let right_rows = run_subquery(db, vindex, &wrap(right)).await?;
+
+    let all = matches!(
+        set_quantifier,
+        SetQuantifier::All | SetQuantifier::AllByName
+    );
+    let key = |r: &[Value]| -> Vec<u8> { bincode::serialize(r).unwrap_or_default() };
+
+    let mut out: Vec<Vec<Value>> = Vec::new();
+    match op {
+        SetOperator::Union => {
+            if all {
+                out = left_rows;
+                out.extend(right_rows);
+            } else {
+                let mut seen = std::collections::HashSet::new();
+                for r in left_rows.into_iter().chain(right_rows) {
+                    if seen.insert(key(&r)) {
+                        out.push(r);
+                    }
+                }
+            }
+        }
+        SetOperator::Intersect => {
+            let rset: std::collections::HashSet<Vec<u8>> =
+                right_rows.iter().map(|r| key(r)).collect();
+            let mut seen = std::collections::HashSet::new();
+            for r in left_rows {
+                let k = key(&r);
+                if rset.contains(&k) && (all || seen.insert(k)) {
+                    out.push(r);
+                }
+            }
+        }
+        SetOperator::Except => {
+            let rset: std::collections::HashSet<Vec<u8>> =
+                right_rows.iter().map(|r| key(r)).collect();
+            let mut seen = std::collections::HashSet::new();
+            for r in std::mem::take(&mut left_rows) {
+                let k = key(&r);
+                if !rset.contains(&k) && (all || seen.insert(k)) {
+                    out.push(r);
+                }
+            }
+        }
+    }
+
+    // Outer ORDER BY / LIMIT / OFFSET over the combined result.
+    let order_exprs: Vec<(Expr, bool)> = match &query.order_by {
+        Some(ob) => ob
+            .exprs
+            .iter()
+            .map(|o| (o.expr.clone(), o.asc.unwrap_or(true)))
+            .collect(),
+        None => Vec::new(),
+    };
+    order_output_rows(&mut out, &schema, &order_exprs)?;
+    let offset = match &query.offset {
+        Some(o) => eval_usize(&o.value)?,
+        None => 0,
+    };
+    let limit = match &query.limit {
+        Some(e) => Some(eval_usize(e)?),
+        None => None,
+    };
+    apply_offset_limit(&mut out, offset, limit);
+    Ok(QueryResult::Rows(RowStream::literal(schema, out)))
 }
 
 /// Execute a subquery and return both its schema and rows (for derived tables).

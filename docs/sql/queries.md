@@ -170,5 +170,20 @@ self-referencing branch. `UNION` deduplicates (so cyclic graphs terminate);
 `UNION ALL` does not and is capped at 1000 iterations. `FROM`-less anchors
 (`SELECT 1`) are supported.
 
+### Set operations (UNION / INTERSECT / EXCEPT)
+
+```sql
+SELECT v FROM a UNION     SELECT v FROM b;   -- distinct
+SELECT v FROM a UNION ALL SELECT v FROM b;   -- keep duplicates
+SELECT v FROM a INTERSECT SELECT v FROM b;
+SELECT v FROM a EXCEPT    SELECT v FROM b;
+
+SELECT v FROM a UNION SELECT v FROM b ORDER BY v DESC LIMIT 10;
+```
+
+`UNION`, `INTERSECT`, and `EXCEPT` are supported (with `ALL`). A trailing
+`ORDER BY`/`LIMIT`/`OFFSET` applies to the combined result. Both sides must
+produce the same number of columns.
+
 !!! note "Not yet supported"
     Correlated subqueries combined with joins are not supported yet.

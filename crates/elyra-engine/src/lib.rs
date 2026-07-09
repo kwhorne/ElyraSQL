@@ -135,7 +135,7 @@ impl Engine {
             Statement::AlterTable {
                 name, operations, ..
             } => exec::alter_table(sess, &name, &operations).await,
-            Statement::Insert(ins) => exec::insert(sess, ins).await,
+            Statement::Insert(ins) => exec::insert(sess, &self.vindex, ins).await,
             Statement::Update {
                 table,
                 assignments,
@@ -232,5 +232,14 @@ fn required_privilege(stmt: &Statement) -> Privilege {
 }
 
 fn query_has_from(q: &sqlparser::ast::Query) -> bool {
-    matches!(q.body.as_ref(), sqlparser::ast::SetExpr::Select(s) if !s.from.is_empty())
+    // Route anything the full engine must handle: SELECTs with a FROM, set
+    // operations (UNION/INTERSECT/EXCEPT), CTEs, and nested queries. Only bare
+    // literal selects (`SELECT 1`) fall through to the lightweight evaluator.
+    if q.with.is_some() {
+        return true;
+    }
+    match q.body.as_ref() {
+        sqlparser::ast::SetExpr::Select(s) => !s.from.is_empty(),
+        _ => true,
+    }
 }
