@@ -78,8 +78,11 @@ implemented, so you can judge fit.
   yet honoring per-column `_bin`: `ORDER BY`, `GROUP BY`, `DISTINCT` and join
   keys (these still use the default case-insensitive collation). Accent
   sensitivity and alternate charsets are not implemented.
-- `ENUM`/`SET` are stored as text and not value-checked; no spatial types;
-  full-text search is vector-only.
+- Full-text search: `MATCH(col, ...) AGAINST('terms' [IN BOOLEAN MODE])`
+  evaluates a relevance score by exact word match (natural-language OR-of-terms,
+  or boolean `+`/`-`). It is **scan-based** (no persistent full-text index) and
+  does no stemming/synonyms. Vector (ANN) search is also available.
+- `ENUM`/`SET` are stored as text and not value-checked; no spatial types.
 
 ## Security & operations
 

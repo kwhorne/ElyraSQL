@@ -138,6 +138,70 @@ pub fn eval_row(expr: &Expr, schema: &Schema, row: &[Value]) -> Result<Value> {
             let v = eval_row(expr, schema, row)?;
             Ok(date_part(&v, &field.to_string()))
         }
+        Expr::MatchAgainst {
+            columns,
+            match_value,
+            opt_search_modifier,
+        } => {
+            use sqlparser::ast::SearchModifier;
+            let boolean = matches!(opt_search_modifier, Some(SearchModifier::InBooleanMode));
+            // Collect the searchable text from the named columns.
+            let mut doc = String::new();
+            for col in columns {
+                if let Some(i) = schema
+                    .columns
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(&col.value))
+                {
+                    if let Some(s) = row.get(i).and_then(|v| v.to_wire_string()) {
+                        doc.push(' ');
+                        doc.push_str(&s);
+                    }
+                }
+            }
+            let words: std::collections::HashSet<String> = doc
+                .to_lowercase()
+                .split(|c: char| !c.is_alphanumeric())
+                .filter(|w| !w.is_empty())
+                .map(|w| w.to_string())
+                .collect();
+            let query = match match_value {
+                sqlparser::ast::Value::SingleQuotedString(s)
+                | sqlparser::ast::Value::DoubleQuotedString(s) => s.clone(),
+                other => other.to_string(),
+            };
+            let mut score = 0.0f64;
+            let mut ok = true;
+            for raw in query.split_whitespace() {
+                let (required, excluded, term) = if boolean {
+                    match raw.strip_prefix('+') {
+                        Some(t) => (true, false, t),
+                        None => match raw.strip_prefix('-') {
+                            Some(t) => (false, true, t),
+                            None => (false, false, raw),
+                        },
+                    }
+                } else {
+                    (false, false, raw)
+                };
+                let term: String = term
+                    .chars()
+                    .filter(|c| c.is_alphanumeric())
+                    .collect::<String>()
+                    .to_lowercase();
+                if term.is_empty() {
+                    continue;
+                }
+                let present = words.contains(&term);
+                if (excluded && present) || (required && !present) {
+                    ok = false;
+                } else if present {
+                    score += 1.0;
+                }
+            }
+            let relevance = if ok { score } else { 0.0 };
+            Ok(Value::Float(relevance))
+        }
         Expr::RLike {
             negated,
             expr,
