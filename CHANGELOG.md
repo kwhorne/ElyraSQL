@@ -4,6 +4,24 @@ All notable changes to ElyraSQL are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.8.0] - 2026-07-09
+
+Programmability & log-management release.
+
+### Binary log management
+
+- The binlog is now a directory of rotating segment files, rotating at
+  `ELYRASQL_BINLOG_SEGMENT_MB` (default 128 MB).
+- `SHOW BINARY LOGS` lists segments and sizes; `PURGE BINARY LOGS TO '<name>'`
+  deletes older segments. `--binlog` and `binlog-replay` now take a directory.
+
+### Stored procedures
+
+- `CREATE [OR REPLACE] PROCEDURE name() BEGIN ...; END`, `CALL name()`, and
+  `DROP PROCEDURE` — statement-list macros executed through the engine, with a
+  recursion-depth guard. (Parameters, variables and control flow are not yet
+  supported.)
+
 ## [0.7.0] - 2026-07-09
 
 Durability & recovery release: point-in-time recovery, richer statistics, and
@@ -275,6 +293,7 @@ core CRUD with `WHERE`/`ORDER BY`/`LIMIT`, indexes, aggregation and `GROUP BY`,
 joins, prepared statements, authentication and TLS, vector search (exact +
 HNSW), parallel OLAP aggregation, and transactions with snapshot isolation.
 
+[0.8.0]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.8.0
 [0.7.0]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.7.0
 [0.6.0]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.6.0
 [0.5.0]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.5.0
