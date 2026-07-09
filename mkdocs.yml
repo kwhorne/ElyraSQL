@@ -58,6 +58,7 @@ nav:
       - Insert, Update, Delete: sql/dml.md
       - Queries & Joins: sql/queries.md
       - Aggregation: sql/aggregation.md
+      - Functions: sql/functions.md
       - Transactions: sql/transactions.md
       - Vector Search: sql/vector-search.md
   - Analytics (OLAP): olap.md
