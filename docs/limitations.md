@@ -78,9 +78,11 @@ implemented, so you can judge fit.
 - Hot and offline backup/restore, plus an append-only binlog for point-in-time
   recovery (`--binlog` + `elyrasql binlog-replay`). Binlog rotation/pruning is
   manual; there is no incremental (block-level) backup.
-- Asynchronous primary → replica replication (read replicas, warm standby,
-  manual failover) is supported. There is no synchronous/quorum commit,
-  automatic leader election/failover, or multi-primary.
+- Primary → replica replication (read replicas, warm standby, manual failover),
+  asynchronous by default with an optional **semi-synchronous** mode
+  (`--semi-sync-ms`: wait for a replica ack per commit, degrading to async on
+  timeout). There is no quorum commit, automatic leader election/failover, or
+  multi-primary.
 
 ## Wire protocol
 
@@ -100,7 +102,7 @@ Candidate next steps, roughly in order of value:
 4. Spill-to-disk for large sorts/aggregations.
 5. Cost-based planning with statistics; hash/merge joins.
 6. Observability: slow-query log and metrics.
-7. Synchronous/quorum replication and automatic failover.
+7. Quorum replication and automatic failover (leader election).
 
 Have a need that isn't listed? Open an issue on
 [GitHub](https://github.com/kwhorne/ElyraSQL/issues).

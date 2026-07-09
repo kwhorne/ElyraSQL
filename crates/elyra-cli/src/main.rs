@@ -63,6 +63,11 @@ enum Command {
         /// recovery.
         #[arg(long, env = "ELYRASQL_BINLOG")]
         binlog: Option<PathBuf>,
+
+        /// Semi-synchronous replication: wait up to this many ms for a replica to
+        /// acknowledge each commit before returning (0 = asynchronous).
+        #[arg(long, env = "ELYRASQL_SEMI_SYNC_MS", default_value_t = 0)]
+        semi_sync_ms: u64,
     },
     /// Replay a binlog onto a database for point-in-time recovery. Apply onto a
     /// restored backup (or an empty file) up to a target LSN or timestamp.
@@ -195,12 +200,17 @@ async fn main() -> anyhow::Result<()> {
             metrics_listen,
             replication_listen,
             binlog,
+            semi_sync_ms,
         } => {
             tracing::info!(?data, "opening ElyraSQL database file");
             if binlog.is_some() {
                 tracing::info!(?binlog, "binlog (point-in-time recovery) enabled");
             }
             let db = Db::open_with_binlog(&data, binlog)?;
+            if semi_sync_ms > 0 {
+                tracing::info!(semi_sync_ms, "semi-synchronous replication enabled");
+                db.set_sync_timeout_ms(semi_sync_ms);
+            }
             let engine = Engine::new(db.clone());
 
             let mut entries: Vec<(String, String, elyra_core::Privilege)> = Vec::new();

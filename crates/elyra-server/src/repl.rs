@@ -32,6 +32,8 @@ enum ReplMsg {
         puts: Vec<(Vec<u8>, Vec<u8>)>,
         deletes: Vec<Vec<u8>>,
     },
+    /// Replica → primary: acknowledge application through `lsn` (semi-sync).
+    Ack { lsn: u64 },
 }
 
 const SNAP_CHUNK: usize = 4096;
@@ -65,18 +67,32 @@ pub async fn serve_replication(addr: String, db: Db) -> std::io::Result<()> {
     let listener = TcpListener::bind(&addr).await?;
     info!(%addr, "ElyraSQL replication endpoint listening");
     loop {
-        let (mut stream, peer) = listener.accept().await?;
+        let (stream, peer) = listener.accept().await?;
         let db = db.clone();
         tokio::spawn(async move {
             info!(%peer, "replica connected");
-            if let Err(e) = handle_replica(&mut stream, db).await {
+            if let Err(e) = handle_replica(stream, db).await {
                 warn!(%peer, error = %e, "replica stream ended");
             }
         });
     }
 }
 
-async fn handle_replica(stream: &mut TcpStream, db: Db) -> std::io::Result<()> {
+async fn handle_replica(stream: TcpStream, db: Db) -> std::io::Result<()> {
+    let (mut rd, mut stream) = stream.into_split();
+
+    // Read replica acknowledgements (semi-sync) on the read half.
+    let adb = db.clone();
+    tokio::spawn(async move {
+        loop {
+            match recv_msg(&mut rd).await {
+                Ok(Some(ReplMsg::Ack { lsn })) => adb.report_ack(lsn),
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => break,
+            }
+        }
+    });
+
     // Subscribe before reading the LSN so no committed write is missed; any
     // write with lsn <= snap_lsn that also appears in the (live) snapshot is
     // applied idempotently on the replica.
@@ -95,12 +111,12 @@ async fn handle_replica(stream: &mut TcpStream, db: Db) -> std::io::Result<()> {
         }
         let last = batch.len() < SNAP_CHUNK;
         cursor = batch.last().map(|(k, _)| k.clone());
-        send_msg(stream, &ReplMsg::Snap(batch)).await?;
+        send_msg(&mut stream, &ReplMsg::Snap(batch)).await?;
         if last {
             break;
         }
     }
-    send_msg(stream, &ReplMsg::SnapEnd { lsn: snap_lsn }).await?;
+    send_msg(&mut stream, &ReplMsg::SnapEnd { lsn: snap_lsn }).await?;
 
     // Stream subsequent write-sets.
     loop {
@@ -111,7 +127,7 @@ async fn handle_replica(stream: &mut TcpStream, db: Db) -> std::io::Result<()> {
                         lsn, puts, deletes, ..
                     } = &*ev;
                     send_msg(
-                        stream,
+                        &mut stream,
                         &ReplMsg::Write {
                             lsn: *lsn,
                             puts: puts.clone(),
@@ -135,10 +151,11 @@ async fn handle_replica(stream: &mut TcpStream, db: Db) -> std::io::Result<()> {
 /// the local `db`. Returns when the stream ends (the process should restart to
 /// re-bootstrap). The caller must start with a fresh (empty) `db`.
 pub async fn run_replica(primary: String, db: Db) -> std::io::Result<()> {
-    let mut stream = TcpStream::connect(&primary).await?;
+    let stream = TcpStream::connect(&primary).await?;
     info!(%primary, "connected to primary; bootstrapping");
+    let (mut rd, mut wr) = stream.into_split();
     let mut snap_pairs = 0u64;
-    while let Some(msg) = recv_msg(&mut stream).await? {
+    while let Some(msg) = recv_msg(&mut rd).await? {
         match msg {
             ReplMsg::Snap(pairs) => {
                 snap_pairs += pairs.len() as u64;
@@ -146,13 +163,17 @@ pub async fn run_replica(primary: String, db: Db) -> std::io::Result<()> {
             }
             ReplMsg::SnapEnd { lsn } => {
                 info!(lsn, rows = snap_pairs, "snapshot applied; streaming writes");
+                // Acknowledge the snapshot point so semi-sync can proceed.
+                send_msg(&mut wr, &ReplMsg::Ack { lsn }).await?;
             }
             ReplMsg::Write { lsn, puts, deletes } => {
                 db.commit(puts, deletes).await.map_err(io)?;
+                send_msg(&mut wr, &ReplMsg::Ack { lsn }).await?;
                 if lsn % 10_000 == 0 {
                     info!(lsn, "replica caught up");
                 }
             }
+            ReplMsg::Ack { .. } => {}
         }
     }
     Err(io("primary closed the replication stream"))

@@ -105,6 +105,10 @@ pub struct Db {
     writer: mpsc::Sender<WriteJob>,
     lsn: Arc<AtomicU64>,
     repl_tx: broadcast::Sender<Arc<WriteEvent>>,
+    /// Highest LSN acknowledged by any replica (semi-sync replication).
+    acked: Arc<tokio::sync::watch::Sender<u64>>,
+    /// Semi-sync commit wait in ms (0 = asynchronous).
+    sync_timeout_ms: Arc<AtomicU64>,
 }
 
 impl Db {
@@ -131,6 +135,9 @@ impl Db {
         let (tx, rx) = mpsc::channel::<WriteJob>(WRITE_QUEUE_DEPTH);
         let lsn = Arc::new(AtomicU64::new(0));
         let (repl_tx, _) = broadcast::channel::<Arc<WriteEvent>>(REPL_CAPACITY);
+        let (acked, _) = tokio::sync::watch::channel(0u64);
+        let acked = Arc::new(acked);
+        let sync_timeout_ms = Arc::new(AtomicU64::new(0));
         let binlog = match binlog {
             Some(p) => Some(crate::binlog::BinlogWriter::open(p)?),
             None => None,
@@ -155,7 +162,58 @@ impl Db {
             writer: tx,
             lsn,
             repl_tx,
+            acked,
+            sync_timeout_ms,
         })
+    }
+
+    /// Enable semi-synchronous replication: a commit waits up to `ms` for a
+    /// replica to acknowledge before returning (0 disables).
+    pub fn set_sync_timeout_ms(&self, ms: u64) {
+        self.sync_timeout_ms.store(ms, Ordering::SeqCst);
+    }
+
+    /// Record that a replica has applied up to `lsn` (advances the ack high-water
+    /// mark).
+    pub fn report_ack(&self, lsn: u64) {
+        self.acked.send_if_modified(|v| {
+            if lsn > *v {
+                *v = lsn;
+                true
+            } else {
+                false
+            }
+        });
+    }
+
+    fn has_replicas(&self) -> bool {
+        self.repl_tx.receiver_count() > 0
+    }
+
+    /// Semi-sync barrier: wait until a replica acknowledges through the current
+    /// LSN, or the timeout elapses (then degrade to asynchronous).
+    async fn await_sync(&self) {
+        let ms = self.sync_timeout_ms.load(Ordering::SeqCst);
+        if ms == 0 || !self.has_replicas() {
+            return;
+        }
+        let target = self.current_lsn();
+        let mut rx = self.acked.subscribe();
+        if *rx.borrow() >= target {
+            return;
+        }
+        let deadline = tokio::time::sleep(std::time::Duration::from_millis(ms));
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                _ = &mut deadline => break,
+                r = rx.changed() => {
+                    if r.is_err() || *rx.borrow() >= target {
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     /// The current log sequence number (number of committed write-sets).
@@ -218,7 +276,9 @@ impl Db {
 
     /// Submit a mutation to the group-commit writer and await durability.
     pub async fn commit(&self, puts: Vec<(Vec<u8>, Vec<u8>)>, deletes: Vec<Vec<u8>>) -> Result<()> {
-        self.submit(puts, deletes, None).await
+        self.submit(puts, deletes, None).await?;
+        self.await_sync().await;
+        Ok(())
     }
 
     /// Submit a validated (transactional) commit: the validation must still
@@ -229,7 +289,9 @@ impl Db {
         puts: Vec<(Vec<u8>, Vec<u8>)>,
         deletes: Vec<Vec<u8>>,
     ) -> Result<()> {
-        self.submit(puts, deletes, Some(validation)).await
+        self.submit(puts, deletes, Some(validation)).await?;
+        self.await_sync().await;
+        Ok(())
     }
 
     /// Submit a plain `INSERT`: `new` keys must not already exist (duplicate
@@ -253,7 +315,9 @@ impl Db {
             .await
             .map_err(|_| Error::Storage("writer thread stopped".into()))?;
         wait.await
-            .map_err(|_| Error::Storage("write acknowledgement lost".into()))?
+            .map_err(|_| Error::Storage("write acknowledgement lost".into()))??;
+        self.await_sync().await;
+        Ok(())
     }
 
     async fn submit(

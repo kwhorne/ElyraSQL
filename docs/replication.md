@@ -38,6 +38,23 @@ The replica's `--data` file is **disposable**: it is recreated and
 re-bootstrapped from the primary each time the replica starts. Point read-only
 clients at the replica's MySQL port.
 
+## Semi-synchronous replication
+
+By default replication is asynchronous. Enable **semi-sync** on the primary to
+wait for a replica to acknowledge each commit before returning success to the
+client, shrinking the data-loss window on failover:
+
+```bash
+elyrasql serve \
+  --data elyra.edb --listen 0.0.0.0:3307 \
+  --replication-listen 0.0.0.0:7000 \
+  --semi-sync-ms 2000
+```
+
+Each commit waits up to `--semi-sync-ms` for a replica to acknowledge the write.
+If no replica acknowledges in time (or none is connected), the commit proceeds
+anyway (degrading to asynchronous), so a lost replica never blocks the primary.
+
 ## Failover
 
 Failover is manual. A replica's data file is a complete ElyraSQL database, so to
