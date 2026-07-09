@@ -124,6 +124,13 @@ impl Engine {
                 }
             }
             Statement::CreateTable(ct) => exec::create_table(sess, ct).await,
+            Statement::CreateView {
+                name,
+                columns,
+                query,
+                or_replace,
+                ..
+            } => exec::create_view(sess, &name, &columns, &query, or_replace).await,
             Statement::CreateIndex(ci) => exec::create_index(sess, ci).await,
             Statement::AlterTable {
                 name, operations, ..
@@ -148,6 +155,19 @@ impl Engine {
                     .map(|i| i.value.clone())
                     .ok_or_else(|| Error::Catalog("empty table name".into()))?;
                 exec::drop_table(sess, &name, if_exists).await
+            }
+            Statement::Drop {
+                object_type: sqlparser::ast::ObjectType::View,
+                names,
+                if_exists,
+                ..
+            } => {
+                let name = names
+                    .first()
+                    .and_then(|n| n.0.last())
+                    .map(|i| i.value.clone())
+                    .ok_or_else(|| Error::Catalog("empty view name".into()))?;
+                exec::drop_view(sess, &name, if_exists).await
             }
             Statement::StartTransaction { .. } => {
                 sess.begin()?;

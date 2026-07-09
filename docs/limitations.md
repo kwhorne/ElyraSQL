@@ -54,7 +54,7 @@ Candidate next steps, roughly in order of value:
 
 1. Named windows; `RANGE`/`GROUPS` numeric-offset frames.
 2. More JSON functions (`JSON_SET`, `JSON_ARRAY`, containment).
-3. Views, triggers, stored procedures.
+3. Triggers, stored procedures, materialized views.
 4. Secondary-index range on composite keys; merge joins.
 5. Columnar OLAP with spill-to-disk.
 6. Richer `information_schema` / `SHOW`.

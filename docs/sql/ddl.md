@@ -61,6 +61,26 @@ ALTER TABLE users RENAME TO members;
 - **RENAME COLUMN** is a metadata-only change.
 - **RENAME TABLE** re-keys the data and rebuilds index entries.
 
+## Views
+
+```sql
+CREATE VIEW big_sales AS
+    SELECT id, region, amount FROM sales WHERE amount >= 100;
+
+CREATE VIEW region_totals(region, total) AS
+    SELECT region, SUM(amount) FROM sales GROUP BY region;
+
+CREATE OR REPLACE VIEW big_sales AS SELECT id FROM sales WHERE amount >= 200;
+
+DROP VIEW big_sales;
+```
+
+Views are stored SELECT statements, expanded as derived tables when queried.
+They support an optional column list, `OR REPLACE`, joins, aggregation over the
+view, and views that reference other views. Views are read-only (no inserts or
+updates through a view). Materialized views and `WITH CHECK OPTION` are not
+supported.
+
 ## DROP TABLE
 
 ```sql

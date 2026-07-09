@@ -53,6 +53,19 @@ pub fn rowid_key(table: &str) -> Vec<u8> {
     format!("meta::rowid::{table}").into_bytes()
 }
 
+/// Key under which a view's SQL definition is stored.
+pub fn view_key(name: &str) -> Vec<u8> {
+    format!("view::{name}").into_bytes()
+}
+
+/// Load a view's stored SELECT text, if it exists.
+pub async fn load_view(db: &Session, name: &str) -> Result<Option<String>> {
+    match db.get(view_key(name)).await? {
+        Some(bytes) => Ok(Some(String::from_utf8_lossy(&bytes).into_owned())),
+        None => Ok(None),
+    }
+}
+
 /// Monotonic write counter per table; bumped on every mutation. Used to
 /// invalidate cached in-memory indexes (e.g. the vector HNSW).
 pub fn wcount_key(table: &str) -> Vec<u8> {

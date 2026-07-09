@@ -570,6 +570,15 @@ pub async fn select(
         return Box::pin(select(db, vindex, &expanded)).await;
     }
 
+    // Expand view references in FROM into derived tables.
+    let view_expanded;
+    let query = if from_has_plain_table(query) {
+        view_expanded = expand_views(db, query).await?;
+        &view_expanded
+    } else {
+        query
+    };
+
     let select = match query.body.as_ref() {
         SetExpr::Select(s) => s,
         _ => return Err(Error::Unsupported("only simple SELECT is supported".into())),
@@ -2793,6 +2802,135 @@ fn agg_over(name: &str, vals: &[Value], count_star: usize) -> Value {
     }
 }
 
+/// `CREATE VIEW name [(cols)] AS SELECT ...` — store the view's SELECT text.
+pub async fn create_view(
+    db: &Session,
+    name: &ObjectName,
+    columns: &[sqlparser::ast::ViewColumnDef],
+    query: &SqlQuery,
+    or_replace: bool,
+) -> Result<QueryResult> {
+    let name = table_ident(name)?;
+    if catalog::exists(db, &name).await? {
+        return Err(Error::Catalog(format!(
+            "cannot create view: a table named '{name}' exists"
+        )));
+    }
+    if !or_replace && catalog::load_view(db, &name).await?.is_some() {
+        return Err(Error::Catalog(format!("view already exists: {name}")));
+    }
+
+    // Apply an explicit column list by aliasing the projection.
+    let mut q = query.clone();
+    if !columns.is_empty() {
+        if let SetExpr::Select(select) = q.body.as_mut() {
+            use sqlparser::ast::SelectItem;
+            if select.projection.len() != columns.len() {
+                return Err(Error::Query(
+                    "view column count does not match the query".into(),
+                ));
+            }
+            for (item, col) in select.projection.iter_mut().zip(columns.iter()) {
+                let expr = match item {
+                    SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
+                        e.clone()
+                    }
+                    _ => {
+                        return Err(Error::Unsupported(
+                            "view column list requires explicit projection expressions".into(),
+                        ))
+                    }
+                };
+                *item = SelectItem::ExprWithAlias {
+                    expr,
+                    alias: col.name.clone(),
+                };
+            }
+        }
+    }
+
+    db.commit_write(
+        vec![(catalog::view_key(&name), q.to_string().into_bytes())],
+        vec![],
+    )
+    .await?;
+    Ok(QueryResult::empty_ok())
+}
+
+pub async fn drop_view(db: &Session, name: &str, if_exists: bool) -> Result<QueryResult> {
+    if catalog::load_view(db, name).await?.is_none() {
+        if if_exists {
+            return Ok(QueryResult::Affected(0));
+        }
+        return Err(Error::Catalog(format!("no such view: {name}")));
+    }
+    db.commit_write(vec![], vec![catalog::view_key(name)])
+        .await?;
+    Ok(QueryResult::empty_ok())
+}
+
+/// Replace references to views in a query's `FROM` with derived tables backed
+/// by the view's stored SELECT. Nested views expand when the derived subquery
+/// is itself executed.
+async fn expand_views(db: &Session, query: &SqlQuery) -> Result<SqlQuery> {
+    let mut q = query.clone();
+    if let SetExpr::Select(select) = q.body.as_mut() {
+        for twj in &mut select.from {
+            expand_view_factor(db, &mut twj.relation).await?;
+            for j in &mut twj.joins {
+                expand_view_factor(db, &mut j.relation).await?;
+            }
+        }
+    }
+    Ok(q)
+}
+
+async fn expand_view_factor(db: &Session, tf: &mut TableFactor) -> Result<()> {
+    if let TableFactor::Table { name, alias, .. } = tf {
+        if let Some(last) = name.0.last() {
+            if let Some(sql) = catalog::load_view(db, &last.value).await? {
+                let vq = parse_query(&sql)?;
+                let al = alias.clone().unwrap_or_else(|| sqlparser::ast::TableAlias {
+                    name: sqlparser::ast::Ident::new(last.value.clone()),
+                    columns: Vec::new(),
+                });
+                *tf = TableFactor::Derived {
+                    lateral: false,
+                    subquery: Box::new(vq),
+                    alias: Some(al),
+                };
+            }
+        }
+    }
+    Ok(())
+}
+
+/// True if the query's top-level FROM has any plain table reference (a possible
+/// view). Cheap gate to avoid catalog lookups on view-free queries.
+fn from_has_plain_table(query: &SqlQuery) -> bool {
+    if let SetExpr::Select(select) = query.body.as_ref() {
+        select.from.iter().any(|twj| {
+            matches!(twj.relation, TableFactor::Table { .. })
+                || twj
+                    .joins
+                    .iter()
+                    .any(|j| matches!(j.relation, TableFactor::Table { .. }))
+        })
+    } else {
+        false
+    }
+}
+
+fn parse_query(sql: &str) -> Result<SqlQuery> {
+    let dialect = sqlparser::dialect::MySqlDialect {};
+    let stmts = sqlparser::parser::Parser::parse_sql(&dialect, sql)
+        .map_err(|e| Error::Parse(e.to_string()))?;
+    match stmts.into_iter().next() {
+        Some(sqlparser::ast::Statement::Query(q)) => Ok(*q),
+        _ => Err(Error::Query("view definition is not a query".into())),
+    }
+}
+
 static TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn unique_temp_name(base: &str) -> String {
@@ -3731,10 +3869,14 @@ fn order_output_rows(
         let name = ident_name(e)
             .map(|s| s.to_string())
             .unwrap_or_else(|| e.to_string());
+        let want = name.rsplit('.').next().unwrap_or(&name);
         let idx = schema
             .columns
             .iter()
-            .position(|c| c.name.eq_ignore_ascii_case(&name))
+            .position(|c| {
+                let have = c.name.rsplit('.').next().unwrap_or(&c.name);
+                c.name.eq_ignore_ascii_case(&name) || have.eq_ignore_ascii_case(want)
+            })
             .ok_or_else(|| {
                 Error::Query(format!("ORDER BY references unknown output column: {name}"))
             })?;
