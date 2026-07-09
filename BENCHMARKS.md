@@ -24,6 +24,26 @@ MySQL wire round-trip and the Python client's row decoding.)
 | `GROUP BY age` | 17.5 ms | full aggregation |
 | Vector ANN, first query | 1.1 s | one-time HNSW build over 20k vectors |
 
+### 1,000,000 rows (Linux, containerised)
+
+Single client, medians, inside a Docker container (`python3 bench/benchmark.py
+--rows 1000000`). Storage on a virtualised volume (slower `fsync` than a bare
+NVMe host, which penalises small autocommit batches).
+
+| Workload | Median | Note |
+|---|---:|---|
+| Bulk insert 1M rows | ~5.3 s | **~190,000 rows/s** (~240k on fast-fsync storage) |
+| PK point lookup | **0.2 ms** | clustered key |
+| Selective join (index NLJ) | **0.3 ms** | `u.id = ?` |
+| Vector ANN, cached | **0.4 ms** | HNSW top-10 |
+| Indexed `COUNT` | 16 ms | secondary index |
+| Full scan `COUNT` (no index) | ~205 ms | scans 1M rows |
+| `GROUP BY age` | ~273 ms | full aggregation, 60 groups |
+
+Since 0.2.1, bulk `INSERT` is ~5-6x faster (writer-side duplicate detection +
+group commit) and low-cardinality `GROUP BY` ~3.4x faster (compact binary group
+key).
+
 ## Honest caveats
 
 - **Non-unique index lookups use a batched multi-get** (all matching rows in a

@@ -4,6 +4,29 @@ All notable changes to ElyraSQL are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.2.1] - 2026-07-09
+
+Performance and robustness pass, verified on Linux (1,000,000-row workloads).
+
+### Performance
+
+- **Bulk `INSERT` ~5-6x faster** (~33k → ~190k rows/s in a container, ~240k on
+  fast-fsync storage). The 0.2.0 duplicate-key check did one storage read per
+  row (each opening its own read transaction); it now:
+  - detects duplicates inside the write transaction itself for plain `INSERT`
+    (redb returns the previous value — no existence read), and
+  - batches the existence check into a single read for `IGNORE`/`REPLACE`/
+    `ON DUPLICATE KEY UPDATE`.
+- **Group commit for `INSERT`**: the writer coalesces queued plain/insert jobs
+  into one transaction (one fsync), falling back to per-statement application
+  only when a group contains a duplicate — so concurrent write throughput is
+  preserved.
+- **`GROUP BY` ~3.4x faster** on low-cardinality groups (~927ms → ~273ms over
+  1M rows): the group key is a compact binary encoding instead of
+  `Debug`-formatting every row's key columns.
+- Statement dispatch inspects only a short prefix instead of lowercasing the
+  whole (possibly large) SQL text.
+
 ## [0.2.0] - 2026-07-09
 
 A large expansion of SQL coverage on top of the 0.1.0 foundation, turning
@@ -98,5 +121,6 @@ core CRUD with `WHERE`/`ORDER BY`/`LIMIT`, indexes, aggregation and `GROUP BY`,
 joins, prepared statements, authentication and TLS, vector search (exact +
 HNSW), parallel OLAP aggregation, and transactions with snapshot isolation.
 
+[0.2.1]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.2.1
 [0.2.0]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.2.0
 [0.1.0]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.1.0
