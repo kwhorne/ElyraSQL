@@ -72,6 +72,32 @@ ALTER TABLE users ALTER COLUMN status SET NOT NULL;
   `'99'`).
 - **RENAME TABLE** re-keys the data and rebuilds index entries.
 
+## Constraints
+
+```sql
+CREATE TABLE users (
+    id    BIGINT PRIMARY KEY,
+    email TEXT UNIQUE,
+    age   BIGINT CHECK (age >= 0)
+);
+
+CREATE TABLE orders (
+    id   BIGINT PRIMARY KEY,
+    uid  BIGINT,
+    FOREIGN KEY (uid) REFERENCES users(id) ON DELETE CASCADE
+);
+```
+
+- **PRIMARY KEY**, **UNIQUE** (column, table, or `CREATE UNIQUE INDEX`), and
+  **NOT NULL** are enforced (duplicate key → error 1062). Multiple `NULL`s are
+  allowed in a unique index.
+- **CHECK(expr)** (column- or table-level) is enforced on INSERT/UPDATE; it
+  passes when the expression is TRUE or NULL and fails only when FALSE.
+- **FOREIGN KEY** requires a matching parent row in a primary key or unique
+  index (error 1452). `ON DELETE` supports `RESTRICT`/`NO ACTION` (default,
+  blocks), `CASCADE` (deletes children), and `SET NULL`. Referencing columns
+  are automatically indexed.
+
 ## Column defaults, AUTO_INCREMENT, and generated columns
 
 ```sql

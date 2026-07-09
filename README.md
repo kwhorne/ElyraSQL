@@ -5,7 +5,7 @@
 A robust, **MySQL-compatible** SQL server written in Rust. Single database
 file, ACID storage, OLAP-ready and vector-native — all under one brand.
 
-> Status: **v0.2.1**. A broad, MySQL-compatible SQL engine: full DDL/DML,
+> Status: **v0.3.0**. A broad, MySQL-compatible SQL engine: full DDL/DML,
 > joins, subqueries (correlated too), CTEs (incl. `WITH RECURSIVE`), window
 > functions, set operations, transactions (snapshot + serializable), a large
 > function catalog, introspection (`SHOW` + `INFORMATION_SCHEMA`), vector search
@@ -30,6 +30,8 @@ file, ACID storage, OLAP-ready and vector-native — all under one brand.
   `CREATE TABLE ... AS SELECT`, `CREATE TABLE ... LIKE`, `TRUNCATE`,
   `CREATE`/`DROP VIEW`, `CREATE INDEX`; primary/composite keys, secondary and
   vector indexes; `DEFAULT`, `AUTO_INCREMENT`, generated columns, `ENUM`/`SET`.
+- **Constraints** — enforced `PRIMARY KEY`, `UNIQUE`, `NOT NULL`, `CHECK`, and
+  `FOREIGN KEY` (with `ON DELETE RESTRICT`/`CASCADE`/`SET NULL`).
 - **DML** — `INSERT` (multi-row, `INSERT ... SELECT`), upserts (`REPLACE`,
   `INSERT IGNORE`, `ON DUPLICATE KEY UPDATE`), `UPDATE`/`DELETE` with subqueries
   and multi-table joins.
@@ -40,8 +42,9 @@ file, ACID storage, OLAP-ready and vector-native — all under one brand.
 - **Functions** — string, math, date/time (incl. `INTERVAL` arithmetic),
   conditional, `CAST`, `REGEXP`, JSON, vector, and aggregates including
   `GROUP_CONCAT` and conditional aggregates. Exact `DECIMAL` arithmetic.
-- **Transactions** — `BEGIN`/`COMMIT`/`ROLLBACK` with snapshot isolation and
-  opt-in serializable isolation.
+- **Transactions** — `BEGIN`/`COMMIT`/`ROLLBACK`, `SAVEPOINT`, snapshot and
+  opt-in serializable isolation, and `SELECT ... FOR UPDATE`/`FOR SHARE`
+  (optimistic row locking).
 - **Introspection** — `SHOW TABLES`/`COLUMNS`/`INDEX`, `SHOW CREATE TABLE`,
   `DESCRIBE`, and a queryable `INFORMATION_SCHEMA`.
 
@@ -105,7 +108,7 @@ mysql -h 127.0.0.1 -P 3307 -u root -p
 SELECT 1;
 SELECT 1 + 1 AS two;
 SELECT 'hei fra ElyraSQL' AS msg;
-SELECT VERSION();   -- 8.0.0-ElyraSQL-0.2.1
+SELECT VERSION();   -- 8.0.0-ElyraSQL-0.3.0
 ```
 
 ## Configuration
@@ -130,8 +133,8 @@ Static Linux binaries (x86_64 and aarch64) are attached to each
 
 ```bash
 curl -L -o elyrasql.tar.gz \
-  https://github.com/kwhorne/ElyraSQL/releases/download/v0.2.1/elyrasql-0.2.1-linux-x86_64.tar.gz
-tar xzf elyrasql.tar.gz && ./elyrasql-0.2.1-linux-x86_64/elyrasql serve
+  https://github.com/kwhorne/ElyraSQL/releases/download/v0.3.0/elyrasql-0.3.0-linux-x86_64.tar.gz
+tar xzf elyrasql.tar.gz && ./elyrasql-0.3.0-linux-x86_64/elyrasql serve
 ```
 
 ## Docker
@@ -139,7 +142,7 @@ tar xzf elyrasql.tar.gz && ./elyrasql-0.2.1-linux-x86_64/elyrasql serve
 Multi-arch image (amd64 + arm64) on GHCR:
 
 ```bash
-docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:0.2.1
+docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:0.3.0
 # with auth + a persistent volume:
 docker run -p 3307:3307 -v elyra:/var/lib/elyrasql \
   -e ELYRASQL_USER=root -e ELYRASQL_PASSWORD=secret \

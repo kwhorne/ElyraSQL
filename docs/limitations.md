@@ -6,41 +6,57 @@ implemented, so you can judge fit.
 ## SQL surface
 
 - Subqueries (`WHERE` and SELECT-list, uncorrelated **and** correlated,
-  including over joins), derived tables, CTEs (`WITH`, including `WITH
-  RECURSIVE`), `HAVING`, window functions with explicit `ROWS`/`RANGE` frames,
-  set operations, and `FROM`-less `SELECT` are supported. Not yet: named
-  windows, `RANGE`/`GROUPS` numeric-offset frames, and correlated subqueries
-  combined with aggregation over a join.
-- No views, triggers, stored procedures, or user-defined functions.
-- `ALTER TABLE` covers add/drop/rename column and rename table — not
-  `MODIFY`/`CHANGE` (column type changes) or `ADD/DROP INDEX` via `ALTER`.
-- JSON is stored and validated but has no path operators
-  (`->`, `->>`, `JSON_EXTRACT`) yet.
-- Minimal `information_schema` / `SHOW` support.
+  including over joins), derived tables, CTEs (`WITH`, including
+  `WITH RECURSIVE`), `HAVING`, window functions with explicit `ROWS`/`RANGE`
+  frames, set operations, and `FROM`-less `SELECT` are supported.
+- Not yet: named windows, `RANGE`/`GROUPS` numeric-offset frames, correlated
+  subqueries combined with aggregation over a join, triggers, stored
+  procedures, user-defined functions, and events.
+
+## Constraints & integrity
+
+- Enforced: `PRIMARY KEY`, `UNIQUE`, `NOT NULL`, `CHECK`, and `FOREIGN KEY`.
+- Foreign keys reference a primary key or unique index; `ON DELETE`
+  `RESTRICT`/`NO ACTION`/`CASCADE`/`SET NULL` are enforced.
+- Not yet: `ON UPDATE` referential actions when a referenced key changes,
+  multi-level (recursive) cascades, and deferred constraint checking.
 
 ## Query planning
 
 - Range scans and index nested-loop joins are **single-column**; composite
   ranges fall back to a scan.
 - `RIGHT`/`FULL` and non-equi joins use nested-loop (no hash/merge).
+- There is no cost-based optimizer or statistics; the planner uses heuristic
+  fast paths.
 - `ORDER BY`, grouped/aggregated output, and in-transaction reads materialize
-  their working set in memory.
+  their working set in memory (no spill-to-disk).
 
-## Transactions
+## Transactions & locking
 
 - **Snapshot** isolation (default, first-committer-wins) and **serializable**
-  isolation (opt-in via `SET SESSION TRANSACTION ISOLATION LEVEL SERIALIZABLE`,
-  read-set + scanned-range validation). Serializable is optimistic
-  (validate-on-commit), so it aborts conflicting transactions with error `1213`
-  rather than blocking; range validation is conservative (any change in a
-  scanned range aborts).
-- `SET autocommit=0` is accepted but not honoured; use explicit `BEGIN`.
+  isolation (opt-in), both optimistic (validate-on-commit; conflicts abort with
+  error `1213` rather than blocking).
+- `SAVEPOINT` / `ROLLBACK TO SAVEPOINT` / `RELEASE SAVEPOINT` are supported.
+- `SELECT ... FOR UPDATE` / `FOR SHARE` provide **optimistic** row locking: a
+  locked row that another transaction changes aborts your commit. There is no
+  pessimistic blocking; `LOCK IN SHARE MODE` and `LOCK TABLES` are not parsed
+  (use `FOR SHARE`). Row locking is applied to single-table locking selects.
+- A single writer serializes all commits (redb); write concurrency is bounded
+  by that writer plus group commit.
 
-## Analytics
+## Types & text
 
-- The OLAP path is a **row-oriented parallel streaming** aggregator, not a
-  columnar engine; there is no spill-to-disk for working sets that exceed
-  memory (only per-group state is bounded, not sort/materialize buffers).
+- No charset/collation handling: text compares and sorts bytewise (no
+  case-insensitive `_ci` collation, no `COLLATE`).
+- `ENUM`/`SET` are stored as text and not value-checked; no spatial types;
+  full-text search is vector-only.
+
+## Security & operations
+
+- One user with a role (read/write/admin); no `GRANT`/`REVOKE`, multiple users,
+  or per-object privileges.
+- No replication/HA, no built-in backup/restore tooling, and no metrics /
+  slow-query log yet.
 
 ## Wire protocol
 
@@ -48,18 +64,19 @@ implemented, so you can judge fit.
   `COM_STMT_CLOSE` → `COM_STMT_PREPARE` cycles on one connection with strict
   clients (an upstream library limitation). Statement reuse and pooled clients
   are unaffected.
+- No `LOAD DATA INFILE`.
 
 ## Roadmap
 
 Candidate next steps, roughly in order of value:
 
-1. Named windows; `RANGE`/`GROUPS` numeric-offset frames.
-2. Triggers, stored procedures, materialized views.
-3. Correlated subqueries combined with aggregation over a join.
-4. Secondary-index range on composite keys; merge joins.
-5. Columnar OLAP with spill-to-disk.
-6. Richer `information_schema` / `SHOW`.
-7. The ElyraSQL client (Rust + Svelte).
+1. `charset`/`collation` (at least a case-insensitive default).
+2. Backup/restore and a consistent logical dump.
+3. `GRANT`/`REVOKE` and multiple users.
+4. `ON UPDATE` referential actions and multi-level cascades.
+5. Spill-to-disk for large sorts/aggregations.
+6. Cost-based planning with statistics; hash/merge joins.
+7. Replication for HA.
 
 Have a need that isn't listed? Open an issue on
 [GitHub](https://github.com/kwhorne/ElyraSQL/issues).

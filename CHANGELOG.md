@@ -4,6 +4,36 @@ All notable changes to ElyraSQL are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.3.0] - 2026-07-09
+
+Data-integrity release: the constraints a production database must enforce.
+
+### Constraints
+
+- **UNIQUE** constraints are now enforced (previously stored but not checked).
+  Column-level `UNIQUE`, table-level `UNIQUE(...)`, and `CREATE UNIQUE INDEX`
+  all reject duplicates (error `1062`), including duplicates within a single
+  statement; multiple `NULL`s are allowed.
+- **FOREIGN KEY** constraints are enforced. INSERT/UPDATE require a matching
+  parent row (primary key or unique index, error `1452`); DELETE on the parent
+  applies `RESTRICT`/`NO ACTION` (block), `ON DELETE CASCADE` (delete children),
+  or `ON DELETE SET NULL`.
+- **CHECK** constraints (column- and table-level) are enforced on INSERT and
+  UPDATE, passing on TRUE or NULL per SQL semantics.
+
+### Transactions
+
+- **SAVEPOINT**, **ROLLBACK TO SAVEPOINT**, and **RELEASE SAVEPOINT**.
+- **SELECT ... FOR UPDATE / FOR SHARE**: optimistic row locking — a locked row
+  changed by another transaction aborts the locking transaction at commit
+  (lost-update prevention without blocking).
+
+### Fixed
+
+- Three-valued logic for comparisons: `NULL = x`, `x >= NULL`, etc. now evaluate
+  to NULL (UNKNOWN) instead of false. WHERE still excludes them, CHECK passes,
+  and SELECT shows NULL — matching SQL semantics.
+
 ## [0.2.1] - 2026-07-09
 
 Performance and robustness pass, verified on Linux (1,000,000-row workloads).
@@ -121,6 +151,7 @@ core CRUD with `WHERE`/`ORDER BY`/`LIMIT`, indexes, aggregation and `GROUP BY`,
 joins, prepared statements, authentication and TLS, vector search (exact +
 HNSW), parallel OLAP aggregation, and transactions with snapshot isolation.
 
+[0.3.0]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.3.0
 [0.2.1]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.2.1
 [0.2.0]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.2.0
 [0.1.0]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.1.0

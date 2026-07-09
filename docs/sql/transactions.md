@@ -51,6 +51,32 @@ COMMIT;
 Statements outside an explicit transaction commit immediately. Each connection
 has its own transaction state.
 
+## Savepoints
+
+```sql
+BEGIN;
+INSERT INTO t VALUES (1);
+SAVEPOINT sp1;
+INSERT INTO t VALUES (2);
+ROLLBACK TO SAVEPOINT sp1;   -- undoes row 2, keeps row 1 and sp1
+RELEASE SAVEPOINT sp1;       -- forgets sp1
+COMMIT;
+```
+
+## Row locking
+
+```sql
+BEGIN;
+SELECT balance FROM accounts WHERE id = 1 FOR UPDATE;
+UPDATE accounts SET balance = balance - 100 WHERE id = 1;
+COMMIT;
+```
+
+`SELECT ... FOR UPDATE` / `FOR SHARE` use **optimistic** locking: the locked
+rows are validated at commit, so if another transaction changed one of them the
+commit fails with error `1213` (retry). There is no pessimistic blocking, and
+`LOCK IN SHARE MODE` is not parsed (use `FOR SHARE`).
+
 ## Isolation levels
 
 The default is **snapshot** isolation (with first-committer-wins write-conflict
