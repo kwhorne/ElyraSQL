@@ -121,14 +121,20 @@ implemented, so you can judge fit.
   close — the failover data-loss window (there is no pre-commit 2-phase
   replication / multi-primary).
   **Automatic failover** is available in `cluster` mode via Raft-style leader
-  election (majority quorum, leader-only writes/fencing). A reconnecting replica
-  catches up **incrementally from the binlog** (streaming only the delta since
-  its last applied LSN) instead of re-copying the whole database; it falls back
-  to a full snapshot only when the binlog is disabled or the needed segments
-  were purged. The LSN counter is resumed from the binlog across restarts.
-  Cluster membership is a static peer list (no dynamic add/remove), and an
-  even-node cluster can, rarely, need an extra election round to break a tie —
-  run an odd number of nodes.
+  election (majority quorum, leader-only writes/fencing) with the **election
+  restriction**: a node only votes for a candidate at least as up-to-date (by
+  LSN) as itself, so an elected leader has every quorum-acknowledged write.
+  Together with `--sync-strict` this gives no-data-loss failover for
+  acknowledged writes (the sync barrier still runs after the local commit, so
+  it is not a pre-commit 2-phase protocol). A reconnecting replica catches up
+  **incrementally from the binlog** (streaming only the delta since its last
+  applied LSN), falling back to a full snapshot only when the binlog is disabled
+  or the needed segments were purged; the LSN counter resumes from the binlog
+  across restarts. **Cluster membership is dynamic**: `elyrasql cluster-ctl
+  --action add|remove` changes membership at runtime (send to the leader, which
+  propagates it to followers via heartbeats); add one node at a time and start a
+  new node before adding it. An even-node cluster can, rarely, need an extra
+  election round to break a tie — run an odd number of nodes.
 
 ## Wire protocol
 

@@ -44,6 +44,10 @@ enum Msg {
     RequestVote {
         term: u64,
         candidate: u64,
+        /// Candidate's highest applied LSN — voters reject less up-to-date
+        /// candidates (Raft election restriction) so failover never elects a
+        /// node missing acknowledged writes.
+        last_lsn: u64,
     },
     Vote {
         term: u64,
@@ -53,9 +57,25 @@ enum Msg {
         term: u64,
         leader: u64,
         repl_addr: String,
+        /// Current cluster membership (id, control_addr), propagated by the
+        /// leader so followers converge on dynamic add/remove.
+        members: Vec<(u64, String)>,
     },
     HeartbeatAck {
         term: u64,
+    },
+    /// Operator → node: add a peer to this node's membership.
+    AddPeer {
+        id: u64,
+        control_addr: String,
+    },
+    /// Operator → node: remove a peer by id.
+    RemovePeer {
+        id: u64,
+    },
+    /// Response to AddPeer/RemovePeer.
+    CtlAck {
+        ok: bool,
     },
 }
 
@@ -107,20 +127,28 @@ pub struct Leader {
     pub repl_addr: String,
 }
 
+/// A source of this node's highest applied LSN (for the election restriction).
+pub type LsnSource = Arc<dyn Fn() -> u64 + Send + Sync>;
+
 /// Handle to a running election node.
 pub struct Node {
     cfg: Arc<ClusterConfig>,
+    /// Live membership (mutable for dynamic add/remove).
+    peers: Mutex<Vec<Peer>>,
     state: Arc<Mutex<State>>,
+    lsn_source: LsnSource,
     leader_tx: watch::Sender<Option<Leader>>,
     pub leader_rx: watch::Receiver<Option<Leader>>,
 }
 
 impl Node {
-    pub fn new(cfg: ClusterConfig) -> Arc<Self> {
+    pub fn new(cfg: ClusterConfig, lsn_source: LsnSource) -> Arc<Self> {
         let cfg_id = cfg.id;
+        let peers = Mutex::new(cfg.peers.clone());
         let (leader_tx, leader_rx) = watch::channel(None);
         Arc::new(Node {
             cfg: Arc::new(cfg),
+            peers,
             state: Arc::new(Mutex::new(State {
                 term: 0,
                 voted_for: None,
@@ -128,14 +156,43 @@ impl Node {
                 leader: None,
                 election_deadline: Instant::now() + election_timeout(cfg_id),
             })),
+            lsn_source,
             leader_tx,
             leader_rx,
         })
     }
 
+    fn peer_snapshot(&self) -> Vec<Peer> {
+        self.peers.lock().unwrap().clone()
+    }
+
     fn majority(&self) -> usize {
-        let n = self.cfg.peers.len() + 1;
+        let n = self.peers.lock().unwrap().len() + 1;
         n / 2 + 1
+    }
+
+    /// Adopt a membership list advertised by the leader (peers = members minus
+    /// self). Idempotent.
+    fn adopt_members(&self, members: &[(u64, String)]) {
+        let mut p = self.peers.lock().unwrap();
+        let new: Vec<Peer> = members
+            .iter()
+            .filter(|(id, _)| *id != self.cfg.id)
+            .map(|(id, addr)| Peer {
+                id: *id,
+                control_addr: addr.clone(),
+            })
+            .collect();
+        *p = new;
+    }
+
+    /// The full membership (this node + peers) as (id, control_addr) pairs.
+    fn members(&self) -> Vec<(u64, String)> {
+        let mut m = vec![(self.cfg.id, self.cfg.control_listen.clone())];
+        for p in self.peers.lock().unwrap().iter() {
+            m.push((p.id, p.control_addr.clone()));
+        }
+        m
     }
 
     fn publish(&self, leader: Option<Leader>) {
@@ -168,19 +225,53 @@ impl Node {
 
     async fn handle_control(&self, mut stream: TcpStream) -> std::io::Result<()> {
         let msg = recv(&mut stream).await?;
+
+        // Membership control commands don't touch election state.
+        match &msg {
+            Msg::AddPeer { id, control_addr } => {
+                {
+                    let mut p = self.peers.lock().unwrap();
+                    if *id != self.cfg.id && !p.iter().any(|x| x.id == *id) {
+                        p.push(Peer {
+                            id: *id,
+                            control_addr: control_addr.clone(),
+                        });
+                    }
+                }
+                info!(id = self.cfg.id, added = *id, "peer added");
+                return send(&mut stream, &Msg::CtlAck { ok: true }).await;
+            }
+            Msg::RemovePeer { id } => {
+                self.peers.lock().unwrap().retain(|x| x.id != *id);
+                info!(id = self.cfg.id, removed = *id, "peer removed");
+                return send(&mut stream, &Msg::CtlAck { ok: true }).await;
+            }
+            _ => {}
+        }
+
         // Compute the reply (and any leader to publish) entirely under the lock,
         // then release it before doing any IO.
+        let mut adopt: Option<Vec<(u64, String)>> = None;
         let (reply, publish) = {
             let mut s = self.state.lock().unwrap();
             match msg {
-                Msg::RequestVote { term, candidate } => {
+                Msg::RequestVote {
+                    term,
+                    candidate,
+                    last_lsn,
+                } => {
                     if term > s.term {
                         s.term = term;
                         s.voted_for = None;
                         s.role = Role::Follower;
                     }
-                    let granted =
-                        term == s.term && (s.voted_for.is_none() || s.voted_for == Some(candidate));
+                    // Election restriction: only vote for a candidate at least as
+                    // up-to-date as us, so an elected leader has every
+                    // quorum-acknowledged write (no zero-data-loss violation).
+                    let up_to_date = last_lsn >= (self.lsn_source)();
+                    let granted = term == s.term
+                        && (s.voted_for.is_none() || s.voted_for == Some(candidate))
+                        && up_to_date;
                     if granted {
                         s.voted_for = Some(candidate);
                         s.election_deadline = Instant::now() + election_timeout(self.cfg.id);
@@ -197,12 +288,14 @@ impl Node {
                     term,
                     leader,
                     repl_addr,
+                    members,
                 } => {
                     if term >= s.term {
                         s.term = term;
                         s.role = Role::Follower;
                         s.leader = Some(leader);
                         s.election_deadline = Instant::now() + election_timeout(self.cfg.id);
+                        adopt = Some(members);
                         (
                             Msg::HeartbeatAck { term },
                             Some(Leader {
@@ -218,6 +311,9 @@ impl Node {
                 _ => (Msg::HeartbeatAck { term: s.term }, None),
             }
         };
+        if let Some(m) = adopt {
+            self.adopt_members(&m);
+        }
         if let Some(l) = publish {
             self.publish(Some(l));
         }
@@ -257,12 +353,14 @@ impl Node {
             s.election_deadline = Instant::now() + election_timeout(self.cfg.id);
             s.term
         };
-        info!(id = self.cfg.id, term, "standing for election");
+        let last_lsn = (self.lsn_source)();
+        info!(id = self.cfg.id, term, last_lsn, "standing for election");
         let mut votes = 1; // vote for self
-        for peer in &self.cfg.peers {
+        for peer in self.peer_snapshot() {
             let m = Msg::RequestVote {
                 term,
                 candidate: self.cfg.id,
+                last_lsn,
             };
             if let Ok(Msg::Vote { term: t, granted }) = rpc(&peer.control_addr, &m).await {
                 let mut s = self.state.lock().unwrap();
@@ -299,11 +397,13 @@ impl Node {
             }
             s.term
         };
-        for peer in &self.cfg.peers {
+        let members = self.members();
+        for peer in self.peer_snapshot() {
             let m = Msg::Heartbeat {
                 term,
                 leader: self.cfg.id,
                 repl_addr: self.cfg.replication_addr.clone(),
+                members: members.clone(),
             };
             if let Ok(Msg::HeartbeatAck { term: t }) = rpc(&peer.control_addr, &m).await {
                 if t > term {
@@ -397,6 +497,26 @@ async fn rpc(addr: &str, m: &Msg) -> std::io::Result<Msg> {
         .map_err(|_| Error::new(ErrorKind::TimedOut, "rpc timeout"))?
 }
 
+/// Operator command: add or remove a peer at `control_addr` on the node whose
+/// control plane is at `node_addr`. Prefer sending to the current leader, which
+/// propagates membership to followers via heartbeats.
+pub async fn send_membership(
+    node_addr: &str,
+    add: bool,
+    id: u64,
+    control_addr: String,
+) -> std::io::Result<()> {
+    let m = if add {
+        Msg::AddPeer { id, control_addr }
+    } else {
+        Msg::RemovePeer { id }
+    };
+    match rpc(node_addr, &m).await? {
+        Msg::CtlAck { ok: true } => Ok(()),
+        _ => Err(Error::other("membership change was not acknowledged")),
+    }
+}
+
 /// Parse `id@host:port` peer specs.
 pub fn parse_peer(spec: &str) -> std::io::Result<Peer> {
     let (id, addr) = spec
@@ -423,12 +543,15 @@ mod tests {
                     control_addr: String::new(),
                 })
                 .collect();
-            Node::new(ClusterConfig {
-                id: 99,
-                control_listen: String::new(),
-                replication_addr: String::new(),
-                peers,
-            })
+            Node::new(
+                ClusterConfig {
+                    id: 99,
+                    control_listen: String::new(),
+                    replication_addr: String::new(),
+                    peers,
+                },
+                Arc::new(|| 0),
+            )
             .majority()
         };
         assert_eq!(mk(0), 1); // single node

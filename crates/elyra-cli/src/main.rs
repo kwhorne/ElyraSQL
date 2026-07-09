@@ -96,6 +96,20 @@ enum Command {
         #[arg(long)]
         until_time_ms: Option<u64>,
     },
+    /// Add or remove a cluster member at runtime. Send to the current leader
+    /// (it propagates membership to followers via heartbeats). Start a new node
+    /// before adding it so it can be reached.
+    ClusterCtl {
+        /// Control-plane address of a running node (preferably the leader).
+        #[arg(long)]
+        node: String,
+        /// `add` or `remove`.
+        #[arg(long)]
+        action: String,
+        /// The peer to add/remove, as `id@host:port` (remove only needs the id).
+        #[arg(long)]
+        peer: String,
+    },
     /// Run as a cluster node with automatic failover (Raft-style leader
     /// election). The elected leader accepts writes; followers are read-only and
     /// replicate from the leader.
@@ -313,6 +327,16 @@ async fn run() -> anyhow::Result<()> {
             let n = elyra_storage::binlog::replay(&binlog, &db, until_lsn, until_time_ms).await?;
             println!("replayed {n} write-sets into {}", data.display());
         }
+        Command::ClusterCtl { node, action, peer } => {
+            let add = match action.to_ascii_lowercase().as_str() {
+                "add" => true,
+                "remove" => false,
+                _ => return Err(anyhow::anyhow!("action must be 'add' or 'remove'")),
+            };
+            let p = elyra_server::cluster::parse_peer(&peer)?;
+            elyra_server::cluster::send_membership(&node, add, p.id, p.control_addr).await?;
+            println!("membership {action} acknowledged by {node}");
+        }
         Command::Cluster {
             id,
             data,
@@ -328,12 +352,16 @@ async fn run() -> anyhow::Result<()> {
                 .iter()
                 .map(|p| elyra_server::cluster::parse_peer(p))
                 .collect::<std::io::Result<Vec<_>>>()?;
-            let node = elyra_server::cluster::Node::new(elyra_server::cluster::ClusterConfig {
-                id,
-                control_listen,
-                replication_addr: replication_listen.clone(),
-                peers,
-            });
+            let lsn_db = db.clone();
+            let node = elyra_server::cluster::Node::new(
+                elyra_server::cluster::ClusterConfig {
+                    id,
+                    control_listen,
+                    replication_addr: replication_listen.clone(),
+                    peers,
+                },
+                std::sync::Arc::new(move || lsn_db.current_lsn()),
+            );
             tokio::spawn(node.clone().run());
             tokio::spawn(elyra_server::cluster::follow_leadership(
                 node.clone(),
