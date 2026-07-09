@@ -62,10 +62,21 @@ UPDATE accounts SET balance = balance + 100 WHERE id = 42;
 ```sql
 DELETE FROM users WHERE id = 2;
 DELETE FROM logs WHERE created < '2024-01-01';
+DELETE FROM users WHERE id NOT IN (SELECT uid FROM orders);
 DELETE FROM users;            -- all rows
 ```
 
-`DELETE` supports `WHERE` and a MySQL-style `LIMIT`.
+`DELETE` supports `WHERE` (including uncorrelated and correlated subqueries)
+and a MySQL-style `LIMIT`.
+
+### Multi-table DELETE
+
+```sql
+DELETE u FROM users u JOIN orders o ON u.id = o.uid WHERE o.amount >= 100;
+```
+
+Name the table(s) to delete from before `FROM`; those tables must have a
+primary key.
 
 ## Performance notes
 

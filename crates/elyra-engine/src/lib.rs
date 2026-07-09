@@ -141,8 +141,8 @@ impl Engine {
                 assignments,
                 selection,
                 ..
-            } => exec::update(sess, &table, &assignments, selection.as_ref()).await,
-            Statement::Delete(del) => exec::delete(sess, &del).await,
+            } => exec::update(sess, &self.vindex, &table, &assignments, selection.as_ref()).await,
+            Statement::Delete(del) => exec::delete(sess, &self.vindex, &del).await,
             Statement::Drop {
                 object_type: sqlparser::ast::ObjectType::Table,
                 names,

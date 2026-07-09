@@ -55,7 +55,7 @@ Candidate next steps, roughly in order of value:
 
 1. Named windows; `RANGE`/`GROUPS` numeric-offset frames.
 2. Triggers, stored procedures, materialized views.
-3. `UPDATE`/`DELETE` with subqueries or joins.
+3. Correlated subqueries combined with aggregation over a join.
 4. Secondary-index range on composite keys; merge joins.
 5. Columnar OLAP with spill-to-disk.
 6. Richer `information_schema` / `SHOW`.

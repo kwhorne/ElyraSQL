@@ -2249,14 +2249,55 @@ fn table_of(twj: &TableWithJoins) -> Result<String> {
     }
 }
 
+/// Collect the rows a mutation should touch, resolving any subquery in the
+/// WHERE. Uncorrelated subqueries resolve once; a subquery correlated with the
+/// target table is evaluated per row.
+async fn mutation_matches(
+    db: &Session,
+    vindex: &VectorRegistry,
+    def: &TableDef,
+    qualifier: &str,
+    selection: Option<&Expr>,
+    limit: Option<usize>,
+) -> Result<Vec<(Vec<u8>, Vec<Value>)>> {
+    let Some(f) = selection else {
+        return collect_matches(db, def, None, limit).await;
+    };
+    if filter_correlated(f, qualifier) {
+        let all = collect_matches(db, def, None, None).await?;
+        let mut out = Vec::new();
+        for (key, row) in all {
+            let bound = bind_outer(f, qualifier, &def.schema, &row);
+            let resolved = resolve_subqueries(db, vindex, bound).await?;
+            if predicate::matches(&resolved, &def.schema, &row)? {
+                out.push((key, row));
+                if let Some(l) = limit {
+                    if out.len() >= l {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(out)
+    } else {
+        let resolved = resolve_subqueries(db, vindex, f.clone()).await?;
+        collect_matches(db, def, Some(&resolved), limit).await
+    }
+}
+
 pub async fn update(
     db: &Session,
+    vindex: &VectorRegistry,
     table: &TableWithJoins,
     assignments: &[Assignment],
     selection: Option<&Expr>,
 ) -> Result<QueryResult> {
+    if !table.joins.is_empty() {
+        return multi_update(db, vindex, table, assignments, selection).await;
+    }
     let name = table_of(table)?;
     let def = catalog::load(db, &name).await?;
+    let qualifier = factor_qualifier(&table.relation).unwrap_or_else(|| name.clone());
 
     // Resolve assignment targets to column indices.
     let mut sets: Vec<(usize, &Expr)> = Vec::with_capacity(assignments.len());
@@ -2282,7 +2323,7 @@ pub async fn update(
         sets.push((idx, &a.value));
     }
 
-    let matches = collect_matches(db, &def, selection, None).await?;
+    let matches = mutation_matches(db, vindex, &def, &qualifier, selection, None).await?;
     let affected = matches.len() as u64;
 
     let mut puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
@@ -2330,24 +2371,25 @@ pub async fn update(
     Ok(QueryResult::Affected(affected))
 }
 
-pub async fn delete(db: &Session, del: &Delete) -> Result<QueryResult> {
+pub async fn delete(db: &Session, vindex: &VectorRegistry, del: &Delete) -> Result<QueryResult> {
     let relations = match &del.from {
         FromTable::WithFromKeyword(v) | FromTable::WithoutKeyword(v) => v,
     };
-    if relations.len() != 1 {
-        return Err(Error::Unsupported(
-            "multi-table DELETE is not supported".into(),
-        ));
+    // Multi-table DELETE: a join in FROM, or explicit target tables.
+    if relations.len() != 1 || !relations[0].joins.is_empty() || !del.tables.is_empty() {
+        return multi_delete(db, vindex, del, relations).await;
     }
     let name = table_of(&relations[0])?;
     let def = catalog::load(db, &name).await?;
+    let qualifier = factor_qualifier(&relations[0].relation).unwrap_or_else(|| name.clone());
 
     let limit = match &del.limit {
         Some(e) => Some(eval_usize(e)?),
         None => None,
     };
 
-    let matches = collect_matches(db, &def, del.selection.as_ref(), limit).await?;
+    let matches =
+        mutation_matches(db, vindex, &def, &qualifier, del.selection.as_ref(), limit).await?;
     let affected = matches.len() as u64;
 
     let mut deletes: Vec<Vec<u8>> = Vec::with_capacity(matches.len());
@@ -2358,6 +2400,283 @@ pub async fn delete(db: &Session, del: &Delete) -> Result<QueryResult> {
 
     let wc = bump_wcount(db, &name).await?;
     db.commit_write(vec![wc], deletes).await?;
+    Ok(QueryResult::Affected(affected))
+}
+
+/// A plain table participating in a multi-table mutation, plus the combined
+/// schema indices of its columns (in base-table order).
+struct TargetInfo {
+    name: String,
+    def: TableDef,
+    col_idx: Vec<usize>,
+}
+
+/// Map each plain table in `from` (by qualifier) to its base definition and the
+/// combined-schema indices of its columns.
+async fn collect_targets(
+    db: &Session,
+    from: &[TableWithJoins],
+    schema: &Schema,
+) -> Result<std::collections::HashMap<String, TargetInfo>> {
+    let mut factors: Vec<&TableFactor> = Vec::new();
+    for twj in from {
+        factors.push(&twj.relation);
+        for j in &twj.joins {
+            factors.push(&j.relation);
+        }
+    }
+    let mut map = std::collections::HashMap::new();
+    for tf in factors {
+        if let TableFactor::Table { name, alias, .. } = tf {
+            let tname = name
+                .0
+                .last()
+                .map(|i| i.value.clone())
+                .ok_or_else(|| Error::Catalog("empty table name".into()))?;
+            let qual = alias
+                .as_ref()
+                .map(|a| a.name.value.clone())
+                .unwrap_or_else(|| tname.clone());
+            let def = catalog::load(db, &tname).await?;
+            let mut col_idx = Vec::with_capacity(def.schema.columns.len());
+            for c in &def.schema.columns {
+                let qn = format!("{qual}.{}", c.name);
+                let i = schema
+                    .columns
+                    .iter()
+                    .position(|sc| sc.name.eq_ignore_ascii_case(&qn))
+                    .ok_or_else(|| Error::Query(format!("column {qn} not found in join output")))?;
+                col_idx.push(i);
+            }
+            map.insert(
+                qual.to_ascii_lowercase(),
+                TargetInfo {
+                    name: tname,
+                    def,
+                    col_idx,
+                },
+            );
+        }
+    }
+    Ok(map)
+}
+
+fn extract_base_row(joined: &[Value], col_idx: &[usize]) -> Vec<Value> {
+    col_idx.iter().map(|&i| joined[i].clone()).collect()
+}
+
+/// Multi-table UPDATE: `UPDATE t1 JOIN t2 ON ... SET t1.c = ... WHERE ...`.
+async fn multi_update(
+    db: &Session,
+    vindex: &VectorRegistry,
+    table: &TableWithJoins,
+    assignments: &[Assignment],
+    selection: Option<&Expr>,
+) -> Result<QueryResult> {
+    let from = std::slice::from_ref(table);
+    let (cols, rows) = build_from(db, vindex, from, &[]).await?;
+    let schema = Schema::new(cols);
+    let filter = match selection {
+        Some(f) => Some(resolve_subqueries(db, vindex, f.clone()).await?),
+        None => None,
+    };
+    let targets = collect_targets(db, from, &schema).await?;
+    let primary = factor_qualifier(&table.relation).map(|q| q.to_ascii_lowercase());
+
+    struct SetOp<'a> {
+        qual: String,
+        col: usize,
+        expr: &'a Expr,
+    }
+    let mut sets: Vec<SetOp> = Vec::new();
+    for a in assignments {
+        let n = match &a.target {
+            AssignmentTarget::ColumnName(n) => n,
+            AssignmentTarget::Tuple(_) => {
+                return Err(Error::Unsupported(
+                    "tuple assignment is not supported".into(),
+                ))
+            }
+        };
+        let (qual, colname) = if n.0.len() >= 2 {
+            (
+                n.0[n.0.len() - 2].value.to_ascii_lowercase(),
+                n.0.last().unwrap().value.clone(),
+            )
+        } else {
+            (
+                primary.clone().ok_or_else(|| {
+                    Error::Query("cannot resolve target table for assignment".into())
+                })?,
+                n.0.last().unwrap().value.clone(),
+            )
+        };
+        let info = targets
+            .get(&qual)
+            .ok_or_else(|| Error::Catalog(format!("unknown table in UPDATE: {qual}")))?;
+        if !info.def.has_pk() {
+            return Err(Error::Unsupported(
+                "multi-table UPDATE requires a primary key on the target table".into(),
+            ));
+        }
+        let col = info
+            .def
+            .schema
+            .columns
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(&colname))
+            .ok_or_else(|| Error::Catalog(format!("unknown column: {colname}")))?;
+        sets.push(SetOp {
+            qual,
+            col,
+            expr: &a.value,
+        });
+    }
+
+    // Per target table: pk -> (old base row, new base row). A base row hit by
+    // multiple joined rows is updated once (first match).
+    type RowMap = std::collections::HashMap<Vec<u8>, (Vec<Value>, Vec<Value>)>;
+    let mut updated: std::collections::HashMap<String, RowMap> = std::collections::HashMap::new();
+    let mut affected = 0u64;
+    for joined in rows {
+        if let Some(f) = &filter {
+            if !predicate::matches(f, &schema, &joined)? {
+                continue;
+            }
+        }
+        for (qual, info) in &targets {
+            if !sets.iter().any(|s| &s.qual == qual) {
+                continue;
+            }
+            let base = extract_base_row(&joined, &info.col_idx);
+            let pk_vals: Vec<Value> = info.def.pk_cols.iter().map(|&i| base[i].clone()).collect();
+            let pk_key = data_key(&info.name, &keyenc::encode_key(&pk_vals)?);
+            let entry = updated.entry(qual.clone()).or_default();
+            if entry.contains_key(&pk_key) {
+                continue;
+            }
+            let mut new_base = base.clone();
+            for s in &sets {
+                if &s.qual == qual {
+                    let v = predicate::eval_row(s.expr, &schema, &joined)?;
+                    let col = &info.def.schema.columns[s.col];
+                    new_base[s.col] = coerce(v, &col.ty, &col.name)?;
+                }
+            }
+            for (i, col) in info.def.schema.columns.iter().enumerate() {
+                if !col.nullable && new_base[i].is_null() {
+                    return Err(Error::Query(format!(
+                        "column '{}' cannot be NULL",
+                        col.name
+                    )));
+                }
+            }
+            entry.insert(pk_key, (base, new_base));
+            affected += 1;
+        }
+    }
+
+    let mut puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    let mut deletes: Vec<Vec<u8>> = Vec::new();
+    for (qual, rowsmap) in &updated {
+        let info = &targets[qual];
+        for (pk_key, (old_base, new_base)) in rowsmap {
+            let new_pk: Vec<Value> = info
+                .def
+                .pk_cols
+                .iter()
+                .map(|&i| new_base[i].clone())
+                .collect();
+            let new_key = data_key(&info.name, &keyenc::encode_key(&new_pk)?);
+            deletes.extend(index::entry_keys_for_row(&info.def, old_base, pk_key)?);
+            let new_entries = index::entries_for_row(&info.def, new_base, &new_key)?;
+            if &new_key != pk_key {
+                deletes.push(pk_key.clone());
+            }
+            let enc = bincode::serialize(new_base).map_err(|e| Error::Storage(e.to_string()))?;
+            puts.push((new_key, enc));
+            puts.extend(new_entries);
+        }
+        puts.push(bump_wcount(db, &info.name).await?);
+    }
+    db.commit_write(puts, deletes).await?;
+    Ok(QueryResult::Affected(affected))
+}
+
+/// Multi-table DELETE: `DELETE t1 FROM t1 JOIN t2 ON ... WHERE ...`.
+async fn multi_delete(
+    db: &Session,
+    vindex: &VectorRegistry,
+    del: &Delete,
+    relations: &[TableWithJoins],
+) -> Result<QueryResult> {
+    let mut from_all: Vec<TableWithJoins> = relations.to_vec();
+    if let Some(using) = &del.using {
+        from_all.extend(using.clone());
+    }
+    let (cols, rows) = build_from(db, vindex, &from_all, &[]).await?;
+    let schema = Schema::new(cols);
+    let filter = match &del.selection {
+        Some(f) => Some(resolve_subqueries(db, vindex, f.clone()).await?),
+        None => None,
+    };
+    let targets = collect_targets(db, &from_all, &schema).await?;
+
+    let del_quals: Vec<String> = if del.tables.is_empty() {
+        vec![factor_qualifier(&relations[0].relation)
+            .map(|q| q.to_ascii_lowercase())
+            .ok_or_else(|| Error::Query("no target table for DELETE".into()))?]
+    } else {
+        del.tables
+            .iter()
+            .filter_map(|t| t.0.last().map(|i| i.value.to_ascii_lowercase()))
+            .collect()
+    };
+    for q in &del_quals {
+        let info = targets
+            .get(q)
+            .ok_or_else(|| Error::Catalog(format!("unknown table in DELETE: {q}")))?;
+        if !info.def.has_pk() {
+            return Err(Error::Unsupported(
+                "multi-table DELETE requires a primary key on the target table".into(),
+            ));
+        }
+    }
+
+    let mut per_table: std::collections::HashMap<
+        String,
+        std::collections::HashMap<Vec<u8>, Vec<Value>>,
+    > = std::collections::HashMap::new();
+    let mut affected = 0u64;
+    for joined in rows {
+        if let Some(f) = &filter {
+            if !predicate::matches(f, &schema, &joined)? {
+                continue;
+            }
+        }
+        for q in &del_quals {
+            let info = &targets[q];
+            let base = extract_base_row(&joined, &info.col_idx);
+            let pk_vals: Vec<Value> = info.def.pk_cols.iter().map(|&i| base[i].clone()).collect();
+            let pk_key = data_key(&info.name, &keyenc::encode_key(&pk_vals)?);
+            let entry = per_table.entry(q.clone()).or_default();
+            if entry.insert(pk_key, base).is_none() {
+                affected += 1;
+            }
+        }
+    }
+
+    let mut deletes: Vec<Vec<u8>> = Vec::new();
+    let mut wcs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    for (q, rowsmap) in &per_table {
+        let info = &targets[q];
+        for (pk_key, base) in rowsmap {
+            deletes.extend(index::entry_keys_for_row(&info.def, base, pk_key)?);
+            deletes.push(pk_key.clone());
+        }
+        wcs.push(bump_wcount(db, &info.name).await?);
+    }
+    db.commit_write(wcs, deletes).await?;
     Ok(QueryResult::Affected(affected))
 }
 
