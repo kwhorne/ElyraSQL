@@ -2476,6 +2476,7 @@ fn compute_window(rows: &[Vec<Value>], schema: &Schema, func: &Expr) -> Result<V
             &idxs,
             ordered,
             &order,
+            spec.window_frame.as_ref(),
             &mut result,
         )?;
     }
@@ -2502,6 +2503,7 @@ fn compute_partition(
     idxs: &[usize],
     ordered: bool,
     order: &[(Expr, bool)],
+    frame: Option<&sqlparser::ast::WindowFrame>,
     result: &mut [Value],
 ) -> Result<()> {
     let order_key = |i: usize| -> Result<Vec<Value>> {
@@ -2560,38 +2562,39 @@ fn compute_partition(
             }
         }
         "sum" | "count" | "avg" | "min" | "max" => {
-            // Frame: running (RANGE, incl. peers) when ordered, else whole partition.
             let count_star = name == "count" && args.is_empty();
-            if !ordered {
-                let vals: Vec<Value> = idxs.iter().map(|&i| arg_val(i)).collect::<Result<_>>()?;
-                let agg = if count_star {
-                    Value::Int(idxs.len() as i64)
-                } else {
-                    agg_over(name, &vals, idxs.len())
-                };
-                for &i in idxs {
-                    result[i] = agg.clone();
-                }
-            } else {
-                // Group peers by order key; aggregate cumulatively.
-                let mut p = 0;
-                let mut acc: Vec<Value> = Vec::new();
-                while p < idxs.len() {
-                    let key = order_key(idxs[p])?;
-                    let mut q = p;
-                    while q < idxs.len() && order_key(idxs[q])? == key {
-                        acc.push(arg_val(idxs[q])?);
-                        q += 1;
+            let arg0 = args.first().copied();
+            let n = idxs.len();
+
+            match frame_mode(frame, ordered)? {
+                FrameMode::Rows => {
+                    let f = frame.expect("rows frame present");
+                    for (p, &i) in idxs.iter().enumerate() {
+                        let (lo, hi) = rows_bounds(f, p, n, schema, rows, idxs)?;
+                        let members: &[usize] = if lo <= hi { &idxs[lo..=hi] } else { &[] };
+                        result[i] = window_agg(name, count_star, members, arg0, rows, schema)?;
                     }
-                    let agg = if count_star {
-                        Value::Int(acc.len() as i64)
-                    } else {
-                        agg_over(name, &acc, acc.len())
-                    };
-                    for &i in &idxs[p..q] {
+                }
+                FrameMode::Whole => {
+                    let agg = window_agg(name, count_star, idxs, arg0, rows, schema)?;
+                    for &i in idxs {
                         result[i] = agg.clone();
                     }
-                    p = q;
+                }
+                FrameMode::PeerRunning => {
+                    let mut p = 0;
+                    while p < n {
+                        let key = order_key(idxs[p])?;
+                        let mut q = p;
+                        while q < n && order_key(idxs[q])? == key {
+                            q += 1;
+                        }
+                        let agg = window_agg(name, count_star, &idxs[0..q], arg0, rows, schema)?;
+                        for &i in &idxs[p..q] {
+                            result[i] = agg.clone();
+                        }
+                        p = q;
+                    }
                 }
             }
         }
@@ -2602,6 +2605,106 @@ fn compute_partition(
         }
     }
     Ok(())
+}
+
+enum FrameMode {
+    Rows,
+    Whole,
+    PeerRunning,
+}
+
+/// Decide how to evaluate a framed aggregate. Explicit `ROWS` frames use
+/// physical offsets; `RANGE` supports whole-partition and running (peer) forms;
+/// the default frame is running when ordered, else whole partition.
+fn frame_mode(frame: Option<&sqlparser::ast::WindowFrame>, ordered: bool) -> Result<FrameMode> {
+    use sqlparser::ast::{WindowFrameBound as B, WindowFrameUnits as U};
+    let Some(f) = frame else {
+        return Ok(if ordered {
+            FrameMode::PeerRunning
+        } else {
+            FrameMode::Whole
+        });
+    };
+    match f.units {
+        U::Rows => Ok(FrameMode::Rows),
+        U::Range | U::Groups => {
+            let whole = matches!(f.start_bound, B::Preceding(None))
+                && matches!(f.end_bound, Some(B::Following(None)));
+            let running = matches!(f.start_bound, B::Preceding(None))
+                && matches!(f.end_bound, None | Some(B::CurrentRow));
+            if whole {
+                Ok(FrameMode::Whole)
+            } else if running && ordered {
+                Ok(FrameMode::PeerRunning)
+            } else if !ordered {
+                Ok(FrameMode::Whole)
+            } else {
+                Err(Error::Unsupported(
+                    "only RANGE UNBOUNDED PRECEDING .. CURRENT ROW / UNBOUNDED FOLLOWING frames are supported"
+                        .into(),
+                ))
+            }
+        }
+    }
+}
+
+/// Physical `[lo, hi]` bounds (inclusive, clamped) for a `ROWS` frame at sorted
+/// position `p`. Returns `lo > hi` for an empty frame.
+fn rows_bounds(
+    frame: &sqlparser::ast::WindowFrame,
+    p: usize,
+    n: usize,
+    schema: &Schema,
+    rows: &[Vec<Value>],
+    idxs: &[usize],
+) -> Result<(usize, usize)> {
+    use sqlparser::ast::WindowFrameBound as B;
+    let off = |b: &B| -> Result<isize> {
+        Ok(match b {
+            B::CurrentRow => p as isize,
+            B::Preceding(None) => 0,
+            B::Preceding(Some(e)) => p as isize - const_isize(e, schema, rows, idxs)?,
+            B::Following(None) => n as isize - 1,
+            B::Following(Some(e)) => p as isize + const_isize(e, schema, rows, idxs)?,
+        })
+    };
+    let lo = off(&frame.start_bound)?.max(0) as usize;
+    let hi_raw = match frame.end_bound.as_ref() {
+        Some(b) => off(b)?,
+        None => p as isize,
+    };
+    let hi = hi_raw.min(n as isize - 1);
+    if hi < 0 || lo as isize > hi {
+        return Ok((1, 0)); // empty
+    }
+    Ok((lo, hi as usize))
+}
+
+fn const_isize(e: &Expr, schema: &Schema, rows: &[Vec<Value>], idxs: &[usize]) -> Result<isize> {
+    let v = predicate::eval_row(e, schema, &rows[idxs[0]])?;
+    Ok(v.as_f64().unwrap_or(0.0) as isize)
+}
+
+/// Aggregate `name` over the given member rows (evaluating `arg` per row).
+fn window_agg(
+    name: &str,
+    count_star: bool,
+    members: &[usize],
+    arg: Option<&Expr>,
+    rows: &[Vec<Value>],
+    schema: &Schema,
+) -> Result<Value> {
+    if count_star {
+        return Ok(Value::Int(members.len() as i64));
+    }
+    let vals: Vec<Value> = match arg {
+        Some(e) => members
+            .iter()
+            .map(|&i| predicate::eval_row(e, schema, &rows[i]))
+            .collect::<Result<_>>()?,
+        None => Vec::new(),
+    };
+    Ok(agg_over(name, &vals, members.len()))
 }
 
 fn agg_over(name: &str, vals: &[Value], count_star: usize) -> Value {

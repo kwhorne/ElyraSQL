@@ -66,9 +66,25 @@ Supported: `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `SUM`/`COUNT`/`AVG`/`MIN`/`MAX`
 **running** (cumulative, peers share a value); without it they cover the whole
 partition.
 
+### Frames
+
+Explicit `ROWS` frames (physical row offsets) are supported:
+
+```sql
+-- 3-row moving sum
+SUM(v) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND CURRENT ROW)
+-- centered average
+AVG(v) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING)
+-- suffix sum
+SUM(v) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING)
+```
+
+`RANGE` supports the whole-partition (`UNBOUNDED PRECEDING AND UNBOUNDED
+FOLLOWING`) and running (`UNBOUNDED PRECEDING AND CURRENT ROW`) forms.
+
 !!! note
-    Explicit frame clauses (`ROWS`/`RANGE BETWEEN ...`) and named windows are
-    not supported; the default frame is used.
+    `RANGE`/`GROUPS` with numeric offsets, frame `EXCLUDE`, and named windows
+    are not supported.
 
 ## The OLAP engine
 
