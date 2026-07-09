@@ -1985,6 +1985,15 @@ pub async fn select(
         None => None,
     };
 
+    // SELECT ... FOR UPDATE / FOR SHARE inside a transaction: record the matched
+    // rows so a concurrent change to them aborts this transaction at commit
+    // (optimistic row locking).
+    if !query.locks.is_empty() && db.in_txn() {
+        let matched = collect_matches(db, &def, filter.as_ref(), None).await?;
+        let keys: Vec<Vec<u8>> = matched.into_iter().map(|(k, _)| k).collect();
+        db.lock_keys(&keys);
+    }
+
     // Resolve uncorrelated subqueries in the SELECT list; work with the
     // resolved projection thereafter.
     let resolved_select;

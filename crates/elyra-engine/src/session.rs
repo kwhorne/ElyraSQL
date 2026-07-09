@@ -33,6 +33,9 @@ struct TxnState {
     serializable: bool,
     reads: BTreeSet<Vec<u8>>,
     ranges: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+    /// Rows explicitly locked with SELECT ... FOR UPDATE / FOR SHARE. Always
+    /// validated at commit, so a concurrent change aborts this transaction.
+    locked: BTreeSet<Vec<u8>>,
     /// Named savepoints (overlay snapshots), innermost last.
     savepoints: Vec<Savepoint>,
 }
@@ -44,6 +47,7 @@ struct Savepoint {
     deletes: BTreeSet<Vec<u8>>,
     reads: BTreeSet<Vec<u8>>,
     ranges: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+    locked: BTreeSet<Vec<u8>>,
 }
 
 pub struct Session {
@@ -91,9 +95,18 @@ impl Session {
             serializable,
             reads: BTreeSet::new(),
             ranges: Vec::new(),
+            locked: BTreeSet::new(),
             savepoints: Vec::new(),
         });
         Ok(())
+    }
+
+    /// Record rows locked by SELECT ... FOR UPDATE (validated at commit). A
+    /// no-op outside a transaction.
+    pub fn lock_keys(&self, keys: &[Vec<u8>]) {
+        if let Some(tx) = self.txn.lock().unwrap().as_mut() {
+            tx.locked.extend(keys.iter().cloned());
+        }
     }
 
     /// Establish (or redefine) a savepoint within the current transaction.
@@ -109,6 +122,7 @@ impl Session {
             deletes: tx.deletes.clone(),
             reads: tx.reads.clone(),
             ranges: tx.ranges.clone(),
+            locked: tx.locked.clone(),
         });
         Ok(())
     }
@@ -125,19 +139,21 @@ impl Session {
             .iter()
             .position(|s| s.name == name)
             .ok_or_else(|| Error::Query(format!("no such savepoint: {name}")))?;
-        let (p, d, r, rg) = {
+        let (p, d, r, rg, lk) = {
             let sp = &tx.savepoints[pos];
             (
                 sp.puts.clone(),
                 sp.deletes.clone(),
                 sp.reads.clone(),
                 sp.ranges.clone(),
+                sp.locked.clone(),
             )
         };
         tx.puts = p;
         tx.deletes = d;
         tx.reads = r;
         tx.ranges = rg;
+        tx.locked = lk;
         tx.savepoints.truncate(pos + 1);
         Ok(())
     }
@@ -168,6 +184,7 @@ impl Session {
             serializable,
             reads,
             ranges,
+            locked,
             savepoints: _,
         } = tx;
 
@@ -178,6 +195,7 @@ impl Session {
         let mut keyset: BTreeSet<Vec<u8>> = BTreeSet::new();
         keyset.extend(puts.keys().filter(|k| !is_meta(k)).cloned());
         keyset.extend(deletes.iter().filter(|k| !is_meta(k)).cloned());
+        keyset.extend(locked.iter().filter(|k| !is_meta(k)).cloned());
         if serializable {
             keyset.extend(reads.iter().filter(|k| !is_meta(k)).cloned());
         }
