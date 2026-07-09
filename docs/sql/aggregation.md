@@ -46,6 +46,30 @@ SELECT region, COUNT(*) AS n FROM sales GROUP BY region HAVING COUNT(*) >= 3;
 `HAVING` references must appear in the SELECT list (as an aggregate expression
 or an alias) or be a grouped column.
 
+## Window functions
+
+Window functions compute a value per row over a partition, without collapsing
+rows:
+
+```sql
+SELECT id, region, amount,
+       ROW_NUMBER() OVER (PARTITION BY region ORDER BY amount DESC) AS rn,
+       RANK()       OVER (ORDER BY amount)                          AS rk,
+       SUM(amount)  OVER (PARTITION BY region ORDER BY id)         AS running,
+       SUM(amount)  OVER (PARTITION BY region)                     AS region_total,
+       LAG(amount)  OVER (ORDER BY id)                             AS prev
+FROM sales;
+```
+
+Supported: `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `SUM`/`COUNT`/`AVG`/`MIN`/`MAX`
+`OVER (...)`, and `LAG`/`LEAD`. With `ORDER BY` in the window, aggregates are
+**running** (cumulative, peers share a value); without it they cover the whole
+partition.
+
+!!! note
+    Explicit frame clauses (`ROWS`/`RANGE BETWEEN ...`) and named windows are
+    not supported; the default frame is used.
+
 ## The OLAP engine
 
 Large aggregations run through a dedicated analytical path:

@@ -5,10 +5,10 @@ implemented, so you can judge fit.
 
 ## SQL surface
 
-- Subqueries in `WHERE` (uncorrelated **and** correlated: `IN`, scalar,
-  `EXISTS`), derived tables (`FROM (SELECT ...) AS t`), and `HAVING` are
-  supported. Scalar subqueries in the **SELECT list**, CTEs (`WITH`), window
-  functions, and correlated subqueries combined with joins are not.
+- Subqueries (`WHERE` and SELECT-list, uncorrelated **and** correlated),
+  derived tables, CTEs (`WITH`), `HAVING`, and window functions are supported.
+  Not yet: `WITH RECURSIVE`, explicit window frames (`ROWS`/`RANGE BETWEEN`),
+  named windows, and correlated subqueries combined with joins.
 - No views, triggers, stored procedures, or user-defined functions.
 - `ALTER TABLE` covers add/drop/rename column and rename table — not
   `MODIFY`/`CHANGE` (column type changes) or `ADD/DROP INDEX` via `ALTER`.
@@ -51,9 +51,9 @@ implemented, so you can judge fit.
 
 Candidate next steps, roughly in order of value:
 
-1. Window functions and scalar subqueries in the SELECT list.
+1. Explicit window frames and named windows; `WITH RECURSIVE`.
 2. More JSON functions (`JSON_SET`, `JSON_ARRAY`, containment).
-3. CTEs (`WITH`).
+3. Views, triggers, stored procedures.
 4. Secondary-index range on composite keys; merge joins.
 5. Columnar OLAP with spill-to-disk.
 6. Richer `information_schema` / `SHOW`.

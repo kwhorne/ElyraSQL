@@ -694,6 +694,20 @@ pub async fn select(
         select
     };
 
+    // Window functions in the projection take a dedicated materialised path.
+    if projection_has_window(&select.projection) {
+        return window_select(
+            db,
+            &def,
+            select,
+            filter.as_ref(),
+            &order_exprs,
+            offset,
+            limit,
+        )
+        .await;
+    }
+
     // Aggregation / grouping path: parallel streaming aggregation (OLAP).
     if !group_by.is_empty() || aggregate::projection_has_aggregate(&select.projection) {
         let plan = aggregate::build_plan(&def.schema, &select.projection, &group_by)?;
@@ -2273,6 +2287,360 @@ fn replace_cte_relation(
         }
     }
     tf.clone()
+}
+
+/// True if any projection item contains a window function (`f(...) OVER (...)`).
+fn projection_has_window(projection: &[sqlparser::ast::SelectItem]) -> bool {
+    use sqlparser::ast::SelectItem;
+    projection.iter().any(|it| match it {
+        SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
+            expr_has_window(e)
+        }
+        _ => false,
+    })
+}
+
+fn expr_has_window(e: &Expr) -> bool {
+    let found = std::cell::Cell::new(false);
+    let _ = map_expr(e, &|x| {
+        if let Expr::Function(f) = x {
+            if f.over.is_some() {
+                found.set(true);
+            }
+        }
+        None
+    });
+    found.get()
+}
+
+fn collect_window_exprs(e: &Expr, out: &mut Vec<Expr>) {
+    let acc = std::cell::RefCell::new(Vec::new());
+    let _ = map_expr(e, &|x| {
+        if let Expr::Function(f) = x {
+            if f.over.is_some() {
+                acc.borrow_mut().push(x.clone());
+            }
+        }
+        None
+    });
+    out.extend(acc.into_inner());
+}
+
+/// Execute a query with window functions in its projection. Materialises the
+/// filtered rows, computes each window function, substitutes the results into
+/// the projection, then orders/pages.
+#[allow(clippy::too_many_arguments)]
+async fn window_select(
+    db: &Session,
+    def: &TableDef,
+    select: &Select,
+    filter: Option<&Expr>,
+    order_exprs: &[(Expr, bool)],
+    offset: usize,
+    limit: Option<usize>,
+) -> Result<QueryResult> {
+    use sqlparser::ast::SelectItem;
+    let rows = scan_rows(db, def, filter).await?;
+    let schema = &def.schema;
+
+    // Precompute each window function's value per row.
+    let mut win_exprs: Vec<Expr> = Vec::new();
+    for item in &select.projection {
+        if let SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } = item {
+            collect_window_exprs(e, &mut win_exprs);
+        }
+    }
+    let mut win_values: Vec<(Expr, Vec<Value>)> = Vec::new();
+    for we in &win_exprs {
+        let vals = compute_window(&rows, schema, we)?;
+        win_values.push((we.clone(), vals));
+    }
+
+    // Build output rows: substitute each window result, then evaluate.
+    let mut out_rows: Vec<Vec<Value>> = Vec::with_capacity(rows.len());
+    for (i, row) in rows.iter().enumerate() {
+        let subst = |e: &Expr| -> Option<Expr> {
+            win_values
+                .iter()
+                .find(|(we, _)| we == e)
+                .map(|(_, vals)| value_to_expr(&vals[i]))
+        };
+        let mut vals = Vec::with_capacity(select.projection.len());
+        for item in &select.projection {
+            let expr = match item {
+                SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => e,
+                other => {
+                    return Err(Error::Unsupported(format!(
+                        "projection item not supported with window functions: {other}"
+                    )))
+                }
+            };
+            let bound = map_expr(expr, &subst);
+            vals.push(predicate::eval_row(&bound, schema, row)?);
+        }
+        out_rows.push(vals);
+    }
+
+    // Output schema (names + inferred types).
+    let mut cols = Vec::with_capacity(select.projection.len());
+    for (ci, item) in select.projection.iter().enumerate() {
+        let name = match item {
+            SelectItem::ExprWithAlias { alias, .. } => alias.value.clone(),
+            SelectItem::UnnamedExpr(e) => ident_name(e)
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| e.to_string()),
+            _ => format!("col{ci}"),
+        };
+        let ty = out_rows
+            .iter()
+            .map(|r| &r[ci])
+            .find(|v| !v.is_null())
+            .map(infer_val)
+            .unwrap_or(ColumnType::Text);
+        cols.push(ColumnDef {
+            name,
+            ty,
+            nullable: true,
+        });
+    }
+    let out_schema = Schema::new(cols);
+    order_output_rows(&mut out_rows, &out_schema, order_exprs)?;
+    apply_offset_limit(&mut out_rows, offset, limit);
+    Ok(QueryResult::Rows(RowStream::literal(out_schema, out_rows)))
+}
+
+/// Compute a window function's value for every input row (indexed by original
+/// position). Supports ROW_NUMBER/RANK/DENSE_RANK, SUM/COUNT/AVG/MIN/MAX (as
+/// running aggregates when ordered, else over the whole partition), and
+/// LAG/LEAD.
+fn compute_window(rows: &[Vec<Value>], schema: &Schema, func: &Expr) -> Result<Vec<Value>> {
+    let Expr::Function(f) = func else {
+        return Err(Error::Unsupported("expected a window function".into()));
+    };
+    let name = f
+        .name
+        .0
+        .last()
+        .map(|i| i.value.to_ascii_lowercase())
+        .unwrap_or_default();
+    let spec = match &f.over {
+        Some(sqlparser::ast::WindowType::WindowSpec(s)) => s,
+        _ => return Err(Error::Unsupported("named windows are not supported".into())),
+    };
+    let args = fn_arg_exprs(f);
+
+    // Partition rows (preserving first-seen order), then sort each partition.
+    let mut partitions: Vec<(String, Vec<usize>)> = Vec::new();
+    let mut index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (i, row) in rows.iter().enumerate() {
+        let mut key = String::new();
+        for p in &spec.partition_by {
+            key.push_str(&format!("{:?}\u{1}", predicate::eval_row(p, schema, row)?));
+        }
+        let slot = *index.entry(key.clone()).or_insert_with(|| {
+            partitions.push((key, Vec::new()));
+            partitions.len() - 1
+        });
+        partitions[slot].1.push(i);
+    }
+
+    let order: Vec<(Expr, bool)> = spec
+        .order_by
+        .iter()
+        .map(|o| (o.expr.clone(), o.asc.unwrap_or(true)))
+        .collect();
+    let ordered = !order.is_empty();
+
+    let mut result = vec![Value::Null; rows.len()];
+    for (_, mut idxs) in partitions {
+        if ordered {
+            let key_of = |i: usize| -> Result<Vec<Value>> {
+                order
+                    .iter()
+                    .map(|(e, _)| predicate::eval_row(e, schema, &rows[i]))
+                    .collect()
+            };
+            let mut keyed: Vec<(Vec<Value>, usize)> = idxs
+                .iter()
+                .map(|&i| Ok((key_of(i)?, i)))
+                .collect::<Result<_>>()?;
+            keyed.sort_by(|a, b| cmp_order_keys(&a.0, &b.0, &order));
+            idxs = keyed.iter().map(|(_, i)| *i).collect();
+        }
+
+        compute_partition(
+            &name,
+            &args,
+            rows,
+            schema,
+            &idxs,
+            ordered,
+            &order,
+            &mut result,
+        )?;
+    }
+    Ok(result)
+}
+
+fn cmp_order_keys(a: &[Value], b: &[Value], order: &[(Expr, bool)]) -> std::cmp::Ordering {
+    for (i, (_, asc)) in order.iter().enumerate() {
+        let o = a[i].total_cmp(&b[i]);
+        let o = if *asc { o } else { o.reverse() };
+        if o != std::cmp::Ordering::Equal {
+            return o;
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compute_partition(
+    name: &str,
+    args: &[&Expr],
+    rows: &[Vec<Value>],
+    schema: &Schema,
+    idxs: &[usize],
+    ordered: bool,
+    order: &[(Expr, bool)],
+    result: &mut [Value],
+) -> Result<()> {
+    let order_key = |i: usize| -> Result<Vec<Value>> {
+        order
+            .iter()
+            .map(|(e, _)| predicate::eval_row(e, schema, &rows[i]))
+            .collect()
+    };
+    let arg_val = |i: usize| -> Result<Value> {
+        match args.first() {
+            Some(e) => predicate::eval_row(e, schema, &rows[i]),
+            None => Ok(Value::Null),
+        }
+    };
+
+    match name {
+        "row_number" => {
+            for (pos, &i) in idxs.iter().enumerate() {
+                result[i] = Value::Int(pos as i64 + 1);
+            }
+        }
+        "rank" | "dense_rank" => {
+            let dense = name == "dense_rank";
+            let mut rank = 0i64;
+            let mut prev: Option<Vec<Value>> = None;
+            for (pos, &i) in idxs.iter().enumerate() {
+                let key = order_key(i)?;
+                if prev.as_ref() != Some(&key) {
+                    rank = if dense { rank + 1 } else { pos as i64 + 1 };
+                    prev = Some(key);
+                }
+                result[i] = Value::Int(rank);
+            }
+        }
+        "lag" | "lead" => {
+            let off = args
+                .get(1)
+                .and_then(|e| predicate::eval_row(e, schema, &rows[idxs[0]]).ok())
+                .and_then(|v| v.as_f64())
+                .unwrap_or(1.0) as isize;
+            let default = match args.get(2) {
+                Some(e) => predicate::eval_row(e, schema, &rows[idxs[0]])?,
+                None => Value::Null,
+            };
+            for (pos, &i) in idxs.iter().enumerate() {
+                let target = if name == "lag" {
+                    pos as isize - off
+                } else {
+                    pos as isize + off
+                };
+                result[i] = if target >= 0 && (target as usize) < idxs.len() {
+                    arg_val(idxs[target as usize])?
+                } else {
+                    default.clone()
+                };
+            }
+        }
+        "sum" | "count" | "avg" | "min" | "max" => {
+            // Frame: running (RANGE, incl. peers) when ordered, else whole partition.
+            let count_star = name == "count" && args.is_empty();
+            if !ordered {
+                let vals: Vec<Value> = idxs.iter().map(|&i| arg_val(i)).collect::<Result<_>>()?;
+                let agg = if count_star {
+                    Value::Int(idxs.len() as i64)
+                } else {
+                    agg_over(name, &vals, idxs.len())
+                };
+                for &i in idxs {
+                    result[i] = agg.clone();
+                }
+            } else {
+                // Group peers by order key; aggregate cumulatively.
+                let mut p = 0;
+                let mut acc: Vec<Value> = Vec::new();
+                while p < idxs.len() {
+                    let key = order_key(idxs[p])?;
+                    let mut q = p;
+                    while q < idxs.len() && order_key(idxs[q])? == key {
+                        acc.push(arg_val(idxs[q])?);
+                        q += 1;
+                    }
+                    let agg = if count_star {
+                        Value::Int(acc.len() as i64)
+                    } else {
+                        agg_over(name, &acc, acc.len())
+                    };
+                    for &i in &idxs[p..q] {
+                        result[i] = agg.clone();
+                    }
+                    p = q;
+                }
+            }
+        }
+        other => {
+            return Err(Error::Unsupported(format!(
+                "window function not supported: {other}"
+            )))
+        }
+    }
+    Ok(())
+}
+
+fn agg_over(name: &str, vals: &[Value], count_star: usize) -> Value {
+    match name {
+        "count" => Value::Int(vals.iter().filter(|v| !v.is_null()).count() as i64),
+        "sum" | "avg" => {
+            let nums: Vec<f64> = vals.iter().filter_map(|v| v.as_f64()).collect();
+            if nums.is_empty() {
+                return Value::Null;
+            }
+            let sum: f64 = nums.iter().sum();
+            if name == "avg" {
+                Value::Float(sum / nums.len() as f64)
+            } else if vals
+                .iter()
+                .all(|v| matches!(v, Value::Int(_) | Value::Null))
+            {
+                Value::Int(sum as i64)
+            } else {
+                Value::Float(sum)
+            }
+        }
+        "min" => vals
+            .iter()
+            .filter(|v| !v.is_null())
+            .min_by(|a, b| a.total_cmp(b))
+            .cloned()
+            .unwrap_or(Value::Null),
+        "max" => vals
+            .iter()
+            .filter(|v| !v.is_null())
+            .max_by(|a, b| a.total_cmp(b))
+            .cloned()
+            .unwrap_or(Value::Null),
+        _ => {
+            let _ = count_star;
+            Value::Null
+        }
+    }
 }
 
 /// True if a projection contains any subquery (scalar/IN/EXISTS).
