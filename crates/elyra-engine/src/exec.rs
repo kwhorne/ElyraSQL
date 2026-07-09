@@ -131,6 +131,7 @@ pub async fn create_table(
     let mut columns = Vec::with_capacity(ct.columns.len());
     let mut col_meta: Vec<ColMeta> = Vec::with_capacity(ct.columns.len());
     let mut pk_cols: Vec<usize> = Vec::new();
+    let mut indexes: Vec<IndexDef> = Vec::new();
 
     for (idx, col) in ct.columns.iter().enumerate() {
         let ty = map_type(&col.data_type)?;
@@ -139,11 +140,18 @@ pub async fn create_table(
         for opt in &col.options {
             match &opt.option {
                 ColumnOption::NotNull => nullable = false,
-                ColumnOption::Unique {
-                    is_primary: true, ..
-                } => {
-                    pk_cols.push(idx);
-                    nullable = false;
+                ColumnOption::Unique { is_primary, .. } => {
+                    if *is_primary {
+                        pk_cols.push(idx);
+                        nullable = false;
+                    } else {
+                        indexes.push(IndexDef {
+                            name: format!("uniq_{}", col.name.value),
+                            cols: vec![idx],
+                            unique: true,
+                            vector: false,
+                        });
+                    }
                 }
                 ColumnOption::Default(e) => meta.default = Some(e.to_string()),
                 ColumnOption::Generated {
@@ -168,20 +176,54 @@ pub async fn create_table(
         col_meta.push(meta);
     }
 
-    // Table-level PRIMARY KEY (single or composite).
+    // Table-level PRIMARY KEY / UNIQUE (single or composite).
     for c in &ct.constraints {
-        if let TableConstraint::PrimaryKey { columns: cols, .. } = c {
-            pk_cols.clear();
-            for ident in cols {
-                let i = columns
-                    .iter()
-                    .position(|c| c.name.eq_ignore_ascii_case(&ident.value))
-                    .ok_or_else(|| {
-                        Error::Catalog(format!("unknown primary key column: {}", ident.value))
-                    })?;
-                columns[i].nullable = false;
-                pk_cols.push(i);
+        match c {
+            TableConstraint::PrimaryKey { columns: cols, .. } => {
+                pk_cols.clear();
+                for ident in cols {
+                    let i = columns
+                        .iter()
+                        .position(|c| c.name.eq_ignore_ascii_case(&ident.value))
+                        .ok_or_else(|| {
+                            Error::Catalog(format!("unknown primary key column: {}", ident.value))
+                        })?;
+                    columns[i].nullable = false;
+                    pk_cols.push(i);
+                }
             }
+            TableConstraint::Unique {
+                name: cname,
+                columns: cols,
+                ..
+            } => {
+                let mut idxs = Vec::new();
+                for ident in cols {
+                    let i = columns
+                        .iter()
+                        .position(|c| c.name.eq_ignore_ascii_case(&ident.value))
+                        .ok_or_else(|| {
+                            Error::Catalog(format!("unknown unique column: {}", ident.value))
+                        })?;
+                    idxs.push(i);
+                }
+                let iname = cname.as_ref().map(|n| n.value.clone()).unwrap_or_else(|| {
+                    format!(
+                        "uniq_{}",
+                        idxs.iter()
+                            .map(|&i| columns[i].name.clone())
+                            .collect::<Vec<_>>()
+                            .join("_")
+                    )
+                });
+                indexes.push(IndexDef {
+                    name: iname,
+                    cols: idxs,
+                    unique: true,
+                    vector: false,
+                });
+            }
+            _ => {}
         }
     }
 
@@ -189,7 +231,7 @@ pub async fn create_table(
         name: name.clone(),
         schema: Schema::new(columns),
         pk_cols,
-        indexes: Vec::new(),
+        indexes,
         col_meta,
     };
     db.commit_write(vec![(catalog_key(&name), def.encode()?)], vec![])
@@ -1395,8 +1437,13 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
         let mut aux_puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         for (key, row) in &built {
             let enc = bincode::serialize(row).map_err(|e| Error::Storage(e.to_string()))?;
-            aux_puts.extend(index::entries_for_row(&def, row, key)?);
+            // Non-unique index entries may coexist (aux); the data key and any
+            // unique index entries must be new, so a duplicate PK or unique
+            // value is caught inside the write transaction.
+            let (nonuniq, uniq) = index::partition_entries_for_row(&def, row, key)?;
+            aux_puts.extend(nonuniq);
             new_puts.push((key.clone(), enc));
+            new_puts.extend(uniq);
         }
         aux_puts.push(bump_wcount(db, &name).await?);
         let affected = built.len() as u64;
@@ -1466,6 +1513,12 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
             affected += 1;
         }
     }
+    // Enforce unique secondary indexes for plain INSERT on the slow path
+    // (transactions, rowid tables) where writer-side detection is not used.
+    if !replace && !on_dup && !ignore && index::has_unique(&def) {
+        check_unique_batch(db, &def, &batch).await?;
+    }
+
     // Materialise the batch into data + index puts.
     let mut puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(batch.len() + 2);
     for (key, row) in &batch {
@@ -1511,6 +1564,42 @@ fn bind_values(expr: &Expr, insert_row: &[Value], schema: &Schema) -> Expr {
         }
         None
     })
+}
+
+/// Verify that no row in `batch` collides on a unique index, either with
+/// another row in the batch or an existing row owned by a different key.
+async fn check_unique_batch(
+    db: &Session,
+    def: &TableDef,
+    batch: &[(Vec<u8>, Vec<Value>)],
+) -> Result<()> {
+    let mut probes: Vec<(Vec<u8>, usize)> = Vec::new();
+    for (i, (_, row)) in batch.iter().enumerate() {
+        for pk in index::unique_probe_keys(def, row)? {
+            probes.push((pk, i));
+        }
+    }
+    if probes.is_empty() {
+        return Ok(());
+    }
+    // Two batch rows sharing a probe key violate uniqueness.
+    let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+    for (pk, _) in &probes {
+        if !seen.insert(pk.clone()) {
+            return Err(Error::Duplicate("Duplicate entry for a unique key".into()));
+        }
+    }
+    // A stored value under the probe key that belongs to a different row.
+    let keys: Vec<Vec<u8>> = probes.iter().map(|(k, _)| k.clone()).collect();
+    let existing = db.multi_get(keys).await?;
+    for ((_, i), owner) in probes.iter().zip(existing) {
+        if let Some(owner_key) = owner {
+            if owner_key != batch[*i].0 {
+                return Err(Error::Duplicate("Duplicate entry for a unique key".into()));
+            }
+        }
+    }
+    Ok(())
 }
 
 pub async fn select(
@@ -3202,6 +3291,8 @@ pub async fn update(
 
     let mut puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     let mut deletes: Vec<Vec<u8>> = Vec::new();
+    let check_uniq = index::has_unique(&def);
+    let mut uniq_batch: Vec<(Vec<u8>, Vec<Value>)> = Vec::new();
 
     for (old_key, old_row) in matches {
         let mut new_row = old_row.clone();
@@ -3233,6 +3324,10 @@ pub async fn update(
             old_key.clone()
         };
 
+        if check_uniq {
+            uniq_batch.push((new_key.clone(), new_row.clone()));
+        }
+
         // Index maintenance: drop old entries, write new ones. Deletes are
         // applied before puts, so unchanged index entries survive.
         deletes.extend(index::entry_keys_for_row(&def, &old_row, &old_key)?);
@@ -3243,6 +3338,10 @@ pub async fn update(
         let encoded = bincode::serialize(&new_row).map_err(|e| Error::Storage(e.to_string()))?;
         puts.push((new_key, encoded));
         puts.extend(new_index_entries);
+    }
+
+    if check_uniq {
+        check_unique_batch(db, &def, &uniq_batch).await?;
     }
 
     puts.push(bump_wcount(db, &name).await?);

@@ -15,6 +15,9 @@ use elyra_core::{Result, Value};
 use crate::catalog::{data_prefix, IndexDef, TableDef};
 use crate::keyenc;
 
+/// A stored key/value pair.
+type Entry = (Vec<u8>, Vec<u8>);
+
 fn index_prefix(table: &str, index: &str) -> Vec<u8> {
     format!("index::{table}::{index}::").into_bytes()
 }
@@ -27,11 +30,81 @@ fn value_prefix(table: &str, index: &str, values: &[Value]) -> Result<Vec<u8>> {
     Ok(k)
 }
 
-fn entry_key(table: &str, index: &str, values: &[Value], data_key: &[u8]) -> Result<Vec<u8>> {
+fn entry_key(
+    table: &str,
+    index: &str,
+    values: &[Value],
+    data_key: &[u8],
+    unique: bool,
+) -> Result<Vec<u8>> {
     let mut k = value_prefix(table, index, values)?;
-    let clustered = &data_key[data_prefix(table).len()..];
-    k.extend_from_slice(clustered);
+    // A UNIQUE index keys purely on the indexed values, so two rows with the
+    // same value collide (enforcing uniqueness). A non-unique index appends the
+    // clustered key so rows with equal values coexist.
+    if !unique {
+        let clustered = &data_key[data_prefix(table).len()..];
+        k.extend_from_slice(clustered);
+    }
     Ok(k)
+}
+
+/// The probe key for a unique index's value tuple (== its entry key). A stored
+/// value at this key means some row already holds the tuple.
+pub fn unique_probe_key(table: &str, index: &str, values: &[Value]) -> Result<Vec<u8>> {
+    value_prefix(table, index, values)
+}
+
+/// Split a row's index entries into (non-unique, unique). Unique entries
+/// enforce uniqueness by colliding on duplicate value tuples. NULL tuples are
+/// skipped in both (multiple NULLs are allowed in a unique index).
+pub fn partition_entries_for_row(
+    def: &TableDef,
+    row: &[Value],
+    data_key: &[u8],
+) -> Result<(Vec<Entry>, Vec<Entry>)> {
+    let mut nonuniq = Vec::new();
+    let mut uniq = Vec::new();
+    for idx in &def.indexes {
+        if idx.vector {
+            continue;
+        }
+        let values: Vec<Value> = idx.cols.iter().map(|&c| row[c].clone()).collect();
+        if values.iter().any(|v| v.is_null()) || keyenc::encode_key(&values).is_err() {
+            continue;
+        }
+        let entry = (
+            entry_key(&def.name, &idx.name, &values, data_key, idx.unique)?,
+            data_key.to_vec(),
+        );
+        if idx.unique {
+            uniq.push(entry);
+        } else {
+            nonuniq.push(entry);
+        }
+    }
+    Ok((nonuniq, uniq))
+}
+
+/// Probe keys for every unique index over `row` (skipping NULL tuples), for
+/// existence checks on paths that cannot use writer-side collision detection.
+pub fn unique_probe_keys(def: &TableDef, row: &[Value]) -> Result<Vec<Vec<u8>>> {
+    let mut out = Vec::new();
+    for idx in &def.indexes {
+        if idx.vector || !idx.unique {
+            continue;
+        }
+        let values: Vec<Value> = idx.cols.iter().map(|&c| row[c].clone()).collect();
+        if values.iter().any(|v| v.is_null()) || keyenc::encode_key(&values).is_err() {
+            continue;
+        }
+        out.push(unique_probe_key(&def.name, &idx.name, &values)?);
+    }
+    Ok(out)
+}
+
+/// True if the table has any enforceable unique secondary index.
+pub fn has_unique(def: &TableDef) -> bool {
+    def.indexes.iter().any(|i| i.unique && !i.vector)
 }
 
 /// Index entries (key, value) for one row. Skips an index when any of its
@@ -51,7 +124,7 @@ pub fn entries_for_row(
             continue;
         }
         out.push((
-            entry_key(&def.name, &idx.name, &values, data_key)?,
+            entry_key(&def.name, &idx.name, &values, data_key, idx.unique)?,
             data_key.to_vec(),
         ));
     }
