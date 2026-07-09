@@ -246,6 +246,16 @@ pub async fn create_table(
                         })?;
                     fk_cols.push(i);
                 }
+                // Index the referencing columns so parent-side checks (RESTRICT
+                // / CASCADE / SET NULL) can find child rows efficiently.
+                if !indexes.iter().any(|ix| ix.cols == fk_cols) && pk_cols != fk_cols {
+                    indexes.push(IndexDef {
+                        name: format!("fk_{name}_{}", foreign_keys.len()),
+                        cols: fk_cols.clone(),
+                        unique: false,
+                        vector: false,
+                    });
+                }
                 foreign_keys.push(ForeignKey {
                     name: fname
                         .as_ref()
@@ -1478,6 +1488,9 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
     // transaction itself (redb returns the previous value), avoiding any
     // existence read. This is the bulk-load hot path.
     if !replace && !on_dup && !ignore && has_pk && !db.in_txn() {
+        if !def.foreign_keys.is_empty() {
+            check_fk_batch(db, &def, &built).await?;
+        }
         let mut new_puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(built.len());
         let mut aux_puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         for (key, row) in &built {
@@ -1563,6 +1576,9 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
     if !replace && !on_dup && !ignore && index::has_unique(&def) {
         check_unique_batch(db, &def, &batch).await?;
     }
+    if !def.foreign_keys.is_empty() {
+        check_fk_batch(db, &def, &batch).await?;
+    }
 
     // Materialise the batch into data + index puts.
     let mut puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(batch.len() + 2);
@@ -1641,6 +1657,62 @@ fn check_row(def: &TableDef, checks: &[Expr], row: &[Value]) -> Result<()> {
                 "CHECK constraint violated for '{}'",
                 def.name
             )));
+        }
+    }
+    Ok(())
+}
+
+/// The parent-table storage key to probe for a referenced-key's existence.
+/// Foreign keys must reference the parent's primary key or a unique index.
+fn fk_probe_key(parent: &TableDef, ref_cols: &[String], vals: &[Value]) -> Result<Vec<u8>> {
+    let name_match = |cols: &[usize]| {
+        cols.len() == ref_cols.len()
+            && cols
+                .iter()
+                .zip(ref_cols)
+                .all(|(&i, rc)| parent.schema.columns[i].name.eq_ignore_ascii_case(rc))
+    };
+    if !parent.pk_cols.is_empty() && name_match(&parent.pk_cols) {
+        return Ok(data_key(&parent.name, &keyenc::encode_key(vals)?));
+    }
+    for idx in &parent.indexes {
+        if idx.unique && !idx.vector && name_match(&idx.cols) {
+            return index::unique_probe_key(&parent.name, &idx.name, vals);
+        }
+    }
+    Err(Error::Query(format!(
+        "foreign key must reference the primary key or a unique index of '{}'",
+        parent.name
+    )))
+}
+
+/// Verify every foreign key of `def` for the rows in `batch`: each non-NULL
+/// referencing tuple must exist in the parent (error 1452 otherwise).
+async fn check_fk_batch(
+    db: &Session,
+    def: &TableDef,
+    batch: &[(Vec<u8>, Vec<Value>)],
+) -> Result<()> {
+    for fk in &def.foreign_keys {
+        let parent = catalog::load(db, &fk.ref_table).await?;
+        let mut probes = Vec::new();
+        for (_, row) in batch {
+            let vals: Vec<Value> = fk.columns.iter().map(|&i| row[i].clone()).collect();
+            if vals.iter().any(|v| v.is_null()) {
+                continue; // a NULL in the referencing tuple is allowed
+            }
+            probes.push(fk_probe_key(&parent, &fk.ref_columns, &vals)?);
+        }
+        if probes.is_empty() {
+            continue;
+        }
+        for found in db.multi_get(probes).await? {
+            if found.is_none() {
+                return Err(Error::ForeignKey(format!(
+                    "a row in '{}' has no matching parent in '{}' (constraint '{}')",
+                    def.name, fk.ref_table, fk.name
+                )));
+            }
         }
     }
     Ok(())
@@ -3372,6 +3444,7 @@ pub async fn update(
     let mut puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     let mut deletes: Vec<Vec<u8>> = Vec::new();
     let check_uniq = index::has_unique(&def);
+    let check_fk = !def.foreign_keys.is_empty();
     let mut uniq_batch: Vec<(Vec<u8>, Vec<Value>)> = Vec::new();
     let checks = parse_checks(&def)?;
 
@@ -3406,7 +3479,7 @@ pub async fn update(
             old_key.clone()
         };
 
-        if check_uniq {
+        if check_uniq || check_fk {
             uniq_batch.push((new_key.clone(), new_row.clone()));
         }
 
@@ -3424,6 +3497,9 @@ pub async fn update(
 
     if check_uniq {
         check_unique_batch(db, &def, &uniq_batch).await?;
+    }
+    if check_fk {
+        check_fk_batch(db, &def, &uniq_batch).await?;
     }
 
     puts.push(bump_wcount(db, &name).await?);
@@ -3452,15 +3528,162 @@ pub async fn delete(db: &Session, vindex: &VectorRegistry, del: &Delete) -> Resu
         mutation_matches(db, vindex, &def, &qualifier, del.selection.as_ref(), limit).await?;
     let affected = matches.len() as u64;
 
-    let mut deletes: Vec<Vec<u8>> = Vec::with_capacity(matches.len());
+    let mut puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    let mut deletes: Vec<Vec<u8>> = Vec::new();
+    let mut wcounts: Vec<String> = vec![name.clone()];
+
+    // Foreign keys referencing this table: RESTRICT / CASCADE / SET NULL.
+    cascade_parent_delete(db, &def, &matches, &mut puts, &mut deletes, &mut wcounts).await?;
+
     for (key, row) in matches {
         deletes.extend(index::entry_keys_for_row(&def, &row, &key)?);
         deletes.push(key);
     }
-
-    let wc = bump_wcount(db, &name).await?;
-    db.commit_write(vec![wc], deletes).await?;
+    for t in wcounts {
+        puts.push(bump_wcount(db, &t).await?);
+    }
+    db.commit_write(puts, deletes).await?;
     Ok(QueryResult::Affected(affected))
+}
+
+/// Tables (other than `parent`) that declare a foreign key referencing it.
+async fn referencing_children(db: &Session, parent: &str) -> Result<Vec<TableDef>> {
+    let mut out = Vec::new();
+    for t in catalog::list_tables(db).await? {
+        if t.eq_ignore_ascii_case(parent) {
+            continue;
+        }
+        let def = catalog::load(db, &t).await?;
+        if def
+            .foreign_keys
+            .iter()
+            .any(|fk| fk.ref_table.eq_ignore_ascii_case(parent))
+        {
+            out.push(def);
+        }
+    }
+    Ok(out)
+}
+
+/// Apply referential actions for deleted `parent` rows: block on RESTRICT/NO
+/// ACTION, delete child rows on CASCADE, or null their FK columns on SET NULL.
+/// (Single level — cascades do not currently recurse into grandchildren.)
+async fn cascade_parent_delete(
+    db: &Session,
+    parent: &TableDef,
+    matches: &[(Vec<u8>, Vec<Value>)],
+    puts: &mut Vec<(Vec<u8>, Vec<u8>)>,
+    deletes: &mut Vec<Vec<u8>>,
+    wcounts: &mut Vec<String>,
+) -> Result<()> {
+    let children = referencing_children(db, &parent.name).await?;
+    if children.is_empty() || matches.is_empty() {
+        return Ok(());
+    }
+    for child in &children {
+        let mut touched = false;
+        for fk in &child
+            .foreign_keys
+            .iter()
+            .filter(|fk| fk.ref_table.eq_ignore_ascii_case(&parent.name))
+            .cloned()
+            .collect::<Vec<_>>()
+        {
+            for (_, prow) in matches {
+                let refvals: Vec<Value> = fk
+                    .ref_columns
+                    .iter()
+                    .filter_map(|rc| {
+                        parent
+                            .schema
+                            .columns
+                            .iter()
+                            .position(|c| c.name.eq_ignore_ascii_case(rc))
+                            .map(|i| prow[i].clone())
+                    })
+                    .collect();
+                if refvals.len() != fk.ref_columns.len() || refvals.iter().any(|v| v.is_null()) {
+                    continue;
+                }
+                let child_rows = lookup_child_rows(db, child, &fk.columns, &refvals).await?;
+                if child_rows.is_empty() {
+                    continue;
+                }
+                match fk.on_delete {
+                    RefAction::Cascade => {
+                        for (ck, crow) in child_rows {
+                            deletes.extend(index::entry_keys_for_row(child, &crow, &ck)?);
+                            deletes.push(ck);
+                        }
+                        touched = true;
+                    }
+                    RefAction::SetNull => {
+                        for (ck, crow) in child_rows {
+                            let mut nrow = crow.clone();
+                            for &fc in &fk.columns {
+                                nrow[fc] = Value::Null;
+                            }
+                            deletes.extend(index::entry_keys_for_row(child, &crow, &ck)?);
+                            let enc = bincode::serialize(&nrow)
+                                .map_err(|e| Error::Storage(e.to_string()))?;
+                            puts.push((ck.clone(), enc));
+                            puts.extend(index::entries_for_row(child, &nrow, &ck)?);
+                        }
+                        touched = true;
+                    }
+                    _ => {
+                        return Err(Error::ForeignKey(format!(
+                            "cannot delete from '{}': rows in '{}' reference it (constraint '{}')",
+                            parent.name, child.name, fk.name
+                        )));
+                    }
+                }
+            }
+        }
+        if touched {
+            wcounts.push(child.name.clone());
+        }
+    }
+    Ok(())
+}
+
+/// Child rows whose columns `cols` equal `vals` (via an index if present, else
+/// a scan).
+async fn lookup_child_rows(
+    db: &Session,
+    child: &TableDef,
+    cols: &[usize],
+    vals: &[Value],
+) -> Result<Vec<(Vec<u8>, Vec<Value>)>> {
+    // Prefer an index on exactly these columns.
+    if let Some(idx) = child
+        .indexes
+        .iter()
+        .find(|ix| !ix.vector && ix.cols == cols)
+    {
+        let data_keys = index::lookup_eq(db, &child.name, idx, vals).await?;
+        let blobs = db.multi_get(data_keys.clone()).await?;
+        let mut out = Vec::new();
+        for (k, b) in data_keys.into_iter().zip(blobs) {
+            if let Some(bytes) = b {
+                out.push((
+                    k,
+                    bincode::deserialize(&bytes).map_err(|e| Error::Storage(e.to_string()))?,
+                ));
+            }
+        }
+        return Ok(out);
+    }
+    // Fallback: scan the child and filter.
+    let all = collect_matches(db, child, None, None).await?;
+    Ok(all
+        .into_iter()
+        .filter(|(_, row)| {
+            cols.iter()
+                .zip(vals)
+                .all(|(&c, v)| row[c].compare(v) == Some(std::cmp::Ordering::Equal))
+        })
+        .collect())
 }
 
 /// A plain table participating in a multi-table mutation, plus the combined

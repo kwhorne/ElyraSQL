@@ -24,6 +24,9 @@ pub enum Error {
     #[error("duplicate entry: {0}")]
     Duplicate(String),
 
+    #[error("foreign key constraint: {0}")]
+    ForeignKey(String),
+
     #[error("type error: {0}")]
     Type(String),
 
@@ -51,6 +54,7 @@ impl Error {
             Error::Unsupported(_) => 1235, // ER_NOT_SUPPORTED_YET
             Error::Conflict(_) => 1213,    // ER_LOCK_DEADLOCK (serialization failure)
             Error::Duplicate(_) => 1062,   // ER_DUP_ENTRY
+            Error::ForeignKey(_) => 1452,  // ER_NO_REFERENCED_ROW
             _ => 1105,
         }
     }
