@@ -3316,6 +3316,32 @@ async fn build_from(
     from: &[TableWithJoins],
     conjuncts: &[Expr],
 ) -> Result<(Vec<ColumnDef>, Vec<Vec<Value>>)> {
+    // Cost-based reordering of an explicit INNER-join chain over base tables:
+    // build from the smallest tables and always extend along a join predicate,
+    // keeping intermediate results small.
+    if from.len() == 1 {
+        let twj = &from[0];
+        let all_inner = twj.joins.iter().all(|j| {
+            matches!(
+                j.join_operator,
+                JoinOperator::Inner(_) | JoinOperator::CrossJoin
+            )
+        });
+        let all_tables = matches!(twj.relation, TableFactor::Table { .. })
+            && twj
+                .joins
+                .iter()
+                .all(|j| matches!(j.relation, TableFactor::Table { .. }));
+        if !twj.joins.is_empty() && all_inner && all_tables {
+            if let Some(res) = build_inner_join_reordered(db, vindex, twj, conjuncts).await? {
+                return Ok(res);
+            }
+            // Fell back (a predicate wasn't a clean equi-connector): use the
+            // sequential left-to-right plan below, which applies each ON at its
+            // own two-relation step.
+        }
+    }
+
     let mut cur_cols: Vec<ColumnDef> = Vec::new();
     let mut cur_rows: Vec<Vec<Value>> = Vec::new();
     let mut first = true;
@@ -3424,6 +3450,138 @@ async fn build_from(
     Ok((cur_cols, cur_rows))
 }
 
+/// Execute an all-INNER join chain over base tables in a cost-based order.
+/// Loads each table (with predicate pushdown), then greedily joins starting from
+/// the smallest, always extending along an available equi-join predicate.
+async fn build_inner_join_reordered(
+    db: &Session,
+    vindex: &VectorRegistry,
+    twj: &TableWithJoins,
+    conjuncts: &[Expr],
+) -> Result<Option<(Vec<ColumnDef>, Vec<Vec<Value>>)>> {
+    // Collect relations and ON predicates. A CROSS JOIN contributes no predicate.
+    let mut relations: Vec<&TableFactor> = vec![&twj.relation];
+    let mut on_preds: Vec<Expr> = Vec::new();
+    for j in &twj.joins {
+        relations.push(&j.relation);
+        if let (_, Some(e)) = join_kind(&j.join_operator)? {
+            on_preds.push(e);
+        }
+    }
+    // Only reorder when every join is a single equi-condition connector (the
+    // common case). Anything else (multi-condition/non-equi ON) falls back to
+    // the sequential plan, which applies each ON at its own two-relation step.
+    for p in &on_preds {
+        if !matches!(
+            p,
+            Expr::BinaryOp {
+                op: sqlparser::ast::BinaryOperator::Eq,
+                ..
+            }
+        ) {
+            return Ok(None);
+        }
+    }
+    // As many equi connectors as (tables - 1) are needed to connect the graph.
+    if on_preds.len() + 1 < relations.len() {
+        return Ok(None);
+    }
+
+    // Load each relation (materialize + pushdown) and estimate its size.
+    struct Loaded {
+        cols: Vec<ColumnDef>,
+        rows: Vec<Vec<Value>>,
+        est: u64,
+    }
+    let mut loaded: Vec<Loaded> = Vec::with_capacity(relations.len());
+    for rel in &relations {
+        let (cols, mut rows) = load_relation(db, vindex, rel, conjuncts).await?;
+        rows = apply_pushdown(rows, &cols, conjuncts)?;
+        // Prefer the actual loaded size (already filtered) as the cost estimate.
+        let est = rows.len() as u64;
+        loaded.push(Loaded { cols, rows, est });
+    }
+
+    // Start from the smallest relation.
+    let mut remaining: Vec<usize> = (0..loaded.len()).collect();
+    remaining.sort_by_key(|&i| loaded[i].est);
+    let start = remaining.remove(0);
+    let mut cur_cols = std::mem::take(&mut loaded[start].cols);
+    let mut cur_rows = std::mem::take(&mut loaded[start].rows);
+
+    while !remaining.is_empty() {
+        // Among the remaining tables, pick the smallest one connected to what
+        // we've built by an equi-join predicate whose two sides' *aliases* span
+        // the built set and that table. (Alias-aware, so `c.id` never falsely
+        // matches another table's `id` column.) If none connects, fall back to
+        // the sequential plan.
+        let cur_aliases = relation_aliases(&cur_cols);
+        let mut best: Option<(usize, Expr)> = None; // (pos in remaining, connecting pred)
+        let mut best_est = u64::MAX;
+        for (pos, &i) in remaining.iter().enumerate() {
+            let t_aliases = relation_aliases(&loaded[i].cols);
+            for pred in &on_preds {
+                if let Some((lq, rq)) = equi_qualifiers(pred) {
+                    let connects = (cur_aliases.contains(&lq) && t_aliases.contains(&rq))
+                        || (cur_aliases.contains(&rq) && t_aliases.contains(&lq));
+                    if connects && loaded[i].est < best_est {
+                        best_est = loaded[i].est;
+                        best = Some((pos, pred.clone()));
+                        break;
+                    }
+                }
+            }
+        }
+        let Some((pos, pred)) = best else {
+            return Ok(None);
+        };
+        let idx = remaining.remove(pos);
+        let rcols = std::mem::take(&mut loaded[idx].cols);
+        let rrows = std::mem::take(&mut loaded[idx].rows);
+        let (c, r) = combine(
+            &cur_cols,
+            &cur_rows,
+            &rcols,
+            &rrows,
+            JoinKind::Inner,
+            Some(&pred),
+        )?;
+        cur_cols = c;
+        cur_rows = r;
+    }
+    Ok(Some((cur_cols, cur_rows)))
+}
+
+/// The set of alias/table qualifiers present in a relation's column names
+/// (`"o.cust"` -> `"o"`).
+fn relation_aliases(cols: &[ColumnDef]) -> std::collections::HashSet<String> {
+    cols.iter()
+        .filter_map(|c| c.name.split_once('.').map(|(q, _)| q.to_ascii_lowercase()))
+        .collect()
+}
+
+/// For an equi predicate `A.x = B.y`, the two operand qualifiers `(a, b)`.
+fn equi_qualifiers(pred: &Expr) -> Option<(String, String)> {
+    let Expr::BinaryOp {
+        left,
+        op: sqlparser::ast::BinaryOperator::Eq,
+        right,
+    } = pred
+    else {
+        return None;
+    };
+    Some((expr_qualifier(left)?, expr_qualifier(right)?))
+}
+
+fn expr_qualifier(e: &Expr) -> Option<String> {
+    match e {
+        Expr::CompoundIdentifier(parts) if parts.len() >= 2 => {
+            Some(parts[parts.len() - 2].value.to_ascii_lowercase())
+        }
+        _ => None,
+    }
+}
+
 /// Filter `rows` by every conjunct that references only this relation's
 /// columns (predicate pushdown).
 fn apply_pushdown(
@@ -3498,10 +3656,24 @@ fn combine(
     let lschema = Schema::new(lcols.to_vec());
     let rschema = Schema::new(rcols.to_vec());
 
-    // Hash join for equi INNER/LEFT/RIGHT (cost-based build side).
+    // Hash join for equi INNER/LEFT/RIGHT (cost-based build side). For large
+    // INNER equi-joins whose inputs are already sorted on the join key (e.g.
+    // clustered primary-key scans), use a streaming merge join instead — no hash
+    // table, and the output stays ordered.
     if matches!(kind, JoinKind::Inner | JoinKind::Left | JoinKind::Right) {
         if let Some(e) = on {
             if let Some((lkey, rkey)) = equi_keys(e, &lschema, &rschema) {
+                const MERGE_MIN: usize = 2048;
+                if kind == JoinKind::Inner && lrows.len() >= MERGE_MIN && rrows.len() >= MERGE_MIN {
+                    if let (Some(lk), Some(rk)) = (
+                        sorted_keyed(lrows, &lschema, &lkey)?,
+                        sorted_keyed(rrows, &rschema, &rkey)?,
+                    ) {
+                        if let Some(out) = merge_join_inner(lk, rk) {
+                            return Ok((cols, out));
+                        }
+                    }
+                }
                 let rows = hash_join(lrows, rrows, &lschema, &rschema, &lkey, &rkey, kind)?;
                 return Ok((cols, rows));
             }
@@ -3634,6 +3806,70 @@ fn hash_join(
         }
     }
     Ok(out)
+}
+
+/// A join key paired with its source row (for merge join).
+type KeyedRows<'a> = Vec<(Value, &'a Vec<Value>)>;
+
+/// If every non-NULL key is non-decreasing, return the (key, row) pairs with
+/// NULL-key rows dropped (they never match an equi-join), ready for a merge
+/// join; otherwise `None` (the input is not sorted on the key).
+fn sorted_keyed<'a>(
+    rows: &'a [Vec<Value>],
+    schema: &Schema,
+    key: &Expr,
+) -> Result<Option<KeyedRows<'a>>> {
+    let mut out: Vec<(Value, &Vec<Value>)> = Vec::with_capacity(rows.len());
+    for r in rows {
+        let k = predicate::eval_row(key, schema, r)?;
+        if k.is_null() {
+            continue;
+        }
+        if let Some((prev, _)) = out.last() {
+            match prev.compare(&k) {
+                Some(std::cmp::Ordering::Greater) | None => return Ok(None),
+                _ => {}
+            }
+        }
+        out.push((k, r));
+    }
+    Ok(Some(out))
+}
+
+/// Streaming merge join of two key-sorted, NULL-free inputs (INNER equi-join).
+/// Returns `None` if two keys are incomparable (mixed types), so the caller can
+/// fall back to a hash join.
+fn merge_join_inner(l: KeyedRows, r: KeyedRows) -> Option<Vec<Vec<Value>>> {
+    use std::cmp::Ordering;
+    let mut out = Vec::new();
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < l.len() && j < r.len() {
+        match l[i].0.compare(&r[j].0)? {
+            Ordering::Less => i += 1,
+            Ordering::Greater => j += 1,
+            Ordering::Equal => {
+                // Emit the cartesian product of the equal-key blocks on both sides.
+                let mut ie = i;
+                while ie < l.len() && l[ie].0.compare(&l[i].0)? == Ordering::Equal {
+                    ie += 1;
+                }
+                let mut je = j;
+                while je < r.len() && r[je].0.compare(&r[j].0)? == Ordering::Equal {
+                    je += 1;
+                }
+                for a in &l[i..ie] {
+                    for b in &r[j..je] {
+                        let mut combined = a.1.clone();
+                        combined.extend_from_slice(b.1);
+                        out.push(combined);
+                    }
+                }
+                i = ie;
+                j = je;
+            }
+        }
+    }
+    Some(out)
 }
 
 /// Hash-key string for a value; `None` for NULL (never matches, per SQL).

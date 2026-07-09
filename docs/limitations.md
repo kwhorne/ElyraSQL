@@ -42,8 +42,16 @@ implemented, so you can judge fit.
   ranges fall back to a scan.
 - Equi joins (INNER/LEFT/RIGHT) use a hash join with a cost-based build side
   (the smaller relation for INNER; an index nested-loop join when the driving
-  side is small and the partner is indexed). `FULL` and non-equi joins use
-  nested-loop; there is no merge join.
+  side is small and the partner is indexed). Large INNER equi-joins whose inputs
+  are already sorted on the join key (e.g. clustered primary-key scans) use a
+  streaming **merge join** (no hash table, ordered output). `FULL` and non-equi
+  joins use nested-loop.
+- Explicit **INNER-join chains over base tables are reordered cost-based**: the
+  planner drives from the smallest relation and always extends along an
+  equi-join predicate, keeping intermediate results small. Reordering is
+  alias-aware and applies only when every join is a single equi-connector;
+  outer joins, non-equi/multi-condition ON, and derived tables keep the
+  written order.
 - `ANALYZE TABLE` records row-count and per-column statistics (NDV, null count,
   min/max), surfaced as `information_schema.tables.TABLE_ROWS` and
   `information_schema.column_statistics`. The planner drives a comma cross-join
