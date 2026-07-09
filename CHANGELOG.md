@@ -4,6 +4,40 @@ All notable changes to ElyraSQL are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.8.5] - 2026-07-09
+
+Planner, security, and durability release.
+
+### Histogram-based cardinality
+
+- `ANALYZE TABLE` builds an equi-height histogram per column (reservoir sample),
+  exposed as a JSON `HISTOGRAM` in `information_schema.column_statistics`. The
+  planner estimates WHERE-predicate selectivity from histograms to order joins
+  by estimated (not just raw) row counts.
+
+### Roles, per-database grants & audit log
+
+- `CREATE ROLE` / `DROP ROLE`, `GRANT <role> TO <user>` / `REVOKE <role> FROM
+  <user>`; users inherit the global and per-table grants of their roles.
+- `GRANT ... ON db.*` is accepted (maps to a global grant, single database).
+- `--audit-log <path>` appends one line per executed statement
+  (`timestamp  conn_id  user  OK|ERR  sql`).
+
+### LOAD DATA INFILE & auth hardening
+
+- `LOAD DATA INFILE '<server path>' INTO TABLE t [FIELDS/LINES TERMINATED BY]
+  [IGNORE n LINES] [(cols)]` bulk-loads a server-side file (ADMIN required; `\N`
+  = NULL).
+- Connection salts now use the OS CSPRNG. (`caching_sha2_password` is not
+  implemented — the wire library lacks its multi-round exchange; MySQL 8 clients
+  negotiate down to `mysql_native_password`.)
+
+### Crash-safe cluster elections
+
+- Election state (current term + vote) is persisted to `<data>.raftstate`, so a
+  restarted node never double-votes in a term (Raft safety). Full Raft log
+  replication (pre-commit 2-phase durability) remains a dedicated milestone.
+
 ## [0.8.4] - 2026-07-09
 
 High-availability & query-planner release.
@@ -417,6 +451,7 @@ core CRUD with `WHERE`/`ORDER BY`/`LIMIT`, indexes, aggregation and `GROUP BY`,
 joins, prepared statements, authentication and TLS, vector search (exact +
 HNSW), parallel OLAP aggregation, and transactions with snapshot isolation.
 
+[0.8.5]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.8.5
 [0.8.4]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.8.4
 [0.8.3]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.8.3
 [0.8.2]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.8.2
