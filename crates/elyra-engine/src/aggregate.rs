@@ -76,6 +76,7 @@ fn agg_of(expr: &Expr) -> Option<(AggFunc, &sqlparser::ast::Function)> {
         "avg" => AggFunc::Avg,
         "min" => AggFunc::Min,
         "max" => AggFunc::Max,
+        "group_concat" => AggFunc::GroupConcat,
         _ => return None,
     };
     Some((func, f))
@@ -117,6 +118,23 @@ fn ident_of(expr: &Expr) -> Option<String> {
         ),
         _ => None,
     }
+}
+
+/// Extract a GROUP_CONCAT `SEPARATOR '...'` clause, if present.
+fn agg_separator(f: &sqlparser::ast::Function) -> Option<String> {
+    let FunctionArguments::List(list) = &f.args else {
+        return None;
+    };
+    for c in &list.clauses {
+        if let sqlparser::ast::FunctionArgumentClause::Separator(v) = c {
+            return match v {
+                sqlparser::ast::Value::SingleQuotedString(s)
+                | sqlparser::ast::Value::DoubleQuotedString(s) => Some(s.clone()),
+                other => Some(other.to_string()),
+            };
+        }
+    }
+    None
 }
 
 fn agg_arg(schema: &Schema, f: &sqlparser::ast::Function) -> Result<(Option<usize>, bool)> {
@@ -167,6 +185,7 @@ pub fn build_plan(
             let ty = match func {
                 AggFunc::CountStar | AggFunc::Count => ColumnType::Int,
                 AggFunc::Avg => ColumnType::Float,
+                AggFunc::GroupConcat => ColumnType::Text,
                 AggFunc::Sum | AggFunc::Min | AggFunc::Max => arg
                     .map(|i| schema.columns[i].ty.clone())
                     .unwrap_or(ColumnType::Float),
@@ -176,11 +195,13 @@ pub fn build_plan(
                 ty,
                 nullable: true,
             });
+            let separator = agg_separator(f);
             let idx = aggs.len();
             aggs.push(AggSpec {
                 func,
                 arg_col: arg,
                 distinct,
+                separator,
             });
             plan.push(OutCol::Agg(idx));
         } else {

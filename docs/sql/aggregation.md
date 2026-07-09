@@ -46,6 +46,17 @@ SELECT region, COUNT(*) AS n FROM sales GROUP BY region HAVING COUNT(*) >= 3;
 `HAVING` references must appear in the SELECT list (as an aggregate expression
 or an alias) or be a grouped column.
 
+## GROUP_CONCAT
+
+```sql
+SELECT region, GROUP_CONCAT(name) AS names FROM stores GROUP BY region;
+SELECT region, GROUP_CONCAT(DISTINCT name SEPARATOR '; ') FROM stores GROUP BY region;
+```
+
+`GROUP_CONCAT` concatenates a group's values (default separator `,`), and
+supports `DISTINCT` and a custom `SEPARATOR`. Ordering within the group follows
+row order (an inner `ORDER BY` is not yet applied).
+
 ## Window functions
 
 Window functions compute a value per row over a partition, without collapsing

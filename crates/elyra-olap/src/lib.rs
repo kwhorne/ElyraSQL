@@ -21,6 +21,7 @@ pub enum AggFunc {
     Avg,
     Min,
     Max,
+    GroupConcat,
 }
 
 /// One aggregate to compute: function, optional argument column, DISTINCT.
@@ -29,6 +30,8 @@ pub struct AggSpec {
     pub func: AggFunc,
     pub arg_col: Option<usize>,
     pub distinct: bool,
+    /// GROUP_CONCAT separator (default ",").
+    pub separator: Option<String>,
 }
 
 #[derive(Clone)]
@@ -38,6 +41,7 @@ struct Acc {
     sum_is_int: bool,
     extreme: Option<Value>,
     distinct: HashSet<String>,
+    concat: Vec<String>,
 }
 
 impl Acc {
@@ -48,6 +52,7 @@ impl Acc {
             sum_is_int: true,
             extreme: None,
             distinct: HashSet::new(),
+            concat: Vec::new(),
         }
     }
 }
@@ -131,7 +136,7 @@ impl GroupAggregator {
                 let results = accs
                     .iter()
                     .zip(&aggs)
-                    .map(|(acc, spec)| finish(acc, spec.func))
+                    .map(|(acc, spec)| finish(acc, spec))
                     .collect();
                 (sample.clone(), results)
             })
@@ -140,10 +145,7 @@ impl GroupAggregator {
 
     /// Results for an aggregate over zero rows (e.g. `COUNT(*)` -> 0).
     pub fn empty_result(&self) -> Vec<Value> {
-        self.aggs
-            .iter()
-            .map(|s| finish(&Acc::new(), s.func))
-            .collect()
+        self.aggs.iter().map(|s| finish(&Acc::new(), s)).collect()
     }
 }
 
@@ -187,6 +189,20 @@ fn update(acc: &mut Acc, func: AggFunc, val: Option<Value>, distinct: bool) {
                 }
             }
         }
+        AggFunc::GroupConcat => {
+            if let Some(v) = val {
+                if !v.is_null() {
+                    let s = v.to_wire_string().unwrap_or_default();
+                    if distinct {
+                        if acc.distinct.insert(s.clone()) {
+                            acc.concat.push(s);
+                        }
+                    } else {
+                        acc.concat.push(s);
+                    }
+                }
+            }
+        }
         AggFunc::Min | AggFunc::Max => {
             if let Some(v) = val {
                 if v.is_null() {
@@ -212,6 +228,7 @@ fn merge_acc(a: &mut Acc, b: Acc, func: AggFunc) {
     a.count += b.count;
     a.sum += b.sum;
     a.sum_is_int = a.sum_is_int && b.sum_is_int;
+    a.concat.extend(b.concat);
     for d in b.distinct {
         a.distinct.insert(d);
     }
@@ -233,8 +250,16 @@ fn merge_acc(a: &mut Acc, b: Acc, func: AggFunc) {
     }
 }
 
-fn finish(acc: &Acc, func: AggFunc) -> Value {
-    match func {
+fn finish(acc: &Acc, spec: &AggSpec) -> Value {
+    match spec.func {
+        AggFunc::GroupConcat => {
+            if acc.concat.is_empty() {
+                Value::Null
+            } else {
+                let sep = spec.separator.as_deref().unwrap_or(",");
+                Value::Text(acc.concat.join(sep))
+            }
+        }
         AggFunc::CountStar | AggFunc::Count => Value::Int(acc.count),
         AggFunc::Sum => {
             if acc.count == 0 {

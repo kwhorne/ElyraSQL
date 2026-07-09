@@ -494,21 +494,22 @@ async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec
             let mut rows = Vec::new();
             for tname in names {
                 let def = catalog::load(db, &tname).await?;
-                let mut push = |non_unique: i64, iname: &str, seq: usize, ci: usize, itype: &str| {
-                    let c = &def.schema.columns[ci];
-                    rows.push(vec![
-                        Value::Text("elyra".into()),
-                        Value::Text(tname.clone()),
-                        Value::Int(non_unique),
-                        Value::Text(iname.to_string()),
-                        Value::Int(seq as i64 + 1),
-                        Value::Text(c.name.clone()),
-                        Value::Text("A".into()),
-                        Value::Null,
-                        Value::Text(if c.nullable { "YES" } else { "" }.into()),
-                        Value::Text(itype.to_string()),
-                    ]);
-                };
+                let mut push =
+                    |non_unique: i64, iname: &str, seq: usize, ci: usize, itype: &str| {
+                        let c = &def.schema.columns[ci];
+                        rows.push(vec![
+                            Value::Text("elyra".into()),
+                            Value::Text(tname.clone()),
+                            Value::Int(non_unique),
+                            Value::Text(iname.to_string()),
+                            Value::Int(seq as i64 + 1),
+                            Value::Text(c.name.clone()),
+                            Value::Text("A".into()),
+                            Value::Null,
+                            Value::Text(if c.nullable { "YES" } else { "" }.into()),
+                            Value::Text(itype.to_string()),
+                        ]);
+                    };
                 for (seq, &ci) in def.pk_cols.iter().enumerate() {
                     push(0, "PRIMARY", seq, ci, "BTREE");
                 }
