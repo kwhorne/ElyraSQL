@@ -22,6 +22,7 @@ pub mod auth;
 pub mod cluster;
 mod observ;
 mod prepared;
+pub mod raftlog;
 pub mod repl;
 
 pub use auth::Auth;

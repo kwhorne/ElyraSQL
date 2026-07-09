@@ -164,11 +164,16 @@ implemented, so you can judge fit.
   new node before adding it. An even-node cluster can, rarely, need an extra
   election round to break a tie — run an odd number of nodes. Election state
   (current term + vote) is persisted to a `<data>.raftstate` file so a restarted
-  node never double-votes in a term (a Raft safety requirement). Full **Raft log
-  replication** — a replicated, apply-on-commit log with uncommitted-entry
-  truncation for pre-commit (2-phase) durability — is a dedicated future
-  milestone; today durability is async by default, with quorum/strict-sync plus
-  the election restriction giving no-data-loss for acknowledged writes.
+  node never double-votes in a term (a Raft safety requirement). A unit-tested
+  **Raft log core** (`raftlog`) implements the consensus-critical pieces — the
+  AppendEntries consistency check with conflicting-suffix truncation, the
+  quorum/current-term commit rule, apply-only-when-committed, and the §5.4.1
+  election restriction. **Routing the live cluster write path through this log**
+  (leader append → quorum commit → apply, followers applying to the leader's
+  commit index) for pre-commit (2-phase) durability is the remaining
+  integration step; today durability is async by default, with quorum/strict-
+  sync plus the LSN-aware election restriction giving no-data-loss for
+  acknowledged writes.
 
 ## Wire protocol
 
