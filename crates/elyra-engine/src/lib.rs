@@ -14,6 +14,7 @@ mod exec;
 mod index;
 mod keyenc;
 mod predicate;
+mod proc;
 mod session;
 mod sort;
 mod stream;
@@ -81,6 +82,66 @@ impl Engine {
     /// The underlying database handle (used for replication).
     pub fn db(&self) -> Db {
         self.db.clone()
+    }
+
+    /// Interpret a parsed procedure body against a variable environment.
+    async fn run_proc(
+        &self,
+        stmts: &[proc::ProcStmt],
+        env: &mut std::collections::HashMap<String, Value>,
+        privilege: Privilege,
+        user: &str,
+        sess: &Session,
+    ) -> Result<()> {
+        use proc::ProcStmt;
+        const MAX_LOOP: u64 = 10_000_000;
+        for stmt in stmts {
+            match stmt {
+                ProcStmt::Declare { name, default } => {
+                    let v = match default {
+                        Some(e) => exec::eval_scalar(&exec::substitute_vars(e, env))?,
+                        None => Value::Null,
+                    };
+                    env.insert(name.to_ascii_lowercase(), v);
+                }
+                ProcStmt::Set { name, expr } => {
+                    let v = exec::eval_scalar(&exec::substitute_vars(expr, env))?;
+                    env.insert(name.to_ascii_lowercase(), v);
+                }
+                ProcStmt::If { branches, els } => {
+                    let mut ran = false;
+                    for (cond, body) in branches {
+                        if truthy(&exec::eval_scalar(&exec::substitute_vars(cond, env))?) {
+                            Box::pin(self.run_proc(body, env, privilege, user, sess)).await?;
+                            ran = true;
+                            break;
+                        }
+                    }
+                    if !ran {
+                        if let Some(body) = els {
+                            Box::pin(self.run_proc(body, env, privilege, user, sess)).await?;
+                        }
+                    }
+                }
+                ProcStmt::While { cond, body } => {
+                    let mut iters = 0u64;
+                    while truthy(&exec::eval_scalar(&exec::substitute_vars(cond, env))?) {
+                        Box::pin(self.run_proc(body, env, privilege, user, sess)).await?;
+                        iters += 1;
+                        if iters >= MAX_LOOP {
+                            return Err(Error::Query(
+                                "procedure WHILE loop exceeded iteration limit".into(),
+                            ));
+                        }
+                    }
+                }
+                ProcStmt::Sql(s) => {
+                    let sql = exec::substitute_vars(s, env);
+                    Box::pin(self.execute_as(&sql, privilege, user, sess)).await?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Run any trigger bodies queued by the last DML (with definer/admin rights),
@@ -253,8 +314,9 @@ impl Engine {
                     "access denied: CREATE PROCEDURE requires ADMIN privilege".into(),
                 ));
             }
-            let (name, body) = parse_create_procedure(trimmed)?;
-            sess.commit_write(vec![(catalog::proc_key(&name), body.into_bytes())], vec![])
+            let (name, def) = parse_create_procedure(trimmed)?;
+            let enc = bincode::serialize(&def).map_err(|e| Error::Storage(e.to_string()))?;
+            sess.commit_write(vec![(catalog::proc_key(&name), enc)], vec![])
                 .await?;
             return Ok(vec![QueryResult::empty_ok()]);
         }
@@ -277,24 +339,39 @@ impl Engine {
             return Ok(vec![QueryResult::empty_ok()]);
         }
         if head.starts_with("call ") {
-            let name = trimmed[4..]
-                .trim()
-                .split(['(', ' ', ';'])
+            let call = trimmed[4..].trim().trim_end_matches(';');
+            let name = call
+                .split(['(', ' '])
                 .next()
                 .unwrap_or("")
                 .trim_matches(['`', '"'])
                 .to_string();
-            let body = match sess.get(catalog::proc_key(&name)).await? {
-                Some(b) => String::from_utf8_lossy(&b).into_owned(),
+            let def: proc::ProcDef = match sess.get(catalog::proc_key(&name)).await? {
+                Some(b) => bincode::deserialize(&b).map_err(|e| Error::Storage(e.to_string()))?,
                 None => return Err(Error::Query(format!("procedure does not exist: {name}"))),
             };
+            // Bind arguments (evaluated as scalar expressions) to parameters.
+            let mut env: std::collections::HashMap<String, Value> =
+                std::collections::HashMap::new();
+            if let (Some(open), Some(close)) = (call.find('('), call.rfind(')')) {
+                let args_s = &call[open + 1..close];
+                let args: Vec<&str> = if args_s.trim().is_empty() {
+                    Vec::new()
+                } else {
+                    args_s.split(',').collect()
+                };
+                for (i, a) in args.iter().enumerate() {
+                    if let Some(p) = def.params.get(i) {
+                        env.insert(p.clone(), exec::eval_scalar(a.trim())?);
+                    }
+                }
+            }
+            let stmts = proc::parse(&def.body)?;
             sess.enter_call()?;
-            let r = Box::pin(self.execute_as(&body, privilege, user, sess)).await;
+            let r = Box::pin(self.run_proc(&stmts, &mut env, privilege, user, sess)).await;
             sess.leave_call();
-            return r.map(|mut out| {
-                // Return the last statement's result (empty if none).
-                out.pop().map(|last| vec![last]).unwrap_or_default()
-            });
+            r?;
+            return Ok(vec![QueryResult::empty_ok()]);
         }
 
         // User management (CREATE USER / GRANT / REVOKE / ...): parsed and
@@ -552,6 +629,17 @@ impl Engine {
 }
 
 /// Minimum privilege required to run a statement.
+/// SQL truthiness for procedure IF/WHILE conditions.
+fn truthy(v: &Value) -> bool {
+    match v {
+        Value::Null => false,
+        Value::Bool(b) => *b,
+        Value::Int(i) => *i != 0,
+        Value::Float(f) => *f != 0.0,
+        other => other.as_f64().map(|n| n != 0.0).unwrap_or(true),
+    }
+}
+
 fn object_name_last(name: &sqlparser::ast::ObjectName) -> Option<String> {
     name.0.last().map(|i| i.value.clone())
 }
@@ -672,15 +760,14 @@ fn parse_create_trigger(sql: &str) -> Result<catalog::TriggerDef> {
     })
 }
 
-/// Parse `CREATE [OR REPLACE] PROCEDURE name(...) BEGIN <body> END` into the
-/// procedure name and the body (the statements between BEGIN and END).
-fn parse_create_procedure(sql: &str) -> Result<(String, String)> {
+/// Parse `CREATE [OR REPLACE] PROCEDURE name(params) BEGIN <body> END` into the
+/// procedure name and definition (parameter names + body).
+fn parse_create_procedure(sql: &str) -> Result<(String, proc::ProcDef)> {
     let lower = sql.to_ascii_lowercase();
     let after_proc = lower
         .find("procedure")
         .map(|i| i + "procedure".len())
         .ok_or_else(|| Error::Parse("malformed CREATE PROCEDURE".into()))?;
-    // Name: from after PROCEDURE up to '(' or whitespace.
     let rest = sql[after_proc..].trim_start();
     let name: String = rest
         .chars()
@@ -690,7 +777,30 @@ fn parse_create_procedure(sql: &str) -> Result<(String, String)> {
     if name.is_empty() {
         return Err(Error::Parse("CREATE PROCEDURE requires a name".into()));
     }
-    // Body: between the first BEGIN and the last END.
+    // Parameter list, if any, between the first '(' and its matching ')'.
+    let mut params = Vec::new();
+    if let Some(open) = sql[after_proc..].find('(') {
+        let open = after_proc + open;
+        if let Some(close) = sql[open..].find(')') {
+            let inner = &sql[open + 1..open + close];
+            for p in inner.split(',') {
+                // [IN|OUT|INOUT] name type -> take the name token.
+                let toks: Vec<&str> = p.split_whitespace().collect();
+                let nm = match toks.as_slice() {
+                    [] => continue,
+                    [a] => *a,
+                    [a, b, ..] => {
+                        if matches!(a.to_ascii_lowercase().as_str(), "in" | "out" | "inout") {
+                            b
+                        } else {
+                            a
+                        }
+                    }
+                };
+                params.push(nm.trim_matches(['`', '"']).to_ascii_lowercase());
+            }
+        }
+    }
     let begin = lower
         .find("begin")
         .map(|i| i + "begin".len())
@@ -700,7 +810,7 @@ fn parse_create_procedure(sql: &str) -> Result<(String, String)> {
         .filter(|e| *e >= begin)
         .ok_or_else(|| Error::Parse("CREATE PROCEDURE requires a BEGIN ... END body".into()))?;
     let body = sql[begin..end].trim().to_string();
-    Ok((name, body))
+    Ok((name, proc::ProcDef { params, body }))
 }
 
 fn required_privilege(stmt: &Statement) -> Privilege {

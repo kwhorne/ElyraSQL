@@ -1729,8 +1729,65 @@ fn map_ref_action(a: &Option<sqlparser::ast::ReferentialAction>) -> RefAction {
     }
 }
 
+/// Evaluate a scalar SQL expression string (no FROM) to a value.
+pub(crate) fn eval_scalar(sql: &str) -> Result<Value> {
+    let e = parse_scalar_expr(sql)?;
+    predicate::eval_row(&e, &Schema::new(vec![]), &[])
+}
+
+/// Replace bare identifiers that name a procedure variable with the variable's
+/// SQL literal, leaving string literals and qualified names untouched.
+pub(crate) fn substitute_vars(sql: &str, env: &std::collections::HashMap<String, Value>) -> String {
+    if env.is_empty() {
+        return sql.to_string();
+    }
+    let cs: Vec<char> = sql.chars().collect();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0;
+    while i < cs.len() {
+        let c = cs[i];
+        if c == '\'' {
+            out.push(c);
+            i += 1;
+            while i < cs.len() {
+                out.push(cs[i]);
+                if cs[i] == '\'' {
+                    if i + 1 < cs.len() && cs[i + 1] == '\'' {
+                        out.push(cs[i + 1]);
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if c.is_ascii_alphabetic() || c == '_' {
+            let start = i;
+            while i < cs.len() && (cs[i].is_ascii_alphanumeric() || cs[i] == '_') {
+                i += 1;
+            }
+            let word: String = cs[start..i].iter().collect();
+            let prev_dot = start > 0 && cs[start - 1] == '.';
+            let next_dot = i < cs.len() && cs[i] == '.';
+            let lw = word.to_ascii_lowercase();
+            if !prev_dot && !next_dot && env.contains_key(&lw) {
+                out.push_str(&value_sql_literal(&env[&lw]));
+            } else {
+                out.push_str(&word);
+            }
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
 /// Render a value as a SQL literal (for splicing NEW/OLD into trigger bodies).
-fn value_sql_literal(v: &Value) -> String {
+pub(crate) fn value_sql_literal(v: &Value) -> String {
     match v {
         Value::Null => "NULL".into(),
         Value::Bool(b) => {
