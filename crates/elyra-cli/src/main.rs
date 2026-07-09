@@ -147,8 +147,17 @@ fn parse_auth_spec(spec: &str) -> anyhow::Result<(String, String, elyra_core::Pr
     Ok((parts[0].to_string(), parts[1].to_string(), role))
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    // A generous worker-thread stack gives headroom for deep (but depth-guarded)
+    // recursion via triggers and stored procedures.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(16 * 1024 * 1024)
+        .build()?;
+    runtime.block_on(run())
+}
+
+async fn run() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),

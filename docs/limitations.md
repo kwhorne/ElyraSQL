@@ -12,9 +12,15 @@ implemented, so you can judge fit.
 - Stored procedures are supported as statement-list macros: `CREATE PROCEDURE
   name() BEGIN ...; END`, `CALL name()`, `DROP PROCEDURE` (recursion-guarded).
   Parameters, variables, and control flow (IF/LOOP/WHILE) are not yet supported.
+- Row-level triggers are supported: `CREATE TRIGGER name {BEFORE|AFTER}
+  {INSERT|UPDATE|DELETE} ON t FOR EACH ROW <body>`, with `NEW.col`/`OLD.col`.
+  BEFORE bodies support `SET NEW.col = expr`; AFTER bodies run arbitrary DML.
+  Firing is depth-guarded against runaway recursion. Triggers fire on
+  single-table INSERT/UPDATE/DELETE (not on multi-table or the upsert variants
+  REPLACE/ON DUPLICATE/IGNORE).
 - Not yet: named windows, `RANGE`/`GROUPS` numeric-offset frames, correlated
-  subqueries combined with aggregation over a join, triggers, user-defined
-  functions, and events.
+  subqueries combined with aggregation over a join, user-defined functions, and
+  events.
 
 ## Constraints & integrity
 

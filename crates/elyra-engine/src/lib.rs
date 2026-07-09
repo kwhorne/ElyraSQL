@@ -83,6 +83,25 @@ impl Engine {
         self.db.clone()
     }
 
+    /// Run any trigger bodies queued by the last DML (with definer/admin rights),
+    /// depth-guarded against runaway recursion.
+    async fn fire_triggers(&self, sess: &Session) -> Result<()> {
+        let pending = sess.take_triggers();
+        if pending.is_empty() {
+            return Ok(());
+        }
+        sess.enter_call()?;
+        let mut result = Ok(());
+        for sql in pending {
+            if let Err(e) = Box::pin(self.execute_as(&sql, Privilege::Admin, "", sess)).await {
+                result = Err(e);
+                break;
+            }
+        }
+        sess.leave_call();
+        result
+    }
+
     pub async fn execute(
         &self,
         sql: &str,
@@ -158,6 +177,52 @@ impl Engine {
                 .backup_to(std::path::PathBuf::from(path))
                 .await?;
             return Ok(vec![QueryResult::Affected(n)]);
+        }
+
+        // Triggers (MySQL CREATE/DROP TRIGGER, not parsed by the frontend).
+        if head.starts_with("create trigger") || head.starts_with("create or replace trigger") {
+            if privilege < Privilege::Admin {
+                return Err(Error::Query(
+                    "access denied: CREATE TRIGGER requires ADMIN privilege".into(),
+                ));
+            }
+            let t = parse_create_trigger(trimmed)?;
+            sess.commit_write(
+                vec![(
+                    catalog::trigger_key(&t.table, &t.name),
+                    bincode::serialize(&t).map_err(|e| Error::Storage(e.to_string()))?,
+                )],
+                vec![],
+            )
+            .await?;
+            return Ok(vec![QueryResult::empty_ok()]);
+        }
+        if head.starts_with("drop trigger") {
+            if privilege < Privilege::Admin {
+                return Err(Error::Query(
+                    "access denied: DROP TRIGGER requires ADMIN privilege".into(),
+                ));
+            }
+            let toks: Vec<&str> = trimmed.split_whitespace().collect();
+            let name = toks
+                .iter()
+                .position(|t| t.eq_ignore_ascii_case("trigger"))
+                .and_then(|i| toks.get(i + 1))
+                .map(|s| s.trim_matches(['`', '"', ';']).to_string())
+                .filter(|s| !s.eq_ignore_ascii_case("if"))
+                .ok_or_else(|| Error::Parse("DROP TRIGGER requires a name".into()))?;
+            match catalog::find_trigger(sess, &name).await? {
+                Some(t) => {
+                    sess.commit_write(vec![], vec![catalog::trigger_key(&t.table, &t.name)])
+                        .await?;
+                }
+                None => {
+                    if !trimmed.to_ascii_lowercase().contains("if exists") {
+                        return Err(Error::Query(format!("trigger does not exist: {name}")));
+                    }
+                }
+            }
+            return Ok(vec![QueryResult::empty_ok()]);
         }
 
         // Binlog administration (not standard SQL).
@@ -336,14 +401,27 @@ impl Engine {
             Statement::AlterTable {
                 name, operations, ..
             } => exec::alter_table(sess, &name, &operations).await,
-            Statement::Insert(ins) => exec::insert(sess, &self.vindex, ins).await,
+            Statement::Insert(ins) => {
+                let r = exec::insert(sess, &self.vindex, ins).await?;
+                self.fire_triggers(sess).await?;
+                Ok(r)
+            }
             Statement::Update {
                 table,
                 assignments,
                 selection,
                 ..
-            } => exec::update(sess, &self.vindex, &table, &assignments, selection.as_ref()).await,
-            Statement::Delete(del) => exec::delete(sess, &self.vindex, &del).await,
+            } => {
+                let r = exec::update(sess, &self.vindex, &table, &assignments, selection.as_ref())
+                    .await?;
+                self.fire_triggers(sess).await?;
+                Ok(r)
+            }
+            Statement::Delete(del) => {
+                let r = exec::delete(sess, &self.vindex, &del).await?;
+                self.fire_triggers(sess).await?;
+                Ok(r)
+            }
             Statement::Drop {
                 object_type: sqlparser::ast::ObjectType::Table,
                 names,
@@ -526,6 +604,72 @@ fn stmt_targets(stmt: &Statement) -> Vec<String> {
         } => names.iter().filter_map(object_name_last).collect(),
         _ => vec![],
     }
+}
+
+/// Parse `CREATE TRIGGER name {BEFORE|AFTER} {INSERT|UPDATE|DELETE} ON table
+/// FOR EACH ROW <body>`.
+fn parse_create_trigger(sql: &str) -> Result<catalog::TriggerDef> {
+    use catalog::TrigEvent;
+    let lower = sql.to_ascii_lowercase();
+    let after = lower
+        .find("trigger")
+        .map(|i| i + "trigger".len())
+        .ok_or_else(|| Error::Parse("malformed CREATE TRIGGER".into()))?;
+    // name is the first token after TRIGGER
+    let toks: Vec<&str> = sql[after..].split_whitespace().collect();
+    let name = toks
+        .first()
+        .map(|s| s.trim_matches(['`', '"']).to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| Error::Parse("CREATE TRIGGER requires a name".into()))?;
+    // The timing/event clause lives before ` ON <table> `; restrict the search
+    // to the header so keywords inside the body (e.g. an INSERT statement) are
+    // not mistaken for the trigger event.
+    let on = lower
+        .find(" on ")
+        .ok_or_else(|| Error::Parse("CREATE TRIGGER requires ON <table>".into()))?;
+    let header = &lower[..on];
+    let before = if header.contains(" before ") {
+        true
+    } else if header.contains(" after ") {
+        false
+    } else {
+        return Err(Error::Parse(
+            "CREATE TRIGGER requires BEFORE or AFTER".into(),
+        ));
+    };
+    let event = if header.contains("insert") {
+        TrigEvent::Insert
+    } else if header.contains("update") {
+        TrigEvent::Update
+    } else if header.contains("delete") {
+        TrigEvent::Delete
+    } else {
+        return Err(Error::Parse(
+            "CREATE TRIGGER requires INSERT, UPDATE or DELETE".into(),
+        ));
+    };
+    let table = sql[on + 4..]
+        .split_whitespace()
+        .next()
+        .map(|s| s.trim_matches(['`', '"']).to_string())
+        .ok_or_else(|| Error::Parse("CREATE TRIGGER requires ON <table>".into()))?;
+    // body: everything after FOR EACH ROW
+    let fer = lower
+        .find("for each row")
+        .map(|i| i + "for each row".len())
+        .ok_or_else(|| Error::Parse("CREATE TRIGGER requires FOR EACH ROW <body>".into()))?;
+    let body = sql[fer..].trim().trim_end_matches(';').trim().to_string();
+    if body.is_empty() {
+        return Err(Error::Parse("CREATE TRIGGER has an empty body".into()));
+    }
+    Ok(catalog::TriggerDef {
+        name,
+        table,
+        before,
+        event,
+        body,
+    })
 }
 
 /// Parse `CREATE [OR REPLACE] PROCEDURE name(...) BEGIN <body> END` into the

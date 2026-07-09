@@ -170,6 +170,61 @@ pub fn proc_key(name: &str) -> Vec<u8> {
     format!("sys::proc::{}", name.to_ascii_lowercase()).into_bytes()
 }
 
+/// The DML event a trigger fires on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TrigEvent {
+    Insert,
+    Update,
+    Delete,
+}
+
+/// A stored trigger definition.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TriggerDef {
+    pub name: String,
+    pub table: String,
+    /// true = BEFORE, false = AFTER.
+    pub before: bool,
+    pub event: TrigEvent,
+    pub body: String,
+}
+
+fn trigger_prefix(table: &str) -> Vec<u8> {
+    format!("sys::trigger::{}::", table.to_ascii_lowercase()).into_bytes()
+}
+
+pub fn trigger_key(table: &str, name: &str) -> Vec<u8> {
+    let mut k = trigger_prefix(table);
+    k.extend_from_slice(name.to_ascii_lowercase().as_bytes());
+    k
+}
+
+/// Load all triggers defined on `table`.
+pub async fn load_triggers(db: &Session, table: &str) -> Result<Vec<TriggerDef>> {
+    let prefix = trigger_prefix(table);
+    let batch = db.scan_batch(prefix, None, 4096).await?;
+    Ok(batch
+        .iter()
+        .filter_map(|(_, v)| bincode::deserialize(v).ok())
+        .collect())
+}
+
+/// Find a trigger by name across all tables (for DROP TRIGGER).
+pub async fn find_trigger(db: &Session, name: &str) -> Result<Option<TriggerDef>> {
+    let want = name.to_ascii_lowercase();
+    let batch = db
+        .scan_batch(b"sys::trigger::".to_vec(), None, 100_000)
+        .await?;
+    for (_, v) in &batch {
+        if let Ok(t) = bincode::deserialize::<TriggerDef>(v) {
+            if t.name.eq_ignore_ascii_case(&want) {
+                return Ok(Some(t));
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// Load a table's statistics, if it has been analyzed.
 pub async fn load_stats(db: &Session, table: &str) -> Result<Option<TableStats>> {
     match db.get(stats_key(table)).await? {

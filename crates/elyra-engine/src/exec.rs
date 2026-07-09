@@ -1478,6 +1478,17 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
     // NOT NULL) and its clustered key — no per-row storage reads.
     let mut built: Vec<(Vec<u8>, Vec<Value>)> = Vec::with_capacity(rows.len());
     let checks = parse_checks(&def)?;
+    let trigs = catalog::load_triggers(db, &name).await?;
+    let before_ins: Vec<catalog::TriggerDef> = trigs
+        .iter()
+        .filter(|t| t.before && t.event == catalog::TrigEvent::Insert)
+        .cloned()
+        .collect();
+    let after_ins: Vec<catalog::TriggerDef> = trigs
+        .iter()
+        .filter(|t| !t.before && t.event == catalog::TrigEvent::Insert)
+        .cloned()
+        .collect();
     for vals in rows {
         if vals.len() != target.len() {
             return Err(Error::Query(format!(
@@ -1525,6 +1536,10 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
             }
         }
 
+        for t in &before_ins {
+            apply_before_trigger(t, &def.schema, &mut row, None)?;
+        }
+
         for (i, col) in def.schema.columns.iter().enumerate() {
             if !col.nullable && row[i].is_null() {
                 return Err(Error::Query(format!(
@@ -1566,10 +1581,20 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
             new_puts.extend(uniq);
         }
         aux_puts.push(bump_wcount(db, &name).await?);
+        // Persist the advanced AUTO_INCREMENT counter (otherwise a later insert
+        // would reuse ids).
+        if auto_col.is_some() {
+            aux_puts.push((autoinc_key(&name), autoinc.to_le_bytes().to_vec()));
+        }
         let affected = built.len() as u64;
         db.raw_db()
             .commit_insert(new_puts, aux_puts, Vec::new())
             .await?;
+        if !after_ins.is_empty() {
+            for (_, row) in &built {
+                queue_after(db, &after_ins, &def.schema, Some(row), None)?;
+            }
+        }
         return Ok(QueryResult::Affected(affected));
     }
 
@@ -1660,6 +1685,11 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
     puts.push(bump_wcount(db, &name).await?);
 
     db.commit_write(puts, deletes).await?;
+    if !after_ins.is_empty() {
+        for (_, row) in &batch {
+            queue_after(db, &after_ins, &def.schema, Some(row), None)?;
+        }
+    }
     Ok(QueryResult::Affected(affected))
 }
 
@@ -1697,6 +1727,177 @@ fn map_ref_action(a: &Option<sqlparser::ast::ReferentialAction>) -> RefAction {
         Some(RA::Restrict) => RefAction::Restrict,
         _ => RefAction::NoAction,
     }
+}
+
+/// Render a value as a SQL literal (for splicing NEW/OLD into trigger bodies).
+fn value_sql_literal(v: &Value) -> String {
+    match v {
+        Value::Null => "NULL".into(),
+        Value::Bool(b) => {
+            if *b {
+                "1".into()
+            } else {
+                "0".into()
+            }
+        }
+        Value::Int(i) => i.to_string(),
+        Value::Float(f) => f.to_string(),
+        Value::Text(s) | Value::Json(s) => format!("'{}'", s.replace('\'', "''")),
+        Value::Bytes(b) => format!(
+            "x'{}'",
+            b.iter().map(|x| format!("{x:02x}")).collect::<String>()
+        ),
+        Value::Vector(_) => "NULL".into(),
+        other => match other.to_wire_string() {
+            Some(s) => format!("'{}'", s.replace('\'', "''")),
+            None => "NULL".into(),
+        },
+    }
+}
+
+/// Strip an optional `BEGIN ... END` wrapper from a trigger body.
+fn strip_begin_end(body: &str) -> String {
+    let t = body.trim().trim_end_matches(';').trim();
+    let low = t.to_ascii_lowercase();
+    if low.starts_with("begin") && low.ends_with("end") {
+        t[5..t.len() - 3].trim().to_string()
+    } else {
+        t.to_string()
+    }
+}
+
+/// Replace `NEW.col` / `OLD.col` references with SQL literals of the row values,
+/// leaving string literals untouched.
+fn substitute_newold(
+    body: &str,
+    schema: &Schema,
+    new: Option<&[Value]>,
+    old: Option<&[Value]>,
+) -> Result<String> {
+    let lookup = |is_new: bool, col: &str| -> Result<String> {
+        let row = if is_new { new } else { old };
+        let row = row.ok_or_else(|| {
+            Error::Query(format!(
+                "trigger references {}.{} which is not available for this event",
+                if is_new { "NEW" } else { "OLD" },
+                col
+            ))
+        })?;
+        let i = schema
+            .columns
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(col))
+            .ok_or_else(|| Error::Query(format!("trigger references unknown column: {col}")))?;
+        Ok(value_sql_literal(row.get(i).unwrap_or(&Value::Null)))
+    };
+    let cs: Vec<char> = body.chars().collect();
+    let mut out = String::with_capacity(body.len());
+    let mut i = 0;
+    while i < cs.len() {
+        let c = cs[i];
+        if c == '\'' {
+            out.push(c);
+            i += 1;
+            while i < cs.len() {
+                out.push(cs[i]);
+                if cs[i] == '\'' {
+                    if i + 1 < cs.len() && cs[i + 1] == '\'' {
+                        out.push(cs[i + 1]);
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if c.is_ascii_alphabetic() || c == '_' {
+            let start = i;
+            while i < cs.len() && (cs[i].is_ascii_alphanumeric() || cs[i] == '_') {
+                i += 1;
+            }
+            let word: String = cs[start..i].iter().collect();
+            let is_new = word.eq_ignore_ascii_case("new");
+            let is_old = word.eq_ignore_ascii_case("old");
+            if (is_new || is_old) && i < cs.len() && cs[i] == '.' {
+                let cstart = i + 1;
+                let mut j = cstart;
+                while j < cs.len() && (cs[j].is_ascii_alphanumeric() || cs[j] == '_') {
+                    j += 1;
+                }
+                let col: String = cs[cstart..j].iter().collect();
+                out.push_str(&lookup(is_new, &col)?);
+                i = j;
+            } else {
+                out.push_str(&word);
+            }
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    Ok(out)
+}
+
+/// Apply a BEFORE trigger (supports `SET NEW.col = expr` statements) to `row`.
+fn apply_before_trigger(
+    t: &catalog::TriggerDef,
+    schema: &Schema,
+    row: &mut [Value],
+    old: Option<&[Value]>,
+) -> Result<()> {
+    let empty = Schema::new(vec![]);
+    for stmt in strip_begin_end(&t.body).split(';') {
+        let s = stmt.trim();
+        if s.is_empty() {
+            continue;
+        }
+        let low = s.to_ascii_lowercase();
+        if !low.starts_with("set ") {
+            return Err(Error::Unsupported(
+                "BEFORE triggers support only SET NEW.col = expr".into(),
+            ));
+        }
+        let rest = s[4..].trim();
+        let eq = rest
+            .find('=')
+            .ok_or_else(|| Error::Parse("malformed SET in trigger".into()))?;
+        let lhs = rest[..eq].trim();
+        let col = lhs
+            .to_ascii_lowercase()
+            .strip_prefix("new.")
+            .map(|_| lhs[4..].to_string())
+            .ok_or_else(|| {
+                Error::Unsupported("BEFORE trigger SET target must be NEW.col".into())
+            })?;
+        let ci = schema
+            .columns
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(&col))
+            .ok_or_else(|| Error::Query(format!("unknown column in trigger: {col}")))?;
+        let sub = substitute_newold(rest[eq + 1..].trim(), schema, Some(row), old)?;
+        let expr = parse_scalar_expr(&sub)?;
+        let val = predicate::eval_row(&expr, &empty, &[])?;
+        row[ci] = coerce(val, &schema.columns[ci].ty, &schema.columns[ci].name)?;
+    }
+    Ok(())
+}
+
+/// Queue AFTER-trigger bodies (rendered to concrete SQL) for a set of rows.
+fn queue_after(
+    db: &Session,
+    trigs: &[catalog::TriggerDef],
+    schema: &Schema,
+    new: Option<&[Value]>,
+    old: Option<&[Value]>,
+) -> Result<()> {
+    for t in trigs {
+        let sql = substitute_newold(&strip_begin_end(&t.body), schema, new, old)?;
+        db.queue_trigger(sql);
+    }
+    Ok(())
 }
 
 /// Parse a table's CHECK expressions once (for a whole statement).
@@ -3640,6 +3841,17 @@ pub async fn update(
     let mut uniq_batch: Vec<(Vec<u8>, Vec<Value>)> = Vec::new();
     let checks = parse_checks(&def)?;
 
+    let utrigs = catalog::load_triggers(db, &name).await?;
+    let before_upd: Vec<catalog::TriggerDef> = utrigs
+        .iter()
+        .filter(|t| t.before && t.event == catalog::TrigEvent::Update)
+        .cloned()
+        .collect();
+    let after_upd: Vec<catalog::TriggerDef> = utrigs
+        .iter()
+        .filter(|t| !t.before && t.event == catalog::TrigEvent::Update)
+        .cloned()
+        .collect();
     for (old_key, old_row) in matches {
         let mut new_row = old_row.clone();
         for (idx, expr) in &sets {
@@ -3653,6 +3865,10 @@ pub async fn update(
             let col = &def.schema.columns[*i];
             new_row[*i] = coerce(v, &col.ty, &col.name)?;
         }
+        for t in &before_upd {
+            apply_before_trigger(t, &def.schema, &mut new_row, Some(&old_row))?;
+        }
+
         for (i, col) in def.schema.columns.iter().enumerate() {
             if !col.nullable && new_row[i].is_null() {
                 return Err(Error::Query(format!(
@@ -3714,6 +3930,11 @@ pub async fn update(
         puts.push(bump_wcount(db, &t).await?);
     }
     db.commit_write(puts, deletes).await?;
+    if !after_upd.is_empty() {
+        for (old_row, new_row) in &fk_parent_changes {
+            queue_after(db, &after_upd, &def.schema, Some(new_row), Some(old_row))?;
+        }
+    }
     Ok(QueryResult::Affected(affected))
 }
 
@@ -3745,7 +3966,16 @@ pub async fn delete(db: &Session, vindex: &VectorRegistry, del: &Delete) -> Resu
     // Foreign keys referencing this table: RESTRICT / CASCADE / SET NULL.
     cascade_parent_delete(db, &def, &matches, &mut puts, &mut deletes, &mut wcounts).await?;
 
+    let after_del: Vec<catalog::TriggerDef> = catalog::load_triggers(db, &name)
+        .await?
+        .into_iter()
+        .filter(|t| !t.before && t.event == catalog::TrigEvent::Delete)
+        .collect();
+    let mut deleted_rows: Vec<Vec<Value>> = Vec::new();
     for (key, row) in matches {
+        if !after_del.is_empty() {
+            deleted_rows.push(row.clone());
+        }
         deletes.extend(index::entry_keys_for_row(&def, &row, &key)?);
         deletes.push(key);
     }
@@ -3753,6 +3983,9 @@ pub async fn delete(db: &Session, vindex: &VectorRegistry, del: &Delete) -> Resu
         puts.push(bump_wcount(db, &t).await?);
     }
     db.commit_write(puts, deletes).await?;
+    for row in &deleted_rows {
+        queue_after(db, &after_del, &def.schema, None, Some(row))?;
+    }
     Ok(QueryResult::Affected(affected))
 }
 

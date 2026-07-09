@@ -56,6 +56,8 @@ pub struct Session {
     isolation: Mutex<Isolation>,
     /// Nested `CALL` depth (guards against runaway procedure recursion).
     call_depth: std::sync::atomic::AtomicUsize,
+    /// Ready-to-run trigger-body SQL queued by the last DML, fired by the engine.
+    pending_triggers: Mutex<Vec<String>>,
 }
 
 fn is_meta(k: &[u8]) -> bool {
@@ -69,7 +71,19 @@ impl Session {
             txn: Mutex::new(None),
             isolation: Mutex::new(Isolation::Snapshot),
             call_depth: std::sync::atomic::AtomicUsize::new(0),
+            pending_triggers: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Queue a trigger body (already rendered to concrete SQL) to run after the
+    /// current DML statement.
+    pub fn queue_trigger(&self, sql: String) {
+        self.pending_triggers.lock().unwrap().push(sql);
+    }
+
+    /// Take and clear the queued trigger bodies.
+    pub fn take_triggers(&self) -> Vec<String> {
+        std::mem::take(&mut *self.pending_triggers.lock().unwrap())
     }
 
     /// Enter a `CALL`; errors if procedure recursion is too deep.
@@ -79,7 +93,7 @@ impl Session {
         let d = self.call_depth.fetch_add(1, Ordering::SeqCst);
         if d >= MAX_CALL_DEPTH {
             self.call_depth.fetch_sub(1, Ordering::SeqCst);
-            return Err(Error::Query("stored procedure recursion too deep".into()));
+            return Err(Error::Query("trigger/procedure recursion too deep".into()));
         }
         Ok(())
     }
