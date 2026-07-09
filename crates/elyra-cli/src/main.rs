@@ -68,6 +68,17 @@ enum Command {
         /// acknowledge each commit before returning (0 = asynchronous).
         #[arg(long, env = "ELYRASQL_SEMI_SYNC_MS", default_value_t = 0)]
         semi_sync_ms: u64,
+
+        /// Quorum/synchronous replication: number of replica acks each commit
+        /// must collect before returning (0 = asynchronous). Overrides
+        /// --semi-sync-ms's implicit count of 1 when set.
+        #[arg(long, env = "ELYRASQL_SYNC_REPLICAS", default_value_t = 0)]
+        sync_replicas: u64,
+
+        /// Strict sync: on timeout, fail the commit-confirmation instead of
+        /// silently degrading to asynchronous (no silent data-loss window).
+        #[arg(long, env = "ELYRASQL_SYNC_STRICT", default_value_t = false)]
+        sync_strict: bool,
     },
     /// Replay a binlog onto a database for point-in-time recovery. Apply onto a
     /// restored backup (or an empty file) up to a target LSN or timestamp.
@@ -233,15 +244,29 @@ async fn run() -> anyhow::Result<()> {
             replication_listen,
             binlog,
             semi_sync_ms,
+            sync_replicas,
+            sync_strict,
         } => {
             tracing::info!(?data, "opening ElyraSQL database file");
             if binlog.is_some() {
                 tracing::info!(?binlog, "binlog (point-in-time recovery) enabled");
             }
             let db = Db::open_with_binlog(&data, binlog)?;
-            if semi_sync_ms > 0 {
-                tracing::info!(semi_sync_ms, "semi-synchronous replication enabled");
-                db.set_sync_timeout_ms(semi_sync_ms);
+            if sync_replicas > 0 {
+                tracing::info!(
+                    sync_replicas,
+                    timeout_ms = semi_sync_ms,
+                    strict = sync_strict,
+                    "quorum/synchronous replication enabled"
+                );
+                db.set_sync_policy(sync_replicas, semi_sync_ms, sync_strict);
+            } else if semi_sync_ms > 0 {
+                tracing::info!(
+                    semi_sync_ms,
+                    strict = sync_strict,
+                    "semi-synchronous replication enabled"
+                );
+                db.set_sync_policy(1, semi_sync_ms, sync_strict);
             }
             let engine = Engine::new(db.clone());
 

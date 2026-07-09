@@ -106,11 +106,15 @@ implemented, so you can judge fit.
   recovery (`--binlog` + `elyrasql binlog-replay`). Binlog rotation/pruning is
   manual; there is no incremental (block-level) backup.
 - Primary → replica replication (read replicas, warm standby), asynchronous by
-  default with an optional **semi-synchronous** mode (`--semi-sync-ms`).
+  default with **semi-synchronous** (`--semi-sync-ms`) and **quorum /
+  synchronous** modes (`--sync-replicas N`, optional `--sync-strict`). A commit
+  waits until `N` replicas acknowledge; in strict mode a timeout fails the
+  commit-confirmation instead of silently degrading. The barrier runs *after*
+  the local commit (which is always durable), so it shrinks — but does not fully
+  close — the failover data-loss window (there is no pre-commit 2-phase
+  replication / multi-primary).
   **Automatic failover** is available in `cluster` mode via Raft-style leader
-  election (majority quorum, leader-only writes/fencing). Replication of data is
-  still asynchronous (a new leader may lack the old leader's last writes); there
-  is no synchronous/quorum commit or multi-primary.
+  election (majority quorum, leader-only writes/fencing).
 
 ## Wire protocol
 

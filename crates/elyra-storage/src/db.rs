@@ -14,13 +14,14 @@
 //! `Db` is cheap to clone (it is just handles) and safe to share across all
 //! connection tasks.
 
+use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use elyra_core::{Error, Result};
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot, Notify};
 
 use crate::{RangeSnapshot, Snapshot, Storage};
 
@@ -105,10 +106,20 @@ pub struct Db {
     writer: mpsc::Sender<WriteJob>,
     lsn: Arc<AtomicU64>,
     repl_tx: broadcast::Sender<Arc<WriteEvent>>,
-    /// Highest LSN acknowledged by any replica (semi-sync replication).
-    acked: Arc<tokio::sync::watch::Sender<u64>>,
-    /// Semi-sync commit wait in ms (0 = asynchronous).
+    /// Per-replica highest acknowledged LSN (keyed by a registration id), for
+    /// quorum/synchronous replication.
+    replicas: Arc<Mutex<HashMap<u64, u64>>>,
+    /// Woken whenever a replica advances its ack, so commit barriers re-check.
+    ack_notify: Arc<Notify>,
+    /// Allocator for replica registration ids.
+    next_replica: Arc<AtomicU64>,
+    /// Number of replica acks a commit must collect (0 = asynchronous).
+    sync_replicas: Arc<AtomicU64>,
+    /// Commit-barrier wait in ms (0 = wait indefinitely in strict mode).
     sync_timeout_ms: Arc<AtomicU64>,
+    /// Strict mode: on timeout, fail the commit-confirmation instead of
+    /// silently degrading to asynchronous.
+    sync_strict: Arc<AtomicBool>,
     /// Binlog directory, if point-in-time recovery is enabled.
     binlog_dir: Option<std::path::PathBuf>,
 }
@@ -137,9 +148,12 @@ impl Db {
         let (tx, rx) = mpsc::channel::<WriteJob>(WRITE_QUEUE_DEPTH);
         let lsn = Arc::new(AtomicU64::new(0));
         let (repl_tx, _) = broadcast::channel::<Arc<WriteEvent>>(REPL_CAPACITY);
-        let (acked, _) = tokio::sync::watch::channel(0u64);
-        let acked = Arc::new(acked);
+        let replicas = Arc::new(Mutex::new(HashMap::new()));
+        let ack_notify = Arc::new(Notify::new());
+        let next_replica = Arc::new(AtomicU64::new(0));
+        let sync_replicas = Arc::new(AtomicU64::new(0));
         let sync_timeout_ms = Arc::new(AtomicU64::new(0));
+        let sync_strict = Arc::new(AtomicBool::new(false));
         let binlog_dir = binlog.clone();
         let binlog = match binlog {
             Some(p) => Some(crate::binlog::BinlogWriter::open(p)?),
@@ -165,8 +179,12 @@ impl Db {
             writer: tx,
             lsn,
             repl_tx,
-            acked,
+            replicas,
+            ack_notify,
+            next_replica,
+            sync_replicas,
             sync_timeout_ms,
+            sync_strict,
             binlog_dir,
         })
     }
@@ -176,49 +194,109 @@ impl Db {
         self.binlog_dir.as_deref()
     }
 
-    /// Enable semi-synchronous replication: a commit waits up to `ms` for a
-    /// replica to acknowledge before returning (0 disables).
+    /// Enable semi-synchronous replication: a commit waits up to `ms` for one
+    /// replica to acknowledge before returning (0 disables). Kept for
+    /// compatibility; equivalent to `set_sync_policy(1, ms, false)`.
     pub fn set_sync_timeout_ms(&self, ms: u64) {
-        self.sync_timeout_ms.store(ms, Ordering::SeqCst);
+        self.set_sync_policy(if ms == 0 { 0 } else { 1 }, ms, false);
     }
 
-    /// Record that a replica has applied up to `lsn` (advances the ack high-water
-    /// mark).
-    pub fn report_ack(&self, lsn: u64) {
-        self.acked.send_if_modified(|v| {
-            if lsn > *v {
-                *v = lsn;
-                true
-            } else {
-                false
+    /// Configure the commit replication barrier:
+    /// * `required` — replica acks a commit must collect (0 = asynchronous),
+    /// * `timeout_ms` — how long to wait (0 = indefinitely, only meaningful with
+    ///   `strict`),
+    /// * `strict` — on timeout, fail the commit-confirmation with an error
+    ///   instead of degrading to asynchronous (no silent data-loss window).
+    pub fn set_sync_policy(&self, required: u64, timeout_ms: u64, strict: bool) {
+        self.sync_replicas.store(required, Ordering::SeqCst);
+        self.sync_timeout_ms.store(timeout_ms, Ordering::SeqCst);
+        self.sync_strict.store(strict, Ordering::SeqCst);
+    }
+
+    /// Register a replica for quorum accounting; returns its id.
+    pub fn register_replica(&self) -> u64 {
+        let id = self.next_replica.fetch_add(1, Ordering::SeqCst);
+        self.replicas.lock().unwrap().insert(id, 0);
+        self.ack_notify.notify_waiters();
+        id
+    }
+
+    /// Deregister a replica (on disconnect).
+    pub fn unregister_replica(&self, id: u64) {
+        self.replicas.lock().unwrap().remove(&id);
+        self.ack_notify.notify_waiters();
+    }
+
+    /// Record that replica `id` has applied up to `lsn`.
+    pub fn report_ack(&self, id: u64, lsn: u64) {
+        {
+            let mut m = self.replicas.lock().unwrap();
+            let e = m.entry(id).or_insert(0);
+            if lsn > *e {
+                *e = lsn;
             }
-        });
+        }
+        self.ack_notify.notify_waiters();
     }
 
     fn has_replicas(&self) -> bool {
         self.repl_tx.receiver_count() > 0
     }
 
-    /// Semi-sync barrier: wait until a replica acknowledges through the current
-    /// LSN, or the timeout elapses (then degrade to asynchronous).
-    async fn await_sync(&self) {
-        let ms = self.sync_timeout_ms.load(Ordering::SeqCst);
-        if ms == 0 || !self.has_replicas() {
-            return;
+    /// Number of replicas that have acknowledged through `target`.
+    fn acked_count(&self, target: u64) -> usize {
+        self.replicas
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|&&v| v >= target)
+            .count()
+    }
+
+    /// Commit replication barrier: wait until `sync_replicas` replicas have
+    /// acknowledged the current LSN. In non-strict mode, degrade to success on
+    /// timeout; in strict mode, return an error so the caller knows the commit
+    /// was not confirmed by the quorum (the local write is already durable).
+    async fn await_sync(&self) -> Result<()> {
+        let required = self.sync_replicas.load(Ordering::SeqCst) as usize;
+        if required == 0 {
+            return Ok(());
+        }
+        let strict = self.sync_strict.load(Ordering::SeqCst);
+        // Non-strict with no replicas attached: nothing to wait for.
+        if !strict && !self.has_replicas() {
+            return Ok(());
         }
         let target = self.current_lsn();
-        let mut rx = self.acked.subscribe();
-        if *rx.borrow() >= target {
-            return;
-        }
-        let deadline = tokio::time::sleep(std::time::Duration::from_millis(ms));
-        tokio::pin!(deadline);
+        let ms = self.sync_timeout_ms.load(Ordering::SeqCst);
+        let deadline = if ms == 0 {
+            None
+        } else {
+            Some(tokio::time::Instant::now() + std::time::Duration::from_millis(ms))
+        };
         loop {
-            tokio::select! {
-                _ = &mut deadline => break,
-                r = rx.changed() => {
-                    if r.is_err() || *rx.borrow() >= target {
-                        break;
+            let notified = self.ack_notify.notified();
+            if self.acked_count(target) >= required {
+                return Ok(());
+            }
+            tokio::pin!(notified);
+            match deadline {
+                None => notified.await,
+                Some(dl) => {
+                    tokio::select! {
+                        _ = &mut notified => {}
+                        _ = tokio::time::sleep_until(dl) => {
+                            if self.acked_count(target) >= required {
+                                return Ok(());
+                            }
+                            if strict {
+                                return Err(Error::Storage(
+                                    "sync replication timeout: commit not confirmed by quorum"
+                                        .into(),
+                                ));
+                            }
+                            return Ok(()); // degrade to asynchronous
+                        }
                     }
                 }
             }
@@ -286,8 +364,7 @@ impl Db {
     /// Submit a mutation to the group-commit writer and await durability.
     pub async fn commit(&self, puts: Vec<(Vec<u8>, Vec<u8>)>, deletes: Vec<Vec<u8>>) -> Result<()> {
         self.submit(puts, deletes, None).await?;
-        self.await_sync().await;
-        Ok(())
+        self.await_sync().await
     }
 
     /// Submit a validated (transactional) commit: the validation must still
@@ -299,8 +376,7 @@ impl Db {
         deletes: Vec<Vec<u8>>,
     ) -> Result<()> {
         self.submit(puts, deletes, Some(validation)).await?;
-        self.await_sync().await;
-        Ok(())
+        self.await_sync().await
     }
 
     /// Submit a plain `INSERT`: `new` keys must not already exist (duplicate
@@ -325,8 +401,7 @@ impl Db {
             .map_err(|_| Error::Storage("writer thread stopped".into()))?;
         wait.await
             .map_err(|_| Error::Storage("write acknowledgement lost".into()))??;
-        self.await_sync().await;
-        Ok(())
+        self.await_sync().await
     }
 
     async fn submit(

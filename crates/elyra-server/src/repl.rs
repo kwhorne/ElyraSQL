@@ -81,16 +81,20 @@ pub async fn serve_replication(addr: String, db: Db) -> std::io::Result<()> {
 async fn handle_replica(stream: TcpStream, db: Db) -> std::io::Result<()> {
     let (mut rd, mut stream) = stream.into_split();
 
-    // Read replica acknowledgements (semi-sync) on the read half.
+    // Register this replica for quorum accounting; deregister on disconnect.
+    let replica_id = db.register_replica();
+
+    // Read replica acknowledgements (semi-sync / quorum) on the read half.
     let adb = db.clone();
     tokio::spawn(async move {
         loop {
             match recv_msg(&mut rd).await {
-                Ok(Some(ReplMsg::Ack { lsn })) => adb.report_ack(lsn),
+                Ok(Some(ReplMsg::Ack { lsn })) => adb.report_ack(replica_id, lsn),
                 Ok(Some(_)) => {}
                 Ok(None) | Err(_) => break,
             }
         }
+        adb.unregister_replica(replica_id);
     });
 
     // Subscribe before reading the LSN so no committed write is missed; any
