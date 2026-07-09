@@ -28,8 +28,12 @@ implemented, so you can judge fit.
 - `RIGHT`/`FULL` and non-equi joins use nested-loop (no hash/merge).
 - There is no cost-based optimizer or statistics; the planner uses heuristic
   fast paths.
-- `ORDER BY`, grouped/aggregated output, and in-transaction reads materialize
-  their working set in memory (no spill-to-disk).
+- `ORDER BY` is memory-bounded: `ORDER BY ... LIMIT` uses a top-N heap, and
+  large unbounded sorts spill sorted runs to temp files (external merge sort,
+  `ELYRASQL_SORT_MAX_ROWS`). `GROUP BY` holds groups in memory but fails
+  gracefully past `ELYRASQL_GROUP_MAX_GROUPS` rather than risking OOM; it does
+  not yet spill (partitioned aggregation is future work). In-transaction reads
+  still materialize their working set.
 
 ## Transactions & locking
 

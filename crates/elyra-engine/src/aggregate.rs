@@ -272,5 +272,12 @@ pub fn run(
             agg.feed(&plan.extend_row(row)?);
         }
     }
+    if agg.overflowed() {
+        return Err(Error::Query(format!(
+            "GROUP BY produced too many distinct groups (limit {}); add a more \
+             selective WHERE or raise ELYRASQL_GROUP_MAX_GROUPS",
+            elyra_olap::default_max_groups()
+        )));
+    }
     Ok(plan.finalize(agg))
 }

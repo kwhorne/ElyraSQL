@@ -14,6 +14,14 @@ variable fallback (handy for systemd and containers).
 | `--auth <spec>` | — | — | Additional user `user:password:role` (repeatable). |
 | `--tls-cert <file>` | `ELYRASQL_TLS_CERT` | — | PEM certificate; enables TLS (requires `--tls-key`). |
 | `--tls-key <file>` | `ELYRASQL_TLS_KEY` | — | PEM private key. |
+| `--slow-query-ms <n>` | `ELYRASQL_SLOW_QUERY_MS` | `0` | Log queries at or above this many ms (0 = off). See [Observability](observability.md). |
+
+## Memory limits (environment-only)
+
+| Environment | Default | Description |
+|-------------|---------|-------------|
+| `ELYRASQL_SORT_MAX_ROWS` | `1000000` | Rows an `ORDER BY` holds in memory before spilling a sorted run to a temp file (external merge sort). |
+| `ELYRASQL_GROUP_MAX_GROUPS` | `5000000` | Max distinct `GROUP BY` groups before the query fails gracefully instead of risking OOM (0 = unlimited). |
 
 `RUST_LOG` controls log verbosity (`error`, `warn`, `info`, `debug`, `trace`;
 default `info`).

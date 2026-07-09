@@ -73,6 +73,23 @@ pub struct GroupAggregator {
     /// key -> (sample row for group columns, per-agg accumulators)
     groups: HashMap<Vec<u8>, (Vec<Value>, Vec<Acc>)>,
     order: Vec<Vec<u8>>,
+    /// Cap on distinct groups (0 = unlimited); protects against OOM.
+    max_groups: usize,
+    /// Set once the cap is hit; the aggregation is then incomplete.
+    overflow: bool,
+}
+
+/// Default distinct-group cap, from `ELYRASQL_GROUP_MAX_GROUPS`
+/// (default 5,000,000; 0 disables).
+pub fn default_max_groups() -> usize {
+    use std::sync::OnceLock;
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("ELYRASQL_GROUP_MAX_GROUPS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(5_000_000)
+    })
 }
 
 impl GroupAggregator {
@@ -82,12 +99,28 @@ impl GroupAggregator {
             aggs,
             groups: HashMap::new(),
             order: Vec::new(),
+            max_groups: default_max_groups(),
+            overflow: false,
         }
+    }
+
+    /// Whether the distinct-group cap was exceeded (result would be incomplete).
+    pub fn overflowed(&self) -> bool {
+        self.overflow
     }
 
     /// Feed one row into the aggregator.
     pub fn feed(&mut self, row: &[Value]) {
         let key = group_key(&self.group_cols, row);
+        // At/over the cap, refuse to create new groups (bounding memory) but
+        // keep updating existing ones.
+        if self.max_groups > 0
+            && self.order.len() >= self.max_groups
+            && !self.groups.contains_key(&key)
+        {
+            self.overflow = true;
+            return;
+        }
         let aggs = &self.aggs;
         let order = &mut self.order;
         let entry = self.groups.entry(key.clone()).or_insert_with(|| {
@@ -104,6 +137,7 @@ impl GroupAggregator {
 
     /// Merge another partial aggregator (from a parallel worker) into this one.
     pub fn merge(&mut self, other: GroupAggregator) {
+        self.overflow |= other.overflow;
         for key in other.order {
             let (sample, accs) = other.groups.get(&key).expect("key present").clone();
             match self.groups.get_mut(&key) {
@@ -113,6 +147,10 @@ impl GroupAggregator {
                     }
                 }
                 None => {
+                    if self.max_groups > 0 && self.order.len() >= self.max_groups {
+                        self.overflow = true;
+                        continue;
+                    }
                     self.order.push(key.clone());
                     self.groups.insert(key, (sample, accs));
                 }

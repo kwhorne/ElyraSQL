@@ -14,6 +14,7 @@ mod index;
 mod keyenc;
 mod predicate;
 mod session;
+mod sort;
 mod stream;
 mod users;
 mod vindex;

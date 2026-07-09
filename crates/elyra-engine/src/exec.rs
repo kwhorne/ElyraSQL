@@ -2077,6 +2077,41 @@ pub async fn select(
             }
         }
 
+        // Memory-bounded ORDER BY for the non-accelerable autocommit case:
+        // stream the filtered rows and sort with a top-N heap (when LIMIT is
+        // small) or an external merge sort that spills to disk (OOM safety),
+        // instead of materialising the whole result set.
+        if !resolved.is_empty() && !db.in_txn() && !accelerable(&def, filter.as_ref())? {
+            let ncols = def.schema.columns.len();
+            let spec = ScanSpec {
+                projection: (0..ncols).collect(),
+                out_schema: def.schema.clone(),
+                filter: filter.clone(),
+                offset: 0,
+                limit: None,
+            };
+            let mut stream = RowStream::scan(db.raw_db(), &def, spec);
+            let asc: Vec<bool> = resolved.iter().map(|(_, a)| *a).collect();
+            let mut sorter =
+                crate::sort::Sorter::new(asc, offset, limit, crate::sort::sort_max_rows());
+            loop {
+                let batch = stream.next_batch(4096).await?;
+                if batch.is_empty() {
+                    break;
+                }
+                for row in batch {
+                    let mut keys = Vec::with_capacity(resolved.len());
+                    for (e, _) in &resolved {
+                        keys.push(predicate::eval_row(e, &def.schema, &row)?);
+                    }
+                    sorter.push(keys, row)?;
+                }
+            }
+            let rows = sorter.finish()?;
+            let (schema, out) = project_exprs(&select.projection, &def.schema, &rows)?;
+            return Ok(QueryResult::Rows(RowStream::literal(schema, out)));
+        }
+
         let mut rows = scan_rows(db, &def, filter.as_ref()).await?;
         if !resolved.is_empty() {
             sort_full_rows(&mut rows, &def.schema, &resolved)?;
@@ -5823,10 +5858,23 @@ async fn olap_aggregate(
                     agg.feed(&row);
                 }
             }
+            agg_overflow_check(&agg)?;
             return Ok(agg);
         }
     }
     parallel_aggregate(db, def, filter, plan).await
+}
+
+/// Error out (rather than OOM) when a GROUP BY exceeded the distinct-group cap.
+fn agg_overflow_check(agg: &GroupAggregator) -> Result<()> {
+    if agg.overflowed() {
+        return Err(Error::Query(format!(
+            "GROUP BY produced too many distinct groups (limit {}); add a more \
+             selective WHERE or raise ELYRASQL_GROUP_MAX_GROUPS",
+            elyra_olap::default_max_groups()
+        )));
+    }
+    Ok(())
 }
 
 /// Scan the table in batches and aggregate them across worker threads, merging
@@ -5899,6 +5947,7 @@ async fn parallel_aggregate(
             break;
         }
     }
+    agg_overflow_check(&result)?;
     Ok(result)
 }
 
