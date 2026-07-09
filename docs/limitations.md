@@ -162,7 +162,16 @@ implemented, so you can judge fit.
   `COM_STMT_CLOSE` → `COM_STMT_PREPARE` cycles on one connection with strict
   clients (an upstream library limitation). Statement reuse and pooled clients
   are unaffected.
-- No `LOAD DATA INFILE`.
+- **`LOAD DATA INFILE`** reads a **server-side** file and bulk-inserts it
+  (requires ADMIN, like MySQL's `FILE` privilege): `LOAD DATA INFILE '<path>'
+  INTO TABLE t [FIELDS TERMINATED BY '...'] [ENCLOSED BY '...'] [LINES
+  TERMINATED BY '...'] [IGNORE n LINES] [(cols)]`, with `\N` for NULL. Client-
+  side `LOAD DATA LOCAL INFILE` (streaming the file over the wire) is not
+  supported.
+- Authentication uses `mysql_native_password`; connection salts now come from the
+  OS CSPRNG. `caching_sha2_password` (MySQL 8's default) is **not** implemented —
+  the wire library does not drive its multi-round fast/full-auth exchange — but
+  MySQL 8 clients automatically negotiate down to `mysql_native_password`.
 
 ## Roadmap
 

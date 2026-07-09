@@ -157,29 +157,32 @@ fn double_sha1(pw: &[u8]) -> [u8; 20] {
     sha1(&sha1(pw))
 }
 
-/// Generate a fresh per-connection salt of printable, non-`\0`/`$` bytes.
-///
-/// Note: this is a fast, non-cryptographic PRNG seeded from the clock and a
-/// global counter. It is unique per connection; a CSPRNG (getrandom) is the
-/// recommended hardening for production.
+/// Generate a fresh per-connection salt of printable, non-`\0`/`$` bytes,
+/// using the OS cryptographically-secure RNG (`getrandom`). Falls back to a
+/// clock+counter PRNG only if the OS RNG is unavailable.
 pub fn generate_salt() -> [u8; 20] {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    let mut x = nanos
-        ^ (COUNTER
-            .fetch_add(0x9E3779B97F4A7C15, Ordering::Relaxed)
-            .wrapping_mul(0xD1B54A32D192ED03));
+    let mut raw = [0u8; 20];
+    if getrandom::getrandom(&mut raw).is_err() {
+        // Extremely rare fallback: seed a weak PRNG from the clock + a counter.
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let mut x = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0)
+            ^ COUNTER
+                .fetch_add(0x9E3779B97F4A7C15, Ordering::Relaxed)
+                .wrapping_mul(0xD1B54A32D192ED03);
+        for b in raw.iter_mut() {
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            *b = (x.wrapping_mul(0x2545F4914F6CDD1D) >> 56) as u8;
+        }
+    }
     let mut salt = [0u8; 20];
-    for b in salt.iter_mut() {
-        x ^= x >> 12;
-        x ^= x << 25;
-        x ^= x >> 27;
-        let v = (x.wrapping_mul(0x2545F4914F6CDD1D) >> 33) as u32;
-        // Map into printable ASCII range 0x21..=0x7e, avoiding '\0' and '$'.
-        let mut c = 0x21 + (v % (0x7e - 0x21));
+    for (b, r) in salt.iter_mut().zip(raw) {
+        // Map into printable ASCII 0x21..=0x7e, avoiding '\0' and '$'.
+        let mut c = 0x21 + (r as u32 % (0x7e - 0x21));
         if c == b'$' as u32 {
             c += 1;
         }

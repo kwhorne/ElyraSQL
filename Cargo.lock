@@ -524,6 +524,7 @@ dependencies = [
  "elyra-core",
  "elyra-engine",
  "elyra-storage",
+ "getrandom 0.2.17",
  "opensrv-mysql",
  "rustls-pemfile",
  "rustls-pki-types",

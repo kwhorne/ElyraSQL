@@ -488,6 +488,30 @@ impl Engine {
             ]);
         }
 
+        // LOAD DATA INFILE '<server-side path>' INTO TABLE t ... — reads a file on
+        // the server and bulk-inserts it (requires ADMIN, like MySQL's FILE priv).
+        if head.starts_with("load data") {
+            if privilege < Privilege::Admin {
+                return Err(Error::Query(
+                    "access denied: LOAD DATA INFILE requires ADMIN privilege".into(),
+                ));
+            }
+            let spec = exec::parse_load_data(trimmed)?;
+            let content = tokio::fs::read_to_string(&spec.path).await.map_err(|e| {
+                Error::Query(format!("LOAD DATA: cannot read '{}': {e}", spec.path))
+            })?;
+            let stmts = exec::build_load_inserts(&spec, &content, 1000);
+            let mut total = 0u64;
+            for stmt in stmts {
+                for r in Box::pin(self.execute_as(&stmt, privilege, user, sess)).await? {
+                    if let QueryResult::Affected(n) = r {
+                        total += n;
+                    }
+                }
+            }
+            return Ok(vec![QueryResult::Affected(total)]);
+        }
+
         // Pessimistic table locking (LOCK TABLES / UNLOCK TABLES) — not parsed by
         // the SQL frontend.
         if head.starts_with("lock tables") || head.starts_with("lock table ") {

@@ -3530,6 +3530,155 @@ fn simple_pred(e: &Expr) -> Option<(String, catalog::SelOp, String)> {
     None
 }
 
+/// A parsed `LOAD DATA INFILE` statement.
+pub struct LoadSpec {
+    pub path: String,
+    pub table: String,
+    pub cols: Vec<String>,
+    pub field_term: String,
+    pub enclosed: Option<char>,
+    pub line_term: String,
+    pub ignore: usize,
+}
+
+/// Parse `LOAD DATA [LOCAL] INFILE '<path>' INTO TABLE <t> [FIELDS TERMINATED BY
+/// 'x' [[OPTIONALLY] ENCLOSED BY 'y']] [LINES TERMINATED BY 'z'] [IGNORE n LINES]
+/// [(col, ...)]`.
+pub fn parse_load_data(sql: &str) -> Result<LoadSpec> {
+    let lower = sql.to_ascii_lowercase();
+    // Extract the single-quoted string starting at byte position `from`.
+    let quoted = |from: usize| -> Option<String> {
+        let rest = &sql[from..];
+        let start = rest.find('\'')?;
+        let after = &rest[start + 1..];
+        // Support simple backslash escapes for terminators like '\t'.
+        let mut out = String::new();
+        let mut chars = after.chars();
+        while let Some(c) = chars.next() {
+            match c {
+                '\'' => return Some(out),
+                '\\' => match chars.next() {
+                    Some('t') => out.push('\t'),
+                    Some('n') => out.push('\n'),
+                    Some('r') => out.push('\r'),
+                    Some('0') => out.push('\0'),
+                    Some(o) => out.push(o),
+                    None => break,
+                },
+                _ => out.push(c),
+            }
+        }
+        Some(out)
+    };
+    let infile = lower
+        .find("infile")
+        .ok_or_else(|| Error::Parse("LOAD DATA requires INFILE '<path>'".into()))?;
+    let path = quoted(infile).ok_or_else(|| Error::Parse("LOAD DATA: missing file path".into()))?;
+    let into = lower
+        .find("into table")
+        .ok_or_else(|| Error::Parse("LOAD DATA requires INTO TABLE <table>".into()))?;
+    let after_into = sql[into + "into table".len()..].trim_start();
+    let table = after_into
+        .split(|c: char| c.is_whitespace() || c == '(')
+        .next()
+        .unwrap_or("")
+        .trim_matches(['`', '"'])
+        .to_string();
+    if table.is_empty() {
+        return Err(Error::Parse("LOAD DATA: empty table name".into()));
+    }
+    let field_term = lower
+        .find("fields terminated by")
+        .or_else(|| lower.find("columns terminated by"))
+        .and_then(|p| quoted(p + "fields terminated by".len()))
+        .unwrap_or_else(|| "\t".to_string());
+    let enclosed = lower
+        .find("enclosed by")
+        .and_then(|p| quoted(p + "enclosed by".len()))
+        .and_then(|s| s.chars().next());
+    let line_term = lower
+        .find("lines terminated by")
+        .and_then(|p| quoted(p + "lines terminated by".len()))
+        .unwrap_or_else(|| "\n".to_string());
+    let ignore = lower.find("ignore").and_then(|p| {
+        sql[p + "ignore".len()..]
+            .split_whitespace()
+            .next()
+            .and_then(|n| n.parse::<usize>().ok())
+    });
+    // Optional explicit column list: the last `(...)` group.
+    let cols = if let (Some(open), Some(close)) = (sql.rfind('('), sql.rfind(')')) {
+        if open < close && open > into {
+            sql[open + 1..close]
+                .split(',')
+                .map(|c| c.trim().trim_matches(['`', '"']).to_string())
+                .filter(|c| !c.is_empty())
+                .collect()
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
+    Ok(LoadSpec {
+        path,
+        table,
+        cols,
+        field_term,
+        enclosed,
+        line_term,
+        ignore: ignore.unwrap_or(0),
+    })
+}
+
+/// Turn file `content` into batched `INSERT` statements per the load spec.
+pub fn build_load_inserts(spec: &LoadSpec, content: &str, batch: usize) -> Vec<String> {
+    let mut stmts = Vec::new();
+    let col_list = if spec.cols.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " ({})",
+            spec.cols
+                .iter()
+                .map(|c| format!("`{c}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    let mut rows_iter = content
+        .split(spec.line_term.as_str())
+        .skip(spec.ignore)
+        .filter(|l| !l.is_empty())
+        .peekable();
+    while rows_iter.peek().is_some() {
+        let mut tuples: Vec<String> = Vec::with_capacity(batch);
+        for line in rows_iter.by_ref().take(batch) {
+            let fields = line.split(spec.field_term.as_str()).map(|f| {
+                let f = match spec.enclosed {
+                    Some(q) => f.trim_matches(q),
+                    None => f,
+                };
+                if f == "\\N" {
+                    "NULL".to_string()
+                } else {
+                    format!("'{}'", f.replace('\\', "\\\\").replace('\'', "''"))
+                }
+            });
+            tuples.push(format!("({})", fields.collect::<Vec<_>>().join(", ")));
+        }
+        if !tuples.is_empty() {
+            stmts.push(format!(
+                "INSERT INTO `{}`{} VALUES {}",
+                spec.table,
+                col_list,
+                tuples.join(", ")
+            ));
+        }
+    }
+    stmts
+}
+
 /// Execute an all-INNER join chain over base tables in a cost-based order.
 /// Loads each table (with predicate pushdown), then greedily joins starting from
 /// the smallest, always extending along an available equi-join predicate.
