@@ -42,6 +42,12 @@ struct Repl {
 }
 
 impl Repl {
+    /// Whether any replica is currently attached (avoids cloning write-sets when
+    /// there is nothing to replicate).
+    fn has_replicas(&self) -> bool {
+        self.tx.receiver_count() > 0
+    }
+
     /// Assign the next LSN and broadcast a committed write-set.
     fn publish(&self, puts: Vec<(Vec<u8>, Vec<u8>)>, deletes: Vec<Vec<u8>>) {
         if puts.is_empty() && deletes.is_empty() {
@@ -269,7 +275,7 @@ fn writer_loop(storage: Arc<Storage>, mut rx: mpsc::Receiver<WriteJob>, repl: Re
         // conflict fails only that transaction, not batched neighbours.
         if let Some(v) = &first.validation {
             let r = storage.apply_validated(&v.keys, &v.ranges, &first.puts, &first.deletes);
-            if r.is_ok() {
+            if r.is_ok() && repl.has_replicas() {
                 repl.publish(first.puts.clone(), first.deletes.clone());
             }
             let _ = first.ack.send(r);
@@ -297,7 +303,7 @@ fn writer_loop(storage: Arc<Storage>, mut rx: mpsc::Receiver<WriteJob>, repl: Re
         if let Some(job) = pending {
             let v = job.validation.as_ref().unwrap();
             let r = storage.apply_validated(&v.keys, &v.ranges, &job.puts, &job.deletes);
-            if r.is_ok() {
+            if r.is_ok() && repl.has_replicas() {
                 repl.publish(job.puts.clone(), job.deletes.clone());
             }
             let _ = job.ack.send(r);
@@ -329,7 +335,7 @@ fn apply_job_group(storage: &Arc<Storage>, jobs: Vec<WriteJob>, repl: &Repl) {
 
     if jobs.len() == 1 {
         let r = apply_one(&jobs[0]);
-        if r.is_ok() {
+        if r.is_ok() && repl.has_replicas() {
             repl.publish(job_puts(&jobs[0]), jobs[0].deletes.clone());
         }
         let _ = jobs.into_iter().next().unwrap().ack.send(r);
@@ -349,9 +355,11 @@ fn apply_job_group(storage: &Arc<Storage>, jobs: Vec<WriteJob>, repl: &Repl) {
 
     match storage.apply_insert(&new, &puts, &deletes) {
         Ok(()) => {
-            let mut all_puts = new.clone();
-            all_puts.extend_from_slice(&puts);
-            repl.publish(all_puts, deletes.clone());
+            if repl.has_replicas() {
+                let mut all_puts = new.clone();
+                all_puts.extend_from_slice(&puts);
+                repl.publish(all_puts, deletes.clone());
+            }
             for job in jobs {
                 let _ = job.ack.send(Ok(()));
             }
@@ -361,7 +369,7 @@ fn apply_job_group(storage: &Arc<Storage>, jobs: Vec<WriteJob>, repl: &Repl) {
             // only the statement with the duplicate fails.
             for job in jobs {
                 let r = apply_one(&job);
-                if r.is_ok() {
+                if r.is_ok() && repl.has_replicas() {
                     repl.publish(job_puts(&job), job.deletes.clone());
                 }
                 let _ = job.ack.send(r);

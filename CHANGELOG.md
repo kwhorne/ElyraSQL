@@ -4,6 +4,37 @@ All notable changes to ElyraSQL are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.6.0] - 2026-07-09
+
+Scale & availability release: replication, partitioned aggregation spill,
+cost-based joins with statistics, and a Prometheus metrics endpoint.
+
+### Replication & HA
+
+- Asynchronous primary → replica replication. A primary streams LSN-tagged
+  committed write-sets (`--replication-listen`); a replica bootstraps from a
+  snapshot and applies the stream (`elyrasql replica`), serving read-only
+  queries. Idempotent, ordered application means replicas never diverge; failover
+  is manual (a replica file is a complete database).
+
+### Aggregation
+
+- `GROUP BY` with many distinct groups now falls back to **partitioned spill**
+  aggregation (bounded memory) instead of erroring, completing the OOM-safety
+  story alongside `ORDER BY` spill.
+
+### Query planning
+
+- Equi hash joins now cover **INNER / LEFT / RIGHT** with a cost-based build side
+  (INNER builds the smaller relation; RIGHT no longer degrades to nested-loop).
+- `ANALYZE TABLE` records row-count statistics, surfaced as
+  `information_schema.tables.TABLE_ROWS`.
+
+### Observability
+
+- Prometheus/OpenMetrics endpoint (`--metrics-listen`, `GET /metrics`) exposing
+  the server counters, plus a `/health` probe.
+
 ## [0.5.0] - 2026-07-09
 
 Operations & data-model release: observability, memory-bounded sorts, per-column
@@ -218,6 +249,7 @@ core CRUD with `WHERE`/`ORDER BY`/`LIMIT`, indexes, aggregation and `GROUP BY`,
 joins, prepared statements, authentication and TLS, vector search (exact +
 HNSW), parallel OLAP aggregation, and transactions with snapshot isolation.
 
+[0.6.0]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.6.0
 [0.5.0]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.5.0
 [0.4.0]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.4.0
 [0.3.0]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.3.0
