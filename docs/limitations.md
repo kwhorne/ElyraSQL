@@ -29,10 +29,12 @@ implemented, so you can judge fit.
   (the smaller relation for INNER; an index nested-loop join when the driving
   side is small and the partner is indexed). `FULL` and non-equi joins use
   nested-loop; there is no merge join.
-- `ANALYZE TABLE` records row-count statistics (surfaced as
-  `information_schema.tables.TABLE_ROWS`). Join build-side selection uses live
-  materialized sizes; there is not yet a full cost-based optimizer with
-  per-column histograms or automatic join reordering.
+- `ANALYZE TABLE` records row-count and per-column statistics (NDV, null count,
+  min/max), surfaced as `information_schema.tables.TABLE_ROWS` and
+  `information_schema.column_statistics`. The planner drives a comma cross-join
+  from the smallest analyzed table and picks hash-join build sides by live size;
+  automatic reordering of explicit multi-table JOIN chains and full histogram-
+  based cardinality estimation are not yet implemented.
 - `ORDER BY` is memory-bounded: `ORDER BY ... LIMIT` uses a top-N heap, and
   large unbounded sorts spill sorted runs to temp files (external merge sort,
   `ELYRASQL_SORT_MAX_ROWS`). `GROUP BY` with many distinct groups falls back to

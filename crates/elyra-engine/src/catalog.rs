@@ -137,11 +137,28 @@ pub fn catalog_key(table: &str) -> Vec<u8> {
     format!("catalog::{table}").into_bytes()
 }
 
+/// Per-column statistics collected by `ANALYZE TABLE`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ColStat {
+    pub name: String,
+    /// Number of distinct non-null values (capped; see `ndv_capped`).
+    pub ndv: u64,
+    /// Whether `ndv` hit the counting cap (a lower bound if true).
+    #[serde(default)]
+    pub ndv_capped: bool,
+    pub nulls: u64,
+    pub min: Option<String>,
+    pub max: Option<String>,
+}
+
 /// Persisted table statistics (from `ANALYZE TABLE`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TableStats {
     /// Row count at the last ANALYZE.
     pub rows: u64,
+    /// Per-column statistics (positional with the table schema).
+    #[serde(default)]
+    pub columns: Vec<ColStat>,
 }
 
 pub fn stats_key(table: &str) -> Vec<u8> {

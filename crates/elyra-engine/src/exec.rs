@@ -680,6 +680,33 @@ async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec
             }
             Ok((schema, rows))
         }
+        "column_statistics" => {
+            let schema = Schema::new(vec![
+                text("TABLE_NAME"),
+                text("COLUMN_NAME"),
+                int("NDV"),
+                int("NULLS"),
+                text("MIN_VALUE"),
+                text("MAX_VALUE"),
+            ]);
+            let mut rows = Vec::new();
+            for tname in names {
+                let Some(stats) = catalog::load_stats(db, &tname).await? else {
+                    continue;
+                };
+                for c in &stats.columns {
+                    rows.push(vec![
+                        Value::Text(tname.clone()),
+                        Value::Text(c.name.clone()),
+                        Value::Int(c.ndv as i64),
+                        Value::Int(c.nulls as i64),
+                        c.min.clone().map(Value::Text).unwrap_or(Value::Null),
+                        c.max.clone().map(Value::Text).unwrap_or(Value::Null),
+                    ]);
+                }
+            }
+            Ok((schema, rows))
+        }
         other => Err(Error::Unsupported(format!(
             "information_schema.{other} is not available"
         ))),
@@ -2885,7 +2912,35 @@ async fn build_from(
     let mut cur_rows: Vec<Vec<Value>> = Vec::new();
     let mut first = true;
 
-    for twj in from {
+    // Cost-based ordering for a pure comma cross-join (every entry is a plain
+    // base table with no explicit JOINs): drive from the smallest analyzed
+    // table. This is safe because cross-join + global WHERE is commutative.
+    let ordered: Vec<&TableWithJoins> = if from.len() > 1
+        && from
+            .iter()
+            .all(|t| t.joins.is_empty() && matches!(t.relation, TableFactor::Table { .. }))
+    {
+        let mut idx: Vec<(&TableWithJoins, u64)> = Vec::with_capacity(from.len());
+        for t in from {
+            let est = match &t.relation {
+                TableFactor::Table { name, .. } => {
+                    let n = name.0.last().map(|i| i.value.clone()).unwrap_or_default();
+                    catalog::load_stats(db, &n)
+                        .await?
+                        .map(|s| s.rows)
+                        .unwrap_or(u64::MAX)
+                }
+                _ => u64::MAX,
+            };
+            idx.push((t, est));
+        }
+        idx.sort_by_key(|(_, est)| *est);
+        idx.into_iter().map(|(t, _)| t).collect()
+    } else {
+        from.iter().collect()
+    };
+
+    for twj in ordered {
         let (bc, mut br) = load_relation(db, vindex, &twj.relation, conjuncts).await?;
         br = apply_pushdown(br, &bc, conjuncts)?;
         if first {
@@ -6316,6 +6371,15 @@ pub async fn analyze_table(db: &Session, name: &str) -> Result<QueryResult> {
     if !catalog::exists(db, name).await? {
         return Err(Error::Catalog(format!("no such table: {name}")));
     }
+    let def = catalog::load(db, name).await?;
+    let ncols = def.schema.columns.len();
+    const NDV_CAP: usize = 100_000;
+    let mut distinct: Vec<std::collections::HashSet<Vec<u8>>> = vec![Default::default(); ncols];
+    let mut capped = vec![false; ncols];
+    let mut nulls = vec![0u64; ncols];
+    let mut mins: Vec<Option<Value>> = vec![None; ncols];
+    let mut maxs: Vec<Option<Value>> = vec![None; ncols];
+
     let prefix = data_prefix(name);
     let mut cursor: Option<Vec<u8>> = None;
     let mut rows = 0u64;
@@ -6327,11 +6391,50 @@ pub async fn analyze_table(db: &Session, name: &str) -> Result<QueryResult> {
         rows += batch.len() as u64;
         let last = batch.len() < 8192;
         cursor = batch.last().map(|(k, _)| k.clone());
+        for (_, v) in &batch {
+            let row: Vec<Value> =
+                bincode::deserialize(v).map_err(|e| Error::Storage(e.to_string()))?;
+            for (i, val) in row.iter().enumerate().take(ncols) {
+                if val.is_null() {
+                    nulls[i] += 1;
+                    continue;
+                }
+                if !capped[i] {
+                    if distinct[i].len() < NDV_CAP {
+                        distinct[i].insert(val.collation_key());
+                    } else {
+                        capped[i] = true;
+                    }
+                }
+                if mins[i]
+                    .as_ref()
+                    .is_none_or(|m| val.compare(m) == Some(std::cmp::Ordering::Less))
+                {
+                    mins[i] = Some(val.clone());
+                }
+                if maxs[i]
+                    .as_ref()
+                    .is_none_or(|m| val.compare(m) == Some(std::cmp::Ordering::Greater))
+                {
+                    maxs[i] = Some(val.clone());
+                }
+            }
+        }
         if last {
             break;
         }
     }
-    let stats = catalog::TableStats { rows };
+    let columns = (0..ncols)
+        .map(|i| catalog::ColStat {
+            name: def.schema.columns[i].name.clone(),
+            ndv: distinct[i].len() as u64,
+            ndv_capped: capped[i],
+            nulls: nulls[i],
+            min: mins[i].as_ref().and_then(|v| v.to_wire_string()),
+            max: maxs[i].as_ref().and_then(|v| v.to_wire_string()),
+        })
+        .collect();
+    let stats = catalog::TableStats { rows, columns };
     let enc = bincode::serialize(&stats).map_err(|e| Error::Storage(e.to_string()))?;
     db.commit_write(vec![(catalog::stats_key(name), enc)], vec![])
         .await?;
