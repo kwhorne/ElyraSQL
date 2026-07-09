@@ -24,6 +24,27 @@ INSERT INTO combined (id, v) SELECT id, v FROM a UNION SELECT id, v FROM b;
 The source may be any query (including joins, aggregation, and set operations).
 The selected columns map positionally to the target columns.
 
+### Duplicate keys and upserts
+
+Inserting a row whose primary key already exists fails with a duplicate-key
+error (`1062`). Three ways to change that:
+
+```sql
+-- Skip conflicting rows
+INSERT IGNORE INTO users VALUES (1, 'Alice');
+
+-- Overwrite the existing row
+REPLACE INTO users VALUES (1, 'Alice');
+
+-- Update selected columns of the existing row; VALUES(col) is the value that
+-- would have been inserted
+INSERT INTO counters (id, hits) VALUES (1, 1)
+    ON DUPLICATE KEY UPDATE hits = hits + VALUES(hits);
+```
+
+`REPLACE` and `ON DUPLICATE KEY UPDATE` maintain secondary indexes correctly,
+and duplicates within a single statement coalesce.
+
 ## UPDATE
 
 ```sql

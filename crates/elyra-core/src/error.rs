@@ -21,6 +21,9 @@ pub enum Error {
     #[error("serialization failure: {0}")]
     Conflict(String),
 
+    #[error("duplicate entry: {0}")]
+    Duplicate(String),
+
     #[error("type error: {0}")]
     Type(String),
 
@@ -47,6 +50,7 @@ impl Error {
             Error::Type(_) => 1366,        // ER_TRUNCATED_WRONG_VALUE
             Error::Unsupported(_) => 1235, // ER_NOT_SUPPORTED_YET
             Error::Conflict(_) => 1213,    // ER_LOCK_DEADLOCK (serialization failure)
+            Error::Duplicate(_) => 1062,   // ER_DUP_ENTRY
             _ => 1105,
         }
     }

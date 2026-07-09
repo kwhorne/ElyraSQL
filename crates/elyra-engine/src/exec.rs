@@ -499,6 +499,44 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
         None => run_subquery(db, vindex, source).await?,
     };
 
+    // Upsert mode: REPLACE INTO, INSERT IGNORE, ON DUPLICATE KEY UPDATE.
+    let replace = ins.replace_into;
+    let ignore = ins.ignore;
+    let dup_sets: Vec<(usize, Expr)> = match &ins.on {
+        Some(sqlparser::ast::OnInsert::DuplicateKeyUpdate(assigns)) => {
+            let mut v = Vec::with_capacity(assigns.len());
+            for a in assigns {
+                let col = match &a.target {
+                    AssignmentTarget::ColumnName(n) => {
+                        n.0.last()
+                            .map(|i| i.value.clone())
+                            .ok_or_else(|| Error::Query("empty assignment target".into()))?
+                    }
+                    AssignmentTarget::Tuple(_) => {
+                        return Err(Error::Unsupported(
+                            "tuple assignment is not supported".into(),
+                        ))
+                    }
+                };
+                let idx = def
+                    .schema
+                    .columns
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(&col))
+                    .ok_or_else(|| Error::Catalog(format!("unknown column: {col}")))?;
+                v.push((idx, a.value.clone()));
+            }
+            v
+        }
+        Some(other) => {
+            return Err(Error::Unsupported(format!(
+                "unsupported ON clause: {other:?}"
+            )))
+        }
+        None => Vec::new(),
+    };
+    let on_dup = !dup_sets.is_empty();
+
     // Load rowid counter once for tables without a PK.
     let mut next_rowid = if def.has_pk() {
         0
@@ -506,7 +544,23 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
         read_rowid(db, &name).await?
     };
 
-    let mut puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(rows.len());
+    let mut deletes: Vec<Vec<u8>> = Vec::new();
+    let mut affected: u64 = 0;
+    // PK rows coalesce by clustered key so within-statement duplicates merge;
+    // rowid rows are always fresh inserts.
+    let mut batch: Vec<(Vec<u8>, Vec<Value>)> = Vec::new();
+    let mut pos_of: std::collections::HashMap<Vec<u8>, usize> = std::collections::HashMap::new();
+
+    let apply_dup = |old: &[Value], insert: &[Value]| -> Result<Vec<Value>> {
+        let mut merged = old.to_vec();
+        for (idx, expr) in &dup_sets {
+            let bound = bind_values(expr, insert, &def.schema);
+            let v = predicate::eval_row(&bound, &def.schema, &merged)?;
+            let col = &def.schema.columns[*idx];
+            merged[*idx] = coerce(v, &col.ty, &col.name)?;
+        }
+        Ok(merged)
+    };
 
     for vals in rows {
         if vals.len() != target.len() {
@@ -533,20 +587,68 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
             }
         }
 
-        let key = if def.has_pk() {
-            let pk_vals: Vec<Value> = def.pk_cols.iter().map(|&i| row[i].clone()).collect();
-            data_key(&name, &keyenc::encode_key(&pk_vals)?)
-        } else {
+        if !def.has_pk() {
             next_rowid += 1;
-            data_key(&name, &keyenc::encode_rowid(next_rowid))
-        };
-        let encoded = bincode::serialize(&row).map_err(|e| Error::Storage(e.to_string()))?;
-        let idx_entries = index::entries_for_row(&def, &row, &key)?;
-        puts.push((key, encoded));
-        puts.extend(idx_entries);
+            batch.push((data_key(&name, &keyenc::encode_rowid(next_rowid)), row));
+            affected += 1;
+            continue;
+        }
+
+        let pk_vals: Vec<Value> = def.pk_cols.iter().map(|&i| row[i].clone()).collect();
+        let key = data_key(&name, &keyenc::encode_key(&pk_vals)?);
+
+        // Coalesce with an earlier row in the same statement.
+        if let Some(&pos) = pos_of.get(&key) {
+            if replace {
+                batch[pos].1 = row;
+                affected += 1;
+            } else if on_dup {
+                batch[pos].1 = apply_dup(&batch[pos].1.clone(), &row)?;
+                affected += 1;
+            } else if !ignore {
+                return Err(Error::Duplicate(format!(
+                    "Duplicate entry for key 'PRIMARY' on '{name}'"
+                )));
+            }
+            continue;
+        }
+
+        // Coalesce with an existing row in storage.
+        if let Some(old_enc) = db.get(key.clone()).await? {
+            if !replace && !on_dup {
+                if ignore {
+                    continue;
+                }
+                return Err(Error::Duplicate(format!(
+                    "Duplicate entry for key 'PRIMARY' on '{name}'"
+                )));
+            }
+            let old_row: Vec<Value> =
+                bincode::deserialize(&old_enc).map_err(|e| Error::Storage(e.to_string()))?;
+            // The old row's index entries must go (data key is overwritten).
+            deletes.extend(index::entry_keys_for_row(&def, &old_row, &key)?);
+            let new_row = if replace {
+                row
+            } else {
+                apply_dup(&old_row, &row)?
+            };
+            pos_of.insert(key.clone(), batch.len());
+            batch.push((key, new_row));
+            affected += 1;
+        } else {
+            pos_of.insert(key.clone(), batch.len());
+            batch.push((key, row));
+            affected += 1;
+        }
     }
 
-    let affected = puts.len() as u64;
+    // Materialise the batch into data + index puts.
+    let mut puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(batch.len() + 2);
+    for (key, row) in &batch {
+        let encoded = bincode::serialize(row).map_err(|e| Error::Storage(e.to_string()))?;
+        puts.push((key.clone(), encoded));
+        puts.extend(index::entries_for_row(&def, row, key)?);
+    }
 
     // Persist the advanced rowid counter in the same atomic commit.
     if !def.has_pk() {
@@ -554,8 +656,34 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
     }
     puts.push(bump_wcount(db, &name).await?);
 
-    db.commit_write(puts, vec![]).await?;
+    db.commit_write(puts, deletes).await?;
     Ok(QueryResult::Affected(affected))
+}
+
+/// Replace `VALUES(col)` references (MySQL ON DUPLICATE KEY UPDATE) with the
+/// value that would have been inserted.
+fn bind_values(expr: &Expr, insert_row: &[Value], schema: &Schema) -> Expr {
+    map_expr(expr, &|e| {
+        if let Expr::Function(f) = e {
+            let is_values = f
+                .name
+                .0
+                .last()
+                .is_some_and(|i| i.value.eq_ignore_ascii_case("values"));
+            if is_values {
+                if let Some(col) = fn_arg_exprs(f).first().and_then(|a| ident_name(a)) {
+                    if let Some(i) = schema
+                        .columns
+                        .iter()
+                        .position(|c| c.name.eq_ignore_ascii_case(col))
+                    {
+                        return Some(value_to_expr(&insert_row[i]));
+                    }
+                }
+            }
+        }
+        None
+    })
 }
 
 pub async fn select(
