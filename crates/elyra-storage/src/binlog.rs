@@ -170,6 +170,70 @@ pub fn purge(dir: impl AsRef<Path>, to: &str) -> Result<u64> {
     Ok(removed)
 }
 
+/// Read every record from one segment file into memory.
+fn read_segment_records(path: &Path) -> Result<Vec<BinlogRecord>> {
+    let mut r = BufReader::new(File::open(path).map_err(Error::Io)?);
+    let mut out = Vec::new();
+    loop {
+        let mut len = [0u8; 4];
+        match r.read_exact(&mut len) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(Error::Io(e)),
+        }
+        let n = u32::from_le_bytes(len) as usize;
+        let mut buf = vec![0u8; n];
+        r.read_exact(&mut buf).map_err(Error::Io)?;
+        out.push(bincode::deserialize(&buf).map_err(|e| Error::Storage(e.to_string()))?);
+    }
+    Ok(out)
+}
+
+/// The smallest LSN still available in the binlog (the start of the oldest
+/// segment), or `None` if the binlog is empty.
+pub fn earliest_lsn(dir: impl AsRef<Path>) -> Result<Option<u64>> {
+    let dir = dir.as_ref();
+    for seq in list_seqs(dir)? {
+        let recs = read_segment_records(&dir.join(segment_name(seq)))?;
+        if let Some(first) = recs.first() {
+            return Ok(Some(first.lsn));
+        }
+    }
+    Ok(None)
+}
+
+/// The highest LSN recorded in the binlog (0 if empty). Used to make the LSN
+/// counter monotonic across primary restarts.
+pub fn max_lsn(dir: impl AsRef<Path>) -> Result<u64> {
+    let dir = dir.as_ref();
+    let mut max = 0;
+    if let Some(&last) = list_seqs(dir)?.last() {
+        if let Some(rec) = read_segment_records(&dir.join(segment_name(last)))?.last() {
+            max = rec.lsn;
+        }
+    }
+    Ok(max)
+}
+
+/// Collect binlog records with `after_lsn < lsn <= up_to_lsn`, in order. Used to
+/// stream an incremental catch-up to a reconnecting replica.
+pub fn read_since(
+    dir: impl AsRef<Path>,
+    after_lsn: u64,
+    up_to_lsn: u64,
+) -> Result<Vec<BinlogRecord>> {
+    let dir = dir.as_ref();
+    let mut out = Vec::new();
+    for seq in list_seqs(dir)? {
+        for rec in read_segment_records(&dir.join(segment_name(seq)))? {
+            if rec.lsn > after_lsn && rec.lsn <= up_to_lsn {
+                out.push(rec);
+            }
+        }
+    }
+    Ok(out)
+}
+
 fn replay_segment(
     path: &Path,
     db: &Db,

@@ -146,7 +146,13 @@ impl Db {
     fn from_storage(storage: Storage, binlog: Option<std::path::PathBuf>) -> Result<Self> {
         let storage = Arc::new(storage);
         let (tx, rx) = mpsc::channel::<WriteJob>(WRITE_QUEUE_DEPTH);
-        let lsn = Arc::new(AtomicU64::new(0));
+        // Resume the LSN counter from the binlog so it stays monotonic across
+        // restarts (correct binlog ordering + incremental replica catch-up).
+        let initial_lsn = match &binlog {
+            Some(p) => crate::binlog::max_lsn(p).unwrap_or(0),
+            None => 0,
+        };
+        let lsn = Arc::new(AtomicU64::new(initial_lsn));
         let (repl_tx, _) = broadcast::channel::<Arc<WriteEvent>>(REPL_CAPACITY);
         let replicas = Arc::new(Mutex::new(HashMap::new()));
         let ack_notify = Arc::new(Notify::new());

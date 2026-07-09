@@ -114,7 +114,14 @@ implemented, so you can judge fit.
   close — the failover data-loss window (there is no pre-commit 2-phase
   replication / multi-primary).
   **Automatic failover** is available in `cluster` mode via Raft-style leader
-  election (majority quorum, leader-only writes/fencing).
+  election (majority quorum, leader-only writes/fencing). A reconnecting replica
+  catches up **incrementally from the binlog** (streaming only the delta since
+  its last applied LSN) instead of re-copying the whole database; it falls back
+  to a full snapshot only when the binlog is disabled or the needed segments
+  were purged. The LSN counter is resumed from the binlog across restarts.
+  Cluster membership is a static peer list (no dynamic add/remove), and an
+  even-node cluster can, rarely, need an extra election round to break a tie —
+  run an odd number of nodes.
 
 ## Wire protocol
 
