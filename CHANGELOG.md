@@ -4,6 +4,35 @@ All notable changes to ElyraSQL are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.8.2] - 2026-07-09
+
+High-availability & feature-completeness release.
+
+### Automatic failover
+
+- `cluster` mode: Raft-style leader election (terms, majority votes, heartbeats,
+  step-down). The elected leader accepts writes and serves replication;
+  followers are read-only and replicate from it. On leader failure a surviving
+  node is automatically elected. Leader-only writes provide fencing; a majority
+  quorum avoids split-brain. Data replication remains asynchronous.
+
+### Stored procedures
+
+- `IN`/`OUT`/`INOUT` parameters, session `@user` variables, and full control
+  flow: `LOOP`, `REPEAT ... UNTIL`, labeled `LEAVE`/`ITERATE` (in addition to
+  `IF`/`WHILE`).
+
+### Full-text search
+
+- `CREATE FULLTEXT INDEX` builds a persistent inverted index maintained on
+  INSERT/UPDATE/DELETE and used to accelerate `MATCH ... AGAINST`; light English
+  stemming folds regular word forms.
+
+### Spatial
+
+- `POINT`/`GEOMETRY` columns (WKT) with `POINT`, `ST_X`, `ST_Y`, `ST_Distance`,
+  `ST_AsText`, `ST_GeomFromText`.
+
 ## [0.8.1] - 2026-07-09
 
 Programmability release: triggers, procedural stored procedures, and full-text
@@ -320,6 +349,7 @@ core CRUD with `WHERE`/`ORDER BY`/`LIMIT`, indexes, aggregation and `GROUP BY`,
 joins, prepared statements, authentication and TLS, vector search (exact +
 HNSW), parallel OLAP aggregation, and transactions with snapshot isolation.
 
+[0.8.2]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.8.2
 [0.8.1]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.8.1
 [0.8.0]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.8.0
 [0.7.0]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.7.0
