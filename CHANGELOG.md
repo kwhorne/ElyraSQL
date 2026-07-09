@@ -4,6 +4,32 @@ All notable changes to ElyraSQL are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.8.8] - 2026-07-09
+
+Partitioning release.
+
+### Partitioning
+
+- `CREATE TABLE ... PARTITION BY RANGE|LIST|HASH (<pk column>) (...)` records a
+  partitioning scheme (managed primary-key ranges), exposed in
+  `information_schema.partitions`.
+- `ALTER TABLE t DROP PARTITION p` / `TRUNCATE PARTITION p` cheaply delete a
+  partition's rows (range/`IN` delete with index cleanup). Queries with a PK
+  predicate prune automatically via clustered range scans.
+- Also fixed a stale docs line: `ON UPDATE` referential actions are enforced.
+
+### Notes / deferred
+
+- Partitioning is **single-node** (managed PK ranges, not physical files, not
+  enforced on INSERT). **Horizontal write scale-out** across nodes would require
+  distributed sharding and is out of scope by design.
+- **Wiring the Raft log into the live cluster write path** (leader append →
+  quorum commit → apply, for pre-commit 2-phase durability) is intentionally
+  *not* bundled here: it is a correctness-critical change that warrants a
+  dedicated release with partition/failover testing (the tested log core landed
+  in 0.8.6). Today's HA remains async replication + quorum/`--sync-strict` + the
+  LSN-aware election restriction (no data loss for acknowledged writes).
+
 ## [0.8.7] - 2026-07-09
 
 SQL-surface & usability release.
@@ -503,6 +529,7 @@ core CRUD with `WHERE`/`ORDER BY`/`LIMIT`, indexes, aggregation and `GROUP BY`,
 joins, prepared statements, authentication and TLS, vector search (exact +
 HNSW), parallel OLAP aggregation, and transactions with snapshot isolation.
 
+[0.8.8]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.8.8
 [0.8.7]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.8.7
 [0.8.6]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.8.6
 [0.8.5]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.8.5
