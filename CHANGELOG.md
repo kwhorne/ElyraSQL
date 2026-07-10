@@ -4,6 +4,48 @@ All notable changes to ElyraSQL are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.9.1] - 2026-07-10
+
+MySQL client compatibility release. Real GUI tools (DBeaver, Workbench) and
+drivers fire a cluster of introspection queries on connect and to populate their
+schema tree; ElyraSQL now answers them, and a few everyday query forms that
+errored now work. No on-disk format change.
+
+### Session / introspection queries
+
+- `SHOW [GLOBAL|SESSION] VARIABLES [LIKE ...]` returns a MySQL 8.0-compatible
+  system-variable set (character sets, collations, timeouts,
+  `max_allowed_packet`, `lower_case_table_names`, `sql_mode`, `version*`, ...)
+  with `LIKE` filtering.
+- `SHOW STATUS`, `SHOW COLLATION`, `SHOW DATABASES`, `SHOW WARNINGS`/`ERRORS`,
+  `SHOW TABLE STATUS`, and `SHOW FUNCTION`/`PROCEDURE STATUS` (including the
+  `WHERE` form, which the SQL parser rejects, handled pre-parse).
+
+### `information_schema` virtual tables
+
+- Added `engines`, `schemata`, `views`, `events`, `routines`, and `triggers`
+  (views/routines/triggers reflect the actual stored objects). The reported
+  database name is now consistently `elyra` (matching `TABLE_SCHEMA` and
+  `Tables_in_elyra`).
+
+### Query engine
+
+- **Expressions over aggregates**: `ROUND(SUM(x), 2)`, `SUM(a)/COUNT(*)`,
+  `SUM(qty*price)`, `COALESCE(SUM(x), 0) + n`, and scalar expressions over group
+  columns like `UPPER(status)` — with or without `GROUP BY`, and over an empty
+  input (yields `NULL`). Previously these errored.
+- **Positional `ORDER BY`** (`ORDER BY 2`, `ORDER BY 1 DESC`) in both the
+  aggregated and plain paths.
+
+### Dependencies
+
+- Applied safe in-range dependency updates; pinned crates that define the
+  on-disk format / SQL parsing / SIMD API (bincode, redb, sqlparser, wide) and
+  the opensrv-pinned rustls stack against breaking Dependabot bumps. Bumped the
+  Alpine runtime image and GitHub Actions. The four `rustls-webpki` advisories
+  are not reachable (server-only TLS, no client-cert/CRL validation) and are
+  transitively pinned by `opensrv-mysql`.
+
 ## [0.9.0] - 2026-07-10
 
 Robustness, correctness & security hardening release. A broad review of the
@@ -667,6 +709,7 @@ core CRUD with `WHERE`/`ORDER BY`/`LIMIT`, indexes, aggregation and `GROUP BY`,
 joins, prepared statements, authentication and TLS, vector search (exact +
 HNSW), parallel OLAP aggregation, and transactions with snapshot isolation.
 
+[0.9.1]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.9.1
 [0.9.0]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.9.0
 [0.8.10]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.8.10
 [0.8.9]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.8.9
