@@ -54,7 +54,10 @@ nearest-neighbour search — typically **sub-millisecond**, versus a full scan f
 exact search.
 
 - The index is **cached in memory** and **rebuilt when the table changes**
-  (rebuild-when-stale), which suits read-heavy embedding workloads.
+  (rebuild-when-stale), which suits read-heavy embedding workloads. Rebuilds are
+  **single-flight**: if many queries arrive at once after a write, only one
+  rebuilds the index while the others wait for and share its result, so a burst
+  of concurrent queries can't trigger a stampede of parallel full-table scans.
 - Without the pattern (e.g. with a `WHERE` filter, or cosine/inner-product),
   the query falls back to **exact** search, which is always correct.
 
