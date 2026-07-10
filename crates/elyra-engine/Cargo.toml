@@ -13,6 +13,8 @@ elyra-vector.workspace = true
 elyra-olap.workspace = true
 sqlparser.workspace = true
 regex.workspace = true
+# Snowball stemmers (English + many other languages) for full-text search.
+rust-stemmers = "1.2"
 tokio = { workspace = true }
 bincode.workspace = true
 serde.workspace = true

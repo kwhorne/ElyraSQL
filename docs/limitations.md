@@ -137,9 +137,13 @@ implemented, so you can judge fit.
   (natural-language OR-of-terms, or boolean `+`/`-`, with relevance scoring).
   `CREATE FULLTEXT INDEX` builds a persistent inverted index that is maintained
   on INSERT/UPDATE/DELETE and used to accelerate MATCH; without one, MATCH falls
-  back to a scan. Light stemming folds regular forms (dogs->dog, foxes->fox) but
-  not irregular ones (wolves), and there are no synonyms. Vector (ANN) search is
-  also available.
+  back to a scan. Stemming uses the **Snowball** algorithms (`rust-stemmers`),
+  so it is linguistically correct (`running`->`run`, `studies`->`study`, while
+  `string`/`sing` are left alone) and supports many languages via
+  `ELYRASQL_FULLTEXT_LANGUAGE` (default `english`; `none` disables stemming).
+  It still doesn't handle synonyms, and truly irregular forms (e.g. `wolves`)
+  aren't unified. Changing the language invalidates an existing index
+  (rebuild with `CREATE FULLTEXT INDEX`). Vector (ANN) search is also available.
 - `ENUM`/`SET` are stored as text and not value-checked.
 - Basic spatial support: `POINT`/`GEOMETRY` columns are stored as WKT text, with
   `POINT(x,y)`, `ST_X`, `ST_Y`, `ST_Distance` (Euclidean), `ST_AsText`, and
