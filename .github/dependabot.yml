@@ -30,6 +30,11 @@ updates:
       - dependency-name: "tokio-rustls"
         update-types:
           ["version-update:semver-major", "version-update:semver-minor"]
+      # sha1 0.11 pulls the breaking digest 0.11 API used in the (security-
+      # critical) password-hashing path; migrating needs deliberate code changes.
+      - dependency-name: "sha1"
+        update-types:
+          ["version-update:semver-major", "version-update:semver-minor"]
 
   - package-ecosystem: github-actions
     directory: "/"
