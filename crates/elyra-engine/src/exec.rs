@@ -523,6 +523,28 @@ pub fn show_warnings() -> Result<QueryResult> {
     )))
 }
 
+/// `SHOW {FUNCTION|PROCEDURE} STATUS [WHERE ...|LIKE ...]` — always empty
+/// (ElyraSQL exposes no stored functions here). Handled pre-parse because the
+/// `WHERE` form doesn't parse.
+pub fn show_routine_status() -> Result<QueryResult> {
+    Ok(QueryResult::Rows(RowStream::literal(
+        text_schema(&[
+            "Db",
+            "Name",
+            "Type",
+            "Definer",
+            "Modified",
+            "Created",
+            "Security_type",
+            "Comment",
+            "character_set_client",
+            "collation_connection",
+            "Database Collation",
+        ]),
+        Vec::new(),
+    )))
+}
+
 /// `SHOW TABLE STATUS [FROM db] [LIKE ...]` — one metadata row per table.
 /// Any FROM/LIKE clause is ignored (all tables are returned; tools tolerate it).
 pub async fn show_table_status(db: &Session) -> Result<QueryResult> {
@@ -1046,6 +1068,86 @@ async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec
                 Value::Text("YES".into()),
             ]];
             Ok((schema, rows))
+        }
+        "views" => {
+            let schema = Schema::new(vec![
+                text("TABLE_CATALOG"),
+                text("TABLE_SCHEMA"),
+                text("TABLE_NAME"),
+                text("VIEW_DEFINITION"),
+                text("CHECK_OPTION"),
+                text("IS_UPDATABLE"),
+                text("DEFINER"),
+                text("SECURITY_TYPE"),
+                text("CHARACTER_SET_CLIENT"),
+                text("COLLATION_CONNECTION"),
+            ]);
+            let prefix = b"view::".to_vec();
+            let mut rows = Vec::new();
+            let mut after: Option<Vec<u8>> = None;
+            loop {
+                let batch = db.scan_batch(prefix.clone(), after.clone(), 512).await?;
+                if batch.is_empty() {
+                    break;
+                }
+                for (k, v) in &batch {
+                    let name = String::from_utf8_lossy(&k[prefix.len()..]).to_string();
+                    let def = String::from_utf8_lossy(v).to_string();
+                    rows.push(vec![
+                        Value::Text("def".into()),
+                        Value::Text("elyra".into()),
+                        Value::Text(name),
+                        Value::Text(def),
+                        Value::Text("NONE".into()),
+                        Value::Text("NO".into()),
+                        Value::Text("root@%".into()),
+                        Value::Text("DEFINER".into()),
+                        Value::Text("utf8mb4".into()),
+                        Value::Text("utf8mb4_general_ci".into()),
+                    ]);
+                }
+                after = batch.last().map(|(k, _)| k.clone());
+                if batch.len() < 512 {
+                    break;
+                }
+            }
+            Ok((schema, rows))
+        }
+        "events" => {
+            // ElyraSQL has no scheduled events; report an empty, correctly-shaped
+            // table so tools that introspect events don't error.
+            let schema = Schema::new(
+                [
+                    "EVENT_CATALOG",
+                    "EVENT_SCHEMA",
+                    "EVENT_NAME",
+                    "DEFINER",
+                    "TIME_ZONE",
+                    "EVENT_BODY",
+                    "EVENT_DEFINITION",
+                    "EVENT_TYPE",
+                    "EXECUTE_AT",
+                    "INTERVAL_VALUE",
+                    "INTERVAL_FIELD",
+                    "SQL_MODE",
+                    "STARTS",
+                    "ENDS",
+                    "STATUS",
+                    "ON_COMPLETION",
+                    "CREATED",
+                    "LAST_ALTERED",
+                    "LAST_EXECUTED",
+                    "EVENT_COMMENT",
+                    "ORIGINATOR",
+                    "CHARACTER_SET_CLIENT",
+                    "COLLATION_CONNECTION",
+                    "DATABASE_COLLATION",
+                ]
+                .iter()
+                .map(|n| text(n))
+                .collect(),
+            );
+            Ok((schema, Vec::new()))
         }
         "schemata" => {
             let schema = Schema::new(vec![

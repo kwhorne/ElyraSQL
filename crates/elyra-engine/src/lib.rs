@@ -653,6 +653,12 @@ impl Engine {
             return Ok(vec![exec::show_index(sess, &name).await?]);
         }
 
+        // SHOW FUNCTION/PROCEDURE STATUS [WHERE ...] — the WHERE form doesn't
+        // parse, so intercept here and return an empty routines listing.
+        if head.starts_with("show function status") || head.starts_with("show procedure status") {
+            return Ok(vec![exec::show_routine_status()?]);
+        }
+
         // BACKUP [DATABASE] TO '<path>' — hot, consistent copy of the whole
         // database to a new file. Not standard SQL, so handled here.
         if head.starts_with("backup") {
