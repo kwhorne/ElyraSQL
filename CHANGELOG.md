@@ -4,6 +4,50 @@ All notable changes to ElyraSQL are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.9.2] - 2026-07-10
+
+MySQL client & driver compatibility release, driven by testing real GUI tools
+and a Rust `sqlx` client against ElyraSQL. No on-disk format change.
+
+### Query engine
+
+- **`LIKE` / `ILIKE` in `WHERE`** are now supported (they were rejected before):
+  `%`/`_` wildcards, `ESCAPE`, `NOT LIKE`, case-insensitive under the default
+  collation — so contains/prefix search works.
+- **Numeric/string comparison coercion**: comparing a numeric column to a string
+  literal (`id = '5'`, `IN ('5','6')`, `price = '10.50'`, `id > '4'`) now coerces
+  per MySQL rules. This also fixes **bound parameters not matching numeric
+  columns** (drivers render params as string literals).
+- **Expressions over aggregates**: `ROUND(SUM(x),2)`, `SUM(a)/COUNT(*)`,
+  `SUM(qty*price)`, `COALESCE(SUM(x),0)+n`, and scalar expressions over group
+  columns like `UPPER(status)` — with or without `GROUP BY`.
+- **Positional `ORDER BY`** (`ORDER BY 2`, `ORDER BY 1 DESC`).
+- **`VERSION()`, `DATABASE()`, `USER()`, `CURRENT_USER()`, `CONNECTION_ID()`,
+  `CURRENT_ROLE()`** work as scalar functions in any context (not just as an
+  exact-match intercept).
+- `CREATE`/`DROP DATABASE` and `SCHEMA` are accepted as no-ops (single-file
+  database), so tools and migrations that issue them proceed.
+
+### Introspection
+
+- **`information_schema`**: added `engines`, `schemata`, `views`, `events`,
+  `routines`, `triggers`; `KEY_COLUMN_USAGE` gained `POSITION_IN_UNIQUE_
+  CONSTRAINT` and `REFERENCED_TABLE_SCHEMA`/`NAME`/`COLUMN_NAME` (foreign-key
+  discovery). Database name unified to `elyra`.
+- **`SHOW`**: `VARIABLES`, `STATUS`, `COLLATION`, `DATABASES`, `WARNINGS`,
+  `TABLE STATUS`, `FUNCTION`/`PROCEDURE STATUS` (incl. the `WHERE` form), and
+  `PROCESSLIST` (now handled in-engine, so it works over the prepared path too).
+- `mysql.user` lists accounts (always including the built-in `root`).
+
+### Drivers
+
+- **Opt-in prepared-statement column description** (`ELYRASQL_STMT_DESCRIBE`,
+  default off): describes a simple `SELECT`'s result columns at `PREPARE` time
+  so drivers like **sqlx** resolve result columns **by name**. Off by default
+  because strict `libmysqlclient`-based clients mishandle it; verified with a
+  real sqlx harness that it enables by-name resolution and survives multiple
+  prepares on one connection.
+
 ## [0.9.1] - 2026-07-10
 
 MySQL client compatibility release. Real GUI tools (DBeaver, Workbench) and
@@ -709,6 +753,7 @@ core CRUD with `WHERE`/`ORDER BY`/`LIMIT`, indexes, aggregation and `GROUP BY`,
 joins, prepared statements, authentication and TLS, vector search (exact +
 HNSW), parallel OLAP aggregation, and transactions with snapshot isolation.
 
+[0.9.2]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.9.2
 [0.9.1]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.9.1
 [0.9.0]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.9.0
 [0.8.10]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.8.10
