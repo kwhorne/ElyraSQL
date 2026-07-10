@@ -507,7 +507,7 @@ pub fn show_collation(filter: Option<&sqlparser::ast::ShowStatementFilter>) -> R
 pub fn show_databases() -> Result<QueryResult> {
     let rows = vec![
         vec![Value::Text("information_schema".into())],
-        vec![Value::Text("elyrasql".into())],
+        vec![Value::Text("elyra".into())],
     ];
     Ok(QueryResult::Rows(RowStream::literal(
         text_schema(&["Database"]),
@@ -972,6 +972,47 @@ async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec
                     ]);
                 }
             }
+            Ok((schema, rows))
+        }
+        "engines" => {
+            let schema = Schema::new(vec![
+                text("ENGINE"),
+                text("SUPPORT"),
+                text("COMMENT"),
+                text("TRANSACTIONS"),
+                text("XA"),
+                text("SAVEPOINTS"),
+            ]);
+            let rows = vec![vec![
+                Value::Text("InnoDB".into()),
+                Value::Text("DEFAULT".into()),
+                Value::Text("ElyraSQL storage engine (single-file, ACID, MVCC)".into()),
+                Value::Text("YES".into()),
+                Value::Text("NO".into()),
+                Value::Text("YES".into()),
+            ]];
+            Ok((schema, rows))
+        }
+        "schemata" => {
+            let schema = Schema::new(vec![
+                text("CATALOG_NAME"),
+                text("SCHEMA_NAME"),
+                text("DEFAULT_CHARACTER_SET_NAME"),
+                text("DEFAULT_COLLATION_NAME"),
+                text("SQL_PATH"),
+            ]);
+            let rows = ["information_schema", "elyra"]
+                .into_iter()
+                .map(|s| {
+                    vec![
+                        Value::Text("def".into()),
+                        Value::Text(s.into()),
+                        Value::Text("utf8mb4".into()),
+                        Value::Text("utf8mb4_general_ci".into()),
+                        Value::Null,
+                    ]
+                })
+                .collect();
             Ok((schema, rows))
         }
         other => Err(Error::Unsupported(format!(
