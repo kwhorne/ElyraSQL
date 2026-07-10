@@ -8,6 +8,28 @@ updates:
     groups:
       cargo:
         patterns: ["*"]
+    ignore:
+      # These crates define the on-disk format or SQL parsing; a breaking bump
+      # needs a deliberate migration (and data-format review), not an automated
+      # PR. bincode 2/3 also break the serialize/deserialize API we use
+      # (bincode 3.0.0 is an intentionally non-compiling protest release).
+      - dependency-name: "bincode"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "redb"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "sqlparser"
+        update-types:
+          ["version-update:semver-major", "version-update:semver-minor"]
+      # SIMD API is pinned (f32x8 kernels); 0.7 -> 1.x is a breaking bump.
+      - dependency-name: "wide"
+        update-types:
+          ["version-update:semver-major", "version-update:semver-minor"]
+      # rustls is transitively pinned to 0.22 by opensrv-mysql 0.7.0 (the latest
+      # published wire library); bumping tokio-rustls breaks the build until
+      # opensrv-mysql upgrades.
+      - dependency-name: "tokio-rustls"
+        update-types:
+          ["version-update:semver-major", "version-update:semver-minor"]
 
   - package-ecosystem: github-actions
     directory: "/"
