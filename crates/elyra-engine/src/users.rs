@@ -107,6 +107,44 @@ fn parse_userspec(toks: &[Tok], mut i: usize) -> Option<(String, usize)> {
     Some((name, i))
 }
 
+/// Enforce the password strength policy on a new password. Configurable via env:
+/// `ELYRASQL_PASSWORD_POLICY=off` disables it; `ELYRASQL_PASSWORD_MIN_LEN`
+/// (default 8) sets the minimum length; `ELYRASQL_PASSWORD_REQUIRE_MIXED`
+/// (default true) requires at least one letter and one digit.
+pub fn check_password_policy(pw: &str) -> Result<()> {
+    if std::env::var("ELYRASQL_PASSWORD_POLICY")
+        .map(|v| v.eq_ignore_ascii_case("off"))
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+    let min_len: usize = std::env::var("ELYRASQL_PASSWORD_MIN_LEN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8);
+    if pw.chars().count() < min_len {
+        return Err(Error::Query(format!(
+            "password does not meet policy: minimum length is {min_len} \
+             (set ELYRASQL_PASSWORD_POLICY=off to disable)"
+        )));
+    }
+    let require_mixed = std::env::var("ELYRASQL_PASSWORD_REQUIRE_MIXED")
+        .map(|v| !v.eq_ignore_ascii_case("false") && v != "0")
+        .unwrap_or(true);
+    if require_mixed {
+        let has_letter = pw.chars().any(|c| c.is_alphabetic());
+        let has_digit = pw.chars().any(|c| c.is_ascii_digit());
+        if !(has_letter && has_digit) {
+            return Err(Error::Query(
+                "password does not meet policy: must contain both letters and digits \
+                 (set ELYRASQL_PASSWORD_REQUIRE_MIXED=false to relax)"
+                    .into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// True if `sql` (already trimmed) begins a user-management statement we handle.
 pub fn is_user_stmt(head: &str) -> bool {
     let h = head.trim_start();
@@ -305,6 +343,7 @@ pub async fn execute(sql: &str, sess: &Session, privilege: Privilege) -> Result<
                 password = w(j + 1);
             }
         }
+        check_password_policy(&password)?;
         let rec = UserRecord {
             digest: password_digest(password.as_bytes()),
             privilege: Privilege::Read,
@@ -404,6 +443,7 @@ async fn set_password(
     };
     let mut rec =
         decode_user(&bytes).ok_or_else(|| Error::Storage("corrupt user record".into()))?;
+    check_password_policy(&pw)?;
     rec.digest = password_digest(pw.as_bytes());
     sess.commit_write(vec![(user_key(&name), encode_user(&rec))], vec![])
         .await?;

@@ -7,12 +7,39 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Mutex;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use elyra_core::users::{decode_user, user_key, UserRecord, USER_PREFIX};
 use elyra_core::Privilege;
 use elyra_storage::Db;
 use sha1::{Digest, Sha1};
+use tracing::warn;
+
+/// Failed-login tracking for one account (brute-force lockout).
+#[derive(Default)]
+struct FailState {
+    fails: u32,
+    locked_until: Option<Instant>,
+}
+
+/// Max consecutive failed logins before an account is temporarily locked
+/// (`ELYRASQL_AUTH_MAX_FAILURES`, 0 = disabled).
+fn max_failures() -> u32 {
+    std::env::var("ELYRASQL_AUTH_MAX_FAILURES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10)
+}
+
+/// Lockout duration in seconds after too many failures
+/// (`ELYRASQL_AUTH_LOCKOUT_SECS`).
+fn lockout_secs() -> u64 {
+    std::env::var("ELYRASQL_AUTH_LOCKOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(60)
+}
 
 /// Credential store. Accounts come from two places: a `bootstrap` map supplied
 /// at startup (the CLI `--user` / `--auth` flags, always valid) and persistent
@@ -22,6 +49,8 @@ use sha1::{Digest, Sha1};
 pub struct Auth {
     bootstrap: HashMap<String, ([u8; 20], Privilege)>,
     db: Option<Db>,
+    /// Per-account failed-login state for brute-force lockout.
+    failures: Mutex<HashMap<String, FailState>>,
 }
 
 impl Auth {
@@ -31,6 +60,7 @@ impl Auth {
         Auth {
             bootstrap: HashMap::new(),
             db: None,
+            failures: Mutex::new(HashMap::new()),
         }
     }
 
@@ -52,6 +82,7 @@ impl Auth {
         Auth {
             bootstrap,
             db: None,
+            failures: Mutex::new(HashMap::new()),
         }
     }
 
@@ -120,6 +151,51 @@ impl Auth {
         let Ok(user) = std::str::from_utf8(username) else {
             return false;
         };
+
+        // Brute-force lockout: reject while an account is temporarily locked.
+        let threshold = max_failures();
+        if threshold > 0 {
+            let locked = self
+                .failures
+                .lock()
+                .unwrap()
+                .get(user)
+                .and_then(|f| f.locked_until)
+                .is_some_and(|t| Instant::now() < t);
+            if locked {
+                warn!(user, "authentication rejected: account temporarily locked");
+                return false;
+            }
+        }
+
+        let ok = self.verify_raw(user, salt, auth_data);
+
+        if threshold > 0 {
+            let mut map = self.failures.lock().unwrap();
+            if ok {
+                map.remove(user);
+            } else {
+                let f = map.entry(user.to_string()).or_default();
+                f.fails += 1;
+                if f.fails >= threshold {
+                    f.locked_until =
+                        Some(Instant::now() + std::time::Duration::from_secs(lockout_secs()));
+                    f.fails = 0;
+                    warn!(
+                        user,
+                        lockout_secs = lockout_secs(),
+                        "account locked after too many failed logins"
+                    );
+                } else {
+                    warn!(user, fails = f.fails, "failed login");
+                }
+            }
+        }
+        ok
+    }
+
+    /// The raw `mysql_native_password` challenge/response check.
+    fn verify_raw(&self, user: &str, salt: &[u8], auth_data: &[u8]) -> bool {
         let Some((stored, _)) = self.lookup(user) else {
             return false;
         };

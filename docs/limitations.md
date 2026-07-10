@@ -153,6 +153,16 @@ implemented, so you can judge fit.
   subquery is denied (deny-safe).
 - An optional **audit log** (`--audit-log <path>`) appends one tab-separated
   line per executed statement (`timestamp  conn_id  user  OK|ERR  sql`).
+- **Password hardening.** New passwords (`CREATE USER` / `ALTER USER` / `SET
+  PASSWORD`) must satisfy a strength policy: minimum length
+  (`ELYRASQL_PASSWORD_MIN_LEN`, default 8) and a letters+digits requirement
+  (`ELYRASQL_PASSWORD_REQUIRE_MIXED`, default on); set
+  `ELYRASQL_PASSWORD_POLICY=off` to disable. Repeated failed logins trigger a
+  **temporary account lockout** (`ELYRASQL_AUTH_MAX_FAILURES`, default 10;
+  `ELYRASQL_AUTH_LOCKOUT_SECS`, default 60) to blunt brute-force attacks;
+  failures and lockouts are logged. The wire credential is still
+  `mysql_native_password` (`caching_sha2_password` is not implemented — a wire-
+  library limitation — and MySQL 8 clients negotiate down to it).
 - Hot and offline backup/restore, plus an append-only binlog for point-in-time
   recovery (`--binlog` + `elyrasql binlog-replay`). Binlog rotation/pruning is
   manual; there is no incremental (block-level) backup.
