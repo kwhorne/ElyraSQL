@@ -24,6 +24,7 @@ mod users;
 mod vindex;
 
 pub use session::{Isolation, Session};
+pub use sort::cleanup_stale_tempfiles;
 
 use elyra_core::{ColumnType, Error, Privilege, Result, Schema, Value};
 use elyra_storage::Db;

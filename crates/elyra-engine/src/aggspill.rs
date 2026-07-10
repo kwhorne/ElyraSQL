@@ -101,6 +101,11 @@ impl Partitions {
                     Err(e) => return Err(Error::Io(e)),
                 }
                 let n = u32::from_le_bytes(len) as usize;
+                if n > crate::sort::MAX_SPILL_RECORD {
+                    return Err(Error::Storage(
+                        "aggregation spill record too large (corrupt?)".into(),
+                    ));
+                }
                 let mut buf = vec![0u8; n];
                 r.read_exact(&mut buf)?;
                 let row: Vec<Value> =

@@ -480,6 +480,9 @@ fn write_cell<W: AsyncWrite + Send + Unpin>(
 
 /// Bind and serve ElyraSQL over the MySQL protocol until cancelled.
 pub async fn serve(config: ServerConfig, engine: Engine) -> std::io::Result<()> {
+    // Reclaim spill/aggregation temp files leaked by prior instances that were
+    // killed (SIGKILL skips Drop cleanup); only removes files owned by dead PIDs.
+    elyra_engine::cleanup_stale_tempfiles();
     let listener = TcpListener::bind(&config.listen).await?;
     let tls_enabled = config.tls.is_some();
     info!(addr = %config.listen, tls = tls_enabled, "ElyraSQL accepting MySQL-protocol connections");

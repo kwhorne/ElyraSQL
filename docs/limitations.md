@@ -76,7 +76,14 @@ implemented, so you can judge fit.
   temp files); when column statistics predict a large group count the planner
   goes straight to the spilling path instead of running the in-memory pass,
   hitting the cap, and re-scanning (which previously cost two full scans). A
-  single skewed partition past `ELYRASQL_GROUP_MAX_GROUPS` still errors.
+  single skewed partition past `ELYRASQL_GROUP_MAX_GROUPS` still errors. When a
+  table has **no statistics** (never `ANALYZE`d) and turns out to have a huge
+  group count, the in-memory pass can still overflow and fall back to the
+  spilling path, costing a second scan; running `ANALYZE TABLE` avoids this.
+  Spill files are read back with a size-guarded length prefix, so a corrupt
+  temp file is rejected rather than triggering a giant allocation, and stale
+  spill files left by a killed process (SIGKILL) are reclaimed at startup (only
+  files owned by confirmed-dead PIDs are removed).
 - **Multi-table joins are still materialized in memory**: `build_from` builds
   the full join result before `ORDER BY`/`GROUP BY` are applied, so a very large
   join with sorting/grouping is bounded by the join output size (the sort/group

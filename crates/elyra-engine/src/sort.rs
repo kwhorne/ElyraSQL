@@ -83,6 +83,53 @@ fn temp_path() -> PathBuf {
     std::env::temp_dir().join(format!("elyrasql-sort-{pid}-{n}.tmp"))
 }
 
+/// Upper bound on a single spilled record. A corrupt spill file could otherwise
+/// name a multi-gigabyte length and OOM the process on the next allocation.
+pub(crate) const MAX_SPILL_RECORD: usize = 1 << 30; // 1 GiB
+
+/// Delete leftover spill/aggregation temp files from ElyraSQL processes that are
+/// no longer running (e.g. killed with SIGKILL, which skips `Drop` cleanup).
+/// Only removes files whose embedded PID is *confirmed* dead, so concurrently
+/// running instances are never disturbed; a no-op where liveness can't be
+/// determined (non-Linux) or the temp dir can't be read.
+pub fn cleanup_stale_tempfiles() {
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    let me = std::process::id();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let Some(pid) = tempfile_pid(&name) else {
+            continue;
+        };
+        if pid != me && pid_is_dead(pid) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Extract the owning PID from an `elyrasql-sort-<pid>-...` /
+/// `elyrasql-agg-<pid>-...` temp file name.
+fn tempfile_pid(name: &str) -> Option<u32> {
+    let rest = name
+        .strip_prefix("elyrasql-sort-")
+        .or_else(|| name.strip_prefix("elyrasql-agg-"))?;
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
+}
+
+/// True only when we can *confirm* the process is gone (via Linux `/proc`).
+/// When liveness can't be determined, returns `false` so a possibly-live file
+/// is never deleted.
+fn pid_is_dead(pid: u32) -> bool {
+    let proc_root = std::path::Path::new("/proc");
+    if !proc_root.exists() {
+        return false; // not Linux (e.g. dev on macOS) -> don't risk it
+    }
+    !proc_root.join(pid.to_string()).exists()
+}
+
 /// A spilled, sorted run on disk, read back one length-prefixed frame at a time.
 struct RunReader {
     r: BufReader<File>,
@@ -103,6 +150,11 @@ impl RunReader {
             Err(e) => return Err(Error::Io(e)),
         }
         let n = u32::from_le_bytes(len) as usize;
+        if n > MAX_SPILL_RECORD {
+            return Err(Error::Storage(
+                "sort spill record too large (corrupt?)".into(),
+            ));
+        }
         let mut buf = vec![0u8; n];
         self.r.read_exact(&mut buf)?;
         let v = bincode::deserialize(&buf).map_err(|e| Error::Storage(e.to_string()))?;
@@ -287,6 +339,45 @@ impl Drop for Sorter {
         // unlinked on Unix, so typically a no-op).
         for (p, _) in &self.runs {
             let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
+#[cfg(test)]
+mod cleanup_tests {
+    use super::*;
+
+    #[test]
+    fn parses_owning_pid_from_tempfile_names() {
+        assert_eq!(tempfile_pid("elyrasql-sort-1234-7.tmp"), Some(1234));
+        assert_eq!(tempfile_pid("elyrasql-agg-999-3-12.tmp"), Some(999));
+        assert_eq!(tempfile_pid("elyrasql-other-5.tmp"), None);
+        assert_eq!(tempfile_pid("unrelated.tmp"), None);
+    }
+
+    #[test]
+    fn cleanup_never_removes_live_own_files() {
+        // A file tagged with our own live PID must survive cleanup.
+        let me = std::process::id();
+        let path = std::env::temp_dir().join(format!("elyrasql-agg-{me}-424242-0.tmp"));
+        std::fs::write(&path, b"x").unwrap();
+        cleanup_stale_tempfiles();
+        assert!(
+            path.exists(),
+            "cleanup must not delete a live process's files"
+        );
+        let _ = std::fs::remove_file(&path);
+
+        // On Linux we can confirm a clearly-dead PID's file is reclaimed.
+        if std::path::Path::new("/proc").exists() {
+            let dead = std::env::temp_dir().join("elyrasql-sort-2147480000-1.tmp");
+            std::fs::write(&dead, b"x").unwrap();
+            assert!(pid_is_dead(2_147_480_000));
+            cleanup_stale_tempfiles();
+            assert!(
+                !dead.exists(),
+                "cleanup must reclaim a dead process's files"
+            );
         }
     }
 }
