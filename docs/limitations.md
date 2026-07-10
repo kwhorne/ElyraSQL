@@ -160,8 +160,12 @@ implemented, so you can judge fit.
 
 ## Security & operations
 
-- Multiple persistent accounts with `CREATE USER`/`GRANT`/`REVOKE`, with coarse
-  (read/write/admin) privileges granted **globally** or **per table**.
+- Multiple persistent accounts with `CREATE USER`/`GRANT`/`REVOKE`. Global
+  privileges are tracked as a set (so `REVOKE` removes only the named
+  privileges), but **enforcement** is still evaluated at a coarse
+  read/write/admin tier derived from that set and granted **globally** or **per
+  table** — revoking one of several write privileges keeps the others but does
+  not block only that single action.
   **Roles** are supported: `CREATE ROLE` / `DROP ROLE`, `GRANT <role> TO <user>`
   / `REVOKE <role> FROM <user>`; a user inherits the global and per-table grants
   of every role granted to them. `GRANT ... ON db.*` is accepted and maps to a

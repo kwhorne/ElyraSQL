@@ -57,15 +57,23 @@ DROP USER 'app';
 Notes and current limitations:
 
 - New accounts start **read-only**; use `GRANT` to raise them.
-- Privileges are coarse (`read`/`write`/`admin`). `GRANT ALL` (or
-  `GRANT OPTION`/`SUPER`) → admin; any write action (`INSERT`, `UPDATE`,
-  `DELETE`, `CREATE`, ...) → write; `SELECT`-only → read.
-- **Scope:** `GRANT ... ON *.*` (or `db.*`) sets the account's **global** level;
-  `GRANT ... ON <table>` (or `db.table`) is a **per-table** grant that *raises*
-  the level for that table only. Reads are always allowed at the global
-  baseline, so table grants are used to give a read-only account write/admin on
-  specific tables. `REVOKE ON *.*` lowers the global level to read; `REVOKE ON
-  <table>` removes a table grant.
+- **Global** grants track the individual privileges granted as a set, so
+  `GRANT`/`REVOKE ON *.*` add/remove exactly the named privileges. Revoking one
+  privilege no longer collapses the account: e.g. `REVOKE INSERT` from an admin
+  keeps every other privilege. `SHOW GRANTS` lists the precise set.
+- Enforcement itself is still evaluated at a coarse tier (`read`/`write`/`admin`)
+  derived from that set: `GRANT ALL`/`GRANT OPTION`/`SUPER` → admin; any write
+  action (`INSERT`, `UPDATE`, `DELETE`, `CREATE`, ...) present → write;
+  `SELECT`-only → read. So revoking one of several write privileges keeps the
+  others but does not yet block *only* that one action.
+- **Scope:** `GRANT ... ON *.*` (or `db.*`) sets the account's **global**
+  privileges; `GRANT ... ON <table>` (or `db.table`) is a **per-table** grant
+  that *raises* the tier for that table only. Reads are always allowed at the
+  global baseline, so table grants are used to give a read-only account
+  write/admin on specific tables. `REVOKE ON <table>` removes a table grant.
+- `DROP USER` purges the account's global, per-table, per-column, and role-
+  membership grants, so recreating a user with the same name does not inherit
+  stale privileges.
 - Enforcement is deny-safe: a write/DDL statement whose target table can't be
   determined (e.g. a multi-table `UPDATE`) requires the **global** privilege.
   `SHOW GRANTS` lists the global grant and each table grant.

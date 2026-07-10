@@ -64,6 +64,136 @@ pub fn role_flag_key(role: &str) -> Vec<u8> {
     format!("sys::role::{role}").into_bytes()
 }
 
+/// Storage key for a user's global privilege flag set (`sys::ugrant::<user>`).
+/// Holds the fine-grained set of granted privileges so `REVOKE` removes only
+/// the named privileges instead of collapsing the account to a coarse tier.
+pub fn ugrant_key(user: &str) -> Vec<u8> {
+    format!("sys::ugrant::{user}").into_bytes()
+}
+
+/// Individual privilege flags. Stored as a bitset so GRANT/REVOKE are set
+/// union/difference; the coarse [`Privilege`] tier (what enforcement checks) is
+/// derived from the set with [`tier_from_privset`].
+pub mod priv_bits {
+    pub const SELECT: u32 = 1 << 0;
+    pub const INSERT: u32 = 1 << 1;
+    pub const UPDATE: u32 = 1 << 2;
+    pub const DELETE: u32 = 1 << 3;
+    pub const CREATE: u32 = 1 << 4;
+    pub const DROP: u32 = 1 << 5;
+    pub const ALTER: u32 = 1 << 6;
+    pub const INDEX: u32 = 1 << 7;
+    pub const TRUNCATE: u32 = 1 << 8;
+    pub const REFERENCES: u32 = 1 << 9;
+    /// GRANT OPTION / SUPER / ADMIN — the admin marker.
+    pub const GRANT_OPTION: u32 = 1 << 10;
+
+    /// Data- and schema-modifying privileges (map to the `Write` tier).
+    pub const WRITE: u32 =
+        INSERT | UPDATE | DELETE | CREATE | DROP | ALTER | INDEX | TRUNCATE | REFERENCES;
+    /// Every privilege (what `ALL PRIVILEGES` grants).
+    pub const ALL: u32 = SELECT | WRITE | GRANT_OPTION;
+}
+
+/// Map granted SQL action names to a privilege flag set (parallel to
+/// [`privilege_from_actions`], but preserving the individual privileges).
+pub fn privset_from_actions<I, S>(actions: I) -> u32
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    use priv_bits::*;
+    let mut bits = 0u32;
+    for a in actions {
+        bits |= match a.as_ref().to_ascii_uppercase().as_str() {
+            "ALL" | "ALL PRIVILEGES" => ALL,
+            "GRANT" | "GRANT OPTION" | "SUPER" | "ADMIN" => GRANT_OPTION,
+            "SELECT" => SELECT,
+            "INSERT" => INSERT,
+            "UPDATE" => UPDATE,
+            "DELETE" => DELETE,
+            "CREATE" => CREATE,
+            "DROP" => DROP,
+            "ALTER" => ALTER,
+            "INDEX" => INDEX,
+            "TRUNCATE" => TRUNCATE,
+            "REFERENCES" => REFERENCES,
+            "WRITE" => WRITE,
+            _ => 0, // SELECT-level: USAGE, CONNECT, ...
+        };
+    }
+    bits
+}
+
+/// Derive the coarse enforcement tier from a privilege flag set. Consistent
+/// with [`privilege_from_actions`]: any admin marker => Admin, any write
+/// privilege => Write, else Read.
+pub fn tier_from_privset(bits: u32) -> Privilege {
+    if bits & priv_bits::GRANT_OPTION != 0 {
+        Privilege::Admin
+    } else if bits & priv_bits::WRITE != 0 {
+        Privilege::Write
+    } else {
+        Privilege::Read
+    }
+}
+
+/// Expand a coarse tier into a flag set (used to migrate accounts created
+/// before per-privilege tracking, which only stored a tier).
+pub fn privset_from_tier(p: Privilege) -> u32 {
+    match p {
+        Privilege::Read => priv_bits::SELECT,
+        Privilege::Write => priv_bits::SELECT | priv_bits::WRITE,
+        Privilege::Admin => priv_bits::ALL,
+    }
+}
+
+/// Encode a privilege flag set (4-byte little-endian).
+pub fn encode_privset(bits: u32) -> Vec<u8> {
+    bits.to_le_bytes().to_vec()
+}
+
+/// Decode a privilege flag set; malformed input decodes as empty.
+pub fn decode_privset(bytes: &[u8]) -> u32 {
+    match bytes.try_into() {
+        Ok(b) => u32::from_le_bytes(b),
+        Err(_) => 0,
+    }
+}
+
+/// Human-readable, comma-separated privilege list for a flag set (for
+/// `SHOW GRANTS`). Returns `"ALL PRIVILEGES"` when every privilege is set,
+/// `"USAGE"` when none.
+pub fn privset_to_names(bits: u32) -> String {
+    use priv_bits::*;
+    if bits & ALL == ALL {
+        return "ALL PRIVILEGES".into();
+    }
+    let mut parts = Vec::new();
+    for (bit, name) in [
+        (SELECT, "SELECT"),
+        (INSERT, "INSERT"),
+        (UPDATE, "UPDATE"),
+        (DELETE, "DELETE"),
+        (CREATE, "CREATE"),
+        (DROP, "DROP"),
+        (ALTER, "ALTER"),
+        (INDEX, "INDEX"),
+        (TRUNCATE, "TRUNCATE"),
+        (REFERENCES, "REFERENCES"),
+        (GRANT_OPTION, "GRANT OPTION"),
+    ] {
+        if bits & bit != 0 {
+            parts.push(name);
+        }
+    }
+    if parts.is_empty() {
+        "USAGE".into()
+    } else {
+        parts.join(", ")
+    }
+}
+
 /// Storage key for a user's grant on a specific table.
 pub fn table_grant_key(user: &str, table: &str) -> Vec<u8> {
     let mut k = table_grant_prefix(user);
@@ -152,6 +282,36 @@ mod tests {
             privilege_from_actions(["SELECT", "GRANT OPTION"]),
             Privilege::Admin
         );
+    }
+
+    #[test]
+    fn revoke_removes_only_named_privilege() {
+        use priv_bits::*;
+        // An admin (ALL) who has INSERT revoked keeps admin — the old model
+        // collapsed the whole account to Read here.
+        let admin = privset_from_actions(["ALL"]);
+        let after = admin & !privset_from_actions(["INSERT"]);
+        assert_eq!(tier_from_privset(after), Privilege::Admin);
+        assert_eq!(after & INSERT, 0);
+
+        // A user with INSERT+UPDATE who loses INSERT still has UPDATE (Write),
+        // rather than being reset to Read.
+        let w = privset_from_actions(["INSERT", "UPDATE"]);
+        let after = w & !privset_from_actions(["INSERT"]);
+        assert_eq!(tier_from_privset(after), Privilege::Write);
+        assert_eq!(after & UPDATE, UPDATE);
+        assert_eq!(after & INSERT, 0);
+
+        // Revoking the last write privilege drops to Read.
+        let after = after & !privset_from_actions(["UPDATE"]);
+        assert_eq!(tier_from_privset(after), Privilege::Read);
+
+        // Legacy migration + encode round-trip.
+        assert_eq!(
+            tier_from_privset(privset_from_tier(Privilege::Admin)),
+            Privilege::Admin
+        );
+        assert_eq!(decode_privset(&encode_privset(admin)), admin);
     }
 
     #[test]

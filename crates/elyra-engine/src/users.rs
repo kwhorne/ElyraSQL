@@ -365,6 +365,29 @@ pub async fn execute(sql: &str, sess: &Session, privilege: Privilege) -> Result<
                 return Err(Error::Query(format!("user '{name}' does not exist")));
             }
             deletes.push(user_key(&name));
+            deletes.push(elyra_core::users::ugrant_key(&name));
+            // Purge every per-user grant so a later CREATE USER with the same
+            // name cannot inherit stale privileges.
+            for pfx in [
+                table_grant_prefix(&name),
+                format!("sys::colgrant::{name}::").into_bytes(),
+                role_member_prefix(&name),
+            ] {
+                let mut after: Option<Vec<u8>> = None;
+                loop {
+                    let batch = sess.scan_batch(pfx.clone(), after.clone(), 512).await?;
+                    if batch.is_empty() {
+                        break;
+                    }
+                    for (k, _) in &batch {
+                        deletes.push(k.clone());
+                    }
+                    after = batch.last().map(|(k, _)| k.clone());
+                    if batch.len() < 512 {
+                        break;
+                    }
+                }
+            }
             i = j;
             if matches!(toks.get(i), Some(Tok::Sym(','))) {
                 i += 1;
@@ -555,14 +578,31 @@ async fn grant_revoke(toks: &[Tok], sess: &Session, grant: bool) -> Result<Query
         }
         let mut rec =
             decode_user(&bytes).ok_or_else(|| Error::Storage("corrupt user record".into()))?;
-        rec.privilege = if grant {
-            level.max(rec.privilege)
-        } else {
-            // REVOKE lowers the account to Read (coarse model).
-            Privilege::Read
+        // Global privileges are tracked as a flag set, so REVOKE removes only the
+        // named privileges (set difference) instead of collapsing the account to
+        // Read. The coarse tier stored in the user record is derived from the
+        // resulting set for enforcement and backward compatibility.
+        let ugkey = elyra_core::users::ugrant_key(&name);
+        let current = match sess.get(ugkey.clone()).await? {
+            Some(b) => elyra_core::users::decode_privset(&b),
+            // Account created before per-privilege tracking: migrate its tier.
+            None => elyra_core::users::privset_from_tier(rec.privilege),
         };
-        sess.commit_write(vec![(user_key(&name), encode_user(&rec))], vec![])
-            .await?;
+        let delta = elyra_core::users::privset_from_actions(&actions);
+        let flags = if grant {
+            current | delta
+        } else {
+            current & !delta
+        };
+        rec.privilege = elyra_core::users::tier_from_privset(flags);
+        sess.commit_write(
+            vec![
+                (ugkey, elyra_core::users::encode_privset(flags)),
+                (user_key(&name), encode_user(&rec)),
+            ],
+            vec![],
+        )
+        .await?;
         applied += 1;
         i = j;
         if matches!(toks.get(i), Some(Tok::Sym(','))) {
@@ -648,16 +688,19 @@ async fn show_grants(toks: &[Tok], sess: &Session) -> Result<QueryResult> {
         collation: elyra_core::Collation::Ci,
     }]);
     let mut rows = Vec::new();
-    let emit = |rows: &mut Vec<Vec<Value>>, user: &str, p: Privilege| {
-        let privs = match p {
-            Privilege::Admin => "ALL PRIVILEGES",
-            Privilege::Write => "SELECT, INSERT, UPDATE, DELETE",
-            Privilege::Read => "SELECT",
-        };
+    let emit = |rows: &mut Vec<Vec<Value>>, user: &str, flags: u32| {
+        let privs = elyra_core::users::privset_to_names(flags);
         rows.push(vec![Value::Text(format!(
             "GRANT {privs} ON *.* TO '{user}'"
         ))]);
     };
+    // A user's global flag set (migrating legacy accounts from their tier).
+    async fn global_flags(sess: &Session, user: &str, tier: Privilege) -> Result<u32> {
+        Ok(match sess.get(elyra_core::users::ugrant_key(user)).await? {
+            Some(b) => elyra_core::users::decode_privset(&b),
+            None => elyra_core::users::privset_from_tier(tier),
+        })
+    }
     // Append per-table (scoped) grants for a user.
     async fn emit_table_grants(
         sess: &Session,
@@ -688,7 +731,8 @@ async fn show_grants(toks: &[Tok], sess: &Session) -> Result<QueryResult> {
                 .as_deref()
                 .and_then(decode_user)
                 .ok_or_else(|| Error::Query(format!("user '{n}' does not exist")))?;
-            emit(&mut rows, &n, rec.privilege);
+            let flags = global_flags(sess, &n, rec.privilege).await?;
+            emit(&mut rows, &n, flags);
             emit_table_grants(sess, &n, &mut rows).await?;
         }
         None => {
@@ -714,7 +758,8 @@ async fn show_grants(toks: &[Tok], sess: &Session) -> Result<QueryResult> {
                 }
             }
             for (user, p) in &names {
-                emit(&mut rows, user, *p);
+                let flags = global_flags(sess, user, *p).await?;
+                emit(&mut rows, user, flags);
                 emit_table_grants(sess, user, &mut rows).await?;
             }
         }
