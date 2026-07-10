@@ -1069,6 +1069,70 @@ async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec
             ]];
             Ok((schema, rows))
         }
+        "routines" => {
+            let schema = Schema::new(
+                [
+                    "SPECIFIC_NAME",
+                    "ROUTINE_CATALOG",
+                    "ROUTINE_SCHEMA",
+                    "ROUTINE_NAME",
+                    "ROUTINE_TYPE",
+                    "DATA_TYPE",
+                    "ROUTINE_BODY",
+                    "ROUTINE_DEFINITION",
+                    "SQL_DATA_ACCESS",
+                    "SECURITY_TYPE",
+                    "CREATED",
+                    "LAST_ALTERED",
+                    "SQL_MODE",
+                    "ROUTINE_COMMENT",
+                    "DEFINER",
+                    "CHARACTER_SET_CLIENT",
+                    "COLLATION_CONNECTION",
+                    "DATABASE_COLLATION",
+                ]
+                .iter()
+                .map(|n| text(n))
+                .collect(),
+            );
+            let prefix = b"sys::proc::".to_vec();
+            let mut rows = Vec::new();
+            let mut after: Option<Vec<u8>> = None;
+            loop {
+                let batch = db.scan_batch(prefix.clone(), after.clone(), 512).await?;
+                if batch.is_empty() {
+                    break;
+                }
+                for (k, _) in &batch {
+                    let name = String::from_utf8_lossy(&k[prefix.len()..]).to_string();
+                    rows.push(vec![
+                        Value::Text(name.clone()),
+                        Value::Text("def".into()),
+                        Value::Text("elyra".into()),
+                        Value::Text(name),
+                        Value::Text("PROCEDURE".into()),
+                        Value::Text(String::new()),
+                        Value::Text("SQL".into()),
+                        Value::Null,
+                        Value::Text("CONTAINS SQL".into()),
+                        Value::Text("DEFINER".into()),
+                        Value::Null,
+                        Value::Null,
+                        Value::Text(String::new()),
+                        Value::Text(String::new()),
+                        Value::Text("root@%".into()),
+                        Value::Text("utf8mb4".into()),
+                        Value::Text("utf8mb4_general_ci".into()),
+                        Value::Text("utf8mb4_general_ci".into()),
+                    ]);
+                }
+                after = batch.last().map(|(k, _)| k.clone());
+                if batch.len() < 512 {
+                    break;
+                }
+            }
+            Ok((schema, rows))
+        }
         "views" => {
             let schema = Schema::new(vec![
                 text("TABLE_CATALOG"),
