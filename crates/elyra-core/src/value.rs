@@ -105,9 +105,8 @@ impl Value {
                 .zip(to_micros(other))
                 .map(|(a, b)| a.cmp(&b)),
             (Decimal(au, asc), Decimal(bu, bsc)) => Some(cmp_decimal(*au, *asc, *bu, *bsc)),
-            (Decimal(..), _) | (_, Decimal(..)) => self
-                .as_f64()
-                .zip(other.as_f64())
+            (Decimal(..), _) | (_, Decimal(..)) => coerce_f64(self)
+                .zip(coerce_f64(other))
                 .and_then(|(a, b)| a.partial_cmp(&b)),
             (Time(_), _) | (_, Time(_)) => to_micros_of_day(self)
                 .zip(to_micros_of_day(other))
@@ -118,9 +117,11 @@ impl Value {
             (Json(a), Text(b)) | (Text(b), Json(a)) => Some(fold_cmp(a, b)),
             (Bool(a), Bool(b)) => Some(a.cmp(b)),
             (Bytes(a), Bytes(b)) => Some(a.cmp(b)),
-            _ => self
-                .as_f64()
-                .zip(other.as_f64())
+            // Mixed numeric/string comparison coerces the string to a number
+            // (MySQL implicit conversion), so `int_col = '5'` and bound
+            // parameters rendered as string literals match numeric columns.
+            _ => coerce_f64(self)
+                .zip(coerce_f64(other))
                 .and_then(|(a, b)| a.partial_cmp(&b)),
         }
     }
@@ -252,6 +253,15 @@ pub fn canonical_f64_bits(f: f64) -> u64 {
         f64::NAN.to_bits() // canonical quiet NaN
     } else {
         f.to_bits()
+    }
+}
+
+/// Numeric value for comparison: the native numeric types, plus a numeric
+/// string parsed to a number (MySQL coerces strings in numeric comparisons).
+fn coerce_f64(v: &Value) -> Option<f64> {
+    match v {
+        Value::Text(s) | Value::Json(s) => s.trim().parse::<f64>().ok(),
+        _ => v.as_f64(),
     }
 }
 
