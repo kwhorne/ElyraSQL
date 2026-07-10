@@ -714,6 +714,12 @@ fn eval_scalar(name: &str, a: &[Value]) -> Result<Option<Value>> {
             }
         }
         "uuid" => Value::Text(gen_uuid()),
+        // ---- server / session info ----
+        "version" => Value::Text(elyra_core::SERVER_VERSION.into()),
+        "database" | "schema" => Value::Text("elyra".into()),
+        "user" | "current_user" | "session_user" | "system_user" => Value::Text("root@%".into()),
+        "connection_id" => Value::Int(1),
+        "current_role" => Value::Text("NONE".into()),
         // ---- date parts / arithmetic ----
         "year" | "month" | "day" | "dayofmonth" | "hour" | "minute" | "second" | "quarter"
         | "dayofweek" | "dayofyear" | "weekday" => date_part(&a[0], name),

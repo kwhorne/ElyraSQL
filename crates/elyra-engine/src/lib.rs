@@ -1329,7 +1329,7 @@ impl Engine {
             "select database()" | "select schema()" => Some(QueryResult::scalar(
                 "database()",
                 ColumnType::Text,
-                Value::Null,
+                Value::Text("elyra".into()),
             )),
             _ if lower.starts_with("set ") => Some(QueryResult::empty_ok()),
             _ => None,
