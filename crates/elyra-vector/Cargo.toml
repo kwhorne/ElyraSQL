@@ -8,6 +8,5 @@ description = "ElyraSQL native vector search (ANN)"
 
 [dependencies]
 elyra-core.workspace = true
-
-# NOTE: the ANN index (HNSW) backend is added here in the vector milestone.
-# hnsw_rs = "0.3"
+# Portable SIMD (SSE/AVX on x86, NEON on ARM) for the distance kernels.
+wide = "0.7"

@@ -153,6 +153,14 @@ implemented, so you can judge fit.
   subquery is denied (deny-safe).
 - An optional **audit log** (`--audit-log <path>`) appends one tab-separated
   line per executed statement (`timestamp  conn_id  user  OK|ERR  sql`).
+- **Cluster/replication authentication.** Set `ELYRASQL_CLUSTER_SECRET` (the same
+  value on every node) to require a challenge-response handshake
+  (`SHA1(secret‖nonce)`, constant-time) on every Raft control and replication
+  connection, so an unauthenticated peer cannot inject fake writes or votes.
+  Password hashes are compared in **constant time**. The internal Raft/
+  replication traffic is not yet encrypted, so for **confidentiality** run it on
+  a trusted/private network (or a VPN/WireGuard); mutual TLS for internal
+  traffic is planned.
 - **Password hardening.** New passwords (`CREATE USER` / `ALTER USER` / `SET
   PASSWORD`) must satisfy a strength policy: minimum length
   (`ELYRASQL_PASSWORD_MIN_LEN`, default 8) and a letters+digits requirement

@@ -13,7 +13,7 @@
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
@@ -88,9 +88,11 @@ struct RunReader {
     r: BufReader<File>,
 }
 impl RunReader {
-    fn open(path: &PathBuf) -> Result<Self> {
+    /// Read back a spilled run from its (already-open, possibly-unlinked) file.
+    fn from_file(mut file: File) -> Result<Self> {
+        file.seek(SeekFrom::Start(0)).map_err(Error::Io)?;
         Ok(RunReader {
-            r: BufReader::new(File::open(path)?),
+            r: BufReader::new(file),
         })
     }
     fn next(&mut self) -> Result<Option<(Vec<Value>, Vec<Value>)>> {
@@ -119,7 +121,10 @@ pub struct Sorter {
     heap: BinaryHeap<Ranked>,
     /// Pending in-memory run (external mode).
     buffer: Vec<(Vec<Value>, Vec<Value>)>,
-    runs: Vec<PathBuf>,
+    /// Spilled runs, each an open file handle (unlinked on Unix so a crash never
+    /// leaves a temp file behind); the path is retained only for best-effort
+    /// cleanup on platforms where unlinking an open file isn't possible.
+    runs: Vec<(PathBuf, File)>,
 }
 
 impl Sorter {
@@ -179,14 +184,20 @@ impl Sorter {
         let asc = self.asc.clone();
         self.buffer.sort_by(|a, b| cmp_keys(&a.0, &b.0, &asc));
         let path = temp_path();
-        let mut w = BufWriter::new(File::create(&path)?);
+        let file = File::create(&path)?;
+        // Unlink immediately: the inode lives on via the open handle and is
+        // reclaimed by the OS on close or crash, so no temp file is ever
+        // orphaned (best-effort; a no-op-until-close on non-Unix).
+        let _ = std::fs::remove_file(&path);
+        let mut w = BufWriter::new(file);
         for (k, row) in &self.buffer {
             let bytes = bincode::serialize(&(k, row)).map_err(|e| Error::Storage(e.to_string()))?;
             w.write_all(&(bytes.len() as u32).to_le_bytes())?;
             w.write_all(&bytes)?;
         }
         w.flush()?;
-        self.runs.push(path);
+        let file = w.into_inner().map_err(|e| Error::Storage(e.to_string()))?;
+        self.runs.push((path, file));
         self.buffer.clear();
         Ok(())
     }
@@ -221,8 +232,11 @@ impl Sorter {
             self.spill()?;
         }
         let runs = std::mem::take(&mut self.runs);
-        let mut readers: Vec<RunReader> =
-            runs.iter().map(RunReader::open).collect::<Result<_>>()?;
+        let paths: Vec<PathBuf> = runs.iter().map(|(p, _)| p.clone()).collect();
+        let mut readers: Vec<RunReader> = runs
+            .into_iter()
+            .map(|(_, f)| RunReader::from_file(f))
+            .collect::<Result<_>>()?;
         let mut heads: Vec<Option<(Vec<Value>, Vec<Value>)>> = Vec::with_capacity(readers.len());
         for r in &mut readers {
             heads.push(r.next()?);
@@ -260,7 +274,7 @@ impl Sorter {
                 }
             }
         }
-        for p in &runs {
+        for p in &paths {
             let _ = std::fs::remove_file(p);
         }
         Ok(out)
@@ -269,7 +283,9 @@ impl Sorter {
 
 impl Drop for Sorter {
     fn drop(&mut self) {
-        for p in &self.runs {
+        // Best-effort cleanup for any run not consumed by finish() (already
+        // unlinked on Unix, so typically a no-op).
+        for (p, _) in &self.runs {
             let _ = std::fs::remove_file(p);
         }
     }

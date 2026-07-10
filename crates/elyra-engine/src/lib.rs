@@ -171,6 +171,9 @@ impl Engine {
                             Act::Bubble(o) => return Ok(o),
                         }
                         n += 1;
+                        if n % 1024 == 0 {
+                            tokio::task::yield_now().await;
+                        }
                         if n >= MAX_LOOP {
                             return Err(Error::Query("WHILE exceeded iteration limit".into()));
                         }
@@ -187,6 +190,9 @@ impl Engine {
                             Act::Bubble(o) => return Ok(o),
                         }
                         n += 1;
+                        if n % 1024 == 0 {
+                            tokio::task::yield_now().await;
+                        }
                         if n >= MAX_LOOP {
                             return Err(Error::Query("LOOP exceeded iteration limit".into()));
                         }
@@ -206,6 +212,9 @@ impl Engine {
                             break;
                         }
                         n += 1;
+                        if n % 1024 == 0 {
+                            tokio::task::yield_now().await;
+                        }
                         if n >= MAX_LOOP {
                             return Err(Error::Query("REPEAT exceeded iteration limit".into()));
                         }
@@ -851,10 +860,14 @@ impl Engine {
             }
             let t = parse_create_trigger(trimmed)?;
             sess.commit_write(
-                vec![(
-                    catalog::trigger_key(&t.table, &t.name),
-                    bincode::serialize(&t).map_err(|e| Error::Storage(e.to_string()))?,
-                )],
+                vec![
+                    (
+                        catalog::trigger_key(&t.table, &t.name),
+                        bincode::serialize(&t).map_err(|e| Error::Storage(e.to_string()))?,
+                    ),
+                    // Name->table index for O(1) DROP TRIGGER.
+                    (catalog::trigname_key(&t.name), t.table.clone().into_bytes()),
+                ],
                 vec![],
             )
             .await?;
@@ -876,8 +889,14 @@ impl Engine {
                 .ok_or_else(|| Error::Parse("DROP TRIGGER requires a name".into()))?;
             match catalog::find_trigger(sess, &name).await? {
                 Some(t) => {
-                    sess.commit_write(vec![], vec![catalog::trigger_key(&t.table, &t.name)])
-                        .await?;
+                    sess.commit_write(
+                        vec![],
+                        vec![
+                            catalog::trigger_key(&t.table, &t.name),
+                            catalog::trigname_key(&t.name),
+                        ],
+                    )
+                    .await?;
                 }
                 None => {
                     if !trimmed.to_ascii_lowercase().contains("if exists") {

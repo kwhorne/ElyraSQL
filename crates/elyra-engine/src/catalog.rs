@@ -256,6 +256,12 @@ pub fn trigger_key(table: &str, name: &str) -> Vec<u8> {
     k
 }
 
+/// Index key mapping a trigger name to its table, so DROP TRIGGER is an O(1)
+/// lookup instead of scanning every trigger.
+pub fn trigname_key(name: &str) -> Vec<u8> {
+    format!("sys::trigname::{}", name.to_ascii_lowercase()).into_bytes()
+}
+
 /// Load all triggers defined on `table`.
 pub async fn load_triggers(db: &Session, table: &str) -> Result<Vec<TriggerDef>> {
     let prefix = trigger_prefix(table);
@@ -266,8 +272,17 @@ pub async fn load_triggers(db: &Session, table: &str) -> Result<Vec<TriggerDef>>
         .collect())
 }
 
-/// Find a trigger by name across all tables (for DROP TRIGGER).
+/// Find a trigger by name (for DROP TRIGGER) via the name->table index — O(1),
+/// no full scan. Falls back to a scan only for triggers created before the index
+/// existed.
 pub async fn find_trigger(db: &Session, name: &str) -> Result<Option<TriggerDef>> {
+    if let Some(table) = db.get(trigname_key(name)).await? {
+        let table = String::from_utf8_lossy(&table).into_owned();
+        if let Some(v) = db.get(trigger_key(&table, name)).await? {
+            return Ok(bincode::deserialize(&v).ok());
+        }
+    }
+    // Legacy fallback: scan (bounded) for triggers without an index entry.
     let want = name.to_ascii_lowercase();
     let batch = db
         .scan_batch(b"sys::trigger::".to_vec(), None, 100_000)

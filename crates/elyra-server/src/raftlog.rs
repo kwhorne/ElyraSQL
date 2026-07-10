@@ -114,10 +114,14 @@ impl RaftLog {
         self.entries.retain(|e| e.index > up_to);
         self.snapshot_index = up_to;
         self.snapshot_term = term;
-        self.persist_rewrite();
+        // Persist the new snapshot boundary FIRST, then rewrite the (now shorter)
+        // entries file. If we crash between the two, the boundary is ahead of the
+        // entries file, which still holds a superset of entries — harmless and
+        // consistent. The reverse order could leave a gap (corrupt) on crash.
         if let Some(p) = &self.path {
             write_snapshot_meta(p, self.snapshot_index, self.snapshot_term);
         }
+        self.persist_rewrite();
     }
 
     /// The compaction (snapshot) index — lowest index still in the log is
@@ -167,7 +171,7 @@ impl RaftLog {
                 buf.extend_from_slice(&bytes);
             }
         }
-        let tmp = p.with_extension("tmp");
+        let tmp = PathBuf::from(format!("{}.tmp", p.display()));
         if std::fs::File::create(&tmp)
             .and_then(|mut f| f.write_all(&buf).and_then(|_| f.sync_all()))
             .is_ok()
@@ -361,7 +365,17 @@ fn read_snapshot_meta(path: &std::path::Path) -> (u64, u64) {
 }
 
 fn write_snapshot_meta(path: &std::path::Path, index: u64, term: u64) {
-    let _ = std::fs::write(snap_meta_path(path), format!("{index}\n{term}\n"));
+    use std::io::Write;
+    let meta = snap_meta_path(path);
+    let tmp = PathBuf::from(format!("{}.tmp", meta.display()));
+    let body = format!("{index}\n{term}\n");
+    let ok = std::fs::File::create(&tmp)
+        .and_then(|mut f| f.write_all(body.as_bytes()).and_then(|_| f.sync_all()))
+        .is_ok()
+        && std::fs::rename(&tmp, &meta).is_ok();
+    if !ok {
+        tracing::warn!("failed to persist raft snapshot metadata");
+    }
 }
 
 #[cfg(test)]

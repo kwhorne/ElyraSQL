@@ -203,7 +203,7 @@ impl Auth {
 
         if auth_data.is_empty() {
             // Empty password path.
-            return *stored == double_sha1(b"");
+            return ct_eq(stored, &double_sha1(b""));
         }
         if auth_data.len() != 20 {
             return false;
@@ -218,8 +218,21 @@ impl Auth {
         for i in 0..20 {
             stage1[i] = auth_data[i] ^ token[i];
         }
-        sha1(&stage1) == *stored
+        ct_eq(&sha1(&stage1), stored)
     }
+}
+
+/// Constant-time byte comparison (no early exit) to avoid password-hash timing
+/// attacks.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 fn sha1(bytes: &[u8]) -> [u8; 20] {

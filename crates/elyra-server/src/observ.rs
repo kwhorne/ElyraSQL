@@ -320,13 +320,13 @@ impl AuditLog {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis())
             .unwrap_or(0);
-        let mut flat: String = sql
+        // Truncate first (at most 2000 chars) so a huge bulk statement is not
+        // fully copied just to be trimmed.
+        let flat: String = sql
             .chars()
+            .take(2000)
             .map(|c| if c == '\n' || c == '\t' { ' ' } else { c })
             .collect();
-        if flat.len() > 2000 {
-            flat.truncate(2000);
-        }
         let status = if ok { "OK" } else { "ERR" };
         let user = if user.is_empty() { "-" } else { user };
         if let Ok(mut f) = self.file.lock() {

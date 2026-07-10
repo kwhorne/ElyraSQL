@@ -182,6 +182,9 @@ fn read_segment_records(path: &Path) -> Result<Vec<BinlogRecord>> {
             Err(e) => return Err(Error::Io(e)),
         }
         let n = u32::from_le_bytes(len) as usize;
+        if n > (1 << 30) {
+            return Err(Error::Storage("binlog record too large (corrupt?)".into()));
+        }
         let mut buf = vec![0u8; n];
         r.read_exact(&mut buf).map_err(Error::Io)?;
         out.push(bincode::deserialize(&buf).map_err(|e| Error::Storage(e.to_string()))?);
@@ -250,6 +253,9 @@ fn replay_segment(
             Err(e) => return Err(Error::Io(e)),
         }
         let n = u32::from_le_bytes(len) as usize;
+        if n > (1 << 30) {
+            return Err(Error::Storage("binlog record too large (corrupt?)".into()));
+        }
         let mut buf = vec![0u8; n];
         r.read_exact(&mut buf).map_err(Error::Io)?;
         let rec: BinlogRecord =

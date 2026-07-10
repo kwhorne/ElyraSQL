@@ -71,6 +71,12 @@ async fn recv_msg<R: AsyncRead + Unpin>(r: &mut R) -> std::io::Result<Option<Rep
         Err(e) => return Err(e),
     }
     let n = u32::from_le_bytes(len) as usize;
+    if n > (1 << 30) {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "replication frame too large",
+        ));
+    }
     let mut buf = vec![0u8; n];
     r.read_exact(&mut buf).await?;
     Ok(Some(bincode::deserialize(&buf).map_err(io)?))
@@ -92,7 +98,9 @@ pub async fn serve_replication(addr: String, db: Db) -> std::io::Result<()> {
     }
 }
 
-async fn handle_replica(stream: TcpStream, db: Db) -> std::io::Result<()> {
+async fn handle_replica(mut stream: TcpStream, db: Db) -> std::io::Result<()> {
+    // Authenticate the replica (no-op unless a cluster secret is configured).
+    crate::cluster::auth_accept(&mut stream).await?;
     let (mut rd, mut stream) = stream.into_split();
 
     // First message tells us how far the replica has already caught up.
@@ -251,6 +259,8 @@ pub async fn run_replica(primary: String, db: Db) -> std::io::Result<()> {
             }
         };
         info!(%primary, last_lsn, "connected to primary");
+        let mut stream = stream;
+        crate::cluster::auth_connect(&mut stream).await?;
         let (mut rd, mut wr) = stream.into_split();
         send_msg(&mut wr, &ReplMsg::Hello { last_lsn }).await?;
 

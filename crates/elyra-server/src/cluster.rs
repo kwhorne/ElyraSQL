@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 
 use elyra_storage::{Consensus, Db, WriteOp};
 use serde::{Deserialize, Serialize};
+use sha1::{Digest, Sha1};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{oneshot, watch, Notify};
@@ -76,10 +77,23 @@ fn persist_state(path: &Option<PathBuf>, term: u64, voted_for: Option<u64>) {
             "{term}\n{}\n",
             voted_for.map(|v| v.to_string()).unwrap_or_default()
         );
-        if let Err(e) = std::fs::write(p, body) {
+        if let Err(e) = atomic_write(p, body.as_bytes()) {
             warn!(error = %e, "failed to persist election state");
         }
     }
+}
+
+/// Durably write `bytes` to `path`: write a sibling `<path>.tmp`, fsync it, then
+/// rename over `path` (atomic on the same filesystem) — so a crash mid-write
+/// never leaves a corrupt/partial file. The `.tmp` name appends the suffix (not
+/// `with_extension`) so distinct files never share a temp path.
+fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let tmp = std::path::PathBuf::from(format!("{}.tmp", path.display()));
+    let mut f = std::fs::File::create(&tmp)?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
+    std::fs::rename(&tmp, path)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -295,6 +309,8 @@ impl Node {
     }
 
     async fn handle_control(&self, mut stream: TcpStream) -> std::io::Result<()> {
+        // Authenticate the peer (no-op unless a cluster secret is configured).
+        auth_accept(&mut stream).await?;
         // Loop over messages so a leader can reuse one connection for many
         // AppendEntries (batched throughput); one-shot RPCs simply send one
         // message and close, ending the loop at EOF.
@@ -658,6 +674,10 @@ impl Node {
                     match TcpStream::connect(&peer.control_addr).await {
                         Ok(mut s) => {
                             let _ = s.set_nodelay(true);
+                            if auth_connect(&mut s).await.is_err() {
+                                conns.remove(&peer.id);
+                                continue;
+                            }
                             match append_rpc(&mut s, &m).await {
                                 Ok(r) => {
                                     conns.insert(peer.id, s);
@@ -824,6 +844,9 @@ async fn send(stream: &mut TcpStream, m: &Msg) -> std::io::Result<()> {
 }
 
 /// Read one framed message; `None` on a clean end-of-stream.
+/// Reject absurd frame lengths (corrupt/malicious peer) before allocating.
+const MAX_FRAME: usize = 1 << 30; // 1 GiB
+
 async fn recv(stream: &mut TcpStream) -> std::io::Result<Option<Msg>> {
     let mut len = [0u8; 4];
     match stream.read_exact(&mut len).await {
@@ -832,11 +855,71 @@ async fn recv(stream: &mut TcpStream) -> std::io::Result<Option<Msg>> {
         Err(e) => return Err(e),
     }
     let n = u32::from_le_bytes(len) as usize;
+    if n > MAX_FRAME {
+        return Err(Error::new(ErrorKind::InvalidData, "frame too large"));
+    }
     let mut buf = vec![0u8; n];
     stream.read_exact(&mut buf).await?;
     bincode::deserialize(&buf)
         .map(Some)
         .map_err(|e| Error::new(ErrorKind::InvalidData, e.to_string()))
+}
+
+/// Optional pre-shared cluster secret (`ELYRASQL_CLUSTER_SECRET`). When set,
+/// every Raft control/replication connection must complete a challenge-response
+/// handshake, so an unauthenticated peer cannot inject fake writes or votes.
+fn cluster_secret() -> Option<Vec<u8>> {
+    std::env::var("ELYRASQL_CLUSTER_SECRET")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(String::into_bytes)
+}
+
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+fn response(secret: &[u8], nonce: &[u8]) -> [u8; 20] {
+    let mut h = Sha1::new();
+    h.update(secret);
+    h.update(nonce);
+    let d = h.finalize();
+    let mut out = [0u8; 20];
+    out.copy_from_slice(&d);
+    out
+}
+
+/// Server side of the handshake: send a nonce, verify the peer's response.
+pub async fn auth_accept(stream: &mut TcpStream) -> std::io::Result<()> {
+    let Some(secret) = cluster_secret() else {
+        return Ok(());
+    };
+    let mut nonce = [0u8; 16];
+    getrandom::getrandom(&mut nonce).map_err(|_| Error::other("rng failure"))?;
+    stream.write_all(&nonce).await?;
+    let mut resp = [0u8; 20];
+    stream.read_exact(&mut resp).await?;
+    if !ct_eq(&resp, &response(&secret, &nonce)) {
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            "cluster auth failed",
+        ));
+    }
+    Ok(())
+}
+
+/// Client side of the handshake: read the nonce, send the response.
+pub async fn auth_connect(stream: &mut TcpStream) -> std::io::Result<()> {
+    let Some(secret) = cluster_secret() else {
+        return Ok(());
+    };
+    let mut nonce = [0u8; 16];
+    stream.read_exact(&mut nonce).await?;
+    stream.write_all(&response(&secret, &nonce)).await?;
+    Ok(())
 }
 
 /// One-shot request/response RPC to a peer with a short timeout (elections,
@@ -845,6 +928,7 @@ async fn rpc(addr: &str, m: &Msg) -> std::io::Result<Msg> {
     let fut = async {
         let mut stream = TcpStream::connect(addr).await?;
         let _ = stream.set_nodelay(true);
+        auth_connect(&mut stream).await?;
         send(&mut stream, m).await?;
         recv(&mut stream)
             .await?

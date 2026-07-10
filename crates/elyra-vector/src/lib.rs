@@ -28,19 +28,57 @@ pub fn distance(a: &[f32], b: &[f32], metric: Metric) -> Option<f32> {
         return None;
     }
     Some(match metric {
-        Metric::L2 => a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum(),
-        Metric::InnerProduct => -a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>(),
+        Metric::L2 => l2_sq(a, b),
+        Metric::InnerProduct => -dot(a, b),
         Metric::Cosine => {
-            let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
-            let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-            let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let d = dot(a, b);
+            let na = dot(a, a).sqrt();
+            let nb = dot(b, b).sqrt();
             if na == 0.0 || nb == 0.0 {
                 1.0
             } else {
-                1.0 - dot / (na * nb)
+                1.0 - d / (na * nb)
             }
         }
     })
+}
+
+/// Squared L2 distance, SIMD-accelerated (8-wide) with a scalar remainder.
+fn l2_sq(a: &[f32], b: &[f32]) -> f32 {
+    use wide::f32x8;
+    let mut acc = f32x8::ZERO;
+    let mut ca = a.chunks_exact(8);
+    let mut cb = b.chunks_exact(8);
+    for (xa, xb) in ca.by_ref().zip(cb.by_ref()) {
+        let va = f32x8::new(xa.try_into().unwrap());
+        let vb = f32x8::new(xb.try_into().unwrap());
+        let d = va - vb;
+        acc += d * d;
+    }
+    let mut sum = acc.reduce_add();
+    for (x, y) in ca.remainder().iter().zip(cb.remainder()) {
+        let d = x - y;
+        sum += d * d;
+    }
+    sum
+}
+
+/// Inner product, SIMD-accelerated (8-wide) with a scalar remainder.
+fn dot(a: &[f32], b: &[f32]) -> f32 {
+    use wide::f32x8;
+    let mut acc = f32x8::ZERO;
+    let mut ca = a.chunks_exact(8);
+    let mut cb = b.chunks_exact(8);
+    for (xa, xb) in ca.by_ref().zip(cb.by_ref()) {
+        let va = f32x8::new(xa.try_into().unwrap());
+        let vb = f32x8::new(xb.try_into().unwrap());
+        acc += va * vb;
+    }
+    let mut sum = acc.reduce_add();
+    for (x, y) in ca.remainder().iter().zip(cb.remainder()) {
+        sum += x * y;
+    }
+    sum
 }
 
 #[cfg(test)]

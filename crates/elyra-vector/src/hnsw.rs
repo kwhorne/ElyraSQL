@@ -36,6 +36,12 @@ impl Visited {
             self.epoch = 1;
         }
     }
+    /// Grow the stamp buffer if the index has more nodes than last time.
+    fn ensure(&mut self, n: usize) {
+        if self.stamp.len() < n {
+            self.stamp.resize(n, 0);
+        }
+    }
     /// Mark visited; returns true if it was already visited.
     fn seen(&mut self, node: u32) -> bool {
         let s = &mut self.stamp[node as usize];
@@ -52,6 +58,9 @@ impl Visited {
 pub struct Hnsw {
     metric: Metric,
     dim: usize,
+    /// Pool of reusable visited-sets so `search` does not allocate an O(N)
+    /// buffer per query (checked out briefly under a lock, then returned).
+    visited_pool: std::sync::Mutex<Vec<Visited>>,
     vectors: Vec<Vec<f32>>,
     /// `neighbors[node][level]` = adjacency list at that level.
     neighbors: Vec<Vec<Vec<u32>>>,
@@ -102,6 +111,7 @@ impl Hnsw {
         let mut idx = Hnsw {
             metric,
             dim,
+            visited_pool: std::sync::Mutex::new(Vec::new()),
             vectors,
             neighbors: Vec::with_capacity(n),
             entry: 0,
@@ -276,8 +286,16 @@ impl Hnsw {
             ep = self.greedy_descend(q, ep, l);
             l -= 1;
         }
-        let mut visited = Visited::new(self.vectors.len());
+        // Reuse a pooled visited-set instead of allocating O(N) per search.
+        let mut visited = self
+            .visited_pool
+            .lock()
+            .unwrap()
+            .pop()
+            .unwrap_or_else(|| Visited::new(self.vectors.len()));
+        visited.ensure(self.vectors.len());
         let heap = self.search_layer(q, &[ep], ef.max(k), 0, &mut visited);
+        self.visited_pool.lock().unwrap().push(visited);
         let mut out: Vec<(u32, f32)> = heap.into_iter().map(|c| (c.node, c.dist)).collect();
         out.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
         out.truncate(k);
