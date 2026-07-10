@@ -40,18 +40,32 @@ struct TxnState {
     /// Rows explicitly locked with SELECT ... FOR UPDATE / FOR SHARE. Always
     /// validated at commit, so a concurrent change aborts this transaction.
     locked: BTreeSet<Vec<u8>>,
-    /// Named savepoints (overlay snapshots), innermost last.
+    /// Named savepoints (markers into `undo`/`ranges`), innermost last.
     savepoints: Vec<Savepoint>,
+    /// Reversible log of buffered-write mutations, recorded only while at least
+    /// one savepoint is active. Lets `ROLLBACK TO` revert in
+    /// O(changes-since-savepoint) instead of cloning the whole staged write set
+    /// per savepoint (which was O(writes x savepoints)).
+    undo: Vec<UndoEntry>,
+    /// Approximate bytes buffered by `puts` + `deletes`, maintained
+    /// incrementally, to bound in-transaction memory (see `txn_max_bytes`).
+    mem: usize,
 }
 
-#[derive(Clone)]
+/// A savepoint marker: positions into the undo log and range list rather than a
+/// full copy of the staged transaction state.
 struct Savepoint {
     name: String,
-    puts: BTreeMap<Vec<u8>, Vec<u8>>,
-    deletes: BTreeSet<Vec<u8>>,
-    reads: BTreeSet<Vec<u8>>,
-    ranges: Vec<(Vec<u8>, Option<Vec<u8>>)>,
-    locked: BTreeSet<Vec<u8>>,
+    undo_mark: usize,
+    ranges_len: usize,
+}
+
+/// One reversible mutation to the buffered write set for a single key: the
+/// state of that key (in `puts` / `deletes`) *before* the mutation.
+struct UndoEntry {
+    key: Vec<u8>,
+    prev_put: Option<Vec<u8>>,
+    prev_deleted: bool,
 }
 
 pub struct Session {
@@ -72,6 +86,23 @@ pub struct Session {
 
 fn is_meta(k: &[u8]) -> bool {
     k.starts_with(b"meta::")
+}
+
+/// Upper bound on bytes buffered by an uncommitted transaction before writes
+/// are rejected (default 1 GiB), preventing a single runaway transaction from
+/// exhausting server memory. Override with `ELYRASQL_TXN_MAX_BYTES`.
+fn txn_max_bytes() -> usize {
+    std::env::var("ELYRASQL_TXN_MAX_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1usize << 30)
+}
+
+fn txn_overflow(budget: usize) -> Error {
+    Error::Query(format!(
+        "transaction write buffer exceeded {budget} bytes; COMMIT or ROLLBACK \
+         (raise ELYRASQL_TXN_MAX_BYTES to allow larger transactions)"
+    ))
 }
 
 impl Session {
@@ -202,6 +233,8 @@ impl Session {
             ranges: Vec::new(),
             locked: BTreeSet::new(),
             savepoints: Vec::new(),
+            undo: Vec::new(),
+            mem: 0,
         });
         Ok(())
     }
@@ -223,11 +256,8 @@ impl Session {
         tx.savepoints.retain(|s| s.name != name);
         tx.savepoints.push(Savepoint {
             name: name.to_string(),
-            puts: tx.puts.clone(),
-            deletes: tx.deletes.clone(),
-            reads: tx.reads.clone(),
-            ranges: tx.ranges.clone(),
-            locked: tx.locked.clone(),
+            undo_mark: tx.undo.len(),
+            ranges_len: tx.ranges.len(),
         });
         Ok(())
     }
@@ -244,21 +274,43 @@ impl Session {
             .iter()
             .position(|s| s.name == name)
             .ok_or_else(|| Error::Query(format!("no such savepoint: {name}")))?;
-        let (p, d, r, rg, lk) = {
-            let sp = &tx.savepoints[pos];
-            (
-                sp.puts.clone(),
-                sp.deletes.clone(),
-                sp.reads.clone(),
-                sp.ranges.clone(),
-                sp.locked.clone(),
-            )
-        };
-        tx.puts = p;
-        tx.deletes = d;
-        tx.reads = r;
-        tx.ranges = rg;
-        tx.locked = lk;
+        let mark = tx.savepoints[pos].undo_mark;
+        let ranges_len = tx.savepoints[pos].ranges_len;
+        // Revert buffered-write mutations back to the savepoint, newest first;
+        // each entry restores one key's prior put/delete state.
+        while tx.undo.len() > mark {
+            let UndoEntry {
+                key,
+                prev_put,
+                prev_deleted,
+            } = tx.undo.pop().unwrap();
+            if let Some(v) = tx.puts.get(&key) {
+                tx.mem -= key.len() + v.len();
+            }
+            if tx.deletes.contains(&key) {
+                tx.mem -= key.len();
+            }
+            match prev_put {
+                Some(v) => {
+                    tx.mem += key.len() + v.len();
+                    tx.puts.insert(key.clone(), v);
+                }
+                None => {
+                    tx.puts.remove(&key);
+                }
+            }
+            if prev_deleted {
+                tx.mem += key.len();
+                tx.deletes.insert(key);
+            } else {
+                tx.deletes.remove(&key);
+            }
+        }
+        // Ranges are append-only, so truncation restores them exactly. `reads`
+        // and `locked` are intentionally kept: they only make commit-time
+        // conflict validation more conservative (never incorrect), and reverting
+        // them would reintroduce the expensive per-savepoint set clones.
+        tx.ranges.truncate(ranges_len);
         tx.savepoints.truncate(pos + 1);
         Ok(())
     }
@@ -276,6 +328,10 @@ impl Session {
             .position(|s| s.name == name)
             .ok_or_else(|| Error::Query(format!("no such savepoint: {name}")))?;
         tx.savepoints.truncate(pos);
+        // With no savepoints left, the undo log is no longer needed.
+        if tx.savepoints.is_empty() {
+            tx.undo = Vec::new();
+        }
         Ok(())
     }
 
@@ -291,6 +347,8 @@ impl Session {
             ranges,
             locked,
             savepoints: _,
+            undo: _,
+            mem: _,
         } = tx;
 
         // Keys to validate = written keys, plus (serializable) read keys.
@@ -492,13 +550,46 @@ impl Session {
         {
             let mut guard = self.txn.lock().unwrap();
             if let Some(tx) = guard.as_mut() {
+                let budget = txn_max_bytes();
+                let logging = !tx.savepoints.is_empty();
                 for (k, v) in puts {
-                    tx.deletes.remove(&k);
+                    if logging {
+                        tx.undo.push(UndoEntry {
+                            prev_put: tx.puts.get(&k).cloned(),
+                            prev_deleted: tx.deletes.contains(&k),
+                            key: k.clone(),
+                        });
+                    }
+                    if let Some(old) = tx.puts.get(&k) {
+                        tx.mem -= k.len() + old.len();
+                    }
+                    if tx.deletes.remove(&k) {
+                        tx.mem -= k.len();
+                    }
+                    tx.mem += k.len() + v.len();
                     tx.puts.insert(k, v);
+                    if tx.mem > budget {
+                        return Err(txn_overflow(budget));
+                    }
                 }
                 for k in deletes {
-                    tx.puts.remove(&k);
-                    tx.deletes.insert(k);
+                    let klen = k.len();
+                    if logging {
+                        tx.undo.push(UndoEntry {
+                            prev_put: tx.puts.get(&k).cloned(),
+                            prev_deleted: tx.deletes.contains(&k),
+                            key: k.clone(),
+                        });
+                    }
+                    if let Some(old) = tx.puts.remove(&k) {
+                        tx.mem -= klen + old.len();
+                    }
+                    if tx.deletes.insert(k) {
+                        tx.mem += klen;
+                    }
+                    if tx.mem > budget {
+                        return Err(txn_overflow(budget));
+                    }
                 }
                 return Ok(());
             }

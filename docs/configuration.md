@@ -23,6 +23,7 @@ variable fallback (handy for systemd and containers).
 |-------------|---------|-------------|
 | `ELYRASQL_SORT_MAX_ROWS` | `1000000` | Rows buffered before spilling to a temp file, for both `ORDER BY` (external merge sort) and partitioned `GROUP BY` spill. |
 | `ELYRASQL_GROUP_MAX_GROUPS` | `5000000` | Distinct-group cap: in-memory `GROUP BY` past this falls back to partitioned spill; a single spill partition past it errors (0 = unlimited). |
+| `ELYRASQL_TXN_MAX_BYTES` | `1073741824` | Max bytes an uncommitted transaction may buffer (staged puts + deletes) before writes are rejected, so one huge transaction can't exhaust server memory. The statement errors; `COMMIT` or `ROLLBACK` to continue. |
 
 `RUST_LOG` controls log verbosity (`error`, `warn`, `info`, `debug`, `trace`;
 default `info`).

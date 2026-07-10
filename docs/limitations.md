@@ -83,6 +83,14 @@ implemented, so you can judge fit.
   spilling above helps single-table scans, not joined output). Streaming join
   output (so joins feed the spilling sorter/aggregator directly) is a planned
   refactor.
+- Uncommitted transaction writes are buffered in memory (not spilled to disk)
+  until `COMMIT`/`ROLLBACK`. To keep this bounded, a transaction that stages more
+  than `ELYRASQL_TXN_MAX_BYTES` (default 1 GiB) of writes has its next write
+  rejected with an error rather than exhausting server memory. `SAVEPOINT` is
+  cheap: it records an undo-log marker (O(1)) rather than copying the staged
+  write set, and `ROLLBACK TO` reverts only the changes made since the savepoint
+  (`reads`/locked rows are kept, which only makes commit-time validation more
+  conservative, never incorrect).
 - Spilled `GROUP BY` output is ordered per partition (add `ORDER BY` for a
   defined order).
 
