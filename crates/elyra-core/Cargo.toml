@@ -10,4 +10,4 @@ description = "ElyraSQL core types, errors and catalog primitives"
 thiserror.workspace = true
 serde.workspace = true
 bincode.workspace = true
-sha1 = "0.10"
+sha1 = "0.11"

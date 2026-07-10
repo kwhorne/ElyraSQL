@@ -9,4 +9,4 @@ description = "ElyraSQL native vector search (ANN)"
 [dependencies]
 elyra-core.workspace = true
 # Portable SIMD (SSE/AVX on x86, NEON on ARM) for the distance kernels.
-wide = "0.7"
+wide = "1.5"
