@@ -48,8 +48,10 @@ pub struct RaftLog {
     commit_index: u64,
     /// Highest index applied to the state machine.
     last_applied: u64,
-    /// Optional backing file for durability.
+    /// Optional backing file for durability (append-only records).
     path: Option<PathBuf>,
+    /// Number of entries already durably written to `path`.
+    persisted: usize,
 }
 
 impl RaftLog {
@@ -57,37 +59,87 @@ impl RaftLog {
         RaftLog::default()
     }
 
-    /// Open a log backed by `path`, loading any persisted entries.
+    /// Open a log backed by `path`, loading any persisted entries. The log is an
+    /// append-only sequence of length-prefixed entry records. `commit_index` and
+    /// `last_applied` are **not** persisted: on restart they start at 0 and the
+    /// node re-applies the committed prefix (apply is idempotent for final
+    /// state), or re-learns commit from the current leader via AppendEntries.
     pub fn open(path: PathBuf) -> std::io::Result<Self> {
-        let mut log = RaftLog {
-            path: Some(path.clone()),
-            ..Default::default()
-        };
+        let mut entries = Vec::new();
         if path.exists() {
             let mut buf = Vec::new();
             std::fs::File::open(&path)?.read_to_end(&mut buf)?;
-            if !buf.is_empty() {
-                let (entries, commit): (Vec<LogEntry>, u64) = bincode::deserialize(&buf)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-                log.entries = entries;
-                log.commit_index = commit;
+            let mut pos = 0;
+            while pos + 4 <= buf.len() {
+                let len = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
+                pos += 4;
+                if pos + len > buf.len() {
+                    break; // torn tail record: ignore
+                }
+                if let Ok(e) = bincode::deserialize::<LogEntry>(&buf[pos..pos + len]) {
+                    entries.push(e);
+                }
+                pos += len;
             }
         }
-        Ok(log)
+        let persisted = entries.len();
+        Ok(RaftLog {
+            entries,
+            commit_index: 0,
+            last_applied: 0,
+            path: Some(path),
+            persisted,
+        })
     }
 
-    fn persist(&self) {
-        if let Some(p) = &self.path {
-            if let Ok(bytes) = bincode::serialize(&(&self.entries, self.commit_index)) {
-                // Write to a temp file then rename for atomicity.
-                let tmp = p.with_extension("tmp");
-                if std::fs::File::create(&tmp)
-                    .and_then(|mut f| f.write_all(&bytes).and_then(|_| f.sync_all()))
-                    .is_ok()
-                {
-                    let _ = std::fs::rename(&tmp, p);
-                }
+    /// Append entries not yet on disk (one fsync); the common, O(new) path.
+    fn persist_appended(&mut self) {
+        let Some(p) = &self.path else {
+            self.persisted = self.entries.len();
+            return;
+        };
+        if self.persisted >= self.entries.len() {
+            return;
+        }
+        let mut buf = Vec::new();
+        for e in &self.entries[self.persisted..] {
+            if let Ok(bytes) = bincode::serialize(e) {
+                buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                buf.extend_from_slice(&bytes);
             }
+        }
+        let ok = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(p)
+            .and_then(|mut f| f.write_all(&buf).and_then(|_| f.sync_all()))
+            .is_ok();
+        if ok {
+            self.persisted = self.entries.len();
+        }
+    }
+
+    /// Rewrite the whole log file (used after a conflicting-suffix truncation,
+    /// which is rare).
+    fn persist_rewrite(&mut self) {
+        let Some(p) = &self.path else {
+            self.persisted = self.entries.len();
+            return;
+        };
+        let mut buf = Vec::new();
+        for e in &self.entries {
+            if let Ok(bytes) = bincode::serialize(e) {
+                buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                buf.extend_from_slice(&bytes);
+            }
+        }
+        let tmp = p.with_extension("tmp");
+        if std::fs::File::create(&tmp)
+            .and_then(|mut f| f.write_all(&buf).and_then(|_| f.sync_all()))
+            .is_ok()
+            && std::fs::rename(&tmp, p).is_ok()
+        {
+            self.persisted = self.entries.len();
         }
     }
 
@@ -121,12 +173,23 @@ impl RaftLog {
             .map(|e| e.term)
     }
 
-    /// Leader path: append a new entry for `term`, returning its index.
+    /// Leader path: append a new entry for `term` in memory, returning its
+    /// index. Durability is deferred to [`sync`](Self::sync), so many concurrent
+    /// proposals share a single fsync per replication round (batched throughput).
     pub fn leader_append(&mut self, term: u64, data: Vec<u8>) -> u64 {
         let index = self.last_index() + 1;
         self.entries.push(LogEntry { term, index, data });
-        self.persist();
         index
+    }
+
+    /// Durably persist any not-yet-written entries (one fsync). The leader calls
+    /// this before replicating/committing a round's entries.
+    pub fn sync(&mut self) {
+        if self.persisted > self.entries.len() {
+            self.persist_rewrite();
+        } else {
+            self.persist_appended();
+        }
     }
 
     /// Follower path: the AppendEntries consistency check + truncation + append.
@@ -147,6 +210,7 @@ impl RaftLog {
             Some(t) if t == prev_term => {}
             _ => return false,
         }
+        let mut truncated = false;
         for ne in new_entries {
             match self.entries.iter().position(|e| e.index == ne.index) {
                 Some(pos) => {
@@ -154,13 +218,20 @@ impl RaftLog {
                         // Conflict: drop this entry and everything after it.
                         self.entries.truncate(pos);
                         self.entries.push(ne.clone());
+                        truncated = true;
                     }
                     // Same term at this index: already have it (idempotent).
                 }
                 None => self.entries.push(ne.clone()),
             }
         }
-        self.persist();
+        // A truncation may have discarded already-persisted entries -> rewrite;
+        // otherwise just append the new tail.
+        if truncated || self.persisted > self.entries.len() {
+            self.persist_rewrite();
+        } else {
+            self.persist_appended();
+        }
         true
     }
 
@@ -169,8 +240,7 @@ impl RaftLog {
     pub fn advance_commit(&mut self, leader_commit: u64) {
         let target = leader_commit.min(self.last_index());
         if target > self.commit_index {
-            self.commit_index = target;
-            self.persist();
+            self.commit_index = target; // commit index is not persisted (re-derived)
         }
     }
 
@@ -187,8 +257,7 @@ impl RaftLog {
         // The highest index present on a majority is the median from the top.
         let majority_idx = match_indexes[(match_indexes.len() - 1) / 2];
         if majority_idx > self.commit_index && self.term_at(majority_idx) == Some(current_term) {
-            self.commit_index = majority_idx;
-            self.persist();
+            self.commit_index = majority_idx; // not persisted (re-derived)
         }
     }
 
@@ -308,11 +377,15 @@ mod tests {
             let mut log = RaftLog::open(path.clone()).unwrap();
             log.leader_append(1, vec![1]);
             log.leader_append(1, vec![2]);
+            log.sync(); // durability is deferred to sync()
             log.maybe_commit(&mut [2, 2, 1], 1);
         }
+        // Entries are durable (append-only); commit index is re-derived (0).
         let log = RaftLog::open(path.clone()).unwrap();
         assert_eq!(log.last_index(), 2);
-        assert_eq!(log.commit_index(), 2);
+        assert_eq!(log.last_term(), 1);
+        assert_eq!(log.commit_index(), 0);
         let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("tmp"));
     }
 }

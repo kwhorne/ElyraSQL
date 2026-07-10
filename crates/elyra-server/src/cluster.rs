@@ -270,6 +270,7 @@ impl Node {
             loop {
                 match listener.accept().await {
                     Ok((stream, _)) => {
+                        let _ = stream.set_nodelay(true);
                         let n = srv.clone();
                         tokio::spawn(async move {
                             let _ = n.handle_control(stream).await;
@@ -284,51 +285,42 @@ impl Node {
     }
 
     async fn handle_control(&self, mut stream: TcpStream) -> std::io::Result<()> {
-        let msg = recv(&mut stream).await?;
-
-        match &msg {
-            Msg::AddPeer { id, control_addr } => {
-                {
-                    let mut p = self.peers.lock().unwrap();
-                    if *id != self.cfg.id && !p.iter().any(|x| x.id == *id) {
-                        p.push(Peer {
-                            id: *id,
-                            control_addr: control_addr.clone(),
-                        });
+        // Loop over messages so a leader can reuse one connection for many
+        // AppendEntries (batched throughput); one-shot RPCs simply send one
+        // message and close, ending the loop at EOF.
+        while let Some(msg) = recv(&mut stream).await? {
+            let reply = match msg {
+                Msg::AddPeer { id, control_addr } => {
+                    {
+                        let mut p = self.peers.lock().unwrap();
+                        if id != self.cfg.id && !p.iter().any(|x| x.id == id) {
+                            p.push(Peer { id, control_addr });
+                        }
                     }
+                    info!(id = self.cfg.id, added = id, "peer added");
+                    Msg::CtlAck { ok: true }
                 }
-                info!(id = self.cfg.id, added = *id, "peer added");
-                return send(&mut stream, &Msg::CtlAck { ok: true }).await;
-            }
-            Msg::RemovePeer { id } => {
-                self.peers.lock().unwrap().retain(|x| x.id != *id);
-                return send(&mut stream, &Msg::CtlAck { ok: true }).await;
-            }
-            _ => {}
-        }
-
-        match msg {
-            Msg::RequestVote {
-                term,
-                candidate,
-                last_log_index,
-                last_log_term,
-            } => {
-                let reply = self.on_request_vote(term, candidate, last_log_index, last_log_term);
-                send(&mut stream, &reply).await
-            }
-            Msg::AppendEntries {
-                term,
-                leader,
-                repl_addr,
-                members,
-                prev_index,
-                prev_term,
-                entries,
-                leader_commit,
-            } => {
-                let reply = self
-                    .on_append_entries(
+                Msg::RemovePeer { id } => {
+                    self.peers.lock().unwrap().retain(|x| x.id != id);
+                    Msg::CtlAck { ok: true }
+                }
+                Msg::RequestVote {
+                    term,
+                    candidate,
+                    last_log_index,
+                    last_log_term,
+                } => self.on_request_vote(term, candidate, last_log_index, last_log_term),
+                Msg::AppendEntries {
+                    term,
+                    leader,
+                    repl_addr,
+                    members,
+                    prev_index,
+                    prev_term,
+                    entries,
+                    leader_commit,
+                } => {
+                    self.on_append_entries(
                         term,
                         leader,
                         repl_addr,
@@ -338,11 +330,13 @@ impl Node {
                         entries,
                         leader_commit,
                     )
-                    .await;
-                send(&mut stream, &reply).await
-            }
-            _ => send(&mut stream, &Msg::CtlAck { ok: false }).await,
+                    .await
+                }
+                _ => Msg::CtlAck { ok: false },
+            };
+            send(&mut stream, &reply).await?;
         }
+        Ok(())
     }
 
     fn on_request_vote(
@@ -438,11 +432,15 @@ impl Node {
                 (false, 0, Vec::new())
             }
         };
-        for e in to_apply {
-            if let Ok(op) = bincode::deserialize::<WriteOp>(&e.data) {
-                let _ = self.db.apply_op_local(op).await;
-            }
-        }
+        // Apply committed entries in log order, but submit them together so the
+        // DB group-commit folds them into few fsyncs (batched throughput).
+        let ops: Vec<WriteOp> = to_apply
+            .iter()
+            .filter_map(|e| bincode::deserialize::<WriteOp>(&e.data).ok())
+            .collect();
+        let _ =
+            futures_util::future::join_all(ops.into_iter().map(|op| self.db.apply_op_local(op)))
+                .await;
         let reply_term = self.state.lock().unwrap().term;
         Msg::AppendAck {
             term: reply_term,
@@ -452,6 +450,9 @@ impl Node {
     }
 
     async fn main_loop(self: Arc<Self>) {
+        // Persistent AppendEntries connections to followers, reused across rounds
+        // for batched throughput; cleared when we stop being leader.
+        let mut conns: HashMap<u64, TcpStream> = HashMap::new();
         loop {
             let (role, deadline) = {
                 let s = self.state.lock().unwrap();
@@ -459,13 +460,14 @@ impl Node {
             };
             match role {
                 Role::Leader => {
-                    self.replicate_round().await;
+                    self.replicate_round(&mut conns).await;
                     tokio::select! {
                         _ = self.replicate.notified() => {}
                         _ = tokio::time::sleep(Duration::from_millis(HEARTBEAT_MS)) => {}
                     }
                 }
                 _ => {
+                    conns.clear(); // stale once we're not leader
                     let now = Instant::now();
                     if now >= deadline {
                         self.start_election().await;
@@ -557,7 +559,7 @@ impl Node {
 
     /// One leader replication round: push entries to every follower, collect
     /// acks, advance the commit index, and apply newly committed entries.
-    async fn replicate_round(self: &Arc<Self>) {
+    async fn replicate_round(self: &Arc<Self>, conns: &mut HashMap<u64, TcpStream>) {
         let term = {
             let s = self.state.lock().unwrap();
             if s.role != Role::Leader {
@@ -565,10 +567,18 @@ impl Node {
             }
             s.term
         };
+        // Durably persist all newly-appended entries once (batched fsync) before
+        // they are replicated and counted toward commit.
+        let leader_commit = {
+            let mut log = self.log.lock().unwrap();
+            log.sync();
+            log.commit_index()
+        };
         let members = self.members();
-        let leader_commit = self.log.lock().unwrap().commit_index();
-
-        for peer in self.peer_snapshot() {
+        let peers = self.peer_snapshot();
+        let live: std::collections::HashSet<u64> = peers.iter().map(|p| p.id).collect();
+        conns.retain(|id, _| live.contains(id));
+        for peer in peers {
             let (prev_index, prev_term, entries) = {
                 let log = self.log.lock().unwrap();
                 let next = self
@@ -592,8 +602,32 @@ impl Node {
                 entries,
                 leader_commit,
             };
-            match rpc(&peer.control_addr, &m).await {
-                Ok(Msg::AppendAck {
+            // Reuse the persistent connection; reconnect once on failure.
+            let reply = match conns.get_mut(&peer.id) {
+                Some(s) => append_rpc(s, &m).await.ok(),
+                None => None,
+            };
+            let reply = match reply {
+                Some(r) => Some(r),
+                None => {
+                    conns.remove(&peer.id);
+                    match TcpStream::connect(&peer.control_addr).await {
+                        Ok(mut s) => {
+                            let _ = s.set_nodelay(true);
+                            match append_rpc(&mut s, &m).await {
+                                Ok(r) => {
+                                    conns.insert(peer.id, s);
+                                    Some(r)
+                                }
+                                Err(_) => None,
+                            }
+                        }
+                        Err(_) => None,
+                    }
+                }
+            };
+            match reply {
+                Some(Msg::AppendAck {
                     term: t,
                     success,
                     match_index,
@@ -621,7 +655,10 @@ impl Node {
                         p.next -= 1; // back off and retry with an earlier prefix
                     }
                 }
-                _ => { /* unreachable peer: retried next round */ }
+                Some(_) | None => {
+                    // Unreachable or unexpected reply: drop, retry next round.
+                    conns.remove(&peer.id);
+                }
             }
         }
 
@@ -639,12 +676,26 @@ impl Node {
             log.maybe_commit(&mut match_indexes, term);
             log.take_applicable()
         };
-        for e in to_apply {
-            let result = match bincode::deserialize::<WriteOp>(&e.data) {
-                Ok(op) => self.db.apply_op_local(op).await,
-                Err(err) => Err(elyra_core::Error::Storage(err.to_string())),
-            };
-            if let Some(tx) = self.pending.lock().unwrap().remove(&e.index) {
+        if to_apply.is_empty() {
+            return;
+        }
+        // Apply in log order but submit together: the DB group-commit folds the
+        // batch into few fsyncs. join_all polls in order, so jobs reach the
+        // writer in order (deterministic apply, matching followers).
+        let indexes: Vec<u64> = to_apply.iter().map(|e| e.index).collect();
+        let futs = to_apply.into_iter().map(|e| {
+            let db = self.db.clone();
+            async move {
+                match bincode::deserialize::<WriteOp>(&e.data) {
+                    Ok(op) => db.apply_op_local(op).await,
+                    Err(err) => Err(elyra_core::Error::Storage(err.to_string())),
+                }
+            }
+        });
+        let results = futures_util::future::join_all(futs).await;
+        let mut pending = self.pending.lock().unwrap();
+        for (index, result) in indexes.into_iter().zip(results) {
+            if let Some(tx) = pending.remove(&index) {
                 let _ = tx.send(result);
             }
         }
@@ -704,25 +755,49 @@ async fn send(stream: &mut TcpStream, m: &Msg) -> std::io::Result<()> {
     Ok(())
 }
 
-async fn recv(stream: &mut TcpStream) -> std::io::Result<Msg> {
+/// Read one framed message; `None` on a clean end-of-stream.
+async fn recv(stream: &mut TcpStream) -> std::io::Result<Option<Msg>> {
     let mut len = [0u8; 4];
-    stream.read_exact(&mut len).await?;
+    match stream.read_exact(&mut len).await {
+        Ok(_) => {}
+        Err(e) if e.kind() == ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e),
+    }
     let n = u32::from_le_bytes(len) as usize;
     let mut buf = vec![0u8; n];
     stream.read_exact(&mut buf).await?;
-    bincode::deserialize(&buf).map_err(|e| Error::new(ErrorKind::InvalidData, e.to_string()))
+    bincode::deserialize(&buf)
+        .map(Some)
+        .map_err(|e| Error::new(ErrorKind::InvalidData, e.to_string()))
 }
 
-/// One-shot request/response RPC to a peer with a short timeout.
+/// One-shot request/response RPC to a peer with a short timeout (elections,
+/// membership).
 async fn rpc(addr: &str, m: &Msg) -> std::io::Result<Msg> {
     let fut = async {
         let mut stream = TcpStream::connect(addr).await?;
+        let _ = stream.set_nodelay(true);
         send(&mut stream, m).await?;
-        recv(&mut stream).await
+        recv(&mut stream)
+            .await?
+            .ok_or_else(|| Error::new(ErrorKind::UnexpectedEof, "peer closed"))
     };
     tokio::time::timeout(Duration::from_millis(500), fut)
         .await
         .map_err(|_| Error::new(ErrorKind::TimedOut, "rpc timeout"))?
+}
+
+/// Send an AppendEntries on a persistent connection and await the ack (bounded).
+async fn append_rpc(stream: &mut TcpStream, m: &Msg) -> std::io::Result<Msg> {
+    let fut = async {
+        send(stream, m).await?;
+        recv(stream)
+            .await?
+            .ok_or_else(|| Error::new(ErrorKind::UnexpectedEof, "peer closed"))
+    };
+    tokio::time::timeout(Duration::from_millis(500), fut)
+        .await
+        .map_err(|_| Error::new(ErrorKind::TimedOut, "append rpc timeout"))?
 }
 
 /// Operator command: add/remove a peer on the node at `node_addr`.

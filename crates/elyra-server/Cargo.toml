@@ -16,6 +16,7 @@ tokio.workspace = true
 tracing.workspace = true
 sha1 = "0.10"
 getrandom = "0.2"
+futures-util = "0.3"
 serde.workspace = true
 bincode.workspace = true
 tokio-rustls = "0.25"

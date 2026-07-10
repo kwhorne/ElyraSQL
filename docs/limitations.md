@@ -188,7 +188,12 @@ implemented, so you can judge fit.
   conflicting-suffix truncation) and apply up to the leader's commit index. With
   the §5.4.1 election restriction this is **no-data-loss failover**: an
   acknowledged write is on a quorum's durable log and any new leader has it.
-  A write cannot be acknowledged without a quorum. Known limitation: a leader
+  A write cannot be acknowledged without a quorum. The replication path is
+  **batched for throughput**: the leader holds persistent `AppendEntries`
+  connections to followers, appends are fsynced once per round (not per write),
+  and committed entries are applied together through the DB's group commit — so
+  concurrent writers reach hundreds of committed writes/second even though a
+  single sequential write is fsync-latency-bound. Known limitation: a leader
   partitioned from its quorum blocks writes until it can replicate (or a client
   timeout fires) rather than stepping down proactively (no leader lease yet).
   The older `primary`/`replica` mode remains asynchronous (semi-sync/quorum
