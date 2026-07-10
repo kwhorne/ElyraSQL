@@ -1069,6 +1069,77 @@ async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec
             ]];
             Ok((schema, rows))
         }
+        "triggers" => {
+            let schema = Schema::new(
+                [
+                    "TRIGGER_CATALOG",
+                    "TRIGGER_SCHEMA",
+                    "TRIGGER_NAME",
+                    "EVENT_MANIPULATION",
+                    "EVENT_OBJECT_CATALOG",
+                    "EVENT_OBJECT_SCHEMA",
+                    "EVENT_OBJECT_TABLE",
+                    "ACTION_ORDER",
+                    "ACTION_CONDITION",
+                    "ACTION_STATEMENT",
+                    "ACTION_ORIENTATION",
+                    "ACTION_TIMING",
+                    "CREATED",
+                    "SQL_MODE",
+                    "DEFINER",
+                    "CHARACTER_SET_CLIENT",
+                    "COLLATION_CONNECTION",
+                    "DATABASE_COLLATION",
+                ]
+                .iter()
+                .map(|n| text(n))
+                .collect(),
+            );
+            let prefix = b"sys::trigger::".to_vec();
+            let mut rows = Vec::new();
+            let mut after: Option<Vec<u8>> = None;
+            loop {
+                let batch = db.scan_batch(prefix.clone(), after.clone(), 512).await?;
+                if batch.is_empty() {
+                    break;
+                }
+                for (_, v) in &batch {
+                    let Ok(t) = bincode::deserialize::<catalog::TriggerDef>(v) else {
+                        continue;
+                    };
+                    let event = match t.event {
+                        catalog::TrigEvent::Insert => "INSERT",
+                        catalog::TrigEvent::Update => "UPDATE",
+                        catalog::TrigEvent::Delete => "DELETE",
+                    };
+                    rows.push(vec![
+                        Value::Text("def".into()),
+                        Value::Text("elyra".into()),
+                        Value::Text(t.name),
+                        Value::Text(event.into()),
+                        Value::Text("def".into()),
+                        Value::Text("elyra".into()),
+                        Value::Text(t.table),
+                        Value::Text("1".into()),
+                        Value::Null,
+                        Value::Text(t.body),
+                        Value::Text("ROW".into()),
+                        Value::Text(if t.before { "BEFORE" } else { "AFTER" }.into()),
+                        Value::Null,
+                        Value::Text(String::new()),
+                        Value::Text("root@%".into()),
+                        Value::Text("utf8mb4".into()),
+                        Value::Text("utf8mb4_general_ci".into()),
+                        Value::Text("utf8mb4_general_ci".into()),
+                    ]);
+                }
+                after = batch.last().map(|(k, _)| k.clone());
+                if batch.len() < 512 {
+                    break;
+                }
+            }
+            Ok((schema, rows))
+        }
         "routines" => {
             let schema = Schema::new(
                 [
