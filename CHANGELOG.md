@@ -4,6 +4,47 @@ All notable changes to ElyraSQL are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.8.10] - 2026-07-10
+
+Consensus hardening & security release — making the Raft write path production-
+viable and strengthening password handling.
+
+### Raft write-path throughput
+
+- The leader holds **persistent `AppendEntries` connections** to followers
+  (reused across rounds, `TCP_NODELAY`) instead of a fresh connection per round.
+- The Raft log is now **append-only** (fsync only new entries; the whole log is
+  no longer rewritten per write), and the leader fsyncs a round's entries once.
+- Committed entries are **applied together** through the DB group commit.
+- Together these lift concurrent cluster write throughput from ~60/s to ~500/s
+  (16 connections) / ~800/s (32); a single sequential write stays
+  fsync-latency-bound.
+
+### Leader lease (liveness + linearizable leader reads)
+
+- The leader renews a **lease** each round it confirms a quorum and **steps
+  down** if it cannot within the lease window (below the election timeout). A
+  leader partitioned from its quorum now relinquishes leadership — in-flight
+  writes fail fast and a healthy majority elects a new leader — rather than
+  hanging. A lease-valid leader is guaranteed to be the leader, so its local
+  reads are linearizable without a quorum round-trip.
+
+### Raft log compaction
+
+- The replicated log no longer grows unbounded: once entries are applied and
+  replicated to every member, each node discards them (keeping the snapshot
+  boundary term for the consistency check); the applied state machine is the
+  snapshot. Compaction advances only to the slowest member's replicated index.
+
+### Password hardening
+
+- New passwords must satisfy a strength policy (`ELYRASQL_PASSWORD_MIN_LEN`,
+  default 8; `ELYRASQL_PASSWORD_REQUIRE_MIXED`, default on;
+  `ELYRASQL_PASSWORD_POLICY=off` to disable).
+- Repeated failed logins trigger a temporary **account lockout**
+  (`ELYRASQL_AUTH_MAX_FAILURES`, default 10; `ELYRASQL_AUTH_LOCKOUT_SECS`,
+  default 60), logged.
+
 ## [0.8.9] - 2026-07-09
 
 Consensus release: the Raft log is now on the live cluster write path.
@@ -556,6 +597,7 @@ core CRUD with `WHERE`/`ORDER BY`/`LIMIT`, indexes, aggregation and `GROUP BY`,
 joins, prepared statements, authentication and TLS, vector search (exact +
 HNSW), parallel OLAP aggregation, and transactions with snapshot isolation.
 
+[0.8.10]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.8.10
 [0.8.9]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.8.9
 [0.8.8]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.8.8
 [0.8.7]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.8.7
