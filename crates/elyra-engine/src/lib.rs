@@ -1281,6 +1281,7 @@ impl Engine {
             Statement::CreateDatabase { .. } | Statement::CreateSchema { .. } => {
                 Ok(QueryResult::empty_ok())
             }
+            Statement::Explain { statement, .. } => exec::explain(sess, &statement).await,
             Statement::Drop {
                 object_type:
                     sqlparser::ast::ObjectType::Database | sqlparser::ast::ObjectType::Schema,
@@ -1653,6 +1654,7 @@ fn required_privilege(stmt: &Statement) -> Privilege {
         | Statement::ShowCollation { .. }
         | Statement::ShowDatabases { .. }
         | Statement::ShowVariable { .. }
+        | Statement::Explain { .. }
         | Statement::ExplainTable { .. } => Privilege::Read,
         _ => Privilege::Admin, // CREATE / DROP / CREATE INDEX and anything else
     }

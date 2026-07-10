@@ -357,6 +357,63 @@ fn text_schema(names: &[&str]) -> Schema {
     )
 }
 
+/// The first base table named in a query's `FROM`, if simple.
+fn explain_first_table(stmt: &sqlparser::ast::Statement) -> Option<String> {
+    use sqlparser::ast::{SetExpr, Statement};
+    if let Statement::Query(q) = stmt {
+        if let SetExpr::Select(sel) = q.body.as_ref() {
+            if let Some(t) = sel.from.first() {
+                if let TableFactor::Table { name, .. } = &t.relation {
+                    return name.0.last().map(|i| i.value.clone());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// `EXPLAIN <statement>` — a best-effort, MySQL-shaped plan row (names the first
+/// base table and its estimated row count). Not a full optimizer trace.
+pub async fn explain(db: &Session, stmt: &sqlparser::ast::Statement) -> Result<QueryResult> {
+    let schema = text_schema(&[
+        "id",
+        "select_type",
+        "table",
+        "partitions",
+        "type",
+        "possible_keys",
+        "key",
+        "key_len",
+        "ref",
+        "rows",
+        "filtered",
+        "Extra",
+    ]);
+    let table = explain_first_table(stmt);
+    let rows_est = match &table {
+        Some(t) => catalog::load_stats(db, t)
+            .await?
+            .map(|s| s.rows.to_string())
+            .unwrap_or_else(|| "0".into()),
+        None => "0".into(),
+    };
+    let row = vec![
+        Value::Text("1".into()),
+        Value::Text("SIMPLE".into()),
+        table.clone().map(Value::Text).unwrap_or(Value::Null),
+        Value::Null,
+        Value::Text(if table.is_some() { "ALL" } else { "" }.into()),
+        Value::Null,
+        Value::Null,
+        Value::Null,
+        Value::Null,
+        Value::Text(rows_est),
+        Value::Text("100.00".into()),
+        Value::Text(String::new()),
+    ];
+    Ok(QueryResult::Rows(RowStream::literal(schema, vec![row])))
+}
+
 /// MySQL-compatible system variables reported by `SHOW VARIABLES`. ElyraSQL
 /// presents as MySQL 8.0, so GUI tools and ORMs that read these on connect
 /// behave (character sets, timeouts, case sensitivity, packet size, ...).
@@ -772,12 +829,17 @@ pub async fn show_index(db: &Session, name: &str) -> Result<QueryResult> {
 /// If `tf` is `information_schema.<view>`, return the lowercase view name.
 fn information_schema_view(tf: &TableFactor) -> Option<String> {
     if let TableFactor::Table { name, .. } = tf {
-        if name.0.len() >= 2
-            && name.0[name.0.len() - 2]
-                .value
-                .eq_ignore_ascii_case("information_schema")
-        {
-            return name.0.last().map(|i| i.value.to_ascii_lowercase());
+        if name.0.len() >= 2 {
+            let schema = name.0[name.0.len() - 2].value.to_ascii_lowercase();
+            let table = name.0.last()?.value.to_ascii_lowercase();
+            if schema == "information_schema" {
+                return Some(table);
+            }
+            // Expose a few `mysql.*` catalog tables (prefixed so the virtual-
+            // table provider can tell them apart).
+            if schema == "mysql" {
+                return Some(format!("mysql.{table}"));
+            }
         }
     }
     None
@@ -1049,6 +1111,72 @@ async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec
                 }
             }
             Ok((schema, rows))
+        }
+        "mysql.user" => {
+            let cols = [
+                "Host",
+                "User",
+                "Select_priv",
+                "Insert_priv",
+                "Update_priv",
+                "Delete_priv",
+                "Create_priv",
+                "Drop_priv",
+                "Super_priv",
+                "plugin",
+                "authentication_string",
+                "account_locked",
+                "password_expired",
+            ];
+            let schema = Schema::new(cols.iter().map(|n| text(n)).collect());
+            let prefix = elyra_core::users::USER_PREFIX.to_vec();
+            let mut rows = Vec::new();
+            let mut after: Option<Vec<u8>> = None;
+            loop {
+                let batch = db.scan_batch(prefix.clone(), after.clone(), 512).await?;
+                if batch.is_empty() {
+                    break;
+                }
+                for (k, v) in &batch {
+                    let name = String::from_utf8_lossy(&k[prefix.len()..]).to_string();
+                    let tier = elyra_core::users::decode_user(v)
+                        .map(|u| u.privilege)
+                        .unwrap_or(elyra_core::Privilege::Read);
+                    let y = |on: bool| Value::Text(if on { "Y" } else { "N" }.into());
+                    let write = tier >= elyra_core::Privilege::Write;
+                    let admin = tier >= elyra_core::Privilege::Admin;
+                    rows.push(vec![
+                        Value::Text("%".into()),
+                        Value::Text(name),
+                        y(true),
+                        y(write),
+                        y(write),
+                        y(write),
+                        y(admin),
+                        y(admin),
+                        y(admin),
+                        Value::Text("mysql_native_password".into()),
+                        Value::Text(String::new()),
+                        y(false),
+                        y(false),
+                    ]);
+                }
+                after = batch.last().map(|(k, _)| k.clone());
+                if batch.len() < 512 {
+                    break;
+                }
+            }
+            Ok((schema, rows))
+        }
+        "mysql.db" => {
+            // No per-database grant table; report an empty, shaped result.
+            let schema = Schema::new(
+                ["Host", "Db", "User", "Select_priv", "Insert_priv"]
+                    .iter()
+                    .map(|n| text(n))
+                    .collect(),
+            );
+            Ok((schema, Vec::new()))
         }
         "engines" => {
             let schema = Schema::new(vec![

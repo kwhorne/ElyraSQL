@@ -307,10 +307,111 @@ pub fn eval_row(expr: &Expr, schema: &Schema, row: &[Value]) -> Result<Value> {
             let v = eval_row(expr, schema, row)?;
             cast_value(v, data_type)
         }
+        Expr::Like {
+            negated,
+            expr,
+            pattern,
+            escape_char,
+            ..
+        }
+        | Expr::ILike {
+            negated,
+            expr,
+            pattern,
+            escape_char,
+            ..
+        } => {
+            let text = eval_row(expr, schema, row)?;
+            let pat = eval_row(pattern, schema, row)?;
+            if text.is_null() || pat.is_null() {
+                return Ok(Value::Null);
+            }
+            let esc = escape_char.as_ref().and_then(|s| s.chars().next());
+            // Default collation is case-insensitive (utf8mb4_general_ci), as is
+            // ILIKE, so both match case-insensitively.
+            let m = like_eval(
+                &text.to_wire_string().unwrap_or_default(),
+                &pat.to_wire_string().unwrap_or_default(),
+                esc,
+                true,
+            );
+            Ok(Value::Bool(m != *negated))
+        }
         other => Err(Error::Unsupported(format!(
             "expression not supported in WHERE: {other}"
         ))),
     }
+}
+
+enum LikeTok {
+    Lit(char),
+    Any,
+    One,
+}
+
+/// SQL `LIKE` matching: `%` matches any run, `_` matches one character, an
+/// optional escape character makes the next `%`/`_`/escape literal. Case-
+/// insensitive when `ci` (the default collation). Iterative with `%`
+/// backtracking (no per-row regex compilation).
+fn like_eval(text: &str, pattern: &str, esc: Option<char>, ci: bool) -> bool {
+    let fold = |c: char| if ci { c.to_ascii_lowercase() } else { c };
+    let t: Vec<char> = text.chars().map(fold).collect();
+    let esc = esc.map(fold);
+    let pchars: Vec<char> = pattern.chars().map(fold).collect();
+
+    let mut toks: Vec<LikeTok> = Vec::with_capacity(pchars.len());
+    let mut i = 0;
+    while i < pchars.len() {
+        let c = pchars[i];
+        if Some(c) == esc && i + 1 < pchars.len() {
+            toks.push(LikeTok::Lit(pchars[i + 1]));
+            i += 2;
+            continue;
+        }
+        toks.push(match c {
+            '%' => LikeTok::Any,
+            '_' => LikeTok::One,
+            _ => LikeTok::Lit(c),
+        });
+        i += 1;
+    }
+
+    let (mut ti, mut pi) = (0usize, 0usize);
+    let (mut star, mut mark) = (usize::MAX, 0usize);
+    while ti < t.len() {
+        if pi < toks.len() {
+            match toks[pi] {
+                LikeTok::Any => {
+                    star = pi;
+                    mark = ti;
+                    pi += 1;
+                    continue;
+                }
+                LikeTok::One => {
+                    ti += 1;
+                    pi += 1;
+                    continue;
+                }
+                LikeTok::Lit(c) if c == t[ti] => {
+                    ti += 1;
+                    pi += 1;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        if star != usize::MAX {
+            pi = star + 1;
+            mark += 1;
+            ti = mark;
+        } else {
+            return false;
+        }
+    }
+    while pi < toks.len() && matches!(toks[pi], LikeTok::Any) {
+        pi += 1;
+    }
+    pi == toks.len()
 }
 
 /// Does `expr` filter `row` in or out?
