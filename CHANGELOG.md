@@ -4,6 +4,76 @@ All notable changes to ElyraSQL are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.9.0] - 2026-07-10
+
+Robustness, correctness & security hardening release. A broad review of the
+query engine, transaction layer, vector search, privilege model and network/
+disk I/O, tightening production safety without changing the on-disk format.
+
+### Correctness
+
+- **Signed-zero / NaN grouping.** `GROUP BY`, `DISTINCT` and hash joins now
+  canonicalize float keys, so `-0.0` and `+0.0` group together (as SQL requires)
+  and all NaNs collapse to one key.
+- **Total ordering.** `Value::total_cmp`'s fallback no longer compares `Debug`
+  strings (which allocated per comparison and sorted `10.0` before `2.0`); it
+  uses a numeric / stable per-type order.
+- **Full-text stemming.** Replaced the ad-hoc suffix stripper (which mangled
+  `string`→`str`, `running`→`runn`) with the **Snowball** algorithms
+  (`rust-stemmers`); multilingual via `ELYRASQL_FULLTEXT_LANGUAGE` (default
+  `english`; `none` disables stemming).
+- **Transaction ORDER BY** now uses the disk-spilling sorter *inside*
+  transactions too (via the snapshot+overlay cursor), not just in autocommit.
+- **GROUP BY** consults column statistics to go straight to the spilling path
+  when a large group count is predicted, avoiding a wasted in-memory pass and
+  re-scan (run `ANALYZE TABLE` to benefit).
+
+### Stability
+
+- **JSON validator depth limit** (`MAX_JSON_DEPTH`) stops deeply nested input
+  from overflowing the thread stack.
+- **O(1) savepoints.** `SAVEPOINT` records an undo-log marker instead of cloning
+  the whole staged write set (previously O(writes × savepoints)); `ROLLBACK TO`
+  reverts only changes since the savepoint.
+- **Bounded transaction buffer.** Uncommitted writes past `ELYRASQL_TXN_MAX_BYTES`
+  (default 1 GiB) are rejected with an error instead of exhausting memory.
+- **Single-flight vector index rebuilds.** A burst of queries after a write now
+  triggers exactly one HNSW rebuild while the rest await and share it, instead
+  of a thundering-herd of parallel full-table scans.
+- **Temp-file hygiene.** Sort/aggregation spill files are size-guarded on read
+  (a corrupt file can't trigger a giant allocation) and stale files from a
+  SIGKILLed process are reclaimed at startup (only confirmed-dead PIDs).
+
+### Security
+
+- **Fine-grained global privileges.** `GRANT`/`REVOKE ON *.*` now add/remove
+  individual privileges as a set, so revoking one privilege no longer collapses
+  an admin account to read-only. `SHOW GRANTS` lists the exact set.
+- **DROP USER** purges the account's global, per-table, per-column and role
+  grants, so a recreated same-name user can't inherit stale privileges.
+- **Constant-time password comparison** (`ct_eq`) closes a hash timing side
+  channel.
+- **Bounded frame/record reads.** Every length-prefixed read (cluster,
+  replication, binlog, spill files) rejects oversized lengths before allocating,
+  via the configurable `ELYRASQL_MAX_FRAME_MB` (default 1024 MiB), turning a
+  corrupt file or malicious packet into an error instead of an OOM crash.
+
+### Performance
+
+- **HNSW visited-set pooling** removes an O(N) heap allocation per vector search.
+- **SIMD distance kernels** (`wide::f32x8`, 8-wide) accelerate L2 / inner-product
+  / cosine on the hot ANN path.
+- **Cooperative yielding** (`yield_now`) in stored-procedure `WHILE`/`LOOP`/
+  `REPEAT` loops keeps a long procedure from starving the async runtime.
+
+### Known limitations (documented)
+
+- Multi-table joins still materialize before sort/group (streaming join output
+  is planned); an unanalyzed high-cardinality `GROUP BY` may still fall back with
+  a second scan; internal cluster/replication traffic is authenticated
+  (`ELYRASQL_CLUSTER_SECRET`) but not yet encrypted (mTLS is planned — use a
+  private network/VPN meanwhile).
+
 ## [0.8.10] - 2026-07-10
 
 Consensus hardening & security release — making the Raft write path production-
@@ -597,6 +667,7 @@ core CRUD with `WHERE`/`ORDER BY`/`LIMIT`, indexes, aggregation and `GROUP BY`,
 joins, prepared statements, authentication and TLS, vector search (exact +
 HNSW), parallel OLAP aggregation, and transactions with snapshot isolation.
 
+[0.9.0]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.9.0
 [0.8.10]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.8.10
 [0.8.9]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.8.9
 [0.8.8]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.8.8
