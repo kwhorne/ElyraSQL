@@ -105,6 +105,8 @@ enum Msg {
         prev_term: u64,
         entries: Vec<LogEntry>,
         leader_commit: u64,
+        /// Highest index safe to compact on all nodes (min follower match).
+        compact_index: u64,
     },
     AppendAck {
         term: u64,
@@ -327,6 +329,7 @@ impl Node {
                     prev_term,
                     entries,
                     leader_commit,
+                    compact_index,
                 } => {
                     self.on_append_entries(
                         term,
@@ -337,6 +340,7 @@ impl Node {
                         prev_term,
                         entries,
                         leader_commit,
+                        compact_index,
                     )
                     .await
                 }
@@ -399,6 +403,7 @@ impl Node {
         prev_term: u64,
         entries: Vec<LogEntry>,
         leader_commit: u64,
+        compact_index: u64,
     ) -> Msg {
         {
             let mut s = self.state.lock().unwrap();
@@ -449,6 +454,10 @@ impl Node {
         let _ =
             futures_util::future::join_all(ops.into_iter().map(|op| self.db.apply_op_local(op)))
                 .await;
+        // Compact applied entries up to the cluster-wide safe point.
+        if success {
+            self.log.lock().unwrap().compact(compact_index);
+        }
         let reply_term = self.state.lock().unwrap().term;
         Msg::AppendAck {
             term: reply_term,
@@ -596,6 +605,21 @@ impl Node {
         let peers = self.peer_snapshot();
         let live: std::collections::HashSet<u64> = peers.iter().map(|p| p.id).collect();
         conns.retain(|id, _| live.contains(id));
+        // Cluster-wide safe compaction point = the slowest follower's match
+        // index (everyone has entries up to here, so they can be discarded);
+        // for a single node it's simply what has been applied.
+        let compact_index = {
+            let prog = self.progress.lock().unwrap();
+            if peers.is_empty() {
+                self.log.lock().unwrap().last_applied()
+            } else {
+                peers
+                    .iter()
+                    .map(|p| prog.get(&p.id).map(|x| x.match_).unwrap_or(0))
+                    .min()
+                    .unwrap_or(0)
+            }
+        };
         let mut quorum_acks = 1usize; // this leader counts itself
         for peer in peers {
             let (prev_index, prev_term, entries) = {
@@ -620,6 +644,7 @@ impl Node {
                 prev_term,
                 entries,
                 leader_commit,
+                compact_index,
             };
             // Reuse the persistent connection; reconnect once on failure.
             let reply = match conns.get_mut(&peer.id) {
@@ -687,6 +712,8 @@ impl Node {
             *self.lease.lock().unwrap() = Instant::now();
         }
         self.advance_commit_and_apply(term).await;
+        // Compact the leader's own log up to the cluster-wide safe point.
+        self.log.lock().unwrap().compact(compact_index);
     }
 
     /// Relinquish leadership: become a follower, fail pending proposals fast, and

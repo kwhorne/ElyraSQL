@@ -52,6 +52,12 @@ pub struct RaftLog {
     path: Option<PathBuf>,
     /// Number of entries already durably written to `path`.
     persisted: usize,
+    /// Compaction point: entries with index <= this have been discarded (their
+    /// state lives in the applied state machine). `term_at(snapshot_index)`
+    /// returns `snapshot_term` so the AppendEntries consistency check still works
+    /// at the boundary.
+    snapshot_index: u64,
+    snapshot_term: u64,
 }
 
 impl RaftLog {
@@ -82,14 +88,42 @@ impl RaftLog {
                 pos += len;
             }
         }
+        let (snapshot_index, snapshot_term) = read_snapshot_meta(&path);
         let persisted = entries.len();
         Ok(RaftLog {
             entries,
-            commit_index: 0,
-            last_applied: 0,
+            commit_index: snapshot_index,
+            last_applied: snapshot_index,
             path: Some(path),
             persisted,
+            snapshot_index,
+            snapshot_term,
         })
+    }
+
+    /// Discard applied log entries up to and including `up_to` (compaction). The
+    /// snapshot boundary term is retained so consistency checks at `up_to` still
+    /// succeed. Never compacts past what has been applied.
+    pub fn compact(&mut self, up_to: u64) {
+        if up_to <= self.snapshot_index || up_to > self.last_applied {
+            return;
+        }
+        let Some(term) = self.term_at(up_to) else {
+            return;
+        };
+        self.entries.retain(|e| e.index > up_to);
+        self.snapshot_index = up_to;
+        self.snapshot_term = term;
+        self.persist_rewrite();
+        if let Some(p) = &self.path {
+            write_snapshot_meta(p, self.snapshot_index, self.snapshot_term);
+        }
+    }
+
+    /// The compaction (snapshot) index — lowest index still in the log is
+    /// `snapshot_index + 1`.
+    pub fn snapshot_index(&self) -> u64 {
+        self.snapshot_index
     }
 
     /// Append entries not yet on disk (one fsync); the common, O(new) path.
@@ -143,14 +177,20 @@ impl RaftLog {
         }
     }
 
-    /// Index of the last entry (0 if empty).
+    /// Index of the last entry (the snapshot index if the log is empty).
     pub fn last_index(&self) -> u64 {
-        self.entries.last().map(|e| e.index).unwrap_or(0)
+        self.entries
+            .last()
+            .map(|e| e.index)
+            .unwrap_or(self.snapshot_index)
     }
 
-    /// Term of the last entry (0 if empty).
+    /// Term of the last entry (the snapshot term if the log is empty).
     pub fn last_term(&self) -> u64 {
-        self.entries.last().map(|e| e.term).unwrap_or(0)
+        self.entries
+            .last()
+            .map(|e| e.term)
+            .unwrap_or(self.snapshot_term)
     }
 
     pub fn commit_index(&self) -> u64 {
@@ -164,8 +204,11 @@ impl RaftLog {
     /// The term of the entry at `index`, if present (0 for index 0 = the empty
     /// sentinel before the first entry).
     pub fn term_at(&self, index: u64) -> Option<u64> {
-        if index == 0 {
-            return Some(0);
+        if index == self.snapshot_index {
+            return Some(self.snapshot_term); // 0/0 for an un-compacted log
+        }
+        if index < self.snapshot_index {
+            return None; // compacted away
         }
         self.entries
             .iter()
@@ -296,6 +339,31 @@ impl RaftLog {
     }
 }
 
+/// Path of the snapshot-metadata sidecar for a log file.
+fn snap_meta_path(path: &std::path::Path) -> PathBuf {
+    path.with_extension("snap")
+}
+
+fn read_snapshot_meta(path: &std::path::Path) -> (u64, u64) {
+    let Ok(s) = std::fs::read_to_string(snap_meta_path(path)) else {
+        return (0, 0);
+    };
+    let mut lines = s.lines();
+    let idx = lines
+        .next()
+        .and_then(|l| l.trim().parse().ok())
+        .unwrap_or(0);
+    let term = lines
+        .next()
+        .and_then(|l| l.trim().parse().ok())
+        .unwrap_or(0);
+    (idx, term)
+}
+
+fn write_snapshot_meta(path: &std::path::Path, index: u64, term: u64) {
+    let _ = std::fs::write(snap_meta_path(path), format!("{index}\n{term}\n"));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -338,6 +406,54 @@ mod tests {
         assert!(log.append_entries(2, 1, &[conflicting.clone()]));
         assert_eq!(log.last_index(), 3);
         assert_eq!(log.term_at(3), Some(3));
+    }
+
+    #[test]
+    fn compaction_discards_applied_entries_and_keeps_boundary() {
+        let mut log = RaftLog::new();
+        for i in 1..=5 {
+            log.leader_append(1, vec![i as u8]);
+        }
+        log.maybe_commit(&mut [5, 5, 5], 1);
+        assert_eq!(log.take_applicable().len(), 5); // applied 1..=5
+                                                    // Compact up to 3: entries 1..=3 discarded, boundary term retained.
+        log.compact(3);
+        assert_eq!(log.snapshot_index(), 3);
+        assert_eq!(log.term_at(3), Some(1)); // boundary still known
+        assert_eq!(log.term_at(2), None); // compacted away
+        assert_eq!(log.term_at(4), Some(1)); // still present
+        assert_eq!(log.last_index(), 5);
+        // entries_after the boundary are intact.
+        assert_eq!(log.entries_after(3).len(), 2);
+        // Never compacts past what is applied.
+        log.leader_append(1, vec![9]); // index 6, not applied
+        log.compact(6);
+        assert_eq!(log.snapshot_index(), 3); // unchanged
+    }
+
+    #[test]
+    fn compaction_survives_reload() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("elyra-raftlog-compact-{}.log", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("snap"));
+        {
+            let mut log = RaftLog::open(path.clone()).unwrap();
+            for i in 1..=5 {
+                log.leader_append(1, vec![i as u8]);
+            }
+            log.sync();
+            log.maybe_commit(&mut [5, 5, 5], 1);
+            log.take_applicable();
+            log.compact(3);
+        }
+        let log = RaftLog::open(path.clone()).unwrap();
+        assert_eq!(log.snapshot_index(), 3);
+        assert_eq!(log.term_at(3), Some(1));
+        assert_eq!(log.last_index(), 5);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("snap"));
+        let _ = std::fs::remove_file(path.with_extension("tmp"));
     }
 
     #[test]

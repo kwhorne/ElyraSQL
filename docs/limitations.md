@@ -210,8 +210,14 @@ implemented, so you can judge fit.
   in-flight writes fail fast and a healthy majority elects a new leader — rather
   than hanging. Because the lease is shorter than the election timeout, a
   lease-valid leader is guaranteed to still be the leader, so its local reads are
-  linearizable without a quorum round-trip. The older `primary`/`replica` mode
-  remains asynchronous (semi-sync/quorum barrier).
+  linearizable without a quorum round-trip. The Raft log is **compacted**: once
+  entries are applied and replicated to every member, each node discards them
+  (keeping only the snapshot boundary term for the consistency check), so the log
+  does not grow unbounded — the applied state machine is the snapshot. Compaction
+  advances only to the slowest member's replicated index, so a permanently
+  lagging/dead member holds it back until the member catches up or is removed
+  from membership. The older `primary`/`replica` mode remains asynchronous
+  (semi-sync/quorum barrier).
 
 ## Wire protocol
 
