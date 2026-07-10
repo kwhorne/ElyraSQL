@@ -342,6 +342,187 @@ pub async fn show_tables(db: &Session) -> Result<QueryResult> {
     Ok(QueryResult::Rows(RowStream::literal(schema, rows)))
 }
 
+/// Build a schema of all-Text columns (for SHOW-style tabular results).
+fn text_schema(names: &[&str]) -> Schema {
+    Schema::new(
+        names
+            .iter()
+            .map(|n| ColumnDef {
+                name: (*n).to_string(),
+                ty: ColumnType::Text,
+                nullable: true,
+                collation: elyra_core::Collation::Ci,
+            })
+            .collect(),
+    )
+}
+
+/// MySQL-compatible system variables reported by `SHOW VARIABLES`. ElyraSQL
+/// presents as MySQL 8.0, so GUI tools and ORMs that read these on connect
+/// behave (character sets, timeouts, case sensitivity, packet size, ...).
+fn system_variables() -> Vec<(&'static str, String)> {
+    vec![
+        ("auto_increment_increment", "1".into()),
+        ("autocommit", "ON".into()),
+        ("character_set_client", "utf8mb4".into()),
+        ("character_set_connection", "utf8mb4".into()),
+        ("character_set_database", "utf8mb4".into()),
+        ("character_set_results", "utf8mb4".into()),
+        ("character_set_server", "utf8mb4".into()),
+        ("character_set_system", "utf8mb3".into()),
+        ("collation_connection", "utf8mb4_general_ci".into()),
+        ("collation_database", "utf8mb4_general_ci".into()),
+        ("collation_server", "utf8mb4_general_ci".into()),
+        ("default_storage_engine", "InnoDB".into()),
+        ("event_scheduler", "OFF".into()),
+        ("foreign_key_checks", "ON".into()),
+        ("have_query_cache", "NO".into()),
+        ("hostname", "elyrasql".into()),
+        ("init_connect", String::new()),
+        ("interactive_timeout", "28800".into()),
+        ("license", "MIT".into()),
+        ("lower_case_file_system", "OFF".into()),
+        ("lower_case_table_names", "0".into()),
+        ("max_allowed_packet", "67108864".into()),
+        ("max_connections", "151".into()),
+        ("net_buffer_length", "16384".into()),
+        ("net_read_timeout", "30".into()),
+        ("net_write_timeout", "60".into()),
+        ("performance_schema", "OFF".into()),
+        ("protocol_version", "10".into()),
+        (
+            "sql_mode",
+            "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,\
+             ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION"
+                .into(),
+        ),
+        ("system_time_zone", "UTC".into()),
+        ("time_zone", "SYSTEM".into()),
+        ("transaction_isolation", "REPEATABLE-READ".into()),
+        ("tx_isolation", "REPEATABLE-READ".into()),
+        ("version", elyra_core::SERVER_VERSION.into()),
+        ("version_comment", "ElyraSQL \u{2014} MIT licensed".into()),
+        ("version_compile_machine", std::env::consts::ARCH.into()),
+        ("version_compile_os", "Linux".into()),
+        ("wait_timeout", "28800".into()),
+    ]
+}
+
+/// Case-insensitive SQL LIKE (`%` = any run, `_` = one char) for SHOW filters.
+fn show_like(name: &str, pattern: &str) -> bool {
+    let n: Vec<char> = name.to_ascii_lowercase().chars().collect();
+    let p: Vec<char> = pattern.to_ascii_lowercase().chars().collect();
+    fn m(n: &[char], p: &[char]) -> bool {
+        if p.is_empty() {
+            return n.is_empty();
+        }
+        match p[0] {
+            '%' => m(n, &p[1..]) || (!n.is_empty() && m(&n[1..], p)),
+            '_' => !n.is_empty() && m(&n[1..], &p[1..]),
+            c => !n.is_empty() && n[0] == c && m(&n[1..], &p[1..]),
+        }
+    }
+    m(&n, &p)
+}
+
+/// The LIKE/NoKeyword pattern of a SHOW filter, if any (WHERE returns all).
+fn show_filter_pattern(filter: Option<&sqlparser::ast::ShowStatementFilter>) -> Option<String> {
+    use sqlparser::ast::ShowStatementFilter::*;
+    match filter {
+        Some(Like(p)) | Some(ILike(p)) | Some(NoKeyword(p)) => Some(p.clone()),
+        _ => None,
+    }
+}
+
+/// `SHOW [GLOBAL|SESSION] VARIABLES [LIKE ...]`.
+pub fn show_variables(filter: Option<&sqlparser::ast::ShowStatementFilter>) -> Result<QueryResult> {
+    let pat = show_filter_pattern(filter);
+    let rows: Vec<Vec<Value>> = system_variables()
+        .into_iter()
+        .filter(|(name, _)| pat.as_deref().is_none_or(|p| show_like(name, p)))
+        .map(|(name, val)| vec![Value::Text(name.to_string()), Value::Text(val)])
+        .collect();
+    Ok(QueryResult::Rows(RowStream::literal(
+        text_schema(&["Variable_name", "Value"]),
+        rows,
+    )))
+}
+
+/// `SHOW [GLOBAL|SESSION] STATUS [LIKE ...]` — minimal counters.
+pub fn show_status(filter: Option<&sqlparser::ast::ShowStatementFilter>) -> Result<QueryResult> {
+    let pat = show_filter_pattern(filter);
+    let rows: Vec<Vec<Value>> = [
+        ("Uptime", "0"),
+        ("Threads_connected", "1"),
+        ("Threads_running", "1"),
+        ("Queries", "0"),
+    ]
+    .into_iter()
+    .filter(|(name, _)| pat.as_deref().is_none_or(|p| show_like(name, p)))
+    .map(|(name, val)| vec![Value::Text(name.to_string()), Value::Text(val.to_string())])
+    .collect();
+    Ok(QueryResult::Rows(RowStream::literal(
+        text_schema(&["Variable_name", "Value"]),
+        rows,
+    )))
+}
+
+/// `SHOW COLLATION [LIKE ...]` — the collations ElyraSQL supports.
+pub fn show_collation(filter: Option<&sqlparser::ast::ShowStatementFilter>) -> Result<QueryResult> {
+    let pat = show_filter_pattern(filter);
+    let rows: Vec<Vec<Value>> = [
+        ("utf8mb4_0900_ai_ci", "utf8mb4", "255", "Yes"),
+        ("utf8mb4_general_ci", "utf8mb4", "45", ""),
+        ("utf8mb4_bin", "utf8mb4", "46", ""),
+    ]
+    .into_iter()
+    .filter(|(name, ..)| pat.as_deref().is_none_or(|p| show_like(name, p)))
+    .map(|(coll, cs, id, def)| {
+        vec![
+            Value::Text(coll.to_string()),
+            Value::Text(cs.to_string()),
+            Value::Text(id.to_string()),
+            Value::Text(def.to_string()),
+            Value::Text("Yes".to_string()),
+            Value::Text("1".to_string()),
+            Value::Text("PAD SPACE".to_string()),
+        ]
+    })
+    .collect();
+    Ok(QueryResult::Rows(RowStream::literal(
+        text_schema(&[
+            "Collation",
+            "Charset",
+            "Id",
+            "Default",
+            "Compiled",
+            "Sortlen",
+            "Pad_attribute",
+        ]),
+        rows,
+    )))
+}
+
+/// `SHOW DATABASES` / `SHOW SCHEMAS`.
+pub fn show_databases() -> Result<QueryResult> {
+    let rows = vec![
+        vec![Value::Text("information_schema".into())],
+        vec![Value::Text("elyrasql".into())],
+    ];
+    Ok(QueryResult::Rows(RowStream::literal(
+        text_schema(&["Database"]),
+        rows,
+    )))
+}
+
+/// `SHOW WARNINGS` / `SHOW ERRORS` — always empty (errors surface inline).
+pub fn show_warnings() -> Result<QueryResult> {
+    Ok(QueryResult::Rows(RowStream::literal(
+        text_schema(&["Level", "Code", "Message"]),
+        Vec::new(),
+    )))
+}
+
 /// SHOW COLUMNS / DESCRIBE: column metadata (Field/Type/Null/Key/Default/Extra).
 pub async fn show_columns(db: &Session, table: &str) -> Result<QueryResult> {
     let def = catalog::load(db, table).await?;

@@ -1269,6 +1269,24 @@ impl Engine {
                 exec::show_columns(sess, &name).await
             }
             Statement::SetVariable { .. } | Statement::Use { .. } => Ok(QueryResult::empty_ok()),
+            // Session/introspection queries GUI tools and ORMs fire on connect.
+            Statement::ShowVariables { filter, .. } => exec::show_variables(filter.as_ref()),
+            Statement::ShowStatus { filter, .. } => exec::show_status(filter.as_ref()),
+            Statement::ShowCollation { filter } => exec::show_collation(filter.as_ref()),
+            Statement::ShowDatabases { .. } => exec::show_databases(),
+            Statement::ShowVariable { variable } => {
+                let kw = variable
+                    .iter()
+                    .map(|i| i.value.to_ascii_lowercase())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                match kw.as_str() {
+                    "warnings" | "errors" => exec::show_warnings(),
+                    _ => Err(Error::Unsupported(format!(
+                        "statement not yet implemented: SHOW {kw}"
+                    ))),
+                }
+            }
             other => Err(Error::Unsupported(format!(
                 "statement not yet implemented: {other}"
             ))),
@@ -1612,6 +1630,11 @@ fn required_privilege(stmt: &Statement) -> Privilege {
         | Statement::ShowTables { .. }
         | Statement::ShowColumns { .. }
         | Statement::ShowCreate { .. }
+        | Statement::ShowVariables { .. }
+        | Statement::ShowStatus { .. }
+        | Statement::ShowCollation { .. }
+        | Statement::ShowDatabases { .. }
+        | Statement::ShowVariable { .. }
         | Statement::ExplainTable { .. } => Privilege::Read,
         _ => Privilege::Admin, // CREATE / DROP / CREATE INDEX and anything else
     }
