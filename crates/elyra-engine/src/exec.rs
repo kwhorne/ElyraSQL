@@ -523,6 +523,60 @@ pub fn show_warnings() -> Result<QueryResult> {
     )))
 }
 
+/// `SHOW TABLE STATUS [FROM db] [LIKE ...]` — one metadata row per table.
+/// Any FROM/LIKE clause is ignored (all tables are returned; tools tolerate it).
+pub async fn show_table_status(db: &Session) -> Result<QueryResult> {
+    let schema = text_schema(&[
+        "Name",
+        "Engine",
+        "Version",
+        "Row_format",
+        "Rows",
+        "Avg_row_length",
+        "Data_length",
+        "Max_data_length",
+        "Index_length",
+        "Data_free",
+        "Auto_increment",
+        "Create_time",
+        "Update_time",
+        "Check_time",
+        "Collation",
+        "Checksum",
+        "Create_options",
+        "Comment",
+    ]);
+    let names = catalog::list_tables(db).await?;
+    let mut rows = Vec::with_capacity(names.len());
+    for n in names {
+        let nrows = match catalog::load_stats(db, &n).await? {
+            Some(s) => s.rows.to_string(),
+            None => "0".to_string(),
+        };
+        rows.push(vec![
+            Value::Text(n),                           // Name
+            Value::Text("InnoDB".into()),             // Engine
+            Value::Text("10".into()),                 // Version
+            Value::Text("Dynamic".into()),            // Row_format
+            Value::Text(nrows),                       // Rows
+            Value::Text("0".into()),                  // Avg_row_length
+            Value::Text("0".into()),                  // Data_length
+            Value::Text("0".into()),                  // Max_data_length
+            Value::Text("0".into()),                  // Index_length
+            Value::Text("0".into()),                  // Data_free
+            Value::Null,                              // Auto_increment
+            Value::Null,                              // Create_time
+            Value::Null,                              // Update_time
+            Value::Null,                              // Check_time
+            Value::Text("utf8mb4_general_ci".into()), // Collation
+            Value::Null,                              // Checksum
+            Value::Text(String::new()),               // Create_options
+            Value::Text(String::new()),               // Comment
+        ]);
+    }
+    Ok(QueryResult::Rows(RowStream::literal(schema, rows)))
+}
+
 /// SHOW COLUMNS / DESCRIBE: column metadata (Field/Type/Null/Key/Default/Extra).
 pub async fn show_columns(db: &Session, table: &str) -> Result<QueryResult> {
     let def = catalog::load(db, table).await?;

@@ -1282,6 +1282,7 @@ impl Engine {
                     .join(" ");
                 match kw.as_str() {
                     "warnings" | "errors" => exec::show_warnings(),
+                    _ if kw.starts_with("table status") => exec::show_table_status(sess).await,
                     _ => Err(Error::Unsupported(format!(
                         "statement not yet implemented: SHOW {kw}"
                     ))),
