@@ -149,7 +149,7 @@ impl Value {
             }
             Value::Float(f) => {
                 out.push(3);
-                out.extend_from_slice(&f.to_bits().to_le_bytes());
+                out.extend_from_slice(&canonical_f64_bits(*f).to_le_bytes());
             }
             Value::Text(s) | Value::Json(s) => {
                 out.push(4);
@@ -181,9 +181,37 @@ impl Value {
             (true, true) => Ordering::Equal,
             (true, false) => Ordering::Less,
             (false, true) => Ordering::Greater,
-            _ => self
-                .compare(other)
-                .unwrap_or_else(|| format!("{self:?}").cmp(&format!("{other:?}"))),
+            _ => self.compare(other).unwrap_or_else(|| {
+                // Incomparable under `compare` (e.g. NaN, or two unrelated
+                // types). Use a deterministic, allocation-free total order
+                // rather than comparing Debug strings (which allocated on every
+                // comparison and sorted numbers lexicographically, e.g. 10 < 2).
+                match (self.as_f64(), other.as_f64()) {
+                    // Both numeric (covers NaN via IEEE total order).
+                    (Some(a), Some(b)) => a.total_cmp(&b),
+                    // Otherwise order by a stable per-variant rank.
+                    _ => self.type_rank().cmp(&other.type_rank()),
+                }
+            }),
+        }
+    }
+
+    /// Stable ordering rank per value variant, used only as the final tiebreak
+    /// in `total_cmp` for otherwise-incomparable values.
+    fn type_rank(&self) -> u8 {
+        match self {
+            Value::Null => 0,
+            Value::Bool(_) => 1,
+            Value::Int(_) => 2,
+            Value::Decimal(..) => 3,
+            Value::Float(_) => 4,
+            Value::Date(_) => 5,
+            Value::Time(_) => 6,
+            Value::DateTime(_) => 7,
+            Value::Text(_) => 8,
+            Value::Json(_) => 9,
+            Value::Bytes(_) => 10,
+            Value::Vector(_) => 11,
         }
     }
 
@@ -210,6 +238,20 @@ impl Value {
             Value::Time(t) => Some(crate::datetime::format_time(*t)),
             Value::Json(s) => Some(s.clone()),
         }
+    }
+}
+
+/// Canonical bit pattern of an `f64` for hashing/grouping keys. Collapses
+/// `-0.0` and `+0.0` (which have different sign bits but compare equal in SQL)
+/// to the same key, and maps every NaN to one canonical NaN so that grouping,
+/// DISTINCT, and hash joins treat equal floats as equal.
+pub fn canonical_f64_bits(f: f64) -> u64 {
+    if f == 0.0 {
+        0 // both +0.0 and -0.0
+    } else if f.is_nan() {
+        f64::NAN.to_bits() // canonical quiet NaN
+    } else {
+        f.to_bits()
     }
 }
 
@@ -250,12 +292,18 @@ fn cmp_decimal(au: i128, asc: u8, bu: i128, bsc: u8) -> Ordering {
     a.cmp(&b)
 }
 
+/// Maximum JSON nesting depth accepted by the validator. Bounds recursion so
+/// pathologically nested input (`[[[[...]]]]`) is rejected instead of
+/// overflowing the thread stack. Comfortably above MySQL's documented depth
+/// limit (100).
+const MAX_JSON_DEPTH: u32 = 200;
+
 /// Minimal JSON validator (structure only, no dependency).
 pub fn is_valid_json(s: &str) -> bool {
     let bytes = s.as_bytes();
     let mut pos = 0;
     skip_ws(bytes, &mut pos);
-    if !parse_json_value(bytes, &mut pos) {
+    if !parse_json_value(bytes, &mut pos, 0) {
         return false;
     }
     skip_ws(bytes, &mut pos);
@@ -268,14 +316,14 @@ fn skip_ws(b: &[u8], p: &mut usize) {
     }
 }
 
-fn parse_json_value(b: &[u8], p: &mut usize) -> bool {
+fn parse_json_value(b: &[u8], p: &mut usize, depth: u32) -> bool {
     skip_ws(b, p);
     if *p >= b.len() {
         return false;
     }
     match b[*p] {
-        b'{' => parse_json_object(b, p),
-        b'[' => parse_json_array(b, p),
+        b'{' => parse_json_object(b, p, depth),
+        b'[' => parse_json_array(b, p, depth),
         b'"' => parse_json_string(b, p),
         b't' => consume(b, p, "true"),
         b'f' => consume(b, p, "false"),
@@ -323,7 +371,10 @@ fn s_from(b: &[u8], a: usize, z: usize) -> std::borrow::Cow<'_, str> {
     String::from_utf8_lossy(&b[a..z])
 }
 
-fn parse_json_array(b: &[u8], p: &mut usize) -> bool {
+fn parse_json_array(b: &[u8], p: &mut usize, depth: u32) -> bool {
+    if depth >= MAX_JSON_DEPTH {
+        return false;
+    }
     *p += 1; // [
     skip_ws(b, p);
     if b.get(*p) == Some(&b']') {
@@ -331,7 +382,7 @@ fn parse_json_array(b: &[u8], p: &mut usize) -> bool {
         return true;
     }
     loop {
-        if !parse_json_value(b, p) {
+        if !parse_json_value(b, p, depth + 1) {
             return false;
         }
         skip_ws(b, p);
@@ -348,7 +399,10 @@ fn parse_json_array(b: &[u8], p: &mut usize) -> bool {
     }
 }
 
-fn parse_json_object(b: &[u8], p: &mut usize) -> bool {
+fn parse_json_object(b: &[u8], p: &mut usize, depth: u32) -> bool {
+    if depth >= MAX_JSON_DEPTH {
+        return false;
+    }
     *p += 1; // {
     skip_ws(b, p);
     if b.get(*p) == Some(&b'}') {
@@ -365,7 +419,7 @@ fn parse_json_object(b: &[u8], p: &mut usize) -> bool {
             return false;
         }
         *p += 1;
-        if !parse_json_value(b, p) {
+        if !parse_json_value(b, p, depth + 1) {
             return false;
         }
         skip_ws(b, p);
@@ -458,5 +512,57 @@ mod collation_tests {
             Value::Text("5".into()).collation_key(),
             Value::Int(5).collation_key()
         );
+    }
+
+    #[test]
+    fn signed_zero_floats_group_together() {
+        // -0.0 and +0.0 are equal in SQL and must produce the same group key.
+        assert_eq!(
+            Value::Float(-0.0).collation_key(),
+            Value::Float(0.0).collation_key()
+        );
+        assert_eq!(canonical_f64_bits(-0.0), canonical_f64_bits(0.0));
+        // Distinct NaNs collapse to one key.
+        let nan1 = f64::from_bits(0x7ff8_0000_0000_0001);
+        let nan2 = f64::from_bits(0x7ff8_0000_0000_0002);
+        assert!(nan1.is_nan() && nan2.is_nan());
+        assert_eq!(
+            Value::Float(nan1).collation_key(),
+            Value::Float(nan2).collation_key()
+        );
+    }
+
+    #[test]
+    fn total_cmp_orders_numbers_numerically_not_lexically() {
+        // The old Debug-string fallback sorted 10.0 before 2.0. Ensure numeric
+        // order holds even for NaN (which makes `compare` return None).
+        let nan = f64::NAN;
+        let mut v = [
+            Value::Float(10.0),
+            Value::Float(2.0),
+            Value::Float(nan),
+            Value::Float(1.5),
+        ];
+        v.sort_by(|a, b| a.total_cmp(b));
+        let nums: Vec<f64> = v
+            .iter()
+            .map(|x| if let Value::Float(f) = x { *f } else { 0.0 })
+            .collect();
+        assert_eq!(&nums[..3], &[1.5, 2.0, 10.0]);
+        assert!(nums[3].is_nan()); // NaN sorts last, deterministically
+    }
+
+    #[test]
+    fn deeply_nested_json_is_rejected_not_crashing() {
+        // 10k levels would overflow a recursive parser without the depth guard.
+        let deep = format!("{}{}", "[".repeat(10_000), "]".repeat(10_000));
+        assert!(!is_valid_json(&deep));
+        // Reasonable nesting still validates.
+        assert!(is_valid_json(&format!(
+            "{}1{}",
+            "[".repeat(50),
+            "]".repeat(50)
+        )));
+        assert!(is_valid_json(r#"{"a":[1,2,{"b":true}],"c":null}"#));
     }
 }

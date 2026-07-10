@@ -13,7 +13,7 @@ pub mod value;
 
 pub use error::{Error, Result};
 pub use types::{Collation, ColumnDef, ColumnType, Schema};
-pub use value::{fold, Value};
+pub use value::{canonical_f64_bits, fold, Value};
 
 use serde::{Deserialize, Serialize};
 

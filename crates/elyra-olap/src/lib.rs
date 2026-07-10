@@ -213,7 +213,7 @@ fn group_key(cols: &[usize], row: &[Value]) -> Vec<u8> {
             }
             Some(Value::Float(f)) => {
                 out.push(3);
-                out.extend_from_slice(&f.to_bits().to_le_bytes());
+                out.extend_from_slice(&elyra_core::canonical_f64_bits(*f).to_le_bytes());
             }
             Some(Value::Text(s)) | Some(Value::Json(s)) => {
                 // Case-fold so GROUP BY matches the default collation.
