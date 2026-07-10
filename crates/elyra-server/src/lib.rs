@@ -185,6 +185,24 @@ fn elyra_kind(e: &elyra_core::Error) -> ErrorKind {
     ErrorKind::from(e.mysql_code())
 }
 
+/// Whether to describe prepared-statement result columns at PREPARE time
+/// (`ELYRASQL_STMT_DESCRIBE=on|1|true`). Off by default: it lets lenient drivers
+/// (sqlx) resolve result columns by name, but strict libmysqlclient-based
+/// clients mishandle a prepare response that carries result columns.
+fn stmt_describe_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("ELYRASQL_STMT_DESCRIBE")
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .as_str(),
+            "on" | "1" | "true" | "yes"
+        )
+    })
+}
+
 fn column_type(ty: &elyra_core::ColumnType) -> ColumnType {
     match ty {
         elyra_core::ColumnType::Bool => ColumnType::MYSQL_TYPE_TINY,
@@ -268,7 +286,28 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for ElyraShim {
                 colflags: ColumnFlags::empty(),
             })
             .collect();
-        let columns: Vec<Column> = Vec::new();
+        // Optionally describe result columns statically (no execution) so drivers
+        // can build a by-name column map from the prepare response. Off by
+        // default: it enables by-name resolution for lenient drivers (e.g. sqlx),
+        // but strict libmysqlclient-based clients (mysql-connector) mishandle a
+        // prepare response that carries result columns. See ELYRASQL_STMT_DESCRIBE.
+        let columns: Vec<Column> = if stmt_describe_enabled() {
+            match self.engine.describe_query(query, &self.session).await {
+                Some(schema) => schema
+                    .columns
+                    .iter()
+                    .map(|c| Column {
+                        table: String::new(),
+                        column: c.name.clone(),
+                        coltype: column_type(&c.ty),
+                        colflags: ColumnFlags::empty(),
+                    })
+                    .collect(),
+                None => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
         info.reply(id, &params, &columns).await
     }
 

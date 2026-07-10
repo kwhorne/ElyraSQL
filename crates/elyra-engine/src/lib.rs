@@ -598,6 +598,75 @@ impl Engine {
 
     /// Execute with the connection's user name, so per-table (scoped) grants can
     /// raise the effective privilege for the statement's target tables.
+    /// Statically resolve the result columns of a simple `SELECT` for
+    /// `COM_STMT_PREPARE` (no execution): `SELECT <cols|*> FROM <one base table>
+    /// [WHERE ...]`. Returns `None` for anything else (execute-time still
+    /// describes it). Placeholders are fine — only projection + FROM are read.
+    pub async fn describe_query(&self, sql: &str, sess: &Session) -> Option<Schema> {
+        use sqlparser::ast::{SelectItem, SetExpr, TableFactor};
+        let stmts = Parser::parse_sql(&MySqlDialect {}, sql).ok()?;
+        if stmts.len() != 1 {
+            return None;
+        }
+        let Statement::Query(q) = &stmts[0] else {
+            return None;
+        };
+        let SetExpr::Select(sel) = q.body.as_ref() else {
+            return None;
+        };
+        if sel.from.len() != 1 || !sel.from[0].joins.is_empty() {
+            return None;
+        }
+        let TableFactor::Table { name, .. } = &sel.from[0].relation else {
+            return None;
+        };
+        if name.0.len() != 1 {
+            return None;
+        }
+        let def = catalog::load(sess, &name.0[0].value).await.ok()?;
+        let col_by_name = |n: &str| {
+            def.schema
+                .columns
+                .iter()
+                .find(|c| c.name.eq_ignore_ascii_case(n))
+                .cloned()
+        };
+        let mut out = Vec::new();
+        for item in &sel.projection {
+            match item {
+                SelectItem::Wildcard(_) => out.extend(def.schema.columns.iter().cloned()),
+                SelectItem::UnnamedExpr(e) => {
+                    let name = match e {
+                        sqlparser::ast::Expr::Identifier(i) => i.value.clone(),
+                        sqlparser::ast::Expr::CompoundIdentifier(parts) => {
+                            parts.last()?.value.clone()
+                        }
+                        _ => return None,
+                    };
+                    out.push(col_by_name(&name)?);
+                }
+                SelectItem::ExprWithAlias { expr, alias } => {
+                    let ty = match expr {
+                        sqlparser::ast::Expr::Identifier(i) => col_by_name(&i.value).map(|c| c.ty),
+                        sqlparser::ast::Expr::CompoundIdentifier(parts) => {
+                            col_by_name(&parts.last()?.value).map(|c| c.ty)
+                        }
+                        _ => None,
+                    }
+                    .unwrap_or(ColumnType::Text);
+                    out.push(elyra_core::ColumnDef {
+                        name: alias.value.clone(),
+                        ty,
+                        nullable: true,
+                        collation: elyra_core::Collation::Ci,
+                    });
+                }
+                _ => return None,
+            }
+        }
+        Some(Schema::new(out))
+    }
+
     pub async fn execute_as(
         &self,
         sql: &str,

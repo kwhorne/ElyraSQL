@@ -38,6 +38,7 @@ variable fallback (handy for systemd and containers).
 | `ELYRASQL_CLUSTER_SECRET` | — | Shared secret authenticating cluster/replication connections (challenge-response). Strongly recommended for any multi-node deployment. |
 | `ELYRASQL_FULLTEXT_LANGUAGE` | `english` | Snowball stemming language for `MATCH … AGAINST` and `FULLTEXT` indexes (`english`, `norwegian`, `german`, …, or `none` to disable stemming). Changing it invalidates existing full-text indexes (rebuild them). |
 | `ELYRASQL_AUDIT_LOG` | — | Path to an append-only audit log (tab-separated: timestamp, connection, user, OK/ERR, SQL). |
+| `ELYRASQL_STMT_DESCRIBE` | `off` | Describe prepared-statement result columns at `PREPARE` time (for `SELECT <cols> FROM <one table>`). Lets lenient drivers (e.g. **sqlx**) resolve result columns **by name**; strict `libmysqlclient`-based clients (mysql-connector) may mishandle a prepare response carrying result columns, so it is off by default. |
 
 `RUST_LOG` controls log verbosity (`error`, `warn`, `info`, `debug`, `trace`;
 default `info`).
