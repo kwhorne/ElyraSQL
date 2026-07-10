@@ -572,6 +572,28 @@ pub fn show_databases() -> Result<QueryResult> {
     )))
 }
 
+/// `SHOW [FULL] PROCESSLIST` — a single representative row (the engine does not
+/// track a live connection table); handled in-engine so it works over both the
+/// text and prepared-statement paths.
+pub fn show_processlist() -> Result<QueryResult> {
+    let row = vec![
+        Value::Text("1".into()),
+        Value::Text("root".into()),
+        Value::Text("localhost".into()),
+        Value::Text("elyra".into()),
+        Value::Text("Query".into()),
+        Value::Text("0".into()),
+        Value::Text(String::new()),
+        Value::Null,
+    ];
+    Ok(QueryResult::Rows(RowStream::literal(
+        text_schema(&[
+            "Id", "User", "Host", "db", "Command", "Time", "State", "Info",
+        ]),
+        vec![row],
+    )))
+}
+
 /// `SHOW WARNINGS` / `SHOW ERRORS` — always empty (errors surface inline).
 pub fn show_warnings() -> Result<QueryResult> {
     Ok(QueryResult::Rows(RowStream::literal(
@@ -1000,11 +1022,16 @@ async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec
                 text("TABLE_NAME"),
                 text("COLUMN_NAME"),
                 int("ORDINAL_POSITION"),
+                int("POSITION_IN_UNIQUE_CONSTRAINT"),
+                text("REFERENCED_TABLE_SCHEMA"),
+                text("REFERENCED_TABLE_NAME"),
+                text("REFERENCED_COLUMN_NAME"),
             ]);
             let mut rows = Vec::new();
             for tname in names {
                 let def = catalog::load(db, &tname).await?;
-                let mut push = |cname: &str, seq: usize, ci: usize| {
+                // PRIMARY KEY and UNIQUE constraints: no referenced table.
+                let mut push_key = |cname: &str, seq: usize, ci: usize| {
                     rows.push(vec![
                         Value::Text("elyra".into()),
                         Value::Text(cname.to_string()),
@@ -1012,14 +1039,37 @@ async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec
                         Value::Text(tname.clone()),
                         Value::Text(def.schema.columns[ci].name.clone()),
                         Value::Int(seq as i64 + 1),
+                        Value::Null,
+                        Value::Null,
+                        Value::Null,
+                        Value::Null,
                     ]);
                 };
                 for (seq, &ci) in def.pk_cols.iter().enumerate() {
-                    push("PRIMARY", seq, ci);
+                    push_key("PRIMARY", seq, ci);
                 }
                 for idx in def.indexes.iter().filter(|i| i.unique) {
                     for (seq, &ci) in idx.cols.iter().enumerate() {
-                        push(&idx.name, seq, ci);
+                        push_key(&idx.name, seq, ci);
+                    }
+                }
+                // FOREIGN KEY constraints: fill the REFERENCED_* columns so tools
+                // can discover relationships.
+                for fk in &def.foreign_keys {
+                    for (seq, (&ci, rc)) in fk.columns.iter().zip(fk.ref_columns.iter()).enumerate()
+                    {
+                        rows.push(vec![
+                            Value::Text("elyra".into()),
+                            Value::Text(fk.name.clone()),
+                            Value::Text("elyra".into()),
+                            Value::Text(tname.clone()),
+                            Value::Text(def.schema.columns[ci].name.clone()),
+                            Value::Int(seq as i64 + 1),
+                            Value::Int(seq as i64 + 1),
+                            Value::Text("elyra".into()),
+                            Value::Text(fk.ref_table.clone()),
+                            Value::Text(rc.clone()),
+                        ]);
                     }
                 }
             }
@@ -1130,7 +1180,25 @@ async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec
             ];
             let schema = Schema::new(cols.iter().map(|n| text(n)).collect());
             let prefix = elyra_core::users::USER_PREFIX.to_vec();
-            let mut rows = Vec::new();
+            // Always include the built-in admin account (configured via
+            // --user/--password, not stored in the catalog) so the user list is
+            // never empty.
+            let y = Value::Text("Y".into());
+            let mut rows = vec![vec![
+                Value::Text("%".into()),
+                Value::Text("root".into()),
+                y.clone(),
+                y.clone(),
+                y.clone(),
+                y.clone(),
+                y.clone(),
+                y.clone(),
+                y.clone(),
+                Value::Text("mysql_native_password".into()),
+                Value::Text(String::new()),
+                Value::Text("N".into()),
+                Value::Text("N".into()),
+            ]];
             let mut after: Option<Vec<u8>> = None;
             loop {
                 let batch = db.scan_batch(prefix.clone(), after.clone(), 512).await?;

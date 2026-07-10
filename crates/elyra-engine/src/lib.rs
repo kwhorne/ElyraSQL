@@ -659,6 +659,12 @@ impl Engine {
             return Ok(vec![exec::show_routine_status()?]);
         }
 
+        // SHOW [FULL] PROCESSLIST — handled in-engine so it works over the
+        // prepared-statement path too (SHOW FULL PROCESSLIST also fails to parse).
+        if head.starts_with("show processlist") || head.starts_with("show full processlist") {
+            return Ok(vec![exec::show_processlist()?]);
+        }
+
         // BACKUP [DATABASE] TO '<path>' — hot, consistent copy of the whole
         // database to a new file. Not standard SQL, so handled here.
         if head.starts_with("backup") {
