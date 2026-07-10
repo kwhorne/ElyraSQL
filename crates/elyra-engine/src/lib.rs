@@ -1275,6 +1275,17 @@ impl Engine {
                 exec::show_columns(sess, &name).await
             }
             Statement::SetVariable { .. } | Statement::Use { .. } => Ok(QueryResult::empty_ok()),
+            // ElyraSQL is a single logical schema (one file); CREATE/DROP
+            // DATABASE|SCHEMA are accepted as no-ops so tools and migrations that
+            // issue them proceed.
+            Statement::CreateDatabase { .. } | Statement::CreateSchema { .. } => {
+                Ok(QueryResult::empty_ok())
+            }
+            Statement::Drop {
+                object_type:
+                    sqlparser::ast::ObjectType::Database | sqlparser::ast::ObjectType::Schema,
+                ..
+            } => Ok(QueryResult::empty_ok()),
             // Session/introspection queries GUI tools and ORMs fire on connect.
             Statement::ShowVariables { filter, .. } => exec::show_variables(filter.as_ref()),
             Statement::ShowStatus { filter, .. } => exec::show_status(filter.as_ref()),
