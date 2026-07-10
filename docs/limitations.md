@@ -180,16 +180,19 @@ implemented, so you can judge fit.
   new node before adding it. An even-node cluster can, rarely, need an extra
   election round to break a tie — run an odd number of nodes. Election state
   (current term + vote) is persisted to a `<data>.raftstate` file so a restarted
-  node never double-votes in a term (a Raft safety requirement). A unit-tested
-  **Raft log core** (`raftlog`) implements the consensus-critical pieces — the
-  AppendEntries consistency check with conflicting-suffix truncation, the
-  quorum/current-term commit rule, apply-only-when-committed, and the §5.4.1
-  election restriction. **Routing the live cluster write path through this log**
-  (leader append → quorum commit → apply, followers applying to the leader's
-  commit index) for pre-commit (2-phase) durability is the remaining
-  integration step; today durability is async by default, with quorum/strict-
-  sync plus the LSN-aware election restriction giving no-data-loss for
-  acknowledged writes.
+  node never double-votes in a term (a Raft safety requirement). In `cluster`
+  mode the **live write path runs through the Raft replicated log**: the leader
+  appends each write to the log, replicates it via `AppendEntries`, **commits it
+  once a quorum has it**, and only then **applies** it and acknowledges the
+  client (pre-commit / 2-phase). Followers append (with the consistency check +
+  conflicting-suffix truncation) and apply up to the leader's commit index. With
+  the §5.4.1 election restriction this is **no-data-loss failover**: an
+  acknowledged write is on a quorum's durable log and any new leader has it.
+  A write cannot be acknowledged without a quorum. Known limitation: a leader
+  partitioned from its quorum blocks writes until it can replicate (or a client
+  timeout fires) rather than stepping down proactively (no leader lease yet).
+  The older `primary`/`replica` mode remains asynchronous (semi-sync/quorum
+  barrier).
 
 ## Wire protocol
 

@@ -1,32 +1,39 @@
-//! Automatic failover via Raft-style leader election.
+//! Raft consensus for the cluster: leader election **and** replicated-log write
+//! path (this is the full consensus, not just election).
 //!
-//! Each node runs an election state machine (terms, votes, majority, heartbeats,
-//! step-down). The elected leader accepts writes and serves the replication
-//! endpoint; followers are read-only and replicate from the current leader. On
-//! leader failure, a follower whose election timer fires stands for election and,
-//! with a majority of votes, becomes the new leader — no manual intervention.
+//! Each node runs a Raft state machine: terms, votes with the §5.4.1 election
+//! restriction (a vote is granted only to a candidate whose log is at least as
+//! up-to-date), and `AppendEntries` replication. Writes on the leader are
+//! proposed through the replicated log ([`elyra_storage::Consensus`]): the entry
+//! is appended, replicated, **committed once a quorum has it**, and only then
+//! **applied** to the state machine and acknowledged to the client. Followers
+//! append entries (with the consistency check + conflicting-suffix truncation
+//! from [`crate::raftlog`]) and apply up to the leader's commit index.
 //!
-//! This provides leader election and fencing (a node only accepts writes while it
-//! believes it is the leader for the current term). Log replication remains
-//! asynchronous, so a newly elected leader may lack the old leader's last
-//! unreplicated writes (the standard async-failover trade-off).
+//! This gives no-data-loss failover: an acknowledged write is on a quorum's
+//! durable log before the client is told success, and the election restriction
+//! guarantees any new leader already has it.
 
+use std::collections::HashMap;
 use std::io::{Error, ErrorKind};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use elyra_storage::{Consensus, Db, WriteOp};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch, Notify};
 use tracing::{info, warn};
+
+use crate::raftlog::{LogEntry, RaftLog};
 
 /// A peer node in the cluster.
 #[derive(Clone)]
 pub struct Peer {
     pub id: u64,
-    /// Control-plane address (election RPC).
     pub control_addr: String,
 }
 
@@ -34,16 +41,17 @@ pub struct Peer {
 pub struct ClusterConfig {
     pub id: u64,
     pub control_listen: String,
-    /// This node's replication endpoint, advertised to followers.
+    /// Advertised address (informational; the Raft data path uses the control
+    /// plane, so this is just surfaced to clients/tools).
     pub replication_addr: String,
     pub peers: Vec<Peer>,
-    /// File where the persistent election state (term + vote) is stored, so it
-    /// survives restarts (a Raft safety requirement). `None` = in-memory only.
-    pub state_path: Option<std::path::PathBuf>,
+    /// File for the persistent election state (term + vote).
+    pub state_path: Option<PathBuf>,
+    /// File for the persistent Raft log.
+    pub log_path: Option<PathBuf>,
 }
 
-/// Load `(current_term, voted_for)` persisted by a previous run.
-fn load_state(path: &Option<std::path::PathBuf>) -> (u64, Option<u64>) {
+fn load_state(path: &Option<PathBuf>) -> (u64, Option<u64>) {
     let Some(p) = path else { return (0, None) };
     let Ok(s) = std::fs::read_to_string(p) else {
         return (0, None);
@@ -62,8 +70,7 @@ fn load_state(path: &Option<std::path::PathBuf>) -> (u64, Option<u64>) {
     (term, voted_for)
 }
 
-/// Durably persist `(current_term, voted_for)` before responding to any RPC.
-fn persist_state(path: &Option<std::path::PathBuf>, term: u64, voted_for: Option<u64>) {
+fn persist_state(path: &Option<PathBuf>, term: u64, voted_for: Option<u64>) {
     if let Some(p) = path {
         let body = format!(
             "{term}\n{}\n",
@@ -80,36 +87,37 @@ enum Msg {
     RequestVote {
         term: u64,
         candidate: u64,
-        /// Candidate's highest applied LSN — voters reject less up-to-date
-        /// candidates (Raft election restriction) so failover never elects a
-        /// node missing acknowledged writes.
-        last_lsn: u64,
+        last_log_index: u64,
+        last_log_term: u64,
     },
     Vote {
         term: u64,
         granted: bool,
     },
-    Heartbeat {
+    /// Leader → follower: replicate entries (empty = heartbeat) and advance the
+    /// follower's commit index. Also carries membership + leader identity.
+    AppendEntries {
         term: u64,
         leader: u64,
         repl_addr: String,
-        /// Current cluster membership (id, control_addr), propagated by the
-        /// leader so followers converge on dynamic add/remove.
         members: Vec<(u64, String)>,
+        prev_index: u64,
+        prev_term: u64,
+        entries: Vec<LogEntry>,
+        leader_commit: u64,
     },
-    HeartbeatAck {
+    AppendAck {
         term: u64,
+        success: bool,
+        match_index: u64,
     },
-    /// Operator → node: add a peer to this node's membership.
     AddPeer {
         id: u64,
         control_addr: String,
     },
-    /// Operator → node: remove a peer by id.
     RemovePeer {
         id: u64,
     },
-    /// Response to AddPeer/RemovePeer.
     CtlAck {
         ok: bool,
     },
@@ -127,17 +135,13 @@ struct State {
     voted_for: Option<u64>,
     role: Role,
     leader: Option<u64>,
-    /// Deadline after which a follower/candidate starts a new election.
     election_deadline: Instant,
 }
 
-const HEARTBEAT_MS: u64 = 300;
+const HEARTBEAT_MS: u64 = 150;
 const ELECTION_LO_MS: u64 = 1000;
 const ELECTION_HI_MS: u64 = 2000;
 
-/// A randomized election timeout, seeded by the node id, a global call counter,
-/// and the clock, so different nodes reliably pick different timeouts (avoiding
-/// perpetually split votes).
 fn election_timeout(id: u64) -> Duration {
     use std::sync::atomic::AtomicU64;
     static C: AtomicU64 = AtomicU64::new(0);
@@ -159,31 +163,43 @@ fn election_timeout(id: u64) -> Duration {
 pub struct Leader {
     pub id: u64,
     pub is_self: bool,
-    /// The leader's replication address (for followers to replicate from).
     pub repl_addr: String,
 }
 
-/// A source of this node's highest applied LSN (for the election restriction).
-pub type LsnSource = Arc<dyn Fn() -> u64 + Send + Sync>;
+/// Per-follower replication progress (Raft `nextIndex` / `matchIndex`).
+#[derive(Clone, Copy)]
+struct Progress {
+    next: u64,
+    match_: u64,
+}
 
-/// Handle to a running election node.
+/// A running Raft node: election + replicated-log write path.
 pub struct Node {
     cfg: Arc<ClusterConfig>,
-    /// Live membership (mutable for dynamic add/remove).
     peers: Mutex<Vec<Peer>>,
     state: Arc<Mutex<State>>,
-    lsn_source: LsnSource,
+    log: Arc<Mutex<RaftLog>>,
+    db: Db,
+    /// Client proposals awaiting commit+apply, keyed by log index.
+    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<elyra_core::Result<()>>>>>,
+    /// Per-follower progress (leader only).
+    progress: Arc<Mutex<HashMap<u64, Progress>>>,
+    /// Wakes the leader replication loop when there is new work.
+    replicate: Arc<Notify>,
     leader_tx: watch::Sender<Option<Leader>>,
     pub leader_rx: watch::Receiver<Option<Leader>>,
 }
 
 impl Node {
-    pub fn new(cfg: ClusterConfig, lsn_source: LsnSource) -> Arc<Self> {
+    pub fn new(cfg: ClusterConfig, db: Db) -> Arc<Self> {
         let cfg_id = cfg.id;
         let peers = Mutex::new(cfg.peers.clone());
         let (leader_tx, leader_rx) = watch::channel(None);
-        // Resume persistent election state (term + vote) across restarts.
         let (term, voted_for) = load_state(&cfg.state_path);
+        let log = match &cfg.log_path {
+            Some(p) => RaftLog::open(p.clone()).unwrap_or_default(),
+            None => RaftLog::new(),
+        };
         Arc::new(Node {
             cfg: Arc::new(cfg),
             peers,
@@ -194,7 +210,11 @@ impl Node {
                 leader: None,
                 election_deadline: Instant::now() + election_timeout(cfg_id),
             })),
-            lsn_source,
+            log: Arc::new(Mutex::new(log)),
+            db,
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            progress: Arc::new(Mutex::new(HashMap::new())),
+            replicate: Arc::new(Notify::new()),
             leader_tx,
             leader_rx,
         })
@@ -209,11 +229,9 @@ impl Node {
         n / 2 + 1
     }
 
-    /// Adopt a membership list advertised by the leader (peers = members minus
-    /// self). Idempotent.
     fn adopt_members(&self, members: &[(u64, String)]) {
         let mut p = self.peers.lock().unwrap();
-        let new: Vec<Peer> = members
+        *p = members
             .iter()
             .filter(|(id, _)| *id != self.cfg.id)
             .map(|(id, addr)| Peer {
@@ -221,10 +239,8 @@ impl Node {
                 control_addr: addr.clone(),
             })
             .collect();
-        *p = new;
     }
 
-    /// The full membership (this node + peers) as (id, control_addr) pairs.
     fn members(&self) -> Vec<(u64, String)> {
         let mut m = vec![(self.cfg.id, self.cfg.control_listen.clone())];
         for p in self.peers.lock().unwrap().iter() {
@@ -237,10 +253,18 @@ impl Node {
         let _ = self.leader_tx.send(leader);
     }
 
-    /// Start the control listener and the election/heartbeat loops.
+    /// Fail every pending client proposal (called on step-down / leadership loss).
+    fn drain_pending(&self, err: &str) {
+        let mut p = self.pending.lock().unwrap();
+        for (_, tx) in p.drain() {
+            let _ = tx.send(Err(elyra_core::Error::Storage(err.into())));
+        }
+    }
+
+    /// Start the control listener and the election / replication loops.
     pub async fn run(self: Arc<Self>) -> std::io::Result<()> {
         let listener = TcpListener::bind(&self.cfg.control_listen).await?;
-        info!(id = self.cfg.id, addr = %self.cfg.control_listen, "cluster control plane listening");
+        info!(id = self.cfg.id, addr = %self.cfg.control_listen, "raft control plane listening");
         let srv = self.clone();
         tokio::spawn(async move {
             loop {
@@ -251,20 +275,17 @@ impl Node {
                             let _ = n.handle_control(stream).await;
                         });
                     }
-                    Err(e) => {
-                        warn!(error = %e, "control accept failed");
-                    }
+                    Err(e) => warn!(error = %e, "control accept failed"),
                 }
             }
         });
-        self.election_loop().await;
+        self.main_loop().await;
         Ok(())
     }
 
     async fn handle_control(&self, mut stream: TcpStream) -> std::io::Result<()> {
         let msg = recv(&mut stream).await?;
 
-        // Membership control commands don't touch election state.
         match &msg {
             Msg::AddPeer { id, control_addr } => {
                 {
@@ -281,93 +302,156 @@ impl Node {
             }
             Msg::RemovePeer { id } => {
                 self.peers.lock().unwrap().retain(|x| x.id != *id);
-                info!(id = self.cfg.id, removed = *id, "peer removed");
                 return send(&mut stream, &Msg::CtlAck { ok: true }).await;
             }
             _ => {}
         }
 
-        // Compute the reply (and any leader to publish) entirely under the lock,
-        // then release it before doing any IO.
-        let mut adopt: Option<Vec<(u64, String)>> = None;
-        let before;
-        let after;
-        let (reply, publish) = {
-            let mut s = self.state.lock().unwrap();
-            before = (s.term, s.voted_for);
-            let r = match msg {
-                Msg::RequestVote {
-                    term,
-                    candidate,
-                    last_lsn,
-                } => {
-                    if term > s.term {
-                        s.term = term;
-                        s.voted_for = None;
-                        s.role = Role::Follower;
-                    }
-                    // Election restriction: only vote for a candidate at least as
-                    // up-to-date as us, so an elected leader has every
-                    // quorum-acknowledged write (no zero-data-loss violation).
-                    let up_to_date = last_lsn >= (self.lsn_source)();
-                    let granted = term == s.term
-                        && (s.voted_for.is_none() || s.voted_for == Some(candidate))
-                        && up_to_date;
-                    if granted {
-                        s.voted_for = Some(candidate);
-                        s.election_deadline = Instant::now() + election_timeout(self.cfg.id);
-                    }
-                    (
-                        Msg::Vote {
-                            term: s.term,
-                            granted,
-                        },
-                        None,
+        match msg {
+            Msg::RequestVote {
+                term,
+                candidate,
+                last_log_index,
+                last_log_term,
+            } => {
+                let reply = self.on_request_vote(term, candidate, last_log_index, last_log_term);
+                send(&mut stream, &reply).await
+            }
+            Msg::AppendEntries {
+                term,
+                leader,
+                repl_addr,
+                members,
+                prev_index,
+                prev_term,
+                entries,
+                leader_commit,
+            } => {
+                let reply = self
+                    .on_append_entries(
+                        term,
+                        leader,
+                        repl_addr,
+                        members,
+                        prev_index,
+                        prev_term,
+                        entries,
+                        leader_commit,
                     )
-                }
-                Msg::Heartbeat {
-                    term,
-                    leader,
-                    repl_addr,
-                    members,
-                } => {
-                    if term >= s.term {
-                        s.term = term;
-                        s.role = Role::Follower;
-                        s.leader = Some(leader);
-                        s.election_deadline = Instant::now() + election_timeout(self.cfg.id);
-                        adopt = Some(members);
-                        (
-                            Msg::HeartbeatAck { term },
-                            Some(Leader {
-                                id: leader,
-                                is_self: leader == self.cfg.id,
-                                repl_addr,
-                            }),
-                        )
-                    } else {
-                        (Msg::HeartbeatAck { term: s.term }, None)
-                    }
-                }
-                _ => (Msg::HeartbeatAck { term: s.term }, None),
-            };
-            after = (s.term, s.voted_for);
-            r
-        };
-        // Persist term/vote before responding whenever they changed (Raft safety).
-        if after != before {
-            persist_state(&self.cfg.state_path, after.0, after.1);
+                    .await;
+                send(&mut stream, &reply).await
+            }
+            _ => send(&mut stream, &Msg::CtlAck { ok: false }).await,
         }
-        if let Some(m) = adopt {
-            self.adopt_members(&m);
-        }
-        if let Some(l) = publish {
-            self.publish(Some(l));
-        }
-        send(&mut stream, &reply).await
     }
 
-    async fn election_loop(&self) {
+    fn on_request_vote(
+        &self,
+        term: u64,
+        candidate: u64,
+        last_log_index: u64,
+        last_log_term: u64,
+    ) -> Msg {
+        let mut s = self.state.lock().unwrap();
+        let mut changed = false;
+        if term > s.term {
+            s.term = term;
+            s.voted_for = None;
+            if s.role != Role::Follower {
+                s.role = Role::Follower;
+            }
+            changed = true;
+        }
+        // Election restriction: only vote for an at-least-as-up-to-date log.
+        let up_to_date = self
+            .log
+            .lock()
+            .unwrap()
+            .is_up_to_date(last_log_term, last_log_index);
+        let granted = term == s.term
+            && (s.voted_for.is_none() || s.voted_for == Some(candidate))
+            && up_to_date;
+        if granted {
+            s.voted_for = Some(candidate);
+            s.election_deadline = Instant::now() + election_timeout(self.cfg.id);
+            changed = true;
+        }
+        let reply_term = s.term;
+        if changed {
+            persist_state(&self.cfg.state_path, s.term, s.voted_for);
+        }
+        Msg::Vote {
+            term: reply_term,
+            granted,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn on_append_entries(
+        &self,
+        term: u64,
+        leader: u64,
+        repl_addr: String,
+        members: Vec<(u64, String)>,
+        prev_index: u64,
+        prev_term: u64,
+        entries: Vec<LogEntry>,
+        leader_commit: u64,
+    ) -> Msg {
+        {
+            let mut s = self.state.lock().unwrap();
+            if term < s.term {
+                return Msg::AppendAck {
+                    term: s.term,
+                    success: false,
+                    match_index: 0,
+                };
+            }
+            if term > s.term {
+                s.term = term;
+                s.voted_for = None;
+            }
+            let was_leader = s.role == Role::Leader;
+            s.role = Role::Follower;
+            s.leader = Some(leader);
+            s.election_deadline = Instant::now() + election_timeout(self.cfg.id);
+            persist_state(&self.cfg.state_path, s.term, s.voted_for);
+            if was_leader {
+                drop(s);
+                self.drain_pending("stepped down: no longer leader");
+            }
+        }
+        self.adopt_members(&members);
+        self.publish(Some(Leader {
+            id: leader,
+            is_self: leader == self.cfg.id,
+            repl_addr,
+        }));
+
+        // Append + advance commit under the log lock, collecting entries to apply.
+        let (success, match_index, to_apply) = {
+            let mut log = self.log.lock().unwrap();
+            if log.append_entries(prev_index, prev_term, &entries) {
+                log.advance_commit(leader_commit);
+                (true, log.last_index(), log.take_applicable())
+            } else {
+                (false, 0, Vec::new())
+            }
+        };
+        for e in to_apply {
+            if let Ok(op) = bincode::deserialize::<WriteOp>(&e.data) {
+                let _ = self.db.apply_op_local(op).await;
+            }
+        }
+        let reply_term = self.state.lock().unwrap().term;
+        Msg::AppendAck {
+            term: reply_term,
+            success,
+            match_index,
+        }
+    }
+
+    async fn main_loop(self: Arc<Self>) {
         loop {
             let (role, deadline) = {
                 let s = self.state.lock().unwrap();
@@ -375,8 +459,11 @@ impl Node {
             };
             match role {
                 Role::Leader => {
-                    self.send_heartbeats().await;
-                    tokio::time::sleep(Duration::from_millis(HEARTBEAT_MS)).await;
+                    self.replicate_round().await;
+                    tokio::select! {
+                        _ = self.replicate.notified() => {}
+                        _ = tokio::time::sleep(Duration::from_millis(HEARTBEAT_MS)) => {}
+                    }
                 }
                 _ => {
                     let now = Instant::now();
@@ -390,26 +477,26 @@ impl Node {
         }
     }
 
-    async fn start_election(&self) {
-        let term = {
+    async fn start_election(self: &Arc<Self>) {
+        let (term, last_index, last_term) = {
             let mut s = self.state.lock().unwrap();
             s.term += 1;
             s.role = Role::Candidate;
             s.voted_for = Some(self.cfg.id);
             s.leader = None;
             s.election_deadline = Instant::now() + election_timeout(self.cfg.id);
-            s.term
+            persist_state(&self.cfg.state_path, s.term, s.voted_for);
+            let log = self.log.lock().unwrap();
+            (s.term, log.last_index(), log.last_term())
         };
-        // Persist the incremented term + self-vote before soliciting votes.
-        persist_state(&self.cfg.state_path, term, Some(self.cfg.id));
-        let last_lsn = (self.lsn_source)();
-        info!(id = self.cfg.id, term, last_lsn, "standing for election");
-        let mut votes = 1; // vote for self
+        info!(id = self.cfg.id, term, last_index, "standing for election");
+        let mut votes = 1;
         for peer in self.peer_snapshot() {
             let m = Msg::RequestVote {
                 term,
                 candidate: self.cfg.id,
-                last_lsn,
+                last_log_index: last_index,
+                last_log_term: last_term,
             };
             if let Ok(Msg::Vote { term: t, granted }) = rpc(&peer.control_addr, &m).await {
                 let mut s = self.state.lock().unwrap();
@@ -417,6 +504,7 @@ impl Node {
                     s.term = t;
                     s.role = Role::Follower;
                     s.voted_for = None;
+                    persist_state(&self.cfg.state_path, s.term, s.voted_for);
                     return;
                 }
                 if granted && s.role == Role::Candidate && s.term == term {
@@ -424,21 +512,52 @@ impl Node {
                 }
             }
         }
-        let mut s = self.state.lock().unwrap();
-        if s.role == Role::Candidate && s.term == term && votes >= self.majority() {
-            s.role = Role::Leader;
-            s.leader = Some(self.cfg.id);
-            drop(s);
+        let become_leader = {
+            let mut s = self.state.lock().unwrap();
+            if s.role == Role::Candidate && s.term == term && votes >= self.majority() {
+                s.role = Role::Leader;
+                s.leader = Some(self.cfg.id);
+                true
+            } else {
+                false
+            }
+        };
+        if become_leader {
             info!(id = self.cfg.id, term, votes, "elected leader");
+            // Initialise follower progress and append a no-op so entries from
+            // prior terms become committable in this term (Raft §5.4.2).
+            let last = self.log.lock().unwrap().last_index();
+            {
+                let mut prog = self.progress.lock().unwrap();
+                prog.clear();
+                for peer in self.peer_snapshot() {
+                    prog.insert(
+                        peer.id,
+                        Progress {
+                            next: last + 1,
+                            match_: 0,
+                        },
+                    );
+                }
+            }
+            let noop = bincode::serialize(&WriteOp::Plain {
+                puts: vec![],
+                deletes: vec![],
+            })
+            .unwrap_or_default();
+            self.log.lock().unwrap().leader_append(term, noop);
             self.publish(Some(Leader {
                 id: self.cfg.id,
                 is_self: true,
                 repl_addr: self.cfg.replication_addr.clone(),
             }));
+            self.replicate.notify_one();
         }
     }
 
-    async fn send_heartbeats(&self) {
+    /// One leader replication round: push entries to every follower, collect
+    /// acks, advance the commit index, and apply newly committed entries.
+    async fn replicate_round(self: &Arc<Self>) {
         let term = {
             let s = self.state.lock().unwrap();
             if s.role != Role::Leader {
@@ -447,69 +566,129 @@ impl Node {
             s.term
         };
         let members = self.members();
+        let leader_commit = self.log.lock().unwrap().commit_index();
+
         for peer in self.peer_snapshot() {
-            let m = Msg::Heartbeat {
+            let (prev_index, prev_term, entries) = {
+                let log = self.log.lock().unwrap();
+                let next = self
+                    .progress
+                    .lock()
+                    .unwrap()
+                    .get(&peer.id)
+                    .map(|p| p.next)
+                    .unwrap_or(1);
+                let prev_index = next.saturating_sub(1);
+                let prev_term = log.term_at(prev_index).unwrap_or(0);
+                (prev_index, prev_term, log.entries_after(prev_index))
+            };
+            let m = Msg::AppendEntries {
                 term,
                 leader: self.cfg.id,
                 repl_addr: self.cfg.replication_addr.clone(),
                 members: members.clone(),
+                prev_index,
+                prev_term,
+                entries,
+                leader_commit,
             };
-            if let Ok(Msg::HeartbeatAck { term: t }) = rpc(&peer.control_addr, &m).await {
-                if t > term {
-                    let mut s = self.state.lock().unwrap();
-                    if t > s.term {
-                        s.term = t;
-                        s.role = Role::Follower;
-                        s.voted_for = None;
+            match rpc(&peer.control_addr, &m).await {
+                Ok(Msg::AppendAck {
+                    term: t,
+                    success,
+                    match_index,
+                }) => {
+                    if t > term {
+                        let mut s = self.state.lock().unwrap();
+                        if t > s.term {
+                            s.term = t;
+                            s.role = Role::Follower;
+                            s.voted_for = None;
+                            persist_state(&self.cfg.state_path, s.term, s.voted_for);
+                            drop(s);
+                            self.drain_pending("stepped down during replication");
+                        }
+                        return;
                     }
-                    return;
+                    let mut prog = self.progress.lock().unwrap();
+                    let p = prog
+                        .entry(peer.id)
+                        .or_insert(Progress { next: 1, match_: 0 });
+                    if success {
+                        p.match_ = match_index;
+                        p.next = match_index + 1;
+                    } else if p.next > 1 {
+                        p.next -= 1; // back off and retry with an earlier prefix
+                    }
                 }
+                _ => { /* unreachable peer: retried next round */ }
+            }
+        }
+
+        self.advance_commit_and_apply(term).await;
+    }
+
+    /// Compute the quorum commit index and apply newly committed entries.
+    async fn advance_commit_and_apply(self: &Arc<Self>, term: u64) {
+        let to_apply = {
+            let mut log = self.log.lock().unwrap();
+            let mut match_indexes = vec![log.last_index()]; // the leader itself
+            for p in self.progress.lock().unwrap().values() {
+                match_indexes.push(p.match_);
+            }
+            log.maybe_commit(&mut match_indexes, term);
+            log.take_applicable()
+        };
+        for e in to_apply {
+            let result = match bincode::deserialize::<WriteOp>(&e.data) {
+                Ok(op) => self.db.apply_op_local(op).await,
+                Err(err) => Err(elyra_core::Error::Storage(err.to_string())),
+            };
+            if let Some(tx) = self.pending.lock().unwrap().remove(&e.index) {
+                let _ = tx.send(result);
             }
         }
     }
 }
 
-/// Drive a dynamic read-only flag + replica connection from elected leadership.
-pub async fn follow_leadership(
-    node: Arc<Node>,
-    db: elyra_storage::Db,
-    read_only: Arc<AtomicBool>,
-    self_id: u64,
-) {
-    let mut rx = node.leader_rx.clone();
-    let mut current: Option<String> = None; // replication addr we're following
-    let mut replica_task: Option<tokio::task::JoinHandle<()>> = None;
-    loop {
-        let leader = rx.borrow_and_update().clone();
-        match leader {
-            Some(l) if l.is_self || l.id == self_id => {
-                read_only.store(false, Ordering::Relaxed);
-                if let Some(t) = replica_task.take() {
-                    t.abort();
-                }
-                current = None;
+#[async_trait::async_trait]
+impl Consensus for Node {
+    async fn propose(&self, op: WriteOp) -> elyra_core::Result<()> {
+        let term = {
+            let s = self.state.lock().unwrap();
+            if s.role != Role::Leader {
+                return Err(elyra_core::Error::Storage(
+                    "not the leader: writes must go to the current leader".into(),
+                ));
             }
-            Some(l) => {
-                read_only.store(true, Ordering::Relaxed);
-                if current.as_deref() != Some(l.repl_addr.as_str()) {
-                    if let Some(t) = replica_task.take() {
-                        t.abort();
-                    }
-                    let db2 = db.clone();
-                    let addr = l.repl_addr.clone();
-                    current = Some(addr.clone());
-                    replica_task = Some(tokio::spawn(async move {
-                        if let Err(e) = crate::repl::run_replica(addr, db2).await {
-                            warn!(error = %e, "replica stream ended");
-                        }
-                    }));
-                }
-            }
-            None => {
-                // No known leader: stay read-only until one is elected.
-                read_only.store(true, Ordering::Relaxed);
-            }
+            s.term
+        };
+        let data =
+            bincode::serialize(&op).map_err(|e| elyra_core::Error::Storage(e.to_string()))?;
+        let (tx, rx) = oneshot::channel();
+        let index = {
+            let mut log = self.log.lock().unwrap();
+            let index = log.leader_append(term, data);
+            self.pending.lock().unwrap().insert(index, tx);
+            index
+        };
+        self.replicate.notify_one();
+        let _ = index;
+        match rx.await {
+            Ok(r) => r,
+            Err(_) => Err(elyra_core::Error::Storage(
+                "commit not confirmed (leadership change)".into(),
+            )),
         }
+    }
+}
+
+/// Drive the read-only flag from elected leadership (leader = writable).
+pub async fn follow_leadership(node: Arc<Node>, read_only: Arc<AtomicBool>) {
+    let mut rx = node.leader_rx.clone();
+    loop {
+        let is_leader = matches!(rx.borrow_and_update().as_ref(), Some(l) if l.is_self);
+        read_only.store(!is_leader, Ordering::Relaxed);
         if rx.changed().await.is_err() {
             break;
         }
@@ -546,9 +725,7 @@ async fn rpc(addr: &str, m: &Msg) -> std::io::Result<Msg> {
         .map_err(|_| Error::new(ErrorKind::TimedOut, "rpc timeout"))?
 }
 
-/// Operator command: add or remove a peer at `control_addr` on the node whose
-/// control plane is at `node_addr`. Prefer sending to the current leader, which
-/// propagates membership to followers via heartbeats.
+/// Operator command: add/remove a peer on the node at `node_addr`.
 pub async fn send_membership(
     node_addr: &str,
     add: bool,
@@ -585,6 +762,7 @@ mod tests {
 
     #[test]
     fn majority_sizes() {
+        let db = Db::in_memory().unwrap();
         let mk = |n: usize| {
             let peers = (0..n)
                 .map(|i| Peer {
@@ -599,13 +777,14 @@ mod tests {
                     replication_addr: String::new(),
                     peers,
                     state_path: None,
+                    log_path: None,
                 },
-                Arc::new(|| 0),
+                db.clone(),
             )
             .majority()
         };
-        assert_eq!(mk(0), 1); // single node
-        assert_eq!(mk(2), 2); // 3 nodes -> 2
-        assert_eq!(mk(4), 3); // 5 nodes -> 3
+        assert_eq!(mk(0), 1);
+        assert_eq!(mk(2), 2);
+        assert_eq!(mk(4), 3);
     }
 }

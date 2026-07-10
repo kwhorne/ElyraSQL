@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use elyra_core::{Error, Result};
+use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, oneshot, Notify};
 
 use crate::{RangeSnapshot, Snapshot, Storage};
@@ -75,10 +76,43 @@ const REPL_CAPACITY: usize = 16_384;
 
 /// Optimistic validation performed atomically at commit: read/written keys must
 /// still equal their snapshot values, and scanned ranges must be unchanged.
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 pub struct Validation {
     pub keys: Vec<(Vec<u8>, Option<Vec<u8>>)>,
     pub ranges: Vec<RangeSnapshot>,
+}
+
+/// A replicable, deterministic mutation — the payload of a Raft log entry. Every
+/// node applies these in log order and gets the same result.
+#[derive(Serialize, Deserialize, Clone)]
+pub enum WriteOp {
+    /// Plain put/delete (no validation).
+    Plain {
+        puts: Vec<(Vec<u8>, Vec<u8>)>,
+        deletes: Vec<Vec<u8>>,
+    },
+    /// Validated (transactional) commit: `keys`/`ranges` must still match.
+    Validated {
+        keys: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+        ranges: Vec<RangeSnapshot>,
+        puts: Vec<(Vec<u8>, Vec<u8>)>,
+        deletes: Vec<Vec<u8>>,
+    },
+    /// Plain INSERT: `new` keys must not already exist.
+    Insert {
+        new: Vec<(Vec<u8>, Vec<u8>)>,
+        aux: Vec<(Vec<u8>, Vec<u8>)>,
+        deletes: Vec<Vec<u8>>,
+    },
+}
+
+/// A consensus layer that replicates a mutation to a quorum before it is applied
+/// (Raft). When installed on a [`Db`], the leader routes every mutation through
+/// `propose`, which returns only once the entry is committed and applied.
+#[async_trait::async_trait]
+pub trait Consensus: Send + Sync {
+    /// Propose a mutation; returns the deterministic apply result once committed.
+    async fn propose(&self, op: WriteOp) -> Result<()>;
 }
 
 /// Max writes folded into a single group commit.
@@ -122,6 +156,9 @@ pub struct Db {
     sync_strict: Arc<AtomicBool>,
     /// Binlog directory, if point-in-time recovery is enabled.
     binlog_dir: Option<std::path::PathBuf>,
+    /// Optional consensus layer: when installed (cluster mode), the leader
+    /// routes mutations through it (Raft) instead of committing locally.
+    consensus: Arc<Mutex<Option<Arc<dyn Consensus>>>>,
 }
 
 impl Db {
@@ -192,12 +229,42 @@ impl Db {
             sync_timeout_ms,
             sync_strict,
             binlog_dir,
+            consensus: Arc::new(Mutex::new(None)),
         })
     }
 
     /// The binlog directory, if point-in-time recovery is enabled.
     pub fn binlog_dir(&self) -> Option<&std::path::Path> {
         self.binlog_dir.as_deref()
+    }
+
+    /// Install a consensus layer (Raft). After this, mutations are proposed
+    /// through it (on the leader) rather than committed directly.
+    pub fn set_consensus(&self, c: Arc<dyn Consensus>) {
+        *self.consensus.lock().unwrap() = Some(c);
+    }
+
+    fn consensus(&self) -> Option<Arc<dyn Consensus>> {
+        self.consensus.lock().unwrap().clone()
+    }
+
+    /// Apply a [`WriteOp`] to the local store via the group-commit writer,
+    /// bypassing consensus. This is what the Raft apply loop calls on every node
+    /// once an entry is committed.
+    pub async fn apply_op_local(&self, op: WriteOp) -> Result<()> {
+        match op {
+            WriteOp::Plain { puts, deletes } => self.submit(puts, deletes, None).await,
+            WriteOp::Validated {
+                keys,
+                ranges,
+                puts,
+                deletes,
+            } => {
+                self.submit(puts, deletes, Some(Validation { keys, ranges }))
+                    .await
+            }
+            WriteOp::Insert { new, aux, deletes } => self.submit_insert(new, aux, deletes).await,
+        }
     }
 
     /// Enable semi-synchronous replication: a commit waits up to `ms` for one
@@ -369,6 +436,9 @@ impl Db {
 
     /// Submit a mutation to the group-commit writer and await durability.
     pub async fn commit(&self, puts: Vec<(Vec<u8>, Vec<u8>)>, deletes: Vec<Vec<u8>>) -> Result<()> {
+        if let Some(c) = self.consensus() {
+            return c.propose(WriteOp::Plain { puts, deletes }).await;
+        }
         self.submit(puts, deletes, None).await?;
         self.await_sync().await
     }
@@ -381,6 +451,17 @@ impl Db {
         puts: Vec<(Vec<u8>, Vec<u8>)>,
         deletes: Vec<Vec<u8>>,
     ) -> Result<()> {
+        if let Some(c) = self.consensus() {
+            let Validation { keys, ranges } = validation;
+            return c
+                .propose(WriteOp::Validated {
+                    keys,
+                    ranges,
+                    puts,
+                    deletes,
+                })
+                .await;
+        }
         self.submit(puts, deletes, Some(validation)).await?;
         self.await_sync().await
     }
@@ -389,6 +470,20 @@ impl Db {
     /// detection happens in the write transaction), `aux` puts (index entries,
     /// counters) may overwrite. No separate existence read.
     pub async fn commit_insert(
+        &self,
+        new: Vec<(Vec<u8>, Vec<u8>)>,
+        aux: Vec<(Vec<u8>, Vec<u8>)>,
+        deletes: Vec<Vec<u8>>,
+    ) -> Result<()> {
+        if let Some(c) = self.consensus() {
+            return c.propose(WriteOp::Insert { new, aux, deletes }).await;
+        }
+        self.submit_insert(new, aux, deletes).await?;
+        self.await_sync().await
+    }
+
+    /// The local INSERT writer path (no consensus, no sync barrier).
+    async fn submit_insert(
         &self,
         new: Vec<(Vec<u8>, Vec<u8>)>,
         aux: Vec<(Vec<u8>, Vec<u8>)>,
@@ -406,8 +501,7 @@ impl Db {
             .await
             .map_err(|_| Error::Storage("writer thread stopped".into()))?;
         wait.await
-            .map_err(|_| Error::Storage("write acknowledgement lost".into()))??;
-        self.await_sync().await
+            .map_err(|_| Error::Storage("write acknowledgement lost".into()))?
     }
 
     async fn submit(

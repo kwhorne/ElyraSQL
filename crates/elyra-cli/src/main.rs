@@ -358,7 +358,6 @@ async fn run() -> anyhow::Result<()> {
                 .iter()
                 .map(|p| elyra_server::cluster::parse_peer(p))
                 .collect::<std::io::Result<Vec<_>>>()?;
-            let lsn_db = db.clone();
             let node = elyra_server::cluster::Node::new(
                 elyra_server::cluster::ClusterConfig {
                     id,
@@ -366,15 +365,17 @@ async fn run() -> anyhow::Result<()> {
                     replication_addr: replication_listen.clone(),
                     peers,
                     state_path: Some(data.with_extension("raftstate")),
+                    log_path: Some(data.with_extension("raftlog")),
                 },
-                std::sync::Arc::new(move || lsn_db.current_lsn()),
+                db.clone(),
             );
+            // Route all writes through the Raft log (leader proposes; commit +
+            // apply before the client is acknowledged).
+            db.set_consensus(node.clone());
             tokio::spawn(node.clone().run());
             tokio::spawn(elyra_server::cluster::follow_leadership(
                 node.clone(),
-                db.clone(),
                 read_only.clone(),
-                id,
             ));
             let auth = std::sync::Arc::new(elyra_server::Auth::open().with_db(db));
             let config = elyra_server::ServerConfig {

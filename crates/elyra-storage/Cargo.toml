@@ -9,8 +9,9 @@ description = "ElyraSQL single-file ACID storage engine"
 [dependencies]
 elyra-core.workspace = true
 redb.workspace = true
-serde.workspace = true
+serde = { workspace = true, features = ["derive"] }
 bincode.workspace = true
+async-trait.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true }
 tracing.workspace = true

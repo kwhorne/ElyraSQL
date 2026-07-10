@@ -15,7 +15,7 @@
 
 pub mod binlog;
 mod db;
-pub use db::{Db, Validation, WriteEvent};
+pub use db::{Consensus, Db, Validation, WriteEvent, WriteOp};
 
 use std::path::Path;
 use std::sync::Arc;
@@ -25,7 +25,7 @@ use redb::{Database, ReadTransaction, ReadableTable, TableDefinition};
 
 /// A scanned range and its content at snapshot time, validated on a
 /// serializable commit to detect phantoms and concurrent range changes.
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct RangeSnapshot {
     pub start: Vec<u8>,
     pub end: Option<Vec<u8>>,
