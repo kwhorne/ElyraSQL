@@ -141,6 +141,11 @@ struct State {
 const HEARTBEAT_MS: u64 = 150;
 const ELECTION_LO_MS: u64 = 1000;
 const ELECTION_HI_MS: u64 = 2000;
+/// A leader that has not confirmed contact with a quorum for this long gives up
+/// leadership (step-down). Kept below the minimum election timeout so the old
+/// leader stops acting before a new one can be elected — the basis for safe
+/// lease-based leader reads.
+const LEADER_LEASE_MS: u64 = 900;
 
 fn election_timeout(id: u64) -> Duration {
     use std::sync::atomic::AtomicU64;
@@ -186,6 +191,8 @@ pub struct Node {
     progress: Arc<Mutex<HashMap<u64, Progress>>>,
     /// Wakes the leader replication loop when there is new work.
     replicate: Arc<Notify>,
+    /// Last time this leader confirmed contact with a quorum (its lease anchor).
+    lease: Mutex<Instant>,
     leader_tx: watch::Sender<Option<Leader>>,
     pub leader_rx: watch::Receiver<Option<Leader>>,
 }
@@ -215,6 +222,7 @@ impl Node {
             pending: Arc::new(Mutex::new(HashMap::new())),
             progress: Arc::new(Mutex::new(HashMap::new())),
             replicate: Arc::new(Notify::new()),
+            lease: Mutex::new(Instant::now()),
             leader_tx,
             leader_rx,
         })
@@ -461,6 +469,15 @@ impl Node {
             match role {
                 Role::Leader => {
                     self.replicate_round(&mut conns).await;
+                    // Leader lease: if we haven't confirmed a quorum for the lease
+                    // window, step down so writes fail fast and a healthy
+                    // majority can elect a new leader (liveness).
+                    if self.lease.lock().unwrap().elapsed() > Duration::from_millis(LEADER_LEASE_MS)
+                    {
+                        self.step_down("lost quorum contact (lease expired)");
+                        conns.clear();
+                        continue;
+                    }
                     tokio::select! {
                         _ = self.replicate.notified() => {}
                         _ = tokio::time::sleep(Duration::from_millis(HEARTBEAT_MS)) => {}
@@ -526,8 +543,9 @@ impl Node {
         };
         if become_leader {
             info!(id = self.cfg.id, term, votes, "elected leader");
-            // Initialise follower progress and append a no-op so entries from
-            // prior terms become committable in this term (Raft §5.4.2).
+            *self.lease.lock().unwrap() = Instant::now(); // fresh lease on election
+                                                          // Initialise follower progress and append a no-op so entries from
+                                                          // prior terms become committable in this term (Raft §5.4.2).
             let last = self.log.lock().unwrap().last_index();
             {
                 let mut prog = self.progress.lock().unwrap();
@@ -578,6 +596,7 @@ impl Node {
         let peers = self.peer_snapshot();
         let live: std::collections::HashSet<u64> = peers.iter().map(|p| p.id).collect();
         conns.retain(|id, _| live.contains(id));
+        let mut quorum_acks = 1usize; // this leader counts itself
         for peer in peers {
             let (prev_index, prev_term, entries) = {
                 let log = self.log.lock().unwrap();
@@ -651,6 +670,7 @@ impl Node {
                     if success {
                         p.match_ = match_index;
                         p.next = match_index + 1;
+                        quorum_acks += 1;
                     } else if p.next > 1 {
                         p.next -= 1; // back off and retry with an earlier prefix
                     }
@@ -662,7 +682,28 @@ impl Node {
             }
         }
 
+        // Renew the leader lease if a quorum acknowledged this round.
+        if quorum_acks >= self.majority() {
+            *self.lease.lock().unwrap() = Instant::now();
+        }
         self.advance_commit_and_apply(term).await;
+    }
+
+    /// Relinquish leadership: become a follower, fail pending proposals fast, and
+    /// signal "no leader" so connections go read-only until a new election.
+    fn step_down(&self, reason: &str) {
+        {
+            let mut s = self.state.lock().unwrap();
+            if s.role != Role::Leader {
+                return;
+            }
+            s.role = Role::Follower;
+            s.leader = None;
+            s.election_deadline = Instant::now() + election_timeout(self.cfg.id);
+        }
+        self.drain_pending(reason);
+        self.publish(None);
+        warn!(id = self.cfg.id, reason, "stepped down");
     }
 
     /// Compute the quorum commit index and apply newly committed entries.

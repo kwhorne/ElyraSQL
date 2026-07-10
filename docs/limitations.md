@@ -193,11 +193,15 @@ implemented, so you can judge fit.
   connections to followers, appends are fsynced once per round (not per write),
   and committed entries are applied together through the DB's group commit — so
   concurrent writers reach hundreds of committed writes/second even though a
-  single sequential write is fsync-latency-bound. Known limitation: a leader
-  partitioned from its quorum blocks writes until it can replicate (or a client
-  timeout fires) rather than stepping down proactively (no leader lease yet).
-  The older `primary`/`replica` mode remains asynchronous (semi-sync/quorum
-  barrier).
+  single sequential write is fsync-latency-bound. The leader holds a **lease**:
+  it renews leadership each round it confirms contact with a quorum, and **steps
+  down** if it cannot for the lease window (below the minimum election timeout).
+  A leader partitioned from its quorum therefore relinquishes leadership — its
+  in-flight writes fail fast and a healthy majority elects a new leader — rather
+  than hanging. Because the lease is shorter than the election timeout, a
+  lease-valid leader is guaranteed to still be the leader, so its local reads are
+  linearizable without a quorum round-trip. The older `primary`/`replica` mode
+  remains asynchronous (semi-sync/quorum barrier).
 
 ## Wire protocol
 
