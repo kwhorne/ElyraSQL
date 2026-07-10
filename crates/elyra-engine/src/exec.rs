@@ -2851,7 +2851,7 @@ pub async fn select(
                 // path (bounded memory).
                 partitioned_aggregate(db, &def, filter.clone(), &plan).await?
             } else {
-                plan.finalize(agg)
+                plan.finalize(agg)?
             }
         };
         let mut out_rows = apply_having(
@@ -5849,6 +5849,17 @@ fn eval_usize(e: &Expr) -> Result<usize> {
 /// can go through the streaming scan path.
 /// Rewrite ORDER BY items that name a projection alias into the aliased
 /// expression, so sorting can evaluate them against the table row.
+/// The 1-based ordinal of a positional ORDER BY / GROUP BY item
+/// (`ORDER BY 2`), if `e` is a positive integer literal.
+fn order_ordinal(e: &Expr) -> Option<usize> {
+    match e {
+        Expr::Value(sqlparser::ast::Value::Number(n, _)) => {
+            n.parse::<usize>().ok().filter(|&x| x >= 1)
+        }
+        _ => None,
+    }
+}
+
 fn resolve_order_aliases(
     order: &[(Expr, bool)],
     projection: &[sqlparser::ast::SelectItem],
@@ -5858,6 +5869,14 @@ fn resolve_order_aliases(
     order
         .iter()
         .map(|(e, asc)| {
+            // Positional ORDER BY -> the Nth projected expression.
+            if let Some(n) = order_ordinal(e) {
+                if let Some(SelectItem::UnnamedExpr(expr))
+                | Some(SelectItem::ExprWithAlias { expr, .. }) = projection.get(n - 1)
+                {
+                    return (expr.clone(), *asc);
+                }
+            }
             if let Some(name) = ident_name(e) {
                 let is_column = schema
                     .columns
@@ -7878,11 +7897,14 @@ async fn partitioned_aggregate(
                 elyra_olap::default_max_groups()
             )));
         }
-        let (s, rows) = plan.finalize(agg);
+        let (s, rows) = plan.finalize(agg)?;
         schema = Some(s);
         out_rows.extend(rows);
     }
-    let schema = schema.unwrap_or_else(|| plan.finalize(plan.new_aggregator()).0);
+    let schema = match schema {
+        Some(s) => s,
+        None => plan.finalize(plan.new_aggregator())?.0,
+    };
     Ok((schema, out_rows))
 }
 
@@ -8005,6 +8027,17 @@ fn order_output_rows(
     // Resolve each order expr to an output column index.
     let mut cols = Vec::with_capacity(order.len());
     for (e, _) in order {
+        // Positional ORDER BY (e.g. `ORDER BY 2`) -> the Nth output column.
+        if let Some(n) = order_ordinal(e) {
+            if n >= 1 && n <= schema.columns.len() {
+                cols.push(n - 1);
+                continue;
+            }
+            return Err(Error::Query(format!(
+                "ORDER BY position {n} is out of range (1..{})",
+                schema.columns.len()
+            )));
+        }
         let name = ident_name(e)
             .map(|s| s.to_string())
             .unwrap_or_else(|| e.to_string());

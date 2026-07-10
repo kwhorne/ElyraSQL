@@ -11,10 +11,13 @@ use sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Sele
 
 pub use elyra_olap::value_cmp;
 
-/// An output column: either a (grouped) source column or an aggregate result.
+/// An output column: a (grouped) source column, an aggregate result, or a
+/// scalar expression evaluated per group over the group columns + aggregate
+/// results (e.g. `ROUND(SUM(x), 2)`, `SUM(a)/COUNT(*)`, `UPPER(status)`).
 enum OutCol {
     Column(usize),
     Agg(usize),
+    Computed(Box<Expr>),
 }
 
 /// A planned aggregation: group columns, aggregates, output layout and schema.
@@ -27,6 +30,9 @@ pub struct AggPlan {
     /// input schema (for conditional aggregates like `SUM(CASE ...)`).
     arg_exprs: Vec<Expr>,
     input_schema: Schema,
+    /// Schema for evaluating `Computed` output columns: the input columns
+    /// followed by one `__agg_i` column per aggregate result.
+    eval_schema: Schema,
 }
 
 impl AggPlan {
@@ -54,37 +60,48 @@ impl AggPlan {
     }
 
     /// Finalise an aggregator into output rows in projection order.
-    pub fn finalize(&self, agg: GroupAggregator) -> (Schema, Vec<Vec<Value>>) {
+    pub fn finalize(&self, agg: GroupAggregator) -> Result<(Schema, Vec<Vec<Value>>)> {
         let empty = agg.empty_result();
         let group_by_empty = self.group_cols.is_empty();
         let groups = agg.into_groups();
+        let base_len = self.input_schema.columns.len();
 
         let mut out = Vec::with_capacity(groups.len().max(1));
         if groups.is_empty() && group_by_empty && !self.aggs.is_empty() {
             // Bare aggregate over zero rows still yields one row (COUNT(*)->0).
-            out.push(
-                self.plan
-                    .iter()
-                    .map(|o| match o {
-                        OutCol::Column(_) => Value::Null,
-                        OutCol::Agg(j) => empty[*j].clone(),
-                    })
-                    .collect(),
-            );
+            let sample = vec![Value::Null; base_len];
+            out.push(self.project_group(&sample, &empty)?);
         } else {
             for (sample, results) in groups {
-                out.push(
-                    self.plan
-                        .iter()
-                        .map(|o| match o {
-                            OutCol::Column(i) => sample[*i].clone(),
-                            OutCol::Agg(j) => results[*j].clone(),
-                        })
-                        .collect(),
-                );
+                out.push(self.project_group(&sample, &results)?);
             }
         }
-        (self.out_schema.clone(), out)
+        Ok((self.out_schema.clone(), out))
+    }
+
+    /// Build one output row for a group from its sample row + aggregate results.
+    fn project_group(&self, sample: &[Value], results: &[Value]) -> Result<Vec<Value>> {
+        let base_len = self.input_schema.columns.len();
+        self.plan
+            .iter()
+            .map(|o| match o {
+                OutCol::Column(i) => Ok(sample.get(*i).cloned().unwrap_or(Value::Null)),
+                OutCol::Agg(j) => Ok(results.get(*j).cloned().unwrap_or(Value::Null)),
+                OutCol::Computed(expr) => {
+                    // Row = base input columns of the sample, then the aggregate
+                    // results (named `__agg_i` in `eval_schema`).
+                    let mut row: Vec<Value> = if sample.len() >= base_len {
+                        sample[..base_len].to_vec()
+                    } else {
+                        let mut r = sample.to_vec();
+                        r.resize(base_len, Value::Null);
+                        r
+                    };
+                    row.extend(results.iter().cloned());
+                    crate::predicate::eval_row(expr, &self.eval_schema, &row)
+                }
+            })
+            .collect()
     }
 }
 
@@ -104,11 +121,12 @@ fn agg_of(expr: &Expr) -> Option<(AggFunc, &sqlparser::ast::Function)> {
     Some((func, f))
 }
 
-/// Does this projection contain any aggregate function?
+/// Does this projection contain any aggregate function (including nested in an
+/// expression, e.g. `ROUND(SUM(x), 2)`)?
 pub fn projection_has_aggregate(projection: &[SelectItem]) -> bool {
     projection.iter().any(|item| match item {
         SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
-            agg_of(e).is_some()
+            contains_aggregate(e)
         }
         _ => false,
     })
@@ -188,66 +206,75 @@ pub fn build_plan(
     }
 
     let mut aggs = Vec::new();
+    let mut agg_types: Vec<ColumnType> = Vec::new();
     let mut plan = Vec::new();
     let mut out_cols = Vec::new();
     let mut arg_exprs: Vec<Expr> = Vec::new();
+    let ci = elyra_core::Collation::Ci;
 
     for item in projection {
         let (expr, alias) = item_expr_and_alias(item)?;
-        if let Some((mut func, f)) = agg_of(expr) {
-            let (arg_expr, distinct) = agg_arg(f);
-            // Resolve the argument to a real column, or append it as a virtual
-            // column (conditional aggregates: SUM(CASE ...), COUNT(DISTINCT x+y)).
-            let (arg, arg_ty): (Option<usize>, Option<ColumnType>) = match arg_expr {
-                None => (None, None),
-                Some(e) => match ident_of(e).and_then(|n| col_index(schema, &n).ok()) {
-                    Some(ci) => (Some(ci), Some(schema.columns[ci].ty.clone())),
-                    None => {
-                        let ci = schema.columns.len() + arg_exprs.len();
-                        arg_exprs.push(e.clone());
-                        (Some(ci), None)
-                    }
-                },
-            };
-            if func == AggFunc::Count && arg.is_none() {
-                func = AggFunc::CountStar;
-            }
-            let ty = match func {
-                AggFunc::CountStar | AggFunc::Count => ColumnType::Int,
-                AggFunc::Avg => ColumnType::Float,
-                AggFunc::GroupConcat => ColumnType::Text,
-                AggFunc::Sum | AggFunc::Min | AggFunc::Max => {
-                    arg_ty.clone().unwrap_or(ColumnType::Float)
-                }
-            };
+
+        // 1) A bare aggregate: SUM(x), COUNT(*), ...
+        if let Some((func, f)) = agg_of(expr) {
+            let slot = register_agg(func, f, schema, &mut aggs, &mut arg_exprs, &mut agg_types)?;
             out_cols.push(ColumnDef {
                 name: alias.unwrap_or_else(|| expr.to_string()),
-                ty,
+                ty: agg_types[slot].clone(),
                 nullable: true,
-                collation: elyra_core::Collation::Ci,
+                collation: ci,
             });
-            let separator = agg_separator(f);
-            let idx = aggs.len();
-            aggs.push(AggSpec {
-                func,
-                arg_col: arg,
-                distinct,
-                separator,
-            });
-            plan.push(OutCol::Agg(idx));
-        } else {
-            let name = ident_of(expr).ok_or_else(|| {
-                Error::Unsupported("non-aggregated column must be a plain column".into())
-            })?;
-            let idx = col_index(schema, &name)?;
-            out_cols.push(ColumnDef {
-                name: alias.unwrap_or_else(|| schema.columns[idx].name.clone()),
-                ty: schema.columns[idx].ty.clone(),
-                nullable: schema.columns[idx].nullable,
-                collation: elyra_core::Collation::Ci,
-            });
-            plan.push(OutCol::Column(idx));
+            plan.push(OutCol::Agg(slot));
+            continue;
         }
+
+        // 2/3) No aggregate anywhere: a plain group column, or a scalar
+        // expression over the group columns (e.g. UPPER(status)).
+        if !contains_aggregate(expr) {
+            if let Some(idx) = ident_of(expr).and_then(|n| col_index(schema, &n).ok()) {
+                out_cols.push(ColumnDef {
+                    name: alias.unwrap_or_else(|| schema.columns[idx].name.clone()),
+                    ty: schema.columns[idx].ty.clone(),
+                    nullable: schema.columns[idx].nullable,
+                    collation: ci,
+                });
+                plan.push(OutCol::Column(idx));
+            } else {
+                out_cols.push(ColumnDef {
+                    name: alias.unwrap_or_else(|| expr.to_string()),
+                    ty: infer_computed_type(expr),
+                    nullable: true,
+                    collation: ci,
+                });
+                plan.push(OutCol::Computed(Box::new(expr.clone())));
+            }
+            continue;
+        }
+
+        // 4) A scalar expression *containing* aggregates: ROUND(SUM(x), 2),
+        // SUM(a)/COUNT(*), COALESCE(SUM(x), 0), ... Rewrite each aggregate to a
+        // `__agg_i` reference and evaluate the rest per group.
+        let rewritten =
+            rewrite_aggregates(expr, schema, &mut aggs, &mut arg_exprs, &mut agg_types)?;
+        out_cols.push(ColumnDef {
+            name: alias.unwrap_or_else(|| expr.to_string()),
+            ty: infer_computed_type(expr),
+            nullable: true,
+            collation: ci,
+        });
+        plan.push(OutCol::Computed(Box::new(rewritten)));
+    }
+
+    // Evaluation schema for Computed columns: input columns, then one
+    // `__agg_i` column per aggregate.
+    let mut eval_cols = schema.columns.clone();
+    for (i, t) in agg_types.iter().enumerate() {
+        eval_cols.push(ColumnDef {
+            name: format!("__agg_{i}"),
+            ty: t.clone(),
+            nullable: true,
+            collation: ci,
+        });
     }
 
     Ok(AggPlan {
@@ -257,7 +284,198 @@ pub fn build_plan(
         out_schema: Schema::new(out_cols),
         arg_exprs,
         input_schema: schema.clone(),
+        eval_schema: Schema::new(eval_cols),
     })
+}
+
+/// Register an aggregate call, returning its slot in `aggs` (its type is pushed
+/// to `agg_types`). Shared by bare aggregates and aggregates nested in
+/// expressions.
+fn register_agg(
+    mut func: AggFunc,
+    f: &sqlparser::ast::Function,
+    schema: &Schema,
+    aggs: &mut Vec<AggSpec>,
+    arg_exprs: &mut Vec<Expr>,
+    agg_types: &mut Vec<ColumnType>,
+) -> Result<usize> {
+    let (arg_expr, distinct) = agg_arg(f);
+    let (arg, arg_ty): (Option<usize>, Option<ColumnType>) = match arg_expr {
+        None => (None, None),
+        Some(e) => match ident_of(e).and_then(|n| col_index(schema, &n).ok()) {
+            Some(ci) => (Some(ci), Some(schema.columns[ci].ty.clone())),
+            None => {
+                let ci = schema.columns.len() + arg_exprs.len();
+                arg_exprs.push(e.clone());
+                (Some(ci), None)
+            }
+        },
+    };
+    if func == AggFunc::Count && arg.is_none() {
+        func = AggFunc::CountStar;
+    }
+    let ty = match func {
+        AggFunc::CountStar | AggFunc::Count => ColumnType::Int,
+        AggFunc::Avg => ColumnType::Float,
+        AggFunc::GroupConcat => ColumnType::Text,
+        AggFunc::Sum | AggFunc::Min | AggFunc::Max => arg_ty.unwrap_or(ColumnType::Float),
+    };
+    let slot = aggs.len();
+    aggs.push(AggSpec {
+        func,
+        arg_col: arg,
+        distinct,
+        separator: agg_separator(f),
+    });
+    agg_types.push(ty);
+    Ok(slot)
+}
+
+/// Does `expr` contain an aggregate function anywhere?
+fn contains_aggregate(expr: &Expr) -> bool {
+    if agg_of(expr).is_some() {
+        return true;
+    }
+    match expr {
+        Expr::Nested(e)
+        | Expr::UnaryOp { expr: e, .. }
+        | Expr::Cast { expr: e, .. }
+        | Expr::IsNull(e)
+        | Expr::IsNotNull(e) => contains_aggregate(e),
+        Expr::BinaryOp { left, right, .. } => contains_aggregate(left) || contains_aggregate(right),
+        Expr::Between {
+            expr, low, high, ..
+        } => contains_aggregate(expr) || contains_aggregate(low) || contains_aggregate(high),
+        Expr::Function(f) => {
+            if let FunctionArguments::List(list) = &f.args {
+                list.args.iter().any(|a| match a {
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(e))
+                    | FunctionArg::Named {
+                        arg: FunctionArgExpr::Expr(e),
+                        ..
+                    } => contains_aggregate(e),
+                    _ => false,
+                })
+            } else {
+                false
+            }
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            results,
+            else_result,
+        } => {
+            operand.as_deref().is_some_and(contains_aggregate)
+                || conditions.iter().any(contains_aggregate)
+                || results.iter().any(contains_aggregate)
+                || else_result.as_deref().is_some_and(contains_aggregate)
+        }
+        _ => false,
+    }
+}
+
+/// Replace every aggregate call in `expr` with an `__agg_i` identifier
+/// (registering the aggregate), leaving the surrounding scalar expression
+/// intact so it can be evaluated per group.
+fn rewrite_aggregates(
+    expr: &Expr,
+    schema: &Schema,
+    aggs: &mut Vec<AggSpec>,
+    arg_exprs: &mut Vec<Expr>,
+    agg_types: &mut Vec<ColumnType>,
+) -> Result<Expr> {
+    if let Some((func, f)) = agg_of(expr) {
+        let slot = register_agg(func, f, schema, aggs, arg_exprs, agg_types)?;
+        return Ok(Expr::Identifier(sqlparser::ast::Ident::new(format!(
+            "__agg_{slot}"
+        ))));
+    }
+    if !contains_aggregate(expr) {
+        return Ok(expr.clone());
+    }
+    let mut e = expr.clone();
+    match &mut e {
+        Expr::Nested(inner)
+        | Expr::UnaryOp { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. } => {
+            **inner = rewrite_aggregates(inner, schema, aggs, arg_exprs, agg_types)?;
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            **left = rewrite_aggregates(left, schema, aggs, arg_exprs, agg_types)?;
+            **right = rewrite_aggregates(right, schema, aggs, arg_exprs, agg_types)?;
+        }
+        Expr::Function(f) => {
+            if let FunctionArguments::List(list) = &mut f.args {
+                for a in &mut list.args {
+                    match a {
+                        FunctionArg::Unnamed(FunctionArgExpr::Expr(x))
+                        | FunctionArg::Named {
+                            arg: FunctionArgExpr::Expr(x),
+                            ..
+                        } => {
+                            *x = rewrite_aggregates(x, schema, aggs, arg_exprs, agg_types)?;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            results,
+            else_result,
+        } => {
+            if let Some(o) = operand {
+                **o = rewrite_aggregates(o, schema, aggs, arg_exprs, agg_types)?;
+            }
+            for c in conditions.iter_mut() {
+                *c = rewrite_aggregates(c, schema, aggs, arg_exprs, agg_types)?;
+            }
+            for r in results.iter_mut() {
+                *r = rewrite_aggregates(r, schema, aggs, arg_exprs, agg_types)?;
+            }
+            if let Some(er) = else_result {
+                **er = rewrite_aggregates(er, schema, aggs, arg_exprs, agg_types)?;
+            }
+        }
+        _ => {
+            return Err(Error::Unsupported(
+                "aggregate nested in an unsupported expression".into(),
+            ))
+        }
+    }
+    Ok(e)
+}
+
+/// Best-effort column type for a computed output column (the runtime `Value`
+/// carries the true type; this only affects result metadata).
+fn infer_computed_type(expr: &Expr) -> ColumnType {
+    match expr {
+        Expr::BinaryOp { op, .. } => {
+            use sqlparser::ast::BinaryOperator::*;
+            match op {
+                Plus | Minus | Multiply | Divide | Modulo => ColumnType::Float,
+                _ => ColumnType::Text,
+            }
+        }
+        Expr::UnaryOp { expr: e, .. } | Expr::Nested(e) => infer_computed_type(e),
+        Expr::Function(f) => {
+            let n = f
+                .name
+                .0
+                .last()
+                .map(|i| i.value.to_ascii_lowercase())
+                .unwrap_or_default();
+            match n.as_str() {
+                "round" | "abs" | "ceil" | "ceiling" | "floor" | "sqrt" | "pow" | "power"
+                | "sum" | "avg" | "count" | "min" | "max" | "truncate" | "mod" => ColumnType::Float,
+                _ => ColumnType::Text,
+            }
+        }
+        _ => ColumnType::Text,
+    }
 }
 
 /// In-memory aggregation over a fully materialised row set.
@@ -285,5 +503,5 @@ pub fn run(
             elyra_olap::default_max_groups()
         )));
     }
-    Ok(plan.finalize(agg))
+    plan.finalize(agg)
 }
