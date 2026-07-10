@@ -845,8 +845,6 @@ async fn send(stream: &mut TcpStream, m: &Msg) -> std::io::Result<()> {
 
 /// Read one framed message; `None` on a clean end-of-stream.
 /// Reject absurd frame lengths (corrupt/malicious peer) before allocating.
-const MAX_FRAME: usize = 1 << 30; // 1 GiB
-
 async fn recv(stream: &mut TcpStream) -> std::io::Result<Option<Msg>> {
     let mut len = [0u8; 4];
     match stream.read_exact(&mut len).await {
@@ -855,7 +853,7 @@ async fn recv(stream: &mut TcpStream) -> std::io::Result<Option<Msg>> {
         Err(e) => return Err(e),
     }
     let n = u32::from_le_bytes(len) as usize;
-    if n > MAX_FRAME {
+    if n > elyra_core::max_frame_bytes() {
         return Err(Error::new(ErrorKind::InvalidData, "frame too large"));
     }
     let mut buf = vec![0u8; n];

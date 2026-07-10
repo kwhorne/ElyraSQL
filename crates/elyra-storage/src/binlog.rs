@@ -182,7 +182,7 @@ fn read_segment_records(path: &Path) -> Result<Vec<BinlogRecord>> {
             Err(e) => return Err(Error::Io(e)),
         }
         let n = u32::from_le_bytes(len) as usize;
-        if n > (1 << 30) {
+        if n > elyra_core::max_frame_bytes() {
             return Err(Error::Storage("binlog record too large (corrupt?)".into()));
         }
         let mut buf = vec![0u8; n];
@@ -253,7 +253,7 @@ fn replay_segment(
             Err(e) => return Err(Error::Io(e)),
         }
         let n = u32::from_le_bytes(len) as usize;
-        if n > (1 << 30) {
+        if n > elyra_core::max_frame_bytes() {
             return Err(Error::Storage("binlog record too large (corrupt?)".into()));
         }
         let mut buf = vec![0u8; n];

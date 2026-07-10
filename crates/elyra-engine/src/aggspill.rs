@@ -101,7 +101,7 @@ impl Partitions {
                     Err(e) => return Err(Error::Io(e)),
                 }
                 let n = u32::from_le_bytes(len) as usize;
-                if n > crate::sort::MAX_SPILL_RECORD {
+                if n > elyra_core::max_frame_bytes() {
                     return Err(Error::Storage(
                         "aggregation spill record too large (corrupt?)".into(),
                     ));

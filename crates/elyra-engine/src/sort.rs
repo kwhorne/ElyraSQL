@@ -83,10 +83,6 @@ fn temp_path() -> PathBuf {
     std::env::temp_dir().join(format!("elyrasql-sort-{pid}-{n}.tmp"))
 }
 
-/// Upper bound on a single spilled record. A corrupt spill file could otherwise
-/// name a multi-gigabyte length and OOM the process on the next allocation.
-pub(crate) const MAX_SPILL_RECORD: usize = 1 << 30; // 1 GiB
-
 /// Delete leftover spill/aggregation temp files from ElyraSQL processes that are
 /// no longer running (e.g. killed with SIGKILL, which skips `Drop` cleanup).
 /// Only removes files whose embedded PID is *confirmed* dead, so concurrently
@@ -150,7 +146,7 @@ impl RunReader {
             Err(e) => return Err(Error::Io(e)),
         }
         let n = u32::from_le_bytes(len) as usize;
-        if n > MAX_SPILL_RECORD {
+        if n > elyra_core::max_frame_bytes() {
             return Err(Error::Storage(
                 "sort spill record too large (corrupt?)".into(),
             ));

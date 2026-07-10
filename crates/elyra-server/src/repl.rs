@@ -71,7 +71,7 @@ async fn recv_msg<R: AsyncRead + Unpin>(r: &mut R) -> std::io::Result<Option<Rep
         Err(e) => return Err(e),
     }
     let n = u32::from_le_bytes(len) as usize;
-    if n > (1 << 30) {
+    if n > elyra_core::max_frame_bytes() {
         return Err(Error::new(
             ErrorKind::InvalidData,
             "replication frame too large",
