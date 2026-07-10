@@ -4,6 +4,33 @@ All notable changes to ElyraSQL are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.8.9] - 2026-07-09
+
+Consensus release: the Raft log is now on the live cluster write path.
+
+### Raft replicated-log write path (pre-commit / 2-phase)
+
+- In `cluster` mode, every write is proposed through the Raft log: the leader
+  appends the entry, replicates it via `AppendEntries`, **commits it once a
+  quorum has durably logged it**, and only then **applies** it and acknowledges
+  the client. Followers append (with the AppendEntries consistency check +
+  conflicting-suffix truncation) and apply up to the leader's commit index.
+- Votes use the §5.4.1 election restriction on the log, so failover is
+  **no-data-loss**: an acknowledged write is on a quorum's durable log and any
+  elected leader already has it. A write cannot be acknowledged without a quorum.
+- New plumbing: `elyra_storage::WriteOp` + `Consensus` trait + `Db.set_consensus`
+  / `apply_op_local`; the single-node write path is unchanged when no consensus
+  layer is installed.
+- Known limitation: a leader partitioned from its quorum blocks writes (until it
+  can replicate or the client times out) rather than stepping down proactively
+  (no leader lease yet).
+
+### Verified
+
+- 3-node cluster: writes commit via quorum and replicate; followers reject
+  writes; killing the leader preserves all acknowledged writes on the new leader
+  (no data loss); no commit without a quorum.
+
 ## [0.8.8] - 2026-07-09
 
 Partitioning release.
@@ -529,6 +556,7 @@ core CRUD with `WHERE`/`ORDER BY`/`LIMIT`, indexes, aggregation and `GROUP BY`,
 joins, prepared statements, authentication and TLS, vector search (exact +
 HNSW), parallel OLAP aggregation, and transactions with snapshot isolation.
 
+[0.8.9]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.8.9
 [0.8.8]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.8.8
 [0.8.7]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.8.7
 [0.8.6]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.8.6
