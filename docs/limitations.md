@@ -67,13 +67,22 @@ implemented, so you can judge fit.
   comma cross-joins by estimated (not just raw) row counts, reorders explicit
   INNER-join chains cost-based, and picks hash-join build sides by live size.
   Multi-column/correlated histograms are not modelled.
-- `ORDER BY` is memory-bounded: `ORDER BY ... LIMIT` uses a top-N heap, and
-  large unbounded sorts spill sorted runs to temp files (external merge sort,
-  `ELYRASQL_SORT_MAX_ROWS`). `GROUP BY` with many distinct groups falls back to
-  **partitioned spill** aggregation (rows routed to partitions by group-key
-  hash, spilled to temp files, aggregated per partition) so memory stays
-  bounded; a single skewed partition past `ELYRASQL_GROUP_MAX_GROUPS` still
-  errors. In-transaction reads materialize their working set.
+- **Single-table** `ORDER BY` is memory-bounded: `ORDER BY ... LIMIT` uses a
+  top-N heap and large unbounded sorts spill sorted runs to temp files (external
+  merge sort, `ELYRASQL_SORT_MAX_ROWS`). This spilling path now runs **inside
+  transactions too** (streaming the snapshot+overlay via the session cursor), not
+  just in autocommit. `GROUP BY` with many distinct groups uses **partitioned
+  spill** aggregation (rows routed to partitions by group-key hash, spilled to
+  temp files); when column statistics predict a large group count the planner
+  goes straight to the spilling path instead of running the in-memory pass,
+  hitting the cap, and re-scanning (which previously cost two full scans). A
+  single skewed partition past `ELYRASQL_GROUP_MAX_GROUPS` still errors.
+- **Multi-table joins are still materialized in memory**: `build_from` builds
+  the full join result before `ORDER BY`/`GROUP BY` are applied, so a very large
+  join with sorting/grouping is bounded by the join output size (the sort/group
+  spilling above helps single-table scans, not joined output). Streaming join
+  output (so joins feed the spilling sorter/aggregator directly) is a planned
+  refactor.
 - Spilled `GROUP BY` output is ordered per partition (add `ORDER BY` for a
   defined order).
 

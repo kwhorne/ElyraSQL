@@ -2560,13 +2560,23 @@ pub async fn select(
     // Aggregation / grouping path: parallel streaming aggregation (OLAP).
     if !group_by.is_empty() || aggregate::projection_has_aggregate(&select.projection) {
         let plan = aggregate::build_plan(&def.schema, &select.projection, &group_by)?;
-        let agg = olap_aggregate(db, &def, filter.clone(), &plan).await?;
-        let (schema, out_rows) = if agg.overflowed() {
-            // Too many distinct groups for memory: fall back to partitioned
-            // spill aggregation (bounded memory).
+        // If statistics predict more distinct groups than fit in memory, go
+        // straight to the spilling partitioned aggregation instead of running the
+        // in-memory pass, hitting the cap, and re-scanning from scratch (which
+        // cost two full table scans).
+        let est_groups = estimate_group_count(db, &def, plan.group_cols()).await?;
+        let cap = elyra_olap::default_max_groups() as u64;
+        let (schema, out_rows) = if est_groups.is_some_and(|g| g > cap) {
             partitioned_aggregate(db, &def, filter.clone(), &plan).await?
         } else {
-            plan.finalize(agg)
+            let agg = olap_aggregate(db, &def, filter.clone(), &plan).await?;
+            if agg.overflowed() {
+                // Stats under-estimated (or absent): fall back to the spilling
+                // path (bounded memory).
+                partitioned_aggregate(db, &def, filter.clone(), &plan).await?
+            } else {
+                plan.finalize(agg)
+            }
         };
         let mut out_rows = apply_having(
             select.having.as_ref(),
@@ -2622,30 +2632,40 @@ pub async fn select(
         // stream the filtered rows and sort with a top-N heap (when LIMIT is
         // small) or an external merge sort that spills to disk (OOM safety),
         // instead of materialising the whole result set.
-        if !resolved.is_empty() && !db.in_txn() && !accelerable(&def, filter.as_ref())? {
-            let ncols = def.schema.columns.len();
-            let spec = ScanSpec {
-                projection: (0..ncols).collect(),
-                out_schema: def.schema.clone(),
-                filter: filter.clone(),
-                offset: 0,
-                limit: None,
-            };
-            let mut stream = RowStream::scan(db.raw_db(), &def, spec);
+        if !resolved.is_empty() && !accelerable(&def, filter.as_ref())? {
+            // Stream the (transaction-visible) rows through a spilling sorter so a
+            // large ORDER BY stays memory-bounded. Uses the Session's scan_batch,
+            // which merges the MVCC snapshot with the transaction's own overlay,
+            // so this is correct in autocommit AND inside a transaction (the old
+            // code fell back to a full in-memory sort while in a transaction).
+            let prefix = data_prefix(&def.name);
+            let mut cursor: Option<Vec<u8>> = None;
             let asc: Vec<bool> = resolved.iter().map(|(_, a)| *a).collect();
             let mut sorter =
                 crate::sort::Sorter::new(asc, offset, limit, crate::sort::sort_max_rows());
             loop {
-                let batch = stream.next_batch(4096).await?;
+                let batch = db.scan_batch(prefix.clone(), cursor.clone(), 8192).await?;
                 if batch.is_empty() {
                     break;
                 }
-                for row in batch {
+                let last = batch.len() < 8192;
+                cursor = batch.last().map(|(k, _)| k.clone());
+                for (_, v) in batch {
+                    let row: Vec<Value> =
+                        bincode::deserialize(&v).map_err(|e| Error::Storage(e.to_string()))?;
+                    if let Some(f) = &filter {
+                        if !predicate::matches(f, &def.schema, &row)? {
+                            continue;
+                        }
+                    }
                     let mut keys = Vec::with_capacity(resolved.len());
                     for (e, _) in &resolved {
                         keys.push(predicate::eval_row(e, &def.schema, &row)?);
                     }
                     sorter.push(keys, row)?;
+                }
+                if last {
+                    break;
                 }
             }
             let rows = sorter.finish()?;
@@ -7479,6 +7499,41 @@ async fn olap_aggregate(
         }
     }
     parallel_aggregate(db, def, filter, plan).await
+}
+
+/// Estimate the number of distinct GROUP BY groups from column statistics
+/// (product of per-column NDV). `None` = unknown (not analyzed / a column
+/// without stats), in which case the caller uses the in-memory path with an
+/// overflow fallback. A capped NDV is treated as "very large".
+async fn estimate_group_count(
+    db: &Session,
+    def: &TableDef,
+    group_cols: &[usize],
+) -> Result<Option<u64>> {
+    if group_cols.is_empty() {
+        return Ok(Some(1));
+    }
+    let Some(stats) = catalog::load_stats(db, &def.name).await? else {
+        return Ok(None);
+    };
+    let mut prod = 1u64;
+    for &ci in group_cols {
+        let Some(name) = def.schema.columns.get(ci).map(|c| c.name.as_str()) else {
+            return Ok(None);
+        };
+        let Some(cs) = stats
+            .columns
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(name))
+        else {
+            return Ok(None);
+        };
+        if cs.ndv_capped {
+            return Ok(Some(u64::MAX));
+        }
+        prod = prod.saturating_mul(cs.ndv.max(1));
+    }
+    Ok(Some(prod))
 }
 
 /// Partitioned, spill-to-disk aggregation used when the in-memory aggregation
