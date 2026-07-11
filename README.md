@@ -5,7 +5,7 @@
 A robust, **MySQL-compatible** SQL server written in Rust. Single database
 file, ACID storage, OLAP-ready and vector-native — all under one brand.
 
-> Status: **v0.9.2**. A broad, MySQL-compatible SQL engine: full DDL/DML,
+> Status: **v0.9.3**. A broad, MySQL-compatible SQL engine: full DDL/DML,
 > joins, subqueries (correlated too), CTEs (incl. `WITH RECURSIVE`), window
 > functions, set operations, transactions (snapshot + serializable), a large
 > function catalog, introspection (`SHOW` + `INFORMATION_SCHEMA`), vector search
@@ -21,6 +21,10 @@ file, ACID storage, OLAP-ready and vector-native — all under one brand.
   with memory proportional to the number of groups, not the table size.
 - **Vector-native** — `VECTOR(n)` columns with ANN search, MySQL-flavoured
   distance functions.
+- **AI-native search** — `HYBRID(...)` fuses full-text + vector ranking (RRF)
+  in one query, and `ai_embed('text')` generates embeddings in SQL via an
+  OpenAI-compatible endpoint: the RAG stack in one file, no external search
+  engine.
 - **MIT licensed**, targets **Ubuntu 24.04+** for production, develops
   anywhere Rust runs.
 
@@ -121,7 +125,7 @@ mysql -h 127.0.0.1 -P 3307 -u root -p
 SELECT 1;
 SELECT 1 + 1 AS two;
 SELECT 'hei fra ElyraSQL' AS msg;
-SELECT VERSION();   -- 8.0.0-ElyraSQL-0.9.2
+SELECT VERSION();   -- 8.0.0-ElyraSQL-0.9.3
 ```
 
 ## Configuration
@@ -146,8 +150,8 @@ Static Linux binaries (x86_64 and aarch64) are attached to each
 
 ```bash
 curl -L -o elyrasql.tar.gz \
-  https://github.com/kwhorne/ElyraSQL/releases/download/v0.9.2/elyrasql-0.9.2-linux-x86_64.tar.gz
-tar xzf elyrasql.tar.gz && ./elyrasql-0.9.2-linux-x86_64/elyrasql serve
+  https://github.com/kwhorne/ElyraSQL/releases/download/v0.9.3/elyrasql-0.9.3-linux-x86_64.tar.gz
+tar xzf elyrasql.tar.gz && ./elyrasql-0.9.3-linux-x86_64/elyrasql serve
 ```
 
 ## Docker
@@ -155,7 +159,7 @@ tar xzf elyrasql.tar.gz && ./elyrasql-0.9.2-linux-x86_64/elyrasql serve
 Multi-arch image (amd64 + arm64) on GHCR:
 
 ```bash
-docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:0.9.2
+docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:0.9.3
 # with auth + a persistent volume:
 docker run -p 3307:3307 -v elyra:/var/lib/elyrasql \
   -e ELYRASQL_USER=root -e ELYRASQL_PASSWORD=secret \

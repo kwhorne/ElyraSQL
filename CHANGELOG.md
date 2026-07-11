@@ -4,6 +4,46 @@ All notable changes to ElyraSQL are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.9.3] - 2026-07-10
+
+AI-native search release: hybrid full-text + vector retrieval and in-SQL
+embedding generation — the RAG/AI-app stack in one MySQL-compatible file, no
+external search engine. No on-disk format change.
+
+### Hybrid search
+
+- **`HYBRID(text_col, 'query', vec_col, vector)`** — a first-class ranking
+  primitive that fuses a **vector** (HNSW) ranking and a **full-text** ranking
+  with **Reciprocal Rank Fusion** (RRF, k=60), honouring the query's structured
+  `WHERE` filter:
+
+  ```sql
+  SELECT id, title, HYBRID(body, 'data privacy', embedding, ?) AS score
+  FROM docs WHERE lang = 'en' ORDER BY score DESC LIMIT 10;
+  ```
+
+  The text side uses a `FULLTEXT` index when present (otherwise a scan), the
+  vector side uses the HNSW index, and the fused relevance is exposed via the
+  projection alias. One query, one file — no Elasticsearch/pgvector/reranker.
+
+### In-SQL embeddings
+
+- **`ai_embed('text')`** — calls an OpenAI-compatible `/v1/embeddings` endpoint
+  (cloud, or a local Ollama/LM Studio/llama.cpp/vLLM server) and returns the
+  vector, so query vectors and stored values are generated directly in SQL:
+
+  ```sql
+  SELECT id, HYBRID(body, 'privacy', embedding, ai_embed('privacy')) AS score
+  FROM docs ORDER BY score DESC LIMIT 10;
+  INSERT INTO docs VALUES (1, 'some text', ai_embed('some text'));
+  ```
+
+  Resolved in an async pre-pass (each unique text embedded once and cached, then
+  treated as a vector literal), so all downstream vector operations are
+  unchanged. Configured via `ELYRASQL_AI_EMBED_URL` / `_KEY` / `_MODEL`. HTTP via
+  `ureq` + `ring`, so the static musl builds keep working. Constant arguments
+  only (`ai_embed('query')`); per-row `ai_embed(column)` is future work.
+
 ## [0.9.2] - 2026-07-10
 
 MySQL client & driver compatibility release, driven by testing real GUI tools
@@ -753,6 +793,7 @@ core CRUD with `WHERE`/`ORDER BY`/`LIMIT`, indexes, aggregation and `GROUP BY`,
 joins, prepared statements, authentication and TLS, vector search (exact +
 HNSW), parallel OLAP aggregation, and transactions with snapshot isolation.
 
+[0.9.3]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.9.3
 [0.9.2]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.9.2
 [0.9.1]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.9.1
 [0.9.0]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.9.0
