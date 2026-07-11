@@ -3229,6 +3229,36 @@ pub async fn select(
         None => None,
     };
 
+    // Hybrid-search primitive: `SELECT ..., HYBRID(text_col, 'q', vec_col, vec)
+    // ... FROM t [WHERE ...]` fuses full-text + vector rankings with RRF.
+    if let Some(item) = select.projection.iter().find(|it| {
+        matches!(
+            it,
+            SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. }
+                if hybrid_call(e).is_some()
+        )
+    }) {
+        let e = match item {
+            SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => e,
+            _ => unreachable!(),
+        };
+        let (tcol, tq, vcol, vexpr) = hybrid_call(e).unwrap();
+        return hybrid_select(
+            db,
+            vindex,
+            select,
+            &def,
+            filter.as_ref(),
+            &tcol,
+            &tq,
+            &vcol,
+            vexpr,
+            offset,
+            limit,
+        )
+        .await;
+    }
+
     // SELECT ... FOR UPDATE / FOR SHARE inside a transaction: record the matched
     // rows so a concurrent change to them aborts this transaction at commit
     // (optimistic row locking).
@@ -8157,6 +8187,257 @@ fn ann_query(
         _ => return Ok(None),
     };
     Ok(Some((col, q, k)))
+}
+
+/// Detect a `HYBRID(text_col, 'query', vec_col, vec)` ranking call — the
+/// first-class hybrid-search primitive that fuses full-text and vector
+/// relevance. Returns `(text column, text query, vector column, vector expr)`.
+fn hybrid_call(expr: &Expr) -> Option<(String, String, String, &Expr)> {
+    let Expr::Function(f) = expr else { return None };
+    if !f.name.0.last()?.value.eq_ignore_ascii_case("hybrid") {
+        return None;
+    }
+    let args = fn_arg_exprs(f);
+    if args.len() != 4 {
+        return None;
+    }
+    let text_col = ident_name(args[0])?.to_string();
+    let text_query = match eval_expr(args[1]).ok()? {
+        Value::Text(s) => s,
+        v => v.to_wire_string()?,
+    };
+    let vec_col = ident_name(args[2])?.to_string();
+    Some((text_col, text_query, vec_col, args[3]))
+}
+
+/// `SELECT ..., HYBRID(text_col, 'query', vec_col, '[..]') AS score FROM t
+/// [WHERE ...] ORDER BY score DESC LIMIT k` — fuse a full-text ranking and a
+/// vector (HNSW) ranking with **Reciprocal Rank Fusion**, honouring the
+/// structured `WHERE` filter. One query, one file: no external search engine.
+#[allow(clippy::too_many_arguments)]
+async fn hybrid_select(
+    db: &Session,
+    vindex: &VectorRegistry,
+    select: &Select,
+    def: &TableDef,
+    filter: Option<&Expr>,
+    text_col: &str,
+    text_query: &str,
+    vec_col: &str,
+    vec_expr: &Expr,
+    offset: usize,
+    limit: Option<usize>,
+) -> Result<QueryResult> {
+    use sqlparser::ast::SelectItem;
+    use std::collections::{HashMap, HashSet};
+    const RRF_K: f64 = 60.0;
+    let k = limit.unwrap_or(10);
+    let fanout = (k.max(1) * 10).clamp(50, 500);
+
+    let text_ci = col_of(def, text_col)
+        .ok_or_else(|| Error::Query(format!("HYBRID: unknown column {text_col}")))?;
+    let vec_ci = col_of(def, vec_col)
+        .ok_or_else(|| Error::Query(format!("HYBRID: unknown column {vec_col}")))?;
+    if !matches!(def.schema.columns[vec_ci].ty, ColumnType::Vector(_)) {
+        return Err(Error::Query(format!(
+            "HYBRID: {vec_col} is not a VECTOR column"
+        )));
+    }
+    let qvec = match eval_expr(vec_expr)? {
+        Value::Text(s) => parse_vec_free(&s)?,
+        Value::Vector(v) => v,
+        _ => {
+            return Err(Error::Query(
+                "HYBRID: vector query must be a vector literal".into(),
+            ))
+        }
+    };
+
+    // --- Vector ranking via the HNSW index ---
+    if !def
+        .indexes
+        .iter()
+        .any(|i| i.vector && i.single_col() == Some(vec_ci))
+    {
+        return Err(Error::Query(format!(
+            "HYBRID: {vec_col} has no vector index (CREATE VECTOR INDEX first)"
+        )));
+    }
+    let cached = vindex.get(db, def, vec_ci, Metric::L2).await?;
+    let hits = cached.index.search(&qvec, fanout, (fanout * 2).max(64));
+    let vec_rank: HashMap<Vec<u8>, usize> = hits
+        .iter()
+        .enumerate()
+        .map(|(rank, (node, _))| (cached.keys[*node as usize].clone(), rank))
+        .collect();
+
+    // --- Full-text ranking (term-frequency over stemmed query terms) ---
+    let terms: Vec<String> = text_query
+        .split_whitespace()
+        .map(|w| {
+            w.chars()
+                .filter(|c| c.is_alphanumeric())
+                .collect::<String>()
+        })
+        .filter(|w| !w.is_empty())
+        .map(|w| crate::ft::stem(&w))
+        .collect();
+    let mut ft_score: HashMap<Vec<u8>, u32> = HashMap::new();
+    let ft_idx = def
+        .indexes
+        .iter()
+        .find(|i| i.fulltext && i.single_col() == Some(text_ci));
+    if let Some(idx) = ft_idx {
+        for term in &terms {
+            for dk in index::fulltext_lookup(db, &def.name, &idx.name, term).await? {
+                *ft_score.entry(dk).or_default() += 1;
+            }
+        }
+    } else {
+        // No full-text index: scan and score by distinct query-term presence.
+        let prefix = data_prefix(&def.name);
+        let mut cursor: Option<Vec<u8>> = None;
+        loop {
+            let batch = db.scan_batch(prefix.clone(), cursor.clone(), 4096).await?;
+            if batch.is_empty() {
+                break;
+            }
+            let last = batch.len() < 4096;
+            cursor = batch.last().map(|(k, _)| k.clone());
+            for (kk, v) in batch {
+                let row: Vec<Value> =
+                    bincode::deserialize(&v).map_err(|e| Error::Storage(e.to_string()))?;
+                if let Some(Value::Text(txt)) = row.get(text_ci) {
+                    let doc: HashSet<String> = crate::ft::tokenize(txt).into_iter().collect();
+                    let hitn = terms.iter().filter(|t| doc.contains(*t)).count() as u32;
+                    if hitn > 0 {
+                        ft_score.insert(kk, hitn);
+                    }
+                }
+            }
+            if last {
+                break;
+            }
+        }
+    }
+    let mut ft_sorted: Vec<(Vec<u8>, u32)> = ft_score.into_iter().collect();
+    ft_sorted.sort_by_key(|b| std::cmp::Reverse(b.1));
+    ft_sorted.truncate(fanout);
+    let ft_rank: HashMap<Vec<u8>, usize> = ft_sorted
+        .iter()
+        .enumerate()
+        .map(|(r, (kk, _))| (kk.clone(), r))
+        .collect();
+
+    // --- Reciprocal Rank Fusion ---
+    let mut keys: HashSet<Vec<u8>> = HashSet::new();
+    keys.extend(vec_rank.keys().cloned());
+    keys.extend(ft_rank.keys().cloned());
+    let mut scored: Vec<(Vec<u8>, f64)> = keys
+        .into_iter()
+        .map(|key| {
+            let mut s = 0.0;
+            if let Some(r) = vec_rank.get(&key) {
+                s += 1.0 / (RRF_K + *r as f64);
+            }
+            if let Some(r) = ft_rank.get(&key) {
+                s += 1.0 / (RRF_K + *r as f64);
+            }
+            (key, s)
+        })
+        .collect();
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    // --- Fetch rows, apply the structured WHERE, keep the fused score ---
+    let order: Vec<Vec<u8>> = scored.iter().map(|(k, _)| k.clone()).collect();
+    let blobs = db.multi_get(order).await?;
+    let mut results: Vec<(Vec<Value>, f64)> = Vec::new();
+    for ((_, score), blob) in scored.iter().zip(blobs) {
+        let Some(bytes) = blob else { continue };
+        let row: Vec<Value> =
+            bincode::deserialize(&bytes).map_err(|e| Error::Storage(e.to_string()))?;
+        if let Some(f) = filter {
+            if !predicate::matches(f, &def.schema, &row)? {
+                continue;
+            }
+        }
+        results.push((row, *score));
+    }
+    let start = offset.min(results.len());
+    results.drain(..start);
+    results.truncate(k);
+
+    // --- Project (HYBRID(...) -> the fused score) ---
+    enum P<'a> {
+        Col(usize),
+        Score,
+        Expr(&'a Expr),
+    }
+    let text_col_def = |name: &str, ty: ColumnType| elyra_core::ColumnDef {
+        name: name.to_string(),
+        ty,
+        nullable: true,
+        collation: elyra_core::Collation::Ci,
+    };
+    let mut cols: Vec<elyra_core::ColumnDef> = Vec::new();
+    let mut plan: Vec<P> = Vec::new();
+    for item in &select.projection {
+        match item {
+            SelectItem::Wildcard(_) => {
+                for (i, c) in def.schema.columns.iter().enumerate() {
+                    cols.push(c.clone());
+                    plan.push(P::Col(i));
+                }
+            }
+            SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
+                let alias = match item {
+                    SelectItem::ExprWithAlias { alias, .. } => Some(alias.value.clone()),
+                    _ => None,
+                };
+                if hybrid_call(e).is_some() {
+                    cols.push(text_col_def(
+                        &alias.unwrap_or_else(|| "score".into()),
+                        ColumnType::Float,
+                    ));
+                    plan.push(P::Score);
+                } else if let Some(ci) = ident_name(e).and_then(|n| col_of(def, n)) {
+                    let mut c = def.schema.columns[ci].clone();
+                    if let Some(a) = alias {
+                        c.name = a;
+                    }
+                    cols.push(c);
+                    plan.push(P::Col(ci));
+                } else {
+                    cols.push(text_col_def(
+                        &alias.unwrap_or_else(|| e.to_string()),
+                        ColumnType::Text,
+                    ));
+                    plan.push(P::Expr(e));
+                }
+            }
+            _ => {
+                return Err(Error::Unsupported(
+                    "unsupported HYBRID projection item".into(),
+                ))
+            }
+        }
+    }
+    let mut out_rows = Vec::with_capacity(results.len());
+    for (row, score) in &results {
+        let mut orow = Vec::with_capacity(plan.len());
+        for p in &plan {
+            orow.push(match p {
+                P::Col(i) => row.get(*i).cloned().unwrap_or(Value::Null),
+                P::Score => Value::Float(*score),
+                P::Expr(e) => predicate::eval_row(e, &def.schema, row)?,
+            });
+        }
+        out_rows.push(orow);
+    }
+    Ok(QueryResult::Rows(RowStream::literal(
+        Schema::new(cols),
+        out_rows,
+    )))
 }
 
 fn fn_arg_exprs(f: &sqlparser::ast::Function) -> Vec<&Expr> {

@@ -64,3 +64,37 @@ exact search.
 !!! tip
     Build the index once your vectors are loaded. The first query after a
     change pays a one-time rebuild cost; subsequent queries are cached.
+
+## Hybrid search (full-text + vector, fused)
+
+ElyraSQL fuses **full-text relevance** and **vector similarity** into a single
+ranking with the `HYBRID(...)` primitive, honouring your structured `WHERE`
+filter — no external search engine, one query, one file:
+
+```sql
+SELECT id, title,
+       HYBRID(body, 'data privacy law', embedding, '[0.12, 0.03, ...]') AS score
+FROM docs
+WHERE lang = 'en'                 -- structured filter
+ORDER BY score DESC
+LIMIT 10;
+```
+
+`HYBRID(text_col, 'text query', vector_col, vector)`:
+
+1. Ranks documents by **vector** nearest-neighbour (the HNSW index on
+   `vector_col`).
+2. Ranks documents by **full-text** term frequency over the stemmed query terms
+   (using a `FULLTEXT` index on `text_col` when present, otherwise a scan).
+3. Fuses the two rankings with **Reciprocal Rank Fusion** (RRF, `k = 60`), so a
+   document ranked highly by *both* signals rises to the top.
+4. Applies the query's `WHERE` filter and returns the top `LIMIT` rows, with the
+   fused relevance exposed as the aliased column (`score` above).
+
+Requirements and notes:
+
+- The vector column needs a vector index (`CREATE INDEX ... ON t (embedding)`);
+  a `FULLTEXT` index on the text column makes the text side index-accelerated.
+- Weights are currently equal; the fan-out (candidates considered per side)
+  scales with `LIMIT`. Reference the primitive by alias in `ORDER BY` /
+  projection as shown.
