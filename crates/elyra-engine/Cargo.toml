@@ -15,6 +15,10 @@ sqlparser.workspace = true
 regex.workspace = true
 # Snowball stemmers (English + many other languages) for full-text search.
 rust-stemmers = "1.2"
+# HTTP client for ai_embed() (OpenAI-compatible embeddings). rustls+ring keeps
+# the static musl builds working (no aws-lc-rs).
+ureq = { version = "2", features = ["json"] }
+serde_json = "1"
 tokio = { workspace = true }
 bincode.workspace = true
 serde.workspace = true

@@ -98,3 +98,37 @@ Requirements and notes:
 - Weights are currently equal; the fan-out (candidates considered per side)
   scales with `LIMIT`. Reference the primitive by alias in `ORDER BY` /
   projection as shown.
+
+## Generating embeddings in SQL: `ai_embed()`
+
+`ai_embed('text')` calls an **OpenAI-compatible embeddings endpoint** and
+returns the vector, so query vectors and stored values can be produced directly
+in SQL — no separate embedding step in your app:
+
+```sql
+-- generate the query vector inline
+SELECT id, title
+FROM docs
+ORDER BY VEC_DISTANCE(embedding, ai_embed('data privacy law'))
+LIMIT 10;
+
+-- ... and combine with hybrid search
+SELECT id, HYBRID(body, 'privacy', embedding, ai_embed('privacy')) AS score
+FROM docs ORDER BY score DESC LIMIT 10;
+
+-- populate embeddings on insert
+INSERT INTO docs VALUES (1, 'some text', ai_embed('some text'));
+```
+
+Configure the provider with environment variables:
+
+| Variable | Description |
+|----------|-------------|
+| `ELYRASQL_AI_EMBED_URL` | Embeddings endpoint (e.g. `https://api.openai.com/v1/embeddings`, or a local `http://localhost:11434/v1/embeddings` for Ollama/LM Studio/llama.cpp/vLLM). |
+| `ELYRASQL_AI_EMBED_KEY` | Bearer API key (optional for local servers). |
+| `ELYRASQL_AI_EMBED_MODEL` | Model name (default `text-embedding-3-small`). |
+
+- Each unique text is embedded **once** (resolved in an async pre-pass and
+  cached per model+text), then treated as a normal vector literal.
+- Only **constant** arguments are supported (`ai_embed('query')`); per-row
+  `ai_embed(column)` is not yet supported for large scans.

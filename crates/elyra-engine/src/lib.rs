@@ -8,6 +8,7 @@
 
 mod aggregate;
 mod aggspill;
+mod aiembed;
 mod catalog;
 mod eval;
 mod exec;
@@ -1136,6 +1137,10 @@ impl Engine {
 
         let mut out = Vec::with_capacity(statements.len());
         for stmt in statements {
+            // Resolve ai_embed('...') calls (embed once, substitute a vector
+            // literal) before anything inspects the statement.
+            let mut stmt = stmt;
+            aiembed::resolve_stmt(&mut stmt).await?;
             let need = required_privilege(&stmt);
             let effective = self
                 .effective_privilege(privilege, user, &stmt, sess)
