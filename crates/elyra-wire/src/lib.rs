@@ -104,6 +104,7 @@ use crate::{commands::ClientHandshake, packet_reader::PacketReader, packet_write
 
 const SCRAMBLE_SIZE: usize = 20;
 const MYSQL_NATIVE_PASSWORD: &str = "mysql_native_password";
+const CACHING_SHA2_PASSWORD: &str = "caching_sha2_password";
 
 #[async_trait]
 /// Implementors of this async-trait can be used to drive a MySQL-compatible database backend.
@@ -156,6 +157,31 @@ pub trait AsyncMysqlShim<W: Send> {
         _auth_data: &[u8],
     ) -> bool {
         true
+    }
+
+    /// `caching_sha2_password`: whether this account needs a password, so the
+    /// full-authentication exchange must run (false for open mode / no-password
+    /// accounts, which succeed immediately).
+    async fn caching_sha2_requires_password(&self, _username: &[u8]) -> bool {
+        true
+    }
+
+    /// `caching_sha2_password`: verify a cleartext password (obtained over TLS,
+    /// or decrypted from the RSA exchange on a plaintext connection).
+    async fn caching_sha2_verify(&self, _username: &[u8], _password: &[u8]) -> bool {
+        false
+    }
+
+    /// `caching_sha2_password`: PEM of the RSA public key clients use to encrypt
+    /// the password on a non-TLS connection.
+    fn caching_sha2_public_key(&self) -> Vec<u8> {
+        Vec::new()
+    }
+
+    /// `caching_sha2_password`: RSA-decrypt a full-auth ciphertext, yielding
+    /// `password XOR nonce` (the caller un-XORs with the scramble).
+    fn caching_sha2_decrypt(&self, _ciphertext: &[u8]) -> Option<Vec<u8>> {
+        None
     }
 
     /// Called when the client issues a request to prepare `query` for later execution.
@@ -246,6 +272,86 @@ where
     /// disconnects or an error occurs.
     pub async fn run_on(shim: B, stream: R, output_stream: W) -> Result<(), B::Error> {
         Self::run_with_options(shim, stream, output_stream, &Default::default()).await
+    }
+
+    /// Drive the `caching_sha2_password` authentication exchange. We keep no
+    /// SHA-256 password cache, so we always run *full* authentication, obtaining
+    /// the cleartext password over TLS or via the RSA exchange on a plaintext
+    /// connection, then verifying it through the shim. Empty-password / open
+    /// accounts short-circuit to fast success. Leaves the writer positioned for
+    /// the following OK/init packet.
+    async fn caching_sha2_auth(
+        &mut self,
+        username: &[u8],
+        scramble: &[u8],
+        initial: &[u8],
+        is_secure: bool,
+        seq: &mut u8,
+    ) -> Result<bool, B::Error> {
+        let aborted =
+            || io::Error::new(io::ErrorKind::ConnectionAborted, "peer terminated connection");
+
+        // No password required (open mode / empty-password account).
+        if initial.is_empty() || !self.shim.caching_sha2_requires_password(username).await {
+            // No password: skip fast_auth_success and let the caller send OK
+            // directly (the writer is already positioned at seq+1).
+            let ok = self.shim.caching_sha2_verify(username, b"").await
+                || !self.shim.caching_sha2_requires_password(username).await;
+            return Ok(ok);
+        }
+
+        // Request full authentication.
+        self.writer.set_seq(*seq + 1);
+        self.writer.write_all(&[0x01, 0x04])?; // AuthMoreData: perform_full_authentication
+        self.writer.end_packet().await?;
+        self.writer.flush_all().await?;
+
+        let (rseq, data) = self.reader.next_async().await?.ok_or_else(aborted)?;
+        *seq = rseq;
+        let data = data.to_vec();
+
+        let strip_nul = |b: &[u8]| -> Vec<u8> {
+            let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
+            b[..end].to_vec()
+        };
+        let unxor = |enc: Vec<u8>| -> Vec<u8> {
+            if scramble.is_empty() {
+                return enc;
+            }
+            enc.iter()
+                .enumerate()
+                .map(|(i, b)| b ^ scramble[i % scramble.len()])
+                .collect()
+        };
+
+        let cleartext: Vec<u8> = if is_secure {
+            // Over TLS the client sends the cleartext password (null-terminated).
+            strip_nul(&data)
+        } else if data == [0x02] {
+            // Plaintext: client requested the RSA public key.
+            let pem = self.shim.caching_sha2_public_key();
+            self.writer.set_seq(*seq + 1);
+            self.writer.write_all(&[0x01])?; // AuthMoreData
+            self.writer.write_all(&pem)?;
+            self.writer.end_packet().await?;
+            self.writer.flush_all().await?;
+            let (rseq, enc) = self.reader.next_async().await?.ok_or_else(aborted)?;
+            *seq = rseq;
+            match self.shim.caching_sha2_decrypt(&enc) {
+                Some(xored) => strip_nul(&unxor(xored)),
+                None => return Ok(false),
+            }
+        } else {
+            // Client encrypted with a cached public key (no request first).
+            match self.shim.caching_sha2_decrypt(&data) {
+                Some(xored) => strip_nul(&unxor(xored)),
+                None => strip_nul(&data),
+            }
+        };
+
+        let ok = self.shim.caching_sha2_verify(username, &cleartext).await;
+        self.writer.set_seq(*seq + 1);
+        Ok(ok)
     }
 
     /// Create a new server over two one-way channels and process client commands until the client
@@ -469,7 +575,8 @@ where
             self.client_capabilities = handshake.capabilities;
             let mut auth_response = handshake.auth_response.clone();
             if let Some(username) = &handshake.username {
-                let auth_plugin_expect = self.shim.auth_plugin_for_username(username).await;
+                let auth_plugin_expect =
+                    self.shim.auth_plugin_for_username(username).await.to_string();
 
                 // auth switch
                 if !auth_plugin_expect.is_empty()
@@ -502,16 +609,27 @@ where
 
                 self.writer.set_seq(seq + 1);
 
-                if !self
-                    .shim
-                    .authenticate(
-                        auth_plugin_expect,
+                let is_secure = handshake.capabilities.contains(CapabilityFlags::CLIENT_SSL);
+                let authenticated = if auth_plugin_expect == CACHING_SHA2_PASSWORD {
+                    self.caching_sha2_auth(
                         username,
                         &scramble,
                         auth_response.as_slice(),
+                        is_secure,
+                        &mut seq,
                     )
-                    .await
-                {
+                    .await?
+                } else {
+                    self.shim
+                        .authenticate(
+                            &auth_plugin_expect,
+                            username,
+                            &scramble,
+                            auth_response.as_slice(),
+                        )
+                        .await
+                };
+                if !authenticated {
                     let err_msg = format!(
                         "Authenticate failed, user: {:?}, auth_plugin: {:?}",
                         String::from_utf8_lossy(username),

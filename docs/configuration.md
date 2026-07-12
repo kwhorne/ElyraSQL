@@ -38,6 +38,7 @@ variable fallback (handy for systemd and containers).
 | `ELYRASQL_PASSWORD_POLICY` | `on` | Set to `off` to disable the password-strength policy. |
 | `ELYRASQL_PASSWORD_MIN_LEN` | `8` | Minimum password length when the policy is on. |
 | `ELYRASQL_PASSWORD_REQUIRE_MIXED` | `on` | Require mixed character classes when the policy is on. |
+| `ELYRASQL_AUTH_PLUGIN` | `mysql_native_password` | Authentication plugin advertised in the handshake. Set to `caching_sha2_password` for MySQL 8's default plugin: full authentication over TLS (cleartext) or a plaintext connection (RSA-encrypted password); no server-side password change required. `mysql_native_password` (the default) works with every client and is the safe choice. |
 | `ELYRASQL_AUTH_MAX_FAILURES` | `10` | Failed logins before an account is temporarily locked out. |
 | `ELYRASQL_AUTH_LOCKOUT_SECS` | `60` | Lockout duration after too many failed logins. |
 | `ELYRASQL_CLUSTER_SECRET` | — | Shared secret authenticating cluster/replication connections (challenge-response). Strongly recommended for any multi-node deployment. |

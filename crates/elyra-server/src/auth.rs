@@ -1,9 +1,13 @@
-//! Authentication for the MySQL protocol (`mysql_native_password`).
+//! Authentication for the MySQL protocol: `mysql_native_password` (default) and
+//! `caching_sha2_password` (MySQL 8's default plugin, opt-in via
+//! `ELYRASQL_AUTH_PLUGIN`).
 //!
 //! Passwords are never stored in plaintext: ElyraSQL keeps
 //! `SHA1(SHA1(password))` (the same digest MySQL stores in
-//! `authentication_string`) and verifies the challenge/response without ever
-//! reconstructing the password.
+//! `authentication_string`). native_password verifies the challenge/response
+//! against it; caching_sha2 obtains the cleartext (over TLS, or RSA-decrypted on
+//! a plaintext connection) and checks `SHA1(SHA1(cleartext))` against the stored
+//! digest -- the password is never persisted in the clear.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -51,6 +55,28 @@ pub struct Auth {
     db: Option<Db>,
     /// Per-account failed-login state for brute-force lockout.
     failures: Mutex<HashMap<String, FailState>>,
+    /// RSA keypair for `caching_sha2_password` full auth over a non-TLS channel
+    /// (the client encrypts the password with this key). Generated on first use.
+    rsa: std::sync::OnceLock<RsaKey>,
+}
+
+struct RsaKey {
+    private: rsa::RsaPrivateKey,
+    public_pem: String,
+}
+
+fn generate_rsa() -> RsaKey {
+    use rsa::pkcs8::EncodePublicKey;
+    let mut rng = rand::thread_rng();
+    let private = rsa::RsaPrivateKey::new(&mut rng, 2048).expect("RSA keygen");
+    let public = rsa::RsaPublicKey::from(&private);
+    let public_pem = public
+        .to_public_key_pem(rsa::pkcs8::LineEnding::LF)
+        .expect("RSA public PEM");
+    RsaKey {
+        private,
+        public_pem,
+    }
 }
 
 impl Auth {
@@ -61,6 +87,7 @@ impl Auth {
             bootstrap: HashMap::new(),
             db: None,
             failures: Mutex::new(HashMap::new()),
+            rsa: std::sync::OnceLock::new(),
         }
     }
 
@@ -83,6 +110,7 @@ impl Auth {
             bootstrap,
             db: None,
             failures: Mutex::new(HashMap::new()),
+            rsa: std::sync::OnceLock::new(),
         }
     }
 
@@ -219,6 +247,79 @@ impl Auth {
             stage1[i] = auth_data[i] ^ token[i];
         }
         ct_eq(&sha1(&stage1), stored)
+    }
+
+    /// Whether an account needs a password (so `caching_sha2_password` must run
+    /// full authentication). Open mode and empty-password accounts do not.
+    pub fn requires_password(&self, username: &[u8]) -> bool {
+        if self.is_open() {
+            return false;
+        }
+        match std::str::from_utf8(username).ok().and_then(|u| self.lookup(u)) {
+            Some((stored, _)) => !ct_eq(&stored, &double_sha1(b"")),
+            None => true, // unknown user: force full auth (which then fails)
+        }
+    }
+
+    /// Verify a cleartext password (the `caching_sha2_password` full-auth path),
+    /// with the same brute-force lockout accounting as [`verify`].
+    pub fn verify_cleartext(&self, username: &[u8], password: &[u8]) -> bool {
+        if self.is_open() {
+            return true;
+        }
+        let Ok(user) = std::str::from_utf8(username) else {
+            return false;
+        };
+        let threshold = max_failures();
+        if threshold > 0 {
+            let locked = self
+                .failures
+                .lock()
+                .unwrap()
+                .get(user)
+                .and_then(|f| f.locked_until)
+                .is_some_and(|t| Instant::now() < t);
+            if locked {
+                warn!(user, "authentication rejected: account temporarily locked");
+                return false;
+            }
+        }
+        let ok = match self.lookup(user) {
+            Some((stored, _)) => ct_eq(&double_sha1(password), &stored),
+            None => false,
+        };
+        if threshold > 0 {
+            let mut map = self.failures.lock().unwrap();
+            if ok {
+                map.remove(user);
+            } else {
+                let f = map.entry(user.to_string()).or_default();
+                f.fails += 1;
+                if f.fails >= threshold {
+                    f.locked_until =
+                        Some(Instant::now() + std::time::Duration::from_secs(lockout_secs()));
+                    f.fails = 0;
+                    warn!(user, "account locked after too many failed logins");
+                } else {
+                    warn!(user, fails = f.fails, "failed login");
+                }
+            }
+        }
+        ok
+    }
+
+    /// PEM (SPKI) of the RSA public key clients use to encrypt the password for
+    /// `caching_sha2_password` full auth over a non-TLS connection.
+    pub fn caching_sha2_public_key_pem(&self) -> String {
+        self.rsa.get_or_init(generate_rsa).public_pem.clone()
+    }
+
+    /// Decrypt an RSA-OAEP(SHA-1) ciphertext from a `caching_sha2_password`
+    /// full-auth exchange (returns `password XOR nonce`, still to be un-XORed).
+    pub fn caching_sha2_decrypt(&self, ciphertext: &[u8]) -> Option<Vec<u8>> {
+        let key = self.rsa.get_or_init(generate_rsa);
+        let padding = rsa::Oaep::new::<sha1::Sha1>();
+        key.private.decrypt(padding, ciphertext).ok()
     }
 }
 

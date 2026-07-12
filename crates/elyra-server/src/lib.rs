@@ -73,13 +73,12 @@ pub fn load_tls(
         .map_err(|e| Error::new(ErrorKind::InvalidInput, e))
 }
 
-// Prepared statements (COM_STMT_PREPARE/EXECUTE) are implemented by counting
-// `?` placeholders and binding parameters as SQL literals at execute time.
-// Verified working: prepare + (repeated) execute with typed params, escaping,
-// and INSERT/SELECT/UPDATE. Known upstream limitation: the opensrv-mysql 0.7
-// wire layer can desync across repeated COM_STMT_CLOSE -> COM_STMT_PREPARE
-// cycles on one connection; pooled clients that cache prepared statements
-// (the common case) and PyMySQL-style client-side binding are unaffected.
+// Prepared statements (COM_STMT_PREPARE/EXECUTE) bind parameters as SQL literals
+// at execute time; describe_query reports an exact result-column count at PREPARE
+// so native (binary) prepared statements read the result set correctly. Emulated
+// (client-side) prepares are the recommended setting for maximum compatibility.
+// The MySQL wire layer is our first-party elyra-wire crate (forked from
+// opensrv-mysql), which also implements caching_sha2_password auth.
 
 /// A parsed prepared statement: the SQL template and its placeholder count.
 struct Prepared {
@@ -109,7 +108,29 @@ pub struct ElyraShim {
     audit: Option<Arc<AuditLog>>,
 }
 
+/// The wire auth plugin advertised in the handshake, from `ELYRASQL_AUTH_PLUGIN`
+/// (`mysql_native_password` by default, or `caching_sha2_password`). Cached.
+fn configured_auth_plugin() -> &'static str {
+    use std::sync::OnceLock;
+    static P: OnceLock<&'static str> = OnceLock::new();
+    P.get_or_init(
+        || match std::env::var("ELYRASQL_AUTH_PLUGIN").ok().as_deref() {
+            Some("caching_sha2_password") | Some("caching_sha2") => "caching_sha2_password",
+            _ => "mysql_native_password",
+        },
+    )
+}
+
 impl ElyraShim {
+    /// Record privilege + username on a successful authentication (shared by the
+    /// native-password and caching_sha2 paths).
+    fn on_auth_success(&self, username: &[u8]) {
+        *self.privilege.lock().unwrap() = self.auth.privilege(username);
+        let name = String::from_utf8_lossy(username).into_owned();
+        *self.user.lock().unwrap() = name.clone();
+        self.procs.set_user(self.conn_id, name);
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         engine: Engine,
@@ -237,11 +258,11 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for ElyraShim {
     }
 
     fn default_auth_plugin(&self) -> &str {
-        "mysql_native_password"
+        configured_auth_plugin()
     }
 
     async fn auth_plugin_for_username(&self, _user: &[u8]) -> &str {
-        "mysql_native_password"
+        configured_auth_plugin()
     }
 
     /// Per-connection salt. Must be stable across calls (opensrv reads it for
@@ -259,12 +280,29 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for ElyraShim {
     ) -> bool {
         let ok = self.auth.verify(username, salt, auth_data);
         if ok {
-            *self.privilege.lock().unwrap() = self.auth.privilege(username);
-            let name = String::from_utf8_lossy(username).into_owned();
-            *self.user.lock().unwrap() = name.clone();
-            self.procs.set_user(self.conn_id, name);
+            self.on_auth_success(username);
         }
         ok
+    }
+
+    async fn caching_sha2_requires_password(&self, username: &[u8]) -> bool {
+        self.auth.requires_password(username)
+    }
+
+    async fn caching_sha2_verify(&self, username: &[u8], password: &[u8]) -> bool {
+        let ok = self.auth.verify_cleartext(username, password);
+        if ok {
+            self.on_auth_success(username);
+        }
+        ok
+    }
+
+    fn caching_sha2_public_key(&self) -> Vec<u8> {
+        self.auth.caching_sha2_public_key_pem().into_bytes()
+    }
+
+    fn caching_sha2_decrypt(&self, ciphertext: &[u8]) -> Option<Vec<u8>> {
+        self.auth.caching_sha2_decrypt(ciphertext)
     }
 
     async fn on_prepare<'a>(
