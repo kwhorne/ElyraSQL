@@ -7395,6 +7395,67 @@ fn compute_partition(
                 }
             }
         }
+        "ntile" => {
+            let buckets = args
+                .first()
+                .and_then(|e| predicate::eval_row(e, schema, &rows[idxs[0]]).ok())
+                .and_then(|v| v.as_f64())
+                .unwrap_or(1.0)
+                .max(1.0) as usize;
+            let n = idxs.len();
+            // Distribute n rows into `buckets` groups; the first (n % buckets)
+            // groups get one extra row (MySQL semantics).
+            let base = n / buckets;
+            let rem = n % buckets;
+            let mut pos = 0usize;
+            for b in 0..buckets {
+                let size = base + if b < rem { 1 } else { 0 };
+                for _ in 0..size {
+                    if pos < n {
+                        result[idxs[pos]] = Value::Int(b as i64 + 1);
+                        pos += 1;
+                    }
+                }
+            }
+        }
+        "first_value" => {
+            // Frame starts at the partition start by default, so this is the
+            // first ordered row's value.
+            let v = if idxs.is_empty() {
+                Value::Null
+            } else {
+                arg_val(idxs[0])?
+            };
+            for &i in idxs {
+                result[i] = v.clone();
+            }
+        }
+        "last_value" => {
+            // Whole-partition last value (the common intent); explicit frames are
+            // not applied to LAST_VALUE here.
+            let v = match idxs.last() {
+                Some(&last) => arg_val(last)?,
+                None => Value::Null,
+            };
+            for &i in idxs {
+                result[i] = v.clone();
+            }
+        }
+        "nth_value" => {
+            let nth = args
+                .get(1)
+                .and_then(|e| predicate::eval_row(e, schema, &rows[idxs[0]]).ok())
+                .and_then(|v| v.as_f64())
+                .unwrap_or(1.0) as usize;
+            let v = if nth >= 1 && nth <= idxs.len() {
+                arg_val(idxs[nth - 1])?
+            } else {
+                Value::Null
+            };
+            for &i in idxs {
+                result[i] = v.clone();
+            }
+        }
         other => {
             return Err(Error::Unsupported(format!(
                 "window function not supported: {other}"

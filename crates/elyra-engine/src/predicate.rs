@@ -65,6 +65,19 @@ pub fn eval_row(expr: &Expr, schema: &Schema, row: &[Value]) -> Result<Value> {
         }
         Expr::IsNull(e) => Ok(Value::Bool(eval_row(e, schema, row)?.is_null())),
         Expr::IsNotNull(e) => Ok(Value::Bool(!eval_row(e, schema, row)?.is_null())),
+        // `x IS [NOT] TRUE/FALSE/UNKNOWN` (NULL is UNKNOWN, never TRUE/FALSE).
+        Expr::IsTrue(e) => Ok(Value::Bool(truthy(&eval_row(e, schema, row)?))),
+        Expr::IsNotTrue(e) => Ok(Value::Bool(!truthy(&eval_row(e, schema, row)?))),
+        Expr::IsFalse(e) => {
+            let v = eval_row(e, schema, row)?;
+            Ok(Value::Bool(!v.is_null() && !truthy(&v)))
+        }
+        Expr::IsNotFalse(e) => {
+            let v = eval_row(e, schema, row)?;
+            Ok(Value::Bool(v.is_null() || truthy(&v)))
+        }
+        Expr::IsUnknown(e) => Ok(Value::Bool(eval_row(e, schema, row)?.is_null())),
+        Expr::IsNotUnknown(e) => Ok(Value::Bool(!eval_row(e, schema, row)?.is_null())),
         Expr::UnaryOp { op, expr } => {
             let v = eval_row(expr, schema, row)?;
             match (op, v) {
@@ -1167,6 +1180,55 @@ fn eval_scalar(name: &str, a: &[Value]) -> Result<Option<Value>> {
                 None => Value::Null,
             }
         }
+        "radians" => match nnum(a, 0) {
+            Some(x) => Value::Float(x.to_radians()),
+            None => Value::Null,
+        },
+        "degrees" => match nnum(a, 0) {
+            Some(x) => Value::Float(x.to_degrees()),
+            None => Value::Null,
+        },
+        "char" => {
+            let s: String = a
+                .iter()
+                .filter_map(|v| v.as_f64())
+                .filter_map(|n| char::from_u32(n as u32))
+                .collect();
+            Value::Text(s)
+        }
+        "time_to_sec" => match &a[0] {
+            Value::Time(m) => Value::Int(m / 1_000_000),
+            Value::Null => Value::Null,
+            v => match sstr(std::slice::from_ref(v), 0).and_then(|s| parse_hms(&s)) {
+                Some(sec) => Value::Int(sec),
+                None => Value::Null,
+            },
+        },
+        "sec_to_time" => match nnum(a, 0) {
+            Some(n) => Value::Time((n as i64).rem_euclid(86_400) * 1_000_000),
+            None => Value::Null,
+        },
+        "soundex" => match sstr(a, 0) {
+            Some(s) => Value::Text(soundex(&s)),
+            None => Value::Null,
+        },
+        "regexp_replace" => match (sstr(a, 0), sstr(a, 1), sstr(a, 2)) {
+            (Some(s), Some(pat), Some(rep)) => match regex::Regex::new(&pat) {
+                Ok(re) => Value::Text(re.replace_all(&s, rep.as_str()).into_owned()),
+                Err(_) => Value::Null,
+            },
+            _ => Value::Null,
+        },
+        "regexp_substr" => match (sstr(a, 0), sstr(a, 1)) {
+            (Some(s), Some(pat)) => match regex::Regex::new(&pat) {
+                Ok(re) => re
+                    .find(&s)
+                    .map(|m| Value::Text(m.as_str().to_string()))
+                    .unwrap_or(Value::Null),
+                Err(_) => Value::Null,
+            },
+            _ => Value::Null,
+        },
         "from_unixtime" => match nnum(a, 0) {
             Some(secs) => {
                 let m = (secs as i64).saturating_mul(1_000_000);
@@ -1562,6 +1624,52 @@ fn date_part(v: &Value, unit: &str) -> Value {
         "dayofyear" | "doy" => days - elyra_core::datetime::days_from_civil(y, 1, 1) + 1,
         _ => return Value::Null,
     })
+}
+
+/// Parse an `[H]H:MM:SS` time string to seconds (for TIME_TO_SEC).
+fn parse_hms(s: &str) -> Option<i64> {
+    let neg = s.starts_with('-');
+    let mut it = s.trim_start_matches('-').split(':');
+    let h: i64 = it.next()?.trim().parse().ok()?;
+    let m: i64 = it.next()?.trim().parse().ok()?;
+    let sec: i64 = it.next().unwrap_or("0").trim().parse().ok()?;
+    let total = h * 3600 + m * 60 + sec;
+    Some(if neg { -total } else { total })
+}
+
+/// MySQL-compatible SOUNDEX code (letter + up to three digits).
+fn soundex(input: &str) -> String {
+    let code = |c: char| match c.to_ascii_uppercase() {
+        'B' | 'F' | 'P' | 'V' => b'1',
+        'C' | 'G' | 'J' | 'K' | 'Q' | 'S' | 'X' | 'Z' => b'2',
+        'D' | 'T' => b'3',
+        'L' => b'4',
+        'M' | 'N' => b'5',
+        'R' => b'6',
+        _ => 0,
+    };
+    let letters: Vec<char> = input.chars().filter(|c| c.is_ascii_alphabetic()).collect();
+    if letters.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    out.push(letters[0].to_ascii_uppercase());
+    let mut last = code(letters[0]);
+    for &c in &letters[1..] {
+        let d = code(c);
+        if d != 0 && d != last {
+            out.push(d as char);
+        }
+        // H and W are transparent (don't reset the previous code); others do.
+        if !matches!(c.to_ascii_uppercase(), 'H' | 'W') {
+            last = d;
+        }
+    }
+    // MySQL pads to at least 4 characters.
+    while out.len() < 4 {
+        out.push('0');
+    }
+    out
 }
 
 /// Lowercase hex encoding of a digest (for MD5/SHA* SQL functions).
@@ -2101,6 +2209,17 @@ fn binary(
     match op {
         And => return Ok(Value::Bool(truthy(&l) && truthy(&eval_right()?))),
         Or => return Ok(Value::Bool(truthy(&l) || truthy(&eval_right()?))),
+        // `<=>` null-safe equality: NULL<=>NULL is true, NULL<=>x is false.
+        Spaceship => {
+            let r = eval_right()?;
+            return Ok(Value::Bool(match (l.is_null(), r.is_null()) {
+                (true, true) => true,
+                (true, false) | (false, true) => false,
+                (false, false) => cmp(&l, &r, cmp_collation(lexpr, rexpr, schema))?
+                    .map(|o| o.is_eq())
+                    .unwrap_or(false),
+            }));
+        }
         _ => {}
     }
     let r = eval_right()?;
