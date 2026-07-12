@@ -673,6 +673,13 @@ async fn handle_connection(
         let cfg = tls.expect("client negotiated TLS without a server config");
         secure_run_with_options(shim, w, opts, cfg, init).await
     } else {
+        // Buffer the socket writes. opensrv issues one `write_vectored` syscall
+        // per row packet and flushes after each command, so an unbuffered
+        // TcpStream meant a syscall per result row -- the dominant cost for
+        // large result sets. A BufWriter coalesces rows into ~64 KiB writes;
+        // opensrv's per-command flush still drains it, so responses are prompt.
+        // (TLS is left unbuffered: its handshake needs immediate flushes.)
+        let w = tokio::io::BufWriter::with_capacity(64 * 1024, w);
         plain_run_with_options(shim, w, opts, init).await
     }
 }

@@ -9,6 +9,7 @@ description = "ElyraSQL analytical (OLAP) query acceleration"
 [dependencies]
 elyra-core.workspace = true
 elyra-storage.workspace = true
+indexmap = "2"
 
 # NOTE: the columnar analytics engine (DataFusion/Arrow) is added here in the
 # OLAP milestone. Kept out of the initial build to keep compile times low.

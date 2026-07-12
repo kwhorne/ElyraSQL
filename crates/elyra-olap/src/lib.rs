@@ -8,7 +8,8 @@
 //! to the number of groups, not the table size.
 
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use indexmap::IndexMap;
+use std::collections::HashSet;
 use std::hash::{BuildHasherDefault, Hasher};
 
 /// Fast, non-cryptographic hasher (FxHash, as used by rustc/Firefox) for the
@@ -112,9 +113,10 @@ impl Acc {
 pub struct GroupAggregator {
     group_cols: Vec<usize>,
     aggs: Vec<AggSpec>,
-    /// key -> (sample row for group columns, per-agg accumulators)
-    groups: HashMap<Vec<u8>, (Vec<Value>, Vec<Acc>), FxBuild>,
-    order: Vec<Vec<u8>>,
+    /// key -> (sample row for group columns, per-agg accumulators), in
+    /// first-seen insertion order (IndexMap), so there is no separate order
+    /// vector and each group key is allocated exactly once.
+    groups: IndexMap<Vec<u8>, (Vec<Value>, Vec<Acc>), FxBuild>,
     /// Cap on distinct groups (0 = unlimited); protects against OOM.
     max_groups: usize,
     /// Set once the cap is hit; the aggregation is then incomplete.
@@ -141,8 +143,7 @@ impl GroupAggregator {
         GroupAggregator {
             group_cols,
             aggs,
-            groups: HashMap::default(),
-            order: Vec::new(),
+            groups: IndexMap::default(),
             max_groups: default_max_groups(),
             overflow: false,
             key_buf: Vec::new(),
@@ -170,7 +171,7 @@ impl GroupAggregator {
             return;
         }
         // New group. At/over the cap, refuse to create it (bounding memory).
-        if self.max_groups > 0 && self.order.len() >= self.max_groups {
+        if self.max_groups > 0 && self.groups.len() >= self.max_groups {
             self.overflow = true;
             return;
         }
@@ -181,16 +182,16 @@ impl GroupAggregator {
                 .map(|c| row.get(c).cloned().unwrap_or(Value::Null));
             update(&mut accs[i], spec.func, v, spec.distinct);
         }
-        let key = self.key_buf.clone();
-        self.order.push(key.clone());
-        self.groups.insert(key, (row.to_vec(), accs));
+        self.groups.insert(self.key_buf.clone(), (row.to_vec(), accs));
     }
 
     /// Merge another partial aggregator (from a parallel worker) into this one.
+    /// Consumes `other`, moving each group's sample row and accumulators instead
+    /// of cloning them -- important for high-cardinality GROUP BY where a clone
+    /// would copy every group again.
     pub fn merge(&mut self, other: GroupAggregator) {
         self.overflow |= other.overflow;
-        for key in other.order {
-            let (sample, accs) = other.groups.get(&key).expect("key present").clone();
+        for (key, (sample, accs)) in other.groups {
             match self.groups.get_mut(&key) {
                 Some((_, self_accs)) => {
                     for (i, (a, b)) in self_accs.iter_mut().zip(accs).enumerate() {
@@ -198,11 +199,10 @@ impl GroupAggregator {
                     }
                 }
                 None => {
-                    if self.max_groups > 0 && self.order.len() >= self.max_groups {
+                    if self.max_groups > 0 && self.groups.len() >= self.max_groups {
                         self.overflow = true;
                         continue;
                     }
-                    self.order.push(key.clone());
                     self.groups.insert(key, (sample, accs));
                 }
             }
@@ -211,32 +211,26 @@ impl GroupAggregator {
 
     /// Number of groups accumulated.
     pub fn len(&self) -> usize {
-        self.order.len()
+        self.groups.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.order.is_empty()
+        self.groups.is_empty()
     }
 
     /// Finalise into `(group sample row, aggregate results)` pairs, in first-
     /// seen group order.
     pub fn into_groups(self) -> Vec<(Vec<Value>, Vec<Value>)> {
-        let GroupAggregator {
-            aggs,
-            groups,
-            order,
-            ..
-        } = self;
-        order
+        let GroupAggregator { aggs, groups, .. } = self;
+        groups
             .into_iter()
-            .map(|k| {
-                let (sample, accs) = &groups[&k];
+            .map(|(_k, (sample, accs))| {
                 let results = accs
                     .iter()
                     .zip(&aggs)
                     .map(|(acc, spec)| finish(acc, spec))
                     .collect();
-                (sample.clone(), results)
+                (sample, results) // move the sample row -- no clone
             })
             .collect()
     }

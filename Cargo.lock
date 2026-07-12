@@ -539,6 +539,7 @@ version = "0.9.4"
 dependencies = [
  "elyra-core",
  "elyra-storage",
+ "indexmap",
 ]
 
 [[package]]
