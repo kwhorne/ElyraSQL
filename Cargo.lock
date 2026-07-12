@@ -523,10 +523,13 @@ dependencies = [
  "elyra-olap",
  "elyra-storage",
  "elyra-vector",
+ "md-5",
  "regex",
  "rust-stemmers",
  "serde",
  "serde_json",
+ "sha1",
+ "sha2",
  "sqlparser",
  "tokio",
  "tracing",
@@ -1061,6 +1064,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d1525a2a28c7f4fa0fc98bb91ae755d1e2d1505079e05539e35bc876b5d65ae9"
 dependencies = [
  "regex-automata",
+]
+
+[[package]]
+name = "md-5"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d89e7ee0cfbedfc4da3340218492196241d89eefb6dab27de5df917a6d2e78cf"
+dependencies = [
+ "cfg-if",
+ "digest",
 ]
 
 [[package]]

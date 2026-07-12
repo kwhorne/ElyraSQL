@@ -1093,6 +1093,126 @@ fn eval_scalar(name: &str, a: &[Value]) -> Result<Option<Value>> {
                 None => Value::Null,
             }
         }
+        "from_unixtime" => match nnum(a, 0) {
+            Some(secs) => {
+                let m = (secs as i64).saturating_mul(1_000_000);
+                match sstr(a, 1) {
+                    Some(fmt) => Value::Text(format_dt(m, &fmt)),
+                    None => Value::DateTime(m),
+                }
+            }
+            None => Value::Null,
+        },
+        "dayname" => match to_micros(&a[0]) {
+            Some(m) => {
+                let wd = ((m.div_euclid(86_400_000_000).rem_euclid(7) + 3) % 7) as usize;
+                Value::Text(
+                    [
+                        "Monday",
+                        "Tuesday",
+                        "Wednesday",
+                        "Thursday",
+                        "Friday",
+                        "Saturday",
+                        "Sunday",
+                    ][wd]
+                    .into(),
+                )
+            }
+            None => Value::Null,
+        },
+        "monthname" => match to_micros(&a[0]) {
+            Some(m) => {
+                let (_, mo, _) =
+                    elyra_core::datetime::civil_from_days(m.div_euclid(86_400_000_000));
+                match [
+                    "January",
+                    "February",
+                    "March",
+                    "April",
+                    "May",
+                    "June",
+                    "July",
+                    "August",
+                    "September",
+                    "October",
+                    "November",
+                    "December",
+                ]
+                .get((mo as usize).wrapping_sub(1))
+                {
+                    Some(s) => Value::Text((*s).into()),
+                    None => Value::Null,
+                }
+            }
+            None => Value::Null,
+        },
+        "md5" => match sstr(a, 0) {
+            Some(s) => {
+                use md5::{Digest, Md5};
+                Value::Text(hex_lower(&Md5::digest(s.as_bytes())))
+            }
+            None => Value::Null,
+        },
+        "sha" | "sha1" => match sstr(a, 0) {
+            Some(s) => {
+                use sha1::{Digest, Sha1};
+                Value::Text(hex_lower(&Sha1::digest(s.as_bytes())))
+            }
+            None => Value::Null,
+        },
+        "sha2" => match (sstr(a, 0), nnum(a, 1)) {
+            (Some(s), Some(bits)) => {
+                use sha2::{Digest, Sha224, Sha256, Sha384, Sha512};
+                let h = match bits as u32 {
+                    0 | 256 => hex_lower(&Sha256::digest(s.as_bytes())),
+                    224 => hex_lower(&Sha224::digest(s.as_bytes())),
+                    384 => hex_lower(&Sha384::digest(s.as_bytes())),
+                    512 => hex_lower(&Sha512::digest(s.as_bytes())),
+                    _ => return Ok(Some(Value::Null)),
+                };
+                Value::Text(h)
+            }
+            _ => Value::Null,
+        },
+        "find_in_set" => match (sstr(a, 0), sstr(a, 1)) {
+            (Some(needle), Some(set)) => {
+                let pos = set.split(',').position(|x| x == needle);
+                Value::Int(pos.map(|p| p as i64 + 1).unwrap_or(0))
+            }
+            _ => Value::Null,
+        },
+        "format" => match nnum(a, 0) {
+            Some(n) => Value::Text(format_number(n, nnum(a, 1).unwrap_or(0.0).max(0.0) as usize)),
+            None => Value::Null,
+        },
+        "hex" => match &a[0] {
+            Value::Null => Value::Null,
+            Value::Int(i) => Value::Text(format!("{i:X}")),
+            v => Value::Text(
+                wire(v)
+                    .unwrap_or_default()
+                    .bytes()
+                    .map(|b| format!("{b:02X}"))
+                    .collect(),
+            ),
+        },
+        "unhex" => match sstr(a, 0) {
+            Some(s) => {
+                let decoded: Option<Vec<u8>> = (0..s.len())
+                    .step_by(2)
+                    .map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok())
+                    .collect();
+                match decoded {
+                    Some(b) => match String::from_utf8(b.clone()) {
+                        Ok(t) => Value::Text(t),
+                        Err(_) => Value::Bytes(b),
+                    },
+                    None => Value::Null,
+                }
+            }
+            None => Value::Null,
+        },
         _ => return Ok(None),
     };
     Ok(Some(out))
@@ -1365,6 +1485,46 @@ fn date_part(v: &Value, unit: &str) -> Value {
         "dayofyear" | "doy" => days - elyra_core::datetime::days_from_civil(y, 1, 1) + 1,
         _ => return Value::Null,
     })
+}
+
+/// Lowercase hex encoding of a digest (for MD5/SHA* SQL functions).
+fn hex_lower(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
+/// MySQL `FORMAT(n, d)`: fixed `d` decimals with thousands separators.
+fn format_number(n: f64, d: usize) -> String {
+    let neg = n < 0.0;
+    // MySQL rounds half away from zero (Rust's default is half-to-even).
+    let factor = 10f64.powi(d as i32);
+    let rounded = (n.abs() * factor + 0.5).floor() / factor;
+    let s = format!("{rounded:.d$}");
+    let (int_part, frac) = match s.split_once('.') {
+        Some((i, f)) => (i.to_string(), Some(f.to_string())),
+        None => (s, None),
+    };
+    let len = int_part.chars().count();
+    let mut grouped = String::new();
+    for (i, ch) in int_part.chars().enumerate() {
+        if i > 0 && (len - i) % 3 == 0 {
+            grouped.push(',');
+        }
+        grouped.push(ch);
+    }
+    let mut out = String::new();
+    if neg {
+        out.push('-');
+    }
+    out.push_str(&grouped);
+    if let Some(f) = frac {
+        out.push('.');
+        out.push_str(&f);
+    }
+    out
 }
 
 fn days_in_month(y: i64, m: u32) -> u32 {
