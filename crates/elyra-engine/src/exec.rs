@@ -3367,6 +3367,49 @@ pub async fn select(
             }
         }
 
+        // PK-ordered LIMIT fast path: when ORDER BY is a prefix of the primary
+        // key (ascending) and a LIMIT is present, scan in clustered (PK) order
+        // and stop as soon as enough matching rows are collected -- no full
+        // scan, no sort. Skipped for selective filters (equality / fulltext),
+        // where the index path reads far fewer rows than a clustered scan.
+        if let Some(lim) = limit {
+            if order_is_pk_asc_prefix(&def, &resolved)
+                && !selective_filter(&def, filter.as_ref())?
+            {
+                let need = offset.saturating_add(lim);
+                let prefix = data_prefix(&def.name);
+                let mut cursor: Option<Vec<u8>> = None;
+                let mut rows: Vec<Vec<Value>> = Vec::with_capacity(need.min(4096));
+                'scan: loop {
+                    let batch = db.scan_batch(prefix.clone(), cursor.clone(), 8192).await?;
+                    if batch.is_empty() {
+                        break;
+                    }
+                    let last = batch.len() < 8192;
+                    cursor = batch.last().map(|(k, _)| k.clone());
+                    for (_, v) in batch {
+                        let row: Vec<Value> = bincode::deserialize(&v)
+                            .map_err(|e| Error::Storage(e.to_string()))?;
+                        if let Some(f) = &filter {
+                            if !predicate::matches(f, &def.schema, &row)? {
+                                continue;
+                            }
+                        }
+                        rows.push(row);
+                        if rows.len() >= need {
+                            break 'scan;
+                        }
+                    }
+                    if last {
+                        break;
+                    }
+                }
+                apply_offset_limit(&mut rows, offset, limit);
+                let (schema, out) = project_exprs(&select.projection, &def.schema, &rows)?;
+                return Ok(QueryResult::Rows(RowStream::literal(schema, out)));
+            }
+        }
+
         // Memory-bounded ORDER BY for the non-accelerable autocommit case:
         // stream the filtered rows and sort with a top-N heap (when LIMIT is
         // small) or an external merge sort that spills to disk (OOM safety),
@@ -5278,6 +5321,53 @@ fn key_eq_values(
 
 /// Whether the filter can be served by a PK/index equality (single or
 /// composite) or a single-column range.
+/// True when `order` is a prefix of the primary key, all ascending -- i.e. the
+/// clustered scan order already satisfies the ORDER BY, so no sort is needed.
+fn order_is_pk_asc_prefix(def: &TableDef, order: &[(Expr, bool)]) -> bool {
+    if !def.has_pk() || order.is_empty() || order.len() > def.pk_cols.len() {
+        return false;
+    }
+    for (i, (e, asc)) in order.iter().enumerate() {
+        if !*asc {
+            return false;
+        }
+        let name = match e {
+            Expr::Identifier(id) => &id.value,
+            Expr::CompoundIdentifier(parts) => match parts.last() {
+                Some(p) => &p.value,
+                None => return false,
+            },
+            _ => return false,
+        };
+        let col = def.pk_cols[i];
+        if !def.schema.columns[col].name.eq_ignore_ascii_case(name) {
+            return false;
+        }
+    }
+    true
+}
+
+/// True when the filter can be resolved through a *selective* access path -- an
+/// equality on the primary key or a secondary index, or a full-text MATCH --
+/// in which case the index path reads fewer rows than a clustered PK scan.
+fn selective_filter(def: &TableDef, filter: Option<&Expr>) -> Result<bool> {
+    let Some(f) = filter else {
+        return Ok(false);
+    };
+    if match_conjunct(f).is_some() {
+        return Ok(true);
+    }
+    if def.has_pk() && key_eq_values(def, Some(f), &def.pk_cols)?.is_some() {
+        return Ok(true);
+    }
+    for idx in &def.indexes {
+        if !idx.vector && key_eq_values(def, Some(f), &idx.cols)?.is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn accelerable(def: &TableDef, filter: Option<&Expr>) -> Result<bool> {
     let Some(f) = filter else {
         return Ok(false);
