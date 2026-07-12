@@ -8644,9 +8644,11 @@ async fn olap_aggregate(
     parallel_aggregate(db, def, filter, plan).await
 }
 
-/// Single-pass, zero-copy scan + filter + aggregate for the autocommit case:
-/// holds one read transaction and decodes each row's needed columns straight
-/// from the stored bytes, feeding the aggregator in place.
+/// Zero-copy scan + filter + aggregate for the autocommit case. When the table
+/// has a single integer primary key, the clustered keyspace is split into N
+/// sub-ranges aggregated in parallel (each in its own read transaction),
+/// otherwise a single-pass scan is used. Every worker decodes only the needed
+/// columns straight from borrowed bytes, reusing one row buffer.
 async fn scan_aggregate_fast(
     db: &Session,
     def: &TableDef,
@@ -8658,17 +8660,19 @@ async fn scan_aggregate_fast(
     let needed = agg_needed_mask(&schema, filter.as_ref(), plan);
     let ncols = schema.columns.len();
     let arg_exprs = plan.arg_exprs().to_vec();
-    let agg = plan.new_aggregator();
     let raw = db.raw_db();
-    // One reusable row buffer for the whole scan -- avoids a per-row allocation.
-    let mut buf: Vec<Value> = Vec::with_capacity(ncols);
-    let agg = raw
-        .scan_fold(prefix, agg, move |agg, _k, v| {
+
+    // A closure factory: builds the per-worker fold body (each captures its own
+    // aggregator + reusable buffer).
+    let make_body = |filter: Option<Expr>,
+                     needed: Option<Vec<bool>>,
+                     schema: Schema,
+                     arg_exprs: Vec<Expr>| {
+        let mut buf: Vec<Value> = Vec::with_capacity(ncols);
+        move |agg: &mut GroupAggregator, _k: &[u8], v: &[u8]| -> Result<()> {
             match &needed {
                 Some(m) => rowdec::decode_projected_into(v, ncols, m, &mut buf)?,
-                None => {
-                    buf = bincode::deserialize(v).map_err(|e| Error::Storage(e.to_string()))?
-                }
+                None => buf = bincode::deserialize(v).map_err(|e| Error::Storage(e.to_string()))?,
             }
             let keep = match &filter {
                 Some(e) => predicate::matches(e, &schema, &buf)?,
@@ -8686,9 +8690,121 @@ async fn scan_aggregate_fast(
                 }
             }
             Ok(())
-        })
-        .await?;
-    Ok(agg)
+        }
+    };
+
+    // Parallel split for single integer-PK tables.
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get().min(8))
+        .unwrap_or(4);
+    if workers > 1 {
+        if let Some(ranges) = pk_split_ranges(&raw, def, &prefix, workers).await? {
+            let mut handles = Vec::with_capacity(ranges.len());
+            for (start, end) in ranges {
+                let raw = raw.clone();
+                let body = make_body(
+                    filter.clone(),
+                    needed.clone(),
+                    schema.clone(),
+                    arg_exprs.clone(),
+                );
+                let agg0 = plan.new_aggregator();
+                handles.push(tokio::spawn(async move {
+                    raw.scan_range_fold(start, end, agg0, body).await
+                }));
+            }
+            let mut result = plan.new_aggregator();
+            for h in handles {
+                let part = h
+                    .await
+                    .map_err(|e| Error::Analytics(format!("scan worker failed: {e}")))??;
+                result.merge(part);
+            }
+            return Ok(result);
+        }
+    }
+
+    // Fallback: single-pass full-prefix scan.
+    let body = make_body(filter, needed, schema, arg_exprs);
+    raw.scan_fold(prefix, plan.new_aggregator(), body).await
+}
+
+/// Split the clustered keyspace of a single-integer-PK table into up to `n`
+/// contiguous `[start, end)` key ranges of roughly equal PK span, for parallel
+/// scanning. Returns `None` (caller does a single-pass scan) unless the table
+/// has exactly one BIGINT/INT primary-key column with a usable value spread.
+async fn pk_split_ranges(
+    raw: &elyra_storage::Db,
+    def: &TableDef,
+    prefix: &[u8],
+    n: usize,
+) -> Result<Option<Vec<(Vec<u8>, Vec<u8>)>>> {
+    if def.pk_cols.len() != 1 {
+        return Ok(None);
+    }
+    let ci = def.pk_cols[0];
+    if !matches!(def.schema.columns[ci].ty, elyra_core::ColumnType::Int) {
+        return Ok(None);
+    }
+    let Some((first, last)) = raw.prefix_bounds(prefix.to_vec()).await? else {
+        return Ok(None);
+    };
+    let plen = prefix.len();
+    // Decode the 8-byte order-preserving integer key that follows the prefix.
+    let decode = |key: &[u8]| -> Option<i64> {
+        let b = key.get(plen..plen + 8)?;
+        let u = u64::from_be_bytes(b.try_into().ok()?);
+        Some((u ^ 0x8000_0000_0000_0000) as i64)
+    };
+    let (Some(lo), Some(hi)) = (decode(&first), decode(&last)) else {
+        return Ok(None);
+    };
+    // Need a spread wide enough to bother splitting.
+    if hi <= lo || (hi as i128 - lo as i128) < n as i128 {
+        return Ok(None);
+    }
+    let key_of = |pk: i64| -> Vec<u8> {
+        let mut k = prefix.to_vec();
+        k.extend_from_slice(&((pk as u64) ^ 0x8000_0000_0000_0000).to_be_bytes());
+        k
+    };
+    let span = hi as i128 - lo as i128;
+    let mut ranges = Vec::with_capacity(n);
+    let upper = prefix_successor(prefix); // exclusive end past the last row
+    for i in 0..n {
+        let start = if i == 0 {
+            first.clone()
+        } else {
+            key_of((lo as i128 + span * i as i128 / n as i128) as i64)
+        };
+        let end = if i == n - 1 {
+            upper.clone()
+        } else {
+            key_of((lo as i128 + span * (i as i128 + 1) / n as i128) as i64)
+        };
+        if start < end {
+            ranges.push((start, end));
+        }
+    }
+    if ranges.len() < 2 {
+        return Ok(None);
+    }
+    Ok(Some(ranges))
+}
+
+/// Smallest key strictly greater than every key with the given prefix.
+fn prefix_successor(prefix: &[u8]) -> Vec<u8> {
+    let mut u = prefix.to_vec();
+    while let Some(b) = u.last_mut() {
+        if *b < 0xff {
+            *b += 1;
+            return u;
+        }
+        u.pop();
+    }
+    // All-0xFF prefix: use an unbounded-ish sentinel (won't happen for our
+    // namespaced table prefixes).
+    vec![0xff; prefix.len() + 1]
 }
 
 /// Estimate the number of distinct GROUP BY groups from column statistics

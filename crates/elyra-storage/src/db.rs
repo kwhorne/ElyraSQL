@@ -457,6 +457,34 @@ impl Db {
         .await
     }
 
+    /// Fold over `[start, end)`, decoding from borrowed bytes in one read
+    /// transaction (see [`Storage::scan_range_each`]).
+    pub async fn scan_range_fold<T, F>(
+        &self,
+        start: Vec<u8>,
+        end: Vec<u8>,
+        init: T,
+        mut f: F,
+    ) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnMut(&mut T, &[u8], &[u8]) -> Result<()> + Send + 'static,
+    {
+        let storage = self.storage.clone();
+        spawn_read(move || {
+            let mut acc = init;
+            storage.scan_range_each(&start, &end, |k, v| f(&mut acc, k, v))?;
+            Ok(acc)
+        })
+        .await
+    }
+
+    /// First/last stored key under `prefix` (see [`Storage::prefix_bounds`]).
+    pub async fn prefix_bounds(&self, prefix: Vec<u8>) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        let storage = self.storage.clone();
+        spawn_read(move || storage.prefix_bounds(&prefix)).await
+    }
+
     /// Ordered range scan over `[start, end)` (see [`Storage::scan_range`]).
     pub async fn scan_range(
         &self,

@@ -414,6 +414,70 @@ impl Storage {
         Ok(())
     }
 
+    /// Zero-copy iterate `[start, end)` (end exclusive), passing borrowed
+    /// slices to `f`. Backs the parallel clustered scan: each worker folds a
+    /// disjoint key sub-range in its own read transaction.
+    pub fn scan_range_each<F>(&self, start: &[u8], end: &[u8], mut f: F) -> Result<()>
+    where
+        F: FnMut(&[u8], &[u8]) -> Result<()>,
+    {
+        use std::ops::Bound;
+        let rtx = self
+            .db
+            .begin_read()
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        let t = rtx
+            .open_table(KV)
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        let range = t
+            .range::<&[u8]>((Bound::Included(start), Bound::Excluded(end)))
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        for item in range {
+            let (k, v) = item.map_err(|e| Error::Storage(e.to_string()))?;
+            f(k.value(), v.value())?;
+        }
+        Ok(())
+    }
+
+    /// The first and last stored keys under `prefix`, in key order (or `None`
+    /// if the prefix has no rows). Used to plan a parallel split of a scan.
+    pub fn prefix_bounds(&self, prefix: &[u8]) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        use std::ops::Bound;
+        let rtx = self
+            .db
+            .begin_read()
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        let t = rtx
+            .open_table(KV)
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        let mut range = t
+            .range::<&[u8]>((Bound::Included(prefix), Bound::Unbounded))
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        let first = match range.next() {
+            Some(item) => {
+                let (k, _) = item.map_err(|e| Error::Storage(e.to_string()))?;
+                let kv = k.value();
+                if !kv.starts_with(prefix) {
+                    return Ok(None);
+                }
+                kv.to_vec()
+            }
+            None => return Ok(None),
+        };
+        // Walk from the back, skipping any keys that belong to a later prefix,
+        // until the last key still under `prefix`.
+        let mut last = first.clone();
+        while let Some(item) = range.next_back() {
+            let (k, _) = item.map_err(|e| Error::Storage(e.to_string()))?;
+            let kv = k.value();
+            if kv.starts_with(prefix) {
+                last = kv.to_vec();
+                break;
+            }
+        }
+        Ok(Some((first, last)))
+    }
+
     /// Scan keys in `[start, end)` (end exclusive; unbounded when `None`), up
     /// to `limit` pairs. Backs ordered range lookups on the clustered data
     /// keyspace and on secondary indexes.
