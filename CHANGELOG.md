@@ -4,6 +4,61 @@ All notable changes to ElyraSQL are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.9.8] - 2026-07-12
+
+MySQL-compatibility release, driven by running real MySQL clients and the
+**Laravel/Eloquent** stack against ElyraSQL and closing every gap that surfaced.
+No on-disk format change.
+
+### Laravel / framework support
+
+- A full Laravel Eloquent workload runs cleanly: migrations (`Schema::create`
+  with `$table->id()`, `foreignId()->constrained()`, indexes), model CRUD with
+  correct `lastInsertId`, `hasMany`/`belongsTo`, eager loading, `withCount`,
+  query-builder joins/aggregates/`groupBy`+`having`, `updateOrInsert`,
+  transactions, and cascading deletes.
+- New **[Framework Integration](https://elyracode.com/sql/server/frameworks/)**
+  guide with recommended settings for Laravel, PDO/Symfony, Python (PyMySQL/
+  Django/SQLAlchemy), Rust (sqlx) and Node (mysql2).
+- CREATE TABLE now tolerates trailing table options (`ENGINE=`, `DEFAULT
+  CHARSET`/`CHARACTER SET`, `COLLATE '...'`, `AUTO_INCREMENT=`, `ROW_FORMAT`,
+  `COMMENT`, ...) so Laravel/mysqldump/ORM DDL parses.
+- `ALTER TABLE ADD FOREIGN KEY`/`ADD INDEX`/`KEY`/`UNIQUE` (with backfill).
+- Unsigned and extended column types (`BIGINT UNSIGNED`, `MEDIUMINT`, `DOUBLE
+  PRECISION`, `TINY/MEDIUM/LONGTEXT`+`BLOB`, `NVARCHAR`, ...).
+- `information_schema.columns` reports `COLLATION_NAME`, `COLUMN_COMMENT`,
+  `GENERATION_EXPRESSION`, `CHARACTER_SET_NAME` (schema introspection).
+- The OK packet now sets `SERVER_STATUS_IN_TRANS`, so `PDO::inTransaction()` and
+  `commit`/`rollBack` behave correctly (transactions were silently
+  auto-committing before). The OK packet also carries `last_insert_id`, so
+  driver `lastrowid`/`getGeneratedKeys` work after `INSERT`.
+
+### SQL surface
+
+- Session functions `LAST_INSERT_ID()`, `ROW_COUNT()`, `FOUND_ROWS()`.
+- `@@`system variables (`@@version`, `@@session.*`, `@@global.*`, `sql_mode`,
+  `character_set_*`, ...); unknown ones return NULL.
+- Operators: `<=>` (null-safe equal), `IS [NOT] TRUE/FALSE/UNKNOWN`, row/tuple
+  `IN` (`(a,b) IN ((...),(...))`).
+- Subqueries in the SELECT list (scalar, `EXISTS`), including alongside `t.*`.
+- `HAVING` referencing aggregates not in the SELECT list.
+- Scalar functions: `MD5`/`SHA1`/`SHA2`, `HEX`/`UNHEX`, `FORMAT`, `FIND_IN_SET`,
+  `FROM_UNIXTIME`, `DAYNAME`/`MONTHNAME`, `PI`/`RADIANS`/`DEGREES`, `CHAR`,
+  `TIME_TO_SEC`/`SEC_TO_TIME`, `SOUNDEX`, `REGEXP_REPLACE`/`REGEXP_SUBSTR`,
+  `CONVERT()`.
+- Aggregates: `STDDEV`/`STDDEV_POP`/`STDDEV_SAMP`, `VARIANCE`/`VAR_POP`/
+  `VAR_SAMP`, `BIT_OR`/`BIT_AND`/`BIT_XOR`.
+- Window functions: `NTILE`, `FIRST_VALUE`, `LAST_VALUE`, `NTH_VALUE`.
+- `UPDATE`/`DELETE ... LIMIT n` is accepted (the row limit is not enforced).
+
+### Known limitations
+
+- Binary (native) prepared-statement parameter binding is not yet reliable with
+  PDO/mysqlnd; use client-side/emulated prepares (`PDO::ATTR_EMULATE_PREPARES
+  => true`). PyMySQL and sqlx bind client-side and are unaffected.
+- Parser-level: `INSERT ... SET`, comma multi-table `UPDATE`, `GROUP BY ... WITH
+  ROLLUP`, and the `<<`/`>>`/`~` bitwise operators are not parsed.
+
 ## [0.9.7] - 2026-07-12
 
 OLAP acceleration release. No on-disk format change; fully compatible with
@@ -968,6 +1023,7 @@ core CRUD with `WHERE`/`ORDER BY`/`LIMIT`, indexes, aggregation and `GROUP BY`,
 joins, prepared statements, authentication and TLS, vector search (exact +
 HNSW), parallel OLAP aggregation, and transactions with snapshot isolation.
 
+[0.9.8]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.9.8
 [0.9.7]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.9.7
 [0.9.6]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.9.6
 [0.9.5]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.9.5

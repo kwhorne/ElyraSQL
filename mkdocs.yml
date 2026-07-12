@@ -64,6 +64,7 @@ nav:
   - Analytics (OLAP): olap.md
   - Security: security.md
   - MySQL Compatibility: mysql-compatibility.md
+  - Framework Integration: frameworks.md
   - Deployment: deployment.md
   - Backup & Restore: backup.md
   - Observability: observability.md
