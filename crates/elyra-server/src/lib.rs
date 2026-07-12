@@ -536,7 +536,7 @@ fn write_cell<W: AsyncWrite + Send + Unpin>(
         Value::Bool(b) => rw.write_col(*b as i8),
         Value::Int(i) => rw.write_col(*i),
         Value::Float(f) => rw.write_col(*f),
-        Value::Text(s) => rw.write_col(s),
+        Value::Text(s) => rw.write_col(s.as_str()),
         Value::Bytes(b) => rw.write_col(b),
         Value::Vector(vec) => {
             let inner = vec
