@@ -36,10 +36,17 @@ implemented, so you can judge fit.
   correlated subqueries combined with aggregation over a join, user-defined
   functions, and events.
 - A few MySQL-specific spellings are rejected at parse time by the SQL parser:
-  `INSERT ... SET col = val` (use `INSERT ... VALUES`/`(cols) VALUES`), and the
-  `<<`, `>>` and unary `~` bitwise operators (`&`, `|`, `^` work; use them or
-  arithmetic instead). `LAST_INSERT_ID()`, `ROW_COUNT()`, `@@`system variables,
-  `CONVERT()`, `MD5`/`SHA*`, and statistical/bitwise aggregates are supported.
+  `INSERT ... SET col = val` (use `INSERT ... VALUES`); comma-style multi-table
+  `UPDATE t1, t2 SET ...` (use `UPDATE t1 JOIN t2 ON ... SET ...`, which works);
+  `GROUP BY ... WITH ROLLUP`; and the `<<`, `>>` and unary `~` bitwise operators
+  (`&`, `|`, `^` work).
+- Supported beyond the basics: multi-table `UPDATE`/`DELETE` via `JOIN`,
+  `INSERT ... SELECT`, `CREATE TABLE ... AS SELECT`, `COUNT(DISTINCT ...)`,
+  `UNION ALL`/`INTERSECT`/`EXCEPT`, `WITH RECURSIVE`, row/tuple `IN`, window
+  functions incl. `LAG`/`LEAD`/`NTILE`/`FIRST_VALUE`/`LAST_VALUE`/`NTH_VALUE`,
+  the `<=>` null-safe operator, `IS [NOT] TRUE/FALSE/UNKNOWN`,
+  `LAST_INSERT_ID()`/`ROW_COUNT()`, `@@`system variables, `CONVERT()`,
+  `MD5`/`SHA*`/`SOUNDEX`/`REGEXP_REPLACE`, and statistical/bitwise aggregates.
 
 ## Constraints & integrity
 

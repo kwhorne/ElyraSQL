@@ -50,6 +50,33 @@ pub fn eval_row(expr: &Expr, schema: &Schema, row: &[Value]) -> Result<Value> {
             list,
             negated,
         } => {
+            // Row/tuple form: `(a, b) IN ((x, y), (...))` -> element-wise equality.
+            if let Expr::Tuple(le) = expr.as_ref() {
+                let lhs: Vec<Value> = le
+                    .iter()
+                    .map(|e| eval_row(e, schema, row))
+                    .collect::<Result<_>>()?;
+                let mut found = false;
+                for item in list {
+                    if let Expr::Tuple(re) = item {
+                        if re.len() == lhs.len() {
+                            let mut all_eq = true;
+                            for (lv, re_e) in lhs.iter().zip(re) {
+                                let rv = eval_row(re_e, schema, row)?;
+                                if lv.compare(&rv) != Some(std::cmp::Ordering::Equal) {
+                                    all_eq = false;
+                                    break;
+                                }
+                            }
+                            if all_eq {
+                                found = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                return Ok(Value::Bool(found != *negated));
+            }
             let v = eval_row(expr, schema, row)?;
             if v.is_null() {
                 return Ok(Value::Null);
