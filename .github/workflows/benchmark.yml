@@ -1,0 +1,95 @@
+name: Benchmark (native Linux)
+
+# Runs the cross-engine benchmarks on a native x86_64 Linux runner, with MySQL
+# and PostgreSQL as service containers on the same host -- a fair, representative
+# environment (unlike a laptop VM where all engines share a nested hypervisor).
+# Manual trigger; results are written to the run summary.
+
+on:
+  workflow_dispatch:
+    inputs:
+      rows:
+        description: "Rows for the OLAP benchmark"
+        default: "1000000"
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: root
+        ports:
+          - 3308:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -proot"
+          --health-interval=5s --health-timeout=5s --health-retries=20
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres"
+          --health-interval=5s --health-timeout=5s --health-retries=20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: CPU info
+        run: |
+          echo "cores: $(nproc)"; free -h | head -2
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build ElyraSQL
+        run: cargo build --release -p elyra-cli
+
+      - name: Python drivers
+        run: pip install --quiet pymysql psycopg2-binary
+
+      - name: Start ElyraSQL
+        run: |
+          ELYRASQL_USER=root ELYRASQL_PASSWORD=elyra \
+            ./target/release/elyrasql serve --data /tmp/bench.edb --listen 127.0.0.1:3310 &
+          echo $! > /tmp/elyra.pid
+          for i in $(seq 1 30); do
+            python3 -c "import pymysql; pymysql.connect(host='127.0.0.1',port=3310,user='root',password='elyra')" 2>/dev/null && break
+            sleep 1
+          done
+
+      - name: Core SQL benchmark (vs MySQL, PostgreSQL)
+        run: |
+          {
+            echo '## Core SQL benchmark — native Linux'
+            echo '```'
+            echo "runner cores: $(nproc)"
+            python3 bench/compare.py --driver mysql    --port 3310 --user root --password elyra --label ElyraSQL --rows 200000
+            python3 bench/compare.py --driver mysql    --port 3308 --user root --password root  --label MySQL    --rows 200000
+            python3 bench/compare.py --driver postgres --port 5432 --user postgres --password postgres --database postgres --label PostgreSQL --rows 200000
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: OLAP benchmark (vs MySQL, PostgreSQL)
+        run: |
+          {
+            echo '## OLAP benchmark — native Linux'
+            echo '```'
+            python3 bench/olap.py --rows "${{ github.event.inputs.rows }}" \
+              --engines elyra,postgres,mysql \
+              --elyra-port 3310 --mysql-port 3308 --postgres-port 5432
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Stop ElyraSQL
+        if: always()
+        run: kill "$(cat /tmp/elyra.pid)" 2>/dev/null || true

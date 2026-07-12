@@ -143,14 +143,20 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--rows", type=int, default=1_000_000)
     ap.add_argument("--engines", default="elyra,postgres,mysql")
+    ap.add_argument("--elyra-port", type=int, default=3310)
+    ap.add_argument("--mysql-port", type=int, default=3308)
+    ap.add_argument("--percona-port", type=int, default=3309)
+    ap.add_argument("--postgres-port", type=int, default=5432)
+    ap.add_argument("--clickhouse-port", type=int, default=8124)
+    ap.add_argument("--elyra-password", default="elyra")
     a = ap.parse_args()
 
     factories = {
-        "elyra": lambda: MySQLish("ElyraSQL", 3310, "root", "elyra", elyra=True),
-        "clickhouse": lambda: ClickHouse(8124),
-        "mysql": lambda: MySQLish("MySQL", 3308, "root", "root"),
-        "percona": lambda: MySQLish("Percona", 3309, "root", "root"),
-        "postgres": lambda: Postgres(5432),
+        "elyra": lambda: MySQLish("ElyraSQL", a.elyra_port, "root", a.elyra_password, elyra=True),
+        "clickhouse": lambda: ClickHouse(a.clickhouse_port),
+        "mysql": lambda: MySQLish("MySQL", a.mysql_port, "root", "root"),
+        "percona": lambda: MySQLish("Percona", a.percona_port, "root", "root"),
+        "postgres": lambda: Postgres(a.postgres_port),
     }
     results = {}
     names = None
