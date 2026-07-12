@@ -17,6 +17,7 @@ mod index;
 mod keyenc;
 pub mod lockmgr;
 mod predicate;
+mod rowdec;
 mod proc;
 mod session;
 mod sort;

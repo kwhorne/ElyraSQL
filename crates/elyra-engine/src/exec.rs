@@ -16,6 +16,7 @@ use crate::aggregate;
 use crate::aggregate::AggPlan;
 use crate::index;
 use crate::predicate;
+use crate::rowdec;
 use elyra_olap::GroupAggregator;
 
 use crate::catalog::{
@@ -8597,7 +8598,56 @@ async fn olap_aggregate(
             return Ok(agg);
         }
     }
+    // Autocommit full scans decode directly from borrowed storage bytes in a
+    // single read transaction (no per-row copy). Inside a transaction we must
+    // merge the write overlay, so fall back to the batch-copy parallel path.
+    if !db.in_txn() {
+        return scan_aggregate_fast(db, def, filter, plan).await;
+    }
     parallel_aggregate(db, def, filter, plan).await
+}
+
+/// Single-pass, zero-copy scan + filter + aggregate for the autocommit case:
+/// holds one read transaction and decodes each row's needed columns straight
+/// from the stored bytes, feeding the aggregator in place.
+async fn scan_aggregate_fast(
+    db: &Session,
+    def: &TableDef,
+    filter: Option<Expr>,
+    plan: &AggPlan,
+) -> Result<GroupAggregator> {
+    let prefix = data_prefix(&def.name);
+    let schema = def.schema.clone();
+    let needed = agg_needed_mask(&schema, filter.as_ref(), plan);
+    let ncols = schema.columns.len();
+    let arg_exprs = plan.arg_exprs().to_vec();
+    let agg = plan.new_aggregator();
+    let raw = db.raw_db();
+    let agg = raw
+        .scan_fold(prefix, agg, move |agg, _k, v| {
+            let row: Vec<Value> = match &needed {
+                Some(m) => rowdec::decode_projected(v, ncols, m)?,
+                None => bincode::deserialize(v).map_err(|e| Error::Storage(e.to_string()))?,
+            };
+            let keep = match &filter {
+                Some(e) => predicate::matches(e, &schema, &row)?,
+                None => true,
+            };
+            if keep {
+                if arg_exprs.is_empty() {
+                    agg.feed(&row);
+                } else {
+                    let mut r = row.clone();
+                    for e in &arg_exprs {
+                        r.push(predicate::eval_row(e, &schema, &row)?);
+                    }
+                    agg.feed(&r);
+                }
+            }
+            Ok(())
+        })
+        .await?;
+    Ok(agg)
 }
 
 /// Estimate the number of distinct GROUP BY groups from column statistics
@@ -8715,6 +8765,116 @@ async fn partitioned_aggregate(
 /// Scan the table in batches and aggregate them across worker threads, merging
 /// partial aggregators. Memory is bounded by (workers x batch), independent of
 /// table size — the core OLAP property.
+/// Collect the schema column indices referenced by `e` into `out`. Returns
+/// `false` if the expression contains any form we don't fully understand, in
+/// which case the caller must conservatively assume *all* columns are needed.
+fn collect_col_refs(e: &Expr, schema: &Schema, out: &mut Vec<usize>) -> bool {
+    use sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArguments};
+    let find = |name: &str, out: &mut Vec<usize>| -> bool {
+        match schema
+            .columns
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(name))
+        {
+            Some(i) => {
+                out.push(i);
+                true
+            }
+            None => false,
+        }
+    };
+    match e {
+        Expr::Value(_) | Expr::TypedString { .. } => true,
+        Expr::Identifier(id) => find(&id.value, out),
+        Expr::CompoundIdentifier(parts) => match parts.last() {
+            Some(p) => find(&p.value, out),
+            None => false,
+        },
+        Expr::BinaryOp { left, right, .. } => {
+            collect_col_refs(left, schema, out) && collect_col_refs(right, schema, out)
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::Nested(expr)
+        | Expr::IsNull(expr)
+        | Expr::IsNotNull(expr)
+        | Expr::IsTrue(expr)
+        | Expr::IsFalse(expr)
+        | Expr::Cast { expr, .. } => collect_col_refs(expr, schema, out),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            collect_col_refs(expr, schema, out)
+                && collect_col_refs(low, schema, out)
+                && collect_col_refs(high, schema, out)
+        }
+        Expr::InList { expr, list, .. } => {
+            collect_col_refs(expr, schema, out) && list.iter().all(|x| collect_col_refs(x, schema, out))
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            results,
+            else_result,
+        } => {
+            operand
+                .as_ref()
+                .map(|o| collect_col_refs(o, schema, out))
+                .unwrap_or(true)
+                && conditions.iter().all(|c| collect_col_refs(c, schema, out))
+                && results.iter().all(|r| collect_col_refs(r, schema, out))
+                && else_result
+                    .as_ref()
+                    .map(|er| collect_col_refs(er, schema, out))
+                    .unwrap_or(true)
+        }
+        Expr::Function(f) => match &f.args {
+            FunctionArguments::None => true,
+            FunctionArguments::List(list) => list.args.iter().all(|a| match a {
+                // COUNT(*) and the like reference no column.
+                FunctionArg::Unnamed(FunctionArgExpr::Wildcard)
+                | FunctionArg::Unnamed(FunctionArgExpr::QualifiedWildcard(_)) => true,
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(x))
+                | FunctionArg::Named {
+                    arg: FunctionArgExpr::Expr(x),
+                    ..
+                } => collect_col_refs(x, schema, out),
+                _ => false,
+            }),
+            _ => false,
+        },
+        // Anything else (subqueries, MATCH, JSON access, ...) -> be safe.
+        _ => false,
+    }
+}
+
+/// The set of columns an aggregation reads: filter + group-by + aggregate
+/// arguments. `None` means "couldn't determine statically -> decode all".
+fn agg_needed_mask(schema: &Schema, filter: Option<&Expr>, plan: &AggPlan) -> Option<Vec<bool>> {
+    let mut refs: Vec<usize> = Vec::new();
+    if let Some(f) = filter {
+        if !collect_col_refs(f, schema, &mut refs) {
+            return None;
+        }
+    }
+    for e in plan.arg_exprs() {
+        if !collect_col_refs(e, schema, &mut refs) {
+            return None;
+        }
+    }
+    refs.extend_from_slice(plan.group_cols());
+    // Columns aggregators read directly (e.g. SUM(age)) -- these bypass
+    // arg_exprs, so they must be added explicitly or the scan would decode
+    // them as NULL and silently produce wrong aggregates.
+    refs.extend(plan.agg_input_cols());
+    let mut mask = vec![false; schema.columns.len()];
+    for i in refs {
+        if i < mask.len() {
+            mask[i] = true;
+        }
+    }
+    Some(mask)
+}
+
 async fn parallel_aggregate(
     db: &Session,
     def: &TableDef,
@@ -8727,6 +8887,11 @@ async fn parallel_aggregate(
         .unwrap_or(4);
     let prefix = data_prefix(&def.name);
     let schema = def.schema.clone();
+    // Only decode the columns this aggregation actually reads (filter + group +
+    // aggregate arguments); everything else is skipped in place. `None` = a
+    // column reference we couldn't resolve statically, so decode everything.
+    let needed = agg_needed_mask(&schema, filter.as_ref(), plan);
+    let ncols = schema.columns.len();
 
     let mut cursor: Option<Vec<u8>> = None;
     let mut result = plan.new_aggregator();
@@ -8745,11 +8910,15 @@ async fn parallel_aggregate(
         let f = filter.clone();
         let sch = schema.clone();
         let arg_exprs = plan.arg_exprs().to_vec();
+        let needed = needed.clone();
         handles.push(tokio::task::spawn_blocking(
             move || -> Result<GroupAggregator> {
                 for b in &blobs {
-                    let row: Vec<Value> =
-                        bincode::deserialize(b).map_err(|e| Error::Storage(e.to_string()))?;
+                    let row: Vec<Value> = match &needed {
+                        Some(mask) => rowdec::decode_projected(b, ncols, mask)?,
+                        None => bincode::deserialize(b)
+                            .map_err(|e| Error::Storage(e.to_string()))?,
+                    };
                     let keep = match &f {
                         Some(e) => predicate::matches(e, &sch, &row)?,
                         None => true,

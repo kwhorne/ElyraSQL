@@ -50,6 +50,18 @@ impl AggPlan {
         &self.arg_exprs
     }
 
+    /// Base-table column indices that aggregators read *directly* (e.g. the
+    /// `age` in `SUM(age)`), excluding appended virtual argument columns. Used
+    /// to compute which columns a scan must decode.
+    pub fn agg_input_cols(&self) -> Vec<usize> {
+        let base = self.input_schema.columns.len();
+        self.aggs
+            .iter()
+            .filter_map(|a| a.arg_col)
+            .filter(|&c| c < base)
+            .collect()
+    }
+
     /// Append the evaluated argument expressions to a row (if any).
     pub fn extend_row(&self, row: &[Value]) -> Result<Vec<Value>> {
         let mut r = row.to_vec();

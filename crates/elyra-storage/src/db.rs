@@ -423,6 +423,24 @@ impl Db {
         spawn_read(move || storage.scan_batch(&prefix, after.as_deref(), limit)).await
     }
 
+    /// Fold over every row whose key starts with `prefix`, decoding directly
+    /// from borrowed storage bytes inside a single read transaction (see
+    /// [`Storage::scan_prefix_each`]). The whole scan runs on one blocking
+    /// thread, so `f` never allocates an intermediate row buffer.
+    pub async fn scan_fold<T, F>(&self, prefix: Vec<u8>, init: T, mut f: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnMut(&mut T, &[u8], &[u8]) -> Result<()> + Send + 'static,
+    {
+        let storage = self.storage.clone();
+        spawn_read(move || {
+            let mut acc = init;
+            storage.scan_prefix_each(&prefix, |k, v| f(&mut acc, k, v))?;
+            Ok(acc)
+        })
+        .await
+    }
+
     /// Ordered range scan over `[start, end)` (see [`Storage::scan_range`]).
     pub async fn scan_range(
         &self,

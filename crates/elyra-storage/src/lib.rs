@@ -354,6 +354,36 @@ impl Storage {
         Ok(out)
     }
 
+    /// Iterate every key/value whose key starts with `prefix`, in key order,
+    /// passing **borrowed** slices to `f` -- no per-row `Vec` allocation and a
+    /// single read transaction for the whole scan. This backs streaming
+    /// scan/filter/aggregate operators that decode directly from the stored
+    /// bytes instead of copying each row out first.
+    pub fn scan_prefix_each<F>(&self, prefix: &[u8], mut f: F) -> Result<()>
+    where
+        F: FnMut(&[u8], &[u8]) -> Result<()>,
+    {
+        let rtx = self
+            .db
+            .begin_read()
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        let t = rtx
+            .open_table(KV)
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        let range = t
+            .range(prefix..)
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        for item in range {
+            let (k, v) = item.map_err(|e| Error::Storage(e.to_string()))?;
+            let key = k.value();
+            if !key.starts_with(prefix) {
+                break; // left the table's keyspace -- done
+            }
+            f(key, v.value())?;
+        }
+        Ok(())
+    }
+
     /// Scan keys in `[start, end)` (end exclusive; unbounded when `None`), up
     /// to `limit` pairs. Backs ordered range lookups on the clustered data
     /// keyspace and on secondary indexes.
