@@ -61,11 +61,11 @@ for full method and analysis, and run it yourself with `gh workflow run benchmar
 
 | Query | ElyraSQL | PostgreSQL 17 | MySQL 8.4 |
 |---|---:|---:|---:|
-| `COUNT(*)` | **27.6** | 29.0 | 24.0 |
-| Global agg (`SUM/AVG/MIN/MAX`) | **36.6** | 55.5 | 162.6 |
-| `GROUP BY` (100 groups) | **63.6** | 92.1 | 314.1 |
-| `GROUP BY` + top-10 (10k groups) | **93.4** | 113.9 | 343.0 |
-| Filtered agg (`WHERE amount>500`) | **53.5** | 55.5 | 229.8 |
+| `COUNT(*)` | **24.8** | 28.1 | 23.6 |
+| Global agg (`SUM/AVG/MIN/MAX`) | **35.6** | 47.9 | 161.7 |
+| `GROUP BY` (100 groups) | **45.8** | 81.0 | 314.6 |
+| `GROUP BY` + top-10 (10k groups) | **53.7** | 87.7 | 342.9 |
+| Filtered agg (`WHERE amount>500`) | **46.1** | 51.8 | 229.5 |
 
 **Core SQL, 200k rows (ms):**
 

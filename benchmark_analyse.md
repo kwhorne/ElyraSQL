@@ -20,17 +20,18 @@ with its native schema.
 
 | Query | ElyraSQL | PostgreSQL 17 | MySQL 8.4 |
 |---|---:|---:|---:|
-| `COUNT(*)` | **27.6** | 29.0 | 24.0 |
-| Global aggregation (`SUM/AVG/MIN/MAX`) | **36.6** | 55.5 | 162.6 |
-| `GROUP BY` low-cardinality (100 groups) | **63.6** | 92.1 | 314.1 |
-| `GROUP BY` + top-10 (10k groups) | **93.4** | 113.9 | 343.0 |
-| Filtered aggregation (`WHERE amount>500`) | **53.5** | 55.5 | 229.8 |
+| `COUNT(*)` | **24.8** | 28.1 | 23.6 |
+| Global aggregation (`SUM/AVG/MIN/MAX`) | **35.6** | 47.9 | 161.7 |
+| `GROUP BY` low-cardinality (100 groups) | **45.8** | 81.0 | 314.6 |
+| `GROUP BY` + top-10 (10k groups) | **53.7** | 87.7 | 342.9 |
+| Filtered aggregation (`WHERE amount>500`) | **46.1** | 51.8 | 229.5 |
 
 **ElyraSQL is the fastest of the three on every OLAP query**, and 2–5× ahead of
-MySQL. This is unusual for a row store and comes from the OLAP work in the 0.9.6
-line: parallel clustered scans, a bounded table-keyspace split, vectorised
-(columnar) scalar aggregation over `f64` arrays, and a compiled predicate for
-filtered aggregation.
+MySQL, with the widest margins on high-cardinality `GROUP BY` (top-N is ~1.6×
+faster than PostgreSQL). This is unusual for a row store and comes from the OLAP
+work in the 0.9.x line: parallel clustered scans, a bounded table-keyspace
+split, vectorised (columnar) scalar *and grouped* aggregation over flat `f64`
+arrays, and a compiled predicate for filtered aggregation.
 
 ## Core SQL — 200,000 rows (medians, ms; lower is better)
 
