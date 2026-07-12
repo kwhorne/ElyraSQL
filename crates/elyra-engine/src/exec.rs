@@ -8693,14 +8693,14 @@ async fn scan_aggregate_fast(
         }
     };
 
-    // Parallel split for single integer-PK tables. Restricted to un-grouped
-    // aggregates (COUNT/SUM/... over the whole table): a GROUP BY allocates a
-    // group key per row, and running that across many threads causes global
-    // allocator contention that is slower than a single-threaded pass.
+    // Parallel split for single integer-PK tables: each worker aggregates a
+    // clustered sub-range and the partials merge. The group aggregator reuses
+    // its key buffer, so grouped aggregation no longer thrashes the allocator
+    // across threads.
     let workers = std::thread::available_parallelism()
         .map(|n| n.get().min(8))
         .unwrap_or(4);
-    if workers > 1 && plan.group_cols().is_empty() {
+    if workers > 1 {
         if let Some(ranges) = pk_split_ranges(&raw, def, &prefix, workers).await? {
             let mut handles = Vec::with_capacity(ranges.len());
             for (start, end) in ranges {

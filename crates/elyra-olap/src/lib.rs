@@ -77,6 +77,8 @@ pub struct GroupAggregator {
     max_groups: usize,
     /// Set once the cap is hit; the aggregation is then incomplete.
     overflow: bool,
+    /// Reused scratch buffer for building the group key of each fed row.
+    key_buf: Vec<u8>,
 }
 
 /// Default distinct-group cap, from `ELYRASQL_GROUP_MAX_GROUPS`
@@ -101,6 +103,7 @@ impl GroupAggregator {
             order: Vec::new(),
             max_groups: default_max_groups(),
             overflow: false,
+            key_buf: Vec::new(),
         }
     }
 
@@ -111,22 +114,25 @@ impl GroupAggregator {
 
     /// Feed one row into the aggregator.
     pub fn feed(&mut self, row: &[Value]) {
-        let key = group_key(&self.group_cols, row);
-        // At/over the cap, refuse to create new groups (bounding memory) but
-        // keep updating existing ones.
-        if self.max_groups > 0
-            && self.order.len() >= self.max_groups
-            && !self.groups.contains_key(&key)
-        {
-            self.overflow = true;
-            return;
+        // Build the key into a reused buffer -- existing groups (the common
+        // case) are then found and updated without any per-row allocation.
+        group_key_into(&self.group_cols, row, &mut self.key_buf);
+        if !self.groups.contains_key(self.key_buf.as_slice()) {
+            // At/over the cap, refuse to create new groups (bounding memory)
+            // but keep updating existing ones.
+            if self.max_groups > 0 && self.order.len() >= self.max_groups {
+                self.overflow = true;
+                return;
+            }
+            let key = self.key_buf.clone();
+            let accs = self.aggs.iter().map(|_| Acc::new()).collect();
+            self.order.push(key.clone());
+            self.groups.insert(key, (row.to_vec(), accs));
         }
-        let aggs = &self.aggs;
-        let order = &mut self.order;
-        let entry = self.groups.entry(key.clone()).or_insert_with(|| {
-            order.push(key);
-            (row.to_vec(), aggs.iter().map(|_| Acc::new()).collect())
-        });
+        let entry = self
+            .groups
+            .get_mut(self.key_buf.as_slice())
+            .expect("group present");
         for (i, spec) in self.aggs.iter().enumerate() {
             let v = spec
                 .arg_col
@@ -200,6 +206,14 @@ impl GroupAggregator {
 /// cheaper than formatting each value with `Debug` (hot path for GROUP BY).
 fn group_key(cols: &[usize], row: &[Value]) -> Vec<u8> {
     let mut out = Vec::with_capacity(cols.len() * 9);
+    group_key_into(cols, row, &mut out);
+    out
+}
+
+/// Encode the group key into a caller-owned buffer (cleared first), so the hot
+/// path can reuse one allocation and look up existing groups without copying.
+fn group_key_into(cols: &[usize], row: &[Value], out: &mut Vec<u8>) {
+    out.clear();
     for &i in cols {
         match row.get(i) {
             None | Some(Value::Null) => out.push(0),
@@ -230,7 +244,6 @@ fn group_key(cols: &[usize], row: &[Value]) -> Vec<u8> {
             }
         }
     }
-    out
 }
 
 fn update(acc: &mut Acc, func: AggFunc, val: Option<Value>, distinct: bool) {
