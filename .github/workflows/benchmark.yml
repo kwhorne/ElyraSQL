@@ -70,25 +70,19 @@ jobs:
       - name: Core SQL benchmark (vs MySQL, PostgreSQL)
         run: |
           {
-            echo '## Core SQL benchmark — native Linux'
-            echo '```'
             echo "runner cores: $(nproc)"
             python3 bench/compare.py --driver mysql    --port 3310 --user root --password elyra --label ElyraSQL --rows 200000
             python3 bench/compare.py --driver mysql    --port 3308 --user root --password root  --label MySQL    --rows 200000
             python3 bench/compare.py --driver postgres --port 5432 --user postgres --password postgres --database postgres --label PostgreSQL --rows 200000
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+          } 2>&1 | tee /tmp/core.txt
+          { echo '## Core SQL benchmark — native Linux'; echo '```'; cat /tmp/core.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
       - name: OLAP benchmark (vs MySQL, PostgreSQL)
         run: |
-          {
-            echo '## OLAP benchmark — native Linux'
-            echo '```'
-            python3 bench/olap.py --rows "${{ github.event.inputs.rows }}" \
-              --engines elyra,postgres,mysql \
-              --elyra-port 3310 --mysql-port 3308 --postgres-port 5432
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+          python3 bench/olap.py --rows "${{ github.event.inputs.rows }}" \
+            --engines elyra,postgres,mysql \
+            --elyra-port 3310 --mysql-port 3308 --postgres-port 5432 2>&1 | tee /tmp/olap.txt
+          { echo '## OLAP benchmark — native Linux'; echo '```'; cat /tmp/olap.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Stop ElyraSQL
         if: always()
