@@ -4,6 +4,52 @@ All notable changes to ElyraSQL are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.9.4] - 2026-07-12
+
+Performance release: a focused campaign on scan, aggregation and per-query
+overhead, benchmarked head-to-head against MySQL 8.4, Percona 8.4 and
+PostgreSQL 17 (see `benchmark_analyse.md`). No on-disk format change; fully
+compatible with 0.9.3 data files.
+
+Headline result (200k rows, same host/client): ElyraSQL now **beats MySQL and
+Percona on full-table `COUNT` and bulk insert**, **matches PostgreSQL on
+full-scan `COUNT`**, and is competitive on indexed `COUNT` and range
+`ORDER BY`. Full-scan `COUNT` improved ~10x (48 ms -> ~5 ms) and
+`ORDER BY pk LIMIT` ~50x (29 ms -> ~0.6 ms) versus 0.9.3.
+
+### Query engine
+
+- **PK-ordered `LIMIT` fast path** — `ORDER BY <pk> LIMIT n` scans in clustered
+  order and stops as soon as enough rows are collected, instead of
+  materialising and sorting the whole result set.
+- **Projection-aware decoding** — scans materialise only the columns a query
+  actually reads, skipping (without allocating) `TEXT`/`JSON` columns it never
+  touches.
+- **Zero-copy scanning** — full-table scans decode straight from borrowed
+  storage bytes inside a single read transaction, with a reused row buffer, so
+  there is no per-row copy or allocation.
+- **Parallel clustered aggregation** — for integer-primary-key tables, a
+  full-scan aggregate splits the keyspace into ranges aggregated in parallel.
+- **Covering-index `COUNT`** — `COUNT(*)` whose filter is an equality covered by
+  an index is answered by counting index entries, with no row fetch.
+- **Faster `GROUP BY`** — an allocation-free group-key hot path with a fast
+  (FxHash) aggregation map.
+
+### Per-query overhead
+
+- **Table-definition cache** — autocommit queries resolve their schema from an
+  in-memory cache (epoch-invalidated on DDL) instead of reading it from storage
+  every time.
+- **Common-path check elimination** — materialized-view refresh checks,
+  per-column mask lookups, and redundant privilege lookups are skipped entirely
+  unless the corresponding feature is actually in use.
+
+### Tooling
+
+- `bench/compare.py` — identical portable workload across ElyraSQL, MySQL,
+  Percona and PostgreSQL.
+- `benchmark_analyse.md` — the 0.9.4 cross-engine comparison and analysis.
+
 ## [0.9.3] - 2026-07-10
 
 AI-native search release: hybrid full-text + vector retrieval and in-SQL
@@ -793,6 +839,7 @@ core CRUD with `WHERE`/`ORDER BY`/`LIMIT`, indexes, aggregation and `GROUP BY`,
 joins, prepared statements, authentication and TLS, vector search (exact +
 HNSW), parallel OLAP aggregation, and transactions with snapshot isolation.
 
+[0.9.4]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.9.4
 [0.9.3]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.9.3
 [0.9.2]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.9.2
 [0.9.1]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.9.1
