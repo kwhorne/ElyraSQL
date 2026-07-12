@@ -5,10 +5,11 @@ with their standard **MySQL** driver — no special client. This page collects t
 recommended connection settings per framework so a stock app runs cleanly.
 
 The one setting that matters across drivers: prefer **client-side (emulated)
-prepared statements**. ElyraSQL's binary (native) prepared-statement parameter
-binding is not yet reliable with every driver (notably PDO/mysqlnd); emulated
-prepares send fully-formed queries and are universally supported. Drivers that
-already bind client-side (PyMySQL, sqlx) need no change.
+prepared statements**. ElyraSQL supports native (binary) prepared statements for
+common query shapes, but a few (e.g. `SELECT *` over `information_schema`) are
+not yet reliable with strict drivers such as PDO/mysqlnd; emulated prepares send
+fully-formed queries and are universally supported. Drivers that already bind
+client-side (PyMySQL, sqlx) need no change.
 
 ---
 
@@ -84,8 +85,8 @@ A full Eloquent workload runs cleanly:
 
 - `GROUP BY ... WITH ROLLUP` and comma-style multi-table `UPDATE t1, t2 SET ...`
   are not parsed (use a `JOIN` for the latter). These are rare in Eloquent.
-- Keep `PDO::ATTR_EMULATE_PREPARES => true` until native prepared-statement
-  binding lands.
+- Keep `PDO::ATTR_EMULATE_PREPARES => true` for the widest coverage; native
+  prepared statements handle common shapes but not yet every query.
 
 ---
 

@@ -212,9 +212,12 @@ implemented, so you can judge fit.
   `ELYRASQL_PASSWORD_POLICY=off` to disable. Repeated failed logins trigger a
   **temporary account lockout** (`ELYRASQL_AUTH_MAX_FAILURES`, default 10;
   `ELYRASQL_AUTH_LOCKOUT_SECS`, default 60) to blunt brute-force attacks;
-  failures and lockouts are logged. The wire credential is still
-  `mysql_native_password` (`caching_sha2_password` is not implemented — a wire-
-  library limitation — and MySQL 8 clients negotiate down to it).
+  failures and lockouts are logged. Two auth plugins are supported:
+  `mysql_native_password` (default, works with every client) and
+  `caching_sha2_password` (MySQL 8's default; opt-in via `ELYRASQL_AUTH_PLUGIN`,
+  full authentication over TLS or via an RSA public-key exchange on a plaintext
+  connection). Both verify against the stored `SHA1(SHA1(password))` digest;
+  the password is never persisted in the clear.
 - Hot and offline backup/restore, plus an append-only binlog for point-in-time
   recovery (`--binlog` + `elyrasql binlog-replay`). Binlog rotation/pruning is
   manual; there is no incremental (block-level) backup.
@@ -273,26 +276,28 @@ implemented, so you can judge fit.
 
 ## Wire protocol
 
-- Prepared statements can desynchronize across repeated
-  `COM_STMT_CLOSE` → `COM_STMT_PREPARE` cycles on one connection with strict
-  clients (an upstream library limitation). Statement reuse and pooled clients
-  are unaffected.
+- The MySQL wire layer is a **first-party crate (`elyra-wire`)**, forked from
+  `opensrv-mysql`, so protocol behaviour is ours to fix and extend (this is what
+  enabled rustls 0.23 and `caching_sha2_password`).
+- **Binary (native) prepared statements**: `describe_query` reports an exact
+  result-column count at `PREPARE` for single SELECTs with an explicit
+  projection, so native prepares read the result set correctly for the common
+  shapes. A few shapes still report no columns (e.g. `SELECT *` over
+  `information_schema` or a joined/derived source), which strict drivers may
+  mishandle. For maximum compatibility use client-side (emulated) prepared
+  statements — `PDO::ATTR_EMULATE_PREPARES => true` (Laravel `options`) or the
+  driver equivalent; PyMySQL and sqlx bind client-side and are unaffected.
 - **`LOAD DATA INFILE`** reads a **server-side** file and bulk-inserts it
   (requires ADMIN, like MySQL's `FILE` privilege): `LOAD DATA INFILE '<path>'
   INTO TABLE t [FIELDS TERMINATED BY '...'] [ENCLOSED BY '...'] [LINES
   TERMINATED BY '...'] [IGNORE n LINES] [(cols)]`, with `\N` for NULL. Client-
   side `LOAD DATA LOCAL INFILE` (streaming the file over the wire) is not
   supported.
-- **Binary (native) prepared-statement parameters** are not yet reliably decoded
-  from the `COM_STMT_EXECUTE` packet for all drivers (notably PDO/mysqlnd): a
-  bound parameter can be read as NULL, and the packet stream can desynchronize.
-  Text-protocol queries and client-side (emulated) prepared statements work; set
-  `PDO::ATTR_EMULATE_PREPARES => true` (Laravel `options`) or the driver
-  equivalent. PyMySQL and sqlx (which bind client-side) are unaffected.
-- Authentication uses `mysql_native_password`; connection salts now come from the
-  OS CSPRNG. `caching_sha2_password` (MySQL 8's default) is **not** implemented —
-  the wire library does not drive its multi-round fast/full-auth exchange — but
-  MySQL 8 clients automatically negotiate down to `mysql_native_password`.
+- Authentication offers `mysql_native_password` (default) and
+  `caching_sha2_password` (MySQL 8's default; opt-in via `ELYRASQL_AUTH_PLUGIN`).
+  Connection salts come from the OS CSPRNG. `caching_sha2_password` runs full
+  authentication — cleartext over TLS, or an RSA public-key exchange on a
+  plaintext connection.
 
 ## Roadmap
 
@@ -306,14 +311,15 @@ Candidate next steps, roughly in order of value:
 5. Per-column `_bin` in `ORDER BY` / `GROUP BY` / `DISTINCT` / join keys.
 6. A persistent spatial index (R-tree) and polygon/geodesic operations.
 7. Dynamic cluster membership (online add/remove nodes).
-8. Roles and per-database / per-column privileges; audit logging.
-9. `caching_sha2_password` and `LOAD DATA INFILE`.
+8. Fully reliable binary (native) prepared statements for every result shape.
+9. Client-side `LOAD DATA LOCAL INFILE` (streaming the file over the wire).
 
 Many earlier roadmap items have shipped: per-column `COLLATE`/`_bin`, scoped
-(per-table) privileges, spill-to-disk sorts/aggregations, cost-based hash joins
-with statistics, slow-query log + Prometheus metrics, pessimistic table locking,
-quorum/synchronous replication, and automatic failover with incremental
-catch-up.
+(per-table) and per-column privileges, roles, audit logging, spill-to-disk
+sorts/aggregations, cost-based hash joins with statistics, slow-query log +
+Prometheus metrics, pessimistic table locking, quorum/synchronous replication,
+automatic failover with incremental catch-up, a first-party wire layer
+(`elyra-wire`) on rustls 0.23, and `caching_sha2_password` authentication.
 
 Have a need that isn't listed? Open an issue on
 [GitHub](https://github.com/kwhorne/ElyraSQL/issues).

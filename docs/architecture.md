@@ -30,7 +30,8 @@ handshake) exposes their names.
 | `elyra-engine` | SQL parsing (MySQL dialect), planning, execution, sessions/transactions, catalog, indexes. |
 | `elyra-olap` | Mergeable streaming group-aggregation kernel. |
 | `elyra-vector` | Vector distance metrics and the HNSW index. |
-| `elyra-server` | MySQL wire protocol, auth, TLS, prepared statements. |
+| `elyra-wire` | First-party MySQL wire protocol (forked from opensrv-mysql): handshake, auth plugins (`mysql_native_password`, `caching_sha2_password`), TLS (rustls 0.23), text/binary result sets. |
+| `elyra-server` | Connection handling on top of `elyra-wire`: auth verification, TLS config, prepared-statement dispatch, metrics/audit. |
 | `elyra-cli` | The `elyrasql` binary. |
 
 ## Storage model

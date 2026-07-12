@@ -77,7 +77,7 @@ See the [documentation site](https://kwhorne.github.io/ElyraSQL/) and
               MySQL clients / drivers
                        │  (MySQL wire protocol)
               ┌────────▼────────┐
-              │  elyra-server   │   opensrv-mysql + tokio
+              │  elyra-server   │   elyra-wire (own MySQL protocol) + tokio
               └────────┬────────┘
               ┌────────▼────────┐
               │  elyra-engine   │   sqlparser (MySQL dialect) → plan → execute
@@ -194,8 +194,8 @@ journalctl -u elyrasql -f
 - [x] Range index scans (`>`, `>=`, `<`, `<=`, `BETWEEN`)
 - [x] Roles / per-user privileges (read / write / admin)
 - [ ] Secondary indexes + query planner
-- [x] Prepared statements (binary protocol): typed params, escaping
-      (see caveat on repeated close→prepare cycles under opensrv 0.7)
+- [x] Prepared statements: native (binary) for common shapes + client-side
+      (emulated); `mysql_native_password` + `caching_sha2_password` auth
 - [x] `VECTOR(n)` columns + exact KNN via `VEC_DISTANCE` in `ORDER BY`
 - [x] Secondary indexes (`CREATE INDEX`) with planner integration
 - [x] Aggregation (`COUNT/SUM/AVG/MIN/MAX`), `GROUP BY`, `ORDER BY`

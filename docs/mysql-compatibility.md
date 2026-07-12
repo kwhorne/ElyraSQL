@@ -30,9 +30,9 @@ relationships, the query builder, transactions, and pagination. Point the
 'port'     => env('DB_PORT', '3307'),
 'database' => env('DB_DATABASE', 'elyra'),
 'options'  => [
-    // Recommended: use client-side prepared statements. ElyraSQL's binary
-    // (native) prepared-statement parameter binding is not yet reliable with
-    // PDO/mysqlnd; emulation sends fully-formed queries and is well supported.
+    // Recommended: client-side prepared statements. Native prepares work for
+    // common shapes, but some (e.g. information_schema `SELECT *`) are not yet
+    // reliable with strict drivers; emulation sends fully-formed queries.
     PDO::ATTR_EMULATE_PREPARES => true,
 ],
 ```
@@ -80,7 +80,9 @@ gaps:
 See [Limitations & Roadmap](limitations.md) for the full picture.
 
 !!! note "Prepared-statement caveat"
-    Repeated `COM_STMT_CLOSE` → `COM_STMT_PREPARE` cycles on a single connection
-    can desynchronize with strict clients due to a limitation in the underlying
-    wire library. Statement reuse and pooled clients (the common case), plus
-    client-side-binding drivers like PyMySQL, are unaffected.
+    Binary (native) prepared statements work for common query shapes; a few
+    (e.g. `SELECT *` over `information_schema` or a joined source) report no
+    columns at `PREPARE`, which strict drivers may mishandle. For the widest
+    compatibility, prefer client-side (emulated) prepared statements —
+    `PDO::ATTR_EMULATE_PREPARES => true`, or the driver equivalent. Client-side-
+    binding drivers like PyMySQL and sqlx are unaffected.
