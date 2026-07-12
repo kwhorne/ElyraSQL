@@ -1,0 +1,34 @@
+# cargo-audit configuration for ElyraSQL.
+#
+# Each ignored advisory below is a deliberate, reviewed decision -- not a blanket
+# mute. Re-review whenever `opensrv-mysql` publishes a release that upgrades its
+# rustls stack, or whenever the bincode on-disk format is revisited.
+
+[advisories]
+ignore = [
+    # --- rustls-webpki 0.102.8 (transitive via opensrv-mysql 0.7 -> tokio-rustls
+    #     0.25 -> rustls 0.22). All four advisories are in certificate/CRL *chain
+    #     verification*. ElyraSQL uses this crate only as a TLS *server*: it
+    #     presents its own certificate and does not verify peer certificates
+    #     (mutual TLS is not implemented), so the name-constraint, wildcard and
+    #     CRL parsing paths are never reached. The outbound HTTPS client used by
+    #     ai_embed() -- which *does* verify server certificates -- rides on
+    #     ureq's independent rustls 0.23 + rustls-webpki 0.103.13 (already fixed).
+    #     The real remedy (rustls 0.23 on the server path) is blocked until
+    #     opensrv-mysql bumps rustls; tracked, not forgotten.
+    "RUSTSEC-2026-0104", # reachable panic in CRL parsing (CRLs not parsed server-side)
+    "RUSTSEC-2026-0099", # name constraints accepted for wildcard cert (peer verify only)
+    "RUSTSEC-2026-0098", # name constraints for URI names (peer verify only)
+    "RUSTSEC-2026-0049", # CRLs not authoritative by distribution point (peer verify only)
+
+    # --- Unmaintained (warnings, no known vulnerability) ---
+    # bincode 1.3.3 defines our on-disk row/catalog encoding. bincode 2/3 change
+    # the serialize/deserialize API and byte layout (3.0.0 is an intentionally
+    # non-compiling protest release); a bump is a deliberate data-format
+    # migration, not a routine update.
+    "RUSTSEC-2025-0141", # bincode unmaintained
+    # Transitive via a proc-macro dependency; build-time only, not shipped.
+    "RUSTSEC-2026-0173", # proc-macro-error2 unmaintained
+    # Transitive via tokio-rustls 0.25; leaves with the rustls 0.23 upgrade.
+    "RUSTSEC-2025-0134", # rustls-pemfile unmaintained
+]

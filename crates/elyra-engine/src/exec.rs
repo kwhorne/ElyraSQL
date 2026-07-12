@@ -14,8 +14,8 @@ use sqlparser::ast::{
 
 use crate::aggregate;
 use crate::aggregate::AggPlan;
-use crate::index;
 use crate::cpred;
+use crate::index;
 use crate::predicate;
 use crate::rowdec;
 use elyra_olap::GroupAggregator;
@@ -3390,8 +3390,7 @@ pub async fn select(
         // scan, no sort. Skipped for selective filters (equality / fulltext),
         // where the index path reads far fewer rows than a clustered scan.
         if let Some(lim) = limit {
-            if order_is_pk_asc_prefix(&def, &resolved)
-                && !selective_filter(&def, filter.as_ref())?
+            if order_is_pk_asc_prefix(&def, &resolved) && !selective_filter(&def, filter.as_ref())?
             {
                 let need = offset.saturating_add(lim);
                 let prefix = data_prefix(&def.name);
@@ -8779,9 +8778,8 @@ impl ColAgg {
                     let arr = &self.arrays[self.agg_slot[a].unwrap()];
                     if !arr.is_empty() {
                         self.has[a] = true;
-                        self.max[a] = self
-                            .max[a]
-                            .max(arr.iter().copied().fold(f64::NEG_INFINITY, f64::max));
+                        self.max[a] =
+                            self.max[a].max(arr.iter().copied().fold(f64::NEG_INFINITY, f64::max));
                     }
                 }
                 GroupConcat => {}
@@ -8873,7 +8871,8 @@ async fn scan_columnar_scalar(
                 let specs = specs.to_vec();
                 handles.push(tokio::spawn(async move {
                     let st = ColAgg::new(&specs, ncols);
-                    raw.scan_range_fold(start, end, st, |st, _k, v| st.feed(v)).await
+                    raw.scan_range_fold(start, end, st, |st, _k, v| st.feed(v))
+                        .await
                 }));
             }
             let mut result = ColAgg::new(specs, ncols);
@@ -9326,7 +9325,8 @@ fn collect_col_refs(e: &Expr, schema: &Schema, out: &mut Vec<usize>) -> bool {
                 && collect_col_refs(high, schema, out)
         }
         Expr::InList { expr, list, .. } => {
-            collect_col_refs(expr, schema, out) && list.iter().all(|x| collect_col_refs(x, schema, out))
+            collect_col_refs(expr, schema, out)
+                && list.iter().all(|x| collect_col_refs(x, schema, out))
         }
         Expr::Case {
             operand,
@@ -9434,8 +9434,9 @@ async fn parallel_aggregate(
                 for b in &blobs {
                     let row: Vec<Value> = match &needed {
                         Some(mask) => rowdec::decode_projected(b, ncols, mask)?,
-                        None => bincode::deserialize(b)
-                            .map_err(|e| Error::Storage(e.to_string()))?,
+                        None => {
+                            bincode::deserialize(b).map_err(|e| Error::Storage(e.to_string()))?
+                        }
                     };
                     let keep = match &f {
                         Some(e) => predicate::matches(e, &sch, &row)?,

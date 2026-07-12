@@ -7,8 +7,8 @@
 //! state (not the rows) is retained, aggregation runs in memory proportional
 //! to the number of groups, not the table size.
 
-use std::cmp::Ordering;
 use indexmap::IndexMap;
+use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::hash::{BuildHasherDefault, Hasher};
 
@@ -182,7 +182,8 @@ impl GroupAggregator {
                 .map(|c| row.get(c).cloned().unwrap_or(Value::Null));
             update(&mut accs[i], spec.func, v, spec.distinct);
         }
-        self.groups.insert(self.key_buf.clone(), (row.to_vec(), accs));
+        self.groups
+            .insert(self.key_buf.clone(), (row.to_vec(), accs));
     }
 
     /// Merge another partial aggregator (from a parallel worker) into this one.

@@ -28,7 +28,9 @@ struct Cur<'a> {
 impl<'a> Cur<'a> {
     fn take(&mut self, n: usize) -> Result<&'a [u8]> {
         if self.p + n > self.b.len() {
-            return Err(Error::Storage("row decode: unexpected end of buffer".into()));
+            return Err(Error::Storage(
+                "row decode: unexpected end of buffer".into(),
+            ));
         }
         let s = &self.b[self.p..self.p + n];
         self.p += n;
@@ -70,7 +72,8 @@ pub fn decode_projected_into(
     // If the stored arity differs from the schema (e.g. mid-migration rows),
     // fall back to a full decode for safety.
     if count != ncols {
-        *out = bincode::deserialize::<Vec<Value>>(bytes).map_err(|e| Error::Storage(e.to_string()))?;
+        *out =
+            bincode::deserialize::<Vec<Value>>(bytes).map_err(|e| Error::Storage(e.to_string()))?;
         return Ok(());
     }
     for i in 0..count {

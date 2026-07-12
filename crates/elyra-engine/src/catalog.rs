@@ -464,9 +464,9 @@ pub async fn colgrants_exist(sess: &Session) -> bool {
 }
 
 #[allow(clippy::type_complexity)]
-fn catalog_cache() -> &'static std::sync::RwLock<
-    std::collections::HashMap<String, (u64, std::sync::Arc<TableDef>)>,
-> {
+fn catalog_cache(
+) -> &'static std::sync::RwLock<std::collections::HashMap<String, (u64, std::sync::Arc<TableDef>)>>
+{
     use std::sync::{OnceLock, RwLock};
     static C: OnceLock<RwLock<std::collections::HashMap<String, (u64, std::sync::Arc<TableDef>)>>> =
         OnceLock::new();

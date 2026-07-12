@@ -44,6 +44,19 @@ jobs:
       - name: Test
         run: cargo test --workspace --verbose
 
+  audit:
+    name: security audit
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      # Honours .cargo/audit.toml, where each ignored advisory is documented
+      # with a reachability/format rationale.
+      - name: Audit dependencies
+        run: cargo audit
+
   smoke:
     name: end-to-end smoke test
     runs-on: ubuntu-24.04

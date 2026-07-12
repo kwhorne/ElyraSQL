@@ -66,10 +66,12 @@ impl CompiledPredicate {
     /// the comparison (matching the interpreter's numeric semantics).
     #[inline]
     pub fn matches(&self, row: &[Value]) -> bool {
-        self.conj.iter().all(|c| match row.get(c.col).and_then(|v| v.as_f64()) {
-            Some(x) => c.op.test(x, c.rhs),
-            None => false,
-        })
+        self.conj
+            .iter()
+            .all(|c| match row.get(c.col).and_then(|v| v.as_f64()) {
+                Some(x) => c.op.test(x, c.rhs),
+                None => false,
+            })
     }
 }
 
