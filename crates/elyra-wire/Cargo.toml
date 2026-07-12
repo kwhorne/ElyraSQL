@@ -1,0 +1,21 @@
+[package]
+name = "elyra-wire"
+version.workspace = true
+edition.workspace = true
+license = "Apache-2.0"
+description = "ElyraSQL MySQL-compatible wire protocol server (first-party fork of opensrv-mysql)."
+publish = false
+
+[features]
+default = ["tls"]
+tls = ["dep:tokio-rustls", "dep:pin-project-lite"]
+
+[dependencies]
+async-trait = "0.1"
+byteorder = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+mysql_common = { version = "0.32", features = ["chrono"] }
+nom = "7"
+pin-project-lite = { version = "0.2", optional = true }
+tokio = { workspace = true, features = ["io-util", "io-std", "net", "rt"] }
+tokio-rustls = { version = "0.25", optional = true }

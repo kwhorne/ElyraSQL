@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use elyra_engine::{Engine, QueryResult, Session};
-use opensrv_mysql::{
+use elyra_wire::{
     AsyncMysqlIntermediary, AsyncMysqlShim, Column, ColumnFlags, ColumnType, ErrorKind, InitWriter,
     OkResponse, ParamParser, QueryResultWriter, StatementMetaWriter, StatusFlags,
 };
@@ -527,7 +527,7 @@ async fn write_outcomes<W: AsyncWrite + Send + Unpin>(
 }
 
 fn write_cell<W: AsyncWrite + Send + Unpin>(
-    rw: &mut opensrv_mysql::RowWriter<'_, W>,
+    rw: &mut elyra_wire::RowWriter<'_, W>,
     v: &elyra_core::Value,
 ) -> std::io::Result<()> {
     use elyra_core::Value;
@@ -693,7 +693,7 @@ async fn handle_connection(
     read_only: std::sync::Arc<std::sync::atomic::AtomicBool>,
     audit: Option<Arc<AuditLog>>,
 ) -> std::io::Result<()> {
-    use opensrv_mysql::{plain_run_with_options, secure_run_with_options, IntermediaryOptions};
+    use elyra_wire::{plain_run_with_options, secure_run_with_options, IntermediaryOptions};
 
     let (mut r, mut w) = stream.into_split();
     let mut shim = ElyraShim::new(engine, auth, metrics, procs, conn_id, read_only, audit);

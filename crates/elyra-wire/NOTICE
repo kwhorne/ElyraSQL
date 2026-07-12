@@ -1,0 +1,10 @@
+ElyraSQL wire protocol (elyra-wire)
+
+This crate is a first-party fork of opensrv-mysql
+(https://github.com/datafuselabs/opensrv), Copyright 2021 Datafuse Labs,
+licensed under the Apache License, Version 2.0.
+
+ElyraSQL maintains and extends it as its own MySQL-compatible wire protocol
+implementation (native prepared statements, caching_sha2_password, updated TLS
+stack). The original Apache-2.0 license and copyright headers are preserved in
+the source files; see LICENSE.

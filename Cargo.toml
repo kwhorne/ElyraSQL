@@ -6,6 +6,7 @@ members = [
     "crates/elyra-engine",
     "crates/elyra-olap",
     "crates/elyra-vector",
+    "crates/elyra-wire",
     "crates/elyra-server",
     "crates/elyra-cli",
 ]
@@ -41,7 +42,7 @@ bincode = "1.3"
 
 # Async runtime + MySQL wire protocol
 tokio = { version = "1", features = ["full"] }
-opensrv-mysql = "0.7"
+elyra-wire = { path = "crates/elyra-wire" }
 async-trait = "0.1"
 
 # Errors, logging, serialization

@@ -314,10 +314,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
 dependencies = [
  "iana-time-zone",
- "js-sys",
  "num-traits",
  "serde",
- "wasm-bindgen",
  "windows-link",
 ]
 
@@ -554,9 +552,9 @@ dependencies = [
  "elyra-core",
  "elyra-engine",
  "elyra-storage",
+ "elyra-wire",
  "futures-util",
  "getrandom 0.2.17",
- "opensrv-mysql",
  "rustls-pemfile",
  "rustls-pki-types",
  "serde",
@@ -587,6 +585,20 @@ version = "0.9.8"
 dependencies = [
  "elyra-core",
  "wide",
+]
+
+[[package]]
+name = "elyra-wire"
+version = "0.9.8"
+dependencies = [
+ "async-trait",
+ "byteorder",
+ "chrono",
+ "mysql_common",
+ "nom",
+ "pin-project-lite",
+ "tokio",
+ "tokio-rustls",
 ]
 
 [[package]]
@@ -1231,22 +1243,6 @@ name = "once_cell_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
-
-[[package]]
-name = "opensrv-mysql"
-version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4148ab944991b0a33be74d2636a815268974578812a9e4cf7dc785325e858154"
-dependencies = [
- "async-trait",
- "byteorder",
- "chrono",
- "mysql_common",
- "nom",
- "pin-project-lite",
- "tokio",
- "tokio-rustls",
-]
 
 [[package]]
 name = "parking_lot"

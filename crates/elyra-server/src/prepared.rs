@@ -6,7 +6,7 @@
 //! reuses the full query engine without a separate parameterised code path,
 //! while quoting/escaping values so it stays injection-safe.
 
-use opensrv_mysql::ValueInner;
+use elyra_wire::ValueInner;
 
 /// A token produced by [`scan`].
 enum Tok {
