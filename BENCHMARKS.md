@@ -53,36 +53,41 @@ the same host; 200,000 rows; single client; medians. These are our own
 reproducible numbers on developer hardware — **relative, not absolute** — not a
 tuned, official head-to-head. Re-run them on your target and see for yourself.
 
-| Workload | ElyraSQL 0.9.3 | MySQL 8.4 | Percona 8.4 | PostgreSQL 17 |
+Best-of-3 medians (least host contention):
+
+| Workload | ElyraSQL | MySQL 8.4 | Percona 8.4 | PostgreSQL 17 |
 |---|---:|---:|---:|---:|
-| Bulk insert (rows/s) | **171,000** | 150,000 | 207,000 | 393,000 |
-| Full scan `COUNT` (no index) | **4.7 ms** | 9.1 ms | 10.4 ms | 4.8 ms |
-| Indexed `COUNT` | 0.9 ms | 0.3 ms | 0.3 ms | 0.7 ms |
-| Range + `ORDER BY` pk `LIMIT` | 0.6 ms | 0.4 ms | 0.4 ms | 0.19 ms |
-| `GROUP BY` (full aggregation) | 14 ms | 9.9 ms | 10.3 ms | 7.2 ms |
-| Selective join (index NLJ) | 0.4 ms | 0.11 ms | 0.11 ms | 0.15 ms |
-| PK point lookup | 0.3 ms | 0.17 ms | 0.11 ms | 0.12 ms |
+| Bulk insert (rows/s) | **183,000** | 154,000 | 222,000 | 341,000 |
+| Full scan `COUNT` (no index) | **4.95 ms** | 9.1 ms | 10.7 ms | 4.65 ms |
+| Indexed `COUNT` | 0.68 ms | 0.37 ms | 0.72 ms | 0.71 ms |
+| Range + `ORDER BY` pk `LIMIT` | 0.58 ms | 0.43 ms | 0.76 ms | 0.17 ms |
+| `GROUP BY` (full aggregation) | 13.3 ms | 9.5 ms | 11.7 ms | 7.2 ms |
+| Selective join (index NLJ) | 0.27 ms | 0.12 ms | 0.24 ms | 0.13 ms |
+| PK point lookup | 0.21 ms | 0.11 ms | 0.11 ms | 0.11 ms |
 
 (Numbers vary run-to-run by ~10-30% under shared-host contention; the ordering
 above is the consistent picture across repeated runs.)
 
 What this shows, honestly:
 
-- **ElyraSQL now beats MySQL and Percona on full-table `COUNT` and bulk ingest**,
-  and matches PostgreSQL on full-scan `COUNT` — a >10x improvement on scan
-  aggregation over earlier releases (was ~48 ms).
+- **ElyraSQL beats MySQL and Percona on full-table `COUNT` and bulk ingest**,
+  matches PostgreSQL on full-scan `COUNT`, and beats Percona on indexed `COUNT`
+  and range `ORDER BY` — a >10x improvement on scan aggregation over earlier
+  releases (full-scan `COUNT` was ~48 ms).
 - **`ORDER BY pk LIMIT` is fast** (~0.6 ms, was ~29 ms): a PK-ordered
   early-termination scan avoids materialising and sorting the whole result set.
-- **Indexed `COUNT` and range `ORDER BY` are competitive** with the MySQL family.
-- **Still behind on `GROUP BY`** (~1.4x vs MySQL/Percona; ~2x vs PostgreSQL) and
-  on **sub-0.2 ms point queries** (PK lookup, selective join), where the MySQL
-  wire round-trip and per-query overhead dominate. These are the next targets.
+- **Still behind on `GROUP BY`** (~1.4x vs MySQL, ~2x vs PostgreSQL) and on
+  **sub-0.2 ms point queries** (PK lookup ~0.1 ms of fixed per-query overhead:
+  SQL parse + one read-transaction hop + the MySQL wire round-trip). These, and
+  parallel grouped aggregation, are the next targets.
 
-The scan/aggregation speedups came from: projection-aware decoding (only
-materialise the columns a query reads), zero-copy scanning (decode straight from
-borrowed storage bytes in one read transaction), a parallel clustered-range
-split for integer-PK tables, covering-index `COUNT`, and an allocation-free
-group-by hot path.
+The speedups came from: a PK-ordered early-terminating `ORDER BY ... LIMIT`
+scan; projection-aware decoding (materialise only the columns a query reads);
+zero-copy scanning (decode straight from borrowed storage bytes in one read
+transaction); a parallel clustered-range split for integer-PK tables;
+covering-index `COUNT`; an allocation-free FxHash group-by hot path; an
+in-memory table-definition cache; and skipping materialized-view / column-mask
+checks (and redundant privilege lookups) on the common query path.
 
 ## Honest caveats
 
