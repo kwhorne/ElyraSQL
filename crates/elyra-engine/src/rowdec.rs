@@ -187,6 +187,98 @@ pub fn decode_projected_into(
     Ok(())
 }
 
+/// Extract the numeric (`Int`/`Float`/`Bool`) values of selected columns from a
+/// bincode row into per-column `f64` arrays, in a single walk. `slot_of[col]`
+/// is the destination array index, or `-1` to skip. NULL / non-numeric values
+/// are simply not pushed (so each array holds that column's present values).
+/// This is the row-to-columnar step of the vectorised aggregation path.
+pub fn extract_numeric_cols(
+    bytes: &[u8],
+    ncols: usize,
+    slot_of: &[i32],
+    arrays: &mut [Vec<f64>],
+) -> Result<()> {
+    let mut c = Cur { b: bytes, p: 0 };
+    let count = c.u64()? as usize;
+    if count != ncols {
+        let row =
+            bincode::deserialize::<Vec<Value>>(bytes).map_err(|e| Error::Storage(e.to_string()))?;
+        for (col, s) in slot_of.iter().enumerate() {
+            if *s >= 0 {
+                if let Some((v, _)) = numeric_of(row.get(col)) {
+                    arrays[*s as usize].push(v);
+                }
+            }
+        }
+        return Ok(());
+    }
+    for i in 0..count {
+        let tag = c.u32()?;
+        let slot = slot_of.get(i).copied().unwrap_or(-1);
+        match tag {
+            0 => {} // NULL -> not pushed
+            1 => {
+                let b = c.take(1)?[0];
+                if slot >= 0 {
+                    arrays[slot as usize].push(if b != 0 { 1.0 } else { 0.0 });
+                }
+            }
+            2 => {
+                let n = c.i64()?;
+                if slot >= 0 {
+                    arrays[slot as usize].push(n as f64);
+                }
+            }
+            3 => {
+                let bits = c.u64()?;
+                if slot >= 0 {
+                    arrays[slot as usize].push(f64::from_bits(bits));
+                }
+            }
+            4 | 5 | 11 => {
+                let len = c.u64()? as usize;
+                c.take(len)?;
+            }
+            6 => {
+                let len = c.u64()? as usize;
+                c.take(len * 4)?;
+            }
+            7 => {
+                c.take(4)?;
+            }
+            8 | 10 => {
+                c.i64()?;
+            }
+            9 => {
+                c.take(16)?;
+                c.take(1)?;
+            }
+            _ => {
+                let row = bincode::deserialize::<Vec<Value>>(bytes)
+                    .map_err(|e| Error::Storage(e.to_string()))?;
+                for (col, s) in slot_of.iter().enumerate() {
+                    if *s >= 0 {
+                        if let Some((v, _)) = numeric_of(row.get(col)) {
+                            arrays[*s as usize].push(v);
+                        }
+                    }
+                }
+                return Ok(());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn numeric_of(v: Option<&Value>) -> Option<(f64, bool)> {
+    match v {
+        Some(Value::Int(n)) => Some((*n as f64, true)),
+        Some(Value::Bool(b)) => Some((if *b { 1.0 } else { 0.0 }, true)),
+        Some(Value::Float(f)) => Some((*f, false)),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

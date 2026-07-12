@@ -3306,7 +3306,22 @@ pub async fn select(
         // cost two full table scans).
         let est_groups = estimate_group_count(db, &def, plan.group_cols()).await?;
         let cap = elyra_olap::default_max_groups() as u64;
-        let (schema, out_rows) = if est_groups.is_some_and(|g| g > cap) {
+        // Vectorised (columnar) scalar-aggregate fast path: no GROUP BY, no
+        // filter, numeric aggregates. Extracts columns into f64 arrays and
+        // aggregates with tight SIMD-friendly loops.
+        // Only when at least two aggregates share the scan (e.g. SUM+AVG+MIN+MAX
+        // or SUM+COUNT): vectorising then amortises the columnar extraction over
+        // several tight aggregation loops. A single aggregate stays on the
+        // streaming path, which is as fast for one accumulator.
+        let columnar = if filter.is_none() && !db.in_txn() {
+            plan.scalar_agg_plan(&def.schema).filter(|s| s.len() >= 2)
+        } else {
+            None
+        };
+        let (schema, out_rows) = if let Some(specs) = columnar {
+            let results = scan_columnar_scalar(db, &def, &specs).await?;
+            plan.project_scalar(results)?
+        } else if est_groups.is_some_and(|g| g > cap) {
             partitioned_aggregate(db, &def, filter.clone(), &plan).await?
         } else {
             let agg = olap_aggregate(db, &def, filter.clone(), &plan).await?;
@@ -8675,6 +8690,206 @@ async fn olap_aggregate(
         return scan_aggregate_fast(db, def, filter, plan).await;
     }
     parallel_aggregate(db, def, filter, plan).await
+}
+
+/// Vectorised (columnar) scalar aggregation state for one worker. Rows are
+/// extracted into per-column `f64` arrays, then aggregated with tight,
+/// SIMD-friendly loops over the contiguous arrays instead of per-row `Value`
+/// dispatch. Arrays are flushed into the running accumulators every FLUSH rows
+/// to bound memory.
+struct ColAgg {
+    // static config (per agg slot)
+    funcs: Vec<elyra_olap::AggFunc>,
+    agg_slot: Vec<Option<usize>>, // column array index; None = COUNT(*)
+    is_int: Vec<bool>,
+    slot_of: Vec<i32>, // col -> array index or -1
+    ncols: usize,
+    // batch buffers, one per distinct column
+    arrays: Vec<Vec<f64>>,
+    batch_rows: u64,
+    // running accumulators, one per agg
+    count: Vec<i64>,
+    sum: Vec<f64>,
+    min: Vec<f64>,
+    max: Vec<f64>,
+    has: Vec<bool>,
+}
+
+const COLAGG_FLUSH: u64 = 1 << 20;
+
+impl ColAgg {
+    fn new(specs: &[(elyra_olap::AggFunc, Option<usize>, bool)], ncols: usize) -> Self {
+        let mut dcols: Vec<usize> = specs.iter().filter_map(|(_, c, _)| *c).collect();
+        dcols.sort_unstable();
+        dcols.dedup();
+        let mut slot_of = vec![-1i32; ncols];
+        for (i, &c) in dcols.iter().enumerate() {
+            slot_of[c] = i as i32;
+        }
+        let n = specs.len();
+        ColAgg {
+            funcs: specs.iter().map(|s| s.0).collect(),
+            agg_slot: specs
+                .iter()
+                .map(|s| s.1.map(|c| slot_of[c] as usize))
+                .collect(),
+            is_int: specs.iter().map(|s| s.2).collect(),
+            slot_of,
+            ncols,
+            arrays: vec![Vec::new(); dcols.len()],
+            batch_rows: 0,
+            count: vec![0; n],
+            sum: vec![0.0; n],
+            min: vec![f64::INFINITY; n],
+            max: vec![f64::NEG_INFINITY; n],
+            has: vec![false; n],
+        }
+    }
+
+    fn feed(&mut self, v: &[u8]) -> Result<()> {
+        rowdec::extract_numeric_cols(v, self.ncols, &self.slot_of, &mut self.arrays)?;
+        self.batch_rows += 1;
+        if self.batch_rows >= COLAGG_FLUSH {
+            self.flush();
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) {
+        use elyra_olap::AggFunc::*;
+        for a in 0..self.funcs.len() {
+            match self.funcs[a] {
+                CountStar => self.count[a] += self.batch_rows as i64,
+                Count => self.count[a] += self.arrays[self.agg_slot[a].unwrap()].len() as i64,
+                Sum | Avg => {
+                    let arr = &self.arrays[self.agg_slot[a].unwrap()];
+                    self.count[a] += arr.len() as i64;
+                    self.sum[a] += arr.iter().sum::<f64>();
+                }
+                Min => {
+                    let arr = &self.arrays[self.agg_slot[a].unwrap()];
+                    if !arr.is_empty() {
+                        self.has[a] = true;
+                        self.min[a] =
+                            self.min[a].min(arr.iter().copied().fold(f64::INFINITY, f64::min));
+                    }
+                }
+                Max => {
+                    let arr = &self.arrays[self.agg_slot[a].unwrap()];
+                    if !arr.is_empty() {
+                        self.has[a] = true;
+                        self.max[a] = self
+                            .max[a]
+                            .max(arr.iter().copied().fold(f64::NEG_INFINITY, f64::max));
+                    }
+                }
+                GroupConcat => {}
+            }
+        }
+        for arr in &mut self.arrays {
+            arr.clear();
+        }
+        self.batch_rows = 0;
+    }
+
+    fn merge(&mut self, o: &ColAgg) {
+        use elyra_olap::AggFunc::*;
+        for a in 0..self.funcs.len() {
+            self.count[a] += o.count[a];
+            self.sum[a] += o.sum[a];
+            if o.has[a] {
+                self.has[a] = true;
+                match self.funcs[a] {
+                    Min => self.min[a] = self.min[a].min(o.min[a]),
+                    Max => self.max[a] = self.max[a].max(o.max[a]),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    fn finish(&self) -> Vec<Value> {
+        use elyra_olap::AggFunc::*;
+        (0..self.funcs.len())
+            .map(|a| match self.funcs[a] {
+                CountStar | Count => Value::Int(self.count[a]),
+                Sum => {
+                    if self.count[a] == 0 {
+                        Value::Null
+                    } else if self.is_int[a] && self.sum[a].fract() == 0.0 {
+                        Value::Int(self.sum[a] as i64)
+                    } else {
+                        Value::Float(self.sum[a])
+                    }
+                }
+                Avg => {
+                    if self.count[a] == 0 {
+                        Value::Null
+                    } else {
+                        Value::Float(self.sum[a] / self.count[a] as f64)
+                    }
+                }
+                Min => {
+                    if !self.has[a] {
+                        Value::Null
+                    } else if self.is_int[a] {
+                        Value::Int(self.min[a] as i64)
+                    } else {
+                        Value::Float(self.min[a])
+                    }
+                }
+                Max => {
+                    if !self.has[a] {
+                        Value::Null
+                    } else if self.is_int[a] {
+                        Value::Int(self.max[a] as i64)
+                    } else {
+                        Value::Float(self.max[a])
+                    }
+                }
+                GroupConcat => Value::Null,
+            })
+            .collect()
+    }
+}
+
+/// Run vectorised scalar aggregation (no GROUP BY, no filter) over parallel
+/// clustered ranges and return one `Value` per aggregate slot.
+async fn scan_columnar_scalar(
+    db: &Session,
+    def: &TableDef,
+    specs: &[(elyra_olap::AggFunc, Option<usize>, bool)],
+) -> Result<Vec<Value>> {
+    let ncols = def.schema.columns.len();
+    let prefix = data_prefix(&def.name);
+    let raw = db.raw_db();
+    let workers = agg_workers();
+    if workers > 1 {
+        if let Some(ranges) = pk_split_ranges(&raw, def, &prefix, workers).await? {
+            let mut handles = Vec::with_capacity(ranges.len());
+            for (start, end) in ranges {
+                let raw = raw.clone();
+                let specs = specs.to_vec();
+                handles.push(tokio::spawn(async move {
+                    let st = ColAgg::new(&specs, ncols);
+                    raw.scan_range_fold(start, end, st, |st, _k, v| st.feed(v)).await
+                }));
+            }
+            let mut result = ColAgg::new(specs, ncols);
+            for h in handles {
+                let mut part = h
+                    .await
+                    .map_err(|e| Error::Analytics(format!("columnar-agg worker failed: {e}")))??;
+                part.flush();
+                result.merge(&part);
+            }
+            return Ok(result.finish());
+        }
+    }
+    let st = ColAgg::new(specs, ncols);
+    let mut st = raw.scan_fold(prefix, st, |st, _k, v| st.feed(v)).await?;
+    st.flush();
+    Ok(st.finish())
 }
 
 /// Degree of parallelism for full-scan aggregation: `ELYRASQL_AGG_WORKERS` if

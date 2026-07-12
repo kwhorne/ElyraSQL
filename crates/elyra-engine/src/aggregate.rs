@@ -60,6 +60,55 @@ impl AggPlan {
             && matches!(self.aggs[0].func, elyra_olap::AggFunc::CountStar)
     }
 
+    /// Eligibility for the vectorised (columnar) scalar-aggregate fast path:
+    /// no GROUP BY, no argument expressions, no DISTINCT, and every aggregate
+    /// is `COUNT(*)`/`COUNT`/`SUM`/`AVG`/`MIN`/`MAX` over a base `Int`/`Float`
+    /// column. Returns `(func, arg column, is_integer_column)` per aggregate
+    /// slot, or `None` to fall back.
+    #[allow(clippy::type_complexity)]
+    pub fn scalar_agg_plan(
+        &self,
+        schema: &Schema,
+    ) -> Option<Vec<(elyra_olap::AggFunc, Option<usize>, bool)>> {
+        use elyra_olap::AggFunc::*;
+        if !self.group_cols.is_empty() || !self.arg_exprs.is_empty() {
+            return None;
+        }
+        let base = self.input_schema.columns.len();
+        let mut out = Vec::with_capacity(self.aggs.len());
+        for spec in &self.aggs {
+            if spec.distinct {
+                return None;
+            }
+            match spec.func {
+                CountStar => out.push((spec.func, None, true)),
+                Count | Sum | Avg | Min | Max => {
+                    let c = spec.arg_col?;
+                    if c >= base {
+                        return None;
+                    }
+                    let is_int = match schema.columns.get(c).map(|col| &col.ty) {
+                        Some(ColumnType::Int) => true,
+                        Some(ColumnType::Float) => false,
+                        _ => return None,
+                    };
+                    out.push((spec.func, Some(c), is_int));
+                }
+                GroupConcat => return None,
+            }
+        }
+        Some(out)
+    }
+
+    /// Project a single output row from pre-computed scalar aggregate results
+    /// (one per aggregate slot), reusing the normal projection so
+    /// `COUNT(*)+1`, `SUM(a)/COUNT(*)`, etc. still work.
+    pub fn project_scalar(&self, results: Vec<Value>) -> Result<(Schema, Vec<Vec<Value>>)> {
+        let sample = vec![Value::Null; self.input_schema.columns.len()];
+        let row = self.project_group(&sample, &results)?;
+        Ok((self.out_schema.clone(), vec![row]))
+    }
+
     /// Base-table column indices that aggregators read *directly* (e.g. the
     /// `age` in `SUM(age)`), excluding appended virtual argument columns. Used
     /// to compute which columns a scan must decode.
