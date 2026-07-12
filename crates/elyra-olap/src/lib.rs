@@ -204,12 +204,6 @@ impl GroupAggregator {
 
 /// Compact, collision-free binary encoding of a group's key columns. Much
 /// cheaper than formatting each value with `Debug` (hot path for GROUP BY).
-fn group_key(cols: &[usize], row: &[Value]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(cols.len() * 9);
-    group_key_into(cols, row, &mut out);
-    out
-}
-
 /// Encode the group key into a caller-owned buffer (cleared first), so the hot
 /// path can reuse one allocation and look up existing groups without copying.
 fn group_key_into(cols: &[usize], row: &[Value], out: &mut Vec<u8>) {
