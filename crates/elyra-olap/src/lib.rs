@@ -65,6 +65,15 @@ pub enum AggFunc {
     Min,
     Max,
     GroupConcat,
+    /// Population / sample standard deviation and variance.
+    StddevPop,
+    StddevSamp,
+    VarPop,
+    VarSamp,
+    /// Bitwise OR / AND / XOR over integer values.
+    BitOr,
+    BitAnd,
+    BitXor,
 }
 
 /// One aggregate to compute: function, optional argument column, DISTINCT.
@@ -82,6 +91,11 @@ struct Acc {
     count: i64,
     sum: f64,
     sum_is_int: bool,
+    /// Running sum of squares, for VARIANCE/STDDEV.
+    sum_sq: f64,
+    /// Bitwise accumulator (OR/AND/XOR) and whether it has seen a value.
+    bits: i64,
+    bits_init: bool,
     extreme: Option<Value>,
     distinct: HashSet<String>,
     concat: Vec<String>,
@@ -98,6 +112,9 @@ impl Acc {
             count: 0,
             sum: 0.0,
             sum_is_int: true,
+            sum_sq: 0.0,
+            bits: 0,
+            bits_init: false,
             extreme: None,
             distinct: HashSet::new(),
             concat: Vec::new(),
@@ -374,6 +391,33 @@ fn update(acc: &mut Acc, func: AggFunc, val: Option<Value>, distinct: bool) {
                 }
             }
         }
+        AggFunc::StddevPop | AggFunc::StddevSamp | AggFunc::VarPop | AggFunc::VarSamp => {
+            if let Some(v) = val {
+                if let Some(n) = num(&v) {
+                    acc.sum += n;
+                    acc.sum_sq += n * n;
+                    acc.count += 1;
+                }
+            }
+        }
+        AggFunc::BitOr | AggFunc::BitAnd | AggFunc::BitXor => {
+            if let Some(v) = val {
+                if let Some(n) = num(&v) {
+                    let i = n as i64;
+                    if !acc.bits_init {
+                        acc.bits = i;
+                        acc.bits_init = true;
+                    } else {
+                        match func {
+                            AggFunc::BitOr => acc.bits |= i,
+                            AggFunc::BitAnd => acc.bits &= i,
+                            _ => acc.bits ^= i,
+                        }
+                    }
+                    acc.count += 1;
+                }
+            }
+        }
         AggFunc::Min | AggFunc::Max => {
             if let Some(v) = val {
                 if v.is_null() {
@@ -398,7 +442,21 @@ fn update(acc: &mut Acc, func: AggFunc, val: Option<Value>, distinct: bool) {
 fn merge_acc(a: &mut Acc, b: Acc, func: AggFunc) {
     a.count += b.count;
     a.sum += b.sum;
+    a.sum_sq += b.sum_sq;
     a.sum_is_int = a.sum_is_int && b.sum_is_int;
+    if b.bits_init {
+        if !a.bits_init {
+            a.bits = b.bits;
+            a.bits_init = true;
+        } else {
+            match func {
+                AggFunc::BitOr => a.bits |= b.bits,
+                AggFunc::BitAnd => a.bits &= b.bits,
+                AggFunc::BitXor => a.bits ^= b.bits,
+                _ => {}
+            }
+        }
+    }
     // Merge exact decimal sums, aligning to the larger scale.
     let target = a.dscale.max(b.dscale);
     let av = a
@@ -463,6 +521,36 @@ fn finish(acc: &Acc, spec: &AggSpec) -> Value {
             }
         }
         AggFunc::Min | AggFunc::Max => acc.extreme.clone().unwrap_or(Value::Null),
+        AggFunc::StddevPop | AggFunc::VarPop => {
+            if acc.count == 0 {
+                Value::Null
+            } else {
+                let n = acc.count as f64;
+                let var = (acc.sum_sq - acc.sum * acc.sum / n) / n;
+                let var = var.max(0.0);
+                Value::Float(if spec.func == AggFunc::StddevPop {
+                    var.sqrt()
+                } else {
+                    var
+                })
+            }
+        }
+        AggFunc::StddevSamp | AggFunc::VarSamp => {
+            if acc.count < 2 {
+                Value::Null
+            } else {
+                let n = acc.count as f64;
+                let var = (acc.sum_sq - acc.sum * acc.sum / n) / (n - 1.0);
+                let var = var.max(0.0);
+                Value::Float(if spec.func == AggFunc::StddevSamp {
+                    var.sqrt()
+                } else {
+                    var
+                })
+            }
+        }
+        AggFunc::BitOr | AggFunc::BitXor => Value::Int(if acc.bits_init { acc.bits } else { 0 }),
+        AggFunc::BitAnd => Value::Int(if acc.bits_init { acc.bits } else { -1 }),
     }
 }
 

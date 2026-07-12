@@ -317,6 +317,17 @@ pub fn eval_row(expr: &Expr, schema: &Schema, row: &[Value]) -> Result<Value> {
             let v = eval_row(expr, schema, row)?;
             cast_value(v, data_type)
         }
+        // CONVERT(expr, type) and CONVERT(expr USING charset). A charset
+        // conversion is a no-op here (everything is UTF-8); a target type casts.
+        Expr::Convert {
+            expr, data_type, ..
+        } => {
+            let v = eval_row(expr, schema, row)?;
+            match data_type {
+                Some(ty) => cast_value(v, ty),
+                None => Ok(v),
+            }
+        }
         Expr::Like {
             negated,
             expr,

@@ -9021,7 +9021,7 @@ impl ColAgg {
                             self.max[a].max(arr.iter().copied().fold(f64::NEG_INFINITY, f64::max));
                     }
                 }
-                GroupConcat => {}
+                _ => {}
             }
         }
         for arr in &mut self.arrays {
@@ -9085,7 +9085,7 @@ impl ColAgg {
                         Value::Float(self.max[a])
                     }
                 }
-                GroupConcat => Value::Null,
+                _ => Value::Null,
             })
             .collect()
     }
@@ -9400,7 +9400,7 @@ impl ColGroup {
                                 Value::Float(self.max[base + a])
                             }
                         }
-                        GroupConcat => Value::Null,
+                        _ => Value::Null,
                     }
                 })
                 .collect();

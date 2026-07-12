@@ -221,7 +221,7 @@ pub fn scalar_agg(ct: &CachedTable, specs: &[(AggFunc, Option<usize>, bool)]) ->
                     }
                     finish_ext(ext, is_int)
                 }
-                AggFunc::GroupConcat => Value::Null,
+                _ => Value::Null,
             }
         })
         .collect()
@@ -374,7 +374,7 @@ pub fn group_agg(
                 }
                 AggFunc::Min => finish_ext(has[base + a].then_some(min[base + a]), is_int),
                 AggFunc::Max => finish_ext(has[base + a].then_some(max[base + a]), is_int),
-                AggFunc::GroupConcat => Value::Null,
+                _ => Value::Null,
             })
             .collect();
         let mut sample = vec![Value::Null; base_len];

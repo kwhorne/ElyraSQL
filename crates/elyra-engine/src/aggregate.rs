@@ -94,7 +94,7 @@ impl AggPlan {
                     };
                     out.push((spec.func, Some(c), is_int));
                 }
-                GroupConcat => return None,
+                _ => return None,
             }
         }
         Some(out)
@@ -141,7 +141,7 @@ impl AggPlan {
                     };
                     out.push((spec.func, Some(c), is_int));
                 }
-                GroupConcat => return None,
+                _ => return None,
             }
         }
         Some((gc, out))
@@ -248,6 +248,13 @@ fn agg_of(expr: &Expr) -> Option<(AggFunc, &sqlparser::ast::Function)> {
         "min" => AggFunc::Min,
         "max" => AggFunc::Max,
         "group_concat" => AggFunc::GroupConcat,
+        "stddev" | "std" | "stddev_pop" => AggFunc::StddevPop,
+        "stddev_samp" => AggFunc::StddevSamp,
+        "variance" | "var_pop" => AggFunc::VarPop,
+        "var_samp" => AggFunc::VarSamp,
+        "bit_or" => AggFunc::BitOr,
+        "bit_and" => AggFunc::BitAnd,
+        "bit_xor" => AggFunc::BitXor,
         _ => return None,
     };
     Some((func, f))
@@ -448,8 +455,13 @@ fn register_agg(
     }
     let ty = match func {
         AggFunc::CountStar | AggFunc::Count => ColumnType::Int,
-        AggFunc::Avg => ColumnType::Float,
+        AggFunc::Avg
+        | AggFunc::StddevPop
+        | AggFunc::StddevSamp
+        | AggFunc::VarPop
+        | AggFunc::VarSamp => ColumnType::Float,
         AggFunc::GroupConcat => ColumnType::Text,
+        AggFunc::BitOr | AggFunc::BitAnd | AggFunc::BitXor => ColumnType::Int,
         AggFunc::Sum | AggFunc::Min | AggFunc::Max => arg_ty.unwrap_or(ColumnType::Float),
     };
     let slot = aggs.len();
