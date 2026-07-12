@@ -1829,31 +1829,30 @@ pub async fn alter_table(
                     });
                     continue;
                 }
-                let (idx_name, columns, unique) = match tc {
-                    TC::Index { name, columns, .. } => (name.clone(), columns.clone(), false),
-                    TC::Unique {
-                        name,
-                        index_name,
-                        columns,
-                        ..
-                    } => (
-                        name.clone().or_else(|| index_name.clone()),
-                        columns.clone(),
-                        true,
-                    ),
-                    TC::PrimaryKey { .. } => {
-                        return Err(Error::Unsupported(
+                let (idx_name, columns, unique) =
+                    match tc {
+                        TC::Index { name, columns, .. } => (name.clone(), columns.clone(), false),
+                        TC::Unique {
+                            name,
+                            index_name,
+                            columns,
+                            ..
+                        } => (
+                            name.clone().or_else(|| index_name.clone()),
+                            columns.clone(),
+                            true,
+                        ),
+                        TC::PrimaryKey { .. } => return Err(Error::Unsupported(
                             "ALTER TABLE ADD PRIMARY KEY on an existing table is not supported; \
                              declare the primary key in CREATE TABLE"
                                 .into(),
-                        ))
-                    }
-                    other => {
-                        return Err(Error::Unsupported(format!(
-                            "ALTER ADD constraint not supported: {other}"
-                        )))
-                    }
-                };
+                        )),
+                        other => {
+                            return Err(Error::Unsupported(format!(
+                                "ALTER ADD constraint not supported: {other}"
+                            )))
+                        }
+                    };
                 let ci = CreateIndex {
                     name: idx_name.map(|i| ObjectName(vec![i])),
                     table_name: name.clone(),
@@ -3491,7 +3490,23 @@ pub async fn select(
 
     // Aggregation / grouping path: parallel streaming aggregation (OLAP).
     if !group_by.is_empty() || aggregate::projection_has_aggregate(&select.projection) {
-        let plan = aggregate::build_plan(&def.schema, &select.projection, &group_by)?;
+        // HAVING may reference aggregates not in the SELECT list (e.g.
+        // `... GROUP BY x HAVING COUNT(*) > 1`). Compute them as hidden output
+        // columns, then drop them before returning.
+        let hidden = having_hidden_items(&select.projection, select.having.as_ref());
+        let aug_proj: Vec<sqlparser::ast::SelectItem>;
+        let proj: &[sqlparser::ast::SelectItem] = if hidden.is_empty() {
+            &select.projection
+        } else {
+            aug_proj = select
+                .projection
+                .iter()
+                .cloned()
+                .chain(hidden.iter().cloned())
+                .collect();
+            &aug_proj
+        };
+        let plan = aggregate::build_plan(&def.schema, proj, &group_by)?;
         // If statistics predict more distinct groups than fit in memory, go
         // straight to the spilling partitioned aggregation instead of running the
         // in-memory pass, hitting the cap, and re-scanning from scratch (which
@@ -3568,12 +3583,16 @@ pub async fn select(
                 plan.finalize(agg)?
             }
         };
-        let mut out_rows = apply_having(
-            select.having.as_ref(),
-            &select.projection,
-            &schema,
-            out_rows,
-        )?;
+        let (mut schema, mut out_rows) = (schema, out_rows);
+        out_rows = apply_having(select.having.as_ref(), proj, &schema, out_rows)?;
+        // Drop hidden HAVING-only aggregate columns from the result.
+        if !hidden.is_empty() {
+            let keep = schema.columns.len().saturating_sub(hidden.len());
+            schema.columns.truncate(keep);
+            for r in &mut out_rows {
+                r.truncate(keep);
+            }
+        }
         order_output_rows(&mut out_rows, &schema, &order_exprs)?;
         apply_offset_limit(&mut out_rows, offset, limit);
         return Ok(QueryResult::Rows(RowStream::literal(schema, out_rows)));
@@ -6965,6 +6984,82 @@ fn infer_val(v: &Value) -> ColumnType {
 /// Apply a `HAVING` clause to aggregated output rows. Aggregate expressions
 /// and columns in `HAVING` are matched to output columns by their SELECT-list
 /// text or alias, then evaluated against each output row.
+/// Aggregate function sub-expressions of a HAVING clause that must be computed
+/// as hidden output columns because they are not already in the SELECT list.
+fn having_hidden_items(
+    projection: &[sqlparser::ast::SelectItem],
+    having: Option<&Expr>,
+) -> Vec<sqlparser::ast::SelectItem> {
+    use sqlparser::ast::{Ident, SelectItem};
+    let Some(h) = having else { return Vec::new() };
+    let mut aggs = Vec::new();
+    collect_agg_exprs(h, &mut aggs);
+    if aggs.is_empty() {
+        return Vec::new();
+    }
+    let existing: std::collections::HashSet<String> = projection
+        .iter()
+        .filter_map(|it| match it {
+            SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
+                Some(e.to_string())
+            }
+            _ => None,
+        })
+        .collect();
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for a in aggs {
+        let t = a.to_string();
+        if existing.contains(&t) || !seen.insert(t) {
+            continue;
+        }
+        let alias = Ident::new(format!("__hv_{}", out.len()));
+        out.push(SelectItem::ExprWithAlias { expr: a, alias });
+    }
+    out
+}
+
+/// Collect aggregate-function sub-expressions (not recursing into their args).
+fn collect_agg_exprs(e: &Expr, out: &mut Vec<Expr>) {
+    match e {
+        Expr::Function(f) => {
+            let name = f
+                .name
+                .0
+                .last()
+                .map(|i| i.value.to_ascii_lowercase())
+                .unwrap_or_default();
+            if matches!(
+                name.as_str(),
+                "count"
+                    | "sum"
+                    | "avg"
+                    | "min"
+                    | "max"
+                    | "group_concat"
+                    | "std"
+                    | "stddev"
+                    | "stddev_pop"
+                    | "stddev_samp"
+                    | "variance"
+                    | "var_pop"
+                    | "var_samp"
+                    | "bit_or"
+                    | "bit_and"
+                    | "bit_xor"
+            ) {
+                out.push(e.clone());
+            }
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            collect_agg_exprs(left, out);
+            collect_agg_exprs(right, out);
+        }
+        Expr::Nested(x) | Expr::UnaryOp { expr: x, .. } => collect_agg_exprs(x, out),
+        _ => {}
+    }
+}
+
 fn apply_having(
     having: Option<&Expr>,
     projection: &[sqlparser::ast::SelectItem],
@@ -8269,10 +8364,12 @@ async fn correlated_select(
         for item in &select.projection {
             let expr = match item {
                 SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => e,
-                other => {
-                    return Err(Error::Unsupported(format!(
-                        "projection item not supported with correlated subquery: {other}"
-                    )))
+                // `*` / `table.*`: expand to all base columns of the (single) table.
+                SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..) => {
+                    for v in row {
+                        vals.push(v.clone());
+                    }
+                    continue;
                 }
             };
             let bound = bind_outer(expr, outer, &def.schema, row);
@@ -8283,25 +8380,42 @@ async fn correlated_select(
     }
 
     // Output schema: names from the projection, types from the first row.
-    let mut cols = Vec::with_capacity(select.projection.len());
-    for (ci, item) in select.projection.iter().enumerate() {
-        let name = match item {
-            SelectItem::ExprWithAlias { alias, .. } => alias.value.clone(),
-            SelectItem::UnnamedExpr(e) => ident_name(e)
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| e.to_string()),
-            _ => format!("col{ci}"),
-        };
-        let ty = out_rows
-            .first()
-            .map(|r| infer_val(&r[ci]))
-            .unwrap_or(ColumnType::Text);
-        cols.push(ColumnDef {
-            name,
-            ty,
-            nullable: true,
-            collation: elyra_core::Collation::Ci,
-        });
+    let mut cols = Vec::new();
+    for item in &select.projection {
+        match item {
+            // Wildcards expand to the base table's columns, in order.
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..) => {
+                for c in &def.schema.columns {
+                    cols.push(ColumnDef {
+                        name: c.name.clone(),
+                        ty: c.ty.clone(),
+                        nullable: c.nullable,
+                        collation: c.collation,
+                    });
+                }
+            }
+            _ => {
+                let name = match item {
+                    SelectItem::ExprWithAlias { alias, .. } => alias.value.clone(),
+                    SelectItem::UnnamedExpr(e) => ident_name(e)
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| e.to_string()),
+                    _ => format!("col{}", cols.len()),
+                };
+                let ci = cols.len();
+                let ty = out_rows
+                    .first()
+                    .and_then(|r| r.get(ci))
+                    .map(infer_val)
+                    .unwrap_or(ColumnType::Text);
+                cols.push(ColumnDef {
+                    name,
+                    ty,
+                    nullable: true,
+                    collation: elyra_core::Collation::Ci,
+                });
+            }
+        }
     }
     Ok(QueryResult::Rows(RowStream::literal(
         Schema::new(cols),

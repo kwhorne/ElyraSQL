@@ -1782,7 +1782,11 @@ fn required_privilege(stmt: &Statement) -> Privilege {
 /// with `PARTITION`/`AS SELECT`/`LIKE` after the columns untouched.
 fn strip_create_table_options(sql: &str) -> Option<String> {
     let head = sql.trim_start();
-    let mut up = head.chars().take(40).collect::<String>().to_ascii_uppercase();
+    let mut up = head
+        .chars()
+        .take(40)
+        .collect::<String>()
+        .to_ascii_uppercase();
     up.retain(|c| !c.is_whitespace() || c == ' ');
     if !up.starts_with("CREATE") || !up.contains("TABLE") {
         return None;

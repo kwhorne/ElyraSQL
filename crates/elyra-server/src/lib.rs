@@ -353,7 +353,13 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for ElyraShim {
         }
         match res {
             Ok(outcomes) => {
-                write_outcomes(outcomes, results, self.session.last_insert_id() as u64, self.session.in_txn()).await
+                write_outcomes(
+                    outcomes,
+                    results,
+                    self.session.last_insert_id() as u64,
+                    self.session.in_txn(),
+                )
+                .await
             }
             Err(e) => {
                 results
@@ -399,7 +405,13 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for ElyraShim {
         }
         match res {
             Ok(outcomes) => {
-                write_outcomes(outcomes, results, self.session.last_insert_id() as u64, self.session.in_txn()).await
+                write_outcomes(
+                    outcomes,
+                    results,
+                    self.session.last_insert_id() as u64,
+                    self.session.in_txn(),
+                )
+                .await
             }
             Err(e) => {
                 results
