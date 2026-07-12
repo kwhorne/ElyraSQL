@@ -60,7 +60,14 @@ pub fn load_tls(
         .collect::<Result<Vec<CertificateDer>, _>>()?;
     let key = rustls_pemfile::private_key(&mut BufReader::new(File::open(key_path)?))?
         .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "no private key in key file"))?;
-    TlsServerConfig::builder()
+    // rustls 0.23 requires an explicit crypto provider; use ring (pure-Rust
+    // friendly, matches the ai_embed HTTPS client and keeps musl builds working
+    // -- no aws-lc-rs). Passing it explicitly avoids relying on a process-wide
+    // default provider.
+    let provider = std::sync::Arc::new(tokio_rustls::rustls::crypto::ring::default_provider());
+    TlsServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| Error::new(ErrorKind::InvalidInput, e))?
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .map_err(|e| Error::new(ErrorKind::InvalidInput, e))

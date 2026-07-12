@@ -6,20 +6,9 @@
 
 [advisories]
 ignore = [
-    # --- rustls-webpki 0.102.8 (transitive via opensrv-mysql 0.7 -> tokio-rustls
-    #     0.25 -> rustls 0.22). All four advisories are in certificate/CRL *chain
-    #     verification*. ElyraSQL uses this crate only as a TLS *server*: it
-    #     presents its own certificate and does not verify peer certificates
-    #     (mutual TLS is not implemented), so the name-constraint, wildcard and
-    #     CRL parsing paths are never reached. The outbound HTTPS client used by
-    #     ai_embed() -- which *does* verify server certificates -- rides on
-    #     ureq's independent rustls 0.23 + rustls-webpki 0.103.13 (already fixed).
-    #     The real remedy (rustls 0.23 on the server path) is blocked until
-    #     opensrv-mysql bumps rustls; tracked, not forgotten.
-    "RUSTSEC-2026-0104", # reachable panic in CRL parsing (CRLs not parsed server-side)
-    "RUSTSEC-2026-0099", # name constraints accepted for wildcard cert (peer verify only)
-    "RUSTSEC-2026-0098", # name constraints for URI names (peer verify only)
-    "RUSTSEC-2026-0049", # CRLs not authoritative by distribution point (peer verify only)
+    # NOTE: the four rustls-webpki 0.102 advisories are gone -- forking the wire
+    # layer (elyra-wire) let us move the server TLS stack to rustls 0.23 +
+    # rustls-webpki 0.103.13, so they no longer apply and are not ignored here.
 
     # --- Unmaintained (warnings, no known vulnerability) ---
     # bincode 1.3.3 defines our on-disk row/catalog encoding. bincode 2/3 change
