@@ -168,6 +168,17 @@ impl Snapshot {
 /// therefore a single file.
 const KV: TableDefinition<&[u8], &[u8]> = TableDefinition::new("elyra_kv");
 
+/// Monotonic write sequence, persisted at `meta::wseq` *inside every write
+/// transaction*. Because it commits atomically with the data, any read snapshot
+/// observes the `wseq` that exactly identifies its committed state -- the basis
+/// for race-free cache invalidation in the engine (a cached artifact tagged
+/// with a `wseq` is valid iff the current committed `wseq` still matches).
+const WSEQ_KEY: &[u8] = b"meta::wseq";
+static WSEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+fn next_wseq() -> u64 {
+    WSEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+
 /// Smallest key strictly greater than every key starting with `prefix`
 /// (`None` when the prefix is all `0xFF`). Used to bound prefix range scans to
 /// a single keyspace instead of the whole database.
@@ -698,6 +709,8 @@ impl Storage {
                     )));
                 }
             }
+            t.insert(WSEQ_KEY, next_wseq().to_le_bytes().as_slice())
+                .map_err(|e| Error::Storage(e.to_string()))?;
         }
         wtx.commit().map_err(|e| Error::Storage(e.to_string()))?;
         Ok(results)
@@ -757,6 +770,8 @@ impl Storage {
                 t.insert(k.as_slice(), v.as_slice())
                     .map_err(|e| Error::Storage(e.to_string()))?;
             }
+            t.insert(WSEQ_KEY, next_wseq().to_le_bytes().as_slice())
+                .map_err(|e| Error::Storage(e.to_string()))?;
         }
         wtx.commit().map_err(|e| Error::Storage(e.to_string()))?;
         Ok(())
@@ -781,6 +796,8 @@ impl Storage {
                 t.insert(k.as_slice(), v.as_slice())
                     .map_err(|e| Error::Storage(e.to_string()))?;
             }
+            t.insert(WSEQ_KEY, next_wseq().to_le_bytes().as_slice())
+                .map_err(|e| Error::Storage(e.to_string()))?;
         }
         wtx.commit().map_err(|e| Error::Storage(e.to_string()))?;
         Ok(())
@@ -819,9 +836,20 @@ impl Storage {
                 t.insert(k.as_slice(), v.as_slice())
                     .map_err(|e| Error::Storage(e.to_string()))?;
             }
+            t.insert(WSEQ_KEY, next_wseq().to_le_bytes().as_slice())
+                .map_err(|e| Error::Storage(e.to_string()))?;
         }
         wtx.commit().map_err(|e| Error::Storage(e.to_string()))?;
         Ok(())
+    }
+
+    /// The current committed write sequence (see [`WSEQ_KEY`]). `0` if unset.
+    pub fn write_epoch(&self) -> Result<u64> {
+        Ok(self
+            .get(WSEQ_KEY)?
+            .and_then(|b| b.as_slice().try_into().ok())
+            .map(u64::from_le_bytes)
+            .unwrap_or(0))
     }
 }
 

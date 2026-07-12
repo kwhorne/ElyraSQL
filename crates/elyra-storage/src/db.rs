@@ -440,6 +440,12 @@ impl Db {
         spawn_read(move || storage.get(&key)).await
     }
 
+    /// The current committed write sequence (see [`Storage::write_epoch`]).
+    /// Changes on every committed write; used for race-free cache invalidation.
+    pub fn write_epoch(&self) -> Result<u64> {
+        self.storage.write_epoch()
+    }
+
     /// Fetch many values in a single read transaction (see
     /// [`Storage::multi_get`]).
     pub async fn multi_get(&self, keys: Vec<Vec<u8>>) -> Result<Vec<Option<Vec<u8>>>> {

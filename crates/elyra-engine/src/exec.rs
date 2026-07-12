@@ -14,6 +14,7 @@ use sqlparser::ast::{
 
 use crate::aggregate;
 use crate::aggregate::AggPlan;
+use crate::colcache;
 use crate::cpred;
 use crate::index;
 use crate::predicate;
@@ -3354,15 +3355,33 @@ pub async fn select(
             None
         };
         let (schema, out_rows) = if let Some(specs) = columnar {
-            let results = scan_columnar_scalar(db, &def, &specs).await?;
+            // Unfiltered scalar aggregation may use the columnar cache (opt-in).
+            let results = if colcache::enabled() {
+                columnar_cached_scalar(db, &def, &specs).await?
+            } else {
+                scan_columnar_scalar(db, &def, &specs).await?
+            };
             plan.project_scalar(results)?
         } else if est_groups.is_some_and(|g| g > cap) {
             partitioned_aggregate(db, &def, filter.clone(), &plan).await?
         } else if let Some((gc, specs, cf, needed)) = columnar_group {
             let base_len = def.schema.columns.len();
-            match scan_columnar_group(db, &def, gc, &specs, cf, needed, base_len).await? {
+            // The cache holds whole (unfiltered) columns, so it serves only the
+            // no-filter case; filtered GROUP BY stays on the compiled-predicate
+            // scan path.
+            let cached = if colcache::enabled() && cf.is_none() {
+                columnar_cached_group(db, &def, gc, &specs, base_len).await?
+            } else {
+                None
+            };
+            match cached {
                 Some(groups) => plan.project_grouped(groups)?,
-                None => partitioned_aggregate(db, &def, filter.clone(), &plan).await?,
+                None => {
+                    match scan_columnar_group(db, &def, gc, &specs, cf, needed, base_len).await? {
+                        Some(groups) => plan.project_grouped(groups)?,
+                        None => partitioned_aggregate(db, &def, filter.clone(), &plan).await?,
+                    }
+                }
             }
         } else {
             let agg = olap_aggregate(db, &def, filter.clone(), &plan).await?;
@@ -9380,6 +9399,101 @@ async fn scan_columnar_group(
         return Ok(None);
     }
     Ok(Some(result.into_groups(base_len)))
+}
+
+/// Build a columnar cache entry for `def` at epoch `e0` from a single consistent
+/// snapshot, or `None` if the table's blobs exceed the cache budget or a write
+/// committed during the build (so it must not be cached).
+async fn build_cached_table(
+    db: &Session,
+    def: &TableDef,
+    e0: u64,
+) -> Result<Option<colcache::CachedTable>> {
+    let budget = colcache::budget_bytes();
+    let prefix = data_prefix(&def.name);
+    let raw = db.raw_db();
+    struct Acc {
+        blobs: Vec<Vec<u8>>,
+        bytes: usize,
+        over: bool,
+    }
+    let acc = raw
+        .scan_fold_until(
+            prefix,
+            Acc {
+                blobs: Vec::new(),
+                bytes: 0,
+                over: false,
+            },
+            move |a, _k, v| {
+                a.bytes += v.len();
+                if a.bytes > budget {
+                    a.over = true;
+                    return Ok(false);
+                }
+                a.blobs.push(v.to_vec());
+                Ok(true)
+            },
+        )
+        .await?;
+    if acc.over {
+        return Ok(None);
+    }
+    let ct = colcache::build(&def.schema, e0, &acc.blobs)?;
+    if ct.bytes > budget {
+        return Ok(None);
+    }
+    // The scan was one snapshot; if the write sequence is unchanged across the
+    // whole build, that snapshot is exactly epoch e0 and safe to cache.
+    if raw.write_epoch()? != e0 {
+        return Ok(None);
+    }
+    Ok(Some(ct))
+}
+
+/// Scalar aggregation via the columnar cache (build-on-miss). Falls back to the
+/// scan path when the table is too large to cache.
+async fn columnar_cached_scalar(
+    db: &Session,
+    def: &TableDef,
+    specs: &[(elyra_olap::AggFunc, Option<usize>, bool)],
+) -> Result<Vec<Value>> {
+    let epoch = db.raw_db().write_epoch()?;
+    if let Some(ct) = colcache::get(&def.name, epoch) {
+        return Ok(colcache::scalar_agg(&ct, specs));
+    }
+    match build_cached_table(db, def, epoch).await? {
+        Some(ct) => {
+            let ct = std::sync::Arc::new(ct);
+            colcache::store(&def.name, ct.clone());
+            Ok(colcache::scalar_agg(&ct, specs))
+        }
+        None => scan_columnar_scalar(db, def, specs).await,
+    }
+}
+
+/// Grouped aggregation via the columnar cache (build-on-miss). Returns `None`
+/// when the cache can't serve it (table too big, or the distinct-group cap is
+/// exceeded), so the caller uses the scan/spill path.
+async fn columnar_cached_group(
+    db: &Session,
+    def: &TableDef,
+    group_col: usize,
+    specs: &[(elyra_olap::AggFunc, Option<usize>, bool)],
+    base_len: usize,
+) -> Result<Option<Vec<(Vec<Value>, Vec<Value>)>>> {
+    let epoch = db.raw_db().write_epoch()?;
+    if let Some(ct) = colcache::get(&def.name, epoch) {
+        return Ok(colcache::group_agg(&ct, group_col, specs, base_len));
+    }
+    match build_cached_table(db, def, epoch).await? {
+        Some(ct) => {
+            let ct = std::sync::Arc::new(ct);
+            colcache::store(&def.name, ct.clone());
+            Ok(colcache::group_agg(&ct, group_col, specs, base_len))
+        }
+        None => Ok(None),
+    }
 }
 
 /// Degree of parallelism for full-scan aggregation: `ELYRASQL_AGG_WORKERS` if
