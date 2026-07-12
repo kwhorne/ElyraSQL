@@ -155,8 +155,21 @@ impl GroupAggregator {
         self.overflow
     }
 
-    /// Feed one row into the aggregator.
+    /// Feed one row into the aggregator. If the distinct-group cap is reached and
+    /// the row belongs to a new group, the aggregation is marked overflowed and
+    /// the row is dropped.
     pub fn feed(&mut self, row: &[Value]) {
+        if !self.try_feed(row) {
+            self.overflow = true;
+        }
+    }
+
+    /// Feed one row, returning `false` (without recording overflow) when the row
+    /// belongs to a *new* group and the cap is already reached -- so a caller
+    /// running a single-pass hybrid aggregation can spill just that row to disk
+    /// instead of losing it. Rows for groups already resident are always
+    /// accepted.
+    pub fn try_feed(&mut self, row: &[Value]) -> bool {
         // Build the key into a reused buffer -- existing groups (the common
         // case) are then found and updated in a single lookup with no per-row
         // allocation.
@@ -168,12 +181,11 @@ impl GroupAggregator {
                     .map(|c| row.get(c).cloned().unwrap_or(Value::Null));
                 update(&mut entry.1[i], spec.func, v, spec.distinct);
             }
-            return;
+            return true;
         }
         // New group. At/over the cap, refuse to create it (bounding memory).
         if self.max_groups > 0 && self.groups.len() >= self.max_groups {
-            self.overflow = true;
-            return;
+            return false;
         }
         let mut accs: Vec<Acc> = self.aggs.iter().map(|_| Acc::new()).collect();
         for (i, spec) in self.aggs.iter().enumerate() {
@@ -184,6 +196,7 @@ impl GroupAggregator {
         }
         self.groups
             .insert(self.key_buf.clone(), (row.to_vec(), accs));
+        true
     }
 
     /// Merge another partial aggregator (from a parallel worker) into this one.

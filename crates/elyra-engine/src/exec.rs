@@ -9495,9 +9495,17 @@ async fn partitioned_aggregate(
     const PARTS: usize = 256;
     let budget = crate::sort::sort_max_rows();
     let group_cols = plan.group_cols().to_vec();
+    let extend = !plan.arg_exprs().is_empty();
     let mut parts = crate::aggspill::Partitions::new(PARTS, budget);
 
-    // Phase 1: scan and route rows to partitions (spilling past the budget).
+    // Phase 1: a single pass that aggregates in memory and spills only the rows
+    // whose group does not fit. The in-memory aggregator holds the first
+    // `max_groups` distinct groups fully aggregated; every later row for a
+    // *new* group is routed to a disk partition. Because a group is either
+    // resident (all its rows aggregated in memory) or absent (all its rows
+    // spilled), the in-memory and spilled group sets are disjoint -- so their
+    // results simply concatenate, no cross-merge needed.
+    let mut resident = plan.new_aggregator();
     let prefix = data_prefix(&def.name);
     let mut cursor: Option<Vec<u8>> = None;
     loop {
@@ -9515,30 +9523,31 @@ async fn partitioned_aggregate(
                     continue;
                 }
             }
-            let gk: Vec<Value> = group_cols
-                .iter()
-                .map(|&c| row.get(c).cloned().unwrap_or(Value::Null))
-                .collect();
-            let p = crate::aggspill::partition_of(&Value::row_collation_key(&gk), PARTS);
-            parts.route(p, row)?;
+            let fed = if extend { plan.extend_row(&row)? } else { row };
+            if !resident.try_feed(&fed) {
+                // Group not resident and memory full -> spill this row.
+                let gk: Vec<Value> = group_cols
+                    .iter()
+                    .map(|&c| fed.get(c).cloned().unwrap_or(Value::Null))
+                    .collect();
+                let p = crate::aggspill::partition_of(&Value::row_collation_key(&gk), PARTS);
+                parts.route(p, fed)?;
+            }
         }
         if last {
             break;
         }
     }
 
-    // Phase 2: aggregate each partition independently and concatenate.
-    let extend = !plan.arg_exprs().is_empty();
-    let mut out_rows: Vec<Vec<Value>> = Vec::new();
-    let mut schema: Option<Schema> = None;
+    // Phase 2: finalise the resident groups, then aggregate each spilled
+    // partition independently and concatenate (all group sets are disjoint).
+    let (schema, resident_rows) = plan.finalize(resident)?;
+    let mut out_rows: Vec<Vec<Value>> = resident_rows;
     for p in 0..parts.len() {
         let mut agg = plan.new_aggregator();
         parts.drain_each(p, |row| {
-            if extend {
-                agg.feed(&plan.extend_row(&row)?);
-            } else {
-                agg.feed(&row);
-            }
+            // Rows were already filtered and extended before spilling.
+            agg.feed(&row);
             Ok(())
         })?;
         if agg.overflowed() {
@@ -9548,14 +9557,9 @@ async fn partitioned_aggregate(
                 elyra_olap::default_max_groups()
             )));
         }
-        let (s, rows) = plan.finalize(agg)?;
-        schema = Some(s);
+        let (_s, rows) = plan.finalize(agg)?;
         out_rows.extend(rows);
     }
-    let schema = match schema {
-        Some(s) => s,
-        None => plan.finalize(plan.new_aggregator())?.0,
-    };
     Ok((schema, out_rows))
 }
 
