@@ -3379,30 +3379,54 @@ pub async fn select(
             {
                 let need = offset.saturating_add(lim);
                 let prefix = data_prefix(&def.name);
-                let mut cursor: Option<Vec<u8>> = None;
                 let mut rows: Vec<Vec<Value>> = Vec::with_capacity(need.min(4096));
-                'scan: loop {
-                    let batch = db.scan_batch(prefix.clone(), cursor.clone(), 8192).await?;
-                    if batch.is_empty() {
-                        break;
-                    }
-                    let last = batch.len() < 8192;
-                    cursor = batch.last().map(|(k, _)| k.clone());
-                    for (_, v) in batch {
-                        let row: Vec<Value> = bincode::deserialize(&v)
-                            .map_err(|e| Error::Storage(e.to_string()))?;
-                        if let Some(f) = &filter {
-                            if !predicate::matches(f, &def.schema, &row)? {
-                                continue;
+                if !db.in_txn() {
+                    // Autocommit: iterate clustered order in one read transaction,
+                    // decoding straight from borrowed bytes and stopping as soon
+                    // as `need` matches are collected (no batch copies).
+                    let sch = def.schema.clone();
+                    let f = filter.clone();
+                    rows = db
+                        .raw_db()
+                        .scan_fold_until(prefix, rows, move |rows, _k, v| {
+                            let row: Vec<Value> = bincode::deserialize(v)
+                                .map_err(|e| Error::Storage(e.to_string()))?;
+                            let keep = match &f {
+                                Some(e) => predicate::matches(e, &sch, &row)?,
+                                None => true,
+                            };
+                            if keep {
+                                rows.push(row);
+                            }
+                            Ok(rows.len() < need)
+                        })
+                        .await?;
+                } else {
+                    // In a transaction: use the overlay-aware batch scan.
+                    let mut cursor: Option<Vec<u8>> = None;
+                    'scan: loop {
+                        let batch = db.scan_batch(prefix.clone(), cursor.clone(), 8192).await?;
+                        if batch.is_empty() {
+                            break;
+                        }
+                        let last = batch.len() < 8192;
+                        cursor = batch.last().map(|(k, _)| k.clone());
+                        for (_, v) in batch {
+                            let row: Vec<Value> = bincode::deserialize(&v)
+                                .map_err(|e| Error::Storage(e.to_string()))?;
+                            if let Some(f) = &filter {
+                                if !predicate::matches(f, &def.schema, &row)? {
+                                    continue;
+                                }
+                            }
+                            rows.push(row);
+                            if rows.len() >= need {
+                                break 'scan;
                             }
                         }
-                        rows.push(row);
-                        if rows.len() >= need {
-                            break 'scan;
+                        if last {
+                            break;
                         }
-                    }
-                    if last {
-                        break;
                     }
                 }
                 apply_offset_limit(&mut rows, offset, limit);
@@ -8636,23 +8660,27 @@ async fn scan_aggregate_fast(
     let arg_exprs = plan.arg_exprs().to_vec();
     let agg = plan.new_aggregator();
     let raw = db.raw_db();
+    // One reusable row buffer for the whole scan -- avoids a per-row allocation.
+    let mut buf: Vec<Value> = Vec::with_capacity(ncols);
     let agg = raw
         .scan_fold(prefix, agg, move |agg, _k, v| {
-            let row: Vec<Value> = match &needed {
-                Some(m) => rowdec::decode_projected(v, ncols, m)?,
-                None => bincode::deserialize(v).map_err(|e| Error::Storage(e.to_string()))?,
-            };
+            match &needed {
+                Some(m) => rowdec::decode_projected_into(v, ncols, m, &mut buf)?,
+                None => {
+                    buf = bincode::deserialize(v).map_err(|e| Error::Storage(e.to_string()))?
+                }
+            }
             let keep = match &filter {
-                Some(e) => predicate::matches(e, &schema, &row)?,
+                Some(e) => predicate::matches(e, &schema, &buf)?,
                 None => true,
             };
             if keep {
                 if arg_exprs.is_empty() {
-                    agg.feed(&row);
+                    agg.feed(&buf);
                 } else {
-                    let mut r = row.clone();
+                    let mut r = buf.clone();
                     for e in &arg_exprs {
-                        r.push(predicate::eval_row(e, &schema, &row)?);
+                        r.push(predicate::eval_row(e, &schema, &buf)?);
                     }
                     agg.feed(&r);
                 }

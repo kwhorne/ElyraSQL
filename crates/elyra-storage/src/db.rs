@@ -441,6 +441,22 @@ impl Db {
         .await
     }
 
+    /// Fold over rows whose key starts with `prefix`, stopping early when `f`
+    /// returns `false` (see [`Storage::scan_prefix_until`]).
+    pub async fn scan_fold_until<T, F>(&self, prefix: Vec<u8>, init: T, mut f: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnMut(&mut T, &[u8], &[u8]) -> Result<bool> + Send + 'static,
+    {
+        let storage = self.storage.clone();
+        spawn_read(move || {
+            let mut acc = init;
+            storage.scan_prefix_until(&prefix, |k, v| f(&mut acc, k, v))?;
+            Ok(acc)
+        })
+        .await
+    }
+
     /// Ordered range scan over `[start, end)` (see [`Storage::scan_range`]).
     pub async fn scan_range(
         &self,

@@ -51,14 +51,28 @@ impl<'a> Cur<'a> {
 /// `needed[i]` flag is set. Non-needed columns are returned as `Value::Null`.
 /// `ncols` is the table's column count (used to validate the stored row).
 pub fn decode_projected(bytes: &[u8], ncols: usize, needed: &[bool]) -> Result<Vec<Value>> {
+    let mut out = Vec::with_capacity(ncols);
+    decode_projected_into(bytes, ncols, needed, &mut out)?;
+    Ok(out)
+}
+
+/// Like [`decode_projected`] but decodes into a caller-owned buffer (cleared
+/// first), so a scan can reuse one allocation across millions of rows.
+pub fn decode_projected_into(
+    bytes: &[u8],
+    ncols: usize,
+    needed: &[bool],
+    out: &mut Vec<Value>,
+) -> Result<()> {
+    out.clear();
     let mut c = Cur { b: bytes, p: 0 };
     let count = c.u64()? as usize;
     // If the stored arity differs from the schema (e.g. mid-migration rows),
     // fall back to a full decode for safety.
     if count != ncols {
-        return bincode::deserialize::<Vec<Value>>(bytes).map_err(|e| Error::Storage(e.to_string()));
+        *out = bincode::deserialize::<Vec<Value>>(bytes).map_err(|e| Error::Storage(e.to_string()))?;
+        return Ok(());
     }
-    let mut out = Vec::with_capacity(count);
     for i in 0..count {
         let tag = c.u32()?;
         let want = needed.get(i).copied().unwrap_or(true);
@@ -163,13 +177,14 @@ pub fn decode_projected(bytes: &[u8], ncols: usize, needed: &[bool]) -> Result<V
             }
             // Unknown variant tag: bail out to a full, authoritative decode.
             _ => {
-                return bincode::deserialize::<Vec<Value>>(bytes)
-                    .map_err(|e| Error::Storage(e.to_string()));
+                *out = bincode::deserialize::<Vec<Value>>(bytes)
+                    .map_err(|e| Error::Storage(e.to_string()))?;
+                return Ok(());
             }
         };
         out.push(v);
     }
-    Ok(out)
+    Ok(())
 }
 
 #[cfg(test)]

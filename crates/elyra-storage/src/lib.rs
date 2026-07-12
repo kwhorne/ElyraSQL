@@ -384,6 +384,36 @@ impl Storage {
         Ok(())
     }
 
+    /// Like [`Storage::scan_prefix_each`] but `f` returns `false` to stop the
+    /// scan early (e.g. after collecting a `LIMIT`'s worth of matches). Avoids
+    /// reading and copying rows past the ones actually needed.
+    pub fn scan_prefix_until<F>(&self, prefix: &[u8], mut f: F) -> Result<()>
+    where
+        F: FnMut(&[u8], &[u8]) -> Result<bool>,
+    {
+        let rtx = self
+            .db
+            .begin_read()
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        let t = rtx
+            .open_table(KV)
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        let range = t
+            .range(prefix..)
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        for item in range {
+            let (k, v) = item.map_err(|e| Error::Storage(e.to_string()))?;
+            let key = k.value();
+            if !key.starts_with(prefix) {
+                break;
+            }
+            if !f(key, v.value())? {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     /// Scan keys in `[start, end)` (end exclusive; unbounded when `None`), up
     /// to `limit` pairs. Backs ordered range lookups on the clustered data
     /// keyspace and on secondary indexes.
