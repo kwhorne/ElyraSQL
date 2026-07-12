@@ -57,4 +57,4 @@ pub const PRODUCT_NAME: &str = "ElyraSQL";
 ///
 /// Format: `<major>.<minor>.<patch>-ElyraSQL`. MySQL clients parse the
 /// leading `x.y.z`, so we prefix a MySQL-looking version and tag the rest.
-pub const SERVER_VERSION: &str = "8.0.0-ElyraSQL-0.9.5";
+pub const SERVER_VERSION: &str = "8.0.0-ElyraSQL-0.9.6";

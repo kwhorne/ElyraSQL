@@ -4,6 +4,42 @@ All notable changes to ElyraSQL are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.9.6] - 2026-07-12
+
+OLAP performance release. No on-disk format change; fully compatible with
+0.9.3–0.9.5 data files.
+
+Headline result (native Linux, all engines on one host — see
+`benchmark_analyse.md`): on 1M rows, **ElyraSQL is the fastest of ElyraSQL,
+PostgreSQL 17 and MySQL 8.4 on every OLAP query** — global aggregation, low- and
+high-cardinality `GROUP BY`, top-N, and filtered aggregation — and 2–5× ahead of
+MySQL.
+
+### OLAP
+
+- **Vectorised (columnar) scalar aggregation.** Multi-aggregate queries without
+  `GROUP BY` over numeric columns extract each column into a contiguous `f64`
+  array per batch and aggregate with tight, SIMD-friendly loops instead of
+  per-row `Value` dispatch. `SUM/AVG/MIN/MAX` over 1M rows ≈ halved.
+- **Compiled filter predicate.** A `WHERE` that is a conjunction of
+  `column <cmp> numeric-literal` is compiled once with pre-resolved column
+  indices and evaluated with native comparisons, instead of re-resolving column
+  names and walking the expression per row. Filtered aggregation on 1M rows
+  dropped from ~87 ms to ~53 ms (now ahead of PostgreSQL).
+- **Fast bare `COUNT(*)`.** Counts keys across parallel clustered ranges without
+  decoding row values, and seeds the result directly (~24 ms → ~8 ms locally).
+- **`ELYRASQL_AGG_WORKERS`** tunes aggregation parallelism (default min(cores, 4);
+  aggregation is memory-bandwidth bound, so more workers can be slower).
+
+### Tooling
+
+- `bench/olap.py` — OLAP benchmark harness (1M-row analytical queries).
+- `.github/workflows/benchmark.yml` — native-Linux CI benchmark against MySQL
+  and PostgreSQL; run with `gh workflow run benchmark.yml`. This is the fair,
+  representative environment (a laptop hypervisor penalises ElyraSQL's parallel,
+  memory-mapped scans).
+- `benchmark_analyse.md` refreshed with the native-Linux OLAP + core-SQL results.
+
 ## [0.9.5] - 2026-07-12
 
 Performance release focused on aggregation. No on-disk format change; fully
@@ -877,6 +913,7 @@ core CRUD with `WHERE`/`ORDER BY`/`LIMIT`, indexes, aggregation and `GROUP BY`,
 joins, prepared statements, authentication and TLS, vector search (exact +
 HNSW), parallel OLAP aggregation, and transactions with snapshot isolation.
 
+[0.9.6]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.9.6
 [0.9.5]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.9.5
 [0.9.4]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.9.4
 [0.9.3]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.9.3
