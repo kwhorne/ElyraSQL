@@ -142,7 +142,7 @@ def bench_engine(eng, n):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--rows", type=int, default=1_000_000)
-    ap.add_argument("--engines", default="elyra,clickhouse,mysql,postgres")
+    ap.add_argument("--engines", default="elyra,postgres,mysql")
     a = ap.parse_args()
 
     factories = {
