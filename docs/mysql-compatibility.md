@@ -35,8 +35,15 @@ gaps:
   joins are not.
 - Views, row-level triggers, and stored procedures are supported;
   user-defined functions and scheduled events are not.
-- `ALTER TABLE` supports add/drop/rename column and rename table (not
-  `MODIFY`/`CHANGE` type changes).
+- `ALTER TABLE` supports add/drop/rename/`MODIFY`/`CHANGE` column, rename table,
+  and `ADD INDEX`/`KEY`/`UNIQUE` (with backfill); `ADD PRIMARY KEY`/`FOREIGN KEY`
+  on an existing table must instead be declared in `CREATE TABLE`.
+- A broad scalar function library (string, math, date/time, JSON, `MD5`/`SHA1`/
+  `SHA2`, `HEX`/`UNHEX`, `FORMAT`, `FIND_IN_SET`, `FROM_UNIXTIME`, ...),
+  statistical and bitwise aggregates (`STDDEV*`, `VAR*`, `BIT_OR`/`AND`/`XOR`),
+  `LAST_INSERT_ID()`/`ROW_COUNT()`, `@@`system variables, and `CONVERT()`.
+  `INSERT ... SET`, the `<<`/`>>`/`~` bitwise operators, and `LOAD DATA LOCAL`
+  are not parsed (parser limitations); `&`, `|`, `^` bitwise operators work.
 - Vector search and `VEC_DISTANCE(...)` are ElyraSQL extensions (they mirror
   MySQL 9's vector direction but are not identical).
 - `SHOW` and `information_schema` cover what GUI tools and drivers need to

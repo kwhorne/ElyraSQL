@@ -35,6 +35,11 @@ implemented, so you can judge fit.
   `UNBOUNDED PRECEDING .. CURRENT ROW`/`UNBOUNDED FOLLOWING` for `RANGE`),
   correlated subqueries combined with aggregation over a join, user-defined
   functions, and events.
+- A few MySQL-specific spellings are rejected at parse time by the SQL parser:
+  `INSERT ... SET col = val` (use `INSERT ... VALUES`/`(cols) VALUES`), and the
+  `<<`, `>>` and unary `~` bitwise operators (`&`, `|`, `^` work; use them or
+  arithmetic instead). `LAST_INSERT_ID()`, `ROW_COUNT()`, `@@`system variables,
+  `CONVERT()`, `MD5`/`SHA*`, and statistical/bitwise aggregates are supported.
 
 ## Constraints & integrity
 
