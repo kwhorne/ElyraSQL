@@ -26,6 +26,7 @@ mod sort;
 mod stream;
 mod users;
 mod vindex;
+mod zonemap;
 
 pub use session::{Isolation, Session};
 pub use sort::cleanup_stale_tempfiles;

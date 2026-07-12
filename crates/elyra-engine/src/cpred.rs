@@ -54,6 +54,25 @@ struct Cmp {
     rhs: f64,
 }
 
+/// One `column <op> literal` bound exposed for zone-map (min/max) chunk
+/// skipping. `op`/`rhs` mirror an internal comparison; `col` is a base column.
+#[derive(Clone, Copy)]
+pub struct ColBound {
+    pub col: usize,
+    pub op: BoundOp,
+    pub rhs: f64,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum BoundOp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
 /// A conjunction of `column <cmp> numeric-literal` comparisons over numeric
 /// (`Int`/`Float`) columns, with column indices pre-resolved.
 #[derive(Clone)]
@@ -62,6 +81,27 @@ pub struct CompiledPredicate {
 }
 
 impl CompiledPredicate {
+    /// The conjunction's per-column numeric bounds, for zone-map chunk skipping.
+    /// Because the predicate is a pure AND of these, a chunk whose [min, max]
+    /// range for some column cannot satisfy its bound contains no matching row.
+    pub fn bounds(&self) -> Vec<ColBound> {
+        self.conj
+            .iter()
+            .map(|c| ColBound {
+                col: c.col,
+                op: match c.op {
+                    Op::Eq => BoundOp::Eq,
+                    Op::Ne => BoundOp::Ne,
+                    Op::Lt => BoundOp::Lt,
+                    Op::Le => BoundOp::Le,
+                    Op::Gt => BoundOp::Gt,
+                    Op::Ge => BoundOp::Ge,
+                },
+                rhs: c.rhs,
+            })
+            .collect()
+    }
+
     /// True if every comparison holds. A NULL / non-numeric column value fails
     /// the comparison (matching the interpreter's numeric semantics).
     #[inline]

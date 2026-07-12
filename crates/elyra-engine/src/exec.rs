@@ -19,6 +19,7 @@ use crate::cpred;
 use crate::index;
 use crate::predicate;
 use crate::rowdec;
+use crate::zonemap;
 use elyra_olap::GroupAggregator;
 
 use crate::catalog::{
@@ -3377,7 +3378,8 @@ pub async fn select(
             match cached {
                 Some(groups) => plan.project_grouped(groups)?,
                 None => {
-                    match scan_columnar_group(db, &def, gc, &specs, cf, needed, base_len).await? {
+                    match scan_columnar_group_zm(db, &def, gc, &specs, cf, needed, base_len).await?
+                    {
                         Some(groups) => plan.project_grouped(groups)?,
                         None => partitioned_aggregate(db, &def, filter.clone(), &plan).await?,
                     }
@@ -9349,6 +9351,7 @@ impl ColGroup {
 /// Run vectorised grouped aggregation over parallel clustered ranges. Returns
 /// `None` if the distinct-group cap was exceeded (caller falls back to the
 /// spilling path).
+#[allow(clippy::too_many_arguments)]
 async fn scan_columnar_group(
     db: &Session,
     def: &TableDef,
@@ -9357,18 +9360,23 @@ async fn scan_columnar_group(
     cfilter: Option<cpred::CompiledPredicate>,
     needed: Vec<bool>,
     base_len: usize,
+    explicit_ranges: Option<Vec<(Vec<u8>, Vec<u8>)>>,
 ) -> Result<Option<Vec<(Vec<Value>, Vec<Value>)>>> {
     let ncols = def.schema.columns.len();
     let prefix = data_prefix(&def.name);
     let raw = db.raw_db();
     let workers = agg_workers();
-    let mk = |cf: Option<cpred::CompiledPredicate>| {
-        ColGroup::new(group_col, specs, ncols, needed.clone(), cf)
+    // Work units: explicit (zone-map surviving) ranges if given, otherwise the
+    // clustered PK split for parallelism, otherwise a single full-prefix scan.
+    let ranges: Option<Vec<(Vec<u8>, Vec<u8>)>> = match explicit_ranges {
+        Some(rs) => Some(rs),
+        None if workers > 1 => pk_split_ranges(&raw, def, &prefix, workers).await?,
+        None => None,
     };
-    let result = if workers > 1 {
-        if let Some(ranges) = pk_split_ranges(&raw, def, &prefix, workers).await? {
-            let mut handles = Vec::with_capacity(ranges.len());
-            for (start, end) in ranges {
+    let result = match ranges {
+        Some(rs) => {
+            let mut handles = Vec::with_capacity(rs.len());
+            for (start, end) in rs {
                 let raw = raw.clone();
                 let specs = specs.to_vec();
                 let needed = needed.clone();
@@ -9379,7 +9387,8 @@ async fn scan_columnar_group(
                         .await
                 }));
             }
-            let mut result = mk(cfilter.clone());
+            let mut result =
+                ColGroup::new(group_col, specs, ncols, needed.clone(), cfilter.clone());
             for h in handles {
                 let part = h.await.map_err(|e| {
                     Error::Analytics(format!("columnar-group worker failed: {e}"))
@@ -9387,18 +9396,86 @@ async fn scan_columnar_group(
                 result.merge(part);
             }
             result
-        } else {
-            let st = mk(cfilter.clone());
+        }
+        None => {
+            let st = ColGroup::new(group_col, specs, ncols, needed.clone(), cfilter.clone());
             raw.scan_fold(prefix, st, |st, _k, v| st.feed(v)).await?
         }
-    } else {
-        let st = mk(cfilter.clone());
-        raw.scan_fold(prefix, st, |st, _k, v| st.feed(v)).await?
     };
     if result.overflow {
         return Ok(None);
     }
     Ok(Some(result.into_groups(base_len)))
+}
+
+/// Get a table's zone map at `epoch`, building it from one consistent snapshot
+/// if absent. Returns `None` if a write committed during the build (so its
+/// statistics can't be trusted for skipping this time).
+async fn get_or_build_zonemap(
+    db: &Session,
+    def: &TableDef,
+    epoch: u64,
+) -> Result<Option<std::sync::Arc<zonemap::ZoneMap>>> {
+    if let Some(zm) = zonemap::get(&def.name, epoch) {
+        return Ok(Some(zm));
+    }
+    let raw = db.raw_db();
+    let prefix = data_prefix(&def.name);
+    let upper = prefix_successor(&prefix);
+    let b = raw
+        .scan_fold(prefix, zonemap::Builder::new(&def.schema), |b, k, v| {
+            b.feed(k, v)
+        })
+        .await?;
+    if raw.write_epoch()? != epoch {
+        return Ok(None);
+    }
+    let zm = std::sync::Arc::new(b.finish(epoch, upper));
+    zonemap::store(&def.name, zm.clone());
+    Ok(Some(zm))
+}
+
+/// Zone-map-aware wrapper over [`scan_columnar_group`]: when zone maps are
+/// enabled and the filter has numeric bounds, skip chunks that cannot match,
+/// then re-validate that no write raced the skipping scan (else recompute in
+/// full). Correctness never depends on the zone map -- only which rows are read.
+async fn scan_columnar_group_zm(
+    db: &Session,
+    def: &TableDef,
+    group_col: usize,
+    specs: &[(elyra_olap::AggFunc, Option<usize>, bool)],
+    cfilter: Option<cpred::CompiledPredicate>,
+    needed: Vec<bool>,
+    base_len: usize,
+) -> Result<Option<Vec<(Vec<Value>, Vec<Value>)>>> {
+    if zonemap::enabled() && !db.in_txn() {
+        if let Some(cf) = &cfilter {
+            let bounds = cf.bounds();
+            if !bounds.is_empty() {
+                let epoch = db.raw_db().write_epoch()?;
+                if let Some(zm) = get_or_build_zonemap(db, def, epoch).await? {
+                    let ranges = zm.surviving_ranges(&bounds);
+                    let res = scan_columnar_group(
+                        db,
+                        def,
+                        group_col,
+                        specs,
+                        cfilter.clone(),
+                        needed.clone(),
+                        base_len,
+                        Some(ranges),
+                    )
+                    .await?;
+                    // If nothing committed during the skipping scan, the skip was
+                    // valid; otherwise fall through to a full, unskipped scan.
+                    if db.raw_db().write_epoch()? == epoch {
+                        return Ok(res);
+                    }
+                }
+            }
+        }
+    }
+    scan_columnar_group(db, def, group_col, specs, cfilter, needed, base_len, None).await
 }
 
 /// Build a columnar cache entry for `def` at epoch `e0` from a single consistent
