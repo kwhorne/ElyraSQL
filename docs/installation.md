@@ -9,7 +9,7 @@ Each [release](https://github.com/kwhorne/ElyraSQL/releases) ships fully static
 dependency.
 
 ```bash
-VER=0.9.4
+VER=0.9.5
 ARCH=x86_64   # or aarch64
 curl -L -o elyrasql.tar.gz \
   https://github.com/kwhorne/ElyraSQL/releases/download/v${VER}/elyrasql-${VER}-linux-${ARCH}.tar.gz
@@ -27,8 +27,8 @@ Each archive contains the `elyrasql` binary, `README`, `LICENSE`, and a sample
 Multi-arch image (`amd64` + `arm64`) on the GitHub Container Registry:
 
 ```bash
-docker pull ghcr.io/kwhorne/elyrasql:0.9.4   # or :latest
-docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:0.9.4
+docker pull ghcr.io/kwhorne/elyrasql:0.9.5   # or :latest
+docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:0.9.5
 ```
 
 The image is ~15 MB, runs as a non-root user, stores data in the

@@ -4,6 +4,44 @@ All notable changes to ElyraSQL are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.9.5] - 2026-07-12
+
+Performance release focused on aggregation. No on-disk format change; fully
+compatible with 0.9.3/0.9.4 data files.
+
+Headline result (200k rows, each engine measured alone on the box): ElyraSQL is
+now the **fastest of the four on full-table `COUNT` and `GROUP BY`** — ahead of
+MySQL 8.4, Percona 8.4 and PostgreSQL 17. See `benchmark_analyse.md`.
+
+### Aggregation
+
+- **Bounded table-keyspace scan for parallel-split planning.** The planner that
+  splits a table for parallel aggregation was walking backwards through the
+  *entire* database (every secondary-index entry and other table) to find a
+  table's last row, making full-scan `COUNT`/`SUM`/`GROUP BY` scale with total
+  database size rather than table size. It now bounds the probe to the table's
+  own keyspace. On a 200k-row table sharing the file with another 200k table and
+  two secondary indexes, `GROUP BY` dropped from ~17 ms to ~4.4 ms.
+- **Aggregation parallelism capped at 4 by default** (`ELYRASQL_AGG_WORKERS`
+  overrides). Full-scan aggregation is memory-bandwidth bound; beyond ~4 workers
+  the coordination overhead makes it slower.
+- **Allocation-light grouping.** The group-by aggregator uses an insertion-
+  ordered map (one key allocation per group instead of two) and moves group
+  state during parallel merges instead of cloning it — markedly faster
+  high-cardinality `GROUP BY`.
+
+### Result transfer
+
+- **Buffered wire writes** (plain connections). The MySQL protocol writer issued
+  one `write_vectored` syscall per result row against an unbuffered socket; a
+  64 KiB buffer now coalesces rows, helping any query that returns many rows to
+  a fast client.
+
+### Tuning
+
+- `ELYRASQL_AGG_WORKERS` — degree of parallelism for full-scan aggregation
+  (1 = single-threaded; default min(cores, 4)).
+
 ## [0.9.4] - 2026-07-12
 
 Performance release: a focused campaign on scan, aggregation and per-query
@@ -839,6 +877,7 @@ core CRUD with `WHERE`/`ORDER BY`/`LIMIT`, indexes, aggregation and `GROUP BY`,
 joins, prepared statements, authentication and TLS, vector search (exact +
 HNSW), parallel OLAP aggregation, and transactions with snapshot isolation.
 
+[0.9.5]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.9.5
 [0.9.4]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.9.4
 [0.9.3]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.9.3
 [0.9.2]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.9.2

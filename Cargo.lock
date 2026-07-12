@@ -491,7 +491,7 @@ checksum = "91622ff5e7162018101f2fea40d6ebf4a78bbe5a49736a2020649edf9693679e"
 
 [[package]]
 name = "elyra-cli"
-version = "0.9.4"
+version = "0.9.5"
 dependencies = [
  "anyhow",
  "clap",
@@ -506,7 +506,7 @@ dependencies = [
 
 [[package]]
 name = "elyra-core"
-version = "0.9.4"
+version = "0.9.5"
 dependencies = [
  "bincode",
  "serde",
@@ -516,7 +516,7 @@ dependencies = [
 
 [[package]]
 name = "elyra-engine"
-version = "0.9.4"
+version = "0.9.5"
 dependencies = [
  "bincode",
  "elyra-core",
@@ -535,7 +535,7 @@ dependencies = [
 
 [[package]]
 name = "elyra-olap"
-version = "0.9.4"
+version = "0.9.5"
 dependencies = [
  "elyra-core",
  "elyra-storage",
@@ -544,7 +544,7 @@ dependencies = [
 
 [[package]]
 name = "elyra-server"
-version = "0.9.4"
+version = "0.9.5"
 dependencies = [
  "async-trait",
  "bincode",
@@ -565,7 +565,7 @@ dependencies = [
 
 [[package]]
 name = "elyra-storage"
-version = "0.9.4"
+version = "0.9.5"
 dependencies = [
  "async-trait",
  "bincode",
@@ -580,7 +580,7 @@ dependencies = [
 
 [[package]]
 name = "elyra-vector"
-version = "0.9.4"
+version = "0.9.5"
 dependencies = [
  "elyra-core",
  "wide",

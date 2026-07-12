@@ -23,6 +23,7 @@ variable fallback (handy for systemd and containers).
 |-------------|---------|-------------|
 | `ELYRASQL_SORT_MAX_ROWS` | `1000000` | Rows buffered before spilling to a temp file, for both `ORDER BY` (external merge sort) and partitioned `GROUP BY` spill. |
 | `ELYRASQL_GROUP_MAX_GROUPS` | `5000000` | Distinct-group cap: in-memory `GROUP BY` past this falls back to partitioned spill; a single spill partition past it errors (0 = unlimited). |
+| `ELYRASQL_AGG_WORKERS` | `min(cores, 4)` | Parallelism for full-scan aggregation (`COUNT`/`SUM`/`GROUP BY` over a whole table). Aggregation is memory-bandwidth bound, so the default caps at 4; set `1` for single-threaded, or raise it on hardware with high memory bandwidth. |
 | `ELYRASQL_TXN_MAX_BYTES` | `1073741824` | Max bytes an uncommitted transaction may buffer (staged puts + deletes) before writes are rejected, so one huge transaction can't exhaust server memory. The statement errors; `COMMIT` or `ROLLBACK` to continue. |
 | `ELYRASQL_MAX_FRAME_MB` | `1024` | Max size of any single length-prefixed frame/record read from the network (cluster/replication), the binlog, or a spill file, before allocation. Rejects corrupt/malicious oversized lengths instead of crashing (OOM). Must stay ≥ the largest replicated/logged transaction. |
 

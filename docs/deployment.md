@@ -8,7 +8,7 @@ docker run -d --name elyrasql \
   -v elyra-data:/var/lib/elyrasql \
   -e ELYRASQL_USER=root \
   -e ELYRASQL_PASSWORD=secret \
-  ghcr.io/kwhorne/elyrasql:0.9.4
+  ghcr.io/kwhorne/elyrasql:0.9.5
 ```
 
 - Data persists in the `/var/lib/elyrasql` volume.
@@ -24,7 +24,7 @@ docker run -d -p 3307:3307 \
   -v $PWD/certs:/certs:ro \
   -e ELYRASQL_TLS_CERT=/certs/server.crt \
   -e ELYRASQL_TLS_KEY=/certs/server.key \
-  ghcr.io/kwhorne/elyrasql:0.9.4
+  ghcr.io/kwhorne/elyrasql:0.9.5
 ```
 
 ## systemd (Ubuntu 24.04+)

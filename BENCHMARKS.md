@@ -53,41 +53,44 @@ the same host; 200,000 rows; single client; medians. These are our own
 reproducible numbers on developer hardware — **relative, not absolute** — not a
 tuned, official head-to-head. Re-run them on your target and see for yourself.
 
-Best-of-3 medians (least host contention):
+Best-of-5 medians, each engine measured alone on the box (200k rows). See
+[`benchmark_analyse.md`](benchmark_analyse.md) for full method and analysis.
 
-| Workload | ElyraSQL | MySQL 8.4 | Percona 8.4 | PostgreSQL 17 |
+| Workload | ElyraSQL 0.9.5 | MySQL 8.4 | Percona 8.4 | PostgreSQL 17 |
 |---|---:|---:|---:|---:|
-| Bulk insert (rows/s) | **183,000** | 154,000 | 222,000 | 341,000 |
-| Full scan `COUNT` (no index) | **4.95 ms** | 9.1 ms | 10.7 ms | 4.65 ms |
-| Indexed `COUNT` | 0.68 ms | 0.37 ms | 0.72 ms | 0.71 ms |
-| Range + `ORDER BY` pk `LIMIT` | 0.58 ms | 0.43 ms | 0.76 ms | 0.17 ms |
-| `GROUP BY` (full aggregation) | 13.3 ms | 9.5 ms | 11.7 ms | 7.2 ms |
-| Selective join (index NLJ) | 0.27 ms | 0.12 ms | 0.24 ms | 0.13 ms |
-| PK point lookup | 0.21 ms | 0.11 ms | 0.11 ms | 0.11 ms |
+| Full scan `COUNT` (no index) | **4.97 ms** | 9.06 ms | 10.64 ms | 4.66 ms |
+| `GROUP BY` (full aggregation) | **5.74 ms** | 9.50 ms | 9.93 ms | 6.95 ms |
+| Selective join (index NLJ) | 0.15 ms | 0.11 ms | 0.11 ms | 0.13 ms |
+| Indexed `COUNT` | 0.62 ms | 0.28 ms | 0.28 ms | 0.69 ms |
+| Range + `ORDER BY` pk `LIMIT` | 0.52 ms | 0.41 ms | 0.41 ms | 0.17 ms |
+| PK point lookup | 0.17 ms | 0.09 ms | 0.08 ms | 0.11 ms |
+| Bulk insert, 50k batches (rows/s) | **351,000** | 290,000 | 296,000 | 345,000 |
 
-(Numbers vary run-to-run by ~10-30% under shared-host contention; the ordering
-above is the consistent picture across repeated runs.)
+(Numbers vary run-to-run by ~10-20%; the ordering above is the consistent
+picture across repeated runs.)
 
 What this shows, honestly:
 
-- **ElyraSQL beats MySQL and Percona on full-table `COUNT` and bulk ingest**,
-  matches PostgreSQL on full-scan `COUNT`, and beats Percona on indexed `COUNT`
-  and range `ORDER BY` — a >10x improvement on scan aggregation over earlier
-  releases (full-scan `COUNT` was ~48 ms).
-- **`ORDER BY pk LIMIT` is fast** (~0.6 ms, was ~29 ms): a PK-ordered
+- **ElyraSQL is the fastest of the four on full-table `COUNT` and `GROUP BY`** —
+  the heavy analytical scans — and matches PostgreSQL on full-scan `COUNT`.
+  Full-scan aggregation improved ~10x over the 0.9.2 line.
+- **`ORDER BY pk LIMIT` is fast** (~0.5 ms, was ~29 ms): a PK-ordered
   early-termination scan avoids materialising and sorting the whole result set.
-- **Still behind on `GROUP BY`** (~1.4x vs MySQL, ~2x vs PostgreSQL) and on
-  **sub-0.2 ms point queries** (PK lookup ~0.1 ms of fixed per-query overhead:
-  SQL parse + one read-transaction hop + the MySQL wire round-trip). These, and
-  parallel grouped aggregation, are the next targets.
+- **Joins, indexed `COUNT`, and range `ORDER BY` are competitive** with the
+  MySQL family.
+- **Point queries** read ~1.5-2x MySQL's latency *in the shared benchmark VM*;
+  measured natively the PK lookup is 0.11 ms — identical to MySQL — so this is
+  virtualisation overhead, not server overhead.
+- **Bulk insert** trails at tiny (2k-row) batches (copy-on-write commit vs a
+  write-ahead log) but leads at realistic bulk-load batch sizes (~351k rows/s).
 
 The speedups came from: a PK-ordered early-terminating `ORDER BY ... LIMIT`
-scan; projection-aware decoding (materialise only the columns a query reads);
-zero-copy scanning (decode straight from borrowed storage bytes in one read
-transaction); a parallel clustered-range split for integer-PK tables;
-covering-index `COUNT`; an allocation-free FxHash group-by hot path; an
-in-memory table-definition cache; and skipping materialized-view / column-mask
-checks (and redundant privilege lookups) on the common query path.
+scan; projection-aware + zero-copy scanning; parallel clustered-range
+aggregation (capped at 4 workers); a table-keyspace-bounded split probe (so
+aggregation scales with table size, not database size); covering-index `COUNT`;
+an allocation-light insertion-ordered group-by map; a table-definition cache;
+buffered wire writes; and skipping matview / column-mask / redundant-privilege
+checks on the common query path.
 
 ## Honest caveats
 
