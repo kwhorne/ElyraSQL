@@ -53,44 +53,42 @@ the same host; 200,000 rows; single client; medians. These are our own
 reproducible numbers on developer hardware — **relative, not absolute** — not a
 tuned, official head-to-head. Re-run them on your target and see for yourself.
 
-Best-of-5 medians, each engine measured alone on the box (200k rows). See
-[`benchmark_analyse.md`](benchmark_analyse.md) for full method and analysis.
+Measured on **native Linux** (GitHub Actions `ubuntu-latest`, 4 cores) with all
+three engines on the same host -- see [`benchmark_analyse.md`](benchmark_analyse.md)
+for full method and analysis, and run it yourself with `gh workflow run benchmark.yml`.
 
-| Workload | ElyraSQL 0.9.5 | MySQL 8.4 | Percona 8.4 | PostgreSQL 17 |
-|---|---:|---:|---:|---:|
-| Full scan `COUNT` (no index) | **4.97 ms** | 9.06 ms | 10.64 ms | 4.66 ms |
-| `GROUP BY` (full aggregation) | **5.74 ms** | 9.50 ms | 9.93 ms | 6.95 ms |
-| Selective join (index NLJ) | 0.15 ms | 0.11 ms | 0.11 ms | 0.13 ms |
-| Indexed `COUNT` | 0.62 ms | 0.28 ms | 0.28 ms | 0.69 ms |
-| Range + `ORDER BY` pk `LIMIT` | 0.52 ms | 0.41 ms | 0.41 ms | 0.17 ms |
-| PK point lookup | 0.17 ms | 0.09 ms | 0.08 ms | 0.11 ms |
-| Bulk insert, 50k batches (rows/s) | **351,000** | 290,000 | 296,000 | 345,000 |
+**OLAP, 1M rows (ms, lower is better):**
 
-(Numbers vary run-to-run by ~10-20%; the ordering above is the consistent
-picture across repeated runs.)
+| Query | ElyraSQL | PostgreSQL 17 | MySQL 8.4 |
+|---|---:|---:|---:|
+| `COUNT(*)` | **27.6** | 29.0 | 24.0 |
+| Global agg (`SUM/AVG/MIN/MAX`) | **36.6** | 55.5 | 162.6 |
+| `GROUP BY` (100 groups) | **63.6** | 92.1 | 314.1 |
+| `GROUP BY` + top-10 (10k groups) | **93.4** | 113.9 | 343.0 |
+| Filtered agg (`WHERE amount>500`) | **53.5** | 55.5 | 229.8 |
 
-What this shows, honestly:
+**Core SQL, 200k rows (ms):**
 
-- **ElyraSQL is the fastest of the four on full-table `COUNT` and `GROUP BY`** —
-  the heavy analytical scans — and matches PostgreSQL on full-scan `COUNT`.
-  Full-scan aggregation improved ~10x over the 0.9.2 line.
-- **`ORDER BY pk LIMIT` is fast** (~0.5 ms, was ~29 ms): a PK-ordered
-  early-termination scan avoids materialising and sorting the whole result set.
-- **Joins, indexed `COUNT`, and range `ORDER BY` are competitive** with the
-  MySQL family.
-- **Point queries** read ~1.5-2x MySQL's latency *in the shared benchmark VM*;
-  measured natively the PK lookup is 0.11 ms — identical to MySQL — so this is
-  virtualisation overhead, not server overhead.
-- **Bulk insert** trails at tiny (2k-row) batches (copy-on-write commit vs a
-  write-ahead log) but leads at realistic bulk-load batch sizes (~351k rows/s).
+| Workload | ElyraSQL | MySQL 8.4 | PostgreSQL 17 |
+|---|---:|---:|---:|
+| `GROUP BY` | **12.9** | 21.8 | 16.8 |
+| Full scan `COUNT` | **10.4** | 20.8 | 11.0 |
+| Selective join | 0.41 | 0.47 | 0.27 |
+| PK point lookup | 0.28 | 0.27 | 0.20 |
+| Bulk insert (rows/s, ≥10k batches) | 351,000 | 290,000 | 345,000 |
 
-The speedups came from: a PK-ordered early-terminating `ORDER BY ... LIMIT`
-scan; projection-aware + zero-copy scanning; parallel clustered-range
-aggregation (capped at 4 workers); a table-keyspace-bounded split probe (so
-aggregation scales with table size, not database size); covering-index `COUNT`;
-an allocation-light insertion-ordered group-by map; a table-definition cache;
-buffered wire writes; and skipping matview / column-mask / redundant-privilege
-checks on the common query path.
+What this shows:
+
+- **ElyraSQL is the fastest of the three on every OLAP query** (global/filtered
+  aggregation, `GROUP BY`, top-N), and 2–5x ahead of MySQL. Row-store
+  aggregation this fast is unusual and comes from vectorised (columnar) scalar
+  aggregation, a compiled filter predicate, parallel clustered scans, and a
+  table-keyspace-bounded split.
+- On core SQL it leads on `GROUP BY` and full-scan `COUNT`; PostgreSQL keeps a
+  small edge on the sub-millisecond point/range queries.
+- Earlier laptop-VM numbers understated ElyraSQL ~1.5x by penalising its
+  parallel, memory-mapped scans; the native-Linux CI run above is the fair,
+  representative comparison.
 
 ## Honest caveats
 

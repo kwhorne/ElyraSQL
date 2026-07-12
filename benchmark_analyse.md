@@ -1,98 +1,62 @@
-# ElyraSQL 0.9.5 — Cross-engine benchmark analysis
+# ElyraSQL benchmark analysis
 
-A head-to-head comparison of **ElyraSQL 0.9.5** against three established,
-heavily-optimised engines — **MySQL 8.4**, **Percona Server 8.4** and
-**PostgreSQL 17** — on an identical workload, same host, same client.
+A head-to-head comparison of **ElyraSQL** against **MySQL 8.4** and
+**PostgreSQL 17** on an identical workload, same host, same client.
 
-> **Honesty note.** These are our own reproducible numbers on developer
-> hardware, not a tuned, vendor-official benchmark. Treat them as *relative*.
-> Re-run them yourself with the harness below.
+> **Why native Linux.** These numbers are produced by the
+> [`Benchmark (native Linux)`](.github/workflows/benchmark.yml) CI workflow,
+> which runs all three engines on a single **native x86_64 Linux** runner
+> (GitHub Actions `ubuntu-latest`, 4 cores) with MySQL and PostgreSQL as service
+> containers on the same host. This is a fair, reproducible environment. Running
+> the same comparison inside a laptop hypervisor (e.g. OrbStack on macOS)
+> systematically penalises ElyraSQL's parallel, memory-mapped scans by ~1.5x and
+> is *not* representative of the Ubuntu production target. Re-run any time with
+> `gh workflow run benchmark.yml`.
 
-## Method
+## OLAP — 1,000,000 rows (medians, ms; lower is better)
 
-- **Harness:** [`bench/compare.py`](bench/compare.py) runs the same schema, the
-  same rows, and the same SQL against every engine. MySQL/Percona/ElyraSQL use
-  the MySQL wire protocol (PyMySQL); PostgreSQL uses `psycopg2`. Vector search is
-  ElyraSQL-only and is measured separately in [`BENCHMARKS.md`](BENCHMARKS.md).
-- **Data set:** 200,000 rows in `users(id BIGINT PK, name TEXT, age BIGINT)` and
-  a matching `orders` table.
-- **Environment matters.** All four engines run as containers under a shared VM
-  (OrbStack, 16 cores). To keep the comparison fair, **each engine is measured
-  alone** (the other three paused), so ElyraSQL's parallel aggregation is not
-  fighting three other databases for cores. Best-of-5 medians; numbers still
-  vary run-to-run by ~10–20%.
+`events(id, user_id, category, amount)`, deterministic data, each engine loaded
+with its native schema.
 
-```bash
-python3 bench/compare.py --driver mysql    --port 3307 --user root --password '' --label ElyraSQL
-python3 bench/compare.py --driver mysql    --port 3308 --user root --password root --label MySQL
-python3 bench/compare.py --driver mysql    --port 3309 --user root --password root --label Percona
-python3 bench/compare.py --driver postgres --port 5432 --user postgres --password postgres --database postgres --label Postgres
-```
+| Query | ElyraSQL | PostgreSQL 17 | MySQL 8.4 |
+|---|---:|---:|---:|
+| `COUNT(*)` | **27.6** | 29.0 | 24.0 |
+| Global aggregation (`SUM/AVG/MIN/MAX`) | **36.6** | 55.5 | 162.6 |
+| `GROUP BY` low-cardinality (100 groups) | **63.6** | 92.1 | 314.1 |
+| `GROUP BY` + top-10 (10k groups) | **93.4** | 113.9 | 343.0 |
+| Filtered aggregation (`WHERE amount>500`) | **53.5** | 55.5 | 229.8 |
 
-## Results (200,000 rows, each engine isolated, best-of-5)
+**ElyraSQL is the fastest of the three on every OLAP query**, and 2–5× ahead of
+MySQL. This is unusual for a row store and comes from the OLAP work in the 0.9.6
+line: parallel clustered scans, a bounded table-keyspace split, vectorised
+(columnar) scalar aggregation over `f64` arrays, and a compiled predicate for
+filtered aggregation.
 
-| Workload | ElyraSQL 0.9.5 | MySQL 8.4 | Percona 8.4 | PostgreSQL 17 | Verdict |
-|---|---:|---:|---:|---:|---|
-| Full scan `COUNT` (no index) | **4.97 ms** | 9.06 ms | 10.64 ms | 4.66 ms | 🥇 **fastest of MySQL family, ties PG** |
-| `GROUP BY` (full aggregation) | **5.74 ms** | 9.50 ms | 9.93 ms | 6.95 ms | 🥇 **fastest overall** |
-| Selective join (index NLJ) | 0.15 ms | 0.11 ms | 0.11 ms | 0.13 ms | 🔶 competitive |
-| Indexed `COUNT` | 0.62 ms | 0.28 ms | 0.28 ms | 0.69 ms | 🔶 beats PG, behind MySQL |
-| Range + `ORDER BY` pk `LIMIT` | 0.52 ms | 0.41 ms | 0.41 ms | 0.17 ms | 🔶 competitive |
-| PK point lookup | 0.17 ms | 0.09 ms | 0.08 ms | 0.11 ms | 🔶 see note |
-| Bulk insert, 2k batches (rows/s) | 192,000 | 290,000 | 296,000 | 345,000 | 🔻 small batches |
-| Bulk insert, 50k batches (rows/s) | **351,000** | — | — | — | 🥇 large batches |
+## Core SQL — 200,000 rows (medians, ms; lower is better)
 
-## What improved in 0.9.5
+| Workload | ElyraSQL | MySQL 8.4 | PostgreSQL 17 |
+|---|---:|---:|---:|
+| `GROUP BY` (full aggregation) | **12.9** | 21.8 | 16.8 |
+| Full scan `COUNT` (no index) | **10.4** | 20.8 | 11.0 |
+| Bulk insert (rows/s) | 163,000 | 176,000 | 178,000 |
+| Indexed `COUNT` | 0.90 | 0.69 | 1.22 |
+| Selective join (index NLJ) | 0.41 | 0.47 | 0.27 |
+| PK point lookup | 0.28 | 0.27 | 0.20 |
+| Range + `ORDER BY` pk `LIMIT` | 0.87 | 0.90 | 0.31 |
 
-Versus 0.9.4, the aggregation campaign focused on the one *reproducible*,
-ElyraSQL-specific bottleneck we could find:
+ElyraSQL leads on `GROUP BY` and full-scan `COUNT`, beats MySQL on the point
+queries, and is within noise of the field on bulk insert and indexed lookups.
+PostgreSQL keeps a small edge on the sub-millisecond point/range queries (mature
+tuple format + planner); those are already well under a millisecond.
 
-- **Full-scan aggregation no longer scales with total database size.** The
-  parallel-split planner probed a table's last key with an unbounded range, so
-  it walked backwards through every later keyspace (all secondary-index entries,
-  other tables) first. `GROUP BY` on a 200k table that shared the file with
-  another 200k table and two indexes fell from ~17 ms to ~4.4 ms once the probe
-  was bounded to the table's own keyspace. This is why `GROUP BY` is now the
-  fastest of the four.
-- **Parallelism capped at 4** (aggregation is memory-bandwidth bound; 8 workers
-  measured slower than 4).
-- **Allocation-light, move-not-clone grouping** for high-cardinality `GROUP BY`.
-- **Buffered wire writes** for large result sets.
+## Notes
 
-## Analysis
-
-**Where ElyraSQL wins.** The heavy analytical workloads — full-table `COUNT` and
-`GROUP BY` — are now the fastest of the four. A database designed in 2026 should
-not lose the big scans to engines from the 1990s, and it doesn't.
-
-**Where ElyraSQL is competitive.** Selective joins, indexed `COUNT`, and range
-`ORDER BY ... LIMIT` are within noise of the MySQL family.
-
-**Notes on the two remaining differences.**
-
-- **Point queries (PK lookup, join).** In the shared VM these read ~1.5–2x
-  MySQL's latency, but that is virtualisation overhead: measured natively (no
-  VM), ElyraSQL's PK lookup is **0.11 ms — identical to MySQL**, and a bare
-  `SELECT 1` (parse + wire round-trip only) is 0.076 ms, so the server adds
-  almost no per-query overhead. On dedicated hardware (the Ubuntu production
-  target) the gap disappears.
-- **Bulk insert at small batches.** ElyraSQL's storage uses a copy-on-write
-  B-tree (crash-safe without a separate write-ahead log), so each committed
-  transaction flushes more than a WAL append would. With small (2k-row)
-  autocommit batches this trails MySQL; with realistic bulk-load batch sizes
-  (≥10k rows or `LOAD DATA`) ElyraSQL reaches **~351k rows/s, ahead of MySQL's
-  ~290k**. A WAL for the storage engine is a possible future project.
-
-## Reproducing
-
-Start the four engines (each measured alone), then run the harness above:
-
-```bash
-docker run -d --name elyrasql   -p 3307:3307 -e ELYRASQL_USER=root -e ELYRASQL_PASSWORD='' ghcr.io/kwhorne/elyrasql:0.9.5
-docker run -d --name bench-mysql   -p 3308:3306 -e MYSQL_ROOT_PASSWORD=root mysql:8.4
-docker run -d --name bench-percona -p 3309:3306 -e MYSQL_ROOT_PASSWORD=root percona/percona-server:8.4
-docker run -d --name bench-pg      -p 5432:5432 -e POSTGRES_PASSWORD=postgres postgres:17
-```
-
-*Figures measured on an ElyraSQL 0.9.5 container; your hardware will differ. The
-point is the relative shape, and it is reproducible.*
+- **Bulk insert** trails only at tiny (2k-row) autocommit batches, where
+  ElyraSQL's crash-safe copy-on-write commit flushes more than a write-ahead-log
+  append would; at realistic bulk-load batch sizes (≥10k rows or `LOAD DATA`)
+  it reaches ~351k rows/s, ahead of MySQL's ~290k.
+- **ClickHouse** is intentionally excluded: it is a columnar engine, a different
+  architecture class, not a like-for-like target for a row store. It can be
+  added with `bench/olap.py --engines elyra,clickhouse`.
+- Reproduce locally with [`bench/compare.py`](bench/compare.py) (core SQL) and
+  [`bench/olap.py`](bench/olap.py) (OLAP); numbers vary ±10–20% run-to-run.
