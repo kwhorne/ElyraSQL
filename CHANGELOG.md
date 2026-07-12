@@ -4,6 +4,52 @@ All notable changes to ElyraSQL are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.9.9] - 2026-07-12
+
+Wire-protocol release. ElyraSQL now owns its MySQL wire layer, which unblocked
+three things a third-party dependency held back. No on-disk format change.
+
+### First-party wire layer
+
+- Forked `opensrv-mysql` into the in-tree **`elyra-wire`** crate (Apache-2.0,
+  attribution preserved). ElyraSQL now maintains and extends its own MySQL
+  wire-protocol implementation instead of depending on an unmaintained upstream.
+
+### TLS: rustls 0.23
+
+- Server TLS moved from rustls 0.22 to **rustls 0.23** (via `tokio-rustls`
+  0.26), using the pure-Rust *ring* provider (no aws-lc/OpenSSL; static musl
+  builds keep working). `rustls-webpki` is now 0.103.13, so the four RUSTSEC
+  webpki advisories no longer apply. Note: rustls 0.23 requires X.509 **v3**
+  certificates (all modern/CA-issued certs qualify).
+
+### Authentication: caching_sha2_password
+
+- Implemented **`caching_sha2_password`** (MySQL 8's default auth plugin),
+  opt-in via `ELYRASQL_AUTH_PLUGIN=caching_sha2_password`. Full authentication
+  runs over TLS (cleartext) or a plaintext connection (RSA-OAEP public-key
+  exchange, 2048-bit *ring* key generated on first use); the recovered password
+  is checked against the existing `SHA1(SHA1(pw))` digest, so no credential
+  storage change and the password is never persisted in the clear. The default
+  stays `mysql_native_password` (works with every client). The full
+  Laravel/Eloquent suite passes authenticating with caching_sha2_password.
+
+### Native prepared statements
+
+- `describe_query` is now **count-complete**: it reports an exact result-column
+  count (with best-effort types) at `PREPARE` for any single SELECT with an
+  explicit projection, so binary (native) prepared-statement drivers read the
+  result set instead of desyncing. Emulated/client-side prepares remain the
+  recommended setting for the widest compatibility.
+
+### Notes
+
+- The `rsa` crate's Marvin timing advisory (RUSTSEC-2023-0071, no fixed release)
+  is documented and scoped in `.cargo/audit.toml`: RSA runs once per connection
+  in the opt-in non-TLS caching_sha2 path only; TLS or native_password avoid it.
+- dependabot now pins `nom`/`mysql_common` (the vendored wire crate uses their
+  current APIs).
+
 ## [0.9.8] - 2026-07-12
 
 MySQL-compatibility release, driven by running real MySQL clients and the
@@ -1023,6 +1069,7 @@ core CRUD with `WHERE`/`ORDER BY`/`LIMIT`, indexes, aggregation and `GROUP BY`,
 joins, prepared statements, authentication and TLS, vector search (exact +
 HNSW), parallel OLAP aggregation, and transactions with snapshot isolation.
 
+[0.9.9]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.9.9
 [0.9.8]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.9.8
 [0.9.7]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.9.7
 [0.9.6]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.9.6

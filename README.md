@@ -5,7 +5,7 @@
 A robust, **MySQL-compatible** SQL server written in Rust. Single database
 file, ACID storage, OLAP-ready and vector-native — all under one brand.
 
-> Status: **v0.9.8**. A broad, MySQL-compatible SQL engine: full DDL/DML,
+> Status: **v0.9.9**. A broad, MySQL-compatible SQL engine: full DDL/DML,
 > joins, subqueries (correlated too), CTEs (incl. `WITH RECURSIVE`), window
 > functions, set operations, transactions (snapshot + serializable), a large
 > function catalog, introspection (`SHOW` + `INFORMATION_SCHEMA`), vector search
@@ -128,7 +128,7 @@ mysql -h 127.0.0.1 -P 3307 -u root -p
 SELECT 1;
 SELECT 1 + 1 AS two;
 SELECT 'hei fra ElyraSQL' AS msg;
-SELECT VERSION();   -- 8.0.0-ElyraSQL-0.9.8
+SELECT VERSION();   -- 8.0.0-ElyraSQL-0.9.9
 ```
 
 ## Configuration
@@ -157,8 +157,8 @@ Static Linux binaries (x86_64 and aarch64) are attached to each
 
 ```bash
 curl -L -o elyrasql.tar.gz \
-  https://github.com/kwhorne/ElyraSQL/releases/download/v0.9.8/elyrasql-0.9.8-linux-x86_64.tar.gz
-tar xzf elyrasql.tar.gz && ./elyrasql-0.9.8-linux-x86_64/elyrasql serve
+  https://github.com/kwhorne/ElyraSQL/releases/download/v0.9.9/elyrasql-0.9.9-linux-x86_64.tar.gz
+tar xzf elyrasql.tar.gz && ./elyrasql-0.9.9-linux-x86_64/elyrasql serve
 ```
 
 ## Docker
@@ -166,7 +166,7 @@ tar xzf elyrasql.tar.gz && ./elyrasql-0.9.8-linux-x86_64/elyrasql serve
 Multi-arch image (amd64 + arm64) on GHCR:
 
 ```bash
-docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:0.9.8
+docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:0.9.9
 # with auth + a persistent volume:
 docker run -p 3307:3307 -v elyra:/var/lib/elyrasql \
   -e ELYRASQL_USER=root -e ELYRASQL_PASSWORD=secret \

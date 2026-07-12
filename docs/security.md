@@ -2,10 +2,19 @@
 
 ## Authentication
 
-ElyraSQL implements the MySQL `mysql_native_password` handshake. Passwords are
-never stored in plaintext — only `SHA1(SHA1(password))`, the same digest MySQL
-keeps — and are verified via the challenge/response without reconstruction. Each
+ElyraSQL implements the MySQL `mysql_native_password` handshake (the default) and
+`caching_sha2_password` (MySQL 8's default plugin, opt-in via
+`ELYRASQL_AUTH_PLUGIN=caching_sha2_password`). Passwords are never stored in
+plaintext — only `SHA1(SHA1(password))`, the same digest MySQL keeps — and each
 connection uses a fresh salt.
+
+- **`mysql_native_password`** verifies the challenge/response against the stored
+  digest without reconstructing the password. Works with every MySQL client.
+- **`caching_sha2_password`** runs full authentication: over TLS the client
+  sends the password (protected by the TLS channel); on a plaintext connection
+  the client encrypts it with the server's RSA public key (RSA-OAEP). The
+  recovered cleartext is checked against the same `SHA1(SHA1(password))` digest —
+  still never persisted in the clear. Prefer TLS so no RSA is involved.
 
 Configure users on the command line:
 
@@ -87,18 +96,22 @@ Notes and current limitations:
 
 ## TLS
 
-Provide a PEM certificate and key to enable TLS. Clients that request SSL are
-upgraded to an encrypted connection; others continue in plaintext.
+Provide a PEM certificate and key to enable TLS (rustls 0.23). Clients that
+request SSL are upgraded to an encrypted connection; others continue in
+plaintext.
 
 ```bash
 elyrasql serve --tls-cert server.crt --tls-key server.key
 ```
 
-Generate a self-signed certificate for testing:
+Generate a self-signed certificate for testing. rustls requires an X.509 **v3**
+certificate, so include a `subjectAltName` (a bare `-subj` alone produces a v1
+certificate rustls will reject):
 
 ```bash
 openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
-  -keyout server.key -out server.crt -subj "/CN=localhost"
+  -keyout server.key -out server.crt -subj "/CN=localhost" \
+  -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
 ```
 
 ```bash
