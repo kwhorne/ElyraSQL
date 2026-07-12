@@ -100,6 +100,67 @@ impl AggPlan {
         Some(out)
     }
 
+    /// Eligibility for the vectorised (columnar) *grouped* aggregate fast path
+    /// (OLAP phase 3): exactly one GROUP BY column, that column a base
+    /// `Int`/`Float` (so its key can be kept exactly -- integer bits or
+    /// canonical float bits), no argument expressions, and every aggregate a
+    /// numeric `COUNT(*)`/`COUNT`/`SUM`/`AVG`/`MIN`/`MAX` (no DISTINCT). Returns
+    /// the group column index and `(func, arg column, is_integer_column)` per
+    /// aggregate slot, or `None` to fall back to the general grouping path.
+    #[allow(clippy::type_complexity)]
+    pub fn columnar_group_plan(
+        &self,
+        schema: &Schema,
+    ) -> Option<(usize, Vec<(elyra_olap::AggFunc, Option<usize>, bool)>)> {
+        use elyra_olap::AggFunc::*;
+        if self.group_cols.len() != 1 || !self.arg_exprs.is_empty() {
+            return None;
+        }
+        let gc = self.group_cols[0];
+        match schema.columns.get(gc).map(|c| &c.ty) {
+            Some(ColumnType::Int) | Some(ColumnType::Float) => {}
+            _ => return None,
+        }
+        let base = self.input_schema.columns.len();
+        let mut out = Vec::with_capacity(self.aggs.len());
+        for spec in &self.aggs {
+            if spec.distinct {
+                return None;
+            }
+            match spec.func {
+                CountStar => out.push((spec.func, None, true)),
+                Count | Sum | Avg | Min | Max => {
+                    let c = spec.arg_col?;
+                    if c >= base {
+                        return None;
+                    }
+                    let is_int = match schema.columns.get(c).map(|col| &col.ty) {
+                        Some(ColumnType::Int) => true,
+                        Some(ColumnType::Float) => false,
+                        _ => return None,
+                    };
+                    out.push((spec.func, Some(c), is_int));
+                }
+                GroupConcat => return None,
+            }
+        }
+        Some((gc, out))
+    }
+
+    /// Project pre-aggregated `(group sample row, aggregate results)` tuples
+    /// (e.g. from the columnar grouped path) into output rows, reusing the
+    /// normal per-group projection.
+    pub fn project_grouped(
+        &self,
+        groups: Vec<(Vec<Value>, Vec<Value>)>,
+    ) -> Result<(Schema, Vec<Vec<Value>>)> {
+        let mut out = Vec::with_capacity(groups.len());
+        for (sample, results) in groups {
+            out.push(self.project_group(&sample, &results)?);
+        }
+        Ok((self.out_schema.clone(), out))
+    }
+
     /// Project a single output row from pre-computed scalar aggregate results
     /// (one per aggregate slot), reusing the normal projection so
     /// `COUNT(*)+1`, `SUM(a)/COUNT(*)`, etc. still work.

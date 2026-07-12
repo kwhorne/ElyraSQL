@@ -3319,11 +3319,35 @@ pub async fn select(
         } else {
             None
         };
+        // Vectorised (columnar) grouped fast path (OLAP phase 3): one numeric
+        // GROUP BY column, numeric aggregates, and either no filter or one that
+        // compiles to the fast predicate. Falls back to the spilling path if the
+        // distinct-group cap is exceeded.
+        let columnar_group = if !db.in_txn() {
+            plan.columnar_group_plan(&def.schema)
+                .and_then(|(gc, specs)| {
+                    let needed = agg_needed_mask(&def.schema, filter.as_ref(), &plan)?;
+                    match &filter {
+                        None => Some((gc, specs, None, needed)),
+                        Some(f) => {
+                            cpred::compile(f, &def.schema).map(|cp| (gc, specs, Some(cp), needed))
+                        }
+                    }
+                })
+        } else {
+            None
+        };
         let (schema, out_rows) = if let Some(specs) = columnar {
             let results = scan_columnar_scalar(db, &def, &specs).await?;
             plan.project_scalar(results)?
         } else if est_groups.is_some_and(|g| g > cap) {
             partitioned_aggregate(db, &def, filter.clone(), &plan).await?
+        } else if let Some((gc, specs, cf, needed)) = columnar_group {
+            let base_len = def.schema.columns.len();
+            match scan_columnar_group(db, &def, gc, &specs, cf, needed, base_len).await? {
+                Some(groups) => plan.project_grouped(groups)?,
+                None => partitioned_aggregate(db, &def, filter.clone(), &plan).await?,
+            }
         } else {
             let agg = olap_aggregate(db, &def, filter.clone(), &plan).await?;
             if agg.overflowed() {
@@ -8890,6 +8914,344 @@ async fn scan_columnar_scalar(
     let mut st = raw.scan_fold(prefix, st, |st, _k, v| st.feed(v)).await?;
     st.flush();
     Ok(st.finish())
+}
+
+type FxU64Map =
+    std::collections::HashMap<u64, u32, std::hash::BuildHasherDefault<elyra_olap::FxHasher>>;
+
+/// Vectorised (columnar) *grouped* aggregation state for one worker (OLAP phase
+/// 3). One numeric GROUP BY column, numeric aggregates. Only the needed columns
+/// are decoded; the group key is kept exactly (integer value or canonical float
+/// bits), and per-group accumulators live in flat `f64`/`i64` arrays indexed by
+/// `group_ordinal * naggs + slot`, avoiding the byte-key encoding and per-row
+/// `Value` dispatch of the general grouping path.
+struct ColGroup {
+    group_col: usize,
+    // static agg config (per slot)
+    funcs: Vec<elyra_olap::AggFunc>,
+    agg_arg: Vec<Option<usize>>, // base column read by this agg; None = COUNT(*)
+    is_int: Vec<bool>,
+    naggs: usize,
+    // decode
+    ncols: usize,
+    needed: Vec<bool>,
+    buf: Vec<Value>,
+    // optional pushed-down compiled filter
+    cfilter: Option<cpred::CompiledPredicate>,
+    // grouping: canonical key bits -> group ordinal, plus a dedicated NULL group
+    index: FxU64Map,
+    null_gid: u32,       // u32::MAX until a NULL-keyed row is seen
+    keyvals: Vec<Value>, // group ordinal -> representative group-column value
+    // flat accumulators, naggs per group
+    count: Vec<i64>,
+    sum: Vec<f64>,
+    min: Vec<f64>,
+    max: Vec<f64>,
+    has: Vec<bool>,
+    // distinct-group cap (bounds memory; on overflow the caller re-runs spilling)
+    max_groups: usize,
+    overflow: bool,
+}
+
+const NO_GID: u32 = u32::MAX;
+
+impl ColGroup {
+    fn new(
+        group_col: usize,
+        specs: &[(elyra_olap::AggFunc, Option<usize>, bool)],
+        ncols: usize,
+        needed: Vec<bool>,
+        cfilter: Option<cpred::CompiledPredicate>,
+    ) -> Self {
+        let n = specs.len();
+        ColGroup {
+            group_col,
+            funcs: specs.iter().map(|s| s.0).collect(),
+            agg_arg: specs.iter().map(|s| s.1).collect(),
+            is_int: specs.iter().map(|s| s.2).collect(),
+            naggs: n,
+            ncols,
+            needed,
+            buf: Vec::with_capacity(ncols),
+            cfilter,
+            index: FxU64Map::default(),
+            null_gid: NO_GID,
+            keyvals: Vec::new(),
+            count: Vec::new(),
+            sum: Vec::new(),
+            min: Vec::new(),
+            max: Vec::new(),
+            has: Vec::new(),
+            max_groups: elyra_olap::default_max_groups(),
+            overflow: false,
+        }
+    }
+
+    /// Allocate accumulator slots for a new group and return its ordinal, or
+    /// `None` if the group cap is reached (sets the overflow flag).
+    fn new_group(&mut self, keyval: Value) -> Option<u32> {
+        if self.max_groups > 0 && self.keyvals.len() >= self.max_groups {
+            self.overflow = true;
+            return None;
+        }
+        let gid = self.keyvals.len() as u32;
+        self.keyvals.push(keyval);
+        self.count.resize(self.count.len() + self.naggs, 0);
+        self.sum.resize(self.sum.len() + self.naggs, 0.0);
+        self.min.resize(self.min.len() + self.naggs, f64::INFINITY);
+        self.max
+            .resize(self.max.len() + self.naggs, f64::NEG_INFINITY);
+        self.has.resize(self.has.len() + self.naggs, false);
+        Some(gid)
+    }
+
+    fn feed(&mut self, v: &[u8]) -> Result<()> {
+        rowdec::decode_projected_into(v, self.ncols, &self.needed, &mut self.buf)?;
+        if let Some(cp) = &self.cfilter {
+            if !cp.matches(&self.buf) {
+                return Ok(());
+            }
+        }
+        // Resolve the group ordinal from the (exactly-keyed) group column.
+        let gid = match self.buf.get(self.group_col) {
+            Some(Value::Null) | None => {
+                if self.null_gid == NO_GID {
+                    match self.new_group(Value::Null) {
+                        Some(g) => self.null_gid = g,
+                        None => return Ok(()),
+                    }
+                }
+                self.null_gid
+            }
+            Some(v) => {
+                let (bits, keyval) = match v {
+                    Value::Int(i) => (*i as u64, Value::Int(*i)),
+                    Value::Float(f) => (elyra_core::canonical_f64_bits(*f), Value::Float(*f)),
+                    // Typed Int/Float column: other variants do not occur.
+                    other => (
+                        elyra_core::canonical_f64_bits(other.as_f64().unwrap_or(f64::NAN)),
+                        other.clone(),
+                    ),
+                };
+                match self.index.get(&bits) {
+                    Some(&g) => g,
+                    None => match self.new_group(keyval) {
+                        Some(g) => {
+                            self.index.insert(bits, g);
+                            g
+                        }
+                        None => return Ok(()),
+                    },
+                }
+            }
+        };
+        let base = gid as usize * self.naggs;
+        for a in 0..self.naggs {
+            match self.funcs[a] {
+                elyra_olap::AggFunc::CountStar => self.count[base + a] += 1,
+                _ => {
+                    let n = self.agg_arg[a]
+                        .and_then(|c| self.buf.get(c))
+                        .and_then(|v| v.as_f64());
+                    if let Some(n) = n {
+                        use elyra_olap::AggFunc::*;
+                        match self.funcs[a] {
+                            Count => self.count[base + a] += 1,
+                            Sum | Avg => {
+                                self.sum[base + a] += n;
+                                self.count[base + a] += 1;
+                            }
+                            Min => {
+                                self.has[base + a] = true;
+                                if n < self.min[base + a] {
+                                    self.min[base + a] = n;
+                                }
+                            }
+                            Max => {
+                                self.has[base + a] = true;
+                                if n > self.max[base + a] {
+                                    self.max[base + a] = n;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn merge(&mut self, o: ColGroup) {
+        self.overflow |= o.overflow;
+        let ColGroup {
+            index,
+            null_gid,
+            keyvals,
+            count,
+            sum,
+            min,
+            max,
+            has,
+            naggs,
+            ..
+        } = o;
+        let merge_slots = |me: &mut ColGroup, dst: u32, src: u32| {
+            let (db, sb) = (dst as usize * naggs, src as usize * naggs);
+            for a in 0..naggs {
+                me.count[db + a] += count[sb + a];
+                me.sum[db + a] += sum[sb + a];
+                if has[sb + a] {
+                    me.has[db + a] = true;
+                    if min[sb + a] < me.min[db + a] {
+                        me.min[db + a] = min[sb + a];
+                    }
+                    if max[sb + a] > me.max[db + a] {
+                        me.max[db + a] = max[sb + a];
+                    }
+                }
+            }
+        };
+        if null_gid != NO_GID {
+            if self.null_gid == NO_GID {
+                match self.new_group(Value::Null) {
+                    Some(g) => self.null_gid = g,
+                    None => return,
+                }
+            }
+            let dst = self.null_gid;
+            merge_slots(self, dst, null_gid);
+        }
+        for (bits, src) in index {
+            let dst = match self.index.get(&bits) {
+                Some(&g) => g,
+                None => match self.new_group(keyvals[src as usize].clone()) {
+                    Some(g) => {
+                        self.index.insert(bits, g);
+                        g
+                    }
+                    None => continue,
+                },
+            };
+            merge_slots(self, dst, src);
+        }
+    }
+
+    /// Finalise into `(group sample row, aggregate results)` tuples. The sample
+    /// carries the group-column value at its own position so the normal
+    /// projection can read it.
+    fn into_groups(self, base_len: usize) -> Vec<(Vec<Value>, Vec<Value>)> {
+        use elyra_olap::AggFunc::*;
+        let ngroups = self.keyvals.len();
+        let mut out = Vec::with_capacity(ngroups);
+        for gid in 0..ngroups {
+            let base = gid * self.naggs;
+            let results: Vec<Value> = (0..self.naggs)
+                .map(|a| {
+                    let (c, s) = (self.count[base + a], self.sum[base + a]);
+                    match self.funcs[a] {
+                        CountStar | Count => Value::Int(c),
+                        Sum => {
+                            if c == 0 {
+                                Value::Null
+                            } else if self.is_int[a] && s.fract() == 0.0 {
+                                Value::Int(s as i64)
+                            } else {
+                                Value::Float(s)
+                            }
+                        }
+                        Avg => {
+                            if c == 0 {
+                                Value::Null
+                            } else {
+                                Value::Float(s / c as f64)
+                            }
+                        }
+                        Min => {
+                            if !self.has[base + a] {
+                                Value::Null
+                            } else if self.is_int[a] {
+                                Value::Int(self.min[base + a] as i64)
+                            } else {
+                                Value::Float(self.min[base + a])
+                            }
+                        }
+                        Max => {
+                            if !self.has[base + a] {
+                                Value::Null
+                            } else if self.is_int[a] {
+                                Value::Int(self.max[base + a] as i64)
+                            } else {
+                                Value::Float(self.max[base + a])
+                            }
+                        }
+                        GroupConcat => Value::Null,
+                    }
+                })
+                .collect();
+            let mut sample = vec![Value::Null; base_len];
+            if self.group_col < base_len {
+                sample[self.group_col] = self.keyvals[gid].clone();
+            }
+            out.push((sample, results));
+        }
+        out
+    }
+}
+
+/// Run vectorised grouped aggregation over parallel clustered ranges. Returns
+/// `None` if the distinct-group cap was exceeded (caller falls back to the
+/// spilling path).
+async fn scan_columnar_group(
+    db: &Session,
+    def: &TableDef,
+    group_col: usize,
+    specs: &[(elyra_olap::AggFunc, Option<usize>, bool)],
+    cfilter: Option<cpred::CompiledPredicate>,
+    needed: Vec<bool>,
+    base_len: usize,
+) -> Result<Option<Vec<(Vec<Value>, Vec<Value>)>>> {
+    let ncols = def.schema.columns.len();
+    let prefix = data_prefix(&def.name);
+    let raw = db.raw_db();
+    let workers = agg_workers();
+    let mk = |cf: Option<cpred::CompiledPredicate>| {
+        ColGroup::new(group_col, specs, ncols, needed.clone(), cf)
+    };
+    let result = if workers > 1 {
+        if let Some(ranges) = pk_split_ranges(&raw, def, &prefix, workers).await? {
+            let mut handles = Vec::with_capacity(ranges.len());
+            for (start, end) in ranges {
+                let raw = raw.clone();
+                let specs = specs.to_vec();
+                let needed = needed.clone();
+                let cf = cfilter.clone();
+                handles.push(tokio::spawn(async move {
+                    let st = ColGroup::new(group_col, &specs, ncols, needed, cf);
+                    raw.scan_range_fold(start, end, st, |st, _k, v| st.feed(v))
+                        .await
+                }));
+            }
+            let mut result = mk(cfilter.clone());
+            for h in handles {
+                let part = h.await.map_err(|e| {
+                    Error::Analytics(format!("columnar-group worker failed: {e}"))
+                })??;
+                result.merge(part);
+            }
+            result
+        } else {
+            let st = mk(cfilter.clone());
+            raw.scan_fold(prefix, st, |st, _k, v| st.feed(v)).await?
+        }
+    } else {
+        let st = mk(cfilter.clone());
+        raw.scan_fold(prefix, st, |st, _k, v| st.feed(v)).await?
+    };
+    if result.overflow {
+        return Ok(None);
+    }
+    Ok(Some(result.into_groups(base_len)))
 }
 
 /// Degree of parallelism for full-scan aggregation: `ELYRASQL_AGG_WORKERS` if
