@@ -120,6 +120,18 @@ const GROUP_COMMIT_MAX: usize = 1024;
 /// Bound on the writer queue → backpressure under write storms.
 const WRITE_QUEUE_DEPTH: usize = 4096;
 
+/// Background flush cadence for relaxed (`Eventual`) durability, from
+/// `ELYRASQL_SYNC_INTERVAL_MS` (default 200 ms, clamped to 10..=10000). This is
+/// roughly the worst-case crash-loss window in that mode.
+fn flush_interval() -> std::time::Duration {
+    let ms = std::env::var("ELYRASQL_SYNC_INTERVAL_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(200)
+        .clamp(10, 10_000);
+    std::time::Duration::from_millis(ms)
+}
+
 /// A single mutation submitted to the group-commit writer.
 struct WriteJob {
     puts: Vec<(Vec<u8>, Vec<u8>)>,
@@ -216,6 +228,30 @@ impl Db {
             .name("elyra-writer".into())
             .spawn(move || writer_loop(writer_storage, rx, repl))
             .map_err(Error::Io)?;
+
+        // Relaxed (Eventual) durability: commits return before the fsync for
+        // throughput, so a background thread periodically forces queued commits
+        // to disk, bounding the crash-loss window (like MySQL's
+        // innodb_flush_log_at_trx_commit=2 or PostgreSQL's synchronous_commit
+        // = off). It never risks corruption -- redb stays consistent and rolls
+        // back to the last durable commit on crash. The thread exits once the
+        // database is dropped (its weak handle can no longer upgrade).
+        if storage.is_relaxed_durability() {
+            let weak = Arc::downgrade(&storage);
+            let interval = flush_interval();
+            thread::Builder::new()
+                .name("elyra-flush".into())
+                .spawn(move || loop {
+                    std::thread::sleep(interval);
+                    match weak.upgrade() {
+                        Some(s) => {
+                            let _ = s.flush();
+                        }
+                        None => break,
+                    }
+                })
+                .map_err(Error::Io)?;
+        }
 
         Ok(Self {
             storage,

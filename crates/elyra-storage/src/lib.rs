@@ -21,7 +21,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use elyra_core::{Error, Result};
-use redb::{Database, ReadTransaction, ReadableTable, TableDefinition};
+use redb::{
+    Database, Durability, ReadTransaction, ReadableTable, TableDefinition, WriteTransaction,
+};
 
 /// A scanned range and its content at snapshot time, validated on a
 /// serializable commit to detect phantoms and concurrent range changes.
@@ -188,6 +190,25 @@ fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
 /// Handle to an ElyraSQL storage file.
 pub struct Storage {
     db: Database,
+    /// Per-commit durability for data writes. `Immediate` (default) fsyncs on
+    /// every commit; `Eventual` (relaxed "normal" mode) lets commits return
+    /// before the fsync, with the group-commit writer forcing a durable flush
+    /// on idle and periodically -- trading a bounded crash-loss window for much
+    /// higher small-batch write throughput. Never risks corruption: redb keeps
+    /// the file consistent and rolls back to the last durable commit on crash.
+    durability: Durability,
+    /// Monotonic marker so a forced [`flush`](Self::flush) is always a real
+    /// (non-empty) `Immediate` commit that persists queued `Eventual` writes.
+    flush_seq: std::sync::atomic::AtomicU64,
+}
+
+/// Read the configured durability from `ELYRASQL_SYNC` (`full` -> Immediate,
+/// the default; `normal`/`relaxed` -> Eventual).
+fn configured_durability() -> Durability {
+    match std::env::var("ELYRASQL_SYNC").ok().as_deref() {
+        Some("normal") | Some("relaxed") | Some("eventual") => Durability::Eventual,
+        _ => Durability::Immediate,
+    }
 }
 
 impl Storage {
@@ -203,7 +224,53 @@ impl Storage {
                 .map_err(|e| Error::Storage(e.to_string()))?;
         }
         wtx.commit().map_err(|e| Error::Storage(e.to_string()))?;
-        Ok(Self { db })
+        Ok(Self {
+            db,
+            durability: configured_durability(),
+            flush_seq: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+
+    /// Begin a write transaction at the configured data-write durability.
+    fn raw_begin_write(&self) -> Result<WriteTransaction> {
+        let mut wtx = self
+            .db
+            .begin_write()
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        wtx.set_durability(self.durability);
+        Ok(wtx)
+    }
+
+    /// True when running in the relaxed (`Eventual`) durability mode, so the
+    /// group-commit writer knows it must force periodic durable flushes.
+    pub fn is_relaxed_durability(&self) -> bool {
+        matches!(self.durability, Durability::Eventual)
+    }
+
+    /// Force everything committed so far to disk with an `Immediate` commit.
+    /// Writes a monotonic marker so the commit is never an empty no-op, which
+    /// guarantees queued `Eventual` commits are persisted. Used by the writer to
+    /// bound the crash-loss window in relaxed mode; a no-op-cost safety net in
+    /// the default mode (already durable).
+    pub fn flush(&self) -> Result<()> {
+        let seq = self
+            .flush_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        let mut wtx = self
+            .db
+            .begin_write()
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        wtx.set_durability(Durability::Immediate);
+        {
+            let mut t = wtx
+                .open_table(KV)
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            t.insert(b"meta::flush_seq".as_slice(), seq.to_le_bytes().as_slice())
+                .map_err(|e| Error::Storage(e.to_string()))?;
+        }
+        wtx.commit().map_err(|e| Error::Storage(e.to_string()))?;
+        Ok(())
     }
 
     /// Take an MVCC read snapshot of the current committed state.
@@ -228,15 +295,16 @@ impl Storage {
                 .map_err(|e| Error::Storage(e.to_string()))?;
         }
         wtx.commit().map_err(|e| Error::Storage(e.to_string()))?;
-        Ok(Self { db })
+        Ok(Self {
+            db,
+            durability: Durability::Immediate,
+            flush_seq: std::sync::atomic::AtomicU64::new(0),
+        })
     }
 
     /// Store a value under a namespaced key.
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        let wtx = self
-            .db
-            .begin_write()
-            .map_err(|e| Error::Storage(e.to_string()))?;
+        let wtx = self.raw_begin_write()?;
         {
             let mut t = wtx
                 .open_table(KV)
@@ -288,10 +356,7 @@ impl Storage {
 
     /// Delete a key. Returns whether something was removed.
     pub fn delete(&self, key: &[u8]) -> Result<bool> {
-        let wtx = self
-            .db
-            .begin_write()
-            .map_err(|e| Error::Storage(e.to_string()))?;
+        let wtx = self.raw_begin_write()?;
         let existed;
         {
             let mut t = wtx
@@ -579,10 +644,7 @@ impl Storage {
     /// transactions, which is the throughput win under high write concurrency.
     pub fn apply_validated_batch(&self, jobs: &[ValidatedCommit]) -> Result<Vec<Result<()>>> {
         use std::ops::Bound;
-        let wtx = self
-            .db
-            .begin_write()
-            .map_err(|e| Error::Storage(e.to_string()))?;
+        let wtx = self.raw_begin_write()?;
         let mut results = Vec::with_capacity(jobs.len());
         {
             let mut t = wtx
@@ -652,10 +714,7 @@ impl Storage {
         deletes: &[Vec<u8>],
     ) -> Result<()> {
         use std::ops::Bound;
-        let wtx = self
-            .db
-            .begin_write()
-            .map_err(|e| Error::Storage(e.to_string()))?;
+        let wtx = self.raw_begin_write()?;
         {
             let mut t = wtx
                 .open_table(KV)
@@ -707,10 +766,7 @@ impl Storage {
     /// This is the primitive the group-commit writer uses to fold many
     /// pending writes into one commit under high write traffic.
     pub fn apply(&self, puts: &[(Vec<u8>, Vec<u8>)], deletes: &[Vec<u8>]) -> Result<()> {
-        let wtx = self
-            .db
-            .begin_write()
-            .map_err(|e| Error::Storage(e.to_string()))?;
+        let wtx = self.raw_begin_write()?;
         {
             let mut t = wtx
                 .open_table(KV)
@@ -741,10 +797,7 @@ impl Storage {
         aux: &[(Vec<u8>, Vec<u8>)],
         deletes: &[Vec<u8>],
     ) -> Result<()> {
-        let wtx = self
-            .db
-            .begin_write()
-            .map_err(|e| Error::Storage(e.to_string()))?;
+        let wtx = self.raw_begin_write()?;
         {
             let mut t = wtx
                 .open_table(KV)
