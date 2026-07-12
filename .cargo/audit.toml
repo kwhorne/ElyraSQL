@@ -10,6 +10,14 @@ ignore = [
     # layer (elyra-wire) let us move the server TLS stack to rustls 0.23 +
     # rustls-webpki 0.103.13, so they no longer apply and are not ignored here.
 
+    # rsa: the Marvin timing side-channel has no fixed release. ElyraSQL uses RSA
+    # only in the opt-in caching_sha2_password *full auth over a non-TLS
+    # connection* -- once per connection, to decrypt the login password. The
+    # attack needs many precise decryption-timing samples of a chosen ciphertext
+    # against a stable key; a login handshake exposes no such oracle. Prefer TLS
+    # (cleartext auth, no RSA) or mysql_native_password to avoid it entirely.
+    "RUSTSEC-2023-0071",
+
     # --- Unmaintained (warnings, no known vulnerability) ---
     # bincode 1.3.3 defines our on-disk row/catalog encoding. bincode 2/3 change
     # the serialize/deserialize API and byte layout (3.0.0 is an intentionally

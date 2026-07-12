@@ -255,7 +255,10 @@ impl Auth {
         if self.is_open() {
             return false;
         }
-        match std::str::from_utf8(username).ok().and_then(|u| self.lookup(u)) {
+        match std::str::from_utf8(username)
+            .ok()
+            .and_then(|u| self.lookup(u))
+        {
             Some((stored, _)) => !ct_eq(&stored, &double_sha1(b"")),
             None => true, // unknown user: force full auth (which then fails)
         }

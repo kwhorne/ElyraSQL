@@ -288,8 +288,12 @@ where
         is_secure: bool,
         seq: &mut u8,
     ) -> Result<bool, B::Error> {
-        let aborted =
-            || io::Error::new(io::ErrorKind::ConnectionAborted, "peer terminated connection");
+        let aborted = || {
+            io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "peer terminated connection",
+            )
+        };
 
         // No password required (open mode / empty-password account).
         if initial.is_empty() || !self.shim.caching_sha2_requires_password(username).await {
@@ -575,8 +579,11 @@ where
             self.client_capabilities = handshake.capabilities;
             let mut auth_response = handshake.auth_response.clone();
             if let Some(username) = &handshake.username {
-                let auth_plugin_expect =
-                    self.shim.auth_plugin_for_username(username).await.to_string();
+                let auth_plugin_expect = self
+                    .shim
+                    .auth_plugin_for_username(username)
+                    .await
+                    .to_string();
 
                 // auth switch
                 if !auth_plugin_expect.is_empty()
