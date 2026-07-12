@@ -82,6 +82,10 @@ pub struct Session {
     locks: Arc<LockManager>,
     /// Explicit `LOCK TABLES` guards held until `UNLOCK TABLES` or disconnect.
     held_locks: Mutex<Vec<LockGuard>>,
+    /// `LAST_INSERT_ID()` -- first auto-generated id of the last INSERT.
+    last_insert_id: std::sync::atomic::AtomicI64,
+    /// `ROW_COUNT()` -- rows changed by the last DML (-1 after a SELECT/DDL).
+    row_count: std::sync::atomic::AtomicI64,
 }
 
 fn is_meta(k: &[u8]) -> bool {
@@ -116,7 +120,34 @@ impl Session {
             user_vars: Mutex::new(std::collections::HashMap::new()),
             locks,
             held_locks: Mutex::new(Vec::new()),
+            last_insert_id: std::sync::atomic::AtomicI64::new(0),
+            row_count: std::sync::atomic::AtomicI64::new(-1),
         }
+    }
+
+    /// Value returned by `LAST_INSERT_ID()`.
+    pub fn last_insert_id(&self) -> i64 {
+        self.last_insert_id
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Record the first auto-generated id of an INSERT (0 = none this statement,
+    /// which leaves the previous value visible, matching MySQL).
+    pub fn set_last_insert_id(&self, id: i64) {
+        if id != 0 {
+            self.last_insert_id
+                .store(id, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Value returned by `ROW_COUNT()`.
+    pub fn row_count(&self) -> i64 {
+        self.row_count.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn set_row_count(&self, n: i64) {
+        self.row_count
+            .store(n, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// The shared lock manager (engine-wide).

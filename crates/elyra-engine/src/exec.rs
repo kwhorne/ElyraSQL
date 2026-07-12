@@ -2346,6 +2346,8 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
     // Pass 1: build every row (coerce, defaults, AUTO_INCREMENT, generated,
     // NOT NULL) and its clustered key — no per-row storage reads.
     let mut built: Vec<(Vec<u8>, Vec<Value>)> = Vec::with_capacity(rows.len());
+    // First auto-generated id of this statement -> LAST_INSERT_ID() / OK packet.
+    let mut first_id: i64 = 0;
     let checks = parse_checks(&def)?;
     let trigs = catalog::load_triggers(db, &name).await?;
     let before_ins: Vec<catalog::TriggerDef> = trigs
@@ -2387,6 +2389,9 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
                 if need {
                     autoinc += 1;
                     row[ai] = Value::Int(autoinc);
+                    if first_id == 0 {
+                        first_id = autoinc;
+                    }
                 } else if let Value::Int(n) = row[ai] {
                     if n > autoinc {
                         autoinc = n;
@@ -2464,6 +2469,7 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
                 queue_after(db, &after_ins, &def.schema, Some(row), None)?;
             }
         }
+        db.set_last_insert_id(first_id);
         return Ok(QueryResult::Affected(affected));
     }
 
@@ -2554,6 +2560,7 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
     puts.push(bump_wcount(db, &name).await?);
 
     db.commit_write(puts, deletes).await?;
+    db.set_last_insert_id(first_id);
     if !after_ins.is_empty() {
         for (_, row) in &batch {
             queue_after(db, &after_ins, &def.schema, Some(row), None)?;

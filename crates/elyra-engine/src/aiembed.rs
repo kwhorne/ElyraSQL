@@ -135,7 +135,7 @@ fn ai_embed_text(e: &Expr) -> Option<String> {
     }
 }
 
-fn fn_arg_exprs_mut(f: &mut sqlparser::ast::Function) -> Vec<&mut Expr> {
+pub(crate) fn fn_arg_exprs_mut(f: &mut sqlparser::ast::Function) -> Vec<&mut Expr> {
     let FunctionArguments::List(list) = &mut f.args else {
         return Vec::new();
     };

@@ -12,6 +12,10 @@ pub fn eval_row(expr: &Expr, schema: &Schema, row: &[Value]) -> Result<Value> {
         Expr::Value(v) => literal(v),
         Expr::Nested(e) => eval_row(e, schema, row),
         Expr::Identifier(id) => {
+            // System variables: `@@var`, `@@session.var`, `@@global.var`.
+            if id.value.starts_with("@@") {
+                return Ok(system_var(&id.value));
+            }
             // Niladic functions like CURRENT_TIMESTAMP appear as bare identifiers.
             if !schema
                 .columns
@@ -25,6 +29,12 @@ pub fn eval_row(expr: &Expr, schema: &Schema, row: &[Value]) -> Result<Value> {
             resolve(&id.value, schema, row)
         }
         Expr::CompoundIdentifier(parts) => {
+            // `@@session.var` / `@@global.var` arrive as a compound identifier.
+            if parts.first().is_some_and(|p| p.value.starts_with("@@")) {
+                return Ok(system_var(
+                    &parts.last().map(|p| p.value.clone()).unwrap_or_default(),
+                ));
+            }
             // Qualified reference like `t.col` -> match a combined-schema
             // column named "t.col".
             let qualified = parts
@@ -744,6 +754,56 @@ fn niladic_fn(name: &str) -> Option<Value> {
     .flatten()
 }
 
+/// Resolve a MySQL system variable reference (`@@var`, `@@session.var`,
+/// `@@global.var`) to a value. Common variables that clients and ORMs probe on
+/// connect are given sensible values; unknown ones return NULL (lenient, so an
+/// unfamiliar `@@variable` never fails a session-setup query).
+pub fn system_var(raw: &str) -> Value {
+    let n = raw
+        .trim_start_matches("@@")
+        .trim_start_matches("session.")
+        .trim_start_matches("global.")
+        .trim_start_matches("local.")
+        .to_ascii_lowercase();
+    let text = |s: &str| Value::Text(s.to_string());
+    match n.as_str() {
+        "version" => text(elyra_core::SERVER_VERSION),
+        "version_comment" => text("ElyraSQL"),
+        "version_compile_os" => text("Linux"),
+        "version_compile_machine" => text("x86_64"),
+        "protocol_version" => Value::Int(10),
+        "autocommit" => Value::Int(1),
+        "sql_mode" => text("STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION"),
+        "tx_isolation" | "transaction_isolation" => text("REPEATABLE-READ"),
+        "tx_read_only" | "transaction_read_only" => Value::Int(0),
+        "max_allowed_packet" => Value::Int(67_108_864),
+        "max_connections" => Value::Int(151),
+        "wait_timeout" | "interactive_timeout" => Value::Int(28800),
+        "net_write_timeout" => Value::Int(60),
+        "net_read_timeout" => Value::Int(30),
+        "lower_case_table_names" => Value::Int(0),
+        "character_set_client"
+        | "character_set_connection"
+        | "character_set_results"
+        | "character_set_server"
+        | "character_set_database" => text("utf8mb4"),
+        "collation_connection" | "collation_server" | "collation_database" => {
+            text("utf8mb4_general_ci")
+        }
+        "time_zone" => text("SYSTEM"),
+        "system_time_zone" => text("UTC"),
+        "license" => text("MIT"),
+        "have_query_cache" => text("NO"),
+        "have_ssl" | "have_openssl" => text("DISABLED"),
+        "hostname" => text("elyrasql"),
+        "port" => Value::Int(3307),
+        "sql_auto_is_null" => Value::Int(0),
+        "foreign_key_checks" | "unique_checks" => Value::Int(1),
+        "init_connect" => text(""),
+        _ => Value::Null,
+    }
+}
+
 fn now_micros() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -820,6 +880,9 @@ fn eval_scalar(name: &str, a: &[Value]) -> Result<Option<Value>> {
         "database" | "schema" => Value::Text("elyra".into()),
         "user" | "current_user" | "session_user" | "system_user" => Value::Text("root@%".into()),
         "connection_id" => Value::Int(1),
+        // Normally resolved from session state by the pre-pass before evaluation;
+        // this fallback (0) only applies in positions the pre-pass doesn't reach.
+        "last_insert_id" | "row_count" | "found_rows" => Value::Int(0),
         "current_role" => Value::Text("NONE".into()),
         // ---- date parts / arithmetic ----
         "year" | "month" | "day" | "dayofmonth" | "hour" | "minute" | "second" | "quarter"
@@ -1116,7 +1179,7 @@ fn eval_scalar(name: &str, a: &[Value]) -> Result<Option<Value>> {
                         "Saturday",
                         "Sunday",
                     ][wd]
-                    .into(),
+                        .into(),
                 )
             }
             None => Value::Null,
@@ -1183,7 +1246,10 @@ fn eval_scalar(name: &str, a: &[Value]) -> Result<Option<Value>> {
             _ => Value::Null,
         },
         "format" => match nnum(a, 0) {
-            Some(n) => Value::Text(format_number(n, nnum(a, 1).unwrap_or(0.0).max(0.0) as usize)),
+            Some(n) => Value::Text(format_number(
+                n,
+                nnum(a, 1).unwrap_or(0.0).max(0.0) as usize,
+            )),
             None => Value::Null,
         },
         "hex" => match &a[0] {

@@ -352,7 +352,9 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for ElyraShim {
             a.record(self.conn_id, &user, &sql, res.is_ok());
         }
         match res {
-            Ok(outcomes) => write_outcomes(outcomes, results).await,
+            Ok(outcomes) => {
+                write_outcomes(outcomes, results, self.session.last_insert_id() as u64).await
+            }
             Err(e) => {
                 results
                     .error(elyra_kind(&e), e.to_string().as_bytes())
@@ -396,7 +398,9 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for ElyraShim {
             a.record(self.conn_id, &user, query, res.is_ok());
         }
         match res {
-            Ok(outcomes) => write_outcomes(outcomes, results).await,
+            Ok(outcomes) => {
+                write_outcomes(outcomes, results, self.session.last_insert_id() as u64).await
+            }
             Err(e) => {
                 results
                     .error(elyra_kind(&e), e.to_string().as_bytes())
@@ -438,6 +442,7 @@ const STREAM_BATCH: usize = 1024;
 async fn write_outcomes<W: AsyncWrite + Send + Unpin>(
     mut outcomes: Vec<QueryResult>,
     results: QueryResultWriter<'_, W>,
+    last_insert_id: u64,
 ) -> Result<(), std::io::Error> {
     // The text protocol returns a single result per query in this build.
     match outcomes.drain(..).next() {
@@ -484,6 +489,7 @@ async fn write_outcomes<W: AsyncWrite + Send + Unpin>(
             results
                 .completed(OkResponse {
                     affected_rows: n,
+                    last_insert_id,
                     ..Default::default()
                 })
                 .await

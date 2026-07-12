@@ -21,6 +21,7 @@ pub mod lockmgr;
 mod predicate;
 mod proc;
 mod rowdec;
+mod sessfn;
 mod session;
 mod sort;
 mod stream;
@@ -1145,6 +1146,9 @@ impl Engine {
             // literal) before anything inspects the statement.
             let mut stmt = stmt;
             aiembed::resolve_stmt(&mut stmt).await?;
+            // Resolve LAST_INSERT_ID()/ROW_COUNT()/FOUND_ROWS() from session
+            // state before execution (stateless evaluator can't see it).
+            sessfn::rewrite(&mut stmt, sess.last_insert_id(), sess.row_count());
             let need = required_privilege(&stmt);
             let effective = self
                 .effective_privilege(privilege, user, &stmt, sess)
@@ -1185,7 +1189,14 @@ impl Engine {
                     }
                 }
             }
-            out.push(self.execute_stmt(stmt, sess).await?);
+            let r = self.execute_stmt(stmt, sess).await?;
+            // Track ROW_COUNT(): rows changed by DML, or -1 after a result set
+            // (matches MySQL).
+            match &r {
+                QueryResult::Affected(n) => sess.set_row_count(*n as i64),
+                QueryResult::Rows(_) => sess.set_row_count(-1),
+            }
+            out.push(r);
         }
         Ok(out)
     }
