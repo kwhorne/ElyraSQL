@@ -4,6 +4,61 @@ All notable changes to ElyraSQL are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.9.7] - 2026-07-12
+
+OLAP acceleration release. No on-disk format change; fully compatible with
+0.9.3–0.9.6 data files. The default behaviour is unchanged — every new
+accelerator below is opt-in.
+
+### Query performance (always on)
+
+- **Vectorised (columnar) grouped aggregation.** `GROUP BY` on a single numeric
+  column with numeric aggregates keys each group exactly in an FxHash map and
+  accumulates into flat per-group `f64`/`i64` arrays, decoding only the needed
+  columns — no byte-key encoding or per-row `Value` dispatch. A pushed-down
+  compiled predicate filters on the same path. On native Linux (1M rows):
+  `GROUP BY` top-10 93→54 ms (≈1.6× ahead of PostgreSQL), low-cardinality
+  64→46 ms, filtered aggregation 53→46 ms.
+- **Single-pass hybrid `GROUP BY` spill.** Aggregation now keeps groups in memory
+  and spills *only the rows whose group does not fit* to disk partitions,
+  instead of routing every row through disk. When the working set fits, nothing
+  spills.
+- **Streaming index nested-loop join.** `FROM a JOIN b ON a.k = b.<indexed>
+  [WHERE …] LIMIT n` (no GROUP BY/aggregate/ORDER BY/DISTINCT) scans the driving
+  table incrementally, probes the indexed partner per row, and stops as soon as
+  enough rows are produced — bounded memory, early termination (e.g. `LIMIT 5`
+  over 100k driving rows in ~0.5 ms).
+
+### Opt-in accelerators
+
+- **`ELYRASQL_SYNC`** — commit durability. `full` (default) fsyncs every commit;
+  `normal` returns before the fsync and flushes in the background
+  (`ELYRASQL_SYNC_INTERVAL_MS`, default 200 ms), greatly increasing small-batch
+  `INSERT` throughput (~14× on single-row autocommit inserts) for a bounded
+  crash-loss window. Never risks corruption; same tradeoff as MySQL
+  `innodb_flush_log_at_trx_commit=2` / PostgreSQL `synchronous_commit=off`.
+- **`ELYRASQL_COLUMN_CACHE_MB`** — in-memory columnar cache (default 0 = off) for
+  repeated **unfiltered** aggregations: a table's numeric columns are
+  materialised once and reused, skipping the scan (cached 4-aggregate scalar
+  over 200k rows ~0.8 ms).
+- **`ELYRASQL_ZONE_MAPS`** — data-skipping for **filtered** aggregations (default
+  off): per-chunk column min/max let a `WHERE col <op> value` skip blocks that
+  cannot match. Big win for data with locality (time-series, monotonic ids);
+  selective filter on 500k rows ~2.2× faster.
+
+  All three are race-free by construction: a monotonic write sequence written
+  *inside every write transaction* invalidates cached state on any committed
+  write (insert/update/delete, COMMIT, replication, DDL), so they never serve
+  stale data. Filtered aggregations still run the predicate on every surviving
+  row, so zone maps never affect correctness.
+
+### Security / tooling
+
+- `cargo audit` now runs in CI, with `.cargo/audit.toml` documenting each
+  reviewed advisory (the rustls-webpki chain is transitive via opensrv-mysql's
+  rustls 0.22 and unreachable server-side).
+- Compatible dependency updates.
+
 ## [0.9.6] - 2026-07-12
 
 OLAP performance release. No on-disk format change; fully compatible with
@@ -913,6 +968,7 @@ core CRUD with `WHERE`/`ORDER BY`/`LIMIT`, indexes, aggregation and `GROUP BY`,
 joins, prepared statements, authentication and TLS, vector search (exact +
 HNSW), parallel OLAP aggregation, and transactions with snapshot isolation.
 
+[0.9.7]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.9.7
 [0.9.6]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.9.6
 [0.9.5]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.9.5
 [0.9.4]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.9.4

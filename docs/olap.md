@@ -141,16 +141,34 @@ SELECT MIN(order_date), MAX(order_date), SUM(price) FROM orders;
 - **Reads scale out.** Concurrent analytical queries each get their own MVCC
   snapshot and run in parallel with writers and with each other.
 
+## Tuning for analytics (opt-in)
+
+The defaults are safe and fast; these knobs trade memory or a bounded
+crash-loss window for more throughput on analytical workloads (see
+[Configuration](configuration.md) for details):
+
+- **`ELYRASQL_AGG_WORKERS`** — aggregation parallelism (default `min(cores, 4)`).
+- **`ELYRASQL_COLUMN_CACHE_MB`** — cache a table's numeric columns in memory so
+  repeated **unfiltered** aggregations skip the scan (default off).
+- **`ELYRASQL_ZONE_MAPS`** — per-chunk min/max so **filtered** aggregations skip
+  blocks that cannot match; best for data with locality such as time series
+  (default off).
+- **`ELYRASQL_SYNC=normal`** — relaxed commit durability for much faster
+  small-batch ingestion (bounded crash-loss window; never corrupts).
+
 ## Limitations and tradeoffs
 
-- **Row-oriented, not columnar.** There is no columnar/vectorized execution or
-  late materialization; each row is decoded even if only one column is
-  aggregated.
-- **No spill-to-disk.** Group state and any `ORDER BY` buffer live in memory.
-  Group *state* is bounded by cardinality, but a final `ORDER BY` over a very
-  large grouped result materializes that result.
+- **Row storage with columnar execution.** Data is stored row-oriented (one
+  file, MVCC), but scalar and single-numeric-column `GROUP BY` aggregations run
+  a vectorized path that decodes only the needed columns into contiguous `f64`
+  arrays; an optional in-memory columnar cache and zone-map data-skipping
+  accelerate repeated and filtered aggregations. It is not a persisted columnar
+  store (no on-disk column segments).
+- **`GROUP BY` spills, `ORDER BY` spills.** High-cardinality `GROUP BY`
+  aggregates in memory and spills only overflow groups to disk; `ORDER BY` uses
+  an external merge sort past `ELYRASQL_SORT_MAX_ROWS`.
 - **Single-column index paths.** Index-driven aggregation uses single-column
   equality/range; composite-key ranges fall back to a scan.
-- **No `HAVING`, window functions, or `ROLLUP`/`CUBE`** yet.
+- **No window functions or `ROLLUP`/`CUBE`** yet (`HAVING` is supported).
 
-A columnar store with spill-to-disk is on the [roadmap](limitations.md).
+A persisted columnar store is on the [roadmap](limitations.md).
