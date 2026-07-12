@@ -297,7 +297,7 @@ pub fn group_agg(
         };
         let gid = if is_null {
             if null_gid == u32::MAX {
-                match new_group(
+                null_gid = new_group(
                     &mut keyvals,
                     &mut count,
                     &mut sum,
@@ -305,30 +305,25 @@ pub fn group_agg(
                     &mut max,
                     &mut has,
                     Value::Null,
-                ) {
-                    Some(g) => null_gid = g,
-                    None => return None,
-                }
+                )?;
             }
             null_gid
         } else {
             match index.get(&bits) {
                 Some(&g) => g,
-                None => match new_group(
-                    &mut keyvals,
-                    &mut count,
-                    &mut sum,
-                    &mut min,
-                    &mut max,
-                    &mut has,
-                    kv,
-                ) {
-                    Some(g) => {
-                        index.insert(bits, g);
-                        g
-                    }
-                    None => return None,
-                },
+                None => {
+                    let g = new_group(
+                        &mut keyvals,
+                        &mut count,
+                        &mut sum,
+                        &mut min,
+                        &mut max,
+                        &mut has,
+                        kv,
+                    )?;
+                    index.insert(bits, g);
+                    g
+                }
             }
         };
         let base = gid as usize * naggs;
