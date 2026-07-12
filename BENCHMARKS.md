@@ -44,6 +44,38 @@ Since 0.2.1, bulk `INSERT` is ~5-6x faster (writer-side duplicate detection +
 group commit) and low-cardinality `GROUP BY` ~3.4x faster (compact binary group
 key).
 
+## Cross-engine comparison
+
+Reproducible with [`bench/compare.py`](bench/compare.py), which runs an
+**identical, portable workload** (same schema, rows, queries and client machine)
+against ElyraSQL and the MySQL/Postgres families. All four ran as containers on
+the same host; 200,000 rows; single client; medians. These are our own
+reproducible numbers on developer hardware — **relative, not absolute** — not a
+tuned, official head-to-head. Re-run them on your target and see for yourself.
+
+| Workload | ElyraSQL 0.9.3 | MySQL 8.4 | Percona 8.4 | PostgreSQL 17 |
+|---|---:|---:|---:|---:|
+| Bulk insert (rows/s) | 183,000 | 177,000 | 222,000 | 316,000 |
+| PK point lookup | 0.25 ms | 0.15 ms | 0.09 ms | 0.13 ms |
+| Selective join (index NLJ) | 0.30 ms | 0.37 ms | 0.21 ms | 0.13 ms |
+| Range + `ORDER BY` pk `LIMIT` | 1.3 ms | 0.57 ms | 0.66 ms | 0.17 ms |
+| Indexed `COUNT` | 2.7 ms | 0.38 ms | 0.39 ms | 0.70 ms |
+| Full scan `COUNT` (no index) | 48 ms | 9 ms | 11 ms | 4.7 ms |
+| `GROUP BY` (full aggregation) | 69 ms | 12 ms | 9.7 ms | 7.1 ms |
+
+What this shows, honestly:
+
+- **Point/selective queries and bulk ingest are competitive** — same order of
+  magnitude as the mature engines, and ElyraSQL edges them on the selective
+  join.
+- **`ORDER BY pk LIMIT` is now fast** (≈1 ms): a PK-ordered early-termination
+  scan avoids materialising and sorting the whole result set (down from ~29 ms).
+- **Large full-table scans and aggregation are the current gap** (≈5-9x behind).
+  Root cause: every scanned row is fully deserialised (including columns the
+  query never uses). Closing it needs projection pushdown / lazy column decoding
+  and the columnar OLAP path — tracked as dedicated, correctness-tested work
+  rather than a rushed change.
+
 ## Honest caveats
 
 - **Non-unique index lookups use a batched multi-get** (all matching rows in a
