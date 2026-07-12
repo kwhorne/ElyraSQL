@@ -3098,6 +3098,22 @@ pub async fn select(
             Some(f) => Some(resolve_subqueries(db, vindex, f).await?),
             None => None,
         };
+        // Streaming index nested-loop fast path for
+        // `FROM a JOIN b ON a.k=b.<indexed> [WHERE ...] LIMIT n` (no GROUP BY,
+        // aggregate, ORDER BY or DISTINCT): stops after enough rows instead of
+        // materialising the whole join. Falls back to join_select otherwise.
+        if group_by.is_empty()
+            && order_exprs.is_empty()
+            && !aggregate::projection_has_aggregate(&select.projection)
+        {
+            if let Some(lim) = limit {
+                if let Some(res) =
+                    streaming_nlj_select(db, select, filter.as_ref(), offset, lim).await?
+                {
+                    return Ok(res);
+                }
+            }
+        }
         return join_select(
             db,
             vindex,
@@ -3675,6 +3691,118 @@ async fn join_select(
     apply_offset_limit(&mut rows, offset, limit);
     let (osch, out) = project_exprs(&select.projection, &schema, &rows)?;
     Ok(QueryResult::Rows(RowStream::literal(osch, out)))
+}
+
+/// Streaming index nested-loop join for the common shape
+/// `SELECT ... FROM driving JOIN partner ON driving.k = partner.<pk|indexed>
+///  [WHERE ...] LIMIT n` with no GROUP BY, aggregate, ORDER BY or DISTINCT.
+///
+/// Scans the driving table incrementally, probes the indexed partner per row,
+/// applies the residual WHERE and stops as soon as `offset + limit` output rows
+/// exist -- bounded memory and early termination instead of materialising the
+/// whole join. Returns `None` when the query does not fit this shape, so the
+/// caller falls back to the materialising `join_select` (no behaviour change for
+/// anything else).
+async fn streaming_nlj_select(
+    db: &Session,
+    select: &Select,
+    filter: Option<&Expr>,
+    offset: usize,
+    limit: usize,
+) -> Result<Option<QueryResult>> {
+    // Reads inside a transaction must see the write overlay -> materialising path.
+    if db.in_txn() || select.distinct.is_some() || select.having.is_some() || select.from.len() != 1
+    {
+        return Ok(None);
+    }
+    let twj = &select.from[0];
+    if twj.joins.len() != 1
+        || !matches!(twj.relation, TableFactor::Table { .. })
+        || !matches!(twj.joins[0].relation, TableFactor::Table { .. })
+    {
+        return Ok(None);
+    }
+    let join = &twj.joins[0];
+    let (kind, on) = join_kind(&join.join_operator)?;
+    if !matches!(kind, JoinKind::Inner | JoinKind::Left) {
+        return Ok(None);
+    }
+    let Some(on) = on else { return Ok(None) };
+    let (ddef, dcols) = resolve_table(db, &twj.relation).await?;
+    let (pdef, pcols) = resolve_table(db, &join.relation).await?;
+    let driving_schema = Schema::new(dcols.clone());
+    let partner_schema = Schema::new(pcols.clone());
+    let Some((driving_key, pcol)) = equi_nlj(&on, &driving_schema, &partner_schema) else {
+        return Ok(None);
+    };
+    if !(pdef.pk_cols == [pcol] || index::index_on(&pdef, pcol).is_some()) {
+        return Ok(None);
+    }
+
+    // Combined schema: driving columns then partner columns (matches build_from).
+    let mut all_cols = dcols;
+    all_cols.extend(pcols.clone());
+    let schema = Schema::new(all_cols);
+    let plen = pcols.len();
+    let left_outer = kind == JoinKind::Left;
+    let want = offset.saturating_add(limit);
+
+    let keep = |row: &[Value]| -> Result<bool> {
+        match filter {
+            Some(f) => predicate::matches(f, &schema, row),
+            None => Ok(true),
+        }
+    };
+
+    let prefix = data_prefix(&ddef.name);
+    let mut cursor: Option<Vec<u8>> = None;
+    let mut out: Vec<Vec<Value>> = Vec::new();
+    'outer: loop {
+        let batch = db.scan_batch(prefix.clone(), cursor.clone(), 4096).await?;
+        if batch.is_empty() {
+            break;
+        }
+        let last = batch.len() < 4096;
+        cursor = batch.last().map(|(k, _)| k.clone());
+        for (_, v) in batch {
+            let l: Vec<Value> =
+                bincode::deserialize(&v).map_err(|e| Error::Storage(e.to_string()))?;
+            let key = predicate::eval_row(&driving_key, &driving_schema, &l)?;
+            let matches = if key.is_null() {
+                Vec::new()
+            } else {
+                lookup_rows_by_eq(db, &pdef, pcol, &key).await?
+            };
+            let matched = !matches.is_empty();
+            for m in matches {
+                let mut combined = l.clone();
+                combined.extend(m);
+                if keep(&combined)? {
+                    out.push(combined);
+                    if out.len() >= want {
+                        break 'outer;
+                    }
+                }
+            }
+            if left_outer && !matched {
+                let mut combined = l.clone();
+                combined.extend(std::iter::repeat_n(Value::Null, plen));
+                if keep(&combined)? {
+                    out.push(combined);
+                    if out.len() >= want {
+                        break 'outer;
+                    }
+                }
+            }
+        }
+        if last {
+            break;
+        }
+    }
+
+    apply_offset_limit(&mut out, offset, Some(limit));
+    let (osch, rows) = project_exprs(&select.projection, &schema, &out)?;
+    Ok(Some(QueryResult::Rows(RowStream::literal(osch, rows))))
 }
 
 /// The table qualifiers (alias or name) of every relation in a FROM clause.
