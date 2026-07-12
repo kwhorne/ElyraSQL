@@ -1199,6 +1199,12 @@ impl Engine {
         sess: &Session,
     ) -> Result<Privilege> {
         let need = required_privilege(stmt);
+        // Fast path: the connection's own privilege already satisfies the
+        // statement. Roles and per-table grants only ever *add* privileges, so
+        // no grant lookup (a storage read on every statement) is needed here.
+        if global >= need {
+            return Ok(global);
+        }
         // Raise the connection's baseline by any roles granted to the user.
         let global = if user.is_empty() {
             global
