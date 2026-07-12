@@ -407,6 +407,62 @@ pub fn bump_epoch() {
     CATALOG_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
 }
 
+// --- Rarely-used-feature existence flags -------------------------------------
+//
+// Materialized-view auto-refresh and per-column masking otherwise cost a
+// storage read on *every* SELECT. These flags let the common path (no matviews,
+// no column grants) skip those reads entirely. They default to `true` (safe:
+// the feature check runs), are corrected once by a lazy startup scan, and are
+// set back to `true` whenever the corresponding key is written.
+use std::sync::atomic::{AtomicBool, Ordering};
+static MATVIEWS_EXIST: AtomicBool = AtomicBool::new(true);
+static COLGRANTS_EXIST: AtomicBool = AtomicBool::new(true);
+static MV_INIT: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+static CG_INIT: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+
+/// Called for every committed write: flip a feature flag on if its key appears.
+pub fn note_feature_writes(puts: &[(Vec<u8>, Vec<u8>)], deletes: &[Vec<u8>]) {
+    let hit = |p: &[u8]| {
+        puts.iter().any(|(k, _)| k.starts_with(p)) || deletes.iter().any(|k| k.starts_with(p))
+    };
+    if hit(b"matview::") {
+        MATVIEWS_EXIST.store(true, Ordering::Release);
+    }
+    if hit(b"sys::colgrant::") {
+        COLGRANTS_EXIST.store(true, Ordering::Release);
+    }
+}
+
+/// Whether any materialized view exists (lazily scanned once, then cached).
+pub async fn matviews_exist(sess: &Session) -> bool {
+    MV_INIT
+        .get_or_init(|| async {
+            let any = sess
+                .scan_batch(b"matview::".to_vec(), None, 1)
+                .await
+                .map(|b| !b.is_empty())
+                .unwrap_or(true);
+            MATVIEWS_EXIST.store(any, Ordering::Release);
+        })
+        .await;
+    MATVIEWS_EXIST.load(Ordering::Acquire)
+}
+
+/// Whether any per-column grant exists (lazily scanned once, then cached).
+pub async fn colgrants_exist(sess: &Session) -> bool {
+    CG_INIT
+        .get_or_init(|| async {
+            let any = sess
+                .scan_batch(b"sys::colgrant::".to_vec(), None, 1)
+                .await
+                .map(|b| !b.is_empty())
+                .unwrap_or(true);
+            COLGRANTS_EXIST.store(any, Ordering::Release);
+        })
+        .await;
+    COLGRANTS_EXIST.load(Ordering::Acquire)
+}
+
 #[allow(clippy::type_complexity)]
 fn catalog_cache() -> &'static std::sync::RwLock<
     std::collections::HashMap<String, (u64, std::sync::Arc<TableDef>)>,

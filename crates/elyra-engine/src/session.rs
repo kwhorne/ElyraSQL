@@ -556,6 +556,7 @@ impl Session {
         {
             crate::catalog::bump_epoch();
         }
+        crate::catalog::note_feature_writes(&puts, &deletes);
         {
             let mut guard = self.txn.lock().unwrap();
             if let Some(tx) = guard.as_mut() {

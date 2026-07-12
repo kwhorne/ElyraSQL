@@ -1152,12 +1152,17 @@ impl Engine {
                 )));
             }
             // Auto-refresh any stale materialized view this statement reads.
-            self.auto_refresh_matviews(&stmt, privilege, user, sess)
-                .await?;
+            // Skipped entirely when the database has no materialized views
+            // (avoids a per-query catalog read on the common path).
+            if catalog::matviews_exist(sess).await {
+                self.auto_refresh_matviews(&stmt, privilege, user, sess)
+                    .await?;
+            }
 
             // Per-column masking: a column-restricted user may only read the
-            // columns granted to them on a table.
-            if !user.is_empty() {
+            // columns granted to them on a table. Skipped when no column grants
+            // exist anywhere.
+            if !user.is_empty() && catalog::colgrants_exist(sess).await {
                 self.enforce_column_masking(user, &stmt, sess).await?;
             }
 
