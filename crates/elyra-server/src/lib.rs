@@ -11,7 +11,7 @@ use std::sync::Arc;
 use elyra_engine::{Engine, QueryResult, Session};
 use opensrv_mysql::{
     AsyncMysqlIntermediary, AsyncMysqlShim, Column, ColumnFlags, ColumnType, ErrorKind, InitWriter,
-    OkResponse, ParamParser, QueryResultWriter, StatementMetaWriter,
+    OkResponse, ParamParser, QueryResultWriter, StatementMetaWriter, StatusFlags,
 };
 use tokio::io::AsyncWrite;
 use tokio::net::TcpListener;
@@ -353,7 +353,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for ElyraShim {
         }
         match res {
             Ok(outcomes) => {
-                write_outcomes(outcomes, results, self.session.last_insert_id() as u64).await
+                write_outcomes(outcomes, results, self.session.last_insert_id() as u64, self.session.in_txn()).await
             }
             Err(e) => {
                 results
@@ -399,7 +399,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for ElyraShim {
         }
         match res {
             Ok(outcomes) => {
-                write_outcomes(outcomes, results, self.session.last_insert_id() as u64).await
+                write_outcomes(outcomes, results, self.session.last_insert_id() as u64, self.session.in_txn()).await
             }
             Err(e) => {
                 results
@@ -443,7 +443,15 @@ async fn write_outcomes<W: AsyncWrite + Send + Unpin>(
     mut outcomes: Vec<QueryResult>,
     results: QueryResultWriter<'_, W>,
     last_insert_id: u64,
+    in_trans: bool,
 ) -> Result<(), std::io::Error> {
+    // Report an open transaction in the OK status flags so drivers (PDO/mysqlnd)
+    // track PDO::inTransaction() correctly.
+    let status_flags = if in_trans {
+        StatusFlags::SERVER_STATUS_IN_TRANS
+    } else {
+        StatusFlags::empty()
+    };
     // The text protocol returns a single result per query in this build.
     match outcomes.drain(..).next() {
         Some(QueryResult::Rows(mut stream)) => {
@@ -490,11 +498,19 @@ async fn write_outcomes<W: AsyncWrite + Send + Unpin>(
                 .completed(OkResponse {
                     affected_rows: n,
                     last_insert_id,
+                    status_flags,
                     ..Default::default()
                 })
                 .await
         }
-        None => results.completed(OkResponse::default()).await,
+        None => {
+            results
+                .completed(OkResponse {
+                    status_flags,
+                    ..Default::default()
+                })
+                .await
+        }
     }
 }
 

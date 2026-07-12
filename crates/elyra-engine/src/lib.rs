@@ -1137,6 +1137,14 @@ impl Engine {
         {
             subst_sql = replace_ci(&subst_sql, "lock in share mode", "for share");
         }
+        // Strip trailing MySQL table options (ENGINE=, DEFAULT CHARSET/CHARACTER
+        // SET, COLLATE, AUTO_INCREMENT, ROW_FORMAT, COMMENT, ...) from CREATE
+        // TABLE, which the parser does not accept in all their spellings. They
+        // are no-ops here (single storage engine, utf8mb4). This makes Laravel,
+        // mysqldump and ORM-emitted DDL parse.
+        if let Some(stripped) = strip_create_table_options(&subst_sql) {
+            subst_sql = stripped;
+        }
         let statements =
             Parser::parse_sql(&dialect, &subst_sql).map_err(|e| Error::Parse(e.to_string()))?;
 
@@ -1764,6 +1772,78 @@ fn required_privilege(stmt: &Statement) -> Privilege {
         | Statement::ExplainTable { .. } => Privilege::Read,
         _ => Privilege::Admin, // CREATE / DROP / CREATE INDEX and anything else
     }
+}
+
+/// Remove trailing table options from a `CREATE TABLE (...) <options>` statement
+/// that the SQL parser cannot accept in every MySQL spelling (`ENGINE=`,
+/// `DEFAULT CHARSET`/`CHARACTER SET`, `COLLATE '...'`, `AUTO_INCREMENT=`,
+/// `ROW_FORMAT=`, `COMMENT='...'`, ...). Returns `Some(new_sql)` only when it
+/// safely truncated options after the column-definition list. Leaves anything
+/// with `PARTITION`/`AS SELECT`/`LIKE` after the columns untouched.
+fn strip_create_table_options(sql: &str) -> Option<String> {
+    let head = sql.trim_start();
+    let mut up = head.chars().take(40).collect::<String>().to_ascii_uppercase();
+    up.retain(|c| !c.is_whitespace() || c == ' ');
+    if !up.starts_with("CREATE") || !up.contains("TABLE") {
+        return None;
+    }
+    // Find the column-list opening paren, tracking string/backtick literals.
+    let bytes = sql.as_bytes();
+    let mut i = 0usize;
+    let open = loop {
+        if i >= bytes.len() {
+            return None;
+        }
+        match bytes[i] {
+            b'\'' | b'"' | b'`' => {
+                let q = bytes[i];
+                i += 1;
+                while i < bytes.len() && bytes[i] != q {
+                    i += 1;
+                }
+            }
+            b'(' => break i,
+            _ => {}
+        }
+        i += 1;
+    };
+    // Match the closing paren of the column list.
+    let mut depth = 0i32;
+    let mut j = open;
+    let close = loop {
+        if j >= bytes.len() {
+            return None;
+        }
+        match bytes[j] {
+            b'\'' | b'"' | b'`' => {
+                let q = bytes[j];
+                j += 1;
+                while j < bytes.len() && bytes[j] != q {
+                    j += 1;
+                }
+            }
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    break j;
+                }
+            }
+            _ => {}
+        }
+        j += 1;
+    };
+    let tail = sql[close + 1..].trim().trim_end_matches(';').trim();
+    if tail.is_empty() {
+        return None;
+    }
+    let tail_up = tail.to_ascii_uppercase();
+    // Preserve clauses the parser genuinely handles / that carry semantics.
+    if tail_up.contains("PARTITION") || tail_up.contains("SELECT") || tail_up.starts_with("LIKE") {
+        return None;
+    }
+    // Everything after the column list is table options -> drop it.
+    Some(sql[..=close].to_string())
 }
 
 fn query_has_from(q: &sqlparser::ast::Query) -> bool {

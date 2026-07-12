@@ -47,25 +47,47 @@ fn map_type(dt: &DataType) -> Result<ColumnType> {
         DataType::Bool | DataType::Boolean => ColumnType::Bool,
         DataType::TinyInt(_)
         | DataType::SmallInt(_)
+        | DataType::MediumInt(_)
         | DataType::Int(_)
         | DataType::Integer(_)
-        | DataType::BigInt(_) => ColumnType::Int,
-        DataType::Float(_) | DataType::Real | DataType::Double => ColumnType::Float,
-        DataType::Text | DataType::String(_) | DataType::Varchar(_) | DataType::Char(_) => {
-            ColumnType::Text
-        }
+        | DataType::BigInt(_)
+        | DataType::UnsignedTinyInt(_)
+        | DataType::UnsignedSmallInt(_)
+        | DataType::UnsignedMediumInt(_)
+        | DataType::UnsignedInt(_)
+        | DataType::UnsignedInteger(_)
+        | DataType::UnsignedBigInt(_) => ColumnType::Int,
+        DataType::Float(_)
+        | DataType::Real
+        | DataType::Double
+        | DataType::DoublePrecision
+        | DataType::Float4
+        | DataType::Float8 => ColumnType::Float,
+        DataType::Text
+        | DataType::TinyText
+        | DataType::MediumText
+        | DataType::LongText
+        | DataType::String(_)
+        | DataType::Varchar(_)
+        | DataType::Nvarchar(_)
+        | DataType::CharacterVarying(_)
+        | DataType::Char(_) => ColumnType::Text,
         // ENUM/SET are stored as their string value.
         DataType::Enum(..) | DataType::Set(_) => ColumnType::Text,
-        DataType::Blob(_) | DataType::Bytea | DataType::Binary(_) | DataType::Varbinary(_) => {
-            ColumnType::Bytes
-        }
+        DataType::Blob(_)
+        | DataType::TinyBlob
+        | DataType::MediumBlob
+        | DataType::LongBlob
+        | DataType::Bytea
+        | DataType::Binary(_)
+        | DataType::Varbinary(_) => ColumnType::Bytes,
         // BIT(n) is stored as an integer.
         DataType::Bit(_) | DataType::BitVarying(_) => ColumnType::Int,
         DataType::Date => ColumnType::Date,
         DataType::Datetime(_) | DataType::Timestamp(_, _) => ColumnType::DateTime,
         DataType::Time(_, _) => ColumnType::Time,
         DataType::JSON | DataType::JSONB => ColumnType::Json,
-        DataType::Decimal(info) | DataType::Numeric(info) => {
+        DataType::Decimal(info) | DataType::Numeric(info) | DataType::Dec(info) => {
             let (p, s) = match info {
                 sqlparser::ast::ExactNumberInfo::None => (10, 0),
                 sqlparser::ast::ExactNumberInfo::Precision(p) => (*p as u8, 0),
@@ -946,6 +968,10 @@ async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec
                 text("COLUMN_TYPE"),
                 text("COLUMN_KEY"),
                 text("EXTRA"),
+                text("COLLATION_NAME"),
+                text("COLUMN_COMMENT"),
+                text("GENERATION_EXPRESSION"),
+                text("CHARACTER_SET_NAME"),
             ]);
             let mut rows = Vec::new();
             for tname in names {
@@ -953,6 +979,17 @@ async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec
                 for (i, c) in def.schema.columns.iter().enumerate() {
                     let meta = def.meta(i);
                     let ty = c.ty.display_name();
+                    let is_text = matches!(c.ty, ColumnType::Text | ColumnType::Json);
+                    let collation = match (is_text, c.collation) {
+                        (true, elyra_core::Collation::Bin) => Value::Text("utf8mb4_bin".into()),
+                        (true, _) => Value::Text("utf8mb4_general_ci".into()),
+                        (false, _) => Value::Null,
+                    };
+                    let charset = if is_text {
+                        Value::Text("utf8mb4".into())
+                    } else {
+                        Value::Null
+                    };
                     rows.push(vec![
                         Value::Text("elyra".into()),
                         Value::Text(tname.clone()),
@@ -967,6 +1004,13 @@ async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec
                         Value::Text(ty),
                         Value::Text(column_key(&def, i).into()),
                         Value::Text(column_extra(&meta).into()),
+                        collation,
+                        Value::Text(String::new()),
+                        match &meta.generated {
+                            Some(g) => Value::Text(g.clone()),
+                            None => Value::Text(String::new()),
+                        },
+                        charset,
                     ]);
                 }
             }
@@ -1716,37 +1760,100 @@ pub async fn alter_table(
             // via the CREATE INDEX path, then refresh the working definition.
             AlterTableOperation::AddConstraint(tc) => {
                 use sqlparser::ast::TableConstraint as TC;
-                let (idx_name, columns, unique) =
-                    match tc {
-                        TC::Index { name, columns, .. } => (name.clone(), columns.clone(), false),
-                        TC::Unique {
-                            name,
-                            index_name,
-                            columns,
-                            ..
-                        } => (
-                            name.clone().or_else(|| index_name.clone()),
-                            columns.clone(),
-                            true,
-                        ),
-                        TC::PrimaryKey { .. } => return Err(Error::Unsupported(
+                // Foreign key: index the referencing columns (with backfill) then
+                // register the constraint. Common via Laravel's constrained().
+                if let TC::ForeignKey {
+                    name: fname,
+                    columns: cols,
+                    foreign_table,
+                    referred_columns,
+                    on_delete,
+                    on_update,
+                    ..
+                } = tc
+                {
+                    let mut fk_cols = Vec::new();
+                    for ident in cols {
+                        let i = def
+                            .schema
+                            .columns
+                            .iter()
+                            .position(|c| c.name.eq_ignore_ascii_case(&ident.value))
+                            .ok_or_else(|| {
+                                Error::Catalog(format!(
+                                    "unknown foreign key column: {}",
+                                    ident.value
+                                ))
+                            })?;
+                        fk_cols.push(i);
+                    }
+                    if !def.indexes.iter().any(|ix| ix.cols == fk_cols) && def.pk_cols != fk_cols {
+                        let ci = CreateIndex {
+                            name: None,
+                            table_name: name.clone(),
+                            using: None,
+                            columns: cols
+                                .iter()
+                                .map(|id| sqlparser::ast::OrderByExpr {
+                                    expr: Expr::Identifier(id.clone()),
+                                    asc: None,
+                                    nulls_first: None,
+                                    with_fill: None,
+                                })
+                                .collect(),
+                            unique: false,
+                            concurrently: false,
+                            if_not_exists: false,
+                            include: Vec::new(),
+                            nulls_distinct: None,
+                            with: Vec::new(),
+                            predicate: None,
+                        };
+                        create_index(db, ci).await?;
+                        def = catalog::load(db, &tname).await?;
+                    }
+                    def.foreign_keys.push(ForeignKey {
+                        name: fname
+                            .as_ref()
+                            .map(|n| n.value.clone())
+                            .unwrap_or_else(|| format!("fk_{tname}_{}", def.foreign_keys.len())),
+                        columns: fk_cols,
+                        ref_table: foreign_table
+                            .0
+                            .last()
+                            .map(|i| i.value.clone())
+                            .unwrap_or_default(),
+                        ref_columns: referred_columns.iter().map(|i| i.value.clone()).collect(),
+                        on_delete: map_ref_action(on_delete),
+                        on_update: map_ref_action(on_update),
+                    });
+                    continue;
+                }
+                let (idx_name, columns, unique) = match tc {
+                    TC::Index { name, columns, .. } => (name.clone(), columns.clone(), false),
+                    TC::Unique {
+                        name,
+                        index_name,
+                        columns,
+                        ..
+                    } => (
+                        name.clone().or_else(|| index_name.clone()),
+                        columns.clone(),
+                        true,
+                    ),
+                    TC::PrimaryKey { .. } => {
+                        return Err(Error::Unsupported(
                             "ALTER TABLE ADD PRIMARY KEY on an existing table is not supported; \
                              declare the primary key in CREATE TABLE"
                                 .into(),
-                        )),
-                        TC::ForeignKey { .. } => {
-                            return Err(Error::Unsupported(
-                                "ALTER TABLE ADD FOREIGN KEY is not yet supported; declare it in \
-                             CREATE TABLE"
-                                    .into(),
-                            ))
-                        }
-                        other => {
-                            return Err(Error::Unsupported(format!(
-                                "ALTER ADD constraint not supported: {other}"
-                            )))
-                        }
-                    };
+                        ))
+                    }
+                    other => {
+                        return Err(Error::Unsupported(format!(
+                            "ALTER ADD constraint not supported: {other}"
+                        )))
+                    }
+                };
                 let ci = CreateIndex {
                     name: idx_name.map(|i| ObjectName(vec![i])),
                     table_name: name.clone(),
