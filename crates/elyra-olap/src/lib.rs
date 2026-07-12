@@ -9,6 +9,48 @@
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::hash::{BuildHasherDefault, Hasher};
+
+/// Fast, non-cryptographic hasher (FxHash, as used by rustc/Firefox) for the
+/// aggregation hash maps. The default `SipHash` is DoS-resistant but far slower
+/// than we need for internal, trusted group keys; FxHash cuts the per-row
+/// hashing cost several-fold, which dominates large `GROUP BY`.
+#[derive(Default)]
+pub struct FxHasher {
+    hash: u64,
+}
+
+const FX_SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+
+impl FxHasher {
+    #[inline]
+    fn add(&mut self, i: u64) {
+        self.hash = (self.hash.rotate_left(5) ^ i).wrapping_mul(FX_SEED);
+    }
+}
+
+impl Hasher for FxHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.hash
+    }
+    #[inline]
+    fn write(&mut self, mut bytes: &[u8]) {
+        while bytes.len() >= 8 {
+            self.add(u64::from_le_bytes(bytes[..8].try_into().unwrap()));
+            bytes = &bytes[8..];
+        }
+        if bytes.len() >= 4 {
+            self.add(u32::from_le_bytes(bytes[..4].try_into().unwrap()) as u64);
+            bytes = &bytes[4..];
+        }
+        for &b in bytes {
+            self.add(b as u64);
+        }
+    }
+}
+
+type FxBuild = BuildHasherDefault<FxHasher>;
 
 use elyra_core::Value;
 
@@ -71,7 +113,7 @@ pub struct GroupAggregator {
     group_cols: Vec<usize>,
     aggs: Vec<AggSpec>,
     /// key -> (sample row for group columns, per-agg accumulators)
-    groups: HashMap<Vec<u8>, (Vec<Value>, Vec<Acc>)>,
+    groups: HashMap<Vec<u8>, (Vec<Value>, Vec<Acc>), FxBuild>,
     order: Vec<Vec<u8>>,
     /// Cap on distinct groups (0 = unlimited); protects against OOM.
     max_groups: usize,
@@ -99,7 +141,7 @@ impl GroupAggregator {
         GroupAggregator {
             group_cols,
             aggs,
-            groups: HashMap::new(),
+            groups: HashMap::default(),
             order: Vec::new(),
             max_groups: default_max_groups(),
             overflow: false,

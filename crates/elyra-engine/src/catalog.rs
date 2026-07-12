@@ -398,11 +398,50 @@ impl TableDef {
 }
 
 /// Load a table definition, or error if it does not exist.
+/// Bumped whenever any `catalog::` key is written, invalidating every cached
+/// `TableDef` (they carry the epoch they were read at).
+static CATALOG_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Invalidate all cached table definitions (called on any catalog write).
+pub fn bump_epoch() {
+    CATALOG_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
+}
+
+#[allow(clippy::type_complexity)]
+fn catalog_cache() -> &'static std::sync::RwLock<
+    std::collections::HashMap<String, (u64, std::sync::Arc<TableDef>)>,
+> {
+    use std::sync::{OnceLock, RwLock};
+    static C: OnceLock<RwLock<std::collections::HashMap<String, (u64, std::sync::Arc<TableDef>)>>> =
+        OnceLock::new();
+    C.get_or_init(|| RwLock::new(std::collections::HashMap::new()))
+}
+
+/// Load a table definition. In autocommit this is served from an in-memory
+/// cache keyed by table name and validated against the catalog epoch, so the
+/// common query path avoids a storage read + decode entirely. Inside a
+/// transaction the definition is always read fresh (through the write overlay),
+/// so uncommitted DDL is visible.
 pub async fn load(db: &Session, table: &str) -> Result<TableDef> {
-    match db.get(catalog_key(table)).await? {
-        Some(bytes) => TableDef::decode(&bytes),
-        None => Err(Error::Catalog(format!("no such table: {table}"))),
+    let epoch = CATALOG_EPOCH.load(std::sync::atomic::Ordering::Acquire);
+    if !db.in_txn() {
+        if let Some((e, def)) = catalog_cache().read().unwrap().get(table) {
+            if *e == epoch {
+                return Ok((**def).clone());
+            }
+        }
     }
+    let def = match db.get(catalog_key(table)).await? {
+        Some(bytes) => TableDef::decode(&bytes)?,
+        None => return Err(Error::Catalog(format!("no such table: {table}"))),
+    };
+    if !db.in_txn() {
+        catalog_cache()
+            .write()
+            .unwrap()
+            .insert(table.to_string(), (epoch, std::sync::Arc::new(def.clone())));
+    }
+    Ok(def)
 }
 
 /// List all user table names (excluding internal temp relations), sorted.

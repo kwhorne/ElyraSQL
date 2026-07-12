@@ -547,6 +547,15 @@ impl Session {
         puts: Vec<(Vec<u8>, Vec<u8>)>,
         deletes: Vec<Vec<u8>>,
     ) -> Result<()> {
+        // Any write to a `catalog::` key changes a table definition; bump the
+        // catalog epoch so cached TableDefs are refreshed. Bumping eagerly (even
+        // for a buffered transactional write that may roll back) is safe -- it
+        // only forces a re-read, never serves stale schema.
+        if puts.iter().any(|(k, _)| k.starts_with(b"catalog::"))
+            || deletes.iter().any(|k| k.starts_with(b"catalog::"))
+        {
+            crate::catalog::bump_epoch();
+        }
         {
             let mut guard = self.txn.lock().unwrap();
             if let Some(tx) = guard.as_mut() {
