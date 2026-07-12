@@ -115,30 +115,33 @@ impl GroupAggregator {
     /// Feed one row into the aggregator.
     pub fn feed(&mut self, row: &[Value]) {
         // Build the key into a reused buffer -- existing groups (the common
-        // case) are then found and updated without any per-row allocation.
+        // case) are then found and updated in a single lookup with no per-row
+        // allocation.
         group_key_into(&self.group_cols, row, &mut self.key_buf);
-        if !self.groups.contains_key(self.key_buf.as_slice()) {
-            // At/over the cap, refuse to create new groups (bounding memory)
-            // but keep updating existing ones.
-            if self.max_groups > 0 && self.order.len() >= self.max_groups {
-                self.overflow = true;
-                return;
+        if let Some(entry) = self.groups.get_mut(self.key_buf.as_slice()) {
+            for (i, spec) in self.aggs.iter().enumerate() {
+                let v = spec
+                    .arg_col
+                    .map(|c| row.get(c).cloned().unwrap_or(Value::Null));
+                update(&mut entry.1[i], spec.func, v, spec.distinct);
             }
-            let key = self.key_buf.clone();
-            let accs = self.aggs.iter().map(|_| Acc::new()).collect();
-            self.order.push(key.clone());
-            self.groups.insert(key, (row.to_vec(), accs));
+            return;
         }
-        let entry = self
-            .groups
-            .get_mut(self.key_buf.as_slice())
-            .expect("group present");
+        // New group. At/over the cap, refuse to create it (bounding memory).
+        if self.max_groups > 0 && self.order.len() >= self.max_groups {
+            self.overflow = true;
+            return;
+        }
+        let mut accs: Vec<Acc> = self.aggs.iter().map(|_| Acc::new()).collect();
         for (i, spec) in self.aggs.iter().enumerate() {
             let v = spec
                 .arg_col
                 .map(|c| row.get(c).cloned().unwrap_or(Value::Null));
-            update(&mut entry.1[i], spec.func, v, spec.distinct);
+            update(&mut accs[i], spec.func, v, spec.distinct);
         }
+        let key = self.key_buf.clone();
+        self.order.push(key.clone());
+        self.groups.insert(key, (row.to_vec(), accs));
     }
 
     /// Merge another partial aggregator (from a parallel worker) into this one.
