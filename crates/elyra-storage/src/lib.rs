@@ -443,6 +443,27 @@ impl Storage {
     /// if the prefix has no rows). Used to plan a parallel split of a scan.
     pub fn prefix_bounds(&self, prefix: &[u8]) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
         use std::ops::Bound;
+        // Bound the range to exactly this prefix's keyspace. Without the upper
+        // bound, `next_back()` starts at the last key of the *entire* database
+        // and walks backwards through every later keyspace (e.g. all `index::`
+        // entries and other tables) before reaching this prefix's last row --
+        // an O(total DB size) cost paid on every parallel aggregation. With the
+        // upper bound it is O(tree height).
+        let upper: Option<Vec<u8>> = {
+            let mut u = prefix.to_vec();
+            loop {
+                match u.last_mut() {
+                    Some(b) if *b < 0xff => {
+                        *b += 1;
+                        break Some(u);
+                    }
+                    Some(_) => {
+                        u.pop();
+                    }
+                    None => break None,
+                }
+            }
+        };
         let rtx = self
             .db
             .begin_read()
@@ -450,31 +471,29 @@ impl Storage {
         let t = rtx
             .open_table(KV)
             .map_err(|e| Error::Storage(e.to_string()))?;
+        let upper_bound = match &upper {
+            Some(u) => Bound::Excluded(u.as_slice()),
+            None => Bound::Unbounded,
+        };
         let mut range = t
-            .range::<&[u8]>((Bound::Included(prefix), Bound::Unbounded))
+            .range::<&[u8]>((Bound::Included(prefix), upper_bound))
             .map_err(|e| Error::Storage(e.to_string()))?;
         let first = match range.next() {
             Some(item) => {
                 let (k, _) = item.map_err(|e| Error::Storage(e.to_string()))?;
-                let kv = k.value();
-                if !kv.starts_with(prefix) {
-                    return Ok(None);
-                }
-                kv.to_vec()
+                k.value().to_vec()
             }
             None => return Ok(None),
         };
-        // Walk from the back, skipping any keys that belong to a later prefix,
-        // until the last key still under `prefix`.
-        let mut last = first.clone();
-        while let Some(item) = range.next_back() {
-            let (k, _) = item.map_err(|e| Error::Storage(e.to_string()))?;
-            let kv = k.value();
-            if kv.starts_with(prefix) {
-                last = kv.to_vec();
-                break;
+        // The range is exactly the prefix keyspace, so next_back() lands on the
+        // last row directly.
+        let last = match range.next_back() {
+            Some(item) => {
+                let (k, _) = item.map_err(|e| Error::Storage(e.to_string()))?;
+                k.value().to_vec()
             }
-        }
+            None => first.clone(),
+        };
         Ok(Some((first, last)))
     }
 
