@@ -283,6 +283,12 @@ implemented, so you can judge fit.
   TERMINATED BY '...'] [IGNORE n LINES] [(cols)]`, with `\N` for NULL. Client-
   side `LOAD DATA LOCAL INFILE` (streaming the file over the wire) is not
   supported.
+- **Binary (native) prepared-statement parameters** are not yet reliably decoded
+  from the `COM_STMT_EXECUTE` packet for all drivers (notably PDO/mysqlnd): a
+  bound parameter can be read as NULL, and the packet stream can desynchronize.
+  Text-protocol queries and client-side (emulated) prepared statements work; set
+  `PDO::ATTR_EMULATE_PREPARES => true` (Laravel `options`) or the driver
+  equivalent. PyMySQL and sqlx (which bind client-side) are unaffected.
 - Authentication uses `mysql_native_password`; connection salts now come from the
   OS CSPRNG. `caching_sha2_password` (MySQL 8's default) is **not** implemented —
   the wire library does not drive its multi-round fast/full-auth exchange — but

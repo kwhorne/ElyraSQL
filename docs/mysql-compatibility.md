@@ -17,6 +17,32 @@ drivers connect without modification.
   `SHOW VARIABLES/STATUS/COLLATION/DATABASES/TABLE STATUS`, and the
   `information_schema` tables GUI tools read to build their schema tree).
 
+## Laravel / Eloquent
+
+ElyraSQL runs Laravel migrations (schema builder), Eloquent models and
+relationships, the query builder, transactions, and pagination. Point the
+`mysql` connection at ElyraSQL and set the database name to `elyra` (used as the
+`information_schema` schema for `Schema::hasTable`/`hasColumn` and `SHOW`):
+
+```php
+// config/database.php  -> connections.mysql
+'host'     => env('DB_HOST', '127.0.0.1'),
+'port'     => env('DB_PORT', '3307'),
+'database' => env('DB_DATABASE', 'elyra'),
+'options'  => [
+    // Recommended: use client-side prepared statements. ElyraSQL's binary
+    // (native) prepared-statement parameter binding is not yet reliable with
+    // PDO/mysqlnd; emulation sends fully-formed queries and is well supported.
+    PDO::ATTR_EMULATE_PREPARES => true,
+],
+```
+
+With that setting a full Eloquent workload -- `Schema::create` (including
+`$table->id()`, `foreignId()->constrained()`, indexes), model CRUD with
+`lastInsertId`, `hasMany`/`belongsTo`, eager loading, `withCount`, query-builder
+joins/aggregates/`groupBy`+`having`, `updateOrInsert`, transactions and
+cascading deletes -- runs cleanly.
+
 ## Verified clients
 
 - `mysql` / `mariadb` command-line clients
