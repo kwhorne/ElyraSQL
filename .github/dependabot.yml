@@ -24,10 +24,18 @@ updates:
       - dependency-name: "wide"
         update-types:
           ["version-update:semver-major", "version-update:semver-minor"]
-      # rustls is transitively pinned to 0.22 by opensrv-mysql 0.7.0 (the latest
-      # published wire library); bumping tokio-rustls breaks the build until
-      # opensrv-mysql upgrades.
+      # tokio-rustls is consumed by the first-party wire crate (elyra-wire); a
+      # minor/major bump changes the rustls API and needs deliberate review.
       - dependency-name: "tokio-rustls"
+        update-types:
+          ["version-update:semver-major", "version-update:semver-minor"]
+      # nom and mysql_common are used by the vendored wire protocol (elyra-wire,
+      # forked from opensrv-mysql). nom 8 and mysql_common 0.33+ change APIs the
+      # vendored code relies on; upgrading needs a deliberate port of that code.
+      - dependency-name: "nom"
+        update-types:
+          ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: "mysql_common"
         update-types:
           ["version-update:semver-major", "version-update:semver-minor"]
       # sha1 0.11 pulls the breaking digest 0.11 API used in the (security-
