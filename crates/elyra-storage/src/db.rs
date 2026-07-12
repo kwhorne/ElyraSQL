@@ -485,6 +485,13 @@ impl Db {
         spawn_read(move || storage.prefix_bounds(&prefix)).await
     }
 
+    /// Count keys under `prefix` without reading values (see
+    /// [`Storage::count_prefix`]).
+    pub async fn count_prefix(&self, prefix: Vec<u8>) -> Result<u64> {
+        let storage = self.storage.clone();
+        spawn_read(move || storage.count_prefix(&prefix)).await
+    }
+
     /// Ordered range scan over `[start, end)` (see [`Storage::scan_range`]).
     pub async fn scan_range(
         &self,

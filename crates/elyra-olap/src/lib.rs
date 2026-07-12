@@ -209,6 +209,15 @@ impl GroupAggregator {
         }
     }
 
+    /// Seed the result of a bare `COUNT(*)` (no GROUP BY, single CountStar
+    /// aggregate) directly from a known row count, avoiding an O(n) feed. The
+    /// caller must ensure this plan is exactly `COUNT(*)`.
+    pub fn seed_count_star(&mut self, n: u64) {
+        let mut acc = Acc::new();
+        acc.count = n as i64;
+        self.groups.insert(Vec::new(), (Vec::new(), vec![acc]));
+    }
+
     /// Number of groups accumulated.
     pub fn len(&self) -> usize {
         self.groups.len()

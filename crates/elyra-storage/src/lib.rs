@@ -166,6 +166,25 @@ impl Snapshot {
 /// therefore a single file.
 const KV: TableDefinition<&[u8], &[u8]> = TableDefinition::new("elyra_kv");
 
+/// Smallest key strictly greater than every key starting with `prefix`
+/// (`None` when the prefix is all `0xFF`). Used to bound prefix range scans to
+/// a single keyspace instead of the whole database.
+fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut u = prefix.to_vec();
+    loop {
+        match u.last_mut() {
+            Some(b) if *b < 0xff => {
+                *b += 1;
+                return Some(u);
+            }
+            Some(_) => {
+                u.pop();
+            }
+            None => return None,
+        }
+    }
+}
+
 /// Handle to an ElyraSQL storage file.
 pub struct Storage {
     db: Database,
@@ -354,6 +373,33 @@ impl Storage {
         Ok(out)
     }
 
+    /// Count the keys under `prefix` without materialising any values -- backs
+    /// bare `COUNT(*)` over a table.
+    pub fn count_prefix(&self, prefix: &[u8]) -> Result<u64> {
+        use std::ops::Bound;
+        let upper = prefix_upper_bound(prefix);
+        let rtx = self
+            .db
+            .begin_read()
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        let t = rtx
+            .open_table(KV)
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        let upper_bound = match &upper {
+            Some(u) => Bound::Excluded(u.as_slice()),
+            None => Bound::Unbounded,
+        };
+        let range = t
+            .range::<&[u8]>((Bound::Included(prefix), upper_bound))
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        let mut n = 0u64;
+        for item in range {
+            item.map_err(|e| Error::Storage(e.to_string()))?; // don't touch value
+            n += 1;
+        }
+        Ok(n)
+    }
+
     /// Iterate every key/value whose key starts with `prefix`, in key order,
     /// passing **borrowed** slices to `f` -- no per-row `Vec` allocation and a
     /// single read transaction for the whole scan. This backs streaming
@@ -449,21 +495,7 @@ impl Storage {
         // entries and other tables) before reaching this prefix's last row --
         // an O(total DB size) cost paid on every parallel aggregation. With the
         // upper bound it is O(tree height).
-        let upper: Option<Vec<u8>> = {
-            let mut u = prefix.to_vec();
-            loop {
-                match u.last_mut() {
-                    Some(b) if *b < 0xff => {
-                        *b += 1;
-                        break Some(u);
-                    }
-                    Some(_) => {
-                        u.pop();
-                    }
-                    None => break None,
-                }
-            }
-        };
+        let upper = prefix_upper_bound(prefix);
         let rtx = self
             .db
             .begin_read()

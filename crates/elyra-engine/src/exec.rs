@@ -8605,6 +8605,39 @@ async fn olap_aggregate(
     filter: Option<Expr>,
     plan: &AggPlan,
 ) -> Result<GroupAggregator> {
+    // Bare COUNT(*) over the whole table (no filter): count keys in the data
+    // keyspace without decoding any rows, in parallel over clustered ranges,
+    // and seed the result directly instead of feeding N rows.
+    if filter.is_none() && plan.is_count_star_only() && !db.in_txn() {
+        let prefix = data_prefix(&def.name);
+        let raw = db.raw_db();
+        let n = match pk_split_ranges(&raw, def, &prefix, agg_workers()).await? {
+            Some(ranges) => {
+                let mut handles = Vec::with_capacity(ranges.len());
+                for (start, end) in ranges {
+                    let raw = raw.clone();
+                    handles.push(tokio::spawn(async move {
+                        raw.scan_range_fold(start, end, 0u64, |acc, _k, _v| {
+                            *acc += 1;
+                            Ok(())
+                        })
+                        .await
+                    }));
+                }
+                let mut total = 0u64;
+                for h in handles {
+                    total += h
+                        .await
+                        .map_err(|e| Error::Analytics(format!("count worker failed: {e}")))??;
+                }
+                total
+            }
+            None => raw.count_prefix(prefix).await?,
+        };
+        let mut agg = plan.new_aggregator();
+        agg.seed_count_star(n);
+        return Ok(agg);
+    }
     if let Some(f) = &filter {
         // Covering-index COUNT: a bare COUNT(*) whose entire filter is an
         // equality fully covered by a PK/secondary index is answered by
