@@ -16,6 +16,7 @@ mod ft;
 mod index;
 mod keyenc;
 pub mod lockmgr;
+mod cpred;
 mod predicate;
 mod rowdec;
 mod proc;

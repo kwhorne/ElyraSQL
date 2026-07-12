@@ -15,6 +15,7 @@ use sqlparser::ast::{
 use crate::aggregate;
 use crate::aggregate::AggPlan;
 use crate::index;
+use crate::cpred;
 use crate::predicate;
 use crate::rowdec;
 use elyra_olap::GroupAggregator;
@@ -8931,10 +8932,14 @@ async fn scan_aggregate_fast(
     let ncols = schema.columns.len();
     let arg_exprs = plan.arg_exprs().to_vec();
     let raw = db.raw_db();
+    // Compile the filter once (pre-resolved column indices, native comparison)
+    // for the common numeric-conjunction shape; fall back to the interpreter.
+    let cfilter = filter.as_ref().and_then(|f| cpred::compile(f, &schema));
 
     // A closure factory: builds the per-worker fold body (each captures its own
     // aggregator + reusable buffer).
     let make_body = |filter: Option<Expr>,
+                     cfilter: Option<cpred::CompiledPredicate>,
                      needed: Option<Vec<bool>>,
                      schema: Schema,
                      arg_exprs: Vec<Expr>| {
@@ -8944,9 +8949,10 @@ async fn scan_aggregate_fast(
                 Some(m) => rowdec::decode_projected_into(v, ncols, m, &mut buf)?,
                 None => buf = bincode::deserialize(v).map_err(|e| Error::Storage(e.to_string()))?,
             }
-            let keep = match &filter {
-                Some(e) => predicate::matches(e, &schema, &buf)?,
-                None => true,
+            let keep = match (&cfilter, &filter) {
+                (Some(cp), _) => cp.matches(&buf),
+                (None, Some(e)) => predicate::matches(e, &schema, &buf)?,
+                (None, None) => true,
             };
             if keep {
                 if arg_exprs.is_empty() {
@@ -8976,6 +8982,7 @@ async fn scan_aggregate_fast(
                 let raw = raw.clone();
                 let body = make_body(
                     filter.clone(),
+                    cfilter.clone(),
                     needed.clone(),
                     schema.clone(),
                     arg_exprs.clone(),
@@ -8997,7 +9004,7 @@ async fn scan_aggregate_fast(
     }
 
     // Fallback: single-pass full-prefix scan.
-    let body = make_body(filter, needed, schema, arg_exprs);
+    let body = make_body(filter, cfilter, needed, schema, arg_exprs);
     raw.scan_fold(prefix, plan.new_aggregator(), body).await
 }
 
