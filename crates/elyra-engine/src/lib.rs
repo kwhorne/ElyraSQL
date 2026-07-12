@@ -609,7 +609,7 @@ impl Engine {
     /// [WHERE ...]`. Returns `None` for anything else (execute-time still
     /// describes it). Placeholders are fine — only projection + FROM are read.
     pub async fn describe_query(&self, sql: &str, sess: &Session) -> Option<Schema> {
-        use sqlparser::ast::{SelectItem, SetExpr, TableFactor};
+        use sqlparser::ast::{Expr, SelectItem, SetExpr, TableFactor};
         let stmts = Parser::parse_sql(&MySqlDialect {}, sql).ok()?;
         if stmts.len() != 1 {
             return None;
@@ -620,54 +620,102 @@ impl Engine {
         let SetExpr::Select(sel) = q.body.as_ref() else {
             return None;
         };
-        if sel.from.len() != 1 || !sel.from[0].joins.is_empty() {
-            return None;
-        }
-        let TableFactor::Table { name, .. } = &sel.from[0].relation else {
-            return None;
+        // Resolve the single base table (for `*` expansion and column typing),
+        // if the FROM is exactly one plain table. Otherwise `def` is None and we
+        // still describe explicit projection items by best-effort type -- what
+        // matters for a prepared statement is that the *column count* is exact,
+        // so drivers (PDO/mysqlnd) read the result set instead of desyncing.
+        let def = if sel.from.len() == 1 && sel.from[0].joins.is_empty() {
+            if let TableFactor::Table { name, .. } = &sel.from[0].relation {
+                catalog::load(sess, &name.0.last()?.value).await.ok()
+            } else {
+                None
+            }
+        } else {
+            None
         };
-        if name.0.len() != 1 {
-            return None;
-        }
-        let def = catalog::load(sess, &name.0[0].value).await.ok()?;
-        let col_by_name = |n: &str| {
-            def.schema
-                .columns
-                .iter()
-                .find(|c| c.name.eq_ignore_ascii_case(n))
-                .cloned()
+        let col_by_name = |n: &str| -> Option<ColumnType> {
+            def.as_ref().and_then(|d| {
+                d.schema
+                    .columns
+                    .iter()
+                    .find(|c| c.name.eq_ignore_ascii_case(n))
+                    .map(|c| c.ty.clone())
+            })
         };
+        // Best-effort result type of a projection expression.
+        fn expr_type(e: &Expr, col: &dyn Fn(&str) -> Option<ColumnType>) -> ColumnType {
+            use sqlparser::ast::Value as V;
+            match e {
+                Expr::Identifier(i) => col(&i.value).unwrap_or(ColumnType::Text),
+                Expr::CompoundIdentifier(p) => p
+                    .last()
+                    .and_then(|x| col(&x.value))
+                    .unwrap_or(ColumnType::Text),
+                Expr::Value(V::Number(n, _)) => {
+                    if n.contains('.') {
+                        ColumnType::Float
+                    } else {
+                        ColumnType::Int
+                    }
+                }
+                Expr::Value(V::SingleQuotedString(_)) | Expr::Value(V::DoubleQuotedString(_)) => {
+                    ColumnType::Text
+                }
+                Expr::Value(V::Boolean(_)) => ColumnType::Bool,
+                Expr::Nested(inner) => expr_type(inner, col),
+                Expr::Function(f) => {
+                    match f
+                        .name
+                        .0
+                        .last()
+                        .map(|i| i.value.to_ascii_lowercase())
+                        .as_deref()
+                    {
+                        Some("count") => ColumnType::Int,
+                        Some(
+                            "sum" | "min" | "max" | "abs" | "round" | "floor" | "ceil" | "ceiling",
+                        ) => ColumnType::Int,
+                        Some(
+                            "avg" | "stddev" | "stddev_pop" | "stddev_samp" | "variance"
+                            | "var_pop" | "var_samp",
+                        ) => ColumnType::Float,
+                        _ => ColumnType::Text,
+                    }
+                }
+                Expr::BinaryOp { .. } => ColumnType::Int,
+                _ => ColumnType::Text,
+            }
+        }
         let mut out = Vec::new();
         for item in &sel.projection {
             match item {
-                SelectItem::Wildcard(_) => out.extend(def.schema.columns.iter().cloned()),
+                // Wildcards require a resolvable single table to know the count.
+                SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..) => {
+                    let d = def.as_ref()?;
+                    out.extend(d.schema.columns.iter().cloned());
+                }
                 SelectItem::UnnamedExpr(e) => {
                     let name = match e {
-                        sqlparser::ast::Expr::Identifier(i) => i.value.clone(),
-                        sqlparser::ast::Expr::CompoundIdentifier(parts) => {
-                            parts.last()?.value.clone()
-                        }
-                        _ => return None,
+                        Expr::Identifier(i) => i.value.clone(),
+                        Expr::CompoundIdentifier(parts) => parts.last()?.value.clone(),
+                        other => format!("{other}"),
                     };
-                    out.push(col_by_name(&name)?);
-                }
-                SelectItem::ExprWithAlias { expr, alias } => {
-                    let ty = match expr {
-                        sqlparser::ast::Expr::Identifier(i) => col_by_name(&i.value).map(|c| c.ty),
-                        sqlparser::ast::Expr::CompoundIdentifier(parts) => {
-                            col_by_name(&parts.last()?.value).map(|c| c.ty)
-                        }
-                        _ => None,
-                    }
-                    .unwrap_or(ColumnType::Text);
                     out.push(elyra_core::ColumnDef {
-                        name: alias.value.clone(),
-                        ty,
+                        name,
+                        ty: expr_type(e, &col_by_name),
                         nullable: true,
                         collation: elyra_core::Collation::Ci,
                     });
                 }
-                _ => return None,
+                SelectItem::ExprWithAlias { expr, alias } => {
+                    out.push(elyra_core::ColumnDef {
+                        name: alias.value.clone(),
+                        ty: expr_type(expr, &col_by_name),
+                        nullable: true,
+                        collation: elyra_core::Collation::Ci,
+                    });
+                }
             }
         }
         Some(Schema::new(out))
