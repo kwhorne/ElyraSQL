@@ -1145,6 +1145,12 @@ impl Engine {
         if let Some(stripped) = strip_create_table_options(&subst_sql) {
             subst_sql = stripped;
         }
+        // Strip a trailing `LIMIT n` from UPDATE/DELETE (not parsed; MySQL's
+        // UPDATE/DELETE ... LIMIT without ORDER BY is non-deterministic anyway,
+        // and drivers like Laravel use it only for a unique-key single row).
+        if let Some(stripped) = strip_dml_limit(&subst_sql) {
+            subst_sql = stripped;
+        }
         let statements =
             Parser::parse_sql(&dialect, &subst_sql).map_err(|e| Error::Parse(e.to_string()))?;
 
@@ -1848,6 +1854,33 @@ fn strip_create_table_options(sql: &str) -> Option<String> {
     }
     // Everything after the column list is table options -> drop it.
     Some(sql[..=close].to_string())
+}
+
+/// Remove a trailing `LIMIT <n>` from an `UPDATE`/`DELETE` statement, which the
+/// parser does not accept. Row-limited UPDATE/DELETE is not enforced (the whole
+/// matching set is affected); the WHERE clause is respected as written.
+fn strip_dml_limit(sql: &str) -> Option<String> {
+    let head = sql.trim_start();
+    let up = head.get(..7).unwrap_or(head).to_ascii_uppercase();
+    if !(up.starts_with("UPDATE ") || up.starts_with("DELETE ")) {
+        return None;
+    }
+    let trimmed = sql.trim_end().trim_end_matches(';').trim_end();
+    // Match a trailing `LIMIT <digits>` (case-insensitive).
+    let bytes = trimmed.as_bytes();
+    let mut i = bytes.len();
+    while i > 0 && bytes[i - 1].is_ascii_digit() {
+        i -= 1;
+    }
+    if i == bytes.len() {
+        return None; // no trailing number
+    }
+    let before_num = trimmed[..i].trim_end();
+    if before_num.len() >= 5 && before_num[before_num.len() - 5..].eq_ignore_ascii_case("limit") {
+        let kept = before_num[..before_num.len() - 5].trim_end();
+        return Some(kept.to_string());
+    }
+    None
 }
 
 fn query_has_from(q: &sqlparser::ast::Query) -> bool {
