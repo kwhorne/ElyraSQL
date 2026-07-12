@@ -8644,6 +8644,28 @@ async fn olap_aggregate(
     parallel_aggregate(db, def, filter, plan).await
 }
 
+/// Degree of parallelism for full-scan aggregation: `ELYRASQL_AGG_WORKERS` if
+/// set (clamped to 1..=64), else min(available cores, 8).
+fn agg_workers() -> usize {
+    use std::sync::OnceLock;
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        if let Some(v) = std::env::var("ELYRASQL_AGG_WORKERS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+        {
+            return v.clamp(1, 64);
+        }
+        // Full-scan aggregation is largely memory-bandwidth bound: ~4 parallel
+        // readers saturate bandwidth, and beyond that the coordination and
+        // read-transaction overhead makes it slower (measured). Cap the default
+        // at 4 regardless of core count; operators can raise it explicitly.
+        std::thread::available_parallelism()
+            .map(|n| n.get().min(4))
+            .unwrap_or(4)
+    })
+}
+
 /// Zero-copy scan + filter + aggregate for the autocommit case. When the table
 /// has a single integer primary key, the clustered keyspace is split into N
 /// sub-ranges aggregated in parallel (each in its own read transaction),
@@ -8696,10 +8718,9 @@ async fn scan_aggregate_fast(
     // Parallel split for single integer-PK tables: each worker aggregates a
     // clustered sub-range and the partials merge. The group aggregator reuses
     // its key buffer, so grouped aggregation no longer thrashes the allocator
-    // across threads.
-    let workers = std::thread::available_parallelism()
-        .map(|n| n.get().min(8))
-        .unwrap_or(4);
+    // across threads. `ELYRASQL_AGG_WORKERS` overrides the degree of parallelism
+    // (0/1 = single-threaded); default is min(cores, 8).
+    let workers = agg_workers();
     if workers > 1 {
         if let Some(ranges) = pk_split_ranges(&raw, def, &prefix, workers).await? {
             let mut handles = Vec::with_capacity(ranges.len());
