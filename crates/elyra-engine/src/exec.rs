@@ -1712,6 +1712,65 @@ pub async fn alter_table(
             AlterTableOperation::AlterColumn { column_name, op } => {
                 alter_column_op(db, &mut def, &column_name.value, op).await?;
             }
+            // ADD INDEX / KEY / UNIQUE: build the equivalent index (with backfill)
+            // via the CREATE INDEX path, then refresh the working definition.
+            AlterTableOperation::AddConstraint(tc) => {
+                use sqlparser::ast::TableConstraint as TC;
+                let (idx_name, columns, unique) =
+                    match tc {
+                        TC::Index { name, columns, .. } => (name.clone(), columns.clone(), false),
+                        TC::Unique {
+                            name,
+                            index_name,
+                            columns,
+                            ..
+                        } => (
+                            name.clone().or_else(|| index_name.clone()),
+                            columns.clone(),
+                            true,
+                        ),
+                        TC::PrimaryKey { .. } => return Err(Error::Unsupported(
+                            "ALTER TABLE ADD PRIMARY KEY on an existing table is not supported; \
+                             declare the primary key in CREATE TABLE"
+                                .into(),
+                        )),
+                        TC::ForeignKey { .. } => {
+                            return Err(Error::Unsupported(
+                                "ALTER TABLE ADD FOREIGN KEY is not yet supported; declare it in \
+                             CREATE TABLE"
+                                    .into(),
+                            ))
+                        }
+                        other => {
+                            return Err(Error::Unsupported(format!(
+                                "ALTER ADD constraint not supported: {other}"
+                            )))
+                        }
+                    };
+                let ci = CreateIndex {
+                    name: idx_name.map(|i| ObjectName(vec![i])),
+                    table_name: name.clone(),
+                    using: None,
+                    columns: columns
+                        .into_iter()
+                        .map(|id| sqlparser::ast::OrderByExpr {
+                            expr: Expr::Identifier(id),
+                            asc: None,
+                            nulls_first: None,
+                            with_fill: None,
+                        })
+                        .collect(),
+                    unique,
+                    concurrently: false,
+                    if_not_exists: false,
+                    include: Vec::new(),
+                    nulls_distinct: None,
+                    with: Vec::new(),
+                    predicate: None,
+                };
+                create_index(db, ci).await?;
+                def = catalog::load(db, &tname).await?;
+            }
             other => {
                 return Err(Error::Unsupported(format!(
                     "ALTER operation not supported: {other}"

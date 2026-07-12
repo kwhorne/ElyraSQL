@@ -1774,7 +1774,41 @@ fn query_has_from(q: &sqlparser::ast::Query) -> bool {
         return true;
     }
     match q.body.as_ref() {
-        sqlparser::ast::SetExpr::Select(s) => !s.from.is_empty(),
+        sqlparser::ast::SetExpr::Select(s) => {
+            // A FROM-less SELECT still needs the full engine when its projection
+            // or WHERE contains a subquery (scalar / EXISTS / IN), which the
+            // lightweight literal evaluator cannot resolve.
+            !s.from.is_empty() || select_has_subquery(s)
+        }
         _ => true,
+    }
+}
+
+/// Whether a SELECT's projection or WHERE contains a subquery expression.
+fn select_has_subquery(s: &sqlparser::ast::Select) -> bool {
+    use sqlparser::ast::SelectItem;
+    let proj = s.projection.iter().any(|it| match it {
+        SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
+            expr_has_subquery(e)
+        }
+        _ => false,
+    });
+    proj || s.selection.as_ref().is_some_and(expr_has_subquery)
+}
+
+fn expr_has_subquery(e: &sqlparser::ast::Expr) -> bool {
+    use sqlparser::ast::Expr;
+    match e {
+        Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } => true,
+        Expr::Nested(x)
+        | Expr::UnaryOp { expr: x, .. }
+        | Expr::Cast { expr: x, .. }
+        | Expr::IsNull(x)
+        | Expr::IsNotNull(x) => expr_has_subquery(x),
+        Expr::BinaryOp { left, right, .. } => expr_has_subquery(left) || expr_has_subquery(right),
+        Expr::Between {
+            expr, low, high, ..
+        } => expr_has_subquery(expr) || expr_has_subquery(low) || expr_has_subquery(high),
+        _ => false,
     }
 }
