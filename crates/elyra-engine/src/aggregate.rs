@@ -50,6 +50,16 @@ impl AggPlan {
         &self.arg_exprs
     }
 
+    /// True when this plan is exactly `COUNT(*)` with no GROUP BY and no other
+    /// aggregates -- so its value is just the matching row count, which a
+    /// covering index can supply without fetching any rows.
+    pub fn is_count_star_only(&self) -> bool {
+        self.group_cols.is_empty()
+            && self.arg_exprs.is_empty()
+            && self.aggs.len() == 1
+            && matches!(self.aggs[0].func, elyra_olap::AggFunc::CountStar)
+    }
+
     /// Base-table column indices that aggregators read *directly* (e.g. the
     /// `age` in `SUM(age)`), excluding appended virtual argument columns. Used
     /// to compute which columns a scan must decode.

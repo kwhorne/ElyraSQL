@@ -8582,6 +8582,19 @@ async fn olap_aggregate(
     plan: &AggPlan,
 ) -> Result<GroupAggregator> {
     if let Some(f) = &filter {
+        // Covering-index COUNT: a bare COUNT(*) whose entire filter is an
+        // equality fully covered by a PK/secondary index is answered by
+        // counting index entries -- no row fetch, no decode.
+        if plan.is_count_star_only() {
+            if let Some(n) = index_count_eq(db, def, f).await? {
+                let mut agg = plan.new_aggregator();
+                let empty: Vec<Value> = Vec::new();
+                for _ in 0..n {
+                    agg.feed(&empty);
+                }
+                return Ok(agg);
+            }
+        }
         // Equality or range on a PK/indexed column: aggregate just the matching
         // rows fetched via the index, rather than scanning the whole table.
         if accelerable(def, Some(f))? {
@@ -8765,6 +8778,88 @@ async fn partitioned_aggregate(
 /// Scan the table in batches and aggregate them across worker threads, merging
 /// partial aggregators. Memory is bounded by (workers x batch), independent of
 /// table size — the core OLAP property.
+/// If `e` is `col = literal` (either order), push `col`'s index and return
+/// true; otherwise false. Used to prove a filter is a pure equality set.
+fn is_col_eq_literal(e: &Expr, schema: &Schema, out: &mut Vec<usize>) -> bool {
+    let Expr::BinaryOp { left, op, right } = e else {
+        return false;
+    };
+    if !matches!(op, sqlparser::ast::BinaryOperator::Eq) {
+        return false;
+    }
+    let ident = |x: &Expr| -> Option<usize> {
+        let name = match x {
+            Expr::Identifier(id) => id.value.clone(),
+            Expr::CompoundIdentifier(parts) => parts.last()?.value.clone(),
+            _ => return None,
+        };
+        schema
+            .columns
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(&name))
+    };
+    let lit = |x: &Expr| matches!(x, Expr::Value(_));
+    if let (Some(ci), true) = (ident(left), lit(right)) {
+        out.push(ci);
+        return true;
+    }
+    if let (true, Some(ci)) = (lit(left), ident(right)) {
+        out.push(ci);
+        return true;
+    }
+    false
+}
+
+/// Count matching rows for a filter that is *exactly* an equality set fully
+/// covered by the primary key or a secondary index, without fetching rows.
+/// Returns `None` when the filter isn't a clean covered equality (caller then
+/// takes the normal path). Correctness rests on two facts: every conjunct is a
+/// `col = literal`, and the equality columns are exactly an index's columns --
+/// so the index entries are precisely the matching rows.
+async fn index_count_eq(db: &Session, def: &TableDef, filter: &Expr) -> Result<Option<u64>> {
+    let mut conj = Vec::new();
+    split_and(filter, &mut conj);
+    let mut refcols: Vec<usize> = Vec::new();
+    for c in &conj {
+        if !is_col_eq_literal(c, &def.schema, &mut refcols) {
+            return Ok(None);
+        }
+    }
+    if refcols.is_empty() {
+        return Ok(None);
+    }
+    let same_set = |cols: &[usize]| {
+        let mut a = refcols.clone();
+        a.sort_unstable();
+        a.dedup();
+        let mut b = cols.to_vec();
+        b.sort_unstable();
+        b.dedup();
+        a == b
+    };
+    if def.has_pk() && same_set(&def.pk_cols) {
+        if let Some(vals) = key_eq_values(def, Some(filter), &def.pk_cols)? {
+            let key = data_key(
+                &def.name,
+                &keyenc::encode_key_coll(&vals, &def.pk_collations())?,
+            );
+            return Ok(Some(u64::from(db.get(key).await?.is_some())));
+        }
+    }
+    for idx in &def.indexes {
+        if idx.vector {
+            continue;
+        }
+        if same_set(&idx.cols) {
+            if let Some(vals) = key_eq_values(def, Some(filter), &idx.cols)? {
+                let keys = index::lookup_eq(db, &def.name, idx, &vals).await?;
+                return Ok(Some(keys.len() as u64));
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// Collect the schema column indices referenced by `e` into `out`. Returns
 /// `false` if the expression contains any form we don't fully understand, in
 /// which case the caller must conservatively assume *all* columns are needed.
