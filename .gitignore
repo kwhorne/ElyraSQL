@@ -5,3 +5,7 @@
 .env
 /site
 .cache
+
+# compat harness deps
+tests/compat/laravel/vendor/
+tests/compat/laravel/composer.lock

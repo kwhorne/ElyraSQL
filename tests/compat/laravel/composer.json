@@ -1,0 +1,9 @@
+{
+  "name": "elyrasql/laravel-compat",
+  "description": "Laravel/Eloquent compatibility harness for ElyraSQL",
+  "require": {
+    "illuminate/database": "^11.0",
+    "illuminate/events": "^11.0",
+    "illuminate/pagination": "^11.0"
+  }
+}

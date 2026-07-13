@@ -57,8 +57,8 @@ jobs:
       - name: Audit dependencies
         run: cargo audit
 
-  smoke:
-    name: end-to-end smoke test
+  compatibility:
+    name: client & framework compatibility
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
@@ -75,28 +75,34 @@ jobs:
       - name: Build release binary
         run: cargo build --release -p elyra-cli
 
-      - name: Start server and run queries
+      - name: Start ElyraSQL server
         run: |
           ./target/release/elyrasql serve --data /tmp/ci.edb --listen 127.0.0.1:3307 &
-          SERVER_PID=$!
-          sleep 2
+          echo "SERVER_PID=$!" >> "$GITHUB_ENV"
+          # wait for the port to accept connections
+          for i in $(seq 1 100); do
+            (echo > /dev/tcp/127.0.0.1/3307) >/dev/null 2>&1 && break
+            sleep 0.2
+          done
+
+      - name: PyMySQL smoke (pure-Python driver, client-side binding)
+        run: |
           python3 -m pip install --quiet PyMySQL
-          python3 - <<'PY'
-          import pymysql
-          c = pymysql.connect(host="127.0.0.1", port=3307, user="root", password="", autocommit=True)
-          cur = c.cursor()
-          cur.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, name TEXT, ts DATETIME)")
-          cur.execute("INSERT INTO t VALUES (1,'a','2024-01-01 00:00:00'),(2,'b','2024-06-01 12:00:00')")
-          cur.execute("SELECT COUNT(*) FROM t")
-          assert cur.fetchone()[0] == 2, "row count"
-          cur.execute("SELECT name FROM t WHERE id = 2")
-          assert cur.fetchone()[0] == "b", "pk lookup"
-          cur.execute("BEGIN")
-          cur.execute("INSERT INTO t VALUES (3,'c','2024-01-01 00:00:00')")
-          cur.execute("ROLLBACK")
-          cur.execute("SELECT COUNT(*) FROM t")
-          assert cur.fetchone()[0] == 2, "rollback"
-          print("smoke test passed")
-          c.close()
-          PY
-          kill $SERVER_PID
+          ELYRASQL_PORT=3307 python3 tests/compat/python/pymysql_smoke.py
+
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: pdo, pdo_mysql
+          tools: composer
+
+      - name: Laravel / Eloquent compatibility (PDO)
+        working-directory: tests/compat/laravel
+        run: |
+          composer install --no-interaction --no-progress
+          ELYRASQL_PORT=3307 ELYRASQL_DB=elyra php eloquent_test.php
+
+      - name: Stop server
+        if: always()
+        run: kill "$SERVER_PID" || true
