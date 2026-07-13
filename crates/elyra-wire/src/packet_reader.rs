@@ -133,11 +133,16 @@ impl<R: AsyncRead + Unpin> PacketReader<R> {
                 };
                 match packet(bytes) {
                     Ok((rest, p)) => {
+                        // Only record how many bytes are left; do NOT reallocate
+                        // `self.bytes` here. `p` (and `rest`) borrow into the
+                        // current `self.bytes` allocation via the unsafe slice
+                        // above, so replacing it (e.g. `self.bytes = rest.to_vec()`)
+                        // would free the buffer `p` points into -> use-after-free,
+                        // returning garbage to the caller for the *next* pipelined
+                        // packet (e.g. mysqlnd sending EXECUTE+CLOSE+PREPARE
+                        // back-to-back). The next call recomputes `self.start`
+                        // from `len - remaining`, matching the sync `next()`.
                         self.remaining = rest.len();
-                        if self.remaining > 0 {
-                            self.bytes = rest.to_vec();
-                            self.start = 0;
-                        }
                         return Ok(Some(p));
                     }
                     Err(nom::Err::Incomplete(_)) | Err(nom::Err::Error(_)) => {}
@@ -165,6 +170,12 @@ impl<R: AsyncRead + Unpin> PacketReader<R> {
                 self.r.read(buf).await?
             };
             self.remaining = end + read;
+            // Drop the zero-padding added by `resize` so `self.bytes.len()`
+            // always equals the number of real buffered bytes. The top-of-call
+            // `self.start = self.bytes.len() - self.remaining` (and the borrow of
+            // `self.bytes[self.start..]`) rely on this; leaving padding in made
+            // `start` point into zeros after a pipelined packet was parsed.
+            self.bytes.truncate(self.remaining);
             // use a larger buffer size to reduce bytes resize times.
             buffer_size = PACKET_LARGE_BUFFER_SIZE;
 
@@ -272,4 +283,48 @@ pub(crate) fn packet(i: &[u8]) -> nom::IResult<&[u8], (u8, Packet<'_>)> {
             (seq, pkt)
         },
     )(i)
+}
+
+#[cfg(test)]
+mod reader_tests {
+    use super::PacketReader;
+
+    fn frame(seq: u8, payload: &[u8]) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&(payload.len() as u32).to_le_bytes()[..3]);
+        v.push(seq);
+        v.extend_from_slice(payload);
+        v
+    }
+
+    /// Several packets arriving in a single read (pipelined, as mysqlnd sends
+    /// EXECUTE/CLOSE/PREPARE back-to-back) must each be returned intact. This
+    /// guards the packet-reader buffer management against the use-after-free /
+    /// zero-padding regressions that corrupted every packet after the first.
+    #[tokio::test]
+    async fn reads_pipelined_packets_intact() {
+        let mut buf = Vec::new();
+        buf.extend(frame(0, &[0x16, b'S', b'E', b'L'])); // prepare-ish
+        buf.extend(frame(0, &[0x19, 1, 0, 0, 0])); // close stmt 1
+        buf.extend(frame(0, &[0x17, 2, 0, 0, 0])); // execute stmt 2
+        buf.extend(frame(0, &[0x01])); // quit
+
+        let src: &[u8] = &buf;
+        let mut r = PacketReader::new(src);
+
+        let expect: [&[u8]; 4] = [
+            &[0x16, b'S', b'E', b'L'],
+            &[0x19, 1, 0, 0, 0],
+            &[0x17, 2, 0, 0, 0],
+            &[0x01],
+        ];
+        for want in expect {
+            let (_seq, pkt) = r.next_async().await.unwrap().expect("a packet");
+            assert_eq!(pkt.as_ref(), want, "pipelined packet payload mismatch");
+        }
+        assert!(
+            r.next_async().await.unwrap().is_none(),
+            "expected end of stream"
+        );
+    }
 }

@@ -76,6 +76,8 @@ jobs:
         run: cargo build --release -p elyra-cli
 
       - name: Start ElyraSQL server
+        env:
+          ELYRASQL_STMT_DESCRIBE: "on"
         run: |
           ./target/release/elyrasql serve --data /tmp/ci.edb --listen 127.0.0.1:3307 &
           echo "SERVER_PID=$!" >> "$GITHUB_ENV"
@@ -102,6 +104,9 @@ jobs:
         run: |
           composer install --no-interaction --no-progress
           ELYRASQL_PORT=3307 ELYRASQL_DB=elyra php eloquent_test.php
+
+      - name: Native (binary) prepared statements (PDO)
+        run: ELYRASQL_PORT=3307 ELYRASQL_DB=elyra php tests/compat/php/native_prepare.php
 
       - name: Stop server
         if: always()
