@@ -186,6 +186,28 @@ pub async fn create_table(
 
     for (idx, col) in ct.columns.iter().enumerate() {
         let ty = map_type(&col.data_type)?;
+        // ENUM columns are constrained to their declared members via a synthesized
+        // CHECK (`col IN ('a','b',...)`), reusing the existing CHECK enforcement.
+        // No on-disk format change (checks already live in TableDef); NULL passes
+        // the CHECK, matching a nullable ENUM. (SET subset-membership is not yet
+        // validated.)
+        if let sqlparser::ast::DataType::Enum(members, _) = &col.data_type {
+            let vals: Vec<String> = members
+                .iter()
+                .map(|m| match m {
+                    sqlparser::ast::EnumMember::Name(s) => s.clone(),
+                    sqlparser::ast::EnumMember::NamedValue(s, _) => s.clone(),
+                })
+                .collect();
+            if !vals.is_empty() {
+                let list = vals
+                    .iter()
+                    .map(|v| format!("'{}'", v.replace('\'', "''")))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                checks.push(format!("`{}` IN ({list})", col.name.value));
+            }
+        }
         let mut nullable = true;
         let mut meta = ColMeta::default();
         let collation = col

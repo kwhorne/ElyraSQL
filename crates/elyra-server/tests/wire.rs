@@ -548,6 +548,35 @@ async fn default_collation_group_is_case_insensitive() {
     assert_eq!(groups[0].1, 3);
 }
 
+/// ENUM columns are constrained to their declared members (via a synthesized
+/// CHECK). [ESQL-2]
+#[tokio::test]
+async fn enum_value_validation() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop("CREATE TABLE t (id INT PRIMARY KEY, status ENUM('active','inactive','pending'))")
+        .await
+        .unwrap();
+
+    c.query_drop("INSERT INTO t VALUES (1,'active')")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO t VALUES (2, NULL)")
+        .await
+        .unwrap(); // nullable enum
+
+    // a value outside the member list is rejected
+    let bad = c.query_drop("INSERT INTO t VALUES (3,'bogus')").await;
+    assert!(bad.is_err(), "ENUM must reject a non-member value");
+
+    let rows: Vec<(i64, Option<String>)> = c
+        .query("SELECT id, status FROM t ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![(1, Some("active".into())), (2, None)]);
+}
+
 #[tokio::test]
 async fn data_types() {
     let srv = TestServer::start().await;

@@ -183,7 +183,10 @@ implemented, so you can judge fit.
   It still doesn't handle synonyms, and truly irregular forms (e.g. `wolves`)
   aren't unified. Changing the language invalidates an existing index
   (rebuild with `CREATE FULLTEXT INDEX`). Vector (ANN) search is also available.
-- `ENUM`/`SET` are stored as text and not value-checked.
+- `ENUM` values are validated against the declared member list (a `CREATE TABLE`
+  `ENUM('a','b',...)` column is enforced via a synthesized `CHECK col IN (...)`;
+  a non-member INSERT/UPDATE is rejected, and NULL is allowed on a nullable
+  column). `SET` is still stored as text without subset-membership validation.
 - Basic spatial support: `POINT`/`GEOMETRY` columns are stored as WKT text, with
   `POINT(x,y)`, `ST_X`, `ST_Y`, `ST_Distance` (Euclidean), `ST_AsText`, and
   `ST_GeomFromText`. Only 2D points are supported; there is no spatial index or
