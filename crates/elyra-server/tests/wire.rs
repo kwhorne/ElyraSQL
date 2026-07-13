@@ -319,6 +319,69 @@ async fn join_group_by_streaming() {
     assert_eq!(rows, vec![("A".into(), 4)]);
 }
 
+/// Three-table (left-deep) join streams for both ORDER BY and GROUP BY via the
+/// chained hash-join. [ESQL-6]
+#[tokio::test]
+async fn three_table_join_streaming() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop("CREATE TABLE fct (id INT PRIMARY KEY, d1 INT, d2 INT, amt INT)")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE dm1 (id INT PRIMARY KEY, name VARCHAR(8))")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE dm2 (id INT PRIMARY KEY, region VARCHAR(8))")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO dm1 VALUES (1,'A'),(2,'B')")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO dm2 VALUES (10,'N'),(20,'S')")
+        .await
+        .unwrap();
+    c.query_drop(
+        "INSERT INTO fct VALUES (1,1,10,100),(2,2,20,50),(3,1,20,80),(4,2,10,120),(5,1,10,30)",
+    )
+    .await
+    .unwrap();
+
+    // GROUP BY over the 3-table join
+    let mut g: Vec<(String, String, i64, i64)> = c
+        .query(
+            "SELECT d1.name, d2.region, COUNT(*), SUM(f.amt) \
+             FROM fct f JOIN dm1 d1 ON f.d1 = d1.id JOIN dm2 d2 ON f.d2 = d2.id \
+             GROUP BY d1.name, d2.region",
+        )
+        .await
+        .unwrap();
+    g.sort();
+    assert_eq!(
+        g,
+        vec![
+            ("A".into(), "N".into(), 2, 130),
+            ("A".into(), "S".into(), 1, 80),
+            ("B".into(), "N".into(), 1, 120),
+            ("B".into(), "S".into(), 1, 50),
+        ]
+    );
+
+    // ORDER BY over the 3-table join
+    let o: Vec<(i64, String, String)> = c
+        .query(
+            "SELECT f.id, d1.name, d2.region \
+             FROM fct f JOIN dm1 d1 ON f.d1 = d1.id JOIN dm2 d2 ON f.d2 = d2.id \
+             ORDER BY f.amt DESC LIMIT 2",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        o,
+        vec![(4, "B".into(), "N".into()), (1, "A".into(), "N".into())]
+    );
+}
+
 /// Join + ORDER BY + LIMIT: the streaming hash-join feeds the spilling sorter,
 /// so the result matches the materialising path (top-N by amount). [ESQL-6]
 #[tokio::test]

@@ -4238,6 +4238,133 @@ async fn streaming_nlj_select(
     Ok(Some(QueryResult::Rows(RowStream::literal(osch, rows))))
 }
 
+/// One built step of a left-deep streaming hash join: the partner relation
+/// materialised into a hash table, plus the info needed to probe it from the
+/// accumulated left row.
+struct JoinChainStep {
+    /// Partner rows keyed by the collated partner join key.
+    table: std::collections::HashMap<String, Vec<Vec<Value>>>,
+    /// Expr (over `left_schema`) that produces the probe key for a left row.
+    probe_key: Expr,
+    /// Schema of the accumulated left side at this step (driving ++ prior partners).
+    left_schema: Schema,
+    coll: elyra_core::Collation,
+    /// Number of partner columns (for LEFT-join NULL extension).
+    plen: usize,
+    left_outer: bool,
+}
+
+/// Build a left-deep streaming hash join for a `TableWithJoins` (a driving table
+/// plus a chain of `JOIN`s). Each partner is materialised into a hash table
+/// keyed by the equi-join key connecting it to the accumulated left side; the
+/// driving table is left to be streamed by the caller. Returns the driving
+/// schema, the per-join steps, and the combined output schema -- or `None` when
+/// the shape is not a plain-table INNER/LEFT equi-join chain we can stream.
+async fn build_join_chain(
+    db: &Session,
+    twj: &TableWithJoins,
+) -> Result<Option<(Schema, Vec<JoinChainStep>, Schema)>> {
+    if !matches!(twj.relation, TableFactor::Table { .. }) || twj.joins.is_empty() {
+        return Ok(None);
+    }
+    let (_ddef, dcols) = resolve_table(db, &twj.relation).await?;
+    let dschema = Schema::new(dcols.clone());
+    let mut left_cols = dcols;
+    let mut steps = Vec::with_capacity(twj.joins.len());
+    for join in &twj.joins {
+        if !matches!(join.relation, TableFactor::Table { .. }) {
+            return Ok(None);
+        }
+        let (kind, on) = join_kind(&join.join_operator)?;
+        if !matches!(kind, JoinKind::Inner | JoinKind::Left) {
+            return Ok(None);
+        }
+        let Some(on) = on else { return Ok(None) };
+        let (pdef, pcols) = resolve_table(db, &join.relation).await?;
+        let left_schema = Schema::new(left_cols.clone());
+        let pschema = Schema::new(pcols.clone());
+        let Some((lkey, rkey)) = equi_keys(&on, &left_schema, &pschema) else {
+            return Ok(None);
+        };
+        let coll = join_key_collation(&lkey, &left_schema, &rkey, &pschema);
+
+        // Materialise the partner into a hash table keyed by its join key.
+        let mut table: std::collections::HashMap<String, Vec<Vec<Value>>> =
+            std::collections::HashMap::new();
+        let prefix = data_prefix(&pdef.name);
+        let mut cursor: Option<Vec<u8>> = None;
+        loop {
+            let batch = db.scan_batch(prefix.clone(), cursor.clone(), 8192).await?;
+            if batch.is_empty() {
+                break;
+            }
+            let last = batch.len() < 8192;
+            cursor = batch.last().map(|(k, _)| k.clone());
+            for (_, v) in batch {
+                let row: Vec<Value> =
+                    bincode::deserialize(&v).map_err(|e| Error::Storage(e.to_string()))?;
+                let key = predicate::eval_row(&rkey, &pschema, &row)?;
+                if let Some(k) = key_str_coll(&key, coll) {
+                    table.entry(k).or_default().push(row);
+                }
+            }
+            if last {
+                break;
+            }
+        }
+
+        steps.push(JoinChainStep {
+            table,
+            probe_key: lkey,
+            left_schema,
+            coll,
+            plen: pcols.len(),
+            left_outer: kind == JoinKind::Left,
+        });
+        left_cols.extend(pcols);
+    }
+    let combined = Schema::new(left_cols);
+    Ok(Some((dschema, steps, combined)))
+}
+
+/// Expand one driving row through the built chain into full combined rows (the
+/// cartesian product of matches at each step; LEFT joins NULL-extend unmatched
+/// left rows). `out` is appended to.
+fn expand_join_chain(
+    driving: Vec<Value>,
+    steps: &[JoinChainStep],
+    out: &mut Vec<Vec<Value>>,
+) -> Result<()> {
+    let mut partials = vec![driving];
+    for step in steps {
+        let mut next = Vec::new();
+        for row in &partials {
+            let key = predicate::eval_row(&step.probe_key, &step.left_schema, row)?;
+            let matches: Option<&Vec<Vec<Value>>> = if key.is_null() {
+                None
+            } else {
+                key_str_coll(&key, step.coll).and_then(|k| step.table.get(&k))
+            };
+            let matched = matches.map(|v| !v.is_empty()).unwrap_or(false);
+            if let Some(rows) = matches {
+                for m in rows {
+                    let mut c = row.clone();
+                    c.extend_from_slice(m);
+                    next.push(c);
+                }
+            }
+            if step.left_outer && !matched {
+                let mut c = row.clone();
+                c.extend(std::iter::repeat_n(Value::Null, step.plen));
+                next.push(c);
+            }
+        }
+        partials = next;
+    }
+    out.extend(partials);
+    Ok(())
+}
+
 /// Streaming index nested-loop **aggregation** for
 /// `SELECT ... aggregates ... FROM driving JOIN partner
 ///  ON driving.k = partner.<pk|indexed> [WHERE] GROUP BY ... [HAVING] [ORDER BY] [LIMIT]`.
@@ -4265,33 +4392,12 @@ async fn streaming_join_aggregate(
         return Ok(None);
     }
     let twj = &select.from[0];
-    if twj.joins.len() != 1
-        || !matches!(twj.relation, TableFactor::Table { .. })
-        || !matches!(twj.joins[0].relation, TableFactor::Table { .. })
-    {
-        return Ok(None);
-    }
-    let join = &twj.joins[0];
-    let (kind, on) = join_kind(&join.join_operator)?;
-    if !matches!(kind, JoinKind::Inner | JoinKind::Left) {
-        return Ok(None);
-    }
-    let Some(on) = on else { return Ok(None) };
-    let (ddef, dcols) = resolve_table(db, &twj.relation).await?;
-    let (pdef, pcols) = resolve_table(db, &join.relation).await?;
-    let driving_schema = Schema::new(dcols.clone());
-    let partner_schema = Schema::new(pcols.clone());
-    let Some((driving_key, pcol)) = equi_nlj(&on, &driving_schema, &partner_schema) else {
+    // Build the (left-deep) join chain: each partner into a hash table, driving
+    // streamed. Handles two or more tables.
+    let Some((_dschema, steps, schema)) = build_join_chain(db, twj).await? else {
         return Ok(None);
     };
-    if !(pdef.pk_cols == [pcol] || index::index_on(&pdef, pcol).is_some()) {
-        return Ok(None);
-    }
-
-    // Combined schema: driving columns then partner columns.
-    let mut all_cols = dcols;
-    all_cols.extend(pcols.clone());
-    let schema = Schema::new(all_cols);
+    let (ddef, _) = resolve_table(db, &twj.relation).await?;
 
     // Build the aggregation plan; if it isn't a plain aggregate/group plan we can
     // stream, fall back to join_select (which is the authoritative path and will
@@ -4301,8 +4407,6 @@ async fn streaming_join_aggregate(
         Err(_) => return Ok(None),
     };
     let extend = !plan.arg_exprs().is_empty();
-    let plen = pcols.len();
-    let left_outer = kind == JoinKind::Left;
 
     let keep = |row: &[Value]| -> Result<bool> {
         match filter {
@@ -4311,9 +4415,13 @@ async fn streaming_join_aggregate(
         }
     };
 
+    // Stream the driving table, expanding each row through the chain and feeding
+    // the spilling aggregator -- so a large join + GROUP BY is bounded by the
+    // group state (which spills), not the join output size.
     let mut sa = SpillAgg::new(&plan);
     let prefix = data_prefix(&ddef.name);
     let mut cursor: Option<Vec<u8>> = None;
+    let mut combined_buf: Vec<Vec<Value>> = Vec::new();
     loop {
         let batch = db.scan_batch(prefix.clone(), cursor.clone(), 4096).await?;
         if batch.is_empty() {
@@ -4324,16 +4432,9 @@ async fn streaming_join_aggregate(
         for (_, v) in batch {
             let l: Vec<Value> =
                 bincode::deserialize(&v).map_err(|e| Error::Storage(e.to_string()))?;
-            let key = predicate::eval_row(&driving_key, &driving_schema, &l)?;
-            let matches = if key.is_null() {
-                Vec::new()
-            } else {
-                lookup_rows_by_eq(db, &pdef, pcol, &key).await?
-            };
-            let matched = !matches.is_empty();
-            for m in matches {
-                let mut combined = l.clone();
-                combined.extend(m);
+            combined_buf.clear();
+            expand_join_chain(l, &steps, &mut combined_buf)?;
+            for combined in combined_buf.drain(..) {
                 if !keep(&combined)? {
                     continue;
                 }
@@ -4343,18 +4444,6 @@ async fn streaming_join_aggregate(
                     combined
                 };
                 sa.feed_extended(fed)?;
-            }
-            if left_outer && !matched {
-                let mut combined = l.clone();
-                combined.extend(std::iter::repeat_n(Value::Null, plen));
-                if keep(&combined)? {
-                    let fed = if extend {
-                        plan.extend_row(&combined)?
-                    } else {
-                        combined
-                    };
-                    sa.feed_extended(fed)?;
-                }
             }
         }
         if last {
@@ -4391,40 +4480,17 @@ async fn streaming_join_order(
     offset: usize,
     limit: Option<usize>,
 ) -> Result<Option<QueryResult>> {
-    use std::collections::HashMap;
-
     // Reads inside a transaction must see the write overlay -> materialising path.
     if db.in_txn() || select.distinct.is_some() || select.from.len() != 1 {
         return Ok(None);
     }
     let twj = &select.from[0];
-    if twj.joins.len() != 1
-        || !matches!(twj.relation, TableFactor::Table { .. })
-        || !matches!(twj.joins[0].relation, TableFactor::Table { .. })
-    {
-        return Ok(None);
-    }
-    let join = &twj.joins[0];
-    let (kind, on) = join_kind(&join.join_operator)?;
-    if !matches!(kind, JoinKind::Inner | JoinKind::Left) {
-        return Ok(None);
-    }
-    let Some(on) = on else { return Ok(None) };
-    let (ddef, dcols) = resolve_table(db, &twj.relation).await?;
-    let (pdef, pcols) = resolve_table(db, &join.relation).await?;
-    let dschema = Schema::new(dcols.clone());
-    let pschema = Schema::new(pcols.clone());
-    let Some((dkey, pkey)) = equi_keys(&on, &dschema, &pschema) else {
+    // Build the (left-deep) join chain: each partner into a hash table, driving
+    // left to be streamed. Handles two or more tables.
+    let Some((_dschema, steps, schema)) = build_join_chain(db, twj).await? else {
         return Ok(None);
     };
-
-    // Combined schema: driving columns then partner columns (matches build_from).
-    let mut all_cols = dcols;
-    all_cols.extend(pcols.clone());
-    let schema = Schema::new(all_cols);
-    let plen = pcols.len();
-    let left_outer = kind == JoinKind::Left;
-    let coll = join_key_collation(&dkey, &dschema, &pkey, &pschema);
+    let (ddef, _) = resolve_table(db, &twj.relation).await?;
 
     // ORDER BY keys resolved against the projection + combined schema, exactly
     // as join_select does before sorting.
@@ -4445,33 +4511,9 @@ async fn streaming_join_order(
         }
     };
 
-    // Build the partner hash table (bounded by the partner relation size).
-    let mut table: HashMap<String, Vec<Vec<Value>>> = HashMap::new();
-    {
-        let prefix = data_prefix(&pdef.name);
-        let mut cursor: Option<Vec<u8>> = None;
-        loop {
-            let batch = db.scan_batch(prefix.clone(), cursor.clone(), 8192).await?;
-            if batch.is_empty() {
-                break;
-            }
-            let last = batch.len() < 8192;
-            cursor = batch.last().map(|(k, _)| k.clone());
-            for (_, v) in batch {
-                let row: Vec<Value> =
-                    bincode::deserialize(&v).map_err(|e| Error::Storage(e.to_string()))?;
-                let key = predicate::eval_row(&pkey, &pschema, &row)?;
-                if let Some(k) = key_str_coll(&key, coll) {
-                    table.entry(k).or_default().push(row);
-                }
-            }
-            if last {
-                break;
-            }
-        }
-    }
-
-    // Stream the driving table into the spilling sorter.
+    // Stream the driving table, expanding each row through the chain into the
+    // spilling sorter (top-N heap / external merge). The join output is never
+    // fully materialised.
     let mut sorter = crate::sort::Sorter::new(
         asc,
         order_colls,
@@ -4481,6 +4523,7 @@ async fn streaming_join_order(
     );
     let prefix = data_prefix(&ddef.name);
     let mut cursor: Option<Vec<u8>> = None;
+    let mut combined_buf: Vec<Vec<Value>> = Vec::new();
     loop {
         let batch = db.scan_batch(prefix.clone(), cursor.clone(), 4096).await?;
         if batch.is_empty() {
@@ -4491,29 +4534,9 @@ async fn streaming_join_order(
         for (_, v) in batch {
             let l: Vec<Value> =
                 bincode::deserialize(&v).map_err(|e| Error::Storage(e.to_string()))?;
-            let key = predicate::eval_row(&dkey, &dschema, &l)?;
-            let matches: Option<&Vec<Vec<Value>>> = if key.is_null() {
-                None
-            } else {
-                key_str_coll(&key, coll).and_then(|k| table.get(&k))
-            };
-            let matched = matches.map(|v| !v.is_empty()).unwrap_or(false);
-            if let Some(rows) = matches {
-                for m in rows {
-                    let mut combined = l.clone();
-                    combined.extend_from_slice(m);
-                    if keep(&combined)? {
-                        let keys = resolved
-                            .iter()
-                            .map(|(e, _)| predicate::eval_row(e, &schema, &combined))
-                            .collect::<Result<Vec<_>>>()?;
-                        sorter.push(keys, combined)?;
-                    }
-                }
-            }
-            if left_outer && !matched {
-                let mut combined = l.clone();
-                combined.extend(std::iter::repeat_n(Value::Null, plen));
+            combined_buf.clear();
+            expand_join_chain(l, &steps, &mut combined_buf)?;
+            for combined in combined_buf.drain(..) {
                 if keep(&combined)? {
                     let keys = resolved
                         .iter()

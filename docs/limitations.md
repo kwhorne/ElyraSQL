@@ -112,16 +112,16 @@ implemented, so you can judge fit.
   directly -- so a large fact-to-dimension join with grouping is bounded by the
   group state (which spills), not the join output size. Also streamed: the same
   join shape with `LIMIT` and no grouping (early-stop index nested-loop).
-- **Two-table `JOIN ... ORDER BY [LIMIT]` streams**: the partner side is built
-  into a hash table and the driving table is scanned incrementally, feeding each
-  joined row straight into the spilling sorter (top-N heap for a small `LIMIT`,
-  external merge sort otherwise). The join output is never fully materialised, so
-  a large join + `ORDER BY` is bounded by the partner hash table plus the sorter,
-  not `|driving| x fanout`. INNER and LEFT are supported (autocommit only).
-- **Remaining materialising joins**: three-plus-table chains, and comma/derived-
-  table joins, still build the full join result before `ORDER BY`/`GROUP BY`.
-  Two-table joins with `GROUP BY` (indexed partner), with `LIMIT` (no order), and
-  with `ORDER BY` are streamed; everything else takes the materialising path.
+- **Left-deep `JOIN` chains stream** (two or more tables): each partner is built
+  into a hash table and the driving table is scanned incrementally; joined rows
+  feed straight into the spilling sorter (`ORDER BY`, top-N heap / external merge)
+  or the spilling aggregator (`GROUP BY`). The join output is never fully
+  materialised, so a large fact-to-dimensions join with sorting or grouping is
+  bounded by the partner hash tables plus the sorter/aggregator, not
+  `|driving| x fanout`. INNER and LEFT are supported (autocommit only).
+- **Remaining materialising joins**: `RIGHT`/`FULL`/non-equi joins, and
+  comma/derived-table joins, still build the full join result before
+  `ORDER BY`/`GROUP BY`.
 - Uncommitted transaction writes are buffered in memory (not spilled to disk)
   until `COMMIT`/`ROLLBACK`. To keep this bounded, a transaction that stages more
   than `ELYRASQL_TXN_MAX_BYTES` (default 1 GiB) of writes has its next write
