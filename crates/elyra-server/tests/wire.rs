@@ -885,3 +885,113 @@ async fn authentication_native_password() {
     let res = mysql_async::Conn::new(opts).await;
     assert!(res.is_err(), "expected auth failure for wrong password");
 }
+
+/// Aggregation invariants over pseudo-random data (deterministic seed):
+/// GROUP BY results match a Rust-computed reference, and are independent of the
+/// row insertion order. Guards the aggregation paths (streaming, columnar,
+/// spilling) against order-dependence and arithmetic drift. [ESQL-7]
+#[tokio::test]
+async fn aggregation_invariants_random() {
+    use std::collections::BTreeMap;
+
+    // Deterministic LCG so failures reproduce.
+    let mut seed: u64 = 0x1234_5678_9abc_def0;
+    let mut next = || {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (seed >> 33) as i64
+    };
+
+    // Generate rows: (id, g in 0..20, v in 0..1000).
+    let n = 3000;
+    let mut rows: Vec<(i64, i64, i64)> = (0..n)
+        .map(|i| (i, next().rem_euclid(20), next().rem_euclid(1000)))
+        .collect();
+
+    // Reference aggregation in Rust.
+    let mut ref_cnt: BTreeMap<i64, i64> = BTreeMap::new();
+    let mut ref_sum: BTreeMap<i64, i64> = BTreeMap::new();
+    let mut ref_min: BTreeMap<i64, i64> = BTreeMap::new();
+    let mut ref_max: BTreeMap<i64, i64> = BTreeMap::new();
+    for &(_, g, v) in &rows {
+        *ref_cnt.entry(g).or_insert(0) += 1;
+        *ref_sum.entry(g).or_insert(0) += v;
+        let e = ref_min.entry(g).or_insert(v);
+        *e = (*e).min(v);
+        let e = ref_max.entry(g).or_insert(v);
+        *e = (*e).max(v);
+    }
+    let expected: Vec<(i64, i64, i64, i64, i64)> = ref_cnt
+        .keys()
+        .map(|&g| (g, ref_cnt[&g], ref_sum[&g], ref_min[&g], ref_max[&g]))
+        .collect();
+
+    // Run the same aggregation with two different insertion orders; both must
+    // equal the reference (order-independence).
+    for pass in 0..2 {
+        if pass == 1 {
+            // reverse the insertion order
+            rows.reverse();
+        }
+        let srv = TestServer::start().await;
+        let mut c = srv.conn().await;
+        c.query_drop("CREATE TABLE m (id INT PRIMARY KEY, g INT, v INT)")
+            .await
+            .unwrap();
+        for chunk in rows.chunks(500) {
+            let vals: Vec<String> = chunk
+                .iter()
+                .map(|(id, g, v)| format!("({id},{g},{v})"))
+                .collect();
+            c.query_drop(format!(
+                "INSERT INTO m (id, g, v) VALUES {}",
+                vals.join(",")
+            ))
+            .await
+            .unwrap();
+        }
+        let mut got: Vec<(i64, i64, i64, i64, i64)> = c
+            .query("SELECT g, COUNT(*), SUM(v), MIN(v), MAX(v) FROM m GROUP BY g")
+            .await
+            .unwrap();
+        got.sort();
+        assert_eq!(got, expected, "aggregation mismatch on pass {pass}");
+    }
+}
+
+/// ORDER BY produces a total order consistent with a Rust sort, over
+/// pseudo-random data with ties. [ESQL-7]
+#[tokio::test]
+async fn order_by_total_order_random() {
+    let mut seed: u64 = 0xdead_beef_0bad_f00d;
+    let mut next = || {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (seed >> 33) as i64
+    };
+    let n = 1500;
+    let data: Vec<(i64, i64)> = (0..n).map(|i| (i, next().rem_euclid(50))).collect();
+
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop("CREATE TABLE o (id INT PRIMARY KEY, k INT)")
+        .await
+        .unwrap();
+    for chunk in data.chunks(500) {
+        let vals: Vec<String> = chunk.iter().map(|(id, k)| format!("({id},{k})")).collect();
+        c.query_drop(format!("INSERT INTO o (id, k) VALUES {}", vals.join(",")))
+            .await
+            .unwrap();
+    }
+
+    // ORDER BY k ASC, id ASC is a total order; compare to a Rust sort.
+    let got: Vec<(i64, i64)> = c
+        .query("SELECT id, k FROM o ORDER BY k ASC, id ASC")
+        .await
+        .unwrap();
+    let mut expected = data.clone();
+    expected.sort_by_key(|(id, k)| (*k, *id));
+    assert_eq!(got, expected);
+}
