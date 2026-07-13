@@ -35,11 +35,13 @@ implemented, so you can judge fit.
   `UNBOUNDED PRECEDING .. CURRENT ROW`/`UNBOUNDED FOLLOWING` for `RANGE`),
   correlated subqueries combined with aggregation over a join, user-defined
   functions, and events.
-- A few MySQL-specific spellings are rejected at parse time by the SQL parser:
-  `INSERT ... SET col = val` (use `INSERT ... VALUES`); comma-style multi-table
-  `UPDATE t1, t2 SET ...` (use `UPDATE t1 JOIN t2 ON ... SET ...`, which works);
-  `GROUP BY ... WITH ROLLUP`; and the `<<`, `>>` and unary `~` bitwise operators
-  (`&`, `|`, `^` work).
+- `INSERT ... SET col = val, ...` (MySQL shorthand) is supported — it is
+  rewritten to `INSERT ... (cols) VALUES (...)` before parsing, including
+  `ON DUPLICATE KEY UPDATE`.
+- A few MySQL-specific spellings are still rejected at parse time by the SQL
+  parser: comma-style multi-table `UPDATE t1, t2 SET ...` (use
+  `UPDATE t1 JOIN t2 ON ... SET ...`, which works); `GROUP BY ... WITH ROLLUP`;
+  and the `<<`, `>>` and unary `~` bitwise operators (`&`, `|`, `^` work).
 - Supported beyond the basics: multi-table `UPDATE`/`DELETE` via `JOIN`,
   `INSERT ... SELECT`, `CREATE TABLE ... AS SELECT`, `COUNT(DISTINCT ...)`,
   `UNION ALL`/`INTERSECT`/`EXCEPT`, `WITH RECURSIVE`, row/tuple `IN`, window

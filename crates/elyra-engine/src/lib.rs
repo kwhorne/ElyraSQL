@@ -1199,6 +1199,11 @@ impl Engine {
         if let Some(stripped) = strip_dml_limit(&subst_sql) {
             subst_sql = stripped;
         }
+        // Rewrite MySQL's `INSERT ... SET col = val, ...` shorthand into the
+        // standard `INSERT ... (cols) VALUES (...)` the parser accepts.
+        if let Some(rewritten) = rewrite_insert_set(&subst_sql) {
+            subst_sql = rewritten;
+        }
         let statements =
             Parser::parse_sql(&dialect, &subst_sql).map_err(|e| Error::Parse(e.to_string()))?;
 
@@ -1931,6 +1936,203 @@ fn strip_dml_limit(sql: &str) -> Option<String> {
     None
 }
 
+/// Return true if the ASCII keyword `kw` sits at byte offset `i` in `bytes`
+/// with word boundaries on both sides (case-insensitive).
+fn kw_at(bytes: &[u8], i: usize, kw: &str) -> bool {
+    let k = kw.as_bytes();
+    if i + k.len() > bytes.len() {
+        return false;
+    }
+    if !bytes[i..i + k.len()].eq_ignore_ascii_case(k) {
+        return false;
+    }
+    let boundary = |b: u8| !(b.is_ascii_alphanumeric() || b == b'_');
+    let before_ok = i == 0 || boundary(bytes[i - 1]);
+    let after_ok = i + k.len() == bytes.len() || boundary(bytes[i + k.len()]);
+    before_ok && after_ok
+}
+
+/// Split `s` on top-level occurrences of `sep` (paren depth 0, outside
+/// single/double-quote and backtick strings). Handles doubled-quote escapes.
+fn split_top_level(s: &str, sep: char) -> Vec<String> {
+    let b = s.as_bytes();
+    let (mut in_s, mut in_d, mut in_b) = (false, false, false);
+    let mut depth = 0i32;
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < b.len() {
+        let c = b[i] as char;
+        if in_s {
+            if c == '\'' {
+                in_s = false;
+            }
+        } else if in_d {
+            if c == '"' {
+                in_d = false;
+            }
+        } else if in_b {
+            if c == '`' {
+                in_b = false;
+            }
+        } else {
+            match c {
+                '\'' => in_s = true,
+                '"' => in_d = true,
+                '`' => in_b = true,
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                _ if depth == 0 && c == sep => {
+                    out.push(s[start..i].to_string());
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    out.push(s[start..].to_string());
+    out
+}
+
+/// Rewrite MySQL's `INSERT [options] INTO t SET a = 1, b = 2
+/// [ON DUPLICATE KEY UPDATE ...]` into the standard
+/// `INSERT [options] INTO t (a, b) VALUES (1, 2) [ON DUPLICATE KEY UPDATE ...]`,
+/// which the parser accepts. Returns None if the statement is not an
+/// `INSERT ... SET` (e.g. a normal `INSERT ... VALUES`), so callers fall through
+/// unchanged. Quote- and paren-aware, so commas/`=` inside string literals or
+/// function calls are respected.
+fn rewrite_insert_set(sql: &str) -> Option<String> {
+    let head = sql.trim_start();
+    if head.len() < 6 || !head[..6].eq_ignore_ascii_case("INSERT") {
+        return None;
+    }
+    let bytes = sql.as_bytes();
+    let (mut in_s, mut in_d, mut in_b) = (false, false, false);
+    let mut depth = 0i32;
+    let mut i = 0usize;
+    let mut set_pos: Option<usize> = None;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        if in_s {
+            if c == '\'' {
+                in_s = false;
+            }
+        } else if in_d {
+            if c == '"' {
+                in_d = false;
+            }
+        } else if in_b {
+            if c == '`' {
+                in_b = false;
+            }
+        } else {
+            match c {
+                '\'' => in_s = true,
+                '"' => in_d = true,
+                '`' => in_b = true,
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                _ if depth == 0 => {
+                    // A top-level VALUES/SELECT before SET means this is a normal
+                    // insert; leave it alone.
+                    if kw_at(bytes, i, "VALUES") || kw_at(bytes, i, "SELECT") {
+                        return None;
+                    }
+                    if kw_at(bytes, i, "SET") {
+                        set_pos = Some(i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    let set_pos = set_pos?;
+    let prefix = sql[..set_pos].trim_end();
+    let after = &sql[set_pos + 3..];
+    let after = after.trim_end().trim_end_matches(';').trim_end();
+
+    // Split off a trailing ON DUPLICATE KEY UPDATE clause (kept verbatim).
+    let ab = after.as_bytes();
+    let (mut s2, mut d2, mut b2) = (false, false, false);
+    let mut dep2 = 0i32;
+    let mut odku: Option<usize> = None;
+    let mut j = 0usize;
+    while j < ab.len() {
+        let c = ab[j] as char;
+        if s2 {
+            if c == '\'' {
+                s2 = false;
+            }
+        } else if d2 {
+            if c == '"' {
+                d2 = false;
+            }
+        } else if b2 {
+            if c == '`' {
+                b2 = false;
+            }
+        } else {
+            match c {
+                '\'' => s2 = true,
+                '"' => d2 = true,
+                '`' => b2 = true,
+                '(' => dep2 += 1,
+                ')' => dep2 -= 1,
+                _ if dep2 == 0 && kw_at(ab, j, "ON") => {
+                    // require "ON DUPLICATE" to avoid false positives
+                    let rest = after[j..].trim_start();
+                    if rest.len() >= 12 && rest[..12].eq_ignore_ascii_case("ON DUPLICATE") {
+                        odku = Some(j);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        j += 1;
+    }
+    let (assigns, suffix) = match odku {
+        Some(k) => (after[..k].trim_end(), Some(after[k..].trim())),
+        None => (after, None),
+    };
+
+    let mut cols = Vec::new();
+    let mut vals = Vec::new();
+    for part in split_top_level(assigns, ',') {
+        let eqs = split_top_level(&part, '=');
+        if eqs.len() < 2 {
+            return None; // not a clean `col = expr`
+        }
+        let col = eqs[0].trim();
+        if col.is_empty() {
+            return None;
+        }
+        let val = part[eqs[0].len() + 1..].trim(); // everything after the first '='
+        if val.is_empty() {
+            return None;
+        }
+        cols.push(col.to_string());
+        vals.push(val.to_string());
+    }
+    if cols.is_empty() {
+        return None;
+    }
+
+    let mut out = format!(
+        "{prefix} ({}) VALUES ({})",
+        cols.join(", "),
+        vals.join(", ")
+    );
+    if let Some(sfx) = suffix {
+        out.push(' ');
+        out.push_str(sfx);
+    }
+    Some(out)
+}
+
 fn query_has_from(q: &sqlparser::ast::Query) -> bool {
     // Route anything the full engine must handle: SELECTs with a FROM, set
     // operations (UNION/INTERSECT/EXCEPT), CTEs, and nested queries. Only bare
@@ -1975,5 +2177,62 @@ fn expr_has_subquery(e: &sqlparser::ast::Expr) -> bool {
             expr, low, high, ..
         } => expr_has_subquery(expr) || expr_has_subquery(low) || expr_has_subquery(high),
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod insert_set_tests {
+    use super::rewrite_insert_set;
+
+    #[test]
+    fn basic() {
+        assert_eq!(
+            rewrite_insert_set("INSERT INTO t SET a = 1, b = 2").unwrap(),
+            "INSERT INTO t (a, b) VALUES (1, 2)"
+        );
+    }
+
+    #[test]
+    fn normal_insert_is_left_alone() {
+        assert!(rewrite_insert_set("INSERT INTO t (a, b) VALUES (1, 2)").is_none());
+        assert!(rewrite_insert_set("INSERT INTO t VALUES (1, 2)").is_none());
+        assert!(rewrite_insert_set("INSERT INTO t SELECT * FROM u").is_none());
+        assert!(rewrite_insert_set("SELECT 1").is_none());
+    }
+
+    #[test]
+    fn commas_inside_strings_and_calls() {
+        // comma inside a string literal must not split the assignment list
+        assert_eq!(
+            rewrite_insert_set("INSERT INTO t SET a = 'x,y', b = CONCAT('p','q')").unwrap(),
+            "INSERT INTO t (a, b) VALUES ('x,y', CONCAT('p','q'))"
+        );
+    }
+
+    #[test]
+    fn ignore_and_backticks() {
+        assert_eq!(
+            rewrite_insert_set("INSERT IGNORE INTO `tbl` SET `col` = 5").unwrap(),
+            "INSERT IGNORE INTO `tbl` (`col`) VALUES (5)"
+        );
+    }
+
+    #[test]
+    fn on_duplicate_key_update_is_preserved() {
+        assert_eq!(
+            rewrite_insert_set("INSERT INTO t SET a = 1, b = 2 ON DUPLICATE KEY UPDATE b = b + 1")
+                .unwrap(),
+            "INSERT INTO t (a, b) VALUES (1, 2) ON DUPLICATE KEY UPDATE b = b + 1"
+        );
+    }
+
+    #[test]
+    fn subquery_value() {
+        // a top-level SELECT lives inside parens, so it is not mistaken for
+        // `INSERT ... SELECT`, and its inner comma does not split assignments
+        assert_eq!(
+            rewrite_insert_set("INSERT INTO t SET a = (SELECT MAX(id) FROM u), b = 1").unwrap(),
+            "INSERT INTO t (a, b) VALUES ((SELECT MAX(id) FROM u), 1)"
+        );
     }
 }

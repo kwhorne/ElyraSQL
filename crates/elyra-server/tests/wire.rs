@@ -359,6 +359,35 @@ async fn left_join_group_by_streaming() {
     );
 }
 
+/// MySQL's `INSERT ... SET col = val` shorthand (rewritten to the standard form).
+#[tokio::test]
+async fn insert_set_shorthand() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop("CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR(32), qty INT)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO t SET id = 1, name = 'a,b', qty = 5")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO t SET id = 2, name = 'x', qty = 9")
+        .await
+        .unwrap();
+    // ON DUPLICATE KEY UPDATE preserved
+    c.query_drop(
+        "INSERT INTO t SET id = 1, name = 'z', qty = 1 ON DUPLICATE KEY UPDATE qty = qty + 100",
+    )
+    .await
+    .unwrap();
+
+    let rows: Vec<(i64, String, i64)> = c
+        .query("SELECT id, name, qty FROM t ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![(1, "a,b".into(), 105), (2, "x".into(), 9)]);
+}
+
 #[tokio::test]
 async fn data_types() {
     let srv = TestServer::start().await;
