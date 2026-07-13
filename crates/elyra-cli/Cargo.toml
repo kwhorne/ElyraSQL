@@ -20,3 +20,7 @@ clap.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+mysql_async = { version = "0.34", default-features = false, features = ["minimal"] }
+tokio = { workspace = true }

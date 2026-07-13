@@ -24,3 +24,7 @@ rustls-pemfile = "2"
 rustls-pki-types = "1"
 rsa = "0.9"
 rand = "0.8"
+
+[dev-dependencies]
+mysql_async = { version = "0.34", default-features = false, features = ["minimal"] }
+tokio = { workspace = true }
