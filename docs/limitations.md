@@ -167,10 +167,9 @@ implemented, so you can judge fit.
 - Text is **case-insensitive by default**. A column can opt into case-sensitive
   behavior with `COLLATE ..._bin` / `BINARY`, which applies to equality/range
   comparisons (`WHERE`), `UNIQUE`, `PRIMARY KEY`, secondary indexes, and now
-  **`ORDER BY`, `GROUP BY` and `DISTINCT`** (a `_bin` column sorts, groups and
-  de-duplicates by exact bytes, case-sensitively; the default column stays
-  case-insensitive). Not yet honoring per-column `_bin`: join keys (these still
-  use the default case-insensitive collation). Accent sensitivity and alternate
+  **`ORDER BY`, `GROUP BY`, `DISTINCT` and equi-join keys** (a `_bin` column
+  sorts, groups, de-duplicates and joins by exact bytes, case-sensitively; the
+  default column stays case-insensitive). Accent sensitivity and alternate
   charsets are not implemented.
 - Full-text search: `MATCH(col, ...) AGAINST('terms' [IN BOOLEAN MODE])`
   (natural-language OR-of-terms, or boolean `+`/`-`, with relevance scoring).
