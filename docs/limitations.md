@@ -46,9 +46,16 @@ implemented, so you can judge fit.
   re-aggregating base rows per level so `AVG`/`MIN`/`MAX` stay correct. `ORDER
   BY`/`LIMIT` apply to the combined result (NULLs sort first).
 - Bitwise shift operators `<<` and `>>` are supported (parsed via a generic-
-  dialect fallback, evaluated as 64-bit shifts), alongside `&`, `|`, `^`. The
-  unary bitwise-NOT `~` is still not parsed (no MySQL/generic-dialect prefix
-  support); use `b'...'` masks or arithmetic as a workaround.
+  dialect fallback, evaluated as 64-bit shifts), alongside `&`, `|`, `^`. These
+  compute on signed 64-bit integers; MySQL returns `BIGINT UNSIGNED`, so results
+  outside the signed range differ in display (fine for the usual small operands).
+- The unary bitwise-NOT `~` is **not** supported. It needs two things ElyraSQL
+  does not have yet: a parser prefix for `~` (no MySQL/generic dialect provides
+  one), and true **unsigned 64-bit** integer semantics -- MySQL's `~5` is
+  `18446744073709551610`, which the signed `i64` value model can't represent
+  (it would show `-6`, wrong even for small inputs). Implementing it correctly
+  is gated on adding an unsigned-integer type, so it is deferred rather than
+  shipped with wrong results.
 - Supported beyond the basics: multi-table `UPDATE`/`DELETE` via `JOIN`,
   `INSERT ... SELECT`, `CREATE TABLE ... AS SELECT`, `COUNT(DISTINCT ...)`,
   `UNION ALL`/`INTERSECT`/`EXCEPT`, `WITH RECURSIVE`, row/tuple `IN`, window
