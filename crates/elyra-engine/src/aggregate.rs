@@ -9,7 +9,6 @@ use elyra_core::{ColumnDef, ColumnType, Error, Result, Schema, Value};
 use elyra_olap::{AggFunc, AggSpec, GroupAggregator};
 use sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, FunctionArguments, SelectItem};
 
-pub use elyra_olap::value_cmp;
 
 /// An output column: a (grouped) source column, an aggregate result, or a
 /// scalar expression evaluated per group over the group columns + aggregate
@@ -46,11 +45,6 @@ impl AggPlan {
             self.aggs.clone(),
             self.group_collations.clone(),
         )
-    }
-
-    /// Text collation per group column (parallel to `group_cols`).
-    pub fn group_collations(&self) -> &[elyra_core::Collation] {
-        &self.group_collations
     }
 
     /// The aggregate-argument expressions to append as virtual columns.
