@@ -41,9 +41,12 @@ implemented, so you can judge fit.
 - Comma-style multi-table `UPDATE t1, t2 SET ... WHERE ...` is supported — it is
   rewritten to `UPDATE t1 CROSS JOIN t2 SET ... WHERE ...` (the WHERE supplies
   the join condition) before parsing.
-- A few MySQL-specific spellings are still rejected at parse time by the SQL
-  parser: `GROUP BY ... WITH ROLLUP`, and the `<<`, `>>` and unary `~` bitwise
-  operators (`&`, `|`, `^` work).
+- `GROUP BY ... WITH ROLLUP` is supported: it adds a subtotal row for each
+  grouping prefix and a grand-total row (dropped group columns are NULL),
+  re-aggregating base rows per level so `AVG`/`MIN`/`MAX` stay correct. `ORDER
+  BY`/`LIMIT` apply to the combined result (NULLs sort first).
+- Still rejected at parse time: the `<<`, `>>` and unary `~` bitwise operators
+  (`&`, `|`, `^` work). These need parser-level support the MySQL dialect lacks.
 - Supported beyond the basics: multi-table `UPDATE`/`DELETE` via `JOIN`,
   `INSERT ... SELECT`, `CREATE TABLE ... AS SELECT`, `COUNT(DISTINCT ...)`,
   `UNION ALL`/`INTERSECT`/`EXCEPT`, `WITH RECURSIVE`, row/tuple `IN`, window

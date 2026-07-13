@@ -3226,6 +3226,76 @@ async fn check_unique_batch(
     Ok(())
 }
 
+/// Execute `GROUP BY ... WITH ROLLUP` by running the aggregation once per
+/// grouping prefix -- full detail (all N columns), then N-1, ..., down to the
+/// grand total (0 columns) -- and concatenating. At level k the dropped group
+/// columns (positions >= k) are projected as NULL, matching MySQL's rollup
+/// super-aggregate rows. Re-aggregating from the base rows at each level keeps
+/// AVG/MIN/MAX correct (they can't be derived from finer groups). ORDER BY and
+/// OFFSET/LIMIT apply to the combined result.
+#[allow(clippy::too_many_arguments)]
+async fn execute_rollup(
+    db: &Session,
+    vindex: &VectorRegistry,
+    query: &SqlQuery,
+    group_by: &[Expr],
+    order_exprs: &[(Expr, bool)],
+    offset: usize,
+    limit: Option<usize>,
+) -> Result<QueryResult> {
+    use sqlparser::ast::{GroupByExpr, SelectItem};
+    let n = group_by.len();
+    let group_texts: Vec<String> = group_by.iter().map(|e| e.to_string()).collect();
+
+    let mut out_schema: Option<Schema> = None;
+    let mut all_rows: Vec<Vec<Value>> = Vec::new();
+
+    // Full detail (k = n) down to the grand total (k = 0).
+    for k in (0..=n).rev() {
+        let mut lq = query.clone();
+        lq.order_by = None;
+        lq.limit = None;
+        lq.offset = None;
+        if let SetExpr::Select(s) = lq.body.as_mut() {
+            // Group by the first k columns, dropping the ROLLUP modifier.
+            s.group_by = GroupByExpr::Expressions(group_by[..k].to_vec(), vec![]);
+            // Replace references to the dropped group columns (positions >= k)
+            // in the projection with NULL, so this level's rows carry NULL there.
+            let dropped = &group_texts[k..];
+            for item in &mut s.projection {
+                let expr = match item {
+                    SelectItem::UnnamedExpr(e) => Some(e),
+                    SelectItem::ExprWithAlias { expr, .. } => Some(expr),
+                    _ => None,
+                };
+                if let Some(e) = expr {
+                    if dropped.iter().any(|d| d == &e.to_string()) {
+                        *e = Expr::Value(sqlparser::ast::Value::Null);
+                    }
+                }
+            }
+        }
+        let res = Box::pin(select(db, vindex, &lq)).await?;
+        if let QueryResult::Rows(mut stream) = res {
+            if out_schema.is_none() {
+                out_schema = Some(stream.schema.clone());
+            }
+            loop {
+                let batch = stream.next_batch(8192).await?;
+                if batch.is_empty() {
+                    break;
+                }
+                all_rows.extend(batch);
+            }
+        }
+    }
+
+    let schema = out_schema.unwrap_or_else(|| Schema::new(Vec::new()));
+    order_output_rows(&mut all_rows, &schema, order_exprs)?;
+    apply_offset_limit(&mut all_rows, offset, limit);
+    Ok(QueryResult::Rows(RowStream::literal(schema, all_rows)))
+}
+
 pub async fn select(
     db: &Session,
     vindex: &VectorRegistry,
@@ -3332,6 +3402,12 @@ pub async fn select(
             return Err(Error::Unsupported("GROUP BY ALL is not supported".into()))
         }
     };
+    // GROUP BY ... WITH ROLLUP: super-aggregate (subtotal + grand-total) rows.
+    let rollup = matches!(
+        &select.group_by,
+        sqlparser::ast::GroupByExpr::Expressions(_, mods)
+            if mods.iter().any(|m| matches!(m, sqlparser::ast::GroupByWithModifier::Rollup))
+    );
     let order_exprs: Vec<(Expr, bool)> = match &query.order_by {
         Some(ob) => ob
             .exprs
@@ -3340,6 +3416,19 @@ pub async fn select(
             .collect(),
         None => Vec::new(),
     };
+
+    if rollup && !group_by.is_empty() {
+        return Box::pin(execute_rollup(
+            db,
+            vindex,
+            query,
+            &group_by,
+            &order_exprs,
+            offset,
+            limit,
+        ))
+        .await;
+    }
 
     // Multi-table / JOIN queries, and any query over a derived table
     // (FROM (SELECT ...)), take the materialised path.

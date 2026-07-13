@@ -445,6 +445,64 @@ async fn left_join_group_by_streaming() {
 }
 
 /// MySQL's `INSERT ... SET col = val` shorthand (rewritten to the standard form).
+/// GROUP BY ... WITH ROLLUP adds per-prefix subtotal rows and a grand total,
+/// re-aggregating base rows at each level (so AVG stays correct). [ESQL-3]
+#[tokio::test]
+async fn group_by_with_rollup() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop("CREATE TABLE sales (region VARCHAR(8), product VARCHAR(8), amt INT)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO sales VALUES ('N','A',10),('N','B',20),('S','A',5),('S','A',15)")
+        .await
+        .unwrap();
+
+    // two-column rollup: details + per-region subtotals (product NULL) + grand
+    // total (both NULL). ORDER BY sorts NULLs first.
+    let rows: Vec<(Option<String>, Option<String>, i64)> = c
+        .query(
+            "SELECT region, product, SUM(amt) FROM sales \
+             GROUP BY region, product WITH ROLLUP ORDER BY region, product",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            (None, None, 50), // grand total
+            (Some("N".into()), None, 30),
+            (Some("N".into()), Some("A".into()), 10),
+            (Some("N".into()), Some("B".into()), 20),
+            (Some("S".into()), None, 20),
+            (Some("S".into()), Some("A".into()), 20),
+        ]
+    );
+}
+
+/// WITH ROLLUP re-aggregates base rows per level, so AVG is the true overall
+/// average, not an average of group averages. [ESQL-3]
+#[tokio::test]
+async fn rollup_avg_is_reaggregated() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop("CREATE TABLE t (g VARCHAR(4), v INT)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO t VALUES ('a',10),('a',20),('a',30),('b',100)")
+        .await
+        .unwrap();
+    let rows: Vec<(Option<String>, f64, i64)> = c
+        .query("SELECT g, AVG(v), COUNT(*) FROM t GROUP BY g WITH ROLLUP ORDER BY g")
+        .await
+        .unwrap();
+    // grand AVG = (10+20+30+100)/4 = 40, not (20+100)/2 = 60
+    assert_eq!(rows[0], (None, 40.0, 4));
+    assert_eq!(rows[1], (Some("a".into()), 20.0, 3));
+    assert_eq!(rows[2], (Some("b".into()), 100.0, 1));
+}
+
 /// MySQL's comma-style multi-table UPDATE (rewritten to CROSS JOIN + WHERE).
 #[tokio::test]
 async fn comma_multi_table_update() {
