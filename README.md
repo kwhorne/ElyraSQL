@@ -56,6 +56,8 @@ workload — served over the protocol your stack already knows.
   [Framework Integration guide](https://elyracode.com/docs/sql-server/frameworks/).
 - **MySQL wire protocol** — connect with `mysql`, DBeaver, Workbench, or any
   MySQL driver in any language. No custom client required.
+- **Native client** — prefer something purpose-built? ElyraSQL ships its own
+  native client: **[elyracode.com/sql/client](https://elyracode.com/sql/client)**.
 - **One file** — the entire database lives in a single ACID file (`*.edb`),
   crash-safe with a single-writer / multi-reader model.
 - **OLAP-ready** — large aggregations run through a parallel, streaming engine
@@ -225,6 +227,7 @@ journalctl -u elyrasql -f
 ## Learn more
 
 - **Documentation** — [elyracode.com/docs/sql-server](https://elyracode.com/docs/sql-server)
+- **Native client** — [elyracode.com/sql/client](https://elyracode.com/sql/client)
 - **Framework integration** (Laravel, Django, Rails, …) — [elyracode.com/docs/sql-server/frameworks](https://elyracode.com/docs/sql-server/frameworks/)
 - **Benchmarks & analysis** — [BENCHMARKS.md](BENCHMARKS.md) · [benchmark_analyse.md](benchmark_analyse.md)
 - **Releases** — [github.com/kwhorne/ElyraSQL/releases](https://github.com/kwhorne/ElyraSQL/releases)
