@@ -2010,7 +2010,11 @@ fn split_top_level(s: &str, sep: char) -> Vec<String> {
 /// function calls are respected.
 fn rewrite_insert_set(sql: &str) -> Option<String> {
     let head = sql.trim_start();
-    if head.len() < 6 || !head[..6].eq_ignore_ascii_case("INSERT") {
+    if !head
+        .as_bytes()
+        .get(..6)
+        .is_some_and(|b| b.eq_ignore_ascii_case(b"INSERT"))
+    {
         return None;
     }
     let bytes = sql.as_bytes();
@@ -2090,7 +2094,11 @@ fn rewrite_insert_set(sql: &str) -> Option<String> {
                 _ if dep2 == 0 && kw_at(ab, j, "ON") => {
                     // require "ON DUPLICATE" to avoid false positives
                     let rest = after[j..].trim_start();
-                    if rest.len() >= 12 && rest[..12].eq_ignore_ascii_case("ON DUPLICATE") {
+                    if rest
+                        .as_bytes()
+                        .get(..12)
+                        .is_some_and(|b| b.eq_ignore_ascii_case(b"ON DUPLICATE"))
+                    {
                         odku = Some(j);
                         break;
                     }
@@ -2146,7 +2154,11 @@ fn rewrite_insert_set(sql: &str) -> Option<String> {
 /// comma before SET). Quote/paren/backtick-aware.
 fn rewrite_comma_update(sql: &str) -> Option<String> {
     let head = sql.trim_start();
-    if head.len() < 6 || !head[..6].eq_ignore_ascii_case("UPDATE") {
+    if !head
+        .as_bytes()
+        .get(..6)
+        .is_some_and(|b| b.eq_ignore_ascii_case(b"UPDATE"))
+    {
         return None;
     }
     let bytes = sql.as_bytes();
@@ -2341,5 +2353,51 @@ mod comma_update_tests {
             rewrite_comma_update("UPDATE a x, b y, c z SET x.v = y.w WHERE x.id = z.id").unwrap(),
             "UPDATE a x CROSS JOIN b y CROSS JOIN c z SET x.v = y.w WHERE x.id = z.id"
         );
+    }
+}
+
+#[cfg(test)]
+mod fuzz_props {
+    use super::{
+        rewrite_comma_update, rewrite_insert_set, split_top_level, strip_create_table_options,
+        strip_dml_limit,
+    };
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(4000))]
+
+        /// The SQL preprocessing rewriters and splitters must never panic on any
+        /// input -- including multi-byte UTF-8, unbalanced quotes/parens, and
+        /// arbitrary control characters. (Byte-offset slicing is the classic
+        /// hazard here.)
+        #[test]
+        fn preprocess_never_panics(s in "(?s).{0,120}") {
+            let _ = rewrite_insert_set(&s);
+            let _ = rewrite_comma_update(&s);
+            let _ = strip_create_table_options(&s);
+            let _ = strip_dml_limit(&s);
+            let _ = split_top_level(&s, ',');
+            let _ = split_top_level(&s, '=');
+        }
+
+        /// Bias toward the shapes the rewriters actually rewrite so the code
+        /// paths past the prefix check are exercised; still must not panic, and
+        /// any produced string must be valid (char-boundary safe by construction).
+        #[test]
+        fn targeted_shapes_never_panic(a in "(?s).{0,60}") {
+            let _ = rewrite_insert_set(&format!("INSERT INTO t SET {a}"));
+            let _ = rewrite_insert_set(&format!("INSERT IGNORE INTO `t` SET {a}"));
+            let _ = rewrite_comma_update(&format!("UPDATE {a} SET x = 1 WHERE y = 2"));
+            let _ = strip_create_table_options(&format!("CREATE TABLE t (id INT) {a}"));
+        }
+
+        /// split_top_level round-trips: joining the parts with the separator
+        /// reproduces the input exactly (no bytes lost or added).
+        #[test]
+        fn split_top_level_roundtrips(s in "(?s).{0,80}") {
+            let parts = split_top_level(&s, ',');
+            prop_assert_eq!(parts.join(","), s);
+        }
     }
 }
