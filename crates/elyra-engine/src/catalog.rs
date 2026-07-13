@@ -464,12 +464,13 @@ pub async fn colgrants_exist(sess: &Session) -> bool {
 }
 
 #[allow(clippy::type_complexity)]
-fn catalog_cache(
-) -> &'static std::sync::RwLock<std::collections::HashMap<String, (u64, std::sync::Arc<TableDef>)>>
-{
+fn catalog_cache() -> &'static std::sync::RwLock<
+    std::collections::HashMap<(u64, String), (u64, std::sync::Arc<TableDef>)>,
+> {
     use std::sync::{OnceLock, RwLock};
-    static C: OnceLock<RwLock<std::collections::HashMap<String, (u64, std::sync::Arc<TableDef>)>>> =
-        OnceLock::new();
+    static C: OnceLock<
+        RwLock<std::collections::HashMap<(u64, String), (u64, std::sync::Arc<TableDef>)>>,
+    > = OnceLock::new();
     C.get_or_init(|| RwLock::new(std::collections::HashMap::new()))
 }
 
@@ -480,8 +481,11 @@ fn catalog_cache(
 /// so uncommitted DDL is visible.
 pub async fn load(db: &Session, table: &str) -> Result<TableDef> {
     let epoch = CATALOG_EPOCH.load(std::sync::atomic::Ordering::Acquire);
+    // Key the process-global cache by (database id, table name) so multiple Dbs
+    // in one process never serve each other's schema for a same-named table.
+    let ckey = (db.db_id(), table.to_string());
     if !db.in_txn() {
-        if let Some((e, def)) = catalog_cache().read().unwrap().get(table) {
+        if let Some((e, def)) = catalog_cache().read().unwrap().get(&ckey) {
             if *e == epoch {
                 return Ok((**def).clone());
             }
@@ -495,7 +499,7 @@ pub async fn load(db: &Session, table: &str) -> Result<TableDef> {
         catalog_cache()
             .write()
             .unwrap()
-            .insert(table.to_string(), (epoch, std::sync::Arc::new(def.clone())));
+            .insert(ckey, (epoch, std::sync::Arc::new(def.clone())));
     }
     Ok(def)
 }

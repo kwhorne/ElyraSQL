@@ -246,6 +246,12 @@ impl Session {
 
     /// The underlying committed-state handle (used for streaming scans in
     /// autocommit mode only).
+    /// The stable, process-unique id of the underlying database (for keying
+    /// process-global caches by database).
+    pub fn db_id(&self) -> u64 {
+        self.db.id()
+    }
+
     pub fn raw_db(&self) -> Db {
         self.db.clone()
     }

@@ -148,6 +148,10 @@ struct WriteJob {
 /// Shareable, high-concurrency database handle.
 #[derive(Clone)]
 pub struct Db {
+    /// Stable, process-unique id assigned at open (never reused), shared by all
+    /// clones of the same database. Lets process-global caches (e.g. the catalog
+    /// cache) key by database so multiple `Db`s in one process never collide.
+    id: u64,
     storage: Arc<Storage>,
     writer: mpsc::Sender<WriteJob>,
     lsn: Arc<AtomicU64>,
@@ -193,6 +197,8 @@ impl Db {
     }
 
     fn from_storage(storage: Storage, binlog: Option<std::path::PathBuf>) -> Result<Self> {
+        static NEXT_DB_ID: AtomicU64 = AtomicU64::new(1);
+        let id = NEXT_DB_ID.fetch_add(1, Ordering::Relaxed);
         let storage = Arc::new(storage);
         let (tx, rx) = mpsc::channel::<WriteJob>(WRITE_QUEUE_DEPTH);
         // Resume the LSN counter from the binlog so it stays monotonic across
@@ -254,6 +260,7 @@ impl Db {
         }
 
         Ok(Self {
+            id,
             storage,
             writer: tx,
             lsn,
@@ -267,6 +274,11 @@ impl Db {
             binlog_dir,
             consensus: Arc::new(Mutex::new(None)),
         })
+    }
+
+    /// The stable, process-unique id of this database (shared by all clones).
+    pub fn id(&self) -> u64 {
+        self.id
     }
 
     /// The binlog directory, if point-in-time recovery is enabled.
