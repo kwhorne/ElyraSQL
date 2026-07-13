@@ -4,6 +4,8 @@
 
 # ElyraSQL
 
+### The modern SQL database that speaks MySQL — one file, blazing fast, AI-ready.
+
 **A robust, MySQL-compatible SQL server written in Rust.**
 
 Single-file · ACID · OLAP-ready · vector-native · AI-native
@@ -14,19 +16,32 @@ Single-file · ACID · OLAP-ready · vector-native · AI-native
 [![Docker](https://img.shields.io/badge/ghcr.io-elyrasql-2496ED?logo=docker&logoColor=white)](https://github.com/kwhorne/ElyraSQL/pkgs/container/elyrasql)
 [![Docs](https://img.shields.io/badge/docs-elyracode.com-14B8A6)](https://elyracode.com/docs/sql-server)
 
+### [📖 Read the docs at elyracode.com →](https://elyracode.com/docs/sql-server)
+
 [Documentation](https://elyracode.com/docs/sql-server) ·
 [Quick start](#quick-start) ·
 [Benchmarks](BENCHMARKS.md) ·
+[Framework guide](https://elyracode.com/docs/sql-server/frameworks/) ·
 [Changelog](CHANGELOG.md)
 
 </div>
 
 ---
 
-ElyraSQL speaks the MySQL wire protocol, so your existing clients, drivers and
-frameworks connect unchanged — while the entire database lives in a single,
-crash-safe file. It pairs a broad, standards-minded SQL engine with a parallel
-analytical path and first-class vector search, all in one self-contained binary.
+## Drop-in for MySQL. Built for what comes next.
+
+ElyraSQL speaks the **MySQL wire protocol**, so your existing clients, drivers
+and frameworks — **Laravel, Django, Rails, Node, Go, Rust** — connect *unchanged*.
+But underneath it's a fresh, Rust-native engine built for 2026: the **entire
+database lives in a single crash-safe file**, large analytical queries run
+through a **parallel streaming engine**, and **vector search + AI embeddings are
+first-class SQL** — no bolt-on extensions, no second system to operate.
+
+One binary. One file. Your whole transactional, analytical and AI-search
+workload — served over the protocol your stack already knows.
+
+**[→ Get started in 60 seconds](#quick-start)** &nbsp;·&nbsp;
+**[→ Full documentation](https://elyracode.com/docs/sql-server)**
 
 > **Current release: v0.9.9.** A broad, MySQL-compatible SQL engine: full
 > DDL/DML, joins, subqueries (correlated too), CTEs (incl. `WITH RECURSIVE`),
@@ -207,6 +222,25 @@ ELYRASQL_USER=root ELYRASQL_PASSWORD=secret \
 journalctl -u elyrasql -f
 ```
 
+## Learn more
+
+- **Documentation** — [elyracode.com/docs/sql-server](https://elyracode.com/docs/sql-server)
+- **Framework integration** (Laravel, Django, Rails, …) — [elyracode.com/docs/sql-server/frameworks](https://elyracode.com/docs/sql-server/frameworks/)
+- **Benchmarks & analysis** — [BENCHMARKS.md](BENCHMARKS.md) · [benchmark_analyse.md](benchmark_analyse.md)
+- **Releases** — [github.com/kwhorne/ElyraSQL/releases](https://github.com/kwhorne/ElyraSQL/releases)
+
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE). Use it freely, in commercial and open projects alike.
+
+---
+
+<div align="center">
+
+<img src="assets/png/icon-64.png" alt="ElyraSQL" width="40" height="40" />
+
+**ElyraSQL** — part of the [Elyra](https://elyracode.com) family.
+
+Developed with ❤️ from Norway 🇳🇴
+
+</div>
