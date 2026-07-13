@@ -620,29 +620,58 @@ impl Engine {
         let SetExpr::Select(sel) = q.body.as_ref() else {
             return None;
         };
-        // Resolve the single base table (for `*` expansion and column typing),
-        // if the FROM is exactly one plain table. Otherwise `def` is None and we
-        // still describe explicit projection items by best-effort type -- what
-        // matters for a prepared statement is that the *column count* is exact,
-        // so drivers (PDO/mysqlnd) read the result set instead of desyncing.
-        let def = if sel.from.len() == 1 && sel.from[0].joins.is_empty() {
-            if let TableFactor::Table { name, .. } = &sel.from[0].relation {
-                catalog::load(sess, &name.0.last()?.value).await.ok()
-            } else {
-                None
+        // Resolve every plain base table in FROM (across commas and joins), each
+        // paired with its alias/name qualifier, for `*` expansion and column
+        // typing. `all_plain` stays true only if every FROM relation is a plain,
+        // loadable table -- required to know the exact column count for `*`.
+        // (Explicit projection items are always described by best-effort type,
+        // so what matters for a prepared statement is an exact column count.)
+        let mut defs: Vec<(String, catalog::TableDef)> = Vec::new();
+        let mut all_plain = !sel.from.is_empty();
+        {
+            let add = |tf: &TableFactor, all_plain: &mut bool| -> Option<(String, String)> {
+                if let TableFactor::Table { name, alias, .. } = tf {
+                    let tname = name.0.last()?.value.clone();
+                    let qual = alias
+                        .as_ref()
+                        .map(|a| a.name.value.clone())
+                        .unwrap_or_else(|| tname.clone());
+                    Some((qual, tname))
+                } else {
+                    *all_plain = false;
+                    None
+                }
+            };
+            let mut pending: Vec<(String, String)> = Vec::new();
+            for twj in &sel.from {
+                if let Some(p) = add(&twj.relation, &mut all_plain) {
+                    pending.push(p);
+                }
+                for j in &twj.joins {
+                    if let Some(p) = add(&j.relation, &mut all_plain) {
+                        pending.push(p);
+                    }
+                }
             }
-        } else {
-            None
-        };
-        let col_by_name = |n: &str| -> Option<ColumnType> {
-            def.as_ref().and_then(|d| {
-                d.schema
-                    .columns
-                    .iter()
-                    .find(|c| c.name.eq_ignore_ascii_case(n))
-                    .map(|c| c.ty.clone())
-            })
-        };
+            for (qual, tname) in pending {
+                match catalog::load(sess, &tname).await.ok() {
+                    Some(d) => defs.push((qual, d)),
+                    None => all_plain = false,
+                }
+            }
+        }
+        let col_by_name =
+            |n: &str| -> Option<ColumnType> {
+                let want = n.rsplit('.').next().unwrap_or(n);
+                for (_, d) in &defs {
+                    if let Some(c) = d.schema.columns.iter().find(|c| {
+                        c.name.eq_ignore_ascii_case(n) || c.name.eq_ignore_ascii_case(want)
+                    }) {
+                        return Some(c.ty.clone());
+                    }
+                }
+                None
+            };
         // Best-effort result type of a projection expression.
         fn expr_type(e: &Expr, col: &dyn Fn(&str) -> Option<ColumnType>) -> ColumnType {
             use sqlparser::ast::Value as V;
@@ -690,9 +719,21 @@ impl Engine {
         let mut out = Vec::new();
         for item in &sel.projection {
             match item {
-                // Wildcards require a resolvable single table to know the count.
-                SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..) => {
-                    let d = def.as_ref()?;
+                // `*`: every base table's columns, in FROM order. Requires all
+                // FROM relations to be plain, loadable tables (else the count is
+                // unknown -> None).
+                SelectItem::Wildcard(_) => {
+                    if !all_plain || defs.is_empty() {
+                        return None;
+                    }
+                    for (_, d) in &defs {
+                        out.extend(d.schema.columns.iter().cloned());
+                    }
+                }
+                // `t.*`: the columns of the table whose alias/name is `t`.
+                SelectItem::QualifiedWildcard(obj, _) => {
+                    let qual = obj.0.last()?.value.clone();
+                    let (_, d) = defs.iter().find(|(q, _)| q.eq_ignore_ascii_case(&qual))?;
                     out.extend(d.schema.columns.iter().cloned());
                 }
                 SelectItem::UnnamedExpr(e) => {
