@@ -61,26 +61,28 @@ for full method and analysis, and run it yourself with `gh workflow run benchmar
 
 | Query | ElyraSQL | PostgreSQL 17 | MySQL 8.4 |
 |---|---:|---:|---:|
-| `COUNT(*)` | **24.8** | 28.1 | 23.6 |
-| Global agg (`SUM/AVG/MIN/MAX`) | **35.6** | 47.9 | 161.7 |
-| `GROUP BY` (100 groups) | **45.8** | 81.0 | 314.6 |
-| `GROUP BY` + top-10 (10k groups) | **53.7** | 87.7 | 342.9 |
-| Filtered agg (`WHERE amount>500`) | **46.1** | 51.8 | 229.5 |
+| `COUNT(*)` | 25.2 | 28.7 | **24.0** |
+| Global agg (`SUM/AVG/MIN/MAX`) | **35.9** | 45.1 | 162.4 |
+| `GROUP BY` (100 groups) | **48.5** | 75.0 | 312.2 |
+| `GROUP BY` + top-10 (10k groups) | **53.5** | 95.9 | 344.6 |
+| Filtered agg (`WHERE amount>500`) | **50.5** | 54.5 | 229.5 |
 
 **Core SQL, 200k rows (ms):**
 
 | Workload | ElyraSQL | MySQL 8.4 | PostgreSQL 17 |
 |---|---:|---:|---:|
-| `GROUP BY` | **12.9** | 21.8 | 16.8 |
-| Full scan `COUNT` | **10.4** | 20.8 | 11.0 |
-| Selective join | 0.41 | 0.47 | 0.27 |
-| PK point lookup | 0.28 | 0.27 | 0.20 |
+| `GROUP BY` | **9.8** | 21.4 | 16.1 |
+| Full scan `COUNT` | **9.3** | 20.8 | 10.4 |
+| Selective join | 0.39 | 0.45 | 0.24 |
+| PK point lookup | 0.26 | 0.27 | 0.19 |
 | Bulk insert (rows/s, ≥10k batches) | 351,000 | 290,000 | 345,000 |
 
 What this shows:
 
-- **ElyraSQL is the fastest of the three on every OLAP query** (global/filtered
-  aggregation, `GROUP BY`, top-N), and 2–5x ahead of MySQL. Row-store
+- **ElyraSQL is the fastest of the three on every OLAP aggregation query**
+  (global/filtered aggregation, `GROUP BY`, top-N), typically 2–6x ahead of
+  MySQL and up to ~1.8x ahead of PostgreSQL; on a bare `COUNT(*)` the three are
+  within noise. Row-store
   aggregation this fast is unusual and comes from vectorised (columnar) scalar
   aggregation, a compiled filter predicate, parallel clustered scans, and a
   table-keyspace-bounded split.

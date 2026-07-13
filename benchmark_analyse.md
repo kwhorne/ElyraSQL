@@ -20,30 +20,32 @@ with its native schema.
 
 | Query | ElyraSQL | PostgreSQL 17 | MySQL 8.4 |
 |---|---:|---:|---:|
-| `COUNT(*)` | **24.8** | 28.1 | 23.6 |
-| Global aggregation (`SUM/AVG/MIN/MAX`) | **35.6** | 47.9 | 161.7 |
-| `GROUP BY` low-cardinality (100 groups) | **45.8** | 81.0 | 314.6 |
-| `GROUP BY` + top-10 (10k groups) | **53.7** | 87.7 | 342.9 |
-| Filtered aggregation (`WHERE amount>500`) | **46.1** | 51.8 | 229.5 |
+| `COUNT(*)` | 25.2 | 28.7 | **24.0** |
+| Global aggregation (`SUM/AVG/MIN/MAX`) | **35.9** | 45.1 | 162.4 |
+| `GROUP BY` low-cardinality (100 groups) | **48.5** | 75.0 | 312.2 |
+| `GROUP BY` + top-10 (10k groups) | **53.5** | 95.9 | 344.6 |
+| Filtered aggregation (`WHERE amount>500`) | **50.5** | 54.5 | 229.5 |
 
-**ElyraSQL is the fastest of the three on every OLAP query**, and 2–5× ahead of
-MySQL, with the widest margins on high-cardinality `GROUP BY` (top-N is ~1.6×
-faster than PostgreSQL). This is unusual for a row store and comes from the OLAP
-work in the 0.9.x line: parallel clustered scans, a bounded table-keyspace
-split, vectorised (columnar) scalar *and grouped* aggregation over flat `f64`
-arrays, and a compiled predicate for filtered aggregation.
+**ElyraSQL is the fastest of the three on every aggregation query** — global
+aggregation, both `GROUP BY` shapes, and the filtered aggregation — typically
+2–6× ahead of MySQL and up to ~1.8× ahead of PostgreSQL on high-cardinality
+`GROUP BY`. On a bare `COUNT(*)` the three are within noise (MySQL a hair ahead).
+This is unusual for a row store and comes from the OLAP work in the 0.9.x line,
+carried into 1.0: parallel clustered scans, a bounded table-keyspace split,
+vectorised (columnar) scalar *and grouped* aggregation over flat `f64` arrays,
+and a compiled predicate for filtered aggregation.
 
 ## Core SQL — 200,000 rows (medians, ms; lower is better)
 
 | Workload | ElyraSQL | MySQL 8.4 | PostgreSQL 17 |
 |---|---:|---:|---:|
-| `GROUP BY` (full aggregation) | **12.9** | 21.8 | 16.8 |
-| Full scan `COUNT` (no index) | **10.4** | 20.8 | 11.0 |
-| Bulk insert (rows/s) | 163,000 | 176,000 | 178,000 |
-| Indexed `COUNT` | 0.90 | 0.69 | 1.22 |
-| Selective join (index NLJ) | 0.41 | 0.47 | 0.27 |
-| PK point lookup | 0.28 | 0.27 | 0.20 |
-| Range + `ORDER BY` pk `LIMIT` | 0.87 | 0.90 | 0.31 |
+| `GROUP BY` (full aggregation) | **9.8** | 21.4 | 16.1 |
+| Full scan `COUNT` (no index) | **9.3** | 20.8 | 10.4 |
+| Bulk insert (rows/s) | 162,000 | 179,000 | 187,000 |
+| Indexed `COUNT` | 0.90 | 0.65 | 1.21 |
+| Selective join (index NLJ) | 0.39 | 0.45 | 0.24 |
+| PK point lookup | 0.26 | 0.27 | 0.19 |
+| Range + `ORDER BY` pk `LIMIT` | 0.85 | 0.85 | 0.30 |
 
 ElyraSQL leads on `GROUP BY` and full-scan `COUNT`, beats MySQL on the point
 queries, and is within noise of the field on bulk insert and indexed lookups.
