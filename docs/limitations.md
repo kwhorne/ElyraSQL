@@ -38,10 +38,12 @@ implemented, so you can judge fit.
 - `INSERT ... SET col = val, ...` (MySQL shorthand) is supported — it is
   rewritten to `INSERT ... (cols) VALUES (...)` before parsing, including
   `ON DUPLICATE KEY UPDATE`.
+- Comma-style multi-table `UPDATE t1, t2 SET ... WHERE ...` is supported — it is
+  rewritten to `UPDATE t1 CROSS JOIN t2 SET ... WHERE ...` (the WHERE supplies
+  the join condition) before parsing.
 - A few MySQL-specific spellings are still rejected at parse time by the SQL
-  parser: comma-style multi-table `UPDATE t1, t2 SET ...` (use
-  `UPDATE t1 JOIN t2 ON ... SET ...`, which works); `GROUP BY ... WITH ROLLUP`;
-  and the `<<`, `>>` and unary `~` bitwise operators (`&`, `|`, `^` work).
+  parser: `GROUP BY ... WITH ROLLUP`, and the `<<`, `>>` and unary `~` bitwise
+  operators (`&`, `|`, `^` work).
 - Supported beyond the basics: multi-table `UPDATE`/`DELETE` via `JOIN`,
   `INSERT ... SELECT`, `CREATE TABLE ... AS SELECT`, `COUNT(DISTINCT ...)`,
   `UNION ALL`/`INTERSECT`/`EXCEPT`, `WITH RECURSIVE`, row/tuple `IN`, window

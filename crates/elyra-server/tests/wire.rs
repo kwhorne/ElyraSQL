@@ -360,6 +360,34 @@ async fn left_join_group_by_streaming() {
 }
 
 /// MySQL's `INSERT ... SET col = val` shorthand (rewritten to the standard form).
+/// MySQL's comma-style multi-table UPDATE (rewritten to CROSS JOIN + WHERE).
+#[tokio::test]
+async fn comma_multi_table_update() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop("CREATE TABLE a (id INT PRIMARY KEY, v INT)")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE b (id INT PRIMARY KEY, w INT)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO a VALUES (1,0),(2,0)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO b VALUES (1,10),(2,20)")
+        .await
+        .unwrap();
+
+    c.query_drop("UPDATE a, b SET a.v = b.w WHERE a.id = b.id")
+        .await
+        .unwrap();
+
+    let rows: Vec<(i64, i64)> = c.query("SELECT id, v FROM a ORDER BY id").await.unwrap();
+    assert_eq!(rows, vec![(1, 10), (2, 20)]);
+}
+
+/// MySQL's `INSERT ... SET col = val` shorthand (rewritten to the standard form).
 #[tokio::test]
 async fn insert_set_shorthand() {
     let srv = TestServer::start().await;

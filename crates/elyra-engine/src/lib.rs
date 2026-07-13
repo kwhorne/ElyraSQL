@@ -1204,6 +1204,12 @@ impl Engine {
         if let Some(rewritten) = rewrite_insert_set(&subst_sql) {
             subst_sql = rewritten;
         }
+        // Rewrite comma-style multi-table `UPDATE t1, t2 SET ... WHERE ...` into
+        // `UPDATE t1 CROSS JOIN t2 SET ... WHERE ...` (the WHERE supplies the
+        // join condition, as in the comma form).
+        if let Some(rewritten) = rewrite_comma_update(&subst_sql) {
+            subst_sql = rewritten;
+        }
         let statements =
             Parser::parse_sql(&dialect, &subst_sql).map_err(|e| Error::Parse(e.to_string()))?;
 
@@ -2133,6 +2139,79 @@ fn rewrite_insert_set(sql: &str) -> Option<String> {
     Some(out)
 }
 
+/// Rewrite MySQL's comma-style multi-table `UPDATE t1, t2 SET ... WHERE ...`
+/// into `UPDATE t1 CROSS JOIN t2 SET ... WHERE ...`, which the parser and the
+/// join-UPDATE executor accept (the WHERE supplies the join condition, exactly
+/// as in the comma form). Returns None for single-table updates (no top-level
+/// comma before SET). Quote/paren/backtick-aware.
+fn rewrite_comma_update(sql: &str) -> Option<String> {
+    let head = sql.trim_start();
+    if head.len() < 6 || !head[..6].eq_ignore_ascii_case("UPDATE") {
+        return None;
+    }
+    let bytes = sql.as_bytes();
+    let update_end = sql.len() - head.len() + 6; // byte just after "UPDATE"
+    let (mut in_s, mut in_d, mut in_b) = (false, false, false);
+    let mut depth = 0i32;
+    let mut i = update_end;
+    let mut set_pos: Option<usize> = None;
+    let mut comma_positions: Vec<usize> = Vec::new();
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        if in_s {
+            if c == '\'' {
+                in_s = false;
+            }
+        } else if in_d {
+            if c == '"' {
+                in_d = false;
+            }
+        } else if in_b {
+            if c == '`' {
+                in_b = false;
+            }
+        } else {
+            match c {
+                '\'' => in_s = true,
+                '"' => in_d = true,
+                '`' => in_b = true,
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                ',' if depth == 0 => comma_positions.push(i),
+                _ if depth == 0 && kw_at(bytes, i, "SET") => {
+                    set_pos = Some(i);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    let set_pos = set_pos?;
+    // Only commas in the table-list region (before SET) matter.
+    let list_commas: Vec<usize> = comma_positions
+        .into_iter()
+        .filter(|&p| p < set_pos)
+        .collect();
+    if list_commas.is_empty() {
+        return None; // single-table UPDATE
+    }
+    let mut out = String::with_capacity(sql.len() + list_commas.len() * 11);
+    let mut prev = 0usize;
+    let sb = sql.as_bytes();
+    for p in list_commas {
+        out.push_str(sql[prev..p].trim_end());
+        out.push_str(" CROSS JOIN ");
+        // Skip the comma and any whitespace that followed it.
+        prev = p + 1;
+        while prev < sb.len() && (sb[prev] == b' ' || sb[prev] == b'\t') {
+            prev += 1;
+        }
+    }
+    out.push_str(&sql[prev..]);
+    Some(out)
+}
+
 fn query_has_from(q: &sqlparser::ast::Query) -> bool {
     // Route anything the full engine must handle: SELECTs with a FROM, set
     // operations (UNION/INTERSECT/EXCEPT), CTEs, and nested queries. Only bare
@@ -2233,6 +2312,34 @@ mod insert_set_tests {
         assert_eq!(
             rewrite_insert_set("INSERT INTO t SET a = (SELECT MAX(id) FROM u), b = 1").unwrap(),
             "INSERT INTO t (a, b) VALUES ((SELECT MAX(id) FROM u), 1)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod comma_update_tests {
+    use super::rewrite_comma_update;
+
+    #[test]
+    fn two_tables() {
+        assert_eq!(
+            rewrite_comma_update("UPDATE a, b SET a.v = b.w WHERE a.id = b.id").unwrap(),
+            "UPDATE a CROSS JOIN b SET a.v = b.w WHERE a.id = b.id"
+        );
+    }
+
+    #[test]
+    fn single_table_untouched() {
+        assert!(rewrite_comma_update("UPDATE t SET v = 1 WHERE id = 2").is_none());
+        // comma is in the SET list, not the table list
+        assert!(rewrite_comma_update("UPDATE t SET a = 1, b = 2").is_none());
+    }
+
+    #[test]
+    fn aliases_and_three_tables() {
+        assert_eq!(
+            rewrite_comma_update("UPDATE a x, b y, c z SET x.v = y.w WHERE x.id = z.id").unwrap(),
+            "UPDATE a x CROSS JOIN b y CROSS JOIN c z SET x.v = y.w WHERE x.id = z.id"
         );
     }
 }
