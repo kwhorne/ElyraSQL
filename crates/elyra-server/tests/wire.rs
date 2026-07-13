@@ -226,6 +226,41 @@ async fn native_prepared_statements() {
     assert_eq!(rows, vec![(2, "pear".into(), 8), (3, "plum".into(), 13)]);
 }
 
+/// Qualified wildcard `alias.*` in the projection expands to that table's
+/// columns. [ESQL-9]
+#[tokio::test]
+async fn qualified_wildcard() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop("CREATE TABLE qa (id INT PRIMARY KEY, name VARCHAR(16))")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE qb (id INT PRIMARY KEY, a_id INT, label VARCHAR(16))")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO qa VALUES (1,'Ada'),(2,'Lin')")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO qb VALUES (1,1,'post'),(2,2,'blog')")
+        .await
+        .unwrap();
+
+    // a.* -> only qa's two columns
+    let rows: Vec<(i64, String)> = c
+        .query("SELECT qa.* FROM qa JOIN qb ON qb.a_id = qa.id ORDER BY qa.id")
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![(1, "Ada".into()), (2, "Lin".into())]);
+
+    // b.* -> qb's three columns
+    let rows: Vec<(i64, i64, String)> = c
+        .query("SELECT qb.* FROM qa JOIN qb ON qb.a_id = qa.id WHERE qa.id = 1")
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![(1, 1, "post".into())]);
+}
+
 /// Join followed by GROUP BY over an indexed partner -- exercises the streaming
 /// index nested-loop aggregation path (bounded memory) and must produce exactly
 /// the same result as the materialising join.

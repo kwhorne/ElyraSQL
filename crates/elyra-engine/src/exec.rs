@@ -7174,6 +7174,26 @@ fn project_exprs(
                     projs.push(Proj::Col(i));
                 }
             }
+            // `alias.*` -> every column qualified by `alias` (join schemas name
+            // columns `alias.col`). Falls back to matching the bare table name.
+            SelectItem::QualifiedWildcard(obj, _) => {
+                let qual = obj.0.last().map(|i| i.value.clone()).unwrap_or_default();
+                let mut matched = false;
+                for (i, c) in schema.columns.iter().enumerate() {
+                    if let Some((q, _)) = c.name.split_once('.') {
+                        if q.eq_ignore_ascii_case(&qual) {
+                            names.push(c.name.clone());
+                            projs.push(Proj::Col(i));
+                            matched = true;
+                        }
+                    }
+                }
+                if !matched {
+                    return Err(Error::Unsupported(format!(
+                        "unknown table qualifier in `{qual}.*`"
+                    )));
+                }
+            }
             SelectItem::UnnamedExpr(e) => {
                 names.push(
                     ident_name(e)
@@ -7185,11 +7205,6 @@ fn project_exprs(
             SelectItem::ExprWithAlias { expr, alias } => {
                 names.push(alias.value.clone());
                 projs.push(Proj::Expr(expr));
-            }
-            other => {
-                return Err(Error::Unsupported(format!(
-                    "projection item not supported: {other}"
-                )))
             }
         }
     }
