@@ -627,3 +627,82 @@ mod collation_tests {
         assert!(is_valid_json(r#"{"a":[1,2,{"b":true}],"c":null}"#));
     }
 }
+
+#[cfg(test)]
+mod value_props {
+    use super::*;
+    use crate::Collation;
+    use proptest::prelude::*;
+
+    /// A strategy generating an arbitrary `Value` across all variants.
+    fn any_value() -> impl Strategy<Value = Value> {
+        prop_oneof![
+            Just(Value::Null),
+            any::<bool>().prop_map(Value::Bool),
+            any::<i64>().prop_map(Value::Int),
+            any::<f64>()
+                .prop_filter("no NaN", |f| !f.is_nan())
+                .prop_map(Value::Float),
+            ".*".prop_map(Value::Text),
+            proptest::collection::vec(any::<u8>(), 0..32).prop_map(Value::Bytes),
+            proptest::collection::vec(any::<f32>().prop_filter("finite", |f| f.is_finite()), 0..8)
+                .prop_map(Value::Vector),
+            any::<i32>().prop_map(Value::Date),
+            any::<i64>().prop_map(Value::DateTime),
+            (any::<i128>(), 0u8..=18).prop_map(|(u, s)| Value::Decimal(u, s)),
+            any::<i64>().prop_map(Value::Time),
+            ".*".prop_map(Value::Json),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(3000))]
+
+        /// bincode round-trips every Value variant losslessly -- the on-disk row
+        /// codec must be exact.
+        #[test]
+        fn bincode_roundtrip(v in any_value()) {
+            let bytes = bincode::serialize(&v).unwrap();
+            let back: Value = bincode::deserialize(&bytes).unwrap();
+            prop_assert_eq!(v, back);
+        }
+
+        /// A whole row round-trips too.
+        #[test]
+        fn row_bincode_roundtrip(row in proptest::collection::vec(any_value(), 0..12)) {
+            let bytes = bincode::serialize(&row).unwrap();
+            let back: Vec<Value> = bincode::deserialize(&bytes).unwrap();
+            prop_assert_eq!(row, back);
+        }
+
+        /// total_cmp is reflexive (a value equals itself).
+        #[test]
+        fn total_cmp_reflexive(v in any_value()) {
+            prop_assert_eq!(v.total_cmp(&v), std::cmp::Ordering::Equal);
+        }
+
+        /// Equal collation keys are consistent with equality under the same
+        /// collation: two texts differing only in case share a Ci key but not a
+        /// Bin key (when they actually differ in case).
+        #[test]
+        fn collation_key_case_folding(s in "[a-zA-Z]{1,16}") {
+            let lower = Value::Text(s.to_lowercase());
+            let upper = Value::Text(s.to_uppercase());
+            // Ci: folded keys match.
+            prop_assert_eq!(
+                lower.collation_key_coll(Collation::Ci),
+                upper.collation_key_coll(Collation::Ci)
+            );
+            // Bin: keys match iff the strings are byte-identical.
+            let bin_eq = lower.collation_key_coll(Collation::Bin)
+                == upper.collation_key_coll(Collation::Bin);
+            prop_assert_eq!(bin_eq, s.to_lowercase() == s.to_uppercase());
+        }
+
+        /// A value keyed twice yields identical bytes (determinism).
+        #[test]
+        fn collation_key_deterministic(v in any_value()) {
+            prop_assert_eq!(v.collation_key(), v.collation_key());
+        }
+    }
+}

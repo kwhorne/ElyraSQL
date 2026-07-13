@@ -609,6 +609,7 @@ name = "elyra-core"
 version = "0.9.9"
 dependencies = [
  "bincode",
+ "proptest",
  "serde",
  "sha1",
  "thiserror 2.0.18",
