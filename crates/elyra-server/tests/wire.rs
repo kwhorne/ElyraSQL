@@ -41,9 +41,11 @@ async fn ddl_dml_roundtrip() {
     c.query_drop("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(64), age INT)")
         .await
         .unwrap();
-    c.query_drop("INSERT INTO users (id, name, age) VALUES (1,'Ada',36),(2,'Linus',54),(3,'Grace',85)")
-        .await
-        .unwrap();
+    c.query_drop(
+        "INSERT INTO users (id, name, age) VALUES (1,'Ada',36),(2,'Linus',54),(3,'Grace',85)",
+    )
+    .await
+    .unwrap();
 
     let count: i64 = c
         .query_first("SELECT COUNT(*) FROM users")
@@ -75,7 +77,9 @@ async fn ddl_dml_roundtrip() {
         .unwrap();
     assert_eq!(age, 37);
 
-    c.query_drop("DELETE FROM users WHERE id = 3").await.unwrap();
+    c.query_drop("DELETE FROM users WHERE id = 3")
+        .await
+        .unwrap();
     let count: i64 = c
         .query_first("SELECT COUNT(*) FROM users")
         .await
@@ -126,10 +130,7 @@ async fn aggregation_and_group_by() {
         .await
         .unwrap();
     rows.sort();
-    assert_eq!(
-        rows,
-        vec![("north".into(), 2, 40), ("south".into(), 3, 40)]
-    );
+    assert_eq!(rows, vec![("north".into(), 2, 40), ("south".into(), 3, 40)]);
 
     let total: i64 = c
         .query_first("SELECT SUM(amount) FROM sales")
@@ -185,7 +186,11 @@ async fn native_prepared_statements() {
     let mut c = srv.conn().await;
 
     // Constant expression through a prepared statement.
-    let sum: i64 = c.exec_first("SELECT ? + ?", (40, 2)).await.unwrap().unwrap();
+    let sum: i64 = c
+        .exec_first("SELECT ? + ?", (40, 2))
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(sum, 42);
 
     c.query_drop("CREATE TABLE items (id INT PRIMARY KEY, name VARCHAR(32), qty INT)")
@@ -212,7 +217,10 @@ async fn native_prepared_statements() {
     assert_eq!(name, "pear");
 
     let rows: Vec<(i64, String, i64)> = c
-        .exec("SELECT id, name, qty FROM items WHERE qty >= ? ORDER BY id", (8,))
+        .exec(
+            "SELECT id, name, qty FROM items WHERE qty >= ? ORDER BY id",
+            (8,),
+        )
         .await
         .unwrap();
     assert_eq!(rows, vec![(2, "pear".into(), 8), (3, "plum".into(), 13)]);
@@ -228,11 +236,9 @@ async fn data_types() {
     )
     .await
     .unwrap();
-    c.query_drop(
-        "INSERT INTO dt VALUES (1, 19.95, '2026-07-13', '{\"a\": 1}', 9000000000)",
-    )
-    .await
-    .unwrap();
+    c.query_drop("INSERT INTO dt VALUES (1, 19.95, '2026-07-13', '{\"a\": 1}', 9000000000)")
+        .await
+        .unwrap();
 
     // DECIMAL and DATE read back as strings (no chrono/bigdecimal features).
     let (price, d, big): (String, String, i64) = c
@@ -265,9 +271,7 @@ async fn introspection() {
     assert!(tables.iter().any(|t| t == "widgets"), "tables: {tables:?}");
 
     let n: i64 = c
-        .query_first(
-            "SELECT COUNT(*) FROM information_schema.columns WHERE table_name = 'widgets'",
-        )
+        .query_first("SELECT COUNT(*) FROM information_schema.columns WHERE table_name = 'widgets'")
         .await
         .unwrap()
         .unwrap();
