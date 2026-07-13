@@ -1999,6 +1999,38 @@ fn strip_dml_limit(sql: &str) -> Option<String> {
     None
 }
 
+/// Fuzz / property entry point: run the full SQL string-preprocessing chain and
+/// the parser over arbitrary input. It must **never panic** (only produce
+/// `Some`/`None`/`Ok`/`Err`), regardless of how malformed, non-UTF-8-boundary,
+/// or adversarial the input is. Driven by both the `cargo-fuzz` target
+/// (`fuzz/fuzz_targets/preprocess.rs`) and a stable proptest, so the invariant is
+/// checked in normal CI too.
+pub fn fuzz_preprocess_parse(sql: &str) {
+    let mut s = sql.to_string();
+    if s.to_ascii_lowercase().contains("lock in share mode") {
+        s = replace_ci(&s, "lock in share mode", "for share");
+    }
+    if let Some(x) = strip_create_table_options(&s) {
+        s = x;
+    }
+    if let Some(x) = strip_dml_limit(&s) {
+        s = x;
+    }
+    if let Some(x) = rewrite_insert_set(&s) {
+        s = x;
+    }
+    if let Some(x) = rewrite_comma_update(&s) {
+        s = x;
+    }
+    let _ = split_top_level(&s, ',');
+    let _ = split_top_level(&s, '=');
+    // Parse both dialects (the generic one is the ROLLUP / shift fallback).
+    let _ = Parser::parse_sql(&MySqlDialect {}, &s);
+    if s.to_ascii_lowercase().contains("rollup") || s.contains("<<") || s.contains(">>") {
+        let _ = Parser::parse_sql(&sqlparser::dialect::GenericDialect {}, &s);
+    }
+}
+
 /// Return true if the ASCII keyword `kw` sits at byte offset `i` in `bytes`
 /// with word boundaries on both sides (case-insensitive).
 fn kw_at(bytes: &[u8], i: usize, kw: &str) -> bool {
@@ -2455,6 +2487,22 @@ mod fuzz_props {
         fn split_top_level_roundtrips(s in "(?s).{0,80}") {
             let parts = split_top_level(&s, ',');
             prop_assert_eq!(parts.join(","), s);
+        }
+
+        /// The full preprocessing + parse entry point (also driven by cargo-fuzz)
+        /// never panics on arbitrary input.
+        #[test]
+        fn fuzz_entry_never_panics(s in "(?s).{0,120}") {
+            crate::fuzz_preprocess_parse(&s);
+        }
+
+        /// Biased toward the shapes the rewriters/fallbacks target.
+        #[test]
+        fn fuzz_entry_targeted(a in "(?s).{0,60}") {
+            crate::fuzz_preprocess_parse(&format!("INSERT INTO t SET {a}"));
+            crate::fuzz_preprocess_parse(&format!("UPDATE {a} SET x=1 WHERE y=2"));
+            crate::fuzz_preprocess_parse(&format!("SELECT a FROM t GROUP BY a {a} WITH ROLLUP"));
+            crate::fuzz_preprocess_parse(&format!("SELECT {a} << {a}"));
         }
     }
 }

@@ -1,0 +1,45 @@
+name: Fuzz
+
+# Fuzzing needs the nightly toolchain + cargo-fuzz (libFuzzer), so it runs on a
+# schedule and on demand rather than gating every push. The same invariant
+# (preprocess+parse never panics) is checked on stable in the normal test suite
+# via proptest, so regressions are still caught per-PR; this job explores deeper.
+on:
+  schedule:
+    - cron: "0 4 * * 1" # Mondays 04:00 UTC
+  workflow_dispatch:
+    inputs:
+      max_total_time:
+        description: "Seconds to fuzz"
+        default: "300"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    name: cargo-fuzz preprocess
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Run fuzzer
+        run: |
+          cd fuzz
+          cargo +nightly fuzz run preprocess -- \
+            -max_total_time=${{ github.event.inputs.max_total_time || '300' }} \
+            -rss_limit_mb=4096
+
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts/
+          if-no-files-found: ignore

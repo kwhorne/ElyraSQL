@@ -1,0 +1,24 @@
+[package]
+name = "elyra-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.elyra-engine]
+path = "../crates/elyra-engine"
+
+# Prevent this from being built as part of the main (stable) workspace.
+[workspace]
+
+[[bin]]
+name = "preprocess"
+path = "fuzz_targets/preprocess.rs"
+test = false
+doc = false
+bench = false
