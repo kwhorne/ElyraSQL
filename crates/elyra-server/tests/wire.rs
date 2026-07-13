@@ -525,6 +525,36 @@ async fn binary_collation_order_and_group() {
     );
 }
 
+/// An equi-join on a `_bin` column matches by exact bytes (case-sensitive);
+/// the default column matches case-insensitively. [ESQL-4]
+#[tokio::test]
+async fn binary_collation_join_key() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop("CREATE TABLE a (id INT PRIMARY KEY, code VARCHAR(8) COLLATE utf8mb4_bin)")
+        .await
+        .unwrap();
+    c.query_drop(
+        "CREATE TABLE b (id INT PRIMARY KEY, code VARCHAR(8) COLLATE utf8mb4_bin, label VARCHAR(16))",
+    )
+    .await
+    .unwrap();
+    c.query_drop("INSERT INTO a VALUES (1,'X'),(2,'x')")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO b VALUES (1,'X','upper'),(2,'x','lower')")
+        .await
+        .unwrap();
+
+    let rows: Vec<(i64, String)> = c
+        .query("SELECT a.id, b.label FROM a JOIN b ON a.code = b.code ORDER BY a.id")
+        .await
+        .unwrap();
+    // X matches X, x matches x -- not the cross product
+    assert_eq!(rows, vec![(1, "upper".into()), (2, "lower".into())]);
+}
+
 /// The default (case-insensitive) column still groups case-insensitively, so the
 /// _bin behavior above is genuinely opt-in.
 #[tokio::test]

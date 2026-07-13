@@ -4425,7 +4425,10 @@ async fn resolve_table(db: &Session, tf: &TableFactor) -> Result<(TableDef, Vec<
                     name: format!("{a}.{}", c.name),
                     ty: c.ty.clone(),
                     nullable: c.nullable,
-                    collation: elyra_core::Collation::Ci,
+                    // Preserve the source column's collation so joins, ORDER BY,
+                    // GROUP BY and DISTINCT over a joined `_bin` column stay
+                    // case-sensitive.
+                    collation: c.collation,
                 })
                 .collect();
             Ok((def, cols))
@@ -5572,7 +5575,15 @@ fn combine(
         if let Some(e) = on {
             if let Some((lkey, rkey)) = equi_keys(e, &lschema, &rschema) {
                 const MERGE_MIN: usize = 2048;
-                if kind == JoinKind::Inner && lrows.len() >= MERGE_MIN && rrows.len() >= MERGE_MIN {
+                // The merge join compares keys under the default collation, so
+                // skip it for a `_bin` join key (fall through to the
+                // collation-aware hash join below).
+                let bin_key = join_key_collation(&lkey, &lschema, &rkey, &rschema).is_bin();
+                if !bin_key
+                    && kind == JoinKind::Inner
+                    && lrows.len() >= MERGE_MIN
+                    && rrows.len() >= MERGE_MIN
+                {
                     if let (Some(lk), Some(rk)) = (
                         sorted_keyed(lrows, &lschema, &lkey)?,
                         sorted_keyed(rrows, &rschema, &rkey)?,
@@ -5656,17 +5667,18 @@ fn hash_join(
         _ => lrows.len() <= rrows.len(),
     };
     let outer = !matches!(kind, JoinKind::Inner);
+    let coll = join_key_collation(lkey, lschema, rkey, rschema);
     let mut out = Vec::new();
 
     if build_left {
         let mut table: HashMap<String, Vec<usize>> = HashMap::new();
         for (i, l) in lrows.iter().enumerate() {
-            if let Some(k) = key_str(&predicate::eval_row(lkey, lschema, l)?) {
+            if let Some(k) = key_str_coll(&predicate::eval_row(lkey, lschema, l)?, coll) {
                 table.entry(k).or_default().push(i);
             }
         }
         for r in rrows {
-            let probe = key_str(&predicate::eval_row(rkey, rschema, r)?);
+            let probe = key_str_coll(&predicate::eval_row(rkey, rschema, r)?, coll);
             let mut matched = false;
             if let Some(k) = probe {
                 if let Some(idxs) = table.get(&k) {
@@ -5688,12 +5700,12 @@ fn hash_join(
     } else {
         let mut table: HashMap<String, Vec<usize>> = HashMap::new();
         for (i, r) in rrows.iter().enumerate() {
-            if let Some(k) = key_str(&predicate::eval_row(rkey, rschema, r)?) {
+            if let Some(k) = key_str_coll(&predicate::eval_row(rkey, rschema, r)?, coll) {
                 table.entry(k).or_default().push(i);
             }
         }
         for l in lrows {
-            let probe = key_str(&predicate::eval_row(lkey, lschema, l)?);
+            let probe = key_str_coll(&predicate::eval_row(lkey, lschema, l)?, coll);
             let mut matched = false;
             if let Some(k) = probe {
                 if let Some(idxs) = table.get(&k) {
@@ -5780,13 +5792,30 @@ fn merge_join_inner(l: KeyedRows, r: KeyedRows) -> Option<Vec<Vec<Value>>> {
     Some(out)
 }
 
-/// Hash-key string for a value; `None` for NULL (never matches, per SQL).
-fn key_str(v: &Value) -> Option<String> {
+/// Hash-key string under an explicit collation; `None` for NULL (never matches,
+/// per SQL). `Bin` keeps text case-sensitive so an equi-join on a `_bin` column
+/// matches by exact bytes.
+fn key_str_coll(v: &Value, coll: elyra_core::Collation) -> Option<String> {
     if v.is_null() {
         None
     } else {
-        // Collation-folded so equi-joins match the default collation.
-        Some(String::from_utf8_lossy(&v.collation_key()).into_owned())
+        Some(String::from_utf8_lossy(&v.collation_key_coll(coll)).into_owned())
+    }
+}
+
+/// The comparison collation for an equi-join on two key expressions: binary if
+/// either side is a `_bin` column (matching MySQL's coercibility rule), else the
+/// default case-insensitive collation.
+fn join_key_collation(
+    lkey: &Expr,
+    lschema: &Schema,
+    rkey: &Expr,
+    rschema: &Schema,
+) -> elyra_core::Collation {
+    if expr_collation(lkey, lschema).is_bin() || expr_collation(rkey, rschema).is_bin() {
+        elyra_core::Collation::Bin
+    } else {
+        elyra_core::Collation::Ci
     }
 }
 
