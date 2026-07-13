@@ -41,6 +41,22 @@ fn table_ident(name: &ObjectName) -> Result<String> {
         .ok_or_else(|| Error::Catalog("empty table name".into()))
 }
 
+/// Escape regex metacharacters so a literal string can be embedded in a pattern
+/// (used to build the SET-membership CHECK).
+fn regex_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        if matches!(
+            ch,
+            '.' | '^' | '$' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '\\'
+        ) {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
+
 fn map_type(dt: &DataType) -> Result<ColumnType> {
     Ok(match dt {
         DataType::TinyInt(_) if is_tinyint_bool(dt) => ColumnType::Bool,
@@ -206,6 +222,21 @@ pub async fn create_table(
                     .collect::<Vec<_>>()
                     .join(", ");
                 checks.push(format!("`{}` IN ({list})", col.name.value));
+            }
+        }
+        // SET: a value is a comma-separated subset of the declared members (or
+        // empty). Validate with a synthesized REGEXP CHECK `^(m1|m2|...)(,(...))*$`
+        // (plus the empty string). NULL passes the CHECK automatically.
+        if let sqlparser::ast::DataType::Set(members) = &col.data_type {
+            let alts: Vec<String> = members.iter().map(|m| regex_escape(m)).collect();
+            if !alts.is_empty() {
+                let group = alts.join("|");
+                let pattern = format!("^({group})(,({group}))*$");
+                let pat_sql = pattern.replace('\'', "''");
+                let cn = &col.name.value;
+                checks.push(format!(
+                    "`{cn}` IS NULL OR `{cn}` = '' OR `{cn}` REGEXP '{pat_sql}'"
+                ));
             }
         }
         let mut nullable = true;

@@ -607,6 +607,44 @@ async fn enum_value_validation() {
     assert_eq!(rows, vec![(1, Some("active".into())), (2, None)]);
 }
 
+/// SET columns accept a comma-separated subset of their members (and empty/NULL),
+/// and reject any value containing a non-member. [ESQL-2]
+#[tokio::test]
+async fn set_value_validation() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop("CREATE TABLE t (id INT PRIMARY KEY, perms SET('read','write','admin'))")
+        .await
+        .unwrap();
+
+    for (id, v) in [(1, "read"), (2, "read,write"), (3, "")] {
+        c.query_drop(format!("INSERT INTO t VALUES ({id},'{v}')"))
+            .await
+            .unwrap();
+    }
+    c.query_drop("INSERT INTO t VALUES (4, NULL)")
+        .await
+        .unwrap();
+
+    // a non-member (alone or within a subset) is rejected
+    assert!(c
+        .query_drop("INSERT INTO t VALUES (5,'delete')")
+        .await
+        .is_err());
+    assert!(c
+        .query_drop("INSERT INTO t VALUES (6,'read,bogus')")
+        .await
+        .is_err());
+
+    let n: i64 = c
+        .query_first("SELECT COUNT(*) FROM t")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(n, 4);
+}
+
 #[tokio::test]
 async fn data_types() {
     let srv = TestServer::start().await;
