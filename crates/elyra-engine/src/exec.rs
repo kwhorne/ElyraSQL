@@ -3287,6 +3287,24 @@ pub async fn select(
                     return Ok(res);
                 }
             }
+        } else if !group_by.is_empty() || aggregate::projection_has_aggregate(&select.projection) {
+            // Streaming index nested-loop aggregation: stream the driving table
+            // and feed the spilling aggregator so a large join + GROUP BY is
+            // bounded by group state, not the join output size. Falls back to
+            // join_select otherwise.
+            if let Some(res) = streaming_join_aggregate(
+                db,
+                select,
+                filter.as_ref(),
+                &group_by,
+                &order_exprs,
+                offset,
+                limit,
+            )
+            .await?
+            {
+                return Ok(res);
+            }
         }
         return join_select(
             db,
@@ -4016,6 +4034,139 @@ async fn streaming_nlj_select(
     apply_offset_limit(&mut out, offset, Some(limit));
     let (osch, rows) = project_exprs(&select.projection, &schema, &out)?;
     Ok(Some(QueryResult::Rows(RowStream::literal(osch, rows))))
+}
+
+/// Streaming index nested-loop **aggregation** for
+/// `SELECT ... aggregates ... FROM driving JOIN partner
+///  ON driving.k = partner.<pk|indexed> [WHERE] GROUP BY ... [HAVING] [ORDER BY] [LIMIT]`.
+///
+/// Scans the driving table incrementally, probes the indexed partner per row,
+/// applies the residual WHERE, and feeds each joined row into the spilling
+/// aggregator (`SpillAgg`) -- so a large join followed by GROUP BY is bounded by
+/// the group state (which spills), not by the full join output. The combined
+/// schema (driving cols ++ partner cols) matches `build_from`'s index-NLJ path
+/// and `join_select`, so projection/GROUP BY/HAVING resolve identically. Returns
+/// `None` when the query does not fit this shape, so the caller falls back to
+/// the materialising `join_select` (no behaviour change otherwise).
+#[allow(clippy::too_many_arguments)]
+async fn streaming_join_aggregate(
+    db: &Session,
+    select: &Select,
+    filter: Option<&Expr>,
+    group_by: &[Expr],
+    order_exprs: &[(Expr, bool)],
+    offset: usize,
+    limit: Option<usize>,
+) -> Result<Option<QueryResult>> {
+    // Reads inside a transaction must see the write overlay -> materialising path.
+    if db.in_txn() || select.distinct.is_some() || select.from.len() != 1 {
+        return Ok(None);
+    }
+    let twj = &select.from[0];
+    if twj.joins.len() != 1
+        || !matches!(twj.relation, TableFactor::Table { .. })
+        || !matches!(twj.joins[0].relation, TableFactor::Table { .. })
+    {
+        return Ok(None);
+    }
+    let join = &twj.joins[0];
+    let (kind, on) = join_kind(&join.join_operator)?;
+    if !matches!(kind, JoinKind::Inner | JoinKind::Left) {
+        return Ok(None);
+    }
+    let Some(on) = on else { return Ok(None) };
+    let (ddef, dcols) = resolve_table(db, &twj.relation).await?;
+    let (pdef, pcols) = resolve_table(db, &join.relation).await?;
+    let driving_schema = Schema::new(dcols.clone());
+    let partner_schema = Schema::new(pcols.clone());
+    let Some((driving_key, pcol)) = equi_nlj(&on, &driving_schema, &partner_schema) else {
+        return Ok(None);
+    };
+    if !(pdef.pk_cols == [pcol] || index::index_on(&pdef, pcol).is_some()) {
+        return Ok(None);
+    }
+
+    // Combined schema: driving columns then partner columns.
+    let mut all_cols = dcols;
+    all_cols.extend(pcols.clone());
+    let schema = Schema::new(all_cols);
+
+    // Build the aggregation plan; if it isn't a plain aggregate/group plan we can
+    // stream, fall back to join_select (which is the authoritative path and will
+    // reproduce any real error).
+    let plan = match aggregate::build_plan(&schema, &select.projection, group_by) {
+        Ok(p) => p,
+        Err(_) => return Ok(None),
+    };
+    let extend = !plan.arg_exprs().is_empty();
+    let plen = pcols.len();
+    let left_outer = kind == JoinKind::Left;
+
+    let keep = |row: &[Value]| -> Result<bool> {
+        match filter {
+            Some(f) => predicate::matches(f, &schema, row),
+            None => Ok(true),
+        }
+    };
+
+    let mut sa = SpillAgg::new(&plan);
+    let prefix = data_prefix(&ddef.name);
+    let mut cursor: Option<Vec<u8>> = None;
+    loop {
+        let batch = db.scan_batch(prefix.clone(), cursor.clone(), 4096).await?;
+        if batch.is_empty() {
+            break;
+        }
+        let last = batch.len() < 4096;
+        cursor = batch.last().map(|(k, _)| k.clone());
+        for (_, v) in batch {
+            let l: Vec<Value> =
+                bincode::deserialize(&v).map_err(|e| Error::Storage(e.to_string()))?;
+            let key = predicate::eval_row(&driving_key, &driving_schema, &l)?;
+            let matches = if key.is_null() {
+                Vec::new()
+            } else {
+                lookup_rows_by_eq(db, &pdef, pcol, &key).await?
+            };
+            let matched = !matches.is_empty();
+            for m in matches {
+                let mut combined = l.clone();
+                combined.extend(m);
+                if !keep(&combined)? {
+                    continue;
+                }
+                let fed = if extend {
+                    plan.extend_row(&combined)?
+                } else {
+                    combined
+                };
+                sa.feed_extended(fed)?;
+            }
+            if left_outer && !matched {
+                let mut combined = l.clone();
+                combined.extend(std::iter::repeat_n(Value::Null, plen));
+                if keep(&combined)? {
+                    let fed = if extend {
+                        plan.extend_row(&combined)?
+                    } else {
+                        combined
+                    };
+                    sa.feed_extended(fed)?;
+                }
+            }
+        }
+        if last {
+            break;
+        }
+    }
+
+    // Finalise, then HAVING / ORDER BY / OFFSET-LIMIT over the (small) grouped
+    // output -- exactly as join_select's aggregation branch does.
+    let (osch, orows) = sa.finalize()?;
+    let mut orows = apply_having(select.having.as_ref(), &select.projection, &osch, orows)?;
+    order_output_rows(&mut orows, &osch, order_exprs)?;
+    apply_offset_limit(&mut orows, offset, limit);
+    Ok(Some(QueryResult::Rows(RowStream::literal(osch, orows))))
 }
 
 /// The table qualifiers (alias or name) of every relation in a FROM clause.
@@ -10153,26 +10304,84 @@ async fn estimate_group_count(
 /// overflows the group cap. Rows are routed to partitions by group-key hash and
 /// spilled to temp files; each partition is then aggregated independently in
 /// bounded memory. Returns finalized output rows.
+/// Reusable resident-plus-spill group aggregator, shared by the base-table
+/// scan path and the streaming join path. It aggregates the first `max_groups`
+/// distinct groups fully in memory; every later row for a *new* group is routed
+/// to one of `SPILL_PARTS` disk partitions. Because a group is either resident
+/// (all its rows aggregated in memory) or absent (all its rows spilled), the
+/// resident and spilled group sets are disjoint, so their results concatenate
+/// without a cross-merge. Memory is bounded by the group cap plus partition
+/// buffers, independent of input size.
+struct SpillAgg<'p> {
+    plan: &'p AggPlan,
+    resident: GroupAggregator,
+    parts: crate::aggspill::Partitions,
+    group_cols: Vec<usize>,
+}
+
+const SPILL_PARTS: usize = 256;
+
+impl<'p> SpillAgg<'p> {
+    fn new(plan: &'p AggPlan) -> Self {
+        SpillAgg {
+            resident: plan.new_aggregator(),
+            parts: crate::aggspill::Partitions::new(SPILL_PARTS, crate::sort::sort_max_rows()),
+            group_cols: plan.group_cols().to_vec(),
+            plan,
+        }
+    }
+
+    /// Feed a row that has already had `extend_row` applied (when the plan needs
+    /// argument expressions). Resident groups aggregate in memory; overflow-group
+    /// rows spill.
+    fn feed_extended(&mut self, fed: Vec<Value>) -> Result<()> {
+        if !self.resident.try_feed(&fed) {
+            let gk: Vec<Value> = self
+                .group_cols
+                .iter()
+                .map(|&c| fed.get(c).cloned().unwrap_or(Value::Null))
+                .collect();
+            let p = crate::aggspill::partition_of(&Value::row_collation_key(&gk), SPILL_PARTS);
+            self.parts.route(p, fed)?;
+        }
+        Ok(())
+    }
+
+    /// Finalise resident groups, then aggregate each spilled partition
+    /// independently and concatenate (all group sets are disjoint).
+    fn finalize(mut self) -> Result<(Schema, Vec<Vec<Value>>)> {
+        let (schema, resident_rows) = self.plan.finalize(self.resident)?;
+        let mut out_rows: Vec<Vec<Value>> = resident_rows;
+        for p in 0..self.parts.len() {
+            let mut agg = self.plan.new_aggregator();
+            self.parts.drain_each(p, |row| {
+                // Rows were already filtered and extended before spilling.
+                agg.feed(&row);
+                Ok(())
+            })?;
+            if agg.overflowed() {
+                return Err(Error::Query(format!(
+                    "GROUP BY partition still exceeds the group limit ({}); raise \
+                     ELYRASQL_GROUP_MAX_GROUPS",
+                    elyra_olap::default_max_groups()
+                )));
+            }
+            let (_s, rows) = self.plan.finalize(agg)?;
+            out_rows.extend(rows);
+        }
+        Ok((schema, out_rows))
+    }
+}
+
 async fn partitioned_aggregate(
     db: &Session,
     def: &TableDef,
     filter: Option<Expr>,
     plan: &AggPlan,
 ) -> Result<(Schema, Vec<Vec<Value>>)> {
-    const PARTS: usize = 256;
-    let budget = crate::sort::sort_max_rows();
-    let group_cols = plan.group_cols().to_vec();
+    // Single pass over the table, feeding the shared resident+spill aggregator.
     let extend = !plan.arg_exprs().is_empty();
-    let mut parts = crate::aggspill::Partitions::new(PARTS, budget);
-
-    // Phase 1: a single pass that aggregates in memory and spills only the rows
-    // whose group does not fit. The in-memory aggregator holds the first
-    // `max_groups` distinct groups fully aggregated; every later row for a
-    // *new* group is routed to a disk partition. Because a group is either
-    // resident (all its rows aggregated in memory) or absent (all its rows
-    // spilled), the in-memory and spilled group sets are disjoint -- so their
-    // results simply concatenate, no cross-merge needed.
-    let mut resident = plan.new_aggregator();
+    let mut sa = SpillAgg::new(plan);
     let prefix = data_prefix(&def.name);
     let mut cursor: Option<Vec<u8>> = None;
     loop {
@@ -10191,43 +10400,13 @@ async fn partitioned_aggregate(
                 }
             }
             let fed = if extend { plan.extend_row(&row)? } else { row };
-            if !resident.try_feed(&fed) {
-                // Group not resident and memory full -> spill this row.
-                let gk: Vec<Value> = group_cols
-                    .iter()
-                    .map(|&c| fed.get(c).cloned().unwrap_or(Value::Null))
-                    .collect();
-                let p = crate::aggspill::partition_of(&Value::row_collation_key(&gk), PARTS);
-                parts.route(p, fed)?;
-            }
+            sa.feed_extended(fed)?;
         }
         if last {
             break;
         }
     }
-
-    // Phase 2: finalise the resident groups, then aggregate each spilled
-    // partition independently and concatenate (all group sets are disjoint).
-    let (schema, resident_rows) = plan.finalize(resident)?;
-    let mut out_rows: Vec<Vec<Value>> = resident_rows;
-    for p in 0..parts.len() {
-        let mut agg = plan.new_aggregator();
-        parts.drain_each(p, |row| {
-            // Rows were already filtered and extended before spilling.
-            agg.feed(&row);
-            Ok(())
-        })?;
-        if agg.overflowed() {
-            return Err(Error::Query(format!(
-                "GROUP BY partition still exceeds the group limit ({}); raise \
-                 ELYRASQL_GROUP_MAX_GROUPS",
-                elyra_olap::default_max_groups()
-            )));
-        }
-        let (_s, rows) = plan.finalize(agg)?;
-        out_rows.extend(rows);
-    }
-    Ok((schema, out_rows))
+    sa.finalize()
 }
 
 /// Scan the table in batches and aggregate them across worker threads, merging

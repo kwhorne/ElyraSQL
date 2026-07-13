@@ -145,24 +145,24 @@ async fn joins() {
     let srv = TestServer::start().await;
     let mut c = srv.conn().await;
 
-    c.query_drop("CREATE TABLE authors (id INT PRIMARY KEY, name VARCHAR(32))")
+    c.query_drop("CREATE TABLE jn_authors (id INT PRIMARY KEY, name VARCHAR(32))")
         .await
         .unwrap();
-    c.query_drop("CREATE TABLE books (id INT PRIMARY KEY, author_id INT, title VARCHAR(64))")
+    c.query_drop("CREATE TABLE jn_books (id INT PRIMARY KEY, author_id INT, title VARCHAR(64))")
         .await
         .unwrap();
-    c.query_drop("INSERT INTO authors VALUES (1,'Tolkien'),(2,'Le Guin')")
+    c.query_drop("INSERT INTO jn_authors VALUES (1,'Tolkien'),(2,'Le Guin')")
         .await
         .unwrap();
     c.query_drop(
-        "INSERT INTO books VALUES (1,1,'The Hobbit'),(2,1,'LOTR'),(3,2,'A Wizard of Earthsea')",
+        "INSERT INTO jn_books VALUES (1,1,'The Hobbit'),(2,1,'LOTR'),(3,2,'A Wizard of Earthsea')",
     )
     .await
     .unwrap();
 
     let mut rows: Vec<(String, String)> = c
         .query(
-            "SELECT a.name, b.title FROM authors a JOIN books b ON b.author_id = a.id ORDER BY b.id",
+            "SELECT a.name, b.title FROM jn_authors a JOIN jn_books b ON b.author_id = a.id ORDER BY b.id",
         )
         .await
         .unwrap();
@@ -224,6 +224,139 @@ async fn native_prepared_statements() {
         .await
         .unwrap();
     assert_eq!(rows, vec![(2, "pear".into(), 8), (3, "plum".into(), 13)]);
+}
+
+/// Join followed by GROUP BY over an indexed partner -- exercises the streaming
+/// index nested-loop aggregation path (bounded memory) and must produce exactly
+/// the same result as the materialising join.
+#[tokio::test]
+async fn join_group_by_streaming() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop("CREATE TABLE sj_dim (id INT PRIMARY KEY, category VARCHAR(8))")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE sj_facts (id INT PRIMARY KEY, dim_id INT, amount INT)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO sj_dim VALUES (1,'A'),(2,'B'),(3,'A')")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO sj_facts VALUES (1,1,10),(2,1,20),(3,2,5),(4,3,7),(5,2,15),(6,1,3)")
+        .await
+        .unwrap();
+
+    // category A = sj_dim {1,3}: sj_facts 1,2,6 (10,20,3) + fact 4 (7) => count 4, sum 40
+    // category B = sj_dim {2}:   sj_facts 3,5 (5,15)               => count 2, sum 20
+    let mut rows: Vec<(String, i64, i64)> = c
+        .query(
+            "SELECT d.category, COUNT(*), SUM(f.amount) \
+             FROM sj_facts f JOIN sj_dim d ON f.dim_id = d.id \
+             GROUP BY d.category",
+        )
+        .await
+        .unwrap();
+    rows.sort();
+    assert_eq!(rows, vec![("A".into(), 4, 40), ("B".into(), 2, 20)]);
+
+    // WHERE (pushed through the join) + GROUP BY
+    let mut rows: Vec<(String, i64, i64)> = c
+        .query(
+            "SELECT d.category, COUNT(*), SUM(f.amount) \
+             FROM sj_facts f JOIN sj_dim d ON f.dim_id = d.id \
+             WHERE f.amount >= 10 GROUP BY d.category",
+        )
+        .await
+        .unwrap();
+    rows.sort();
+    assert_eq!(rows, vec![("A".into(), 2, 30), ("B".into(), 1, 15)]);
+
+    // HAVING + ORDER BY over the grouped output
+    let rows: Vec<(String, i64)> = c
+        .query(
+            "SELECT d.category, COUNT(*) c \
+             FROM sj_facts f JOIN sj_dim d ON f.dim_id = d.id \
+             GROUP BY d.category HAVING COUNT(*) > 2 ORDER BY d.category",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![("A".into(), 4)]);
+}
+
+/// Join + GROUP BY where the partner is NOT indexed on the join key, so the
+/// streaming path declines and the materialising `join_select` handles the
+/// aggregation. Same correct result -- this guards the fallback path.
+#[tokio::test]
+async fn join_group_by_fallback() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop("CREATE TABLE fb_authors (id INT PRIMARY KEY, name VARCHAR(32))")
+        .await
+        .unwrap();
+    // author_id is a plain column (no index) -> streaming NLJ does not apply
+    c.query_drop("CREATE TABLE fb_books (id INT PRIMARY KEY, author_id INT, price INT)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO fb_authors VALUES (1,'Tolkien'),(2,'Le Guin')")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO fb_books VALUES (1,1,30),(2,1,20),(3,2,25)")
+        .await
+        .unwrap();
+
+    let mut rows: Vec<(String, i64, i64)> = c
+        .query(
+            "SELECT a.name, COUNT(*), SUM(b.price) \
+             FROM fb_authors a JOIN fb_books b ON b.author_id = a.id \
+             GROUP BY a.name",
+        )
+        .await
+        .unwrap();
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![("Le Guin".into(), 1, 25), ("Tolkien".into(), 2, 50)]
+    );
+}
+
+/// LEFT join + GROUP BY: an unmatched driving row must form a NULL-category
+/// group, matching MySQL semantics.
+#[tokio::test]
+async fn left_join_group_by_streaming() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop("CREATE TABLE lj_dim (id INT PRIMARY KEY, category VARCHAR(8))")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE lj_facts (id INT PRIMARY KEY, dim_id INT, amount INT)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO lj_dim VALUES (1,'A'),(2,'B'),(3,'A')")
+        .await
+        .unwrap();
+    c.query_drop(
+        "INSERT INTO lj_facts VALUES (1,1,10),(2,1,20),(3,2,5),(4,3,7),(5,2,15),(6,1,3),(7,99,100)",
+    )
+    .await
+    .unwrap();
+
+    // fact 7 has dim_id=99 (no match) -> NULL category group of count 1
+    let mut rows: Vec<(Option<String>, i64)> = c
+        .query(
+            "SELECT d.category, COUNT(*) \
+             FROM lj_facts f LEFT JOIN lj_dim d ON f.dim_id = d.id \
+             GROUP BY d.category",
+        )
+        .await
+        .unwrap();
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![(None, 1), (Some("A".into()), 4), (Some("B".into()), 2)]
+    );
 }
 
 #[tokio::test]

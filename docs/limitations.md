@@ -96,12 +96,18 @@ implemented, so you can judge fit.
   temp file is rejected rather than triggering a giant allocation, and stale
   spill files left by a killed process (SIGKILL) are reclaimed at startup (only
   files owned by confirmed-dead PIDs are removed).
-- **Multi-table joins are still materialized in memory**: `build_from` builds
-  the full join result before `ORDER BY`/`GROUP BY` are applied, so a very large
-  join with sorting/grouping is bounded by the join output size (the sort/group
-  spilling above helps single-table scans, not joined output). Streaming join
-  output (so joins feed the spilling sorter/aggregator directly) is a planned
-  refactor.
+- **Join + `GROUP BY` on an indexed partner streams**: for the common shape
+  `FROM driving JOIN partner ON driving.k = partner.<pk|indexed> [WHERE]
+  GROUP BY ...` (INNER or LEFT), the driving table is scanned incrementally, the
+  partner is probed by index, and joined rows feed the spilling aggregator
+  directly -- so a large fact-to-dimension join with grouping is bounded by the
+  group state (which spills), not the join output size. Also streamed: the same
+  join shape with `LIMIT` and no grouping (early-stop index nested-loop).
+- **Other joins still materialize in memory**: a hash/nested-loop join, or a
+  join whose partner is not indexed on the join key, builds the full join result
+  before `ORDER BY`/`GROUP BY` are applied, so a very large such join with
+  sorting/grouping is bounded by the join output size. Streaming the remaining
+  join shapes (feeding the spilling sorter directly) is a planned refactor.
 - Uncommitted transaction writes are buffered in memory (not spilled to disk)
   until `COMMIT`/`ROLLBACK`. To keep this bounded, a transaction that stages more
   than `ELYRASQL_TXN_MAX_BYTES` (default 1 GiB) of writes has its next write
