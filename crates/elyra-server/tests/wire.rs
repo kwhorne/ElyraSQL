@@ -603,6 +603,37 @@ async fn bigint_unsigned() {
     assert_eq!(rows, vec![(1, 18446744073709551610), (2, 42)]);
 }
 
+/// Unary bitwise-NOT `~` (rewritten to XOR with all-ones), returning BIGINT
+/// UNSIGNED, including unsigned arithmetic on the result. [ESQL-3 / ESQL-10]
+#[tokio::test]
+async fn bitwise_not() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    let v: u64 = c.query_first("SELECT ~5").await.unwrap().unwrap();
+    assert_eq!(v, u64::MAX - 5);
+    let v: u64 = c.query_first("SELECT ~0").await.unwrap().unwrap();
+    assert_eq!(v, u64::MAX);
+    let v: u64 = c.query_first("SELECT ~~5").await.unwrap().unwrap();
+    assert_eq!(v, 5); // double NOT
+    let v: u64 = c.query_first("SELECT ~(1 + 1)").await.unwrap().unwrap();
+    assert_eq!(v, u64::MAX - 2);
+    // unsigned arithmetic on the NOT result
+    let v: u64 = c.query_first("SELECT ~1 + 1").await.unwrap().unwrap();
+    assert_eq!(v, u64::MAX);
+
+    c.query_drop("CREATE TABLE bn (id INT PRIMARY KEY, flags INT)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO bn VALUES (1, 5)").await.unwrap();
+    let v: u64 = c
+        .query_first("SELECT ~flags FROM bn")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(v, u64::MAX - 5);
+}
+
 /// Bitwise shift operators `<<` and `>>` (parsed via the generic-dialect
 /// fallback, evaluated as 64-bit shifts). [ESQL-3]
 #[tokio::test]

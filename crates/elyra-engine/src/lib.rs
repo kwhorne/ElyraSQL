@@ -1251,6 +1251,11 @@ impl Engine {
         if let Some(rewritten) = rewrite_comma_update(&subst_sql) {
             subst_sql = rewritten;
         }
+        // Rewrite unary bitwise-NOT `~x` into `(x ^ 18446744073709551615)` (the
+        // parser has no `~` prefix); the result is BIGINT UNSIGNED.
+        if let Some(rewritten) = rewrite_tilde(&subst_sql) {
+            subst_sql = rewritten;
+        }
         let statements = match Parser::parse_sql(&dialect, &subst_sql) {
             Ok(s) => s,
             Err(e) => {
@@ -2003,6 +2008,181 @@ fn strip_dml_limit(sql: &str) -> Option<String> {
     None
 }
 
+/// Rewrite MySQL's unary bitwise-NOT `~<operand>` into `(<operand> ^
+/// 18446744073709551615)` (XOR with all-ones = 64-bit NOT), which the parser
+/// accepts and the evaluator computes as `BIGINT UNSIGNED` (see `Value::UInt`).
+/// The MySQL/generic dialects have no prefix parser for `~`, so this bridges it.
+/// Quote-aware; processes right-to-left so nested `~~x` works. Returns None if
+/// there is no top-level `~`, or if any `~`'s operand isn't a shape we can bound
+/// safely (then the original is left to fail parsing rather than be mis-scoped).
+fn rewrite_tilde(sql: &str) -> Option<String> {
+    if !sql.contains('~') {
+        return None;
+    }
+    let mut s = sql.to_string();
+    // Rewrite the right-most `~` each pass until none remain (nested `~~x` works
+    // because the inner one becomes `(...)` before the outer is processed).
+    while let Some(p) = last_top_level_tilde(&s) {
+        // Operand starts at the first non-space after `~`.
+        let b = s.as_bytes();
+        let mut j = p + 1;
+        while j < b.len() && (b[j] == b' ' || b[j] == b'\t') {
+            j += 1;
+        }
+        let Some(end) = tilde_operand_end(&s, j) else {
+            return None; // un-boundable operand -> abandon the rewrite
+        };
+        let operand = &s[j..end];
+        let replaced = format!("({operand} ^ 18446744073709551615)");
+        s = format!("{}{}{}", &s[..p], replaced, &s[end..]);
+    }
+    Some(s)
+}
+
+/// Byte offset of the right-most `~` that is outside any string literal.
+fn last_top_level_tilde(s: &str) -> Option<usize> {
+    let b = s.as_bytes();
+    let (mut in_s, mut in_d, mut in_b) = (false, false, false);
+    let mut last = None;
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if in_s {
+            if c == b'\'' {
+                in_s = false;
+            }
+        } else if in_d {
+            if c == b'"' {
+                in_d = false;
+            }
+        } else if in_b {
+            if c == b'`' {
+                in_b = false;
+            }
+        } else {
+            match c {
+                b'\'' => in_s = true,
+                b'"' => in_d = true,
+                b'`' => in_b = true,
+                b'~' => last = Some(i),
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    last
+}
+
+/// End (exclusive) of the unary operand starting at byte `start`, for the safe
+/// shapes: parenthesised expr, number, backtick/plain identifier chain
+/// (optionally a function call). Returns None for anything else.
+fn tilde_operand_end(s: &str, start: usize) -> Option<usize> {
+    let b = s.as_bytes();
+    if start >= b.len() {
+        return None;
+    }
+    match b[start] {
+        b'(' => matching_paren_end(s, start),
+        b'0'..=b'9' => {
+            let mut i = start;
+            while i < b.len() && (b[i].is_ascii_digit() || b[i] == b'.') {
+                i += 1;
+            }
+            Some(i)
+        }
+        b'`' => {
+            // backtick identifier, then optional `.col` / call
+            let mut i = start + 1;
+            while i < b.len() && b[i] != b'`' {
+                i += 1;
+            }
+            if i >= b.len() {
+                return None;
+            }
+            i += 1; // closing backtick
+            ident_tail_end(s, i)
+        }
+        c if c.is_ascii_alphabetic() || c == b'_' || c == b'@' => {
+            let mut i = start;
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] == b'@') {
+                i += 1;
+            }
+            ident_tail_end(s, i)
+        }
+        _ => None,
+    }
+}
+
+/// Extend an identifier operand across `.member` and a trailing `(...)` call.
+fn ident_tail_end(s: &str, mut i: usize) -> Option<usize> {
+    let b = s.as_bytes();
+    loop {
+        if i < b.len() && b[i] == b'.' {
+            i += 1;
+            if i < b.len() && b[i] == b'`' {
+                i += 1;
+                while i < b.len() && b[i] != b'`' {
+                    i += 1;
+                }
+                if i >= b.len() {
+                    return None;
+                }
+                i += 1;
+            } else {
+                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] == b'@')
+                {
+                    i += 1;
+                }
+            }
+        } else if i < b.len() && b[i] == b'(' {
+            return matching_paren_end(s, i);
+        } else {
+            return Some(i);
+        }
+    }
+}
+
+/// End (exclusive) of a balanced parenthesised group starting at `start` (`(`),
+/// quote-aware. None if unbalanced.
+fn matching_paren_end(s: &str, start: usize) -> Option<usize> {
+    let b = s.as_bytes();
+    let (mut in_s, mut in_d, mut in_b) = (false, false, false);
+    let mut depth = 0i32;
+    let mut i = start;
+    while i < b.len() {
+        let c = b[i];
+        if in_s {
+            if c == b'\'' {
+                in_s = false;
+            }
+        } else if in_d {
+            if c == b'"' {
+                in_d = false;
+            }
+        } else if in_b {
+            if c == b'`' {
+                in_b = false;
+            }
+        } else {
+            match c {
+                b'\'' => in_s = true,
+                b'"' => in_d = true,
+                b'`' => in_b = true,
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i + 1);
+                    }
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Fuzz / property entry point: run the full SQL string-preprocessing chain and
 /// the parser over arbitrary input. It must **never panic** (only produce
 /// `Some`/`None`/`Ok`/`Err`), regardless of how malformed, non-UTF-8-boundary,
@@ -2024,6 +2204,9 @@ pub fn fuzz_preprocess_parse(sql: &str) {
         s = x;
     }
     if let Some(x) = rewrite_comma_update(&s) {
+        s = x;
+    }
+    if let Some(x) = rewrite_tilde(&s) {
         s = x;
     }
     let _ = split_top_level(&s, ',');

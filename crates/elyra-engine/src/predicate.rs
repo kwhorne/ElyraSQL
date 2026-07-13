@@ -2321,6 +2321,37 @@ fn arith(l: Value, op: &BinaryOperator, r: Value) -> Result<Value> {
             return Ok(v);
         }
     }
+    // Exact unsigned 64-bit arithmetic when either operand is UInt and both are
+    // integer-typed (MySQL: any unsigned operand makes the operation unsigned).
+    // Division stays float (like signed integer `/`), which MySQL renders as a
+    // decimal.
+    if matches!(l, Value::UInt(_)) || matches!(r, Value::UInt(_)) {
+        let as_u64 = |v: &Value| -> Option<u64> {
+            match v {
+                Value::UInt(u) => Some(*u),
+                Value::Int(i) => Some(*i as u64),
+                Value::Bool(b) => Some(*b as u64),
+                _ => None,
+            }
+        };
+        if let (Some(a), Some(b)) = (as_u64(&l), as_u64(&r)) {
+            let v = match op {
+                Plus => Some(a.wrapping_add(b)),
+                Minus => Some(a.wrapping_sub(b)),
+                Multiply => Some(a.wrapping_mul(b)),
+                Modulo => {
+                    if b == 0 {
+                        return Ok(Value::Null);
+                    }
+                    Some(a % b)
+                }
+                _ => None, // Divide -> fall through to float
+            };
+            if let Some(v) = v {
+                return Ok(Value::UInt(v));
+            }
+        }
+    }
     let (Some(a), Some(b)) = (num(&l), num(&r)) else {
         return Err(Error::Type("arithmetic on non-numeric value".into()));
     };
