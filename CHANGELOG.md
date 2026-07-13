@@ -4,6 +4,66 @@ All notable changes to ElyraSQL are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.0.0] - 2026-07-13
+
+First stable release. ElyraSQL is a robust, MySQL-compatible SQL server in Rust:
+a single ACID file, a broad SQL surface, vector + full-text + hybrid search, and
+parallel OLAP aggregation. This release closes a wave of correctness, robustness
+and compatibility work and commits to Semantic Versioning from here on. No
+on-disk format change from 0.9.x (`.edb` files upgrade in place).
+
+### Correctness fixes
+
+- **`SELECT DISTINCT` now deduplicates.** It was previously a no-op on the base
+  scan path (returned duplicate rows); it now dedups on the projected output,
+  before `OFFSET`/`LIMIT`, and is collation-aware.
+- **Native (binary) prepared statements** no longer desync across repeated
+  `COM_STMT_PREPARE` on one connection. Root-caused to a use-after-free and a
+  buffer-padding bug in the wire packet reader when a client (e.g. PDO/mysqlnd)
+  pipelines commands. PDO with `EMULATE_PREPARES=false` now works.
+- **Process-global catalog cache** is keyed by `(database, table)`, so multiple
+  databases in one process can't serve each other's schema.
+- Fixed a UTF-8 slicing panic in `UPDATE`/`DELETE` `LIMIT` stripping (found by
+  the new fuzzer).
+
+### SQL surface
+
+- **`BIGINT UNSIGNED`** is a first-class type (`Value::UInt`): columns store and
+  read values above `i64::MAX` exactly, and all bitwise operators (`&` `|` `^`
+  `<<` `>>` and unary `~`) return correct 64-bit unsigned results with exact
+  unsigned arithmetic.
+- **`GROUP BY ... WITH ROLLUP`** — subtotal + grand-total rows, re-aggregated per
+  level so `AVG`/`MIN`/`MAX` stay correct.
+- **`INSERT ... SET col = val`** and **comma-style multi-table `UPDATE`** are
+  accepted (rewritten to the standard forms).
+- **Per-column `_bin`/`BINARY` collation** is honored in `ORDER BY`, `GROUP BY`,
+  `DISTINCT` and equi-join keys (not just `WHERE`/`UNIQUE`/indexes).
+- **`ENUM`/`SET` value validation** — a non-member value is rejected.
+- **Qualified wildcard `alias.*`** in the projection.
+
+### Performance / robustness
+
+- **Streaming joins.** `INNER`/`LEFT` joins — explicit, comma, and N-table
+  left-deep chains — followed by `ORDER BY` or `GROUP BY` stream the driving
+  table through a spilling sorter/aggregator, so a large fact-to-dimensions join
+  is bounded by group/sort state, not the full join output size.
+- **Native prepared statements**: `describe_query` reports an exact result-column
+  count (incl. `*` over joins) at `PREPARE`.
+
+### Testing
+
+- End-to-end wire integration tests (independent `mysql_async` driver),
+  crash-recovery/durability tests, a committed Laravel/Eloquent + PyMySQL +
+  native-PDO compatibility harness in CI, property tests (value round-trips,
+  aggregation/ORDER BY invariants), and a `cargo-fuzz` target for the
+  preprocessing+parse pipeline. All gated in CI.
+
+### Notes
+
+- Deferred (documented in [limitations](docs/limitations.md)): streaming
+  `RIGHT`/`FULL`/non-equi/derived-table joins (the materialising path is correct;
+  only a rare OOM risk), and pre-commit 2-phase replication.
+
 ## [0.9.9] - 2026-07-12
 
 Wire-protocol release. ElyraSQL now owns its MySQL wire layer, which unblocked
@@ -1069,6 +1129,7 @@ core CRUD with `WHERE`/`ORDER BY`/`LIMIT`, indexes, aggregation and `GROUP BY`,
 joins, prepared statements, authentication and TLS, vector search (exact +
 HNSW), parallel OLAP aggregation, and transactions with snapshot isolation.
 
+[1.0.0]: https://github.com/kwhorne/ElyraSQL/releases/tag/v1.0.0
 [0.9.9]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.9.9
 [0.9.8]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.9.8
 [0.9.7]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.9.7

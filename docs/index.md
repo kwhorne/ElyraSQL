@@ -48,6 +48,7 @@ FROM docs ORDER BY dist LIMIT 5;
 Continue to [Getting Started](getting-started.md).
 
 !!! note "Project status"
-    ElyraSQL is young and moving fast. The feature set below is implemented and
-    tested, but see [Limitations](limitations.md) for known gaps
-    before relying on it in production.
+    ElyraSQL 1.0 is stable and follows Semantic Versioning. The feature set
+    below is implemented, tested and regression-gated in CI; see
+    [Limitations](limitations.md) for the honest list of what is not yet
+    implemented or differs from MySQL.

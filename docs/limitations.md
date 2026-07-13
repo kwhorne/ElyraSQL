@@ -1,7 +1,8 @@
 # Limitations
 
-ElyraSQL is young. This page is an honest inventory of what is **not** yet
-implemented, so you can judge fit.
+ElyraSQL 1.0 is stable and broadly MySQL-compatible. This page is an honest
+inventory of what is **not** yet implemented (or differs from MySQL), so you can
+judge fit before deploying.
 
 ## SQL surface
 
