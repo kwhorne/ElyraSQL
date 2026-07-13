@@ -45,8 +45,10 @@ implemented, so you can judge fit.
   grouping prefix and a grand-total row (dropped group columns are NULL),
   re-aggregating base rows per level so `AVG`/`MIN`/`MAX` stay correct. `ORDER
   BY`/`LIMIT` apply to the combined result (NULLs sort first).
-- Still rejected at parse time: the `<<`, `>>` and unary `~` bitwise operators
-  (`&`, `|`, `^` work). These need parser-level support the MySQL dialect lacks.
+- Bitwise shift operators `<<` and `>>` are supported (parsed via a generic-
+  dialect fallback, evaluated as 64-bit shifts), alongside `&`, `|`, `^`. The
+  unary bitwise-NOT `~` is still not parsed (no MySQL/generic-dialect prefix
+  support); use `b'...'` masks or arithmetic as a workaround.
 - Supported beyond the basics: multi-table `UPDATE`/`DELETE` via `JOIN`,
   `INSERT ... SELECT`, `CREATE TABLE ... AS SELECT`, `COUNT(DISTINCT ...)`,
   `UNION ALL`/`INTERSECT`/`EXCEPT`, `WITH RECURSIVE`, row/tuple `IN`, window

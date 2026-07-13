@@ -1254,11 +1254,14 @@ impl Engine {
         let statements = match Parser::parse_sql(&dialect, &subst_sql) {
             Ok(s) => s,
             Err(e) => {
-                // The MySQL dialect rejects `GROUP BY ... WITH ROLLUP`; the
-                // generic dialect parses it into a Rollup modifier the executor
-                // handles. Only retry for ROLLUP so other syntax stays on the
-                // MySQL dialect.
-                if subst_sql.to_ascii_lowercase().contains("rollup") {
+                // The MySQL dialect rejects `GROUP BY ... WITH ROLLUP` and the
+                // `<<` / `>>` shift operators; the generic dialect parses both
+                // (ROLLUP into a group-by modifier, shifts into
+                // PGBitwiseShiftLeft/Right, which the evaluator handles). Only
+                // retry for those so all other syntax stays on the MySQL dialect.
+                let lower = subst_sql.to_ascii_lowercase();
+                if lower.contains("rollup") || subst_sql.contains("<<") || subst_sql.contains(">>")
+                {
                     Parser::parse_sql(&sqlparser::dialect::GenericDialect {}, &subst_sql)
                         .map_err(|_| Error::Parse(e.to_string()))?
                 } else {

@@ -445,6 +445,31 @@ async fn left_join_group_by_streaming() {
 }
 
 /// MySQL's `INSERT ... SET col = val` shorthand (rewritten to the standard form).
+/// Bitwise shift operators `<<` and `>>` (parsed via the generic-dialect
+/// fallback, evaluated as 64-bit shifts). [ESQL-3]
+#[tokio::test]
+async fn bitwise_shift_operators() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    let v: i64 = c.query_first("SELECT 8 << 2").await.unwrap().unwrap();
+    assert_eq!(v, 32);
+    let v: i64 = c.query_first("SELECT 255 >> 4").await.unwrap().unwrap();
+    assert_eq!(v, 15);
+
+    c.query_drop("CREATE TABLE bw (id INT PRIMARY KEY, flags INT)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO bw VALUES (1,5),(2,8)")
+        .await
+        .unwrap();
+    let rows: Vec<(i64, i64, i64)> = c
+        .query("SELECT id, flags << 1, flags >> 1 FROM bw ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![(1, 10, 2), (2, 16, 4)]);
+}
+
 /// GROUP BY ... WITH ROLLUP adds per-prefix subtotal rows and a grand total,
 /// re-aggregating base rows at each level (so AVG stays correct). [ESQL-3]
 #[tokio::test]
