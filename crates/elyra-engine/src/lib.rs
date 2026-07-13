@@ -1992,7 +1992,11 @@ fn strip_dml_limit(sql: &str) -> Option<String> {
         return None; // no trailing number
     }
     let before_num = trimmed[..i].trim_end();
-    if before_num.len() >= 5 && before_num[before_num.len() - 5..].eq_ignore_ascii_case("limit") {
+    // Compare the last five *bytes* (LIMIT is ASCII); byte-indexing avoids a
+    // panic when `len - 5` would fall inside a multi-byte UTF-8 char. When they
+    // do match, `len - 5` is an ASCII (char) boundary, so the split below is safe.
+    let bb = before_num.as_bytes();
+    if bb.len() >= 5 && bb[bb.len() - 5..].eq_ignore_ascii_case(b"limit") {
         let kept = before_num[..before_num.len() - 5].trim_end();
         return Some(kept.to_string());
     }
@@ -2504,5 +2508,27 @@ mod fuzz_props {
             crate::fuzz_preprocess_parse(&format!("SELECT a FROM t GROUP BY a {a} WITH ROLLUP"));
             crate::fuzz_preprocess_parse(&format!("SELECT {a} << {a}"));
         }
+    }
+}
+
+#[cfg(test)]
+mod strip_dml_limit_utf8 {
+    use super::strip_dml_limit;
+    #[test]
+    fn multibyte_before_limit_does_not_panic() {
+        // 'é' is 2 bytes; various offsets before a trailing number must not panic.
+        for s in [
+            "UPDATE t SET x=é 5",
+            "DELETE FROM té 9",
+            "UPDATE é limité 3",
+            "UPDATE tμλ 12",
+        ] {
+            let _ = strip_dml_limit(s);
+        }
+        // sanity: a real LIMIT is still stripped
+        assert_eq!(
+            strip_dml_limit("UPDATE t SET x=1 LIMIT 5").unwrap(),
+            "UPDATE t SET x=1"
+        );
     }
 }
