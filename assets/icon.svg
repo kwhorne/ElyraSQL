@@ -1,0 +1,46 @@
+<svg width="512" height="512" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="ElyraSQL">
+  <defs>
+    <linearGradient id="node" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#5EEAD4"/>
+      <stop offset="1" stop-color="#14B8A6"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5">
+      <stop stop-color="#2DD4BF" stop-opacity="0.85"/>
+      <stop offset="1" stop-color="#2DD4BF" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="soft" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="6"/>
+    </filter>
+  </defs>
+
+  <!-- background -->
+  <rect x="0" y="0" width="512" height="512" rx="112" fill="#0A0B0E"/>
+
+  <!-- edges -->
+  <g stroke="#0F766E" stroke-width="20" stroke-linecap="round">
+    <line x1="250" y1="92"  x2="150" y2="222"/>
+    <line x1="250" y1="92"  x2="345" y2="200"/>
+    <line x1="150" y1="222" x2="345" y2="200"/>
+    <line x1="150" y1="222" x2="198" y2="412"/>
+    <line x1="345" y1="200" x2="358" y2="388"/>
+    <line x1="198" y1="412" x2="358" y2="388"/>
+  </g>
+
+  <!-- top spark node with glow + radiating lines -->
+  <circle cx="250" cy="80" r="70" fill="url(#glow)" filter="url(#soft)"/>
+  <g stroke="#2DD4BF" stroke-width="12" stroke-linecap="round">
+    <line x1="180" y1="80" x2="212" y2="80"/>
+    <line x1="288" y1="80" x2="320" y2="80"/>
+    <line x1="250" y1="18" x2="250" y2="44"/>
+    <line x1="250" y1="116" x2="250" y2="140"/>
+  </g>
+  <circle cx="250" cy="80" r="34" fill="url(#node)"/>
+
+  <!-- graph nodes -->
+  <g>
+    <circle cx="150" cy="222" r="27" fill="url(#node)"/>
+    <circle cx="345" cy="200" r="27" fill="url(#node)"/>
+    <circle cx="198" cy="412" r="27" fill="url(#node)"/>
+    <circle cx="358" cy="388" r="27" fill="url(#node)"/>
+  </g>
+</svg>

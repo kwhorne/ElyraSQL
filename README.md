@@ -1,21 +1,44 @@
+<div align="center">
+
+<img src="assets/png/icon-256.png" alt="ElyraSQL" width="128" height="128" />
+
 # ElyraSQL
 
+**A robust, MySQL-compatible SQL server written in Rust.**
+
+Single-file · ACID · OLAP-ready · vector-native · AI-native
+
 [![CI](https://github.com/kwhorne/ElyraSQL/actions/workflows/ci.yml/badge.svg)](https://github.com/kwhorne/ElyraSQL/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/kwhorne/ElyraSQL?color=14B8A6&label=release)](https://github.com/kwhorne/ElyraSQL/releases)
+[![License: MIT](https://img.shields.io/badge/license-MIT-14B8A6.svg)](LICENSE)
+[![Docker](https://img.shields.io/badge/ghcr.io-elyrasql-2496ED?logo=docker&logoColor=white)](https://github.com/kwhorne/ElyraSQL/pkgs/container/elyrasql)
+[![Docs](https://img.shields.io/badge/docs-elyracode.com-14B8A6)](https://elyracode.com/docs/sql-server)
 
-A robust, **MySQL-compatible** SQL server written in Rust. Single database
-file, ACID storage, OLAP-ready and vector-native — all under one brand.
+[Documentation](https://elyracode.com/docs/sql-server) ·
+[Quick start](#quick-start) ·
+[Benchmarks](BENCHMARKS.md) ·
+[Changelog](CHANGELOG.md)
 
-> Status: **v0.9.9**. A broad, MySQL-compatible SQL engine: full DDL/DML,
-> joins, subqueries (correlated too), CTEs (incl. `WITH RECURSIVE`), window
-> functions, set operations, transactions (snapshot + serializable), a large
-> function catalog, introspection (`SHOW` + `INFORMATION_SCHEMA`), vector search
-> and parallel OLAP aggregation. See the [changelog](CHANGELOG.md).
+</div>
+
+---
+
+ElyraSQL speaks the MySQL wire protocol, so your existing clients, drivers and
+frameworks connect unchanged — while the entire database lives in a single,
+crash-safe file. It pairs a broad, standards-minded SQL engine with a parallel
+analytical path and first-class vector search, all in one self-contained binary.
+
+> **Current release: v0.9.9.** A broad, MySQL-compatible SQL engine: full
+> DDL/DML, joins, subqueries (correlated too), CTEs (incl. `WITH RECURSIVE`),
+> window functions, set operations, transactions (snapshot + serializable), a
+> large function catalog, introspection (`SHOW` + `INFORMATION_SCHEMA`), vector
+> search and parallel OLAP aggregation. See the [changelog](CHANGELOG.md).
 
 ## Why ElyraSQL
 
 - **Framework-ready** — runs **Laravel/Eloquent** (migrations, models,
   relationships, transactions) and any MySQL-driver stack; see the
-  [Framework Integration guide](https://elyracode.com/sql/server/frameworks/).
+  [Framework Integration guide](https://elyracode.com/docs/sql-server/frameworks/).
 - **MySQL wire protocol** — connect with `mysql`, DBeaver, Workbench, or any
   MySQL driver in any language. No custom client required.
 - **One file** — the entire database lives in a single ACID file (`*.edb`),
@@ -68,7 +91,7 @@ file, ACID storage, OLAP-ready and vector-native — all under one brand.
 - **Introspection** — `SHOW TABLES`/`COLUMNS`/`INDEX`, `SHOW CREATE TABLE`,
   `DESCRIBE`, and a queryable `INFORMATION_SCHEMA`.
 
-See the [documentation site](https://kwhorne.github.io/ElyraSQL/) and
+See the [documentation site](https://elyracode.com/docs/sql-server) and
 [limitations](docs/limitations.md) for the full, honest picture.
 
 ## Architecture
@@ -99,7 +122,8 @@ Crates:
 | `elyra-engine`  | SQL parsing (MySQL dialect), planning, execution           |
 | `elyra-olap`    | Parallel, streaming group-aggregation kernel               |
 | `elyra-vector`  | Vector column type + ANN search (exact + HNSW)             |
-| `elyra-server`  | MySQL-compatible wire protocol server                      |
+| `elyra-wire`    | First-party MySQL wire protocol (handshake, auth, TLS)      |
+| `elyra-server`  | Connection handling, auth verification, prepared statements |
 | `elyra-cli`     | `elyrasql` binary (serve + admin)                          |
 
 Third-party engines are internal dependencies only — nothing user-facing
