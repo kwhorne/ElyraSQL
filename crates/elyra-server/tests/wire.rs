@@ -319,6 +319,65 @@ async fn join_group_by_streaming() {
     assert_eq!(rows, vec![("A".into(), 4)]);
 }
 
+/// INNER comma-joins (`FROM a, b WHERE a.k = b.k`) are normalized to a JOIN
+/// chain, so they stream (ORDER BY / GROUP BY) like explicit joins. [ESQL-6]
+#[tokio::test]
+async fn comma_join_streaming() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop("CREATE TABLE ord (id INT PRIMARY KEY, cust INT, amt INT)")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE cust (id INT PRIMARY KEY, name VARCHAR(8), reg_id INT)")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE reg (id INT PRIMARY KEY, r VARCHAR(4))")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO reg VALUES (10,'N'),(20,'S')")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO cust VALUES (1,'A',10),(2,'B',20)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO ord VALUES (1,1,100),(2,2,50),(3,1,80)")
+        .await
+        .unwrap();
+
+    // comma join + ORDER BY
+    let rows: Vec<(i64, String, i64)> = c
+        .query("SELECT ord.id, cust.name, ord.amt FROM ord, cust WHERE ord.cust = cust.id ORDER BY ord.amt DESC")
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            (1, "A".into(), 100),
+            (3, "A".into(), 80),
+            (2, "B".into(), 50)
+        ]
+    );
+
+    // comma join + GROUP BY
+    let mut g: Vec<(String, i64)> = c
+        .query("SELECT cust.name, SUM(ord.amt) FROM ord, cust WHERE ord.cust = cust.id GROUP BY cust.name")
+        .await
+        .unwrap();
+    g.sort();
+    assert_eq!(g, vec![("A".into(), 180), ("B".into(), 50)]);
+
+    // three-table comma join
+    let rows: Vec<(i64, String)> = c
+        .query("SELECT ord.id, reg.r FROM ord, cust, reg WHERE ord.cust = cust.id AND cust.reg_id = reg.id ORDER BY ord.id")
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![(1, "N".into()), (2, "S".into()), (3, "N".into())]
+    );
+}
+
 /// Three-table (left-deep) join streams for both ORDER BY and GROUP BY via the
 /// chained hash-join. [ESQL-6]
 #[tokio::test]

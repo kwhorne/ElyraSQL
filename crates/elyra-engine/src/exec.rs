@@ -3377,6 +3377,21 @@ pub async fn select(
         }
     }
 
+    // Normalise an INNER comma-join (`FROM a, b WHERE a.k = b.k`) into an explicit
+    // JOIN chain so it gets cost-based reordering and streaming. Done before the
+    // `select` local shadows the function name below.
+    if let SetExpr::Select(s) = query.body.as_ref() {
+        if s.from.len() > 1 && s.from.iter().all(|t| t.joins.is_empty()) {
+            if let Some(chain) = comma_join_chain(&s.from, s.selection.as_ref()) {
+                let mut q2 = query.clone();
+                if let SetExpr::Select(sm) = q2.body.as_mut() {
+                    sm.from = vec![chain];
+                }
+                return Box::pin(select(db, vindex, &q2)).await;
+            }
+        }
+    }
+
     let select = match query.body.as_ref() {
         SetExpr::Select(s) => s,
         _ => return Err(Error::Unsupported("only simple SELECT is supported".into())),
@@ -5795,6 +5810,71 @@ fn equi_qualifiers(pred: &Expr) -> Option<(String, String)> {
         return None;
     };
     Some((expr_qualifier(left)?, expr_qualifier(right)?))
+}
+
+/// Normalise an INNER comma-join (`FROM a, b, c WHERE a.k = b.k AND b.j = c.j`)
+/// into an explicit left-deep `JOIN` chain, using the WHERE equi-predicates as
+/// the `ON` conditions, so it flows through the full join machinery (cost-based
+/// reordering + streaming). Returns `None` unless every table is a plain table
+/// and each non-driving table is connected to the ones already in the chain by
+/// an equi-predicate. The original WHERE is kept unchanged by the caller (the
+/// equi-predicates remain as harmless residual filters), so semantics are
+/// preserved -- comma joins are always inner.
+fn comma_join_chain(from: &[TableWithJoins], selection: Option<&Expr>) -> Option<TableWithJoins> {
+    use sqlparser::ast::Join;
+    if from.len() < 2
+        || !from
+            .iter()
+            .all(|t| t.joins.is_empty() && matches!(t.relation, TableFactor::Table { .. }))
+    {
+        return None;
+    }
+    let quals: Vec<String> = from
+        .iter()
+        .map(|t| factor_qualifier(&t.relation).map(|q| q.to_ascii_lowercase()))
+        .collect::<Option<Vec<_>>>()?;
+    let mut conjuncts = Vec::new();
+    if let Some(f) = selection {
+        split_and(f, &mut conjuncts);
+    }
+    // (qual_a, qual_b, predicate) for each equi-conjunct connecting two tables.
+    let equis: Vec<(String, String, &Expr)> = conjuncts
+        .iter()
+        .filter_map(|c| {
+            equi_qualifiers(c).map(|(a, b)| (a.to_ascii_lowercase(), b.to_ascii_lowercase(), c))
+        })
+        .collect();
+
+    let mut used = vec![false; from.len()];
+    used[0] = true;
+    let mut acc: std::collections::HashSet<String> = [quals[0].clone()].into_iter().collect();
+    let mut joins: Vec<Join> = Vec::with_capacity(from.len() - 1);
+    for _ in 1..from.len() {
+        let mut found: Option<(usize, Expr)> = None;
+        'outer: for (i, q) in quals.iter().enumerate() {
+            if used[i] {
+                continue;
+            }
+            for (a, b, e) in &equis {
+                if (a == q && acc.contains(b)) || (b == q && acc.contains(a)) {
+                    found = Some((i, (*e).clone()));
+                    break 'outer;
+                }
+            }
+        }
+        let (i, on) = found?; // a table with no equi-connector -> not a clean chain
+        used[i] = true;
+        acc.insert(quals[i].clone());
+        joins.push(Join {
+            relation: from[i].relation.clone(),
+            global: false,
+            join_operator: JoinOperator::Inner(JoinConstraint::On(on)),
+        });
+    }
+    Some(TableWithJoins {
+        relation: from[0].relation.clone(),
+        joins,
+    })
 }
 
 fn expr_qualifier(e: &Expr) -> Option<String> {
