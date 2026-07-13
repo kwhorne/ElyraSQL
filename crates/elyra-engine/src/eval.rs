@@ -88,6 +88,10 @@ fn eval_literal(v: &SqlValue) -> Result<Value> {
         SqlValue::Number(n, _) => {
             if let Ok(i) = n.parse::<i64>() {
                 Ok(Value::Int(i))
+            } else if let Ok(u) = n.parse::<u64>() {
+                // Fits an unsigned 64-bit but not a signed one (e.g. a large
+                // BIGINT UNSIGNED literal) -> keep it exact rather than lossy f64.
+                Ok(Value::UInt(u))
             } else {
                 n.parse::<f64>()
                     .map(Value::Float)
@@ -110,6 +114,7 @@ fn infer_type(v: &Value) -> ColumnType {
         Value::Null => ColumnType::Text,
         Value::Bool(_) => ColumnType::Bool,
         Value::Int(_) => ColumnType::Int,
+        Value::UInt(_) => ColumnType::UInt,
         Value::Float(_) => ColumnType::Float,
         Value::Text(_) => ColumnType::Text,
         Value::Bytes(_) => ColumnType::Bytes,

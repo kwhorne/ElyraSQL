@@ -567,6 +567,42 @@ async fn left_join_group_by_streaming() {
 }
 
 /// MySQL's `INSERT ... SET col = val` shorthand (rewritten to the standard form).
+/// BIGINT UNSIGNED: values above i64::MAX and unsigned bitwise results round-trip
+/// and display correctly (Value::UInt). [ESQL-10]
+#[tokio::test]
+async fn bigint_unsigned() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    // bitwise results are BIGINT UNSIGNED (64-bit), not signed
+    let v: u64 = c
+        .query_first("SELECT 18446744073709551615 & 18446744073709551615")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(v, u64::MAX);
+    let v: u64 = c.query_first("SELECT 1 << 63").await.unwrap().unwrap();
+    assert_eq!(v, 1u64 << 63);
+
+    // native (binary) protocol path
+    let v: u64 = c
+        .exec_first("SELECT ? << ?", (1u64, 63u64))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(v, 1u64 << 63);
+
+    // BIGINT UNSIGNED column stores and reads values above i64::MAX exactly
+    c.query_drop("CREATE TABLE u (id INT PRIMARY KEY, big BIGINT UNSIGNED)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO u VALUES (1, 18446744073709551610), (2, 42)")
+        .await
+        .unwrap();
+    let rows: Vec<(i64, u64)> = c.query("SELECT id, big FROM u ORDER BY id").await.unwrap();
+    assert_eq!(rows, vec![(1, 18446744073709551610), (2, 42)]);
+}
+
 /// Bitwise shift operators `<<` and `>>` (parsed via the generic-dialect
 /// fallback, evaluated as 64-bit shifts). [ESQL-3]
 #[tokio::test]

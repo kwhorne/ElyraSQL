@@ -55,6 +55,11 @@ pub enum Value {
     Time(i64),
     /// JSON document (stored as its text form).
     Json(String),
+    /// 64-bit **unsigned** integer (MySQL `BIGINT UNSIGNED`). Kept distinct from
+    /// `Int` so values above `i64::MAX` (e.g. bitwise results, large unsigned
+    /// columns) are represented and displayed correctly. Added last so existing
+    /// bincode-encoded rows (which never contain it) still decode.
+    UInt(u64),
 }
 
 impl Value {
@@ -66,6 +71,7 @@ impl Value {
     pub fn as_f64(&self) -> Option<f64> {
         match self {
             Value::Int(i) => Some(*i as f64),
+            Value::UInt(u) => Some(*u as f64),
             Value::Float(f) => Some(*f),
             Value::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
             Value::Decimal(u, s) => Some(*u as f64 / 10f64.powi(*s as i32)),
@@ -117,6 +123,11 @@ impl Value {
             (Json(a), Text(b)) | (Text(b), Json(a)) => Some(fold_cmp(a, b)),
             (Bool(a), Bool(b)) => Some(a.cmp(b)),
             (Bytes(a), Bytes(b)) => Some(a.cmp(b)),
+            // Exact integer comparisons (avoid f64 precision loss above 2^53).
+            (UInt(a), UInt(b)) => Some(a.cmp(b)),
+            (Int(a), Int(b)) => Some(a.cmp(b)),
+            (UInt(a), Int(b)) => Some(cmp_u64_i64(*a, *b)),
+            (Int(a), UInt(b)) => Some(cmp_u64_i64(*b, *a).reverse()),
             // Mixed numeric/string comparison coerces the string to a number
             // (MySQL implicit conversion), so `int_col = '5'` and bound
             // parameters rendered as string literals match numeric columns.
@@ -157,6 +168,16 @@ impl Value {
                 let f = fold(s);
                 out.extend_from_slice(&(f.len() as u32).to_le_bytes());
                 out.extend_from_slice(f.as_bytes());
+            }
+            // UInt that fits in i64 keys identically to Int (so 5 == 5 across
+            // signedness for GROUP BY/DISTINCT); larger values get their own tag.
+            Value::UInt(u) if *u <= i64::MAX as u64 => {
+                out.push(1);
+                out.extend_from_slice(&(*u as i64).to_le_bytes());
+            }
+            Value::UInt(u) => {
+                out.push(6);
+                out.extend_from_slice(&u.to_le_bytes());
             }
             other => {
                 out.push(5);
@@ -255,6 +276,7 @@ impl Value {
             Value::Null => 0,
             Value::Bool(_) => 1,
             Value::Int(_) => 2,
+            Value::UInt(_) => 2,
             Value::Decimal(..) => 3,
             Value::Float(_) => 4,
             Value::Date(_) => 5,
@@ -273,6 +295,7 @@ impl Value {
             Value::Null => None,
             Value::Bool(b) => Some(if *b { "1".into() } else { "0".into() }),
             Value::Int(i) => Some(i.to_string()),
+            Value::UInt(u) => Some(u.to_string()),
             Value::Float(f) => Some(f.to_string()),
             Value::Text(s) => Some(s.clone()),
             Value::Bytes(b) => Some(String::from_utf8_lossy(b).into_owned()),
@@ -313,6 +336,15 @@ fn coerce_f64(v: &Value) -> Option<f64> {
     match v {
         Value::Text(s) | Value::Json(s) => s.trim().parse::<f64>().ok(),
         _ => v.as_f64(),
+    }
+}
+
+/// Exact ordering of a `u64` against an `i64` (no f64 rounding).
+fn cmp_u64_i64(a: u64, b: i64) -> Ordering {
+    if b < 0 {
+        Ordering::Greater // any u64 >= 0 > any negative i64
+    } else {
+        a.cmp(&(b as u64))
     }
 }
 
@@ -640,6 +672,7 @@ mod value_props {
             Just(Value::Null),
             any::<bool>().prop_map(Value::Bool),
             any::<i64>().prop_map(Value::Int),
+            any::<u64>().prop_map(Value::UInt),
             any::<f64>()
                 .prop_filter("no NaN", |f| !f.is_nan())
                 .prop_map(Value::Float),

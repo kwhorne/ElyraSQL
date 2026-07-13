@@ -46,6 +46,8 @@ fn encode_component(value: &Value, coll: Collation, out: &mut Vec<u8>) -> Result
     match value {
         // Flip the sign bit so negatives sort first; big-endian for order.
         Value::Int(i) => out.extend_from_slice(&(*i as u64 ^ 0x8000_0000_0000_0000).to_be_bytes()),
+        // Unsigned: plain big-endian is already order-preserving (no sign bit).
+        Value::UInt(u) => out.extend_from_slice(&u.to_be_bytes()),
         Value::Date(d) => out.extend_from_slice(&(*d as u32 ^ 0x8000_0000).to_be_bytes()),
         Value::DateTime(t) => {
             out.extend_from_slice(&(*t as u64 ^ 0x8000_0000_0000_0000).to_be_bytes())

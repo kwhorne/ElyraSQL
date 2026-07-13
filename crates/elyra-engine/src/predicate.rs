@@ -2208,6 +2208,7 @@ fn literal(v: &SqlValue) -> Result<Value> {
         SqlValue::Number(n, _) => n
             .parse::<i64>()
             .map(Value::Int)
+            .or_else(|_| n.parse::<u64>().map(Value::UInt))
             .or_else(|_| n.parse::<f64>().map(Value::Float))
             .map_err(|_| Error::Type(format!("invalid number: {n}"))),
         SqlValue::SingleQuotedString(s) | SqlValue::DoubleQuotedString(s) => {
@@ -2287,16 +2288,27 @@ fn binary(
 
 fn bitwise(l: Value, op: &BinaryOperator, r: Value) -> Result<Value> {
     use BinaryOperator::*;
-    let (a, b) = match (l.as_f64(), r.as_f64()) {
-        (Some(a), Some(b)) => (a as i64, b as i64),
+    // MySQL bitwise operators work on 64-bit **unsigned** integers and return
+    // BIGINT UNSIGNED. Coerce each operand to u64 (preserving the bit pattern of
+    // a signed value) and return a UInt so large results display correctly.
+    let to_u64 = |v: &Value| -> Option<u64> {
+        match v {
+            Value::UInt(u) => Some(*u),
+            Value::Int(i) => Some(*i as u64),
+            Value::Bool(b) => Some(*b as u64),
+            _ => v.as_f64().map(|f| f as i64 as u64),
+        }
+    };
+    let (a, b) = match (to_u64(&l), to_u64(&r)) {
+        (Some(a), Some(b)) => (a, b),
         _ => return Ok(Value::Null),
     };
-    Ok(Value::Int(match op {
+    Ok(Value::UInt(match op {
         BitwiseAnd => a & b,
         BitwiseOr => a | b,
         BitwiseXor => a ^ b,
-        PGBitwiseShiftLeft => a.wrapping_shl(b as u32),
-        PGBitwiseShiftRight => a.wrapping_shr(b as u32),
+        PGBitwiseShiftLeft => a.wrapping_shl((b & 63) as u32),
+        PGBitwiseShiftRight => a.wrapping_shr((b & 63) as u32),
         _ => return Err(Error::Unsupported(format!("operator not supported: {op}"))),
     }))
 }

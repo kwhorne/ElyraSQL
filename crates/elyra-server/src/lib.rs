@@ -231,10 +231,20 @@ fn stmt_describe_enabled() -> bool {
     })
 }
 
+/// Column flags for a result column: mark `BIGINT UNSIGNED` with UNSIGNED_FLAG so
+/// clients interpret large values (bitwise results, unsigned columns) correctly.
+fn column_flags(ty: &elyra_core::ColumnType) -> ColumnFlags {
+    match ty {
+        elyra_core::ColumnType::UInt => ColumnFlags::UNSIGNED_FLAG,
+        _ => ColumnFlags::empty(),
+    }
+}
+
 fn column_type(ty: &elyra_core::ColumnType) -> ColumnType {
     match ty {
         elyra_core::ColumnType::Bool => ColumnType::MYSQL_TYPE_TINY,
         elyra_core::ColumnType::Int => ColumnType::MYSQL_TYPE_LONGLONG,
+        elyra_core::ColumnType::UInt => ColumnType::MYSQL_TYPE_LONGLONG,
         elyra_core::ColumnType::Float => ColumnType::MYSQL_TYPE_DOUBLE,
         elyra_core::ColumnType::Text => ColumnType::MYSQL_TYPE_VAR_STRING,
         elyra_core::ColumnType::Bytes => ColumnType::MYSQL_TYPE_BLOB,
@@ -345,7 +355,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for ElyraShim {
                         table: String::new(),
                         column: c.name.clone(),
                         coltype: column_type(&c.ty),
-                        colflags: ColumnFlags::empty(),
+                        colflags: column_flags(&c.ty),
                     })
                     .collect(),
                 None => Vec::new(),
@@ -520,7 +530,7 @@ async fn write_outcomes<W: AsyncWrite + Send + Unpin>(
                     table: String::new(),
                     column: c.name.clone(),
                     coltype: column_type(&c.ty),
-                    colflags: ColumnFlags::empty(),
+                    colflags: column_flags(&c.ty),
                 })
                 .collect();
 
@@ -580,6 +590,7 @@ fn write_cell<W: AsyncWrite + Send + Unpin>(
         Value::Null => rw.write_col(None::<i64>),
         Value::Bool(b) => rw.write_col(*b as i8),
         Value::Int(i) => rw.write_col(*i),
+        Value::UInt(u) => rw.write_col(*u),
         Value::Float(f) => rw.write_col(*f),
         Value::Text(s) => rw.write_col(s.as_str()),
         Value::Bytes(b) => rw.write_col(b),

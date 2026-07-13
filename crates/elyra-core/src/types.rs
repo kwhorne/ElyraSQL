@@ -25,6 +25,9 @@ pub enum ColumnType {
     Time,
     /// JSON document.
     Json,
+    /// 64-bit unsigned integer (MySQL `BIGINT UNSIGNED`). Added last so existing
+    /// bincode-encoded catalogs (which never contain it) still decode.
+    UInt,
 }
 
 impl ColumnType {
@@ -33,6 +36,7 @@ impl ColumnType {
         match self {
             ColumnType::Bool => "TINYINT(1)".into(),
             ColumnType::Int => "BIGINT".into(),
+            ColumnType::UInt => "BIGINT UNSIGNED".into(),
             ColumnType::Float => "DOUBLE".into(),
             ColumnType::Text => "TEXT".into(),
             ColumnType::Bytes => "BLOB".into(),

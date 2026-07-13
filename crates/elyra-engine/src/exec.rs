@@ -71,8 +71,9 @@ fn map_type(dt: &DataType) -> Result<ColumnType> {
         | DataType::UnsignedSmallInt(_)
         | DataType::UnsignedMediumInt(_)
         | DataType::UnsignedInt(_)
-        | DataType::UnsignedInteger(_)
-        | DataType::UnsignedBigInt(_) => ColumnType::Int,
+        | DataType::UnsignedInteger(_) => ColumnType::Int,
+        // BIGINT UNSIGNED can exceed i64::MAX, so it needs the unsigned type.
+        DataType::UnsignedBigInt(_) => ColumnType::UInt,
         DataType::Float(_)
         | DataType::Real
         | DataType::Double
@@ -2603,16 +2604,27 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
                 }
             }
             if let Some(ai) = auto_col {
-                let need = !provided[ai] || row[ai].is_null() || matches!(row[ai], Value::Int(0));
+                let is_zero = matches!(row[ai], Value::Int(0)) || matches!(row[ai], Value::UInt(0));
+                let need = !provided[ai] || row[ai].is_null() || is_zero;
+                let col = &def.schema.columns[ai];
                 if need {
                     autoinc += 1;
-                    row[ai] = Value::Int(autoinc);
+                    // Coerce to the column type so a UInt (BIGINT UNSIGNED) PK
+                    // stores/looks up with the same key encoding as the value.
+                    row[ai] = coerce(Value::Int(autoinc), &col.ty, &col.name)?;
                     if first_id == 0 {
                         first_id = autoinc;
                     }
-                } else if let Value::Int(n) = row[ai] {
-                    if n > autoinc {
-                        autoinc = n;
+                } else {
+                    let n = match &row[ai] {
+                        Value::Int(n) => Some(*n),
+                        Value::UInt(u) => Some(*u as i64),
+                        _ => None,
+                    };
+                    if let Some(n) = n {
+                        if n > autoinc {
+                            autoinc = n;
+                        }
                     }
                 }
             }
@@ -9270,6 +9282,7 @@ fn value_to_expr(v: &Value) -> Expr {
         Value::Null => V::Null,
         Value::Bool(b) => V::Boolean(*b),
         Value::Int(i) => V::Number(i.to_string(), false),
+        Value::UInt(u) => V::Number(u.to_string(), false),
         Value::Float(f) => V::Number(f.to_string(), false),
         Value::Decimal(..) | Value::Date(_) | Value::DateTime(_) | Value::Time(_) => {
             V::SingleQuotedString(v.to_wire_string().unwrap_or_default())
@@ -11602,6 +11615,19 @@ fn coerce(v: Value, ty: &ColumnType, col: &str) -> Result<Value> {
             }
         }
         (ColumnType::Vector(dim), Value::Text(s)) => Value::Vector(parse_vector(&s, *dim)?),
+        // BIGINT UNSIGNED.
+        (ColumnType::UInt, Value::UInt(u)) => Value::UInt(u),
+        (ColumnType::UInt, Value::Int(i)) => Value::UInt(i as u64),
+        (ColumnType::UInt, Value::Bool(b)) => Value::UInt(b as u64),
+        (ColumnType::UInt, Value::Float(f)) => Value::UInt(f as u64),
+        (ColumnType::UInt, Value::Text(s)) => s
+            .trim()
+            .parse::<u64>()
+            .or_else(|_| s.trim().parse::<f64>().map(|f| f as u64))
+            .map(Value::UInt)
+            .map_err(|_| Error::Type(format!("invalid UNSIGNED value: {s}")))?,
+        (ColumnType::Int, Value::UInt(u)) => Value::Int(u as i64),
+        (ColumnType::Float, Value::UInt(u)) => Value::Float(u as f64),
         // Lenient (MySQL-style) conversions.
         (ColumnType::Int, Value::Float(f)) => Value::Int(f as i64),
         (ColumnType::Int, Value::Text(s)) => s
