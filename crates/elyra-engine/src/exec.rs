@@ -3206,6 +3206,54 @@ pub async fn select(
         return Box::pin(select(db, vindex, inner)).await;
     }
 
+    // SELECT DISTINCT: applied after projection and before OFFSET/LIMIT. Run the
+    // inner query without DISTINCT and without offset/limit (but keeping ORDER BY,
+    // so the output stays ordered and duplicates are adjacent), dedup the
+    // projected rows by a collation-aware key (so a `_bin` column distinguishes
+    // case), then apply offset/limit. This covers every underlying path (scan,
+    // join, aggregate) uniformly via one recursive call. Done before the `select`
+    // local shadows the function name below.
+    if let SetExpr::Select(s) = query.body.as_ref() {
+        if matches!(s.distinct, Some(sqlparser::ast::Distinct::Distinct)) {
+            let d_offset = match &query.offset {
+                Some(o) => eval_usize(&o.value)?,
+                None => 0,
+            };
+            let d_limit = match &query.limit {
+                Some(e) => Some(eval_usize(e)?),
+                None => None,
+            };
+            let mut inner_q = query.clone();
+            inner_q.limit = None;
+            inner_q.offset = None;
+            if let SetExpr::Select(si) = inner_q.body.as_mut() {
+                si.distinct = None;
+            }
+            let res = Box::pin(select(db, vindex, &inner_q)).await?;
+            let QueryResult::Rows(mut stream) = res else {
+                return Ok(res);
+            };
+            let schema = stream.schema.clone();
+            let colls: Vec<elyra_core::Collation> =
+                schema.columns.iter().map(|c| c.collation).collect();
+            let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+            let mut out: Vec<Vec<Value>> = Vec::new();
+            loop {
+                let batch = stream.next_batch(8192).await?;
+                if batch.is_empty() {
+                    break;
+                }
+                for row in batch {
+                    if seen.insert(Value::row_collation_key_coll(&row, &colls)) {
+                        out.push(row);
+                    }
+                }
+            }
+            apply_offset_limit(&mut out, d_offset, d_limit);
+            return Ok(QueryResult::Rows(RowStream::literal(schema, out)));
+        }
+    }
+
     let select = match query.body.as_ref() {
         SetExpr::Select(s) => s,
         _ => return Err(Error::Unsupported("only simple SELECT is supported".into())),
@@ -7080,17 +7128,26 @@ fn project_exprs(
     // a column reference (join-aware), else from the first non-NULL value.
     let mut cols = Vec::with_capacity(projs.len());
     for (ci, (name, p)) in names.iter().zip(&projs).enumerate() {
-        let ty = match p {
-            Proj::Col(i) => schema.columns[*i].ty.clone(),
+        // Carry the source column's type AND collation through a direct column
+        // projection, so DISTINCT / ORDER BY on a projected `_bin` column stays
+        // case-sensitive. Computed expressions default to Text/Ci.
+        let (ty, collation) = match p {
+            Proj::Col(i) => (schema.columns[*i].ty.clone(), schema.columns[*i].collation),
             Proj::Expr(e) => {
                 match col_ref_name(e).and_then(|n| predicate::resolve_index(&n, schema).ok()) {
-                    Some(idx) => schema.columns[idx].ty.clone(),
-                    None => out_rows
-                        .iter()
-                        .map(|r| &r[ci])
-                        .find(|v| !v.is_null())
-                        .map(infer_val)
-                        .unwrap_or(ColumnType::Text),
+                    Some(idx) => (
+                        schema.columns[idx].ty.clone(),
+                        schema.columns[idx].collation,
+                    ),
+                    None => (
+                        out_rows
+                            .iter()
+                            .map(|r| &r[ci])
+                            .find(|v| !v.is_null())
+                            .map(infer_val)
+                            .unwrap_or(ColumnType::Text),
+                        elyra_core::Collation::Ci,
+                    ),
                 }
             }
         };
@@ -7098,7 +7155,7 @@ fn project_exprs(
             name: name.clone(),
             ty,
             nullable: true,
-            collation: elyra_core::Collation::Ci,
+            collation,
         });
     }
 

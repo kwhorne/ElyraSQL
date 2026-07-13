@@ -416,6 +416,77 @@ async fn insert_set_shorthand() {
     assert_eq!(rows, vec![(1, "a,b".into(), 105), (2, "x".into(), 9)]);
 }
 
+/// SELECT DISTINCT deduplicates (was previously a no-op), applies LIMIT after
+/// dedup, and is collation-aware. [ESQL-8 / ESQL-4]
+#[tokio::test]
+async fn select_distinct() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop(
+        "CREATE TABLE u (id INT PRIMARY KEY, name VARCHAR(16), g VARCHAR(8) COLLATE utf8mb4_bin)",
+    )
+    .await
+    .unwrap();
+    c.query_drop("INSERT INTO u VALUES (1,'a','X'),(2,'a','X'),(3,'b','x'),(4,'a','x')")
+        .await
+        .unwrap();
+
+    // basic dedup
+    let names: Vec<String> = c
+        .query("SELECT DISTINCT name FROM u ORDER BY name")
+        .await
+        .unwrap();
+    assert_eq!(names, vec!["a", "b"]);
+
+    // multi-column dedup
+    let pairs: Vec<(String, String)> = c
+        .query("SELECT DISTINCT name, g FROM u ORDER BY name, g")
+        .await
+        .unwrap();
+    // (a,X),(a,X),(b,x),(a,x) -> three distinct pairs (g is _bin, so X != x)
+    assert_eq!(
+        pairs,
+        vec![
+            ("a".into(), "X".into()),
+            ("a".into(), "x".into()),
+            ("b".into(), "x".into())
+        ]
+    );
+
+    // LIMIT applies AFTER distinct
+    let limited: Vec<String> = c
+        .query("SELECT DISTINCT name FROM u ORDER BY name LIMIT 1")
+        .await
+        .unwrap();
+    assert_eq!(limited, vec!["a"]);
+
+    // _bin column: 'X' and 'x' are distinct
+    let gs: Vec<String> = c
+        .query("SELECT DISTINCT g FROM u ORDER BY g")
+        .await
+        .unwrap();
+    assert_eq!(gs, vec!["X", "x"]);
+}
+
+/// Default (case-insensitive) DISTINCT folds case, so 'A' and 'a' collapse.
+#[tokio::test]
+async fn select_distinct_case_insensitive() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop("CREATE TABLE v (id INT PRIMARY KEY, name VARCHAR(16))")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO v VALUES (1,'A'),(2,'a'),(3,'b')")
+        .await
+        .unwrap();
+    let names: Vec<String> = c
+        .query("SELECT DISTINCT name FROM v ORDER BY name")
+        .await
+        .unwrap();
+    assert_eq!(names.len(), 2); // A/a fold to one group
+}
+
 /// A `_bin` column sorts and groups case-sensitively (byte order); the default
 /// column is case-insensitive. [ESQL-4]
 #[tokio::test]
