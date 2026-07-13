@@ -294,14 +294,16 @@ implemented, so you can judge fit.
 - The MySQL wire layer is a **first-party crate (`elyra-wire`)**, forked from
   `opensrv-mysql`, so protocol behaviour is ours to fix and extend (this is what
   enabled rustls 0.23 and `caching_sha2_password`).
-- **Binary (native) prepared statements**: `describe_query` reports an exact
-  result-column count at `PREPARE` for single SELECTs with an explicit
-  projection, so native prepares read the result set correctly for the common
-  shapes. A few shapes still report no columns (e.g. `SELECT *` over
-  `information_schema` or a joined/derived source), which strict drivers may
-  mishandle. For maximum compatibility use client-side (emulated) prepared
-  statements — `PDO::ATTR_EMULATE_PREPARES => true` (Laravel `options`) or the
-  driver equivalent; PyMySQL and sqlx bind client-side and are unaffected.
+- **Binary (native) prepared statements** work for the common shapes, including
+  repeated prepares on one connection (a packet-reader desync that affected
+  drivers pipelining commands — e.g. PDO/mysqlnd with
+  `PDO::ATTR_EMULATE_PREPARES => false` — is fixed). `describe_query` reports an
+  exact result-column count at `PREPARE` (enable with `ELYRASQL_STMT_DESCRIBE`)
+  for single **and** joined/multi-table SELECTs, so `SELECT *` over a join
+  resolves its columns. Remaining gaps: `SELECT a.*` (qualified wildcard in the
+  projection) and `SELECT *` over `information_schema` are not yet executed.
+  Client-side (emulated) prepared statements remain the widest-compatibility
+  default; PyMySQL and sqlx bind client-side and are unaffected.
 - **`LOAD DATA INFILE`** reads a **server-side** file and bulk-inserts it
   (requires ADMIN, like MySQL's `FILE` privilege): `LOAD DATA INFILE '<path>'
   INTO TABLE t [FIELDS TERMINATED BY '...'] [ENCLOSED BY '...'] [LINES
