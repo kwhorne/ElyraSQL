@@ -3377,16 +3377,24 @@ pub async fn select(
         // `FROM a JOIN b ON a.k=b.<indexed> [WHERE ...] LIMIT n` (no GROUP BY,
         // aggregate, ORDER BY or DISTINCT): stops after enough rows instead of
         // materialising the whole join. Falls back to join_select otherwise.
-        if group_by.is_empty()
-            && order_exprs.is_empty()
-            && !aggregate::projection_has_aggregate(&select.projection)
-        {
-            if let Some(lim) = limit {
-                if let Some(res) =
-                    streaming_nlj_select(db, select, filter.as_ref(), offset, lim).await?
-                {
-                    return Ok(res);
+        if group_by.is_empty() && !aggregate::projection_has_aggregate(&select.projection) {
+            if order_exprs.is_empty() {
+                // No ORDER BY: early-stop streaming index nested-loop for LIMIT n.
+                if let Some(lim) = limit {
+                    if let Some(res) =
+                        streaming_nlj_select(db, select, filter.as_ref(), offset, lim).await?
+                    {
+                        return Ok(res);
+                    }
                 }
+            } else if let Some(res) =
+                streaming_join_order(db, select, filter.as_ref(), &order_exprs, offset, limit)
+                    .await?
+            {
+                // ORDER BY (no aggregate): build the partner hash table and stream
+                // the driving table into the spilling sorter, so the join output
+                // is never fully materialised. Falls back to join_select otherwise.
+                return Ok(res);
             }
         } else if !group_by.is_empty() || aggregate::projection_has_aggregate(&select.projection) {
             // Streaming index nested-loop aggregation: stream the driving table
@@ -4272,6 +4280,168 @@ async fn streaming_join_aggregate(
     order_output_rows(&mut orows, &osch, order_exprs)?;
     apply_offset_limit(&mut orows, offset, limit);
     Ok(Some(QueryResult::Rows(RowStream::literal(osch, orows))))
+}
+
+/// Streaming hash join + ORDER BY for
+/// `SELECT ... FROM driving JOIN partner ON driving.k = partner.k
+///  [WHERE] ORDER BY ... [LIMIT]` (INNER/LEFT, no GROUP BY, no aggregate).
+///
+/// Builds the partner side into an in-memory hash table, then scans the driving
+/// table incrementally and feeds each joined row straight into the spilling
+/// `Sorter` (top-N heap for a small LIMIT, external merge sort otherwise). The
+/// join *output* is therefore never fully materialised -- peak memory is the
+/// partner hash table plus the bounded sorter, not `|driving| x fanout`. Returns
+/// `None` when the query does not fit this shape, so the caller falls back to
+/// the materialising `join_select`.
+#[allow(clippy::too_many_arguments)]
+async fn streaming_join_order(
+    db: &Session,
+    select: &Select,
+    filter: Option<&Expr>,
+    order_exprs: &[(Expr, bool)],
+    offset: usize,
+    limit: Option<usize>,
+) -> Result<Option<QueryResult>> {
+    use std::collections::HashMap;
+
+    // Reads inside a transaction must see the write overlay -> materialising path.
+    if db.in_txn() || select.distinct.is_some() || select.from.len() != 1 {
+        return Ok(None);
+    }
+    let twj = &select.from[0];
+    if twj.joins.len() != 1
+        || !matches!(twj.relation, TableFactor::Table { .. })
+        || !matches!(twj.joins[0].relation, TableFactor::Table { .. })
+    {
+        return Ok(None);
+    }
+    let join = &twj.joins[0];
+    let (kind, on) = join_kind(&join.join_operator)?;
+    if !matches!(kind, JoinKind::Inner | JoinKind::Left) {
+        return Ok(None);
+    }
+    let Some(on) = on else { return Ok(None) };
+    let (ddef, dcols) = resolve_table(db, &twj.relation).await?;
+    let (pdef, pcols) = resolve_table(db, &join.relation).await?;
+    let dschema = Schema::new(dcols.clone());
+    let pschema = Schema::new(pcols.clone());
+    let Some((dkey, pkey)) = equi_keys(&on, &dschema, &pschema) else {
+        return Ok(None);
+    };
+
+    // Combined schema: driving columns then partner columns (matches build_from).
+    let mut all_cols = dcols;
+    all_cols.extend(pcols.clone());
+    let schema = Schema::new(all_cols);
+    let plen = pcols.len();
+    let left_outer = kind == JoinKind::Left;
+    let coll = join_key_collation(&dkey, &dschema, &pkey, &pschema);
+
+    // ORDER BY keys resolved against the projection + combined schema, exactly
+    // as join_select does before sorting.
+    let resolved = resolve_order_aliases(order_exprs, &select.projection, &schema);
+    if resolved.is_empty() {
+        return Ok(None);
+    }
+    let order_colls: Vec<elyra_core::Collation> = resolved
+        .iter()
+        .map(|(e, _)| expr_collation(e, &schema))
+        .collect();
+    let asc: Vec<bool> = resolved.iter().map(|(_, a)| *a).collect();
+
+    let keep = |row: &[Value]| -> Result<bool> {
+        match filter {
+            Some(f) => predicate::matches(f, &schema, row),
+            None => Ok(true),
+        }
+    };
+
+    // Build the partner hash table (bounded by the partner relation size).
+    let mut table: HashMap<String, Vec<Vec<Value>>> = HashMap::new();
+    {
+        let prefix = data_prefix(&pdef.name);
+        let mut cursor: Option<Vec<u8>> = None;
+        loop {
+            let batch = db.scan_batch(prefix.clone(), cursor.clone(), 8192).await?;
+            if batch.is_empty() {
+                break;
+            }
+            let last = batch.len() < 8192;
+            cursor = batch.last().map(|(k, _)| k.clone());
+            for (_, v) in batch {
+                let row: Vec<Value> =
+                    bincode::deserialize(&v).map_err(|e| Error::Storage(e.to_string()))?;
+                let key = predicate::eval_row(&pkey, &pschema, &row)?;
+                if let Some(k) = key_str_coll(&key, coll) {
+                    table.entry(k).or_default().push(row);
+                }
+            }
+            if last {
+                break;
+            }
+        }
+    }
+
+    // Stream the driving table into the spilling sorter.
+    let mut sorter = crate::sort::Sorter::new(
+        asc,
+        order_colls,
+        offset,
+        limit,
+        crate::sort::sort_max_rows(),
+    );
+    let prefix = data_prefix(&ddef.name);
+    let mut cursor: Option<Vec<u8>> = None;
+    loop {
+        let batch = db.scan_batch(prefix.clone(), cursor.clone(), 4096).await?;
+        if batch.is_empty() {
+            break;
+        }
+        let last = batch.len() < 4096;
+        cursor = batch.last().map(|(k, _)| k.clone());
+        for (_, v) in batch {
+            let l: Vec<Value> =
+                bincode::deserialize(&v).map_err(|e| Error::Storage(e.to_string()))?;
+            let key = predicate::eval_row(&dkey, &dschema, &l)?;
+            let matches: Option<&Vec<Vec<Value>>> = if key.is_null() {
+                None
+            } else {
+                key_str_coll(&key, coll).and_then(|k| table.get(&k))
+            };
+            let matched = matches.map(|v| !v.is_empty()).unwrap_or(false);
+            if let Some(rows) = matches {
+                for m in rows {
+                    let mut combined = l.clone();
+                    combined.extend_from_slice(m);
+                    if keep(&combined)? {
+                        let keys = resolved
+                            .iter()
+                            .map(|(e, _)| predicate::eval_row(e, &schema, &combined))
+                            .collect::<Result<Vec<_>>>()?;
+                        sorter.push(keys, combined)?;
+                    }
+                }
+            }
+            if left_outer && !matched {
+                let mut combined = l.clone();
+                combined.extend(std::iter::repeat_n(Value::Null, plen));
+                if keep(&combined)? {
+                    let keys = resolved
+                        .iter()
+                        .map(|(e, _)| predicate::eval_row(e, &schema, &combined))
+                        .collect::<Result<Vec<_>>>()?;
+                    sorter.push(keys, combined)?;
+                }
+            }
+        }
+        if last {
+            break;
+        }
+    }
+
+    let sorted = sorter.finish()?;
+    let (osch, out) = project_exprs(&select.projection, &schema, &sorted)?;
+    Ok(Some(QueryResult::Rows(RowStream::literal(osch, out))))
 }
 
 /// The table qualifiers (alias or name) of every relation in a FROM clause.

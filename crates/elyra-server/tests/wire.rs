@@ -319,6 +319,56 @@ async fn join_group_by_streaming() {
     assert_eq!(rows, vec![("A".into(), 4)]);
 }
 
+/// Join + ORDER BY + LIMIT: the streaming hash-join feeds the spilling sorter,
+/// so the result matches the materialising path (top-N by amount). [ESQL-6]
+#[tokio::test]
+async fn join_order_by_streaming() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop("CREATE TABLE so_dim (id INT PRIMARY KEY, cat VARCHAR(8))")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE so_facts (id INT PRIMARY KEY, dim_id INT, amt INT)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO so_dim VALUES (1,'A'),(2,'B'),(3,'C')")
+        .await
+        .unwrap();
+    c.query_drop(
+        "INSERT INTO so_facts VALUES (1,1,50),(2,2,90),(3,3,10),(4,1,70),(5,2,90),(6,3,30)",
+    )
+    .await
+    .unwrap();
+
+    // top 3 by amt desc, id asc as tiebreak
+    let rows: Vec<(i64, String, i64)> = c
+        .query(
+            "SELECT f.id, d.cat, f.amt FROM so_facts f JOIN so_dim d ON f.dim_id = d.id \
+             ORDER BY f.amt DESC, f.id ASC LIMIT 3",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            (2, "B".into(), 90),
+            (5, "B".into(), 90),
+            (4, "A".into(), 70)
+        ]
+    );
+
+    // LEFT join: an unmatched driving row appears with NULL partner, ordered
+    let rows: Vec<(i64, Option<String>)> = c
+        .query(
+            "SELECT f.id, d.cat FROM so_facts f LEFT JOIN so_dim d ON f.dim_id = d.id \
+             WHERE f.id IN (3, 6) ORDER BY f.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![(3, Some("C".into())), (6, Some("C".into()))]);
+}
+
 /// Join + GROUP BY where the partner is NOT indexed on the join key, so the
 /// streaming path declines and the materialising `join_select` handles the
 /// aggregation. Same correct result -- this guards the fallback path.
