@@ -14,8 +14,9 @@ cargo test
 
 ## Before you push
 
-CI runs formatting, linting, build, tests, and an end-to-end smoke test. Run
-the same checks locally:
+CI runs formatting, linting, build, the full test suite, a client & framework
+compatibility job (Laravel/Eloquent + PyMySQL against a live server), and a
+security audit. Run the core checks locally:
 
 ```bash
 cargo fmt --all --check
@@ -23,10 +24,30 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --workspace
 ```
 
-## End-to-end testing
+## Test suites
 
-Many features are best validated against a real MySQL client. Start the server
-and connect with PyMySQL or `mysql`:
+The test pyramid is regression-gated in CI (`cargo test --workspace` plus a
+compatibility job):
+
+- **Unit tests** — in each crate (`cargo test -p <crate>`).
+- **Wire integration tests** (`crates/elyra-server/tests/wire.rs`) — start a real
+  server in-process and drive it with the independent `mysql_async` driver
+  (SQL correctness, native prepared statements, auth). Run with
+  `cargo test -p elyra-server --test wire`.
+- **Crash recovery** (`crates/elyra-cli/tests/durability.rs`) — spawns the real
+  binary, commits rows, SIGKILLs it, restarts and verifies survival. Run with
+  `cargo test -p elyra-cli --test durability`.
+- **Client & framework compatibility** (`tests/compat/`) — a full Laravel/
+  Eloquent workload over PDO and a PyMySQL smoke test, run against a live
+  server. See `tests/compat/README.md`.
+
+When you add or change behaviour, add a test at the lowest layer that can catch a
+regression — prefer the in-process wire tests for anything protocol/SQL-visible.
+
+## Ad-hoc end-to-end checks
+
+Many features are also quick to eyeball against a real MySQL client. Start the
+server and connect with PyMySQL or `mysql`:
 
 ```bash
 cargo run --release -p elyra-cli -- serve --listen 127.0.0.1:3307 &
