@@ -176,6 +176,57 @@ impl Value {
         out
     }
 
+    /// Append this value's collation key under an explicit text collation. Under
+    /// `Bin`, text/JSON is keyed by its exact bytes (case-sensitive) instead of
+    /// case-folded, so `GROUP BY`/`DISTINCT` on a `_bin` column distinguishes
+    /// case. Non-text values are unaffected. The tag bytes match
+    /// [`push_collation_key`], so keys are only ever compared within one column
+    /// (which uses a single collation), never across.
+    pub fn push_collation_key_coll(&self, out: &mut Vec<u8>, coll: crate::Collation) {
+        match self {
+            Value::Text(s) | Value::Json(s) if coll.is_bin() => {
+                out.push(4);
+                out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                out.extend_from_slice(s.as_bytes());
+            }
+            _ => self.push_collation_key(out),
+        }
+    }
+
+    /// Collation key for a single value under an explicit collation.
+    pub fn collation_key_coll(&self, coll: crate::Collation) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.push_collation_key_coll(&mut out, coll);
+        out
+    }
+
+    /// Collation key for a whole row, one collation per column (missing entries
+    /// default to case-insensitive).
+    pub fn row_collation_key_coll(row: &[Value], colls: &[crate::Collation]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(row.len() * 9);
+        for (i, v) in row.iter().enumerate() {
+            let c = colls.get(i).copied().unwrap_or(crate::Collation::Ci);
+            v.push_collation_key_coll(&mut out, c);
+        }
+        out
+    }
+
+    /// Total order under an explicit text collation (NULL sorts first, then
+    /// `compare_coll`). Under `Bin`, text compares case-sensitively.
+    pub fn total_cmp_coll(&self, other: &Value, coll: crate::Collation) -> Ordering {
+        match (self.is_null(), other.is_null()) {
+            (true, true) => Ordering::Equal,
+            (true, false) => Ordering::Less,
+            (false, true) => Ordering::Greater,
+            _ => self.compare_coll(other, coll).unwrap_or_else(|| {
+                match (self.as_f64(), other.as_f64()) {
+                    (Some(a), Some(b)) => a.total_cmp(&b),
+                    _ => self.type_rank().cmp(&other.type_rank()),
+                }
+            }),
+        }
+    }
+
     /// Total order for sorting/extremes: NULL sorts first, then `compare`.
     pub fn total_cmp(&self, other: &Value) -> Ordering {
         match (self.is_null(), other.is_null()) {

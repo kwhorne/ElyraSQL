@@ -17,9 +17,7 @@ use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
-use elyra_core::{Error, Result, Value};
-
-use crate::aggregate::value_cmp;
+use elyra_core::{Collation, Error, Result, Value};
 
 /// Largest `offset + limit` that uses the in-memory top-N heap (rather than
 /// spilling). Above this, a bounded `LIMIT` still goes through the external
@@ -40,10 +38,12 @@ pub fn sort_max_rows() -> usize {
     })
 }
 
-/// Compare two precomputed key vectors under per-key asc/desc flags.
-fn cmp_keys(a: &[Value], b: &[Value], asc: &[bool]) -> Ordering {
+/// Compare two precomputed key vectors under per-key asc/desc flags and text
+/// collations (`Bin` sorts text case-sensitively).
+fn cmp_keys(a: &[Value], b: &[Value], asc: &[bool], colls: &[Collation]) -> Ordering {
     for (i, &asc) in asc.iter().enumerate() {
-        let ord = value_cmp(&a[i], &b[i]);
+        let coll = colls.get(i).copied().unwrap_or(Collation::Ci);
+        let ord = a[i].total_cmp_coll(&b[i], coll);
         let ord = if asc { ord } else { ord.reverse() };
         if ord != Ordering::Equal {
             return ord;
@@ -58,10 +58,11 @@ struct Ranked {
     keys: Vec<Value>,
     row: Vec<Value>,
     asc: std::sync::Arc<Vec<bool>>,
+    colls: std::sync::Arc<Vec<Collation>>,
 }
 impl PartialEq for Ranked {
     fn eq(&self, other: &Self) -> bool {
-        cmp_keys(&self.keys, &other.keys, &self.asc) == Ordering::Equal
+        cmp_keys(&self.keys, &other.keys, &self.asc, &self.colls) == Ordering::Equal
     }
 }
 impl Eq for Ranked {}
@@ -72,7 +73,7 @@ impl PartialOrd for Ranked {
 }
 impl Ord for Ranked {
     fn cmp(&self, other: &Self) -> Ordering {
-        cmp_keys(&self.keys, &other.keys, &self.asc)
+        cmp_keys(&self.keys, &other.keys, &self.asc, &self.colls)
     }
 }
 
@@ -161,6 +162,7 @@ impl RunReader {
 /// Accumulates rows and returns them sorted, bounding peak memory.
 pub struct Sorter {
     asc: std::sync::Arc<Vec<bool>>,
+    colls: std::sync::Arc<Vec<Collation>>,
     offset: usize,
     limit: Option<usize>,
     max_rows: usize,
@@ -178,13 +180,20 @@ pub struct Sorter {
 impl Sorter {
     /// `asc` gives the direction of each ORDER BY key. `max_rows` is the spill
     /// budget for the external sort.
-    pub fn new(asc: Vec<bool>, offset: usize, limit: Option<usize>, max_rows: usize) -> Self {
+    pub fn new(
+        asc: Vec<bool>,
+        colls: Vec<Collation>,
+        offset: usize,
+        limit: Option<usize>,
+        max_rows: usize,
+    ) -> Self {
         let bounded = limit
             .map(|l| offset.saturating_add(l))
             .unwrap_or(usize::MAX);
         let topn = bounded <= TOPN_CAP;
         Sorter {
             asc: std::sync::Arc::new(asc),
+            colls: std::sync::Arc::new(colls),
             offset,
             limit,
             max_rows: max_rows.max(1),
@@ -207,15 +216,17 @@ impl Sorter {
                     keys,
                     row,
                     asc: self.asc.clone(),
+                    colls: self.colls.clone(),
                 });
             } else if let Some(top) = self.heap.peek() {
                 // Replace the worst kept row if this one is better.
-                if cmp_keys(&keys, &top.keys, &self.asc) == Ordering::Less {
+                if cmp_keys(&keys, &top.keys, &self.asc, &self.colls) == Ordering::Less {
                     self.heap.pop();
                     self.heap.push(Ranked {
                         keys,
                         row,
                         asc: self.asc.clone(),
+                        colls: self.colls.clone(),
                     });
                 }
             }
@@ -230,7 +241,9 @@ impl Sorter {
 
     fn spill(&mut self) -> Result<()> {
         let asc = self.asc.clone();
-        self.buffer.sort_by(|a, b| cmp_keys(&a.0, &b.0, &asc));
+        let colls = self.colls.clone();
+        self.buffer
+            .sort_by(|a, b| cmp_keys(&a.0, &b.0, &asc, &colls));
         let path = temp_path();
         let file = File::create(&path)?;
         // Unlink immediately: the inode lives on via the open handle and is
@@ -254,7 +267,7 @@ impl Sorter {
     pub fn finish(&mut self) -> Result<Vec<Vec<Value>>> {
         if self.topn {
             let mut ranked: Vec<Ranked> = self.heap.drain().collect();
-            ranked.sort_by(|a, b| cmp_keys(&a.keys, &b.keys, &self.asc));
+            ranked.sort_by(|a, b| cmp_keys(&a.keys, &b.keys, &self.asc, &self.colls));
             let rows: Vec<Vec<Value>> = ranked.into_iter().map(|r| r.row).collect();
             let start = self.offset.min(rows.len());
             return Ok(rows[start..].to_vec());
@@ -263,8 +276,9 @@ impl Sorter {
         if self.runs.is_empty() {
             // Everything fit in memory: a plain sort.
             let asc = self.asc.clone();
+            let colls = self.colls.clone();
             let mut buffer = std::mem::take(&mut self.buffer);
-            buffer.sort_by(|a, b| cmp_keys(&a.0, &b.0, &asc));
+            buffer.sort_by(|a, b| cmp_keys(&a.0, &b.0, &asc, &colls));
             let mut out: Vec<Vec<Value>> = buffer.into_iter().map(|(_, r)| r).collect();
             if self.offset > 0 {
                 out.drain(0..self.offset.min(out.len()));
@@ -301,7 +315,7 @@ impl Sorter {
                     None => best = Some(i),
                     Some(bi) => {
                         let bk = &heads[bi].as_ref().unwrap().0;
-                        if cmp_keys(k, bk, &self.asc) == Ordering::Less {
+                        if cmp_keys(k, bk, &self.asc, &self.colls) == Ordering::Less {
                             best = Some(i);
                         }
                     }

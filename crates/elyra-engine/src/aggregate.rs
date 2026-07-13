@@ -23,6 +23,9 @@ enum OutCol {
 /// A planned aggregation: group columns, aggregates, output layout and schema.
 pub struct AggPlan {
     group_cols: Vec<usize>,
+    /// Text collation per group column (parallel to `group_cols`), so GROUP BY on
+    /// a `_bin` column distinguishes case.
+    group_collations: Vec<elyra_core::Collation>,
     aggs: Vec<AggSpec>,
     plan: Vec<OutCol>,
     out_schema: Schema,
@@ -38,7 +41,16 @@ pub struct AggPlan {
 impl AggPlan {
     /// A fresh, empty aggregator for this plan (used per parallel worker).
     pub fn new_aggregator(&self) -> GroupAggregator {
-        GroupAggregator::new(self.group_cols.clone(), self.aggs.clone())
+        GroupAggregator::new(
+            self.group_cols.clone(),
+            self.aggs.clone(),
+            self.group_collations.clone(),
+        )
+    }
+
+    /// Text collation per group column (parallel to `group_cols`).
+    pub fn group_collations(&self) -> &[elyra_core::Collation] {
+        &self.group_collations
     }
 
     /// The aggregate-argument expressions to append as virtual columns.
@@ -416,8 +428,13 @@ pub fn build_plan(
         });
     }
 
+    let group_collations: Vec<elyra_core::Collation> = group_cols
+        .iter()
+        .map(|&c| schema.columns[c].collation)
+        .collect();
     Ok(AggPlan {
         group_cols,
+        group_collations,
         aggs,
         plan,
         out_schema: Schema::new(out_cols),

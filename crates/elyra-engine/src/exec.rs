@@ -3734,8 +3734,12 @@ pub async fn select(
             let prefix = data_prefix(&def.name);
             let mut cursor: Option<Vec<u8>> = None;
             let asc: Vec<bool> = resolved.iter().map(|(_, a)| *a).collect();
+            let colls: Vec<elyra_core::Collation> = resolved
+                .iter()
+                .map(|(e, _)| expr_collation(e, &def.schema))
+                .collect();
             let mut sorter =
-                crate::sort::Sorter::new(asc, offset, limit, crate::sort::sort_max_rows());
+                crate::sort::Sorter::new(asc, colls, offset, limit, crate::sort::sort_max_rows());
             loop {
                 let batch = db.scan_batch(prefix.clone(), cursor.clone(), 8192).await?;
                 if batch.is_empty() {
@@ -10704,6 +10708,30 @@ fn apply_offset_limit(rows: &mut Vec<Vec<Value>>, offset: usize, limit: Option<u
 }
 
 /// Sort full table rows by ORDER BY expressions evaluated against the row.
+/// Resolve the text collation to use for each ORDER BY key: if the key is a
+/// direct reference to a `_bin` column, sort case-sensitively; otherwise the
+/// default case-insensitive collation.
+fn order_key_collations(order: &[(Expr, bool)], schema: &Schema) -> Vec<elyra_core::Collation> {
+    order
+        .iter()
+        .map(|(e, _)| expr_collation(e, schema))
+        .collect()
+}
+
+/// The collation of a direct column-reference expression, else the default.
+fn expr_collation(e: &Expr, schema: &Schema) -> elyra_core::Collation {
+    if let Some(name) = ident_name(e) {
+        let want = name.rsplit('.').next().unwrap_or(name);
+        if let Some(c) = schema.columns.iter().find(|c| {
+            let have = c.name.rsplit('.').next().unwrap_or(&c.name);
+            c.name.eq_ignore_ascii_case(name) || have.eq_ignore_ascii_case(want)
+        }) {
+            return c.collation;
+        }
+    }
+    elyra_core::Collation::Ci
+}
+
 fn sort_full_rows(rows: &mut [Vec<Value>], schema: &Schema, order: &[(Expr, bool)]) -> Result<()> {
     // Precompute sort keys once per row.
     let mut keyed: Vec<(Vec<Value>, usize)> = Vec::with_capacity(rows.len());
@@ -10714,7 +10742,8 @@ fn sort_full_rows(rows: &mut [Vec<Value>], schema: &Schema, order: &[(Expr, bool
         }
         keyed.push((keys, i));
     }
-    sort_keyed(&mut keyed, order);
+    let colls = order_key_collations(order, schema);
+    sort_keyed_coll(&mut keyed, order, &colls);
     reorder(rows, &keyed);
     Ok(())
 }
@@ -10758,20 +10787,28 @@ fn order_output_rows(
             })?;
         cols.push(idx);
     }
+    // Collation per key: the resolved output column's collation.
+    let colls: Vec<elyra_core::Collation> =
+        cols.iter().map(|&c| schema.columns[c].collation).collect();
     let mut keyed: Vec<(Vec<Value>, usize)> = rows
         .iter()
         .enumerate()
         .map(|(i, row)| (cols.iter().map(|&c| row[c].clone()).collect(), i))
         .collect();
-    sort_keyed(&mut keyed, order);
+    sort_keyed_coll(&mut keyed, order, &colls);
     reorder(rows, &keyed);
     Ok(())
 }
 
-fn sort_keyed(keyed: &mut [(Vec<Value>, usize)], order: &[(Expr, bool)]) {
+fn sort_keyed_coll(
+    keyed: &mut [(Vec<Value>, usize)],
+    order: &[(Expr, bool)],
+    colls: &[elyra_core::Collation],
+) {
     keyed.sort_by(|a, b| {
         for (i, (_, asc)) in order.iter().enumerate() {
-            let ord = aggregate::value_cmp(&a.0[i], &b.0[i]);
+            let coll = colls.get(i).copied().unwrap_or(elyra_core::Collation::Ci);
+            let ord = a.0[i].total_cmp_coll(&b.0[i], coll);
             let ord = if *asc { ord } else { ord.reverse() };
             if ord != std::cmp::Ordering::Equal {
                 return ord;

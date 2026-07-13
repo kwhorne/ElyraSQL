@@ -129,6 +129,9 @@ impl Acc {
 /// Streaming, mergeable group aggregator.
 pub struct GroupAggregator {
     group_cols: Vec<usize>,
+    /// Text collation per group column (parallel to `group_cols`); `Bin` keeps
+    /// group keys case-sensitive.
+    group_collations: Vec<elyra_core::Collation>,
     aggs: Vec<AggSpec>,
     /// key -> (sample row for group columns, per-agg accumulators), in
     /// first-seen insertion order (IndexMap), so there is no separate order
@@ -156,9 +159,14 @@ pub fn default_max_groups() -> usize {
 }
 
 impl GroupAggregator {
-    pub fn new(group_cols: Vec<usize>, aggs: Vec<AggSpec>) -> Self {
+    pub fn new(
+        group_cols: Vec<usize>,
+        aggs: Vec<AggSpec>,
+        group_collations: Vec<elyra_core::Collation>,
+    ) -> Self {
         GroupAggregator {
             group_cols,
+            group_collations,
             aggs,
             groups: IndexMap::default(),
             max_groups: default_max_groups(),
@@ -190,7 +198,12 @@ impl GroupAggregator {
         // Build the key into a reused buffer -- existing groups (the common
         // case) are then found and updated in a single lookup with no per-row
         // allocation.
-        group_key_into(&self.group_cols, row, &mut self.key_buf);
+        group_key_into(
+            &self.group_cols,
+            &self.group_collations,
+            row,
+            &mut self.key_buf,
+        );
         if let Some(entry) = self.groups.get_mut(self.key_buf.as_slice()) {
             for (i, spec) in self.aggs.iter().enumerate() {
                 let v = spec
@@ -285,9 +298,15 @@ impl GroupAggregator {
 /// cheaper than formatting each value with `Debug` (hot path for GROUP BY).
 /// Encode the group key into a caller-owned buffer (cleared first), so the hot
 /// path can reuse one allocation and look up existing groups without copying.
-fn group_key_into(cols: &[usize], row: &[Value], out: &mut Vec<u8>) {
+fn group_key_into(
+    cols: &[usize],
+    colls: &[elyra_core::Collation],
+    row: &[Value],
+    out: &mut Vec<u8>,
+) {
     out.clear();
-    for &i in cols {
+    for (ci, &i) in cols.iter().enumerate() {
+        let is_bin = colls.get(ci).map(|c| c.is_bin()).unwrap_or(false);
         match row.get(i) {
             None | Some(Value::Null) => out.push(0),
             Some(Value::Int(v)) => {
@@ -303,11 +322,18 @@ fn group_key_into(cols: &[usize], row: &[Value], out: &mut Vec<u8>) {
                 out.extend_from_slice(&elyra_core::canonical_f64_bits(*f).to_le_bytes());
             }
             Some(Value::Text(s)) | Some(Value::Json(s)) => {
-                // Case-fold so GROUP BY matches the default collation.
-                let s = elyra_core::fold(s);
+                // Case-fold for the default collation; keep exact bytes for `_bin`
+                // so GROUP BY on a binary column distinguishes case.
+                let folded;
+                let bytes: &str = if is_bin {
+                    s
+                } else {
+                    folded = elyra_core::fold(s);
+                    &folded
+                };
                 out.push(4);
-                out.extend_from_slice(&(s.len() as u32).to_le_bytes());
-                out.extend_from_slice(s.as_bytes());
+                out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                out.extend_from_slice(bytes.as_bytes());
             }
             Some(other) => {
                 out.push(5);

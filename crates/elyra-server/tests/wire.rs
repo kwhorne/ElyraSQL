@@ -416,6 +416,67 @@ async fn insert_set_shorthand() {
     assert_eq!(rows, vec![(1, "a,b".into(), 105), (2, "x".into(), 9)]);
 }
 
+/// A `_bin` column sorts and groups case-sensitively (byte order); the default
+/// column is case-insensitive. [ESQL-4]
+#[tokio::test]
+async fn binary_collation_order_and_group() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop("CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR(16) COLLATE utf8mb4_bin)")
+        .await
+        .unwrap();
+    c.query_drop(
+        "INSERT INTO t VALUES (1,'Apple'),(2,'apple'),(3,'Banana'),(4,'apple'),(5,'BANANA')",
+    )
+    .await
+    .unwrap();
+
+    // ORDER BY on a _bin column uses byte order: uppercase (0x41..) before
+    // lowercase (0x61..), so all-caps 'BANANA' sorts before 'Banana'.
+    let ordered: Vec<String> = c.query("SELECT name FROM t ORDER BY name").await.unwrap();
+    assert_eq!(ordered, vec!["Apple", "BANANA", "Banana", "apple", "apple"]);
+
+    // GROUP BY on a _bin column keeps distinct case as distinct groups.
+    let mut groups: Vec<(String, i64)> = c
+        .query("SELECT name, COUNT(*) FROM t GROUP BY name")
+        .await
+        .unwrap();
+    groups.sort();
+    assert_eq!(
+        groups,
+        vec![
+            ("Apple".into(), 1),
+            ("BANANA".into(), 1),
+            ("Banana".into(), 1),
+            ("apple".into(), 2),
+        ]
+    );
+}
+
+/// The default (case-insensitive) column still groups case-insensitively, so the
+/// _bin behavior above is genuinely opt-in.
+#[tokio::test]
+async fn default_collation_group_is_case_insensitive() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop("CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR(16))")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO t VALUES (1,'Apple'),(2,'apple'),(3,'APPLE')")
+        .await
+        .unwrap();
+
+    let groups: Vec<(String, i64)> = c
+        .query("SELECT name, COUNT(*) FROM t GROUP BY name")
+        .await
+        .unwrap();
+    // one case-insensitive group of 3
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].1, 3);
+}
+
 #[tokio::test]
 async fn data_types() {
     let srv = TestServer::start().await;
