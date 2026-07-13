@@ -77,7 +77,7 @@ gaps:
   `routines`, `triggers`, `events`, `statistics`, `partitions`); it is not the
   complete MySQL catalog.
 
-See [Limitations & Roadmap](limitations.md) for the full picture.
+See [Limitations](limitations.md) for the full picture.
 
 !!! note "Prepared-statement caveat"
     Binary (native) prepared statements work for common query shapes; a few

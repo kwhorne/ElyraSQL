@@ -171,4 +171,4 @@ crash-loss window for more throughput on analytical workloads (see
   equality/range; composite-key ranges fall back to a scan.
 - **No window functions or `ROLLUP`/`CUBE`** yet (`HAVING` is supported).
 
-A persisted columnar store is on the [roadmap](limitations.md).
+A persisted columnar store is a possible future direction.

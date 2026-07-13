@@ -49,5 +49,5 @@ Continue to [Getting Started](getting-started.md).
 
 !!! note "Project status"
     ElyraSQL is young and moving fast. The feature set below is implemented and
-    tested, but see [Limitations & Roadmap](limitations.md) for known gaps
+    tested, but see [Limitations](limitations.md) for known gaps
     before relying on it in production.

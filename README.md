@@ -183,33 +183,6 @@ ELYRASQL_USER=root ELYRASQL_PASSWORD=secret \
 journalctl -u elyrasql -f
 ```
 
-## Roadmap
-
-- [x] Cargo workspace + branded core types
-- [x] Single-file ACID storage engine (`redb`)
-- [x] MySQL wire-protocol server (handshake + text protocol)
-- [x] SQL frontend (MySQL dialect) + literal/arithmetic `SELECT`
-- [ ] Transactional executor: `CREATE/INSERT/UPDATE/DELETE/SELECT` over storage
-- [x] JOINs (INNER / LEFT / RIGHT / FULL / CROSS, multi-table)
-- [x] Range index scans (`>`, `>=`, `<`, `<=`, `BETWEEN`)
-- [x] Roles / per-user privileges (read / write / admin)
-- [ ] Secondary indexes + query planner
-- [x] Prepared statements: native (binary) for common shapes + client-side
-      (emulated); `mysql_native_password` + `caching_sha2_password` auth
-- [x] `VECTOR(n)` columns + exact KNN via `VEC_DISTANCE` in `ORDER BY`
-- [x] Secondary indexes (`CREATE INDEX`) with planner integration
-- [x] Aggregation (`COUNT/SUM/AVG/MIN/MAX`), `GROUP BY`, `ORDER BY`
-- [x] Vector ANN acceleration (HNSW), cached & rebuilt-when-stale
-- [x] OLAP acceleration: parallel, bounded-memory streaming aggregation
-- [x] Authentication (mysql_native_password) + TLS
-- [x] Transactions: `BEGIN`/`COMMIT`/`ROLLBACK` with **snapshot isolation**
-      (MVCC snapshot + buffered writes)
-- [x] DATE / DATETIME / TIME / DECIMAL / JSON types
-- [x] Composite (multi-column) PK & indexes
-- [x] `ALTER TABLE` (ADD/DROP/RENAME COLUMN, RENAME TABLE)
-- [x] systemd packaging for Ubuntu 24.04+
-- [ ] ElyraSQL client (Rust + Svelte on Elyra Framework)
-
 ## License
 
 MIT — see [LICENSE](LICENSE).

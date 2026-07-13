@@ -71,5 +71,5 @@ nav:
   - Replication & HA: replication.md
   - Architecture: architecture.md
   - Performance: performance.md
-  - Limitations & Roadmap: limitations.md
+  - Limitations: limitations.md
   - Contributing: contributing.md

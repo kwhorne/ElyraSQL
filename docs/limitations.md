@@ -1,4 +1,4 @@
-# Limitations & Roadmap
+# Limitations
 
 ElyraSQL is young. This page is an honest inventory of what is **not** yet
 implemented, so you can judge fit.
@@ -298,28 +298,6 @@ implemented, so you can judge fit.
   Connection salts come from the OS CSPRNG. `caching_sha2_password` runs full
   authentication — cleartext over TLS, or an RSA public-key exchange on a
   plaintext connection.
-
-## Roadmap
-
-Candidate next steps, roughly in order of value:
-
-1. Pre-commit (2-phase) synchronous replication for true zero-data-loss failover
-   (today's quorum barrier runs after the local commit).
-2. Cost-based JOIN reordering for explicit join chains; a merge join.
-3. Cursors and condition handlers in stored procedures.
-4. Multi-level (recursive) cascades and deferred constraints.
-5. Per-column `_bin` in `ORDER BY` / `GROUP BY` / `DISTINCT` / join keys.
-6. A persistent spatial index (R-tree) and polygon/geodesic operations.
-7. Dynamic cluster membership (online add/remove nodes).
-8. Fully reliable binary (native) prepared statements for every result shape.
-9. Client-side `LOAD DATA LOCAL INFILE` (streaming the file over the wire).
-
-Many earlier roadmap items have shipped: per-column `COLLATE`/`_bin`, scoped
-(per-table) and per-column privileges, roles, audit logging, spill-to-disk
-sorts/aggregations, cost-based hash joins with statistics, slow-query log +
-Prometheus metrics, pessimistic table locking, quorum/synchronous replication,
-automatic failover with incremental catch-up, a first-party wire layer
-(`elyra-wire`) on rustls 0.23, and `caching_sha2_password` authentication.
 
 Have a need that isn't listed? Open an issue on
 [GitHub](https://github.com/kwhorne/ElyraSQL/issues).

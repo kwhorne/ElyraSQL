@@ -166,4 +166,4 @@ const conn = await mysql.createConnection({
    offers the choice.
 
 See [MySQL Compatibility](mysql-compatibility.md) for the supported SQL surface
-and [Limitations & Roadmap](limitations.md) for current gaps.
+and [Limitations](limitations.md) for current gaps.
