@@ -4,6 +4,42 @@ All notable changes to ElyraSQL are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.1.0] - 2026-07-14
+
+Robustness release. Adds a soak/chaos test harness and, on its first run, fixes a
+real isolation bug it uncovered. No on-disk format change from 1.0.
+
+### Fixed
+
+- **Snapshot-consistent autocommit aggregates.** A single autocommit aggregate
+  (e.g. `SELECT SUM(x) FROM t`) could, under concurrent writes, return a value
+  that never existed in any consistent state — because the parallel and batched
+  aggregate scan paths each opened their *own* MVCC read snapshot, so different
+  parts of one aggregate observed the table at different commit points. Every
+  single statement now reads through **one** pinned snapshot: the parallel
+  clustered-range scans, the `COUNT(*)` fast path, and the spilling
+  (`partitioned`) aggregation all share a single point-in-time view. This
+  restores snapshot isolation for autocommit aggregate reads. (In-transaction
+  aggregation already read the session snapshot and was unaffected.)
+
+### Testing
+
+- **Soak / chaos harness** (`crates/elyra-cli/tests/soak.rs`). Many concurrent
+  connections run atomic transfers against a fixed-total set of accounts while a
+  global bank invariant — total balance conserved, never negative — is checked
+  continuously. A second test repeatedly `SIGKILL`s and restarts the server
+  mid-write and re-checks the invariant after every crash-recovery, exercising
+  crash consistency under sustained load. Short by default so it runs per-PR;
+  env-tunable (`ELYRASQL_SOAK_SECS`/`WORKERS`/`ACCOUNTS`/`KILL_MS`) with a nightly
+  workflow for long runs. This harness found the aggregate-isolation bug above on
+  its first CI run.
+
+### Notes
+
+- Cross-engine benchmarks were re-run on the fair native-Linux environment and
+  are unchanged by the isolation fix — ElyraSQL remains fastest of the three on
+  every aggregation query.
+
 ## [1.0.0] - 2026-07-13
 
 First stable release. ElyraSQL is a robust, MySQL-compatible SQL server in Rust:
@@ -1129,6 +1165,7 @@ core CRUD with `WHERE`/`ORDER BY`/`LIMIT`, indexes, aggregation and `GROUP BY`,
 joins, prepared statements, authentication and TLS, vector search (exact +
 HNSW), parallel OLAP aggregation, and transactions with snapshot isolation.
 
+[1.1.0]: https://github.com/kwhorne/ElyraSQL/releases/tag/v1.1.0
 [1.0.0]: https://github.com/kwhorne/ElyraSQL/releases/tag/v1.0.0
 [0.9.9]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.9.9
 [0.9.8]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.9.8
