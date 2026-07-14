@@ -30,6 +30,9 @@ pub enum Error {
     #[error("type error: {0}")]
     Type(String),
 
+    #[error("out of range: {0}")]
+    OutOfRange(String),
+
     #[error("vector error: {0}")]
     Vector(String),
 
@@ -51,6 +54,7 @@ impl Error {
             Error::Parse(_) => 1064,
             Error::Catalog(_) => 1146,     // ER_NO_SUCH_TABLE-ish bucket
             Error::Type(_) => 1366,        // ER_TRUNCATED_WRONG_VALUE
+            Error::OutOfRange(_) => 1690,  // ER_DATA_OUT_OF_RANGE
             Error::Unsupported(_) => 1235, // ER_NOT_SUPPORTED_YET
             Error::Conflict(_) => 1213,    // ER_LOCK_DEADLOCK (serialization failure)
             Error::Duplicate(_) => 1062,   // ER_DUP_ENTRY
@@ -64,6 +68,7 @@ impl Error {
         match self {
             Error::Parse(_) => b"42000",
             Error::Catalog(_) => b"42S02",
+            Error::OutOfRange(_) => b"22003",
             _ => b"HY000",
         }
     }

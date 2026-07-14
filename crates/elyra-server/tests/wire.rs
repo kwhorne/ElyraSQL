@@ -1232,3 +1232,74 @@ async fn deep_expression_does_not_crash_server() {
     let got: Vec<i64> = c3.query(&in_list).await.unwrap();
     assert_eq!(got, vec![1]);
 }
+
+// Regression for #15: integer arithmetic must not silently saturate/wrap, `% 0`
+// must be NULL, and DOUBLE overflow must be NULL (MySQL semantics), instead of
+// returning silently-wrong values.
+#[tokio::test]
+async fn integer_overflow_and_division_semantics() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    // Signed 64-bit overflow raises an out-of-range error (not saturate/wrap).
+    for sql in [
+        "SELECT 9223372036854775807 + 1",
+        "SELECT 9223372036854775807 * 9223372036854775807",
+        "SELECT 9223372036854775807 - (-1)",
+        "SELECT -(-9223372036854775808)",
+    ] {
+        assert!(
+            c.query_drop(sql).await.is_err(),
+            "expected out-of-range error for `{sql}`"
+        );
+    }
+
+    // Modulo/division by zero is NULL (the row exists, the value is NULL).
+    for sql in ["SELECT 1 % 0", "SELECT MOD(1, 0)", "SELECT 1 / 0"] {
+        let v: Option<Option<i64>> = c.query_first(sql).await.unwrap();
+        assert_eq!(v, Some(None), "`{sql}` should be NULL");
+    }
+
+    // DOUBLE overflow is NULL, not +inf.
+    let v: Option<Option<f64>> = c.query_first("SELECT POW(10,308) * 10").await.unwrap();
+    assert_eq!(v, Some(None), "double overflow should be NULL");
+
+    // Exact large integer arithmetic (no f64 precision loss) still works.
+    let n: i64 = c
+        .query_first("SELECT 9223372036854775806 + 1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(n, 9223372036854775807);
+    let p: i64 = c
+        .query_first("SELECT 1000000000 * 1000000000")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(p, 1_000_000_000_000_000_000);
+    let m: i64 = c.query_first("SELECT 7 % 3").await.unwrap().unwrap();
+    assert_eq!(m, 1);
+
+    // A computed write that overflows must error, not store a saturated value.
+    c.query_drop("CREATE TABLE t (id INT PRIMARY KEY, v BIGINT)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO t VALUES (1, 9223372036854775807)")
+        .await
+        .unwrap();
+    assert!(
+        c.query_drop("UPDATE t SET v = v + 1 WHERE id = 1")
+            .await
+            .is_err(),
+        "overflowing UPDATE must error"
+    );
+    let still: i64 = c
+        .query_first("SELECT v FROM t WHERE id = 1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        still, 9223372036854775807,
+        "value must be unchanged after the failed UPDATE"
+    );
+}

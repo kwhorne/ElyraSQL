@@ -4,6 +4,22 @@ All notable changes to ElyraSQL are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **Integer arithmetic no longer silently saturates** ([#15]). Signed 64-bit
+  arithmetic was evaluated in `f64` and cast back, so a result past the `BIGINT`
+  range was silently clamped (e.g. `9223372036854775807 + 1` returned
+  `9223372036854775807`) — a correctness/data-integrity foot-gun for computed
+  writes. Integer `+`, `-`, `*` (and unary `-`) are now computed exactly and raise
+  `ERROR 1690 (22003) BIGINT value is out of range` on overflow, matching MySQL,
+  in both the scalar and row (`WHERE`/`UPDATE`) paths.
+- **`x % 0` now returns `NULL`** (was `0`), matching MySQL, for both `%` and
+  `MOD()` — consistent with `x / 0`, which already returned `NULL`.
+- **`DOUBLE` overflow now returns `NULL`** instead of `inf`/`NaN` (e.g.
+  `POW(10,308) * 10`), matching MySQL's out-of-range behaviour.
+
 ## [1.1.1] - 2026-07-14
 
 Security release. Fixes two denial-of-service issues in the same class (unbounded
@@ -1194,6 +1210,7 @@ joins, prepared statements, authentication and TLS, vector search (exact +
 HNSW), parallel OLAP aggregation, and transactions with snapshot isolation.
 
 [1.1.1]: https://github.com/kwhorne/ElyraSQL/releases/tag/v1.1.1
+[#15]: https://github.com/kwhorne/ElyraSQL/issues/15
 [1.1.0]: https://github.com/kwhorne/ElyraSQL/releases/tag/v1.1.0
 [1.0.0]: https://github.com/kwhorne/ElyraSQL/releases/tag/v1.0.0
 [0.9.9]: https://github.com/kwhorne/ElyraSQL/releases/tag/v0.9.9

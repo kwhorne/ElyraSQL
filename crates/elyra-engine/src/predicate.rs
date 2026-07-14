@@ -109,8 +109,24 @@ pub fn eval_row(expr: &Expr, schema: &Schema, row: &[Value]) -> Result<Value> {
             let v = eval_row(expr, schema, row)?;
             match (op, v) {
                 (UnaryOperator::Not, v) => Ok(Value::Bool(!truthy(&v))),
-                (UnaryOperator::Minus, Value::Int(i)) => Ok(Value::Int(-i)),
+                (UnaryOperator::Minus, Value::Int(i)) => {
+                    i.checked_neg().map(Value::Int).ok_or_else(|| {
+                        Error::OutOfRange(format!("BIGINT value is out of range in '-({i})'"))
+                    })
+                }
                 (UnaryOperator::Minus, Value::Float(f)) => Ok(Value::Float(-f)),
+                // Negating a large unsigned literal (e.g. `-9223372036854775808`,
+                // parsed as UInt because it exceeds i64::MAX): valid iff it fits
+                // the signed range once negated, else out of range like MySQL.
+                (UnaryOperator::Minus, Value::UInt(u)) => {
+                    if u <= (i64::MAX as u64) + 1 {
+                        Ok(Value::Int((u as i128).wrapping_neg() as i64))
+                    } else {
+                        Err(Error::OutOfRange(format!(
+                            "BIGINT value is out of range in '-({u})'"
+                        )))
+                    }
+                }
                 (UnaryOperator::Plus, v) => Ok(v),
                 (UnaryOperator::PGBitwiseNot, v) => Ok(match v.as_f64() {
                     Some(x) => Value::Int(!(x as i64)),
@@ -2352,10 +2368,40 @@ fn arith(l: Value, op: &BinaryOperator, r: Value) -> Result<Value> {
             }
         }
     }
+    // Exact signed 64-bit integer arithmetic. MySQL raises an out-of-range error
+    // (1690) on overflow rather than silently saturating or wrapping, and `x % 0`
+    // is NULL. Division stays on the float path below (MySQL renders integer
+    // division as a decimal, e.g. `5/2` -> 2.5000).
+    if let (Value::Int(ai), Value::Int(bi)) = (&l, &r) {
+        let (ai, bi) = (*ai, *bi);
+        if !matches!(op, Divide) {
+            let res = match op {
+                Plus => ai.checked_add(bi),
+                Minus => ai.checked_sub(bi),
+                Multiply => ai.checked_mul(bi),
+                Modulo => {
+                    if bi == 0 {
+                        return Ok(Value::Null);
+                    }
+                    // `i64::MIN % -1` overflows `checked_rem` but the true
+                    // remainder is 0.
+                    Some(ai.checked_rem(bi).unwrap_or(0))
+                }
+                _ => unreachable!(),
+            };
+            return match res {
+                Some(v) => Ok(Value::Int(v)),
+                None => Err(Error::OutOfRange(format!(
+                    "BIGINT value is out of range in '({ai} {} {bi})'",
+                    arith_symbol(op)
+                ))),
+            };
+        }
+    }
+
     let (Some(a), Some(b)) = (num(&l), num(&r)) else {
         return Err(Error::Type("arithmetic on non-numeric value".into()));
     };
-    let both_int = matches!(l, Value::Int(_)) && matches!(r, Value::Int(_));
     let res = match op {
         Plus => a + b,
         Minus => a - b,
@@ -2366,14 +2412,32 @@ fn arith(l: Value, op: &BinaryOperator, r: Value) -> Result<Value> {
             }
             a / b
         }
-        Modulo => a % b,
+        Modulo => {
+            if b == 0.0 {
+                return Ok(Value::Null);
+            }
+            a % b
+        }
         _ => unreachable!(),
     };
-    Ok(if both_int && !matches!(op, Divide) {
-        Value::Int(res as i64)
-    } else {
-        Value::Float(res)
-    })
+    // A non-finite result (DOUBLE overflow to +/-inf, or e.g. inf-inf -> NaN) is
+    // out of range; MySQL yields NULL rather than inf/NaN.
+    if !res.is_finite() {
+        return Ok(Value::Null);
+    }
+    Ok(Value::Float(res))
+}
+
+/// The operator symbol for an arithmetic op, for error messages.
+fn arith_symbol(op: &BinaryOperator) -> &'static str {
+    match op {
+        BinaryOperator::Plus => "+",
+        BinaryOperator::Minus => "-",
+        BinaryOperator::Multiply => "*",
+        BinaryOperator::Divide => "/",
+        BinaryOperator::Modulo => "%",
+        _ => "?",
+    }
 }
 
 /// Three-way compare with SQL cross-type coercion; `None` when either side is
