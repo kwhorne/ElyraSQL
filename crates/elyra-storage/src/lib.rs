@@ -161,6 +161,53 @@ impl Snapshot {
         }
         Ok(out)
     }
+
+    /// Streaming ordered scan over `[start, end)` within this snapshot, invoking
+    /// `f` for each key/value in order. Reads through the snapshot's fixed read
+    /// transaction, so several parallel workers that share one snapshot observe a
+    /// single consistent point-in-time view -- unlike opening a fresh read per
+    /// worker, which would let workers see the table at different commit points.
+    pub fn scan_range_each<F>(&self, start: &[u8], end: &[u8], mut f: F) -> Result<()>
+    where
+        F: FnMut(&[u8], &[u8]) -> Result<()>,
+    {
+        use std::ops::Bound;
+        let t = self
+            .rtx
+            .open_table(KV)
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        for item in t
+            .range::<&[u8]>((Bound::Included(start), Bound::Excluded(end)))
+            .map_err(|e| Error::Storage(e.to_string()))?
+        {
+            let (k, v) = item.map_err(|e| Error::Storage(e.to_string()))?;
+            f(k.value(), v.value())?;
+        }
+        Ok(())
+    }
+
+    /// Streaming scan over every key/value under `prefix` within this snapshot.
+    pub fn scan_prefix_each<F>(&self, prefix: &[u8], mut f: F) -> Result<()>
+    where
+        F: FnMut(&[u8], &[u8]) -> Result<()>,
+    {
+        use std::ops::Bound;
+        let t = self
+            .rtx
+            .open_table(KV)
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        let upper = prefix_upper_bound(prefix);
+        let range = match &upper {
+            Some(e) => t.range::<&[u8]>((Bound::Included(prefix), Bound::Excluded(e.as_slice()))),
+            None => t.range::<&[u8]>((Bound::Included(prefix), Bound::Unbounded)),
+        }
+        .map_err(|e| Error::Storage(e.to_string()))?;
+        for item in range {
+            let (k, v) = item.map_err(|e| Error::Storage(e.to_string()))?;
+            f(k.value(), v.value())?;
+        }
+        Ok(())
+    }
 }
 
 /// Key/value blob table. All logical namespaces share this definition; the

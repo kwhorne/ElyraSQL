@@ -9833,15 +9833,20 @@ async fn olap_aggregate(
         let raw = db.raw_db();
         let n = match pk_split_ranges(&raw, def, &prefix, agg_workers()).await? {
             Some(ranges) => {
+                // One snapshot for all workers: a parallel COUNT(*) can't
+                // double-count or miss rows that concurrent commits move across
+                // range boundaries.
+                let snap = raw.snapshot()?;
                 let mut handles = Vec::with_capacity(ranges.len());
                 for (start, end) in ranges {
-                    let raw = raw.clone();
-                    handles.push(tokio::spawn(async move {
-                        raw.scan_range_fold(start, end, 0u64, |acc, _k, _v| {
-                            *acc += 1;
+                    let snap = snap.clone();
+                    handles.push(tokio::task::spawn_blocking(move || -> Result<u64> {
+                        let mut acc = 0u64;
+                        snap.scan_range_each(&start, &end, |_k, _v| {
+                            acc += 1;
                             Ok(())
-                        })
-                        .await
+                        })?;
+                        Ok(acc)
                     }));
                 }
                 let mut total = 0u64;
@@ -10070,14 +10075,15 @@ async fn scan_columnar_scalar(
     let workers = agg_workers();
     if workers > 1 {
         if let Some(ranges) = pk_split_ranges(&raw, def, &prefix, workers).await? {
+            let snap = raw.snapshot()?; // one consistent view for all workers
             let mut handles = Vec::with_capacity(ranges.len());
             for (start, end) in ranges {
-                let raw = raw.clone();
+                let snap = snap.clone();
                 let specs = specs.to_vec();
-                handles.push(tokio::spawn(async move {
-                    let st = ColAgg::new(&specs, ncols);
-                    raw.scan_range_fold(start, end, st, |st, _k, v| st.feed(v))
-                        .await
+                handles.push(tokio::task::spawn_blocking(move || -> Result<_> {
+                    let mut st = ColAgg::new(&specs, ncols);
+                    snap.scan_range_each(&start, &end, |_k, v| st.feed(v))?;
+                    Ok(st)
                 }));
             }
             let mut result = ColAgg::new(specs, ncols);
@@ -10407,16 +10413,17 @@ async fn scan_columnar_group(
     };
     let result = match ranges {
         Some(rs) => {
+            let snap = raw.snapshot()?; // one consistent view for all workers
             let mut handles = Vec::with_capacity(rs.len());
             for (start, end) in rs {
-                let raw = raw.clone();
+                let snap = snap.clone();
                 let specs = specs.to_vec();
                 let needed = needed.clone();
                 let cf = cfilter.clone();
-                handles.push(tokio::spawn(async move {
-                    let st = ColGroup::new(group_col, &specs, ncols, needed, cf);
-                    raw.scan_range_fold(start, end, st, |st, _k, v| st.feed(v))
-                        .await
+                handles.push(tokio::task::spawn_blocking(move || -> Result<_> {
+                    let mut st = ColGroup::new(group_col, &specs, ncols, needed, cf);
+                    snap.scan_range_each(&start, &end, |_k, v| st.feed(v))?;
+                    Ok(st)
                 }));
             }
             let mut result =
@@ -10689,19 +10696,24 @@ async fn scan_aggregate_fast(
     let workers = agg_workers();
     if workers > 1 {
         if let Some(ranges) = pk_split_ranges(&raw, def, &prefix, workers).await? {
+            // One snapshot shared by every worker: the parallel range scans then
+            // observe a single consistent point-in-time view (concurrent commits
+            // are all-or-nothing across the whole aggregate).
+            let snap = raw.snapshot()?;
             let mut handles = Vec::with_capacity(ranges.len());
             for (start, end) in ranges {
-                let raw = raw.clone();
-                let body = make_body(
+                let snap = snap.clone();
+                let mut body = make_body(
                     filter.clone(),
                     cfilter.clone(),
                     needed.clone(),
                     schema.clone(),
                     arg_exprs.clone(),
                 );
-                let agg0 = plan.new_aggregator();
-                handles.push(tokio::spawn(async move {
-                    raw.scan_range_fold(start, end, agg0, body).await
+                let mut agg0 = plan.new_aggregator();
+                handles.push(tokio::task::spawn_blocking(move || -> Result<_> {
+                    snap.scan_range_each(&start, &end, |k, v| body(&mut agg0, k, v))?;
+                    Ok(agg0)
                 }));
             }
             let mut result = plan.new_aggregator();
@@ -10906,6 +10918,38 @@ impl<'p> SpillAgg<'p> {
     }
 }
 
+/// Batched cursor scan that reads from ONE consistent view for the whole
+/// statement. In a transaction the session snapshot+overlay is already
+/// consistent, so we defer to `db.scan_batch`; in autocommit `snap` pins one raw
+/// snapshot up front so a long multi-batch scan can't tear across concurrent
+/// commits.
+async fn pinned_scan_batch(
+    db: &Session,
+    snap: &Option<elyra_storage::Snapshot>,
+    prefix: &[u8],
+    cursor: &Option<Vec<u8>>,
+    limit: usize,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    match snap {
+        None => db.scan_batch(prefix.to_vec(), cursor.clone(), limit).await,
+        Some(s) => {
+            let start = match cursor {
+                Some(a) => {
+                    let mut k = a.clone();
+                    k.push(0);
+                    k
+                }
+                None => prefix.to_vec(),
+            };
+            let end = prefix_successor(prefix);
+            let s = s.clone();
+            tokio::task::spawn_blocking(move || s.scan_range(&start, Some(&end), limit))
+                .await
+                .map_err(|e| Error::Analytics(format!("scan task failed: {e}")))?
+        }
+    }
+}
+
 async fn partitioned_aggregate(
     db: &Session,
     def: &TableDef,
@@ -10916,9 +10960,18 @@ async fn partitioned_aggregate(
     let extend = !plan.arg_exprs().is_empty();
     let mut sa = SpillAgg::new(plan);
     let prefix = data_prefix(&def.name);
+    // In autocommit, pin one snapshot so this multi-batch scan reads a single
+    // consistent view (concurrent commits are all-or-nothing across the whole
+    // aggregate). In a transaction the session snapshot+overlay is already
+    // consistent, so defer to `scan_batch`.
+    let snap = if db.in_txn() {
+        None
+    } else {
+        Some(db.raw_db().snapshot()?)
+    };
     let mut cursor: Option<Vec<u8>> = None;
     loop {
-        let batch = db.scan_batch(prefix.clone(), cursor.clone(), 8192).await?;
+        let batch = pinned_scan_batch(db, &snap, &prefix, &cursor, 8192).await?;
         if batch.is_empty() {
             break;
         }
