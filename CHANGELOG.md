@@ -4,7 +4,11 @@ All notable changes to ElyraSQL are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.1.3] - 2026-07-14
+
+Security release. Completes the expression-depth denial-of-service guard first
+shipped in 1.1.1, which missed two attack shapes. No on-disk format change from
+1.1.x. Upgrading from 1.1.0/1.1.1/1.1.2 is strongly recommended.
 
 ### Security
 
@@ -1229,6 +1233,7 @@ core CRUD with `WHERE`/`ORDER BY`/`LIMIT`, indexes, aggregation and `GROUP BY`,
 joins, prepared statements, authentication and TLS, vector search (exact +
 HNSW), parallel OLAP aggregation, and transactions with snapshot isolation.
 
+[1.1.3]: https://github.com/kwhorne/ElyraSQL/releases/tag/v1.1.3
 [1.1.2]: https://github.com/kwhorne/ElyraSQL/releases/tag/v1.1.2
 [1.1.1]: https://github.com/kwhorne/ElyraSQL/releases/tag/v1.1.1
 [#15]: https://github.com/kwhorne/ElyraSQL/issues/15

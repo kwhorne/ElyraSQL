@@ -123,10 +123,14 @@ mysql -h 127.0.0.1 -P 3307 -u root -p --ssl-mode=REQUIRED
 ElyraSQL bounds the recursion an untrusted query can trigger, so a single hostile
 statement cannot exhaust the worker-thread stack and abort the process:
 
-- **Expression depth.** Deeply-nested flat expressions (`1+1+1...`, huge `OR`
-  chains) are rejected with a normal SQL error *before* parsing. Configurable via
+- **Expression depth.** Deeply-nested expressions of any shape — arithmetic/
+  boolean/bitwise chains (`1+1+1...`, huge `OR` chains), parentheses and function
+  nesting, JSON `->`/`->>` chains, and postfix subscript/call chains
+  (`x[0][0]...`) — are rejected with a normal SQL error *before* parsing, so they
+  can never build a deep AST that overflows the stack. Configurable via
   `ELYRASQL_MAX_EXPR_DEPTH` (default 2000, clamped 64..5000). Wide-but-shallow
-  queries (long `IN` lists, large multi-row `INSERT`s) are unaffected.
+  queries (long `IN` lists, large multi-row `INSERT`s, multi-statement batches)
+  are unaffected.
 - **JSON nesting.** JSON documents are parsed to a maximum nesting depth of 200
   (both on write and when read by JSON functions); a deeper document is treated as
   invalid JSON rather than crashing.
