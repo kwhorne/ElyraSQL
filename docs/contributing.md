@@ -37,6 +37,14 @@ compatibility job):
 - **Crash recovery** (`crates/elyra-cli/tests/durability.rs`) — spawns the real
   binary, commits rows, SIGKILLs it, restarts and verifies survival. Run with
   `cargo test -p elyra-cli --test durability`.
+- **Soak / chaos** (`crates/elyra-cli/tests/soak.rs`) — many concurrent
+  connections run atomic transfers while a global bank invariant (total balance
+  conserved, never negative) is checked continuously; a second test repeatedly
+  SIGKILLs and restarts the server mid-write and re-checks the invariant after
+  every crash. Short by default (runs per-PR); tune with `ELYRASQL_SOAK_SECS`,
+  `ELYRASQL_SOAK_WORKERS`, `ELYRASQL_SOAK_ACCOUNTS`, `ELYRASQL_SOAK_KILL_MS`. The
+  nightly `Soak / chaos` workflow runs a long version. Run with
+  `cargo test -p elyra-cli --test soak`.
 - **Client & framework compatibility** (`tests/compat/`) — a full Laravel/
   Eloquent workload over PDO and a PyMySQL smoke test, run against a live
   server. See `tests/compat/README.md`.
