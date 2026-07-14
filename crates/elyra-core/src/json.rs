@@ -13,12 +13,20 @@ pub enum Json {
     Obj(Vec<(String, Json)>),
 }
 
-/// Parse a JSON document. Returns `None` if it is not valid JSON.
+/// Maximum JSON nesting depth accepted by the parser. Bounds recursion (and the
+/// resulting value's recursive `Drop`/serialisation) so a deeply-nested document
+/// like `[[[[...]]]]` can't overflow the thread stack and abort the process.
+/// Comfortably above MySQL's documented ~100-level limit; matches the on-write
+/// validator in `value.rs`.
+const MAX_JSON_DEPTH: usize = 200;
+
+/// Parse a JSON document. Returns `None` if it is not valid JSON (including when
+/// it nests deeper than [`MAX_JSON_DEPTH`]).
 pub fn parse(s: &str) -> Option<Json> {
     let b = s.as_bytes();
     let mut p = 0;
     skip_ws(b, &mut p);
-    let v = parse_value(b, &mut p)?;
+    let v = parse_value(b, &mut p, 0)?;
     skip_ws(b, &mut p);
     if p == b.len() {
         Some(v)
@@ -322,11 +330,11 @@ fn skip_ws(b: &[u8], p: &mut usize) {
     }
 }
 
-fn parse_value(b: &[u8], p: &mut usize) -> Option<Json> {
+fn parse_value(b: &[u8], p: &mut usize, depth: usize) -> Option<Json> {
     skip_ws(b, p);
     match *b.get(*p)? {
-        b'{' => parse_object(b, p),
-        b'[' => parse_array(b, p),
+        b'{' => parse_object(b, p, depth),
+        b'[' => parse_array(b, p, depth),
         b'"' => Some(Json::Str(parse_string(b, p)?)),
         b't' => lit(b, p, "true", Json::Bool(true)),
         b'f' => lit(b, p, "false", Json::Bool(false)),
@@ -400,7 +408,10 @@ fn parse_number(b: &[u8], p: &mut usize) -> Option<Json> {
     Some(Json::Num(s.to_string()))
 }
 
-fn parse_array(b: &[u8], p: &mut usize) -> Option<Json> {
+fn parse_array(b: &[u8], p: &mut usize, depth: usize) -> Option<Json> {
+    if depth >= MAX_JSON_DEPTH {
+        return None;
+    }
     *p += 1;
     let mut items = Vec::new();
     skip_ws(b, p);
@@ -409,7 +420,7 @@ fn parse_array(b: &[u8], p: &mut usize) -> Option<Json> {
         return Some(Json::Arr(items));
     }
     loop {
-        items.push(parse_value(b, p)?);
+        items.push(parse_value(b, p, depth + 1)?);
         skip_ws(b, p);
         match b.get(*p)? {
             b',' => {
@@ -424,7 +435,10 @@ fn parse_array(b: &[u8], p: &mut usize) -> Option<Json> {
     }
 }
 
-fn parse_object(b: &[u8], p: &mut usize) -> Option<Json> {
+fn parse_object(b: &[u8], p: &mut usize, depth: usize) -> Option<Json> {
+    if depth >= MAX_JSON_DEPTH {
+        return None;
+    }
     *p += 1;
     let mut pairs = Vec::new();
     skip_ws(b, p);
@@ -440,7 +454,7 @@ fn parse_object(b: &[u8], p: &mut usize) -> Option<Json> {
             return None;
         }
         *p += 1;
-        let val = parse_value(b, p)?;
+        let val = parse_value(b, p, depth + 1)?;
         pairs.push((key, val));
         skip_ws(b, p);
         match b.get(*p)? {
@@ -474,6 +488,31 @@ fn write_quoted(s: &str, out: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_pathologically_deep_nesting() {
+        // A document nested far past the limit must be rejected (returns None),
+        // not parsed recursively into a stack overflow. Uses an iterative build
+        // + explicit checks so the test itself never recurses.
+        let deep_arr = format!("{}{}", "[".repeat(100_000), "]".repeat(100_000));
+        assert!(parse(&deep_arr).is_none());
+        let deep_obj = format!("{}true{}", "{\"a\":".repeat(100_000), "}".repeat(100_000));
+        assert!(parse(&deep_obj).is_none());
+        // Nesting right at the boundary is fine.
+        let ok = format!(
+            "{}1{}",
+            "[".repeat(super::MAX_JSON_DEPTH),
+            "]".repeat(super::MAX_JSON_DEPTH)
+        );
+        assert!(parse(&ok).is_some());
+        // One past the boundary is rejected.
+        let over = format!(
+            "{}1{}",
+            "[".repeat(super::MAX_JSON_DEPTH + 1),
+            "]".repeat(super::MAX_JSON_DEPTH + 1)
+        );
+        assert!(parse(&over).is_none());
+    }
 
     #[test]
     fn extract_paths() {

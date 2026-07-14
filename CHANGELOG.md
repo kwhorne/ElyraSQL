@@ -20,6 +20,13 @@ All notable changes to ElyraSQL are documented here. The format is based on
   the parser, evaluator, and AST destructor never recurse unboundedly). The limit
   is configurable via `ELYRASQL_MAX_EXPR_DEPTH` (default 2000). Wide-but-shallow
   queries (long `IN` lists, large multi-row `INSERT`s) are unaffected.
+- **Fixed a related JSON denial-of-service** found while auditing for siblings of
+  the above. A deeply-nested JSON document (`[[[[...]]]]`, ~200k levels) passed to
+  a JSON function such as `JSON_VALID`/`JSON_EXTRACT` recursed through the JSON
+  parser (and the value's recursive destructor) and overflowed the worker stack,
+  again aborting the whole process. The JSON parser now enforces a maximum nesting
+  depth (200 levels, matching the on-write validator); an over-deep document is
+  treated as invalid JSON instead of crashing.
 
 ## [1.1.0] - 2026-07-14
 
