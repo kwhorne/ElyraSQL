@@ -118,6 +118,26 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
 mysql -h 127.0.0.1 -P 3307 -u root -p --ssl-mode=REQUIRED
 ```
 
+## Resource limits (denial-of-service)
+
+ElyraSQL bounds the recursion an untrusted query can trigger, so a single hostile
+statement cannot exhaust the worker-thread stack and abort the process:
+
+- **Expression depth.** Deeply-nested flat expressions (`1+1+1...`, huge `OR`
+  chains) are rejected with a normal SQL error *before* parsing. Configurable via
+  `ELYRASQL_MAX_EXPR_DEPTH` (default 2000, clamped 64..5000). Wide-but-shallow
+  queries (long `IN` lists, large multi-row `INSERT`s) are unaffected.
+- **JSON nesting.** JSON documents are parsed to a maximum nesting depth of 200
+  (both on write and when read by JSON functions); a deeper document is treated as
+  invalid JSON rather than crashing.
+- Other resource bounds: `ELYRASQL_TXN_MAX_BYTES` (uncommitted transaction size),
+  `ELYRASQL_SORT_MAX_ROWS` / `ELYRASQL_GROUP_MAX_GROUPS` (spill thresholds),
+  `ELYRASQL_MAX_FRAME_MB` (max network/binlog/spill frame). See
+  [Configuration](configuration.md).
+
+To report a vulnerability, use GitHub's private vulnerability reporting on the
+repository (Security tab); see `SECURITY.md`.
+
 ## Hardening checklist
 
 - [ ] Configure `--user`/`--password` or `--auth` (never run open in production).
