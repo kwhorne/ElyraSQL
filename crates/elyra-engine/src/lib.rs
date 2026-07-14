@@ -1990,55 +1990,113 @@ pub fn guard_sql_complexity(sql: &str) -> Result<()> {
         }};
     }
     for tok in &tokens {
-        let is_op = matches!(
-            tok,
-            Token::Plus
-                | Token::Minus
-                | Token::Mul
-                | Token::Div
-                | Token::Mod
-                | Token::StringConcat
-                | Token::Eq
-                | Token::Neq
-                | Token::Lt
-                | Token::Gt
-                | Token::LtEq
-                | Token::GtEq
-                | Token::Spaceship
-                | Token::Ampersand
-                | Token::Pipe
-                | Token::Caret
-                | Token::ShiftLeft
-                | Token::ShiftRight
-                | Token::Tilde
-                | Token::ExclamationMark
-        ) || matches!(tok, Token::Word(w) if is_operator_keyword(w.keyword));
-        if is_op {
+        if is_deepening_token(tok) {
             let top = stack.last_mut().unwrap();
             top.1 += 1;
             bump!(top.0 + top.1);
             continue;
         }
         match tok {
+            // Opening a group/subscript/call roots a sub-expression one level
+            // deeper (catches `((((...))))`, `f(f(f(...)))`, deep subqueries).
             Token::LParen | Token::LBracket => {
                 let top = *stack.last().unwrap();
                 let base = top.0 + top.1 + 1;
                 bump!(base);
                 stack.push((base, 0));
             }
-            Token::RParen | Token::RBracket if stack.len() > 1 => {
-                stack.pop();
+            // Closing returns to the parent, and the group/subscript/call becomes
+            // one more operand in the parent's chain. Incrementing here is what
+            // catches token-balanced *postfix* chains that never accumulate an open
+            // bracket depth, e.g. `x[0][0][0]...` or `f(a)(b)...`.
+            Token::RParen | Token::RBracket => {
+                if stack.len() > 1 {
+                    stack.pop();
+                }
+                let top = stack.last_mut().unwrap();
+                top.1 += 1;
+                bump!(top.0 + top.1);
             }
-            // A comma starts a fresh element (list item / argument) at this level.
+            // A comma starts a fresh element (list item / argument) at this level,
+            // so a long-but-shallow list (`IN (...)`, multi-row `VALUES`) doesn't
+            // accumulate depth.
             Token::Comma => {
                 if let Some(top) = stack.last_mut() {
                     top.1 = 0;
                 }
             }
+            // A statement separator resets to a fresh context, so a multi-statement
+            // batch of shallow statements isn't summed into a false rejection.
+            Token::SemiColon => {
+                stack.clear();
+                stack.push((0, 0));
+            }
             _ => {}
         }
     }
     Ok(())
+}
+
+/// Does this token deepen an expression chain (an operator that nests its
+/// operands in the AST)? Covers every symbolic operator the tokenizer can emit
+/// plus the keyword operators, so no infix/prefix/postfix operator is missed
+/// (unknown-but-operator-shaped tokens are treated as deepening = conservative).
+/// `,`, `.`, `;`, literals, identifiers and brackets are handled separately.
+fn is_deepening_token(tok: &Token) -> bool {
+    use Token::*;
+    match tok {
+        DoubleEq
+        | Eq
+        | Neq
+        | Lt
+        | Gt
+        | LtEq
+        | GtEq
+        | Spaceship
+        | Plus
+        | Minus
+        | Mul
+        | Div
+        | DuckIntDiv
+        | Mod
+        | StringConcat
+        | Assignment
+        | Ampersand
+        | Pipe
+        | Caret
+        | Tilde
+        | TildeAsterisk
+        | ExclamationMarkTilde
+        | ExclamationMarkTildeAsterisk
+        | DoubleTilde
+        | DoubleTildeAsterisk
+        | ExclamationMarkDoubleTilde
+        | ExclamationMarkDoubleTildeAsterisk
+        | ShiftLeft
+        | ShiftRight
+        | Overlap
+        | ExclamationMark
+        | DoubleExclamationMark
+        | AtSign
+        | CaretAt
+        | PGSquareRoot
+        | PGCubeRoot
+        | Arrow
+        | LongArrow
+        | HashArrow
+        | HashLongArrow
+        | AtArrow
+        | ArrowAt
+        | HashMinus
+        | AtQuestion
+        | AtAt
+        | Question
+        | QuestionAnd
+        | QuestionPipe
+        | CustomBinaryOperator(_) => true,
+        Word(w) => is_operator_keyword(w.keyword),
+        _ => false,
+    }
 }
 
 /// Remove trailing table options from a `CREATE TABLE (...) <options>` statement
@@ -2756,14 +2814,29 @@ mod complexity_guard_tests {
 
     #[test]
     fn rejects_deep_flat_chains() {
-        // Arithmetic chain and boolean OR chain both build O(N)-deep ASTs.
-        let arith = format!("SELECT 1{}", "+1".repeat(40000));
-        assert!(guard_sql_complexity(&arith).is_err());
-        let ors = format!("SELECT * FROM t WHERE {}", vec!["id=1"; 40000].join(" OR "));
-        assert!(guard_sql_complexity(&ors).is_err());
-        // Unary and bitwise chains too.
-        let nots = format!("SELECT {}1", "NOT ".repeat(40000));
-        assert!(guard_sql_complexity(&nots).is_err());
+        // Every shape that builds an O(N)-deep AST must be rejected before parse,
+        // whichever way it deepens: infix chains, boolean chains, unary chains,
+        // JSON `->`/`->>` chains, token-balanced postfix subscript/call chains,
+        // and grouping/function nesting.
+        let cases = [
+            format!("SELECT 1{}", "+1".repeat(40000)), // arithmetic
+            format!("SELECT * FROM t WHERE {}", vec!["id=1"; 40000].join(" OR ")), // OR
+            format!("SELECT {}1", "NOT ".repeat(40000)), // unary
+            format!("SELECT 1 {}", "| 1 ".repeat(40000)), // bitwise
+            format!("SELECT '{{}}' {}", "-> '$' ".repeat(40000)), // JSON arrow
+            format!("SELECT '{{}}' {}", "->> '$' ".repeat(40000)), // JSON longarrow
+            format!("SELECT x{}", "[0]".repeat(40000)), // subscript chain
+            format!("SELECT f{}", "()".repeat(40000)), // call chain
+            format!("SELECT {}1{}", "(".repeat(40000), ")".repeat(40000)), // parens
+            format!("SELECT {}1{}", "ABS(".repeat(40000), ")".repeat(40000)), // func nest
+        ];
+        for c in &cases {
+            assert!(
+                guard_sql_complexity(c).is_err(),
+                "expected rejection for a deep chain: {}...",
+                &c[..30.min(c.len())]
+            );
+        }
     }
 
     #[test]
@@ -2786,6 +2859,11 @@ mod complexity_guard_tests {
         guard_sql_complexity(&format!("INSERT INTO t VALUES {rows}")).unwrap();
         // A moderate chain under the limit is fine.
         guard_sql_complexity(&format!("SELECT 1{}", "+1".repeat(500))).unwrap();
+        // A batch of many shallow statements must not be summed into a rejection.
+        let batch = "SELECT 1+1; ".repeat(3000);
+        guard_sql_complexity(&batch).unwrap();
+        // A few JSON arrows / subscripts are fine.
+        guard_sql_complexity("SELECT a->'$.x'->'$.y', b[0][1] FROM t").unwrap();
     }
 }
 

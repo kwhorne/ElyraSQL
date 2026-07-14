@@ -4,6 +4,23 @@ All notable changes to ElyraSQL are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Security
+
+- **Completed the expression-depth DoS guard from 1.1.1.** The initial guard
+  estimated AST depth from a hand-picked set of operator tokens and tracked only
+  open-bracket nesting, so it **missed** two shapes that still overflowed the
+  worker stack and aborted the process: JSON `->`/`->>` chains
+  (`x -> '$' -> '$' ...`) and token-balanced *postfix* chains
+  (`x[0][0]...`, `f()()...`). The guard now treats **every** operator token the
+  tokenizer can emit as depth-contributing and accumulates depth when a
+  group/subscript/call closes, so all deep-AST shapes are rejected before parsing.
+  A statement separator (`;`) resets the estimate so multi-statement batches of
+  shallow statements aren't falsely rejected. Verified against arrow, longarrow,
+  subscript, call, paren, function-nesting, arithmetic, boolean and bitwise chains
+  at 300k terms (all rejected; server stays alive).
+
 ## [1.1.2] - 2026-07-14
 
 Correctness release for integer/floating-point arithmetic. No on-disk format

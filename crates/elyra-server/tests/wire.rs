@@ -1205,11 +1205,18 @@ async fn deep_expression_does_not_crash_server() {
         "deep chain should be rejected, not accepted"
     );
 
-    // WHERE OR chain on a fresh connection (the previous conn may be poisoned by
-    // the error, which is fine — the point is the *server* is alive).
-    let mut c2 = srv.conn().await;
-    let ors = format!("SELECT * FROM t WHERE {}", vec!["id=1"; 40000].join(" OR "));
-    assert!(c2.query_drop(&ors).await.is_err());
+    // Every deep-AST shape must be rejected, not crash: boolean chain, JSON arrow
+    // chain, and a token-balanced subscript chain (each on a fresh connection,
+    // since a prior error may poison the current one — the point is the *server*
+    // stays alive).
+    for payload in [
+        format!("SELECT * FROM t WHERE {}", vec!["id=1"; 40000].join(" OR ")),
+        format!("SELECT '{{}}' {}", "-> '$' ".repeat(40000)),
+        format!("SELECT id{} FROM t", "[0]".repeat(40000)),
+    ] {
+        let mut cn = srv.conn().await;
+        assert!(cn.query_drop(&payload).await.is_err());
+    }
 
     // Definitive proof the server survived both: a normal query on a new
     // connection still works.
