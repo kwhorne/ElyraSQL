@@ -4,6 +4,23 @@ All notable changes to ElyraSQL are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Security
+
+- **Fixed a remote denial-of-service** (reported privately). A single query with a
+  deeply-nested flat expression — e.g. `SELECT 1+1+1...` or
+  `... WHERE id=1 OR id=1 OR ...` with tens of thousands of terms — built a
+  left-deep AST whose depth is O(N). Evaluating it, and even *dropping* it,
+  recursed O(N) frames deep and overflowed the worker thread stack, which aborted
+  the **entire server process** (dropping every client at once), not just the
+  offending connection. Unauthenticated in the default open-auth (dev) mode; any
+  authenticated user otherwise. ElyraSQL now rejects over-deep expressions with a
+  normal SQL error **before parsing** (so the pathological AST is never built —
+  the parser, evaluator, and AST destructor never recurse unboundedly). The limit
+  is configurable via `ELYRASQL_MAX_EXPR_DEPTH` (default 2000). Wide-but-shallow
+  queries (long `IN` lists, large multi-row `INSERT`s) are unaffected.
+
 ## [1.1.0] - 2026-07-14
 
 Robustness release. Adds a soak/chaos test harness and, on its first run, fixes a

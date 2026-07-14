@@ -36,7 +36,9 @@ use elyra_core::{ColumnType, Error, Privilege, Result, Schema, Value};
 use elyra_storage::Db;
 use sqlparser::ast::Statement;
 use sqlparser::dialect::MySqlDialect;
+use sqlparser::keywords::Keyword;
 use sqlparser::parser::Parser;
+use sqlparser::tokenizer::{Token, Tokenizer};
 
 pub use stream::RowStream;
 
@@ -610,6 +612,8 @@ impl Engine {
     /// describes it). Placeholders are fine — only projection + FROM are read.
     pub async fn describe_query(&self, sql: &str, sess: &Session) -> Option<Schema> {
         use sqlparser::ast::{Expr, SelectItem, SetExpr, TableFactor};
+        // Never parse a pathologically deep expression (stack-overflow guard).
+        guard_sql_complexity(sql).ok()?;
         let stmts = Parser::parse_sql(&MySqlDialect {}, sql).ok()?;
         if stmts.len() != 1 {
             return None;
@@ -769,6 +773,9 @@ impl Engine {
         user: &str,
         sess: &Session,
     ) -> Result<Vec<QueryResult>> {
+        // Reject pathologically deep expressions before any parsing/evaluation so
+        // a hostile query can't overflow the worker stack and abort the process.
+        guard_sql_complexity(sql)?;
         // Cheap keyword dispatch on a short prefix — statements can be huge
         // (bulk INSERT), so never lowercase the whole thing here.
         let trimmed = sql.trim_start();
@@ -1901,6 +1908,139 @@ fn required_privilege(stmt: &Statement) -> Privilege {
     }
 }
 
+/// Default cap on expression nesting/chain depth accepted from a client, in
+/// operator-token units (a `a OP a OP a ...` chain of length N counts ~N). A flat
+/// chain builds a left-deep AST of depth O(N); the recursive-descent parser is
+/// bounded by its own recursion limit, but flat infix/prefix chains bypass that
+/// and would recurse O(N) deep in the evaluator -- and, critically, in the AST's
+/// own `Drop` -- overflowing the worker stack and aborting the entire process.
+/// We reject such input *before* parsing so the pathological AST is never built.
+const DEFAULT_MAX_EXPR_DEPTH: usize = 2000;
+
+/// Effective expression-depth limit: `ELYRASQL_MAX_EXPR_DEPTH` if set, clamped to
+/// a safe range (never high enough to reintroduce the stack-overflow), else the
+/// default. Cached after first read.
+fn max_expr_depth() -> usize {
+    use std::sync::OnceLock;
+    static LIMIT: OnceLock<usize> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("ELYRASQL_MAX_EXPR_DEPTH")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map(|v| v.clamp(64, 5000))
+            .unwrap_or(DEFAULT_MAX_EXPR_DEPTH)
+    })
+}
+
+/// Is this a keyword that acts as an infix/prefix operator (and so extends an
+/// expression chain / AST depth)?
+fn is_operator_keyword(k: Keyword) -> bool {
+    matches!(
+        k,
+        Keyword::AND
+            | Keyword::OR
+            | Keyword::XOR
+            | Keyword::NOT
+            | Keyword::LIKE
+            | Keyword::ILIKE
+            | Keyword::RLIKE
+            | Keyword::REGEXP
+            | Keyword::IN
+            | Keyword::IS
+            | Keyword::BETWEEN
+            | Keyword::DIV
+            | Keyword::MOD
+    )
+}
+
+/// Reject pathologically deep expressions **before** parsing.
+///
+/// A single query such as `SELECT 1 + 1 + 1 ... (tens of thousands of terms)` or
+/// `... WHERE id=1 OR id=1 OR ...` builds a left-deep AST whose depth is O(N).
+/// Evaluating it (and even dropping it) recurses O(N) frames deep and overflows
+/// the worker thread's stack, which in Rust triggers `abort()` -- killing the
+/// whole server process, not just the connection. This runs on the flat token
+/// stream (no recursion, safe to drop) and estimates the maximum AST depth with a
+/// small bracket-aware state machine, rejecting anything over [`max_expr_depth`]
+/// with a normal SQL error so the connection survives and other clients are
+/// unaffected. If tokenizing fails we return `Ok(())` and let the parser produce
+/// the real syntax error.
+pub fn guard_sql_complexity(sql: &str) -> Result<()> {
+    let dialect = MySqlDialect {};
+    let tokens = match Tokenizer::new(&dialect, sql).tokenize() {
+        Ok(t) => t,
+        Err(_) => return Ok(()),
+    };
+    let limit = max_expr_depth();
+    // Per bracket level: (base_depth at which this level is rooted, chain length
+    // accumulated so far at this level). Depth at a point = base + chain.
+    let mut stack: Vec<(usize, usize)> = vec![(0, 0)];
+    let mut max_depth = 0usize;
+    macro_rules! bump {
+        ($d:expr) => {{
+            let d = $d;
+            if d > max_depth {
+                max_depth = d;
+                if max_depth > limit {
+                    return Err(Error::Parse(format!(
+                        "expression too deeply nested (depth limit {limit}); simplify the query"
+                    )));
+                }
+            }
+        }};
+    }
+    for tok in &tokens {
+        let is_op = matches!(
+            tok,
+            Token::Plus
+                | Token::Minus
+                | Token::Mul
+                | Token::Div
+                | Token::Mod
+                | Token::StringConcat
+                | Token::Eq
+                | Token::Neq
+                | Token::Lt
+                | Token::Gt
+                | Token::LtEq
+                | Token::GtEq
+                | Token::Spaceship
+                | Token::Ampersand
+                | Token::Pipe
+                | Token::Caret
+                | Token::ShiftLeft
+                | Token::ShiftRight
+                | Token::Tilde
+                | Token::ExclamationMark
+        ) || matches!(tok, Token::Word(w) if is_operator_keyword(w.keyword));
+        if is_op {
+            let top = stack.last_mut().unwrap();
+            top.1 += 1;
+            bump!(top.0 + top.1);
+            continue;
+        }
+        match tok {
+            Token::LParen | Token::LBracket => {
+                let top = *stack.last().unwrap();
+                let base = top.0 + top.1 + 1;
+                bump!(base);
+                stack.push((base, 0));
+            }
+            Token::RParen | Token::RBracket if stack.len() > 1 => {
+                stack.pop();
+            }
+            // A comma starts a fresh element (list item / argument) at this level.
+            Token::Comma => {
+                if let Some(top) = stack.last_mut() {
+                    top.1 = 0;
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// Remove trailing table options from a `CREATE TABLE (...) <options>` statement
 /// that the SQL parser cannot accept in every MySQL spelling (`ENGINE=`,
 /// `DEFAULT CHARSET`/`CHARACTER SET`, `COLLATE '...'`, `AUTO_INCREMENT=`,
@@ -2190,6 +2330,12 @@ fn matching_paren_end(s: &str, start: usize) -> Option<usize> {
 /// (`fuzz/fuzz_targets/preprocess.rs`) and a stable proptest, so the invariant is
 /// checked in normal CI too.
 pub fn fuzz_preprocess_parse(sql: &str) {
+    // Mirror the real pipeline: reject over-deep expressions before parsing, so
+    // neither the parser, the evaluator, nor the AST's Drop can recurse
+    // unboundedly on adversarial flat chains.
+    if guard_sql_complexity(sql).is_err() {
+        return;
+    }
     let mut s = sql.to_string();
     if s.to_ascii_lowercase().contains("lock in share mode") {
         s = replace_ci(&s, "lock in share mode", "for share");
@@ -2601,6 +2747,45 @@ mod insert_set_tests {
             rewrite_insert_set("INSERT INTO t SET a = (SELECT MAX(id) FROM u), b = 1").unwrap(),
             "INSERT INTO t (a, b) VALUES ((SELECT MAX(id) FROM u), 1)"
         );
+    }
+}
+
+#[cfg(test)]
+mod complexity_guard_tests {
+    use super::guard_sql_complexity;
+
+    #[test]
+    fn rejects_deep_flat_chains() {
+        // Arithmetic chain and boolean OR chain both build O(N)-deep ASTs.
+        let arith = format!("SELECT 1{}", "+1".repeat(40000));
+        assert!(guard_sql_complexity(&arith).is_err());
+        let ors = format!("SELECT * FROM t WHERE {}", vec!["id=1"; 40000].join(" OR "));
+        assert!(guard_sql_complexity(&ors).is_err());
+        // Unary and bitwise chains too.
+        let nots = format!("SELECT {}1", "NOT ".repeat(40000));
+        assert!(guard_sql_complexity(&nots).is_err());
+    }
+
+    #[test]
+    fn accepts_legit_wide_but_shallow_queries() {
+        // A long IN list is a flat Vec (shallow), not a nested chain.
+        let in_list = format!(
+            "SELECT * FROM t WHERE id IN ({})",
+            (0..6000)
+                .map(|i| i.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        guard_sql_complexity(&in_list).unwrap();
+        // A big multi-row INSERT with arithmetic in each value stays shallow
+        // because commas and parens reset the per-level chain.
+        let rows = (0..5000)
+            .map(|i| format!("({i},{i}+{i})"))
+            .collect::<Vec<_>>()
+            .join(",");
+        guard_sql_complexity(&format!("INSERT INTO t VALUES {rows}")).unwrap();
+        // A moderate chain under the limit is fine.
+        guard_sql_complexity(&format!("SELECT 1{}", "+1".repeat(500))).unwrap();
     }
 }
 

@@ -1184,3 +1184,51 @@ async fn order_by_total_order_random() {
     expected.sort_by_key(|(id, k)| (*k, *id));
     assert_eq!(got, expected);
 }
+
+// Regression: a deeply-nested flat expression must NOT crash the server. Before
+// the fix, a left-deep `1+1+1...` (or `WHERE id=1 OR id=1 OR ...`) chain overflowed
+// the worker stack and aborted the whole process (all clients dropped). Now it is
+// rejected as a normal SQL error and the server keeps serving.
+#[tokio::test]
+async fn deep_expression_does_not_crash_server() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop("CREATE TABLE t (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO t VALUES (1)").await.unwrap();
+
+    // Arithmetic chain: expect an error, not a dropped connection.
+    let arith = format!("SELECT 1{}", "+1".repeat(40000));
+    assert!(
+        c.query_drop(&arith).await.is_err(),
+        "deep chain should be rejected, not accepted"
+    );
+
+    // WHERE OR chain on a fresh connection (the previous conn may be poisoned by
+    // the error, which is fine — the point is the *server* is alive).
+    let mut c2 = srv.conn().await;
+    let ors = format!("SELECT * FROM t WHERE {}", vec!["id=1"; 40000].join(" OR "));
+    assert!(c2.query_drop(&ors).await.is_err());
+
+    // Definitive proof the server survived both: a normal query on a new
+    // connection still works.
+    let mut c3 = srv.conn().await;
+    let n: i64 = c3
+        .query_first("SELECT COUNT(*) FROM t")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(n, 1);
+
+    // And a legitimately large (but shallow) query is unaffected.
+    let in_list = format!(
+        "SELECT id FROM t WHERE id IN ({})",
+        (0..6000)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let got: Vec<i64> = c3.query(&in_list).await.unwrap();
+    assert_eq!(got, vec![1]);
+}
