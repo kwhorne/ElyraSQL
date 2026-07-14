@@ -37,10 +37,27 @@ INSERT INTO t VALUES
   `DECIMAL(10,2)` reads back as `19.90`, and `SUM` over decimals is exact.
 - **DATE/DATETIME/TIME** accept string literals and compare correctly against
   strings (`WHERE d >= '2024-01-01'`).
-- **JSON** must be structurally valid; invalid JSON is rejected.
+- **JSON** must be structurally valid; invalid JSON is rejected. Nesting is
+  bounded (200 levels) so a pathological document can't exhaust the stack.
 - **VECTOR** accepts a `'[a,b,c]'` string literal of the declared dimension.
-- **ENUM** and **SET** are accepted and stored as their string value (the
-  allowed-value list is parsed but not enforced).
+- **ENUM** and **SET** are accepted and stored as their string value; a value
+  outside the declared member list is rejected.
+
+## Arithmetic semantics
+
+Arithmetic follows MySQL:
+
+- **Signed integer overflow raises an error** rather than silently wrapping or
+  saturating: `9223372036854775807 + 1` returns
+  `ERROR 1690 (22003): BIGINT value is out of range`, in both scalar expressions
+  and computed writes (`UPDATE ... SET v = v + 1`). Integer `+`, `-`, `*` are
+  computed exactly (no `f64` precision loss for large values).
+- **Division or modulo by zero returns `NULL`**: `1 / 0`, `1 % 0` and `MOD(1, 0)`
+  are all `NULL`.
+- **`DOUBLE` overflow returns `NULL`** rather than `inf`/`NaN` (e.g.
+  `POW(10, 308) * 10`).
+- Values above the signed range use `BIGINT UNSIGNED` (exact 64-bit unsigned),
+  and `DECIMAL` arithmetic is exact to its scale.
 
 ## JSON access
 
