@@ -575,8 +575,15 @@ fn finish(acc: &Acc, spec: &AggSpec) -> Value {
                 })
             }
         }
-        AggFunc::BitOr | AggFunc::BitXor => Value::Int(if acc.bits_init { acc.bits } else { 0 }),
-        AggFunc::BitAnd => Value::Int(if acc.bits_init { acc.bits } else { -1 }),
+        // MySQL bit aggregates return BIGINT UNSIGNED (empty BIT_AND = all ones).
+        AggFunc::BitOr | AggFunc::BitXor => {
+            Value::UInt(if acc.bits_init { acc.bits as u64 } else { 0 })
+        }
+        AggFunc::BitAnd => Value::UInt(if acc.bits_init {
+            acc.bits as u64
+        } else {
+            u64::MAX
+        }),
     }
 }
 

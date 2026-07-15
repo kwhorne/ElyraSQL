@@ -122,7 +122,11 @@ pub fn eval_row(expr: &Expr, schema: &Schema, row: &[Value]) -> Result<Value> {
         Expr::UnaryOp { op, expr } => {
             let v = eval_row(expr, schema, row)?;
             match (op, v) {
-                (UnaryOperator::Not, v) => Ok(Value::Bool(!truthy(&v))),
+                (UnaryOperator::Not, v) => Ok(if v.is_null() {
+                    Value::Null // NOT NULL = NULL (three-valued logic)
+                } else {
+                    Value::Bool(!truthy(&v))
+                }),
                 (UnaryOperator::Minus, Value::Int(i)) => {
                     i.checked_neg().map(Value::Int).ok_or_else(|| {
                         Error::OutOfRange(format!("BIGINT value is out of range in '-({i})'"))
@@ -159,9 +163,19 @@ pub fn eval_row(expr: &Expr, schema: &Schema, row: &[Value]) -> Result<Value> {
             let lo = eval_row(low, schema, row)?;
             let hi = eval_row(high, schema, row)?;
             let coll = expr_collation(expr, schema).unwrap_or(Collation::Ci);
-            let inside = cmp(&v, &lo, coll)?.map(|o| o.is_ge()).unwrap_or(false)
-                && cmp(&v, &hi, coll)?.map(|o| o.is_le()).unwrap_or(false);
-            Ok(Value::Bool(if *negated { !inside } else { inside }))
+            // `x BETWEEN a AND b` is `x >= a AND x <= b` with three-valued logic:
+            // a NULL bound yields NULL unless the other test already forces FALSE.
+            let ge = cmp(&v, &lo, coll)?.map(|o| o.is_ge());
+            let le = cmp(&v, &hi, coll)?.map(|o| o.is_le());
+            let inside = match (ge, le) {
+                (Some(false), _) | (_, Some(false)) => Some(false),
+                (Some(true), Some(true)) => Some(true),
+                _ => None,
+            };
+            Ok(match inside {
+                None => Value::Null,
+                Some(b) => Value::Bool(if *negated { !b } else { b }),
+            })
         }
         Expr::BinaryOp { left, op, right } => match op {
             BinaryOperator::Arrow => {
@@ -1164,6 +1178,35 @@ fn eval_scalar(name: &str, a: &[Value]) -> Result<Option<Value>> {
             Some(s) => Value::Int(s.bytes().next().unwrap_or(0) as i64),
             None => Value::Null,
         },
+        // ORD: for a multi-byte first character, MySQL sums the bytes big-endian;
+        // for single-byte it equals ASCII.
+        "ord" => match sstr(a, 0) {
+            Some(s) => match s.chars().next() {
+                Some(c) => {
+                    let mut buf = [0u8; 4];
+                    let bytes = c.encode_utf8(&mut buf).as_bytes();
+                    let mut n: i64 = 0;
+                    for &b in bytes {
+                        n = n * 256 + b as i64;
+                    }
+                    Value::Int(n)
+                }
+                None => Value::Int(0),
+            },
+            None => Value::Null,
+        },
+        "bin" => match nnum(a, 0) {
+            Some(x) => Value::Text(to_base_unsigned(x as i64 as u64, 2)),
+            None => Value::Null,
+        },
+        "oct" => match nnum(a, 0) {
+            Some(x) => Value::Text(to_base_unsigned(x as i64 as u64, 8)),
+            None => Value::Null,
+        },
+        "crc32" => match sstr(a, 0) {
+            Some(s) => Value::Int(crc32(s.as_bytes()) as i64),
+            None => Value::Null,
+        },
         // ---- math ----
         "abs" => match a.first() {
             Some(Value::Int(i)) => Value::Int(i.abs()),
@@ -1568,6 +1611,22 @@ fn conv_fn(a: &[Value]) -> Value {
         to_base_unsigned(mag, to.unsigned_abs())
     };
     Value::Text(out)
+}
+
+/// CRC-32 (IEEE 802.3 / zlib), as used by MySQL's `CRC32()`.
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for &byte in data {
+        crc ^= byte as u32;
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
 }
 
 fn to_base_unsigned(mut n: u64, base: u64) -> String {

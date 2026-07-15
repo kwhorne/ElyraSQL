@@ -471,7 +471,7 @@ fn register_agg(
         | AggFunc::VarPop
         | AggFunc::VarSamp => ColumnType::Float,
         AggFunc::GroupConcat => ColumnType::Text,
-        AggFunc::BitOr | AggFunc::BitAnd | AggFunc::BitXor => ColumnType::Int,
+        AggFunc::BitOr | AggFunc::BitAnd | AggFunc::BitXor => ColumnType::UInt,
         AggFunc::Sum | AggFunc::Min | AggFunc::Max => arg_ty.unwrap_or(ColumnType::Float),
     };
     let slot = aggs.len();

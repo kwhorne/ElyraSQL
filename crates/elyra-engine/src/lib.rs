@@ -1263,6 +1263,11 @@ impl Engine {
         if let Some(rewritten) = rewrite_tilde(&subst_sql) {
             subst_sql = rewritten;
         }
+        // Rewrite the `!` logical-NOT prefix into `(NOT (...))` (after `~` so a
+        // mixed `!~x` is already parenthesised).
+        if let Some(rewritten) = rewrite_bang(&subst_sql) {
+            subst_sql = rewritten;
+        }
         let statements = match Parser::parse_sql(&dialect, &subst_sql) {
             Ok(s) => s,
             Err(e) => {
@@ -2213,6 +2218,69 @@ fn strip_dml_limit(sql: &str) -> Option<String> {
 /// Quote-aware; processes right-to-left so nested `~~x` works. Returns None if
 /// there is no top-level `~`, or if any `~`'s operand isn't a shape we can bound
 /// safely (then the original is left to fail parsing rather than be mis-scoped).
+/// Rewrite MySQL's high-precedence logical-NOT prefix `!x` into `(NOT (x))` (no
+/// SQL dialect parses a bare `!` prefix). Wrapping the tightly-bound operand in
+/// parentheses preserves `!`'s precedence: `!a = b` becomes `(NOT (a)) = b`, i.e.
+/// `(!a) = b`, not `NOT (a = b)`. Skips the `!=` operator and string/quoted
+/// contexts. Runs after `rewrite_tilde`, so `!~a` is already `!(...)`.
+fn rewrite_bang(sql: &str) -> Option<String> {
+    if !sql.contains('!') {
+        return None;
+    }
+    let mut s = sql.to_string();
+    // Rewrite the right-most `!` each pass, so nested `!!x` resolves inside-out.
+    while let Some(p) = last_top_level_bang(&s) {
+        let b = s.as_bytes();
+        let mut j = p + 1;
+        while j < b.len() && (b[j] == b' ' || b[j] == b'\t') {
+            j += 1;
+        }
+        let Some(end) = tilde_operand_end(&s, j) else {
+            return None; // un-boundable operand -> abandon the rewrite
+        };
+        let operand = &s[j..end];
+        let replaced = format!("(NOT ({operand}))");
+        s = format!("{}{}{}", &s[..p], replaced, &s[end..]);
+    }
+    Some(s)
+}
+
+/// Right-most top-level `!` that is a prefix operator (not part of `!=`), outside
+/// string/quoted contexts.
+fn last_top_level_bang(s: &str) -> Option<usize> {
+    let b = s.as_bytes();
+    let (mut in_s, mut in_d, mut in_b) = (false, false, false);
+    let mut last = None;
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if in_s {
+            if c == b'\'' {
+                in_s = false;
+            }
+        } else if in_d {
+            if c == b'"' {
+                in_d = false;
+            }
+        } else if in_b {
+            if c == b'`' {
+                in_b = false;
+            }
+        } else {
+            match c {
+                b'\'' => in_s = true,
+                b'"' => in_d = true,
+                b'`' => in_b = true,
+                // A `!` not immediately followed by `=` is the prefix operator.
+                b'!' if b.get(i + 1) != Some(&b'=') => last = Some(i),
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    last
+}
+
 fn rewrite_tilde(sql: &str) -> Option<String> {
     if !sql.contains('~') {
         return None;
@@ -2411,6 +2479,9 @@ pub fn fuzz_preprocess_parse(sql: &str) {
         s = x;
     }
     if let Some(x) = rewrite_tilde(&s) {
+        s = x;
+    }
+    if let Some(x) = rewrite_bang(&s) {
         s = x;
     }
     let _ = split_top_level(&s, ',');

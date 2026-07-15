@@ -276,6 +276,39 @@ CASES = [
     # window
     ("window", "SELECT id, ROW_NUMBER() OVER (ORDER BY id) FROM d ORDER BY id"),
     ("window", "SELECT id, SUM(id) OVER () FROM d ORDER BY id"),
+    # `!` logical-NOT prefix (rewritten to NOT with preserved precedence)
+    ("bang", "SELECT !0"),
+    ("bang", "SELECT !1"),
+    ("bang", "SELECT !5"),
+    ("bang", "SELECT !NULL"),
+    ("bang", "SELECT !!5"),
+    ("bang", "SELECT !0 = 0"),
+    ("bang", "SELECT 1 != 2"),
+    ("bang", "SELECT !(1 = 1)"),
+    # more numeric functions
+    ("num", "SELECT LOG2(8)"),
+    ("num", "SELECT LOG10(1000)"),
+    ("num", "SELECT EXP(0)"),
+    ("num", "SELECT POW(2, 10)"),
+    ("num", "SELECT SIGN(0)"),
+    ("num", "SELECT MOD(10.5, 3)"),
+    ("num", "SELECT ROUND(-0.5)"),
+    ("num", "SELECT CRC32('ElyraSQL')"),
+    # more string functions
+    ("string", "SELECT FIND_IN_SET('b', 'a,b,c')"),
+    ("string", "SELECT FIND_IN_SET('x', 'a,b,c')"),
+    ("string", "SELECT RPAD('x', 4, 'ab')"),
+    ("string", "SELECT TRIM(LEADING 'x' FROM 'xxabc')"),
+    ("string", "SELECT TRIM(BOTH 'x' FROM 'xxabcxx')"),
+    ("string", "SELECT ORD('A')"),
+    ("string", "SELECT BIN(5)"),
+    ("string", "SELECT OCT(8)"),
+    # comparison / null edges
+    ("null", "SELECT 1 BETWEEN NULL AND 5"),
+    ("null", "SELECT 2 <> 2"),
+    ("null", "SELECT NOT NULL"),
+    # bit aggregates over the fixture
+    ("agg", "SELECT BIT_OR(n), BIT_AND(n), BIT_XOR(n) FROM d WHERE n IS NOT NULL"),
 ]
 
 
@@ -294,12 +327,12 @@ ALLOWLIST = {
     "SELECT CAST(3.14159 AS DECIMAL(4,2))",
     # Benign wire-type: a TIME result is sent as text (value identical: 01:01:01).
     "SELECT SEC_TO_TIME(3661)",
+    # Intentional: MySQL's bare `!!x` is a known quirk (`!!5` = 0, yet `!(!5)` = 1
+    # and `NOT NOT 5` = 1). We treat `!!x` as consistent double negation, matching
+    # the parenthesised / NOT NOT forms rather than replicating the quirk.
+    "SELECT !!5",
     # Both reject the out-of-range value (we return NULL, MySQL errors 1690).
     "SELECT POW(10, 308) * 10",
-    # Tracked feature gap: the `!` prefix-negation operator is not parsed by any
-    # sqlparser dialect, and a text rewrite to NOT would change precedence
-    # (`!a = b` is `(!a) = b`, not `NOT (a = b)`), so it stays unsupported.
-    "SELECT !0",
 }
 
 

@@ -1453,3 +1453,68 @@ async fn mysql_semantics_batch2() {
         .unwrap();
     assert_eq!(s, "255");
 }
+
+// Regression for the third differential batch (ESQL-15): `!` prefix via a
+// precedence-preserving rewrite, NOT/BETWEEN three-valued logic, the added
+// ORD/BIN/OCT/CRC32, and unsigned bit aggregates.
+#[tokio::test]
+async fn mysql_semantics_batch3() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    // `!` logical NOT with preserved precedence.
+    let n: i64 = c.query_first("SELECT !0").await.unwrap().unwrap();
+    assert_eq!(n, 1);
+    let n: i64 = c.query_first("SELECT !5").await.unwrap().unwrap();
+    assert_eq!(n, 0);
+    let n: i64 = c.query_first("SELECT !(1 = 1)").await.unwrap().unwrap();
+    assert_eq!(n, 0);
+    let n: i64 = c.query_first("SELECT !0 = 0").await.unwrap().unwrap(); // (!0)=0 -> 1=0 -> 0
+    assert_eq!(n, 0);
+    // `!=` must still parse as not-equal.
+    let n: i64 = c.query_first("SELECT 1 != 2").await.unwrap().unwrap();
+    assert_eq!(n, 1);
+
+    // Three-valued logic: NOT NULL, !NULL, and BETWEEN with a NULL bound -> NULL.
+    for sql in [
+        "SELECT NOT NULL",
+        "SELECT !NULL",
+        "SELECT 1 BETWEEN NULL AND 5",
+    ] {
+        let v: Option<Option<i64>> = c.query_first(sql).await.unwrap();
+        assert_eq!(v, Some(None), "{sql}");
+    }
+    // But a determinable BETWEEN with a NULL bound is FALSE, not NULL.
+    let n: i64 = c
+        .query_first("SELECT 10 BETWEEN NULL AND 5")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(n, 0);
+
+    // Added functions.
+    let n: i64 = c.query_first("SELECT ORD('A')").await.unwrap().unwrap();
+    assert_eq!(n, 65);
+    let s: String = c.query_first("SELECT BIN(5)").await.unwrap().unwrap();
+    assert_eq!(s, "101");
+    let s: String = c.query_first("SELECT OCT(8)").await.unwrap().unwrap();
+    assert_eq!(s, "10");
+    let n: i64 = c
+        .query_first("SELECT CRC32('MySQL')")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(n, 3259397556);
+
+    // Unsigned bit aggregate.
+    c.query_drop("CREATE TABLE b (id INT PRIMARY KEY, v BIGINT)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO b VALUES (1, -1)").await.unwrap();
+    let u: u64 = c
+        .query_first("SELECT BIT_OR(v) FROM b")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(u, u64::MAX);
+}
