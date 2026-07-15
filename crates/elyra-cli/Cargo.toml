@@ -22,5 +22,5 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
-mysql_async = { version = "0.34", default-features = false, features = ["minimal"] }
+mysql_async = { version = "0.37", default-features = false, features = ["minimal"] }
 tokio = { workspace = true }
