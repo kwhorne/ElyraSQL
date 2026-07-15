@@ -220,6 +220,62 @@ CASES = [
     ("like", "SELECT 'ABC' LIKE 'a%'"),
     ("like", "SELECT 'a_c' LIKE 'a\\_c'"),
     ("like", "SELECT 'abc' REGEXP '^a.c$'"),
+    ("like", "SELECT NULL LIKE '%'"),
+    ("like", "SELECT 'abc' LIKE NULL"),
+    # DIV integer division
+    ("arith", "SELECT 7 DIV 2"),
+    ("arith", "SELECT -7 DIV 2"),
+    ("arith", "SELECT 7 DIV 0"),
+    ("arith", "SELECT 5.9 DIV 2"),
+    # more numeric functions
+    ("num", "SELECT SIGN(-5)"),
+    ("num", "SELECT GREATEST(1, 5, 3)"),
+    ("num", "SELECT LEAST(1, 5, 3)"),
+    ("num", "SELECT GREATEST(1, NULL, 3)"),
+    ("num", "SELECT MOD(-7, 3)"),
+    ("num", "SELECT TRUNCATE(-1.999, 0)"),
+    ("num", "SELECT ROUND(1.5)"),
+    ("num", "SELECT ROUND(0.5)"),
+    ("num", "SELECT BIT_COUNT(7)"),
+    ("num", "SELECT CONV('ff', 16, 10)"),
+    ("num", "SELECT 0.1 + 0.2"),
+    # more string functions
+    ("string", "SELECT LTRIM('  x  ')"),
+    ("string", "SELECT RTRIM('  x  ')"),
+    ("string", "SELECT SPACE(3)"),
+    ("string", "SELECT CHAR(65, 66, 67)"),
+    ("string", "SELECT POSITION('l' IN 'hello')"),
+    ("string", "SELECT INSERT('abcd', 2, 1, 'XY')"),
+    ("string", "SELECT LOWER('ÀÉÎ')"),
+    ("string", "SELECT SUBSTRING('hello' FROM 2 FOR 2)"),
+    ("string", "SELECT CONCAT(1, 2, 3)"),
+    ("string", "SELECT 'a' IN ('A', 'b')"),
+    # more date functions
+    ("date", "SELECT DAYNAME('2024-01-15')"),
+    ("date", "SELECT MONTHNAME('2024-01-15')"),
+    ("date", "SELECT QUARTER('2024-05-01')"),
+    ("date", "SELECT TO_DAYS('2024-01-01')"),
+    ("date", "SELECT SEC_TO_TIME(3661)"),
+    ("date", "SELECT TIME_TO_SEC('01:01:01')"),
+    ("date", "SELECT STR_TO_DATE('2024-13-01', '%Y-%m-%d')"),
+    ("date", "SELECT DATE_SUB('2024-03-01', INTERVAL 1 DAY)"),
+    ("date", "SELECT DATEDIFF('2024-01-01', NULL)"),
+    # CASE / control-flow
+    ("case", "SELECT CASE WHEN NULL THEN 1 ELSE 2 END"),
+    ("case", "SELECT CASE WHEN 1 THEN 'a' WHEN 1 THEN 'b' END"),
+    ("case", "SELECT CASE 2 WHEN 1 THEN 'x' WHEN 2 THEN 'y' ELSE 'z' END"),
+    ("case", "SELECT IF(NULL, 'a', 'b')"),
+    ("case", "SELECT IF(0, 'a', 'b')"),
+    # NULL/aggregate edges on fixture
+    ("agg", "SELECT MAX(dt), MIN(dt) FROM d"),
+    ("agg", "SELECT n, COUNT(*) FROM d GROUP BY n ORDER BY n"),
+    ("agg", "SELECT COUNT(*) FROM d GROUP BY n HAVING COUNT(*) >= 1 ORDER BY 1"),
+    ("agg", "SELECT SUM(f) FROM d WHERE s IS NOT NULL"),
+    ("agg", "SELECT 1 IN (NULL, 2)"),
+    ("agg", "SELECT NULL IN (1, 2)"),
+    # window
+    ("window", "SELECT id, ROW_NUMBER() OVER (ORDER BY id) FROM d ORDER BY id"),
+    ("window", "SELECT id, SUM(id) OVER () FROM d ORDER BY id"),
 ]
 
 
@@ -236,12 +292,13 @@ ALLOWLIST = {
     "SELECT 10 / 3",
     # Benign wire-type: a DECIMAL result is sent as text (value identical).
     "SELECT CAST(3.14159 AS DECIMAL(4,2))",
+    # Benign wire-type: a TIME result is sent as text (value identical: 01:01:01).
+    "SELECT SEC_TO_TIME(3661)",
     # Both reject the out-of-range value (we return NULL, MySQL errors 1690).
     "SELECT POW(10, 308) * 10",
-    # Tracked feature gaps (ESQL follow-up): the `DIV` integer-division operator
-    # and the `!` prefix-negation operator are not yet parsed.
-    "SELECT 10 DIV 3",
-    "SELECT -10 DIV 3",
+    # Tracked feature gap: the `!` prefix-negation operator is not parsed by any
+    # sqlparser dialect, and a text rewrite to NOT would change precedence
+    # (`!a = b` is `(!a) = b`, not `NOT (a = b)`), so it stays unsupported.
     "SELECT !0",
 }
 

@@ -81,14 +81,28 @@ pub fn eval_row(expr: &Expr, schema: &Schema, row: &[Value]) -> Result<Value> {
             if v.is_null() {
                 return Ok(Value::Null);
             }
+            // Three-valued: if no element equals `v` but the list contains a NULL,
+            // the result is NULL (UNKNOWN), not FALSE -- e.g. `1 IN (NULL, 2)`.
             let mut found = false;
+            let mut saw_null = false;
             for item in list {
-                if v.compare(&eval_row(item, schema, row)?) == Some(std::cmp::Ordering::Equal) {
+                let rv = eval_row(item, schema, row)?;
+                if rv.is_null() {
+                    saw_null = true;
+                    continue;
+                }
+                if v.compare(&rv) == Some(std::cmp::Ordering::Equal) {
                     found = true;
                     break;
                 }
             }
-            Ok(Value::Bool(found != *negated))
+            if found {
+                return Ok(Value::Bool(!*negated));
+            }
+            if saw_null {
+                return Ok(Value::Null);
+            }
+            Ok(Value::Bool(*negated))
         }
         Expr::IsNull(e) => Ok(Value::Bool(eval_row(e, schema, row)?.is_null())),
         Expr::IsNotNull(e) => Ok(Value::Bool(!eval_row(e, schema, row)?.is_null())),
@@ -1092,6 +1106,19 @@ fn eval_scalar(name: &str, a: &[Value]) -> Result<Option<Value>> {
             Some(n) => Value::Text(" ".repeat(n.max(0.0) as usize)),
             None => Value::Null,
         },
+        "bit_count" => match nnum(a, 0) {
+            Some(x) => Value::Int((x as i64 as u64).count_ones() as i64),
+            None => Value::Null,
+        },
+        // TO_DAYS: day number since year 0 (MySQL: TO_DAYS('1970-01-01') = 719528).
+        "to_days" => match sstr(a, 0).and_then(|s| elyra_core::datetime::parse_date(&s)) {
+            Some(d) => Value::Int(d as i64 + 719_528),
+            None => Value::Null,
+        },
+        // INSERT(str, pos, len, newstr): replace `len` chars at 1-based `pos`.
+        "insert" => string_insert(a),
+        // CONV(n, from_base, to_base): base conversion, returned as text.
+        "conv" => conv_fn(a),
         "repeat" => match (sstr(a, 0), nnum(a, 1)) {
             (Some(s), Some(n)) => Value::Text(s.repeat(n.max(0.0) as usize)),
             _ => Value::Null,
@@ -1468,6 +1495,103 @@ fn substring(a: &[Value]) -> Value {
 
 /// SUBSTRING_INDEX(str, delim, count): substring before the count-th delimiter
 /// (from the left if positive, from the right if negative).
+fn string_insert(a: &[Value]) -> Value {
+    let (Some(s), Some(pos), Some(len), Some(ins)) =
+        (sstr(a, 0), nnum(a, 1), nnum(a, 2), sstr(a, 3))
+    else {
+        return Value::Null;
+    };
+    let chars: Vec<char> = s.chars().collect();
+    let n = chars.len() as i64;
+    let pos = pos as i64;
+    // MySQL: an out-of-range position returns the original string unchanged.
+    if pos < 1 || pos > n {
+        return Value::Text(s);
+    }
+    let start = (pos - 1) as usize;
+    let len = len as i64;
+    let del = if len < 0 {
+        chars.len() - start
+    } else {
+        (len as usize).min(chars.len() - start)
+    };
+    let mut out: String = chars[..start].iter().collect();
+    out.push_str(&ins);
+    out.extend(chars[start + del..].iter());
+    Value::Text(out)
+}
+
+fn conv_fn(a: &[Value]) -> Value {
+    let (Some(s), Some(from), Some(to)) = (sstr(a, 0), nnum(a, 1), nnum(a, 2)) else {
+        return Value::Null;
+    };
+    let from = from as i64;
+    let to = to as i64;
+    if !(2..=36).contains(&from.unsigned_abs()) || !(2..=36).contains(&to.unsigned_abs()) {
+        return Value::Null;
+    }
+    let s = s.trim();
+    // Parse in `from` base as an unsigned magnitude with an optional sign.
+    let (neg, digits) = match s.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, s.strip_prefix('+').unwrap_or(s)),
+    };
+    let mut val: u64 = 0;
+    let mut any = false;
+    for c in digits.chars() {
+        let d = c.to_digit(from.unsigned_abs() as u32);
+        match d {
+            Some(d) => {
+                val = val.wrapping_mul(from.unsigned_abs()).wrapping_add(d as u64);
+                any = true;
+            }
+            None => break, // MySQL stops at the first invalid digit
+        }
+    }
+    if !any {
+        return Value::Text("0".to_string());
+    }
+    // Signed interpretation only when the target base is negative.
+    let out = if to < 0 {
+        let signed = if neg {
+            (val as i64).wrapping_neg()
+        } else {
+            val as i64
+        };
+        to_base_signed(signed, to.unsigned_abs())
+    } else {
+        let mag = if neg {
+            (val as i64).wrapping_neg() as u64
+        } else {
+            val
+        };
+        to_base_unsigned(mag, to.unsigned_abs())
+    };
+    Value::Text(out)
+}
+
+fn to_base_unsigned(mut n: u64, base: u64) -> String {
+    if n == 0 {
+        return "0".to_string();
+    }
+    let digits = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    let mut out = Vec::new();
+    while n > 0 {
+        out.push(digits[(n % base) as usize]);
+        n /= base;
+    }
+    out.reverse();
+    String::from_utf8(out).unwrap()
+}
+
+fn to_base_signed(n: i64, base: u64) -> String {
+    if n < 0 {
+        format!("-{}", to_base_unsigned(n.unsigned_abs(), base))
+    } else {
+        to_base_unsigned(n as u64, base)
+    }
+}
+
 fn substring_index(s: &str, delim: &str, count: i64) -> String {
     if delim.is_empty() || count == 0 {
         return String::new();
@@ -2389,7 +2513,7 @@ fn binary(
         GtEq => Ok(Value::Bool(
             cmp(&l, &r, coll)?.map(|o| o.is_ge()).unwrap_or(false),
         )),
-        Plus | Minus | Multiply | Divide | Modulo => arith(l, op, r),
+        Plus | Minus | Multiply | Divide | Modulo | MyIntegerDivide => arith(l, op, r),
         BitwiseAnd | BitwiseOr | BitwiseXor | PGBitwiseShiftLeft | PGBitwiseShiftRight => {
             bitwise(l, op, r)
         }
@@ -2429,6 +2553,28 @@ fn arith(l: Value, op: &BinaryOperator, r: Value) -> Result<Value> {
     // Arithmetic with a NULL operand is NULL (MySQL), never an error.
     if l.is_null() || r.is_null() {
         return Ok(Value::Null);
+    }
+    // `a DIV b`: integer division truncating toward zero; `/0` is NULL; overflow
+    // (i64::MIN DIV -1) is out of range like MySQL.
+    if matches!(op, MyIntegerDivide) {
+        if let (Value::Int(a), Value::Int(b)) = (&l, &r) {
+            if *b == 0 {
+                return Ok(Value::Null);
+            }
+            return match a.checked_div(*b) {
+                Some(v) => Ok(Value::Int(v)),
+                None => Err(Error::OutOfRange(format!(
+                    "BIGINT value is out of range in '({a} DIV {b})'"
+                ))),
+            };
+        }
+        let (Some(a), Some(b)) = (num(&l), num(&r)) else {
+            return Err(Error::Type("arithmetic on non-numeric value".into()));
+        };
+        if b == 0.0 {
+            return Ok(Value::Null);
+        }
+        return Ok(Value::Int((a / b).trunc() as i64));
     }
     // Exact DECIMAL arithmetic for +, -, * (division/modulo fall back to float).
     if matches!(l, Value::Decimal(..)) || matches!(r, Value::Decimal(..)) {

@@ -1401,3 +1401,55 @@ async fn mysql_semantics_matches() {
         .unwrap();
     assert_eq!(s, "2024-02-29");
 }
+
+// Regression for the second differential batch (ESQL-15): DIV integer division,
+// IN-list three-valued logic, and the added BIT_COUNT/TO_DAYS/INSERT/CONV.
+#[tokio::test]
+async fn mysql_semantics_batch2() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    // DIV truncates toward zero; DIV 0 -> NULL.
+    let n: i64 = c.query_first("SELECT 7 DIV 2").await.unwrap().unwrap();
+    assert_eq!(n, 3);
+    let n: i64 = c.query_first("SELECT -7 DIV 2").await.unwrap().unwrap();
+    assert_eq!(n, -3);
+    let v: Option<Option<i64>> = c.query_first("SELECT 7 DIV 0").await.unwrap();
+    assert_eq!(v, Some(None));
+
+    // IN-list 3VL: a non-matching value with a NULL in the list -> NULL.
+    let v: Option<Option<i64>> = c.query_first("SELECT 1 IN (NULL, 2)").await.unwrap();
+    assert_eq!(v, Some(None));
+    // A match still wins over the NULL.
+    let n: i64 = c
+        .query_first("SELECT 2 IN (NULL, 2)")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(n, 1);
+    // No NULL, no match -> FALSE.
+    let n: i64 = c.query_first("SELECT 3 IN (1, 2)").await.unwrap().unwrap();
+    assert_eq!(n, 0);
+
+    // Added functions.
+    let n: i64 = c.query_first("SELECT BIT_COUNT(7)").await.unwrap().unwrap();
+    assert_eq!(n, 3);
+    let n: i64 = c
+        .query_first("SELECT TO_DAYS('2024-01-01')")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(n, 739251);
+    let s: String = c
+        .query_first("SELECT INSERT('abcd', 2, 1, 'XY')")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(s, "aXYcd");
+    let s: String = c
+        .query_first("SELECT CONV('ff', 16, 10)")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(s, "255");
+}
