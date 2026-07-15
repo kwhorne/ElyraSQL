@@ -4,6 +4,51 @@ All notable changes to ElyraSQL are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.2.0] - 2026-07-15
+
+MySQL-semantics release. Adds an automated **differential test harness** that runs
+180 edge-case queries against ElyraSQL and a real MySQL 8 in CI, and fixes the
+correctness divergences it surfaced. No on-disk format change from 1.1.x.
+
+### Added
+
+- **MySQL differential harness** (`tests/compat/differential/mysql_diff.py`) and a
+  CI workflow (`mysql:8.4` service) that fail on any non-allowlisted divergence in
+  rows, NULLs, or error/no-error — a permanent guard against MySQL-semantics
+  regressions.
+- New functions: `ISNULL`, `STRCMP`, `BIT_COUNT`, `TO_DAYS`, `INSERT`, `CONV`,
+  `ORD`, `BIN`, `OCT`, `CRC32`.
+- The `DIV` integer-division operator and the `!` logical-NOT prefix operator.
+
+### Fixed (MySQL semantics)
+
+- **NULL propagation:** arithmetic with a NULL operand (`NULL + 1`) returned an
+  error → now NULL. `NOT NULL` / `!NULL` → NULL.
+- **Three-valued logic:** `AND`/`OR` (`NULL AND 1` → NULL, not 0), `IN`
+  (`1 IN (NULL, 2)` → NULL), and `BETWEEN` (`1 BETWEEN NULL AND 5` → NULL) now
+  follow SQL three-valued logic.
+- **Math domain errors** (`SQRT(-1)`, `LN(0)`, `LN(-1)`) return NULL instead of
+  NaN/inf.
+- **`LENGTH`** now returns the byte length (`CHAR_LENGTH` stays characters);
+  `SUBSTRING(s, 0)` returns `''`.
+- **`CAST` to integer** rounds instead of truncating (`CAST(3.7 AS SIGNED)` = 4);
+  `UNSIGNED` wraps (`CAST(-1 AS UNSIGNED)` = 18446744073709551615); non-numeric
+  text casts to its leading integer prefix (or 0).
+- **Invalid dates are rejected** rather than rolled over: `CAST('2024-02-30' AS
+  DATE)` → NULL (also affects date parsing generally).
+- **`DATE_ADD`/date + interval** on a time-less date yields a `DATE`, not a
+  `DATETIME`.
+- **Integer division `DIV`** truncates toward zero; `DIV 0` → NULL.
+- **Bit aggregates** `BIT_OR`/`BIT_AND`/`BIT_XOR` return `BIGINT UNSIGNED`.
+
+### Notes
+
+- A few divergences are intentional and documented in the harness allowlist:
+  ElyraSQL is stricter about implicit string→number coercion in arithmetic and
+  comparison (`0 = 'abc'` is 0, not 1), and it does not replicate MySQL's bare
+  `!!x` quirk (it treats `!!x` as consistent double negation). `DECIMAL`/`TIME`
+  results are sent as text (values identical).
+
 ## [1.1.3] - 2026-07-14
 
 Security release. Completes the expression-depth denial-of-service guard first
@@ -1233,6 +1278,7 @@ core CRUD with `WHERE`/`ORDER BY`/`LIMIT`, indexes, aggregation and `GROUP BY`,
 joins, prepared statements, authentication and TLS, vector search (exact +
 HNSW), parallel OLAP aggregation, and transactions with snapshot isolation.
 
+[1.2.0]: https://github.com/kwhorne/ElyraSQL/releases/tag/v1.2.0
 [1.1.3]: https://github.com/kwhorne/ElyraSQL/releases/tag/v1.1.3
 [1.1.2]: https://github.com/kwhorne/ElyraSQL/releases/tag/v1.1.2
 [1.1.1]: https://github.com/kwhorne/ElyraSQL/releases/tag/v1.1.1

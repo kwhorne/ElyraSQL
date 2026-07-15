@@ -53,7 +53,11 @@ operator.
 `OCTET_LENGTH`, `SUBSTRING`/`SUBSTR`/`MID`, `SUBSTRING_INDEX`, `LEFT`, `RIGHT`,
 `TRIM`/`LTRIM`/`RTRIM` (incl. `TRIM(LEADING/TRAILING 'x' FROM s)`), `REPLACE`,
 `REVERSE`, `REPEAT`, `SPACE`, `LPAD`, `RPAD`, `INSTR`, `LOCATE`/`POSITION`,
-`ASCII`, `FIELD`, `ELT`.
+`ASCII`, `ORD`, `FIELD`, `ELT`, `FIND_IN_SET`, `CHAR`, `INSERT`, `STRCMP`,
+`BIN`, `OCT`, `CONV`, `HEX`, `CRC32`.
+
+`LENGTH` returns the byte length and `CHAR_LENGTH` the character count;
+`SUBSTRING` positions are 1-based (position `0` yields the empty string).
 
 Pattern matching: `str LIKE pattern`, and `str REGEXP pattern` / `str RLIKE
 pattern` (POSIX-style regular expressions, with `NOT REGEXP`).
@@ -62,18 +66,22 @@ pattern` (POSIX-style regular expressions, with `NOT REGEXP`).
 
 `ABS`, `CEIL`/`CEILING`, `FLOOR`, `ROUND(x[,d])`, `TRUNCATE(x,d)`, `SIGN`,
 `SQRT`, `EXP`, `LN`/`LOG`, `LOG10`, `LOG2`, `POWER`/`POW`, `MOD`, `PI()`,
-`RAND()`, `GREATEST`, `LEAST`.
+`RAND()`, `GREATEST`, `LEAST`, `BIT_COUNT`. A math domain error (e.g. `SQRT(-1)`,
+`LN(0)`) returns NULL, and out-of-range `DOUBLE` results are NULL, as in MySQL.
 
 ## Bitwise operators
 
-`a & b` (AND), `a | b` (OR), and `a ^ b` (XOR) operate on integers and are
-usable anywhere, e.g. flag masks: `WHERE flags & 4 > 0`. (The SQL frontend does
-not currently parse `<<`, `>>`, or the unary `~`.)
+`a & b` (AND), `a | b` (OR), `a ^ b` (XOR), `a << b`, `a >> b`, and unary `~a`
+operate on 64-bit **unsigned** integers and return `BIGINT UNSIGNED`, matching
+MySQL. `a DIV b` is integer division (truncating toward zero; `DIV 0` is NULL),
+and `!x` is the logical-NOT prefix. Example flag mask: `WHERE flags & 4 > 0`.
 
 ## Conditional & null
 
-`COALESCE`, `IFNULL`/`NVL`, `NULLIF`, `IF(cond, a, b)`, and `CASE` expressions
-(both simple and searched).
+`COALESCE`, `IFNULL`/`NVL`, `NULLIF`, `ISNULL`, `IF(cond, a, b)`, and `CASE`
+expressions (both simple and searched). `NULL` propagates through arithmetic and
+follows three-valued logic in `AND`/`OR`/`IN`/`BETWEEN` (e.g. `NULL AND 1` and
+`1 IN (NULL, 2)` are `NULL`), as in MySQL.
 
 ## Other
 
