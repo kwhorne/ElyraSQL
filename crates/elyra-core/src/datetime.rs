@@ -35,7 +35,27 @@ pub fn parse_date(s: &str) -> Option<i32> {
     let y: i64 = it.next()?.parse().ok()?;
     let m: u32 = it.next()?.parse().ok()?;
     let d: u32 = it.next()?.parse().ok()?;
-    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+    if !(1..=12).contains(&m) || d < 1 {
+        return None;
+    }
+    // Reject a day that doesn't exist in the month (e.g. 2024-02-30, 2023-02-29,
+    // 2024-04-31) rather than silently rolling it over.
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let dim = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ][(m - 1) as usize];
+    if d > dim {
         return None;
     }
     Some(days_from_civil(y, m, d) as i32)

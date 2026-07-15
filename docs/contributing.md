@@ -48,6 +48,13 @@ compatibility job):
 - **Client & framework compatibility** (`tests/compat/`) — a full Laravel/
   Eloquent workload over PDO and a PyMySQL smoke test, run against a live
   server. See `tests/compat/README.md`.
+- **MySQL differential** (`tests/compat/differential/mysql_diff.py`) — runs an
+  identical battery of edge-case queries (arithmetic, NULL/3VL, coercion, CAST,
+  string/date functions, aggregates) against ElyraSQL **and a real MySQL 8** and
+  fails on any non-allowlisted divergence. The `MySQL differential` workflow runs
+  it in CI against a `mysql:8.4` service container; run it locally against any
+  MySQL with `--ref-port`. Intentional/tracked differences are allowlisted in the
+  harness with a rationale.
 
 When you add or change behaviour, add a test at the lowest layer that can catch a
 regression — prefer the in-process wire tests for anything protocol/SQL-visible.

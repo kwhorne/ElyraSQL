@@ -1,0 +1,62 @@
+name: MySQL differential
+
+# Runs an identical battery of edge-case queries against ElyraSQL and a real
+# MySQL 8, and fails on any non-allowlisted divergence (different rows/NULLs, or
+# one engine accepting a query the other rejects). This catches MySQL-semantics
+# regressions and new divergences before users hit them. Known intentional/
+# tracked differences are allowlisted in the harness.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "0 5 * * *" # nightly 05:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  differential:
+    name: ElyraSQL vs MySQL 8
+    runs-on: ubuntu-24.04
+
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: root
+        ports:
+          - 3390:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -proot"
+          --health-interval=5s --health-timeout=5s --health-retries=20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build ElyraSQL
+        run: cargo build --release -p elyra-cli
+
+      - name: Python driver
+        run: pip install --quiet pymysql
+
+      - name: Start ElyraSQL
+        run: |
+          ./target/release/elyrasql serve --data /tmp/diff.edb --listen 127.0.0.1:3307 &
+          for i in $(seq 1 30); do
+            python3 -c "import pymysql; pymysql.connect(host='127.0.0.1',port=3307,user='root')" 2>/dev/null && break
+            sleep 1
+          done
+
+      - name: Differential
+        run: |
+          python3 tests/compat/differential/mysql_diff.py \
+            --elyra-port 3307 --elyra-password '' \
+            --ref-port 3390 --ref-user root --ref-password root | tee /tmp/diff.txt
+          { echo '## MySQL differential'; echo '```'; cat /tmp/diff.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"

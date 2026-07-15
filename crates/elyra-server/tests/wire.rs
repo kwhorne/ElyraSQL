@@ -1310,3 +1310,94 @@ async fn integer_overflow_and_division_semantics() {
         "value must be unchanged after the failed UPDATE"
     );
 }
+
+// Regression for the MySQL-semantics differential audit (ESQL-15): NULL
+// propagation and 3VL, math domain -> NULL, byte-length, substring(0), the added
+// ISNULL/STRCMP, integer CAST rounding/unsigned-wrap, invalid-date CAST -> NULL,
+// and date+interval preserving the DATE type.
+#[tokio::test]
+async fn mysql_semantics_matches() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    // NULL arithmetic is NULL, not an error.
+    let v: Option<Option<i64>> = c.query_first("SELECT NULL + 1").await.unwrap();
+    assert_eq!(v, Some(None));
+    // Three-valued logic: NULL AND 1 = NULL, NULL AND 0 = 0.
+    let v: Option<Option<i64>> = c.query_first("SELECT NULL AND 1").await.unwrap();
+    assert_eq!(v, Some(None));
+    let v: i64 = c.query_first("SELECT NULL AND 0").await.unwrap().unwrap();
+    assert_eq!(v, 0);
+    // Math out-of-domain -> NULL, not NaN/inf.
+    for sql in ["SELECT SQRT(-1)", "SELECT LN(0)", "SELECT LN(-1)"] {
+        let v: Option<Option<f64>> = c.query_first(sql).await.unwrap();
+        assert_eq!(v, Some(None), "{sql}");
+    }
+    // LENGTH is bytes; CHAR_LENGTH is characters.
+    let n: i64 = c
+        .query_first("SELECT LENGTH('héllo')")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(n, 6);
+    let n: i64 = c
+        .query_first("SELECT CHAR_LENGTH('héllo')")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(n, 5);
+    // SUBSTRING position 0 -> empty string.
+    let s: String = c
+        .query_first("SELECT SUBSTRING('hello', 0)")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(s, "");
+    // ISNULL / STRCMP.
+    let n: i64 = c.query_first("SELECT ISNULL(NULL)").await.unwrap().unwrap();
+    assert_eq!(n, 1);
+    let n: i64 = c
+        .query_first("SELECT STRCMP('a', 'b')")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(n, -1);
+    // Integer CAST rounds (not truncates); UNSIGNED wraps.
+    let n: i64 = c
+        .query_first("SELECT CAST(3.7 AS SIGNED)")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(n, 4);
+    let n: i64 = c
+        .query_first("SELECT CAST(-3.7 AS SIGNED)")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(n, -4);
+    let u: u64 = c
+        .query_first("SELECT CAST(-1 AS UNSIGNED)")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(u, u64::MAX);
+    let n: i64 = c
+        .query_first("SELECT CAST('12abc' AS SIGNED)")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(n, 12);
+    // Invalid date -> NULL (not rolled over).
+    let v: Option<Option<String>> = c
+        .query_first("SELECT CAST('2024-02-30' AS DATE)")
+        .await
+        .unwrap();
+    assert_eq!(v, Some(None));
+    // Adding a day/month interval to a date-shaped string yields a DATE.
+    let s: String = c
+        .query_first("SELECT DATE_ADD('2024-01-31', INTERVAL 1 MONTH)")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(s, "2024-02-29");
+}

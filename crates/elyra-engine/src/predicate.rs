@@ -590,6 +590,23 @@ fn eval_function(f: &sqlparser::ast::Function, schema: &Schema, row: &[Value]) -
             }
             return Ok(Value::Null);
         }
+        "isnull" if args_exprs.len() == 1 => {
+            let v = eval_row(args_exprs[0], schema, row)?;
+            return Ok(Value::Int(v.is_null() as i64));
+        }
+        "strcmp" if args_exprs.len() == 2 => {
+            let a = eval_row(args_exprs[0], schema, row)?;
+            let b = eval_row(args_exprs[1], schema, row)?;
+            if a.is_null() || b.is_null() {
+                return Ok(Value::Null);
+            }
+            let o = a.compare_coll(&b, Collation::Ci);
+            return Ok(match o {
+                Some(std::cmp::Ordering::Less) => Value::Int(-1),
+                Some(std::cmp::Ordering::Greater) => Value::Int(1),
+                _ => Value::Int(0),
+            });
+        }
         "ifnull" | "nvl" if args_exprs.len() == 2 => {
             let a = eval_row(args_exprs[0], schema, row)?;
             return Ok(if a.is_null() {
@@ -899,7 +916,16 @@ fn str1(a: &[Value], f: impl Fn(String) -> String) -> Value {
 }
 fn math1(a: &[Value], f: impl Fn(f64) -> f64) -> Value {
     match nnum(a, 0) {
-        Some(x) => Value::Float(f(x)),
+        // A non-finite result (e.g. SQRT(-1), LN(0), LN(-1)) is out of domain;
+        // MySQL returns NULL rather than NaN/inf.
+        Some(x) => {
+            let y = f(x);
+            if y.is_finite() {
+                Value::Float(y)
+            } else {
+                Value::Null
+            }
+        }
         None => Value::Null,
     }
 }
@@ -1049,12 +1075,13 @@ fn eval_scalar(name: &str, a: &[Value]) -> Result<Option<Value>> {
         }
         "upper" | "ucase" => str1(a, |s| s.to_uppercase()),
         "lower" | "lcase" => str1(a, |s| s.to_lowercase()),
-        "length" | "char_length" | "character_length" => match sstr(a, 0) {
-            Some(s) => Value::Int(s.chars().count() as i64),
+        // MySQL: LENGTH/OCTET_LENGTH are byte lengths; CHAR_LENGTH is characters.
+        "length" | "octet_length" => match sstr(a, 0) {
+            Some(s) => Value::Int(s.len() as i64),
             None => Value::Null,
         },
-        "octet_length" => match sstr(a, 0) {
-            Some(s) => Value::Int(s.len() as i64),
+        "char_length" | "character_length" => match sstr(a, 0) {
+            Some(s) => Value::Int(s.chars().count() as i64),
             None => Value::Null,
         },
         "reverse" => str1(a, |s| s.chars().rev().collect()),
@@ -1426,13 +1453,11 @@ fn substring(a: &[Value]) -> Value {
         Some(p) => p as i64,
         None => return Value::Null,
     };
-    let start = if pos < 0 {
-        (len + pos).max(0)
-    } else if pos > 0 {
-        pos - 1
-    } else {
-        0
-    };
+    // MySQL: a 1-based position of 0 yields the empty string.
+    if pos == 0 {
+        return Value::Text(String::new());
+    }
+    let start = if pos < 0 { (len + pos).max(0) } else { pos - 1 };
     let start = start.clamp(0, len) as usize;
     let take = match nnum(a, 2) {
         Some(l) => (l as i64).max(0) as usize,
@@ -1481,6 +1506,32 @@ fn pad(a: &[Value], left: bool) -> Value {
     } else {
         format!("{s}{padding}")
     })
+}
+
+/// MySQL string-to-integer coercion: an optional sign then leading ASCII digits;
+/// anything non-numeric (or no digits) yields 0. Saturates on overflow.
+fn str_to_int(v: &Value) -> i64 {
+    let s = v.to_wire_string().unwrap_or_default();
+    let b = s.trim().as_bytes();
+    let mut i = 0;
+    let neg = matches!(b.first(), Some(b'-'));
+    if matches!(b.first(), Some(b'+') | Some(b'-')) {
+        i = 1;
+    }
+    let start = i;
+    let mut n: i64 = 0;
+    while i < b.len() && b[i].is_ascii_digit() {
+        n = n.saturating_mul(10).saturating_add((b[i] - b'0') as i64);
+        i += 1;
+    }
+    if i == start {
+        return 0;
+    }
+    if neg {
+        -n
+    } else {
+        n
+    }
 }
 
 fn cast_value(v: Value, ty: &sqlparser::ast::DataType) -> Result<Value> {
@@ -1532,18 +1583,28 @@ fn cast_value(v: Value, ty: &sqlparser::ast::DataType) -> Result<Value> {
         || tn.starts_with("NVARCHAR")
     {
         Value::Text(v.to_wire_string().unwrap_or_default())
+    } else if tn.contains("UNSIGNED") {
+        // MySQL: CAST(x AS UNSIGNED) wraps into 64-bit unsigned (e.g. -1 ->
+        // 18446744073709551615); floats round; non-numeric text -> 0.
+        match &v {
+            Value::UInt(u) => Value::UInt(*u),
+            Value::Int(i) => Value::UInt(*i as u64),
+            _ => match v.as_f64() {
+                Some(x) => Value::UInt(x.round() as i64 as u64),
+                None => Value::UInt(str_to_int(&v) as u64),
+            },
+        }
     } else if tn.contains("INT") || tn.contains("SIGNED") {
+        // MySQL: casting a float to an integer rounds (half away from zero), not
+        // truncates; a non-numeric string casts to its leading integer prefix
+        // (or 0), not NULL.
         match &v {
             Value::Int(i) => Value::Int(*i),
-            _ => v
-                .as_f64()
-                .map(|x| Value::Int(x as i64))
-                .or_else(|| {
-                    v.to_wire_string()
-                        .and_then(|s| s.trim().parse::<i64>().ok())
-                        .map(Value::Int)
-                })
-                .unwrap_or(Value::Null),
+            Value::UInt(u) => Value::Int(*u as i64),
+            _ => match v.as_f64() {
+                Some(x) => Value::Int(x.round() as i64),
+                None => Value::Int(str_to_int(&v)),
+            },
         }
     } else if tn.contains("DOUBLE")
         || tn.contains("FLOAT")
@@ -2028,10 +2089,21 @@ fn apply_interval(base: Value, n: i64, unit: &str) -> Value {
         Value::Date(d) => (*d as i64 * 86_400_000_000, true),
         Value::DateTime(m) => (*m, false),
         Value::Null => return Value::Null,
-        _ => match to_micros(&base) {
-            Some(m) => (m, false),
-            None => return Value::Null,
-        },
+        // A string operand behaves as a DATE when it has no time part and as a
+        // DATETIME when it does (MySQL infers the result type this way, so
+        // `DATE_ADD('2024-01-31', INTERVAL 1 MONTH)` returns a DATE).
+        _ => {
+            let Some(s) = base.to_wire_string() else {
+                return Value::Null;
+            };
+            if let Some(d) = elyra_core::datetime::parse_date(&s) {
+                (d as i64 * 86_400_000_000, true)
+            } else if let Some(m) = elyra_core::datetime::parse_datetime(&s) {
+                (m, false)
+            } else {
+                return Value::Null;
+            }
+        }
     };
     let time_unit = matches!(unit, "HOUR" | "MINUTE" | "SECOND" | "MICROSECOND");
     match unit {
@@ -2249,10 +2321,33 @@ fn binary(
     _row: &[Value],
 ) -> Result<Value> {
     use BinaryOperator::*;
-    // Short-circuit logical operators.
+    // Logical operators with MySQL three-valued logic: for AND, FALSE dominates
+    // and the result is NULL only when no operand is FALSE and at least one is
+    // NULL; symmetrically for OR with TRUE. (`truthy` alone would fold NULL to
+    // FALSE, making `NULL AND 1` wrongly 0 instead of NULL.)
     match op {
-        And => return Ok(Value::Bool(truthy(&l) && truthy(&eval_right()?))),
-        Or => return Ok(Value::Bool(truthy(&l) || truthy(&eval_right()?))),
+        And => {
+            if matches!(bool3(&l), Some(false)) {
+                return Ok(Value::Bool(false)); // short-circuit
+            }
+            let r = eval_right()?;
+            return Ok(match (bool3(&l), bool3(&r)) {
+                (_, Some(false)) => Value::Bool(false),
+                (Some(true), Some(true)) => Value::Bool(true),
+                _ => Value::Null,
+            });
+        }
+        Or => {
+            if matches!(bool3(&l), Some(true)) {
+                return Ok(Value::Bool(true)); // short-circuit
+            }
+            let r = eval_right()?;
+            return Ok(match (bool3(&l), bool3(&r)) {
+                (_, Some(true)) => Value::Bool(true),
+                (Some(false), Some(false)) => Value::Bool(false),
+                _ => Value::Null,
+            });
+        }
         // `<=>` null-safe equality: NULL<=>NULL is true, NULL<=>x is false.
         Spaceship => {
             let r = eval_right()?;
@@ -2331,6 +2426,10 @@ fn bitwise(l: Value, op: &BinaryOperator, r: Value) -> Result<Value> {
 
 fn arith(l: Value, op: &BinaryOperator, r: Value) -> Result<Value> {
     use BinaryOperator::*;
+    // Arithmetic with a NULL operand is NULL (MySQL), never an error.
+    if l.is_null() || r.is_null() {
+        return Ok(Value::Null);
+    }
     // Exact DECIMAL arithmetic for +, -, * (division/modulo fall back to float).
     if matches!(l, Value::Decimal(..)) || matches!(r, Value::Decimal(..)) {
         if let Some(v) = decimal_arith(&l, op, &r) {
@@ -2502,7 +2601,19 @@ fn truthy(v: &Value) -> bool {
     match v {
         Value::Bool(b) => *b,
         Value::Int(i) => *i != 0,
+        Value::UInt(u) => *u != 0,
         Value::Float(f) => *f != 0.0,
-        _ => false,
+        Value::Decimal(u, _) => *u != 0,
+        Value::Null => false,
+        other => other.as_f64().map(|f| f != 0.0).unwrap_or(false),
+    }
+}
+
+/// Three-valued truthiness: `None` for NULL (UNKNOWN), else `Some(bool)`.
+fn bool3(v: &Value) -> Option<bool> {
+    if v.is_null() {
+        None
+    } else {
+        Some(truthy(v))
     }
 }
