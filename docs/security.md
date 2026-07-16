@@ -70,16 +70,20 @@ Notes and current limitations:
   `GRANT`/`REVOKE ON *.*` add/remove exactly the named privileges. Revoking one
   privilege no longer collapses the account: e.g. `REVOKE INSERT` from an admin
   keeps every other privilege. `SHOW GRANTS` lists the precise set.
-- Enforcement itself is still evaluated at a coarse tier (`read`/`write`/`admin`)
-  derived from that set: `GRANT ALL`/`GRANT OPTION`/`SUPER` → admin; any write
-  action (`INSERT`, `UPDATE`, `DELETE`, `CREATE`, ...) present → write;
-  `SELECT`-only → read. So revoking one of several write privileges keeps the
-  others but does not yet block *only* that one action.
+- **DML privileges are enforced per action, per table.** `INSERT`, `UPDATE` and
+  `DELETE` are checked individually against the target table's effective grant
+  (global ∪ per-table ∪ role-inherited), so a user granted only `INSERT` cannot
+  `UPDATE`/`DELETE`, and revoking one write privilege blocks *only* that action.
+  Administrative statements and DDL (`CREATE`/`DROP`/`ALTER`/`CREATE INDEX`,
+  triggers, procedures, `BACKUP`, `LOAD DATA`, ...) are gated at the `admin`
+  tier (`GRANT ALL`/`GRANT OPTION`/`SUPER`). Reads are allowed at the baseline
+  for any authenticated user (no table-level `SELECT` grant required).
 - **Scope:** `GRANT ... ON *.*` (or `db.*`) sets the account's **global**
-  privileges; `GRANT ... ON <table>` (or `db.table`) is a **per-table** grant
-  that *raises* the tier for that table only. Reads are always allowed at the
-  global baseline, so table grants are used to give a read-only account
-  write/admin on specific tables. `REVOKE ON <table>` removes a table grant.
+  privileges; `GRANT ... ON <table>` (or `db.table`) is a **per-table** grant of
+  exactly the named privileges on that table only (stored as a privilege set, so
+  `REVOKE ... ON <table>` removes just those). Reads are allowed at the global
+  baseline, so table grants are used to give a read-only account specific write
+  privileges on specific tables. `REVOKE ON <table>` removes a table grant.
 - `DROP USER` purges the account's global, per-table, per-column, and role-
   membership grants, so recreating a user with the same name does not inherit
   stale privileges.
