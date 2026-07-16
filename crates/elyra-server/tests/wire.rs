@@ -1518,3 +1518,59 @@ async fn mysql_semantics_batch3() {
         .unwrap();
     assert_eq!(u, u64::MAX);
 }
+
+// Fine-grained privilege enforcement (ESQL-16): within the write tier, a user
+// may perform only the *specific* action(s) granted (INSERT vs UPDATE vs DELETE),
+// per table, and REVOKE removes only the named privilege.
+#[tokio::test]
+async fn fine_grained_privileges() {
+    let srv = TestServer::start_with_auth("root", "rootpw").await;
+    let mut a = srv.conn_as("root", "rootpw").await;
+    a.query_drop("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .await
+        .unwrap();
+    a.query_drop("INSERT INTO t VALUES (1,10),(2,20)")
+        .await
+        .unwrap();
+    a.query_drop("CREATE USER 'ins' IDENTIFIED BY 'passw0rd'")
+        .await
+        .unwrap();
+    a.query_drop("GRANT SELECT, INSERT ON t TO 'ins'")
+        .await
+        .unwrap();
+    a.query_drop("CREATE USER 'del' IDENTIFIED BY 'passw0rd'")
+        .await
+        .unwrap();
+    a.query_drop("GRANT SELECT, UPDATE, DELETE ON t TO 'del'")
+        .await
+        .unwrap();
+
+    // Insert-only user: INSERT + SELECT allowed; UPDATE/DELETE denied.
+    let mut ins = srv.conn_as("ins", "passw0rd").await;
+    ins.query_drop("INSERT INTO t VALUES (3,30)").await.unwrap();
+    assert!(ins.query_drop("UPDATE t SET v=1 WHERE id=1").await.is_err());
+    assert!(ins.query_drop("DELETE FROM t WHERE id=2").await.is_err());
+    let n: i64 = ins
+        .query_first("SELECT COUNT(*) FROM t")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(n, 3);
+
+    // Update/delete user: those allowed; INSERT denied.
+    let mut del = srv.conn_as("del", "passw0rd").await;
+    del.query_drop("UPDATE t SET v=99 WHERE id=1")
+        .await
+        .unwrap();
+    del.query_drop("DELETE FROM t WHERE id=2").await.unwrap();
+    assert!(del.query_drop("INSERT INTO t VALUES (4,40)").await.is_err());
+
+    // REVOKE UPDATE leaves DELETE intact.
+    a.query_drop("REVOKE UPDATE ON t FROM 'del'").await.unwrap();
+    let mut del2 = srv.conn_as("del", "passw0rd").await;
+    assert!(del2
+        .query_drop("UPDATE t SET v=1 WHERE id=1")
+        .await
+        .is_err());
+    del2.query_drop("DELETE FROM t WHERE id=1").await.unwrap();
+}

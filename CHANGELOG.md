@@ -4,6 +4,19 @@ All notable changes to ElyraSQL are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed (security)
+
+- **Fine-grained privilege enforcement.** The individual DML privileges `INSERT`,
+  `UPDATE` and `DELETE` are now enforced separately, per target table, instead of
+  a single coarse "write" tier. A user granted only `INSERT` can no longer
+  `UPDATE` or `DELETE`, and `REVOKE`ing one write privilege leaves the others
+  intact. Per-table grants are stored as a privilege set (legacy grants migrate
+  automatically); role-inherited grants are included. Admin/open-auth connections
+  are unaffected (full access), reads remain allowed at the baseline, and DDL is
+  still gated at the `ADMIN` tier.
+
 ## [1.2.0] - 2026-07-15
 
 MySQL-semantics release. Adds an automated **differential test harness** that runs

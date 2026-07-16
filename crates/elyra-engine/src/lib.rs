@@ -1305,6 +1305,22 @@ impl Engine {
                     "access denied: statement requires {need:?} privilege"
                 )));
             }
+            // Fine-grained write enforcement: within the write tier, require the
+            // *specific* privilege (INSERT/UPDATE/DELETE) on each target table,
+            // not merely "some write". Skipped for Admin/open-auth connections
+            // (full access) and for reads/DDL (handled by the tier/Admin gates).
+            let need_bits = required_privset(&stmt);
+            if need_bits != 0 && privilege < Privilege::Admin && !user.is_empty() {
+                for t in stmt_targets(&stmt) {
+                    let have = users::effective_table_privset(sess, user, &t).await?;
+                    if have & need_bits != need_bits {
+                        let missing = elyra_core::users::privset_to_names(need_bits & !have);
+                        return Err(Error::Query(format!(
+                            "access denied: {missing} command denied to user '{user}' for table '{t}'"
+                        )));
+                    }
+                }
+            }
             // Auto-refresh any stale materialized view this statement reads.
             // Skipped entirely when the database has no materialized views
             // (avoids a per-query catalog read on the common path).
@@ -1910,6 +1926,20 @@ fn required_privilege(stmt: &Statement) -> Privilege {
         | Statement::Explain { .. }
         | Statement::ExplainTable { .. } => Privilege::Read,
         _ => Privilege::Admin, // CREATE / DROP / CREATE INDEX and anything else
+    }
+}
+
+/// The *specific* privilege bits a DML statement needs, for fine-grained
+/// enforcement within the write tier (so INSERT no longer implies UPDATE/DELETE).
+/// Returns 0 for statements handled by the coarse tier / Admin gates (reads stay
+/// allowed at the baseline; DDL remains Admin-gated).
+fn required_privset(stmt: &Statement) -> u32 {
+    use elyra_core::users::priv_bits::*;
+    match stmt {
+        Statement::Insert(_) => INSERT,
+        Statement::Update { .. } => UPDATE,
+        Statement::Delete(_) => DELETE,
+        _ => 0,
     }
 }
 

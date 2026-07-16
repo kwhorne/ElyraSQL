@@ -211,13 +211,17 @@ pub async fn effective_global(sess: &Session, user: &str) -> Result<Privilege> {
     Ok(p)
 }
 
-/// A principal's own grant on one table (`Read` default).
+/// A principal's own grant on one table as a coarse tier (`Read` default).
+/// Per-table grants are now stored as a 4-byte flag set; a 1-byte value is a
+/// legacy tier encoding.
 async fn own_table_grant(sess: &Session, name: &str, table: &str) -> Result<Privilege> {
-    Ok(sess
-        .get(table_grant_key(name, table))
-        .await?
-        .and_then(|b| decode_privilege(&b))
-        .unwrap_or(Privilege::Read))
+    Ok(match sess.get(table_grant_key(name, table)).await? {
+        Some(b) if b.len() == 4 => {
+            elyra_core::users::tier_from_privset(elyra_core::users::decode_privset(&b))
+        }
+        Some(b) => decode_privilege(&b).unwrap_or(Privilege::Read),
+        None => Privilege::Read,
+    })
 }
 
 /// Effective per-table privilege of `user` on `table`, including roles.
@@ -227,6 +231,56 @@ pub async fn effective_table_grant(sess: &Session, user: &str, table: &str) -> R
         p = p.max(own_table_grant(sess, &role, table).await?);
     }
     Ok(p)
+}
+
+// --- Fine-grained (per-privilege) accessors --------------------------------
+//
+// The coarse `effective_*` helpers above collapse grants to a Read/Write/Admin
+// tier for the fast-path gate. These return the exact privilege flag set so
+// enforcement can require the *specific* privilege (e.g. INSERT vs UPDATE),
+// closing the gap where any single write grant allowed every write action.
+
+/// A principal's own global privilege flag set (migrating a legacy account that
+/// only stored a coarse tier).
+async fn own_global_privset(sess: &Session, name: &str) -> Result<u32> {
+    match sess.get(elyra_core::users::ugrant_key(name)).await? {
+        Some(b) => Ok(elyra_core::users::decode_privset(&b)),
+        None => Ok(elyra_core::users::privset_from_tier(
+            own_privilege(sess, name).await?,
+        )),
+    }
+}
+
+/// A principal's own per-table grant flag set (0 if none). Migrates the legacy
+/// single-byte tier encoding to a flag set.
+async fn own_table_privset(sess: &Session, name: &str, table: &str) -> Result<u32> {
+    match sess.get(table_grant_key(name, table)).await? {
+        Some(b) if b.len() == 4 => Ok(elyra_core::users::decode_privset(&b)),
+        Some(b) => Ok(elyra_core::users::privset_from_tier(
+            decode_privilege(&b).unwrap_or(Privilege::Read),
+        )),
+        None => Ok(0),
+    }
+}
+
+/// Effective global privilege flag set of `user`, unioned across their roles.
+pub async fn effective_global_privset(sess: &Session, user: &str) -> Result<u32> {
+    let mut bits = own_global_privset(sess, user).await?;
+    for role in roles_of(sess, user).await? {
+        bits |= own_global_privset(sess, &role).await?;
+    }
+    Ok(bits)
+}
+
+/// Effective privilege flag set of `user` on `table`: their global set unioned
+/// with the per-table grant, both including grants inherited from roles.
+pub async fn effective_table_privset(sess: &Session, user: &str, table: &str) -> Result<u32> {
+    let mut bits = effective_global_privset(sess, user).await?;
+    bits |= own_table_privset(sess, user, table).await?;
+    for role in roles_of(sess, user).await? {
+        bits |= own_table_privset(sess, &role, table).await?;
+    }
+    Ok(bits)
 }
 
 pub async fn execute(sql: &str, sess: &Session, privilege: Privilege) -> Result<QueryResult> {
@@ -559,13 +613,32 @@ async fn grant_revoke(toks: &[Tok], sess: &Session, grant: bool) -> Result<Query
             }
         }
         if let Some(table) = &scoped_table {
-            // Per-table grant: raise (GRANT) or clear (REVOKE) the table level.
+            // Per-table grant stored as a flag set (like the global one), so
+            // REVOKE removes only the named privileges and enforcement can check
+            // the specific privilege. Migrates a legacy single-byte tier value.
+            let _ = level; // coarse tier no longer stored per table
             let key = table_grant_key(&name, table);
-            if grant {
-                sess.commit_write(vec![(key, encode_privilege(level))], vec![])
-                    .await?;
+            let current = match sess.get(key.clone()).await? {
+                Some(b) if b.len() == 4 => elyra_core::users::decode_privset(&b),
+                Some(b) => elyra_core::users::privset_from_tier(
+                    decode_privilege(&b).unwrap_or(Privilege::Read),
+                ),
+                None => 0,
+            };
+            let delta = elyra_core::users::privset_from_actions(&actions);
+            let flags = if grant {
+                current | delta
             } else {
+                current & !delta
+            };
+            if !grant && flags == 0 {
                 sess.commit_write(vec![], vec![key]).await?;
+            } else {
+                sess.commit_write(
+                    vec![(key, elyra_core::users::encode_privset(flags))],
+                    vec![],
+                )
+                .await?;
             }
             applied += 1;
             i = j;

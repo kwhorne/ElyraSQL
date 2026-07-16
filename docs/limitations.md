@@ -213,17 +213,21 @@ judge fit before deploying.
 
 ## Security & operations
 
-- Multiple persistent accounts with `CREATE USER`/`GRANT`/`REVOKE`. Global
-  privileges are tracked as a set (so `REVOKE` removes only the named
-  privileges), but **enforcement** is still evaluated at a coarse
-  read/write/admin tier derived from that set and granted **globally** or **per
-  table** — revoking one of several write privileges keeps the others but does
-  not block only that single action.
+- Multiple persistent accounts with `CREATE USER`/`GRANT`/`REVOKE`. Privileges
+  are tracked and **enforced per action**: the individual DML privileges
+  `INSERT`, `UPDATE` and `DELETE` are checked separately, per target table, so a
+  user granted only `INSERT` cannot `UPDATE`/`DELETE`, and revoking one write
+  privilege leaves the others intact. Grants apply **globally** or **per table**.
+  (Reads are still allowed at the global baseline — see below; DDL such as
+  `CREATE`/`DROP`/`ALTER`/`CREATE INDEX` and administrative statements are gated
+  at the `ADMIN` tier rather than by their individual `CREATE`/`DROP`/`ALTER`
+  privileges.)
   **Roles** are supported: `CREATE ROLE` / `DROP ROLE`, `GRANT <role> TO <user>`
   / `REVOKE <role> FROM <user>`; a user inherits the global and per-table grants
   of every role granted to them. `GRANT ... ON db.*` is accepted and maps to a
-  global grant (single default database). Reads are always allowed at the global
-  baseline (grants only raise write/admin). **Per-column** SELECT grants are
+  global grant (single default database). Reads are allowed at the global
+  baseline (table-level `SELECT` is not required for an authenticated user).
+  **Per-column** SELECT grants are
   enforced (`GRANT SELECT(col, ...) ON t TO u`): a column-restricted user may
   only read those columns of `t` — querying an ungranted column (including via
   `SELECT *` or a `WHERE`/`ORDER BY` reference) is denied. Enforcement covers
