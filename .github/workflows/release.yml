@@ -33,7 +33,19 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Install musl tools
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
+        # ports.ubuntu.com (the arm64 mirror) has intermittent connectivity from
+        # the arm64 runners, so retry the update+install a few times before giving
+        # up rather than failing the whole release on a transient network blip.
+        run: |
+          for attempt in 1 2 3 4 5; do
+            if sudo apt-get update && sudo apt-get install -y musl-tools; then
+              exit 0
+            fi
+            echo "apt attempt $attempt failed; retrying in $((attempt * 15))s..."
+            sleep $((attempt * 15))
+          done
+          echo "musl-tools install failed after retries" >&2
+          exit 1
 
       - name: Build static binary
         run: cargo build --release --locked --target ${{ matrix.target }} -p elyra-cli
