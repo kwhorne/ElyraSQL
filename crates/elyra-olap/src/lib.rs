@@ -9,7 +9,7 @@
 
 use indexmap::IndexMap;
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hasher};
 
 /// Fast, non-cryptographic hasher (FxHash, as used by rustc/Firefox) for the
@@ -74,6 +74,9 @@ pub enum AggFunc {
     BitOr,
     BitAnd,
     BitXor,
+    /// Faceted count: a value->count map over the group, finalised to a JSON
+    /// object. The optional top-N cap lives in [`AggSpec::facet_top`].
+    Facet,
 }
 
 /// One aggregate to compute: function, optional argument column, DISTINCT.
@@ -84,6 +87,8 @@ pub struct AggSpec {
     pub distinct: bool,
     /// GROUP_CONCAT separator (default ",").
     pub separator: Option<String>,
+    /// `FACET(col, n)` top-N cap on the number of facet values returned.
+    pub facet_top: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -99,6 +104,8 @@ struct Acc {
     extreme: Option<Value>,
     distinct: HashSet<String>,
     concat: Vec<String>,
+    /// Facet value -> count map (for `FACET(col)`).
+    facet: HashMap<String, i64>,
     /// Exact decimal running sum (unscaled) and its scale.
     dsum: i128,
     dscale: u8,
@@ -118,6 +125,7 @@ impl Acc {
             extreme: None,
             distinct: HashSet::new(),
             concat: Vec::new(),
+            facet: HashMap::new(),
             dsum: 0,
             dscale: 0,
             has_decimal: false,
@@ -426,6 +434,14 @@ fn update(acc: &mut Acc, func: AggFunc, val: Option<Value>, distinct: bool) {
                 }
             }
         }
+        AggFunc::Facet => {
+            if let Some(v) = val {
+                if !v.is_null() {
+                    let key = v.to_wire_string().unwrap_or_default();
+                    *acc.facet.entry(key).or_insert(0) += 1;
+                }
+            }
+        }
         AggFunc::BitOr | AggFunc::BitAnd | AggFunc::BitXor => {
             if let Some(v) = val {
                 if let Some(n) = num(&v) {
@@ -496,6 +512,9 @@ fn merge_acc(a: &mut Acc, b: Acc, func: AggFunc) {
     a.has_decimal |= b.has_decimal;
     a.float_sum |= b.float_sum;
     a.concat.extend(b.concat);
+    for (k, c) in b.facet {
+        *a.facet.entry(k).or_insert(0) += c;
+    }
     for d in b.distinct {
         a.distinct.insert(d);
     }
@@ -526,6 +545,22 @@ fn finish(acc: &Acc, spec: &AggSpec) -> Value {
                 let sep = spec.separator.as_deref().unwrap_or(",");
                 Value::Text(acc.concat.join(sep))
             }
+        }
+        AggFunc::Facet => {
+            // value -> count as a JSON object, ordered by count desc then value
+            // asc (deterministic); optionally capped to the top-N values.
+            let mut pairs: Vec<(&String, &i64)> = acc.facet.iter().collect();
+            pairs.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+            if let Some(top) = spec.facet_top {
+                pairs.truncate(top);
+            }
+            let obj = elyra_core::json::Json::Obj(
+                pairs
+                    .into_iter()
+                    .map(|(k, c)| (k.clone(), elyra_core::json::Json::Num(c.to_string())))
+                    .collect(),
+            );
+            Value::Json(obj.to_json_string())
         }
         AggFunc::CountStar | AggFunc::Count => Value::Int(acc.count),
         AggFunc::Sum => {

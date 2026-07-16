@@ -57,6 +57,29 @@ SELECT region, GROUP_CONCAT(DISTINCT name SEPARATOR '; ') FROM stores GROUP BY r
 supports `DISTINCT` and a custom `SEPARATOR`. Ordering within the group follows
 row order (an inner `ORDER BY` is not yet applied).
 
+## FACET — faceted search counts
+
+`FACET(col)` returns a JSON object mapping each distinct value of `col` to its
+count over the matched rows — the counts side of a faceted search. Because it is
+an ordinary aggregate, every facet plus the hit count is computed in a **single
+pass**, and it composes with `WHERE`, full-text `MATCH ... AGAINST`, vector
+filters, and `GROUP BY`:
+
+```sql
+-- All facets and the total for one search, in one scan:
+SELECT FACET(category) AS categories,
+       FACET(brand, 10) AS brands,   -- top-10 brands by count
+       COUNT(*)         AS total
+FROM docs
+WHERE MATCH(title, body) AGAINST('rust database');
+-- categories -> {"db": 4, "sys": 1, "web": 1}
+```
+
+Values are ordered by count (descending), then value (ascending); the optional
+second argument caps the result to the top-N values. NULLs are not counted. The
+page of matching rows comes from the normal `SELECT ... WHERE ... ORDER BY ...
+LIMIT` query; `FACET` answers the counts efficiently alongside it.
+
 ## Window functions
 
 Window functions compute a value per row over a partition, without collapsing

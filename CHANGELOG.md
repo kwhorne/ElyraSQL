@@ -4,6 +4,18 @@ All notable changes to ElyraSQL are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **Faceted search** via a `FACET(col[, top_n])` aggregate. It returns a JSON
+  object of `{value: count}` over the matched rows (ordered by count, optional
+  top-N cap), computing every facet plus the hit count in a **single pass**. As
+  an ordinary aggregate it composes with `WHERE`, full-text `MATCH ... AGAINST`,
+  vector filters and `GROUP BY` — the counts side of a faceted search, reusing
+  the same engine as full-text and vector search. Works in the server and the
+  embedded engine.
+
 ## [1.3.0] - 2026-07-16
 
 Access-control release. Enforces individual DML privileges per table, closing the

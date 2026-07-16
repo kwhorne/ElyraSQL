@@ -260,6 +260,7 @@ fn agg_of(expr: &Expr) -> Option<(AggFunc, &sqlparser::ast::Function)> {
         "bit_or" => AggFunc::BitOr,
         "bit_and" => AggFunc::BitAnd,
         "bit_xor" => AggFunc::BitXor,
+        "facet" => AggFunc::Facet,
         _ => return None,
     };
     Some((func, f))
@@ -305,6 +306,20 @@ fn ident_of(expr: &Expr) -> Option<String> {
 }
 
 /// Extract a GROUP_CONCAT `SEPARATOR '...'` clause, if present.
+/// The optional top-N cap in `FACET(col, n)` (its second argument, a positive
+/// integer literal). `None` = return every facet value.
+fn facet_top_of(f: &sqlparser::ast::Function) -> Option<usize> {
+    let FunctionArguments::List(list) = &f.args else {
+        return None;
+    };
+    match list.args.get(1) {
+        Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(
+            sqlparser::ast::Value::Number(n, _),
+        )))) => n.parse::<usize>().ok().filter(|&n| n > 0),
+        _ => None,
+    }
+}
+
 fn agg_separator(f: &sqlparser::ast::Function) -> Option<String> {
     let FunctionArguments::List(list) = &f.args else {
         return None;
@@ -471,6 +486,7 @@ fn register_agg(
         | AggFunc::VarPop
         | AggFunc::VarSamp => ColumnType::Float,
         AggFunc::GroupConcat => ColumnType::Text,
+        AggFunc::Facet => ColumnType::Json,
         AggFunc::BitOr | AggFunc::BitAnd | AggFunc::BitXor => ColumnType::UInt,
         AggFunc::Sum | AggFunc::Min | AggFunc::Max => arg_ty.unwrap_or(ColumnType::Float),
     };
@@ -480,6 +496,7 @@ fn register_agg(
         arg_col: arg,
         distinct,
         separator: agg_separator(f),
+        facet_top: facet_top_of(f),
     });
     agg_types.push(ty);
     Ok(slot)

@@ -1574,3 +1574,70 @@ async fn fine_grained_privileges() {
         .is_err());
     del2.query_drop("DELETE FROM t WHERE id=1").await.unwrap();
 }
+
+// Faceted search (ESQL-17): FACET(col[, n]) returns a value->count JSON object
+// over the matched rows, computed in the same single-pass aggregation, and
+// composes with WHERE / MATCH / GROUP BY.
+#[tokio::test]
+async fn faceted_search() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop("CREATE TABLE docs (id INT PRIMARY KEY, title TEXT, category VARCHAR(16), brand VARCHAR(16), price INT)")
+        .await
+        .unwrap();
+    for (id, title, cat, brand, price) in [
+        (1, "rust database engine", "db", "acme", 100),
+        (2, "rust web framework", "web", "acme", 50),
+        (3, "python database tool", "db", "globex", 80),
+        (4, "rust systems programming", "sys", "acme", 120),
+        (5, "rust database driver", "db", "initech", 60),
+        (6, "go database", "db", "globex", 90),
+    ] {
+        c.query_drop(format!(
+            "INSERT INTO docs VALUES ({id},'{title}','{cat}','{brand}',{price})"
+        ))
+        .await
+        .unwrap();
+    }
+
+    // Multi-facet + total in one pass (ordered count desc, then value asc).
+    let (cats, brands, total): (String, String, i64) = c
+        .query_first("SELECT FACET(category), FACET(brand), COUNT(*) FROM docs")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(cats, r#"{"db": 4, "sys": 1, "web": 1}"#);
+    assert_eq!(brands, r#"{"acme": 3, "globex": 2, "initech": 1}"#);
+    assert_eq!(total, 6);
+
+    // Top-N cap.
+    let top2: String = c
+        .query_first("SELECT FACET(brand, 2) FROM docs")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(top2, r#"{"acme": 3, "globex": 2}"#);
+
+    // Composes with a WHERE filter.
+    let filtered: String = c
+        .query_first("SELECT FACET(category) FROM docs WHERE price >= 80")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(filtered, r#"{"db": 3, "sys": 1}"#);
+
+    // Composes with a full-text MATCH.
+    let searched: String = c
+        .query_first("SELECT FACET(brand) FROM docs WHERE MATCH(title) AGAINST('python')")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(searched, r#"{"globex": 1}"#);
+
+    // Composes with GROUP BY (facet within each group).
+    let per_brand: Vec<(String, String)> = c
+        .query("SELECT brand, FACET(category) FROM docs GROUP BY brand ORDER BY brand")
+        .await
+        .unwrap();
+    assert_eq!(per_brand[1], ("globex".into(), r#"{"db": 2}"#.into()));
+}
