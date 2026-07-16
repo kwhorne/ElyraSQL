@@ -99,6 +99,21 @@ Requirements and notes:
   scales with `LIMIT`. Reference the primitive by alias in `ORDER BY` /
   projection as shown.
 
+## Faceted search: `FACET()`
+
+The counts side of a faceted search is a normal aggregate, so it reuses the same
+engine and runs in a single pass alongside the hit count. `FACET(col[, top_n])`
+returns a `{value: count}` JSON object over the matched rows and composes with
+`WHERE`, `MATCH ... AGAINST`, vector filters and `GROUP BY`:
+
+```sql
+SELECT FACET(category) AS categories, FACET(brand, 10) AS brands, COUNT(*) AS total
+FROM docs
+WHERE MATCH(title, body) AGAINST('rust database');
+```
+
+See [Aggregation → FACET](aggregation.md#facet-faceted-search-counts) for details.
+
 ## Generating embeddings in SQL: `ai_embed()`
 
 `ai_embed('text')` calls an **OpenAI-compatible embeddings endpoint** and
