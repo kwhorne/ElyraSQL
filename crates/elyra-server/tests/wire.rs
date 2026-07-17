@@ -1682,13 +1682,22 @@ async fn right_join_streams_correctly() {
         ]
     );
 
-    // SELECT * column order must be (fact.*, dim.*) as MySQL lists it.
-    let star: Vec<(Option<i64>, Option<i64>, Option<i64>, i64, String)> = c
+    // SELECT * column order must be (fact.id, fact.uid, fact.amount, dim.uid,
+    // dim.name) as MySQL lists it (fact.* before dim.*). Read by position to keep
+    // the assertion type simple.
+    let star: Vec<mysql_async::Row> = c
         .query("SELECT * FROM fact RIGHT JOIN dim ON fact.uid = dim.uid ORDER BY dim.uid")
         .await
         .unwrap();
-    assert_eq!(star[0], (Some(1), Some(10), Some(100), 10, "ten".into()));
-    assert_eq!(star[3], (None, None, None, 30, "thirty".into()));
+    let first = &star[0];
+    assert_eq!(first.get::<i64, _>(0).unwrap(), 1); // fact.id
+    assert_eq!(first.get::<i64, _>(2).unwrap(), 100); // fact.amount
+    assert_eq!(first.get::<i64, _>(3).unwrap(), 10); // dim.uid
+    assert_eq!(first.get::<String, _>(4).unwrap(), "ten"); // dim.name
+    let last = &star[3];
+    assert_eq!(last.get::<Option<i64>, _>(0).unwrap(), None); // fact.id NULL
+    assert_eq!(last.get::<i64, _>(3).unwrap(), 30); // dim.uid
+    assert_eq!(last.get::<String, _>(4).unwrap(), "thirty");
 
     // GROUP BY path: aggregate over the right-preserved rows.
     let g: Vec<(String, i64, Option<i64>)> = c
