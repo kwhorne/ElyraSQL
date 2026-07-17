@@ -4281,6 +4281,48 @@ struct JoinChainStep {
     left_outer: bool,
 }
 
+/// Rewrite a two-table `A RIGHT JOIN B ON c` into the equivalent
+/// `B LEFT JOIN A ON c` so the streaming left-deep hash join can handle it
+/// (drive from B, keep every B row, NULL-extend unmatched A). The caller must
+/// reorder the produced `(B-cols, A-cols)` rows back to the query's `(A, B)`
+/// column order via [`right_join_reorder`]. Returns `None` for anything else
+/// (multi-join chains, non-table relations, non-`ON` constraints) — those keep
+/// the materialising path.
+fn rewrite_right_join(twj: &TableWithJoins) -> Option<TableWithJoins> {
+    if twj.joins.len() != 1 || !matches!(twj.relation, TableFactor::Table { .. }) {
+        return None;
+    }
+    let join = &twj.joins[0];
+    if !matches!(join.relation, TableFactor::Table { .. }) {
+        return None;
+    }
+    let JoinOperator::RightOuter(constraint) = &join.join_operator else {
+        return None;
+    };
+    Some(TableWithJoins {
+        relation: join.relation.clone(),
+        joins: vec![sqlparser::ast::Join {
+            relation: twj.relation.clone(),
+            global: join.global,
+            join_operator: JoinOperator::LeftOuter(constraint.clone()),
+        }],
+    })
+}
+
+/// Permutation mapping physical `(B-cols[0..nb], A-cols[0..na])` positions to the
+/// query's logical `(A-cols, B-cols)` order (for a rewritten RIGHT join).
+fn right_join_reorder(nb: usize, na: usize) -> Vec<usize> {
+    let mut perm = Vec::with_capacity(na + nb);
+    perm.extend(nb..nb + na); // A columns (physically after B)
+    perm.extend(0..nb); // B columns (physically first)
+    perm
+}
+
+/// Reorder one row's columns by `perm` (logical position i <- physical perm[i]).
+fn apply_perm(row: &[Value], perm: &[usize]) -> Vec<Value> {
+    perm.iter().map(|&i| row[i].clone()).collect()
+}
+
 /// Build a left-deep streaming hash join for a `TableWithJoins` (a driving table
 /// plus a chain of `JOIN`s). Each partner is materialised into a hash table
 /// keyed by the equi-join key connecting it to the accumulated left side; the
@@ -4418,13 +4460,25 @@ async fn streaming_join_aggregate(
     if db.in_txn() || select.distinct.is_some() || select.from.len() != 1 {
         return Ok(None);
     }
-    let twj = &select.from[0];
+    // A two-table RIGHT join is streamed by rewriting it to `B LEFT JOIN A` and
+    // reordering the output columns back to (A, B) below.
+    let swapped = rewrite_right_join(&select.from[0]);
+    let twj = swapped.as_ref().unwrap_or(&select.from[0]);
     // Build the (left-deep) join chain: each partner into a hash table, driving
     // streamed. Handles two or more tables.
-    let Some((_dschema, steps, schema)) = build_join_chain(db, twj).await? else {
+    let Some((dschema, steps, schema)) = build_join_chain(db, twj).await? else {
         return Ok(None);
     };
     let (ddef, _) = resolve_table(db, &twj.relation).await?;
+
+    let reorder: Option<Vec<usize>> = swapped.as_ref().map(|_| {
+        let nb = dschema.columns.len();
+        right_join_reorder(nb, schema.columns.len() - nb)
+    });
+    let schema = match &reorder {
+        Some(perm) => Schema::new(perm.iter().map(|&i| schema.columns[i].clone()).collect()),
+        None => schema,
+    };
 
     // Build the aggregation plan; if it isn't a plain aggregate/group plan we can
     // stream, fall back to join_select (which is the authoritative path and will
@@ -4462,6 +4516,10 @@ async fn streaming_join_aggregate(
             combined_buf.clear();
             expand_join_chain(l, &steps, &mut combined_buf)?;
             for combined in combined_buf.drain(..) {
+                let combined = match &reorder {
+                    Some(perm) => apply_perm(&combined, perm),
+                    None => combined,
+                };
                 if !keep(&combined)? {
                     continue;
                 }
@@ -4511,13 +4569,27 @@ async fn streaming_join_order(
     if db.in_txn() || select.distinct.is_some() || select.from.len() != 1 {
         return Ok(None);
     }
-    let twj = &select.from[0];
+    // A two-table RIGHT join is streamed by rewriting it to `B LEFT JOIN A` and
+    // reordering the output columns back to (A, B) below.
+    let swapped = rewrite_right_join(&select.from[0]);
+    let twj = swapped.as_ref().unwrap_or(&select.from[0]);
     // Build the (left-deep) join chain: each partner into a hash table, driving
     // left to be streamed. Handles two or more tables.
-    let Some((_dschema, steps, schema)) = build_join_chain(db, twj).await? else {
+    let Some((dschema, steps, schema)) = build_join_chain(db, twj).await? else {
         return Ok(None);
     };
     let (ddef, _) = resolve_table(db, &twj.relation).await?;
+
+    // For a rewritten RIGHT join, restore the query's (A, B) column order in both
+    // the schema and every produced row.
+    let reorder: Option<Vec<usize>> = swapped.as_ref().map(|_| {
+        let nb = dschema.columns.len();
+        right_join_reorder(nb, schema.columns.len() - nb)
+    });
+    let schema = match &reorder {
+        Some(perm) => Schema::new(perm.iter().map(|&i| schema.columns[i].clone()).collect()),
+        None => schema,
+    };
 
     // ORDER BY keys resolved against the projection + combined schema, exactly
     // as join_select does before sorting.
@@ -4564,6 +4636,10 @@ async fn streaming_join_order(
             combined_buf.clear();
             expand_join_chain(l, &steps, &mut combined_buf)?;
             for combined in combined_buf.drain(..) {
+                let combined = match &reorder {
+                    Some(perm) => apply_perm(&combined, perm),
+                    None => combined,
+                };
                 if keep(&combined)? {
                     let keys = resolved
                         .iter()

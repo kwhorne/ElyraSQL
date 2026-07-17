@@ -4,6 +4,18 @@ All notable changes to ElyraSQL are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+
+- **Streaming `RIGHT JOIN`.** A two-table `RIGHT JOIN` followed by `ORDER BY` or
+  `GROUP BY` now streams (rewritten to the equivalent `LEFT JOIN` with the output
+  columns reordered back to the query's `(A, B)` order), so it is bounded by the
+  partner hash table plus the sorter/aggregator rather than the full join size —
+  joining `INNER`/`LEFT`/`RIGHT` equi-joins on the streaming path. `FULL`,
+  non-equi, derived-table, and multi-join-chain `RIGHT` joins still use the
+  correct materialising path.
+
 ## [1.4.0] - 2026-07-16
 
 Search release. Completes the search chapter with faceted counts, reusing the

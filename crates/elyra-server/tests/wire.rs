@@ -1641,3 +1641,70 @@ async fn faceted_search() {
         .unwrap();
     assert_eq!(per_brand[1], ("globex".into(), r#"{"db": 2}"#.into()));
 }
+
+// RIGHT-join streaming (ESQL-6): a two-table RIGHT join is streamed (rewritten to
+// B LEFT JOIN A with the output columns reordered back to A, B), for both the
+// ORDER BY and GROUP BY shapes, keeping every right-side row.
+#[tokio::test]
+async fn right_join_streams_correctly() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop("CREATE TABLE fact (id INT PRIMARY KEY, uid INT, amount INT)")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE dim (uid INT PRIMARY KEY, name VARCHAR(16))")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO fact VALUES (1,10,100),(2,10,50),(3,20,80)")
+        .await
+        .unwrap();
+    // uid 30 has no matching fact row -> RIGHT join must keep it with NULLs.
+    c.query_drop("INSERT INTO dim VALUES (10,'ten'),(20,'twenty'),(30,'thirty')")
+        .await
+        .unwrap();
+
+    // ORDER BY path: every dim row kept; the unmatched one has NULL fact columns.
+    let rows: Vec<(Option<i64>, Option<i64>, i64, String)> = c
+        .query(
+            "SELECT fact.id, fact.amount, dim.uid, dim.name \
+             FROM fact RIGHT JOIN dim ON fact.uid = dim.uid \
+             ORDER BY dim.uid, fact.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            (Some(1), Some(100), 10, "ten".into()),
+            (Some(2), Some(50), 10, "ten".into()),
+            (Some(3), Some(80), 20, "twenty".into()),
+            (None, None, 30, "thirty".into()),
+        ]
+    );
+
+    // SELECT * column order must be (fact.*, dim.*) as MySQL lists it.
+    let star: Vec<(Option<i64>, Option<i64>, Option<i64>, i64, String)> = c
+        .query("SELECT * FROM fact RIGHT JOIN dim ON fact.uid = dim.uid ORDER BY dim.uid")
+        .await
+        .unwrap();
+    assert_eq!(star[0], (Some(1), Some(10), Some(100), 10, "ten".into()));
+    assert_eq!(star[3], (None, None, None, 30, "thirty".into()));
+
+    // GROUP BY path: aggregate over the right-preserved rows.
+    let g: Vec<(String, i64, Option<i64>)> = c
+        .query(
+            "SELECT dim.name, COUNT(fact.id) AS n, SUM(fact.amount) AS s \
+             FROM fact RIGHT JOIN dim ON fact.uid = dim.uid \
+             GROUP BY dim.name ORDER BY dim.name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        g,
+        vec![
+            ("ten".into(), 2, Some(150)),
+            ("thirty".into(), 0, None),
+            ("twenty".into(), 1, Some(80)),
+        ]
+    );
+}

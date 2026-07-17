@@ -121,16 +121,20 @@ judge fit before deploying.
   or the spilling aggregator (`GROUP BY`). The join output is never fully
   materialised, so a large fact-to-dimensions join with sorting or grouping is
   bounded by the partner hash tables plus the sorter/aggregator, not
-  `|driving| x fanout`. INNER and LEFT are supported (autocommit only).
+  `|driving| x fanout`. INNER, LEFT and RIGHT are supported (autocommit only). A
+  two-table `RIGHT JOIN` streams by rewriting it to the equivalent `LEFT JOIN`
+  with the output columns reordered back to the query's order.
 - **INNER comma joins stream too**: `FROM a, b, c WHERE a.k = b.k AND b.j = c.j`
   is normalised to an explicit `JOIN` chain (using the WHERE equi-predicates as
   `ON`), so it gets the same cost-based reordering and streaming as explicit
   joins when every table is connected by an equi-predicate.
-- **Remaining materialising joins**: `RIGHT`/`FULL`/non-equi joins, and
-  derived-table joins, still build the full join result before
+- **Remaining materialising joins**: `FULL` joins, non-equi joins, derived-table
+  joins, and `RIGHT` joins that are part of a multi-table chain (rather than a
+  single two-table `RIGHT JOIN`) still build the full join result before
   `ORDER BY`/`GROUP BY` (correct, but not memory-bounded on very large such
-  joins). RIGHT/FULL need unmatched-build-side tracking; non-equi joins have no
-  hash key to stream on.
+  joins). `FULL` needs unmatched-build-side tracking; non-equi joins have no hash
+  key to stream on; a derived table is materialised first. These shapes are rare
+  and the materialising path is correct.
 - Uncommitted transaction writes are buffered in memory (not spilled to disk)
   until `COMMIT`/`ROLLBACK`. To keep this bounded, a transaction that stages more
   than `ELYRASQL_TXN_MAX_BYTES` (default 1 GiB) of writes has its next write
