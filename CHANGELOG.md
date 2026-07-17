@@ -4,7 +4,11 @@ All notable changes to ElyraSQL are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.4.1] - 2026-07-17
+
+Join-streaming release. Streams two-table `RIGHT JOIN` (closing ESQL-6, the last
+backlog item), so all equi-join shapes are now memory-bounded. No on-disk format
+change.
 
 ### Changed
 
@@ -1322,6 +1326,7 @@ core CRUD with `WHERE`/`ORDER BY`/`LIMIT`, indexes, aggregation and `GROUP BY`,
 joins, prepared statements, authentication and TLS, vector search (exact +
 HNSW), parallel OLAP aggregation, and transactions with snapshot isolation.
 
+[1.4.1]: https://github.com/kwhorne/ElyraSQL/releases/tag/v1.4.1
 [1.4.0]: https://github.com/kwhorne/ElyraSQL/releases/tag/v1.4.0
 [1.3.0]: https://github.com/kwhorne/ElyraSQL/releases/tag/v1.3.0
 [1.2.0]: https://github.com/kwhorne/ElyraSQL/releases/tag/v1.2.0

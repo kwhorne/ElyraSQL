@@ -64,11 +64,18 @@ FROM users u LEFT JOIN orders o ON u.id = o.user_id;
 
 ### Join execution
 
-- **Equi-joins** (`a.x = b.y`) on `INNER`/`LEFT` use a **hash join** — `O(n+m)`.
+- **Equi-joins** (`a.x = b.y`) on `INNER`/`LEFT`/`RIGHT` use a **hash join** —
+  `O(n+m)`.
 - When the driving side is small and the partner is indexed on the join key,
   the planner uses an **index nested-loop join**, making selective joins
   sub-millisecond.
-- `RIGHT`/`FULL` and non-equi joins use nested-loop.
+- **Memory-bounded streaming:** a large `INNER`/`LEFT`/`RIGHT` equi-join followed
+  by `ORDER BY` or `GROUP BY` streams the driving side through the spilling
+  sorter/aggregator (partner sides built into hash tables), so it is bounded by
+  the result/hash state, not the full join output — including N-table left-deep
+  chains and comma joins. A two-table `RIGHT JOIN` is rewritten to the equivalent
+  `LEFT JOIN` (columns reordered back). `FULL` and non-equi joins use nested-loop
+  and materialise before sorting/grouping.
 - Single-table `WHERE` conjuncts are **pushed down** to each relation before
   the join to reduce work.
 
