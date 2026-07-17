@@ -43,8 +43,24 @@ GROUP BY region
 ORDER BY total DESC;
 ```
 
-`GROUP BY` accepts one or more columns. Aggregation works over joined result
-sets too.
+`GROUP BY` accepts one or more columns **or expressions**. Grouping by an
+expression is how you bucket data — most importantly by time:
+
+```sql
+-- Requests, errors and latency percentiles per minute (an observability query):
+SELECT DATE_FORMAT(ts, '%Y-%m-%d %H:%i:00') AS minute,
+       COUNT(*)                     AS requests,
+       SUM(status >= 500)           AS errors,
+       PERCENTILE(latency_ms, 0.95) AS p95
+FROM logs
+GROUP BY DATE_FORMAT(ts, '%Y-%m-%d %H:%i:00')
+ORDER BY minute;
+
+SELECT status DIV 100 AS class, COUNT(*) FROM logs GROUP BY status DIV 100;
+```
+
+Projecting the same expression returns each group's value. Aggregation works over
+joined result sets too.
 
 ## HAVING
 
