@@ -16,6 +16,24 @@ SELECT COUNT(DISTINCT region) FROM sales;
 - `SUM`/`MIN`/`MAX` preserve the argument's type where meaningful (e.g. `SUM`
   over `DECIMAL` is exact); `AVG` returns a float.
 
+Also available: `STDDEV`/`STDDEV_POP`/`STDDEV_SAMP`, `VARIANCE`/`VAR_POP`/
+`VAR_SAMP`, the bitwise aggregates `BIT_OR`/`BIT_AND`/`BIT_XOR`, and percentiles:
+
+```sql
+-- percentile_cont (linear interpolation); p in 0..1
+SELECT service,
+       MEDIAN(latency_ms)             AS p50,
+       PERCENTILE(latency_ms, 0.95)   AS p95,   -- QUANTILE is an alias
+       PERCENTILE(latency_ms, 0.99)   AS p99
+FROM requests
+GROUP BY service;
+```
+
+`PERCENTILE(col, p)` / `QUANTILE(col, p)` compute an exact percentile of the
+group's numeric values (`MEDIAN(col)` = `PERCENTILE(col, 0.5)`); an empty group
+returns `NULL`. Exact computation buffers the group's values, so memory scales
+with group size.
+
 ## GROUP BY
 
 ```sql

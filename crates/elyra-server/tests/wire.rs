@@ -1717,3 +1717,67 @@ async fn right_join_streams_correctly() {
         ]
     );
 }
+
+// Percentile aggregate (ESQL-18): PERCENTILE/QUANTILE/MEDIAN via percentile_cont
+// (linear interpolation), for metrics p50/p95/p99. Composes with GROUP BY.
+#[tokio::test]
+async fn percentile_aggregate() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop("CREATE TABLE req (id INT PRIMARY KEY, service VARCHAR(8), latency INT)")
+        .await
+        .unwrap();
+    // service 'a' = 1..=100, service 'b' = {10,20,30}.
+    for i in 1..=100 {
+        c.query_drop(format!("INSERT INTO req VALUES ({i}, 'a', {i})"))
+            .await
+            .unwrap();
+    }
+    for (i, v) in [(201, 10), (202, 20), (203, 30)] {
+        c.query_drop(format!("INSERT INTO req VALUES ({i}, 'b', {v})"))
+            .await
+            .unwrap();
+    }
+
+    let p50: f64 = c
+        .query_first("SELECT PERCENTILE(latency, 0.5) FROM req WHERE service='a'")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!((p50 - 50.5).abs() < 1e-9, "p50 = {p50}");
+    let p95: f64 = c
+        .query_first("SELECT PERCENTILE(latency, 0.95) FROM req WHERE service='a'")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!((p95 - 95.05).abs() < 1e-9, "p95 = {p95}");
+    let median: f64 = c
+        .query_first("SELECT MEDIAN(latency) FROM req WHERE service='a'")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!((median - 50.5).abs() < 1e-9);
+    let q90: f64 = c
+        .query_first("SELECT QUANTILE(latency, 0.9) FROM req WHERE service='a'")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!((q90 - 90.1).abs() < 1e-9, "q90 = {q90}");
+
+    // GROUP BY per service.
+    let g: Vec<(String, f64)> = c
+        .query(
+            "SELECT service, PERCENTILE(latency, 0.95) FROM req GROUP BY service ORDER BY service",
+        )
+        .await
+        .unwrap();
+    assert!((g[0].1 - 95.05).abs() < 1e-9); // a
+    assert!((g[1].1 - 29.0).abs() < 1e-9); // b
+
+    // Empty group -> NULL.
+    let empty: Option<Option<f64>> = c
+        .query_first("SELECT PERCENTILE(latency, 0.95) FROM req WHERE 1=0")
+        .await
+        .unwrap();
+    assert_eq!(empty, Some(None));
+}

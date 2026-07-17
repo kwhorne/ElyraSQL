@@ -261,6 +261,7 @@ fn agg_of(expr: &Expr) -> Option<(AggFunc, &sqlparser::ast::Function)> {
         "bit_and" => AggFunc::BitAnd,
         "bit_xor" => AggFunc::BitXor,
         "facet" => AggFunc::Facet,
+        "percentile" | "quantile" | "median" => AggFunc::Percentile,
         _ => return None,
     };
     Some((func, f))
@@ -317,6 +318,32 @@ fn facet_top_of(f: &sqlparser::ast::Function) -> Option<usize> {
             sqlparser::ast::Value::Number(n, _),
         )))) => n.parse::<usize>().ok().filter(|&n| n > 0),
         _ => None,
+    }
+}
+
+/// The fraction in `PERCENTILE(col, p)` / `QUANTILE(col, p)` (0..1), or 0.5 for
+/// `MEDIAN(col)`. Defaults to 0.5 if the second argument is missing/unparseable.
+fn percentile_of(f: &sqlparser::ast::Function) -> Option<f64> {
+    let name = f
+        .name
+        .0
+        .last()
+        .map(|p| p.value.to_ascii_lowercase())
+        .unwrap_or_default();
+    if name == "median" {
+        return Some(0.5);
+    }
+    if !(name == "percentile" || name == "quantile") {
+        return None;
+    }
+    let FunctionArguments::List(list) = &f.args else {
+        return Some(0.5);
+    };
+    match list.args.get(1) {
+        Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(
+            sqlparser::ast::Value::Number(n, _),
+        )))) => Some(n.parse::<f64>().unwrap_or(0.5)),
+        _ => Some(0.5),
     }
 }
 
@@ -487,6 +514,7 @@ fn register_agg(
         | AggFunc::VarSamp => ColumnType::Float,
         AggFunc::GroupConcat => ColumnType::Text,
         AggFunc::Facet => ColumnType::Json,
+        AggFunc::Percentile => ColumnType::Float,
         AggFunc::BitOr | AggFunc::BitAnd | AggFunc::BitXor => ColumnType::UInt,
         AggFunc::Sum | AggFunc::Min | AggFunc::Max => arg_ty.unwrap_or(ColumnType::Float),
     };
@@ -497,6 +525,7 @@ fn register_agg(
         distinct,
         separator: agg_separator(f),
         facet_top: facet_top_of(f),
+        percentile: percentile_of(f),
     });
     agg_types.push(ty);
     Ok(slot)

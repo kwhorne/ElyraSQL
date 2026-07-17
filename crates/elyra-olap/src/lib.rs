@@ -77,6 +77,9 @@ pub enum AggFunc {
     /// Faceted count: a value->count map over the group, finalised to a JSON
     /// object. The optional top-N cap lives in [`AggSpec::facet_top`].
     Facet,
+    /// Exact percentile (`percentile_cont` semantics) of the group's numeric
+    /// values; the fraction 0..1 lives in [`AggSpec::percentile`].
+    Percentile,
 }
 
 /// One aggregate to compute: function, optional argument column, DISTINCT.
@@ -89,6 +92,8 @@ pub struct AggSpec {
     pub separator: Option<String>,
     /// `FACET(col, n)` top-N cap on the number of facet values returned.
     pub facet_top: Option<usize>,
+    /// `PERCENTILE(col, p)` fraction in 0..1 (`MEDIAN` = 0.5).
+    pub percentile: Option<f64>,
 }
 
 #[derive(Clone)]
@@ -106,6 +111,8 @@ struct Acc {
     concat: Vec<String>,
     /// Facet value -> count map (for `FACET(col)`).
     facet: HashMap<String, i64>,
+    /// Numeric values collected for `PERCENTILE`/`MEDIAN`.
+    pvals: Vec<f64>,
     /// Exact decimal running sum (unscaled) and its scale.
     dsum: i128,
     dscale: u8,
@@ -126,6 +133,7 @@ impl Acc {
             distinct: HashSet::new(),
             concat: Vec::new(),
             facet: HashMap::new(),
+            pvals: Vec::new(),
             dsum: 0,
             dscale: 0,
             has_decimal: false,
@@ -442,6 +450,13 @@ fn update(acc: &mut Acc, func: AggFunc, val: Option<Value>, distinct: bool) {
                 }
             }
         }
+        AggFunc::Percentile => {
+            if let Some(v) = val {
+                if let Some(n) = num(&v) {
+                    acc.pvals.push(n);
+                }
+            }
+        }
         AggFunc::BitOr | AggFunc::BitAnd | AggFunc::BitXor => {
             if let Some(v) = val {
                 if let Some(n) = num(&v) {
@@ -515,6 +530,7 @@ fn merge_acc(a: &mut Acc, b: Acc, func: AggFunc) {
     for (k, c) in b.facet {
         *a.facet.entry(k).or_insert(0) += c;
     }
+    a.pvals.extend(b.pvals);
     for d in b.distinct {
         a.distinct.insert(d);
     }
@@ -561,6 +577,25 @@ fn finish(acc: &Acc, spec: &AggSpec) -> Value {
                     .collect(),
             );
             Value::Json(obj.to_json_string())
+        }
+        AggFunc::Percentile => {
+            if acc.pvals.is_empty() {
+                return Value::Null;
+            }
+            let mut v = acc.pvals.clone();
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+            // percentile_cont: linear interpolation at rank p*(n-1).
+            let p = spec.percentile.unwrap_or(0.5).clamp(0.0, 1.0);
+            let rank = p * (v.len() - 1) as f64;
+            let lo = rank.floor() as usize;
+            let hi = rank.ceil() as usize;
+            let result = if lo == hi {
+                v[lo]
+            } else {
+                let frac = rank - lo as f64;
+                v[lo] + frac * (v[hi] - v[lo])
+            };
+            Value::Float(result)
         }
         AggFunc::CountStar | AggFunc::Count => Value::Int(acc.count),
         AggFunc::Sum => {
