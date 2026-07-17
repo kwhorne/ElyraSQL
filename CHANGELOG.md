@@ -4,6 +4,15 @@ All notable changes to ElyraSQL are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **Percentile aggregates** `PERCENTILE(col, p)` / `QUANTILE(col, p)` (fraction
+  `p` in 0..1) and `MEDIAN(col)`, with exact `percentile_cont` (linear-
+  interpolation) semantics — for latency percentiles (p50/p95/p99) in metrics
+  workloads. Composes with `WHERE`/`GROUP BY`; an empty group is `NULL`.
+
 ## [1.4.1] - 2026-07-17
 
 Join-streaming release. Streams two-table `RIGHT JOIN` (closing ESQL-6, the last
