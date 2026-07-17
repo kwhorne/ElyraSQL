@@ -309,6 +309,10 @@ CASES = [
     ("null", "SELECT NOT NULL"),
     # bit aggregates over the fixture
     ("agg", "SELECT BIT_OR(n), BIT_AND(n), BIT_XOR(n) FROM d WHERE n IS NOT NULL"),
+    # GROUP BY expression (not just a plain column)
+    ("groupexpr", "SELECT n DIV 5 AS k, COUNT(*) FROM d GROUP BY n DIV 5 ORDER BY k"),
+    ("groupexpr", "SELECT ABS(n) AS a, COUNT(*) FROM d GROUP BY ABS(n) ORDER BY a"),
+    ("groupexpr", "SELECT UPPER(s) AS u, COUNT(*) FROM d GROUP BY UPPER(s) ORDER BY u"),
 ]
 
 

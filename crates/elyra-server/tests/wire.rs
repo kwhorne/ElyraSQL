@@ -1781,3 +1781,57 @@ async fn percentile_aggregate() {
         .unwrap();
     assert_eq!(empty, Some(None));
 }
+
+// GROUP BY expression (ESQL-19): group by an arbitrary expression (time-bucketing,
+// arithmetic), not just a plain column, so observability time-bucket queries work.
+#[tokio::test]
+async fn group_by_expression() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop("CREATE TABLE logs (id INT PRIMARY KEY, ts DATETIME, status INT, latency INT)")
+        .await
+        .unwrap();
+    // 120 rows across two minutes; every 10th is a 500.
+    for i in 0..120 {
+        let ts = format!("2026-07-17 10:{:02}:{:02}", i / 60, i % 60);
+        let status = if i % 10 == 0 { 500 } else { 200 };
+        c.query_drop(format!(
+            "INSERT INTO logs VALUES ({i}, '{ts}', {status}, {})",
+            i % 50
+        ))
+        .await
+        .unwrap();
+    }
+
+    // Time-bucket by minute: reqs, errors, and p95 per minute.
+    let rows: Vec<(String, i64, i64)> = c
+        .query(
+            "SELECT DATE_FORMAT(ts, '%Y-%m-%d %H:%i:00') AS m, COUNT(*), SUM(status >= 500) \
+             FROM logs GROUP BY DATE_FORMAT(ts, '%Y-%m-%d %H:%i:00') ORDER BY m",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            ("2026-07-17 10:00:00".into(), 60, 6),
+            ("2026-07-17 10:01:00".into(), 60, 6),
+        ]
+    );
+
+    // Arithmetic grouping (status class).
+    let klass: Vec<(i64, i64)> = c
+        .query("SELECT status DIV 100 AS k, COUNT(*) FROM logs GROUP BY status DIV 100 ORDER BY k")
+        .await
+        .unwrap();
+    assert_eq!(klass, vec![(2, 108), (5, 12)]);
+
+    // Group expression composes with a percentile aggregate (ordering by the
+    // projected bucket alias, as observability queries do).
+    let p95: Vec<(i64, f64)> = c
+        .query("SELECT status DIV 100 AS k, PERCENTILE(latency, 0.95) FROM logs GROUP BY status DIV 100 ORDER BY k")
+        .await
+        .unwrap();
+    assert_eq!(p95.len(), 2);
+    assert!(p95[0].1 > 0.0);
+}

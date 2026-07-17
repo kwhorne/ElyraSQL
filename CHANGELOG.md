@@ -12,6 +12,16 @@ All notable changes to ElyraSQL are documented here. The format is based on
   `p` in 0..1) and `MEDIAN(col)`, with exact `percentile_cont` (linear-
   interpolation) semantics — for latency percentiles (p50/p95/p99) in metrics
   workloads. Composes with `WHERE`/`GROUP BY`; an empty group is `NULL`.
+- **`GROUP BY` an expression**, not just a plain column — e.g. time-bucketing
+  `GROUP BY DATE_FORMAT(ts, '%Y-%m-%d %H:%i:00')` or `GROUP BY status DIV 100`.
+  The projection of the same expression returns the group value. (Verified
+  against MySQL in the differential suite.)
+
+### Fixed
+
+- Computed-column type inference now reports `DIV` as an integer and the bitwise
+  operators as `BIGINT UNSIGNED` (previously text), so e.g. `SELECT n DIV 5 ...
+  GROUP BY n DIV 5` returns an integer column.
 
 ## [1.4.1] - 2026-07-17
 

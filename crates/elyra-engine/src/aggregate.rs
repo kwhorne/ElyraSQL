@@ -384,18 +384,29 @@ pub fn build_plan(
     projection: &[SelectItem],
     group_by: &[Expr],
 ) -> Result<AggPlan> {
-    let mut group_cols = Vec::new();
-    for g in group_by {
-        let name = ident_of(g)
-            .ok_or_else(|| Error::Unsupported("GROUP BY must reference a column".into()))?;
-        group_cols.push(col_index(schema, &name)?);
-    }
-
     let mut aggs = Vec::new();
     let mut agg_types: Vec<ColumnType> = Vec::new();
     let mut plan = Vec::new();
     let mut out_cols = Vec::new();
     let mut arg_exprs: Vec<Expr> = Vec::new();
+
+    // Group columns: a plain column groups by its index; a non-column expression
+    // (e.g. `DATE_FORMAT(ts, ...)` for time-bucketing, `status DIV 100`) is
+    // registered as a computed column appended after the base columns, and the
+    // group key is taken from that appended position. `extend_row` evaluates it
+    // per row; the projection of the same expression re-evaluates it on the
+    // group's sample row (all rows in a group share the value).
+    let mut group_cols = Vec::new();
+    for g in group_by {
+        match ident_of(g).and_then(|n| col_index(schema, &n).ok()) {
+            Some(idx) => group_cols.push(idx),
+            None => {
+                let idx = schema.columns.len() + arg_exprs.len();
+                arg_exprs.push(g.clone());
+                group_cols.push(idx);
+            }
+        }
+    }
     let ci = elyra_core::Collation::Ci;
 
     for item in projection {
@@ -465,7 +476,15 @@ pub fn build_plan(
 
     let group_collations: Vec<elyra_core::Collation> = group_cols
         .iter()
-        .map(|&c| schema.columns[c].collation)
+        .map(|&c| {
+            // Appended computed group columns (index past the base schema) have
+            // no stored collation; default to case-insensitive.
+            schema
+                .columns
+                .get(c)
+                .map(|col| col.collation)
+                .unwrap_or(elyra_core::Collation::Ci)
+        })
         .collect();
     Ok(AggPlan {
         group_cols,
@@ -657,6 +676,10 @@ fn infer_computed_type(expr: &Expr) -> ColumnType {
             use sqlparser::ast::BinaryOperator::*;
             match op {
                 Plus | Minus | Multiply | Divide | Modulo => ColumnType::Float,
+                MyIntegerDivide => ColumnType::Int,
+                BitwiseAnd | BitwiseOr | BitwiseXor | PGBitwiseShiftLeft | PGBitwiseShiftRight => {
+                    ColumnType::UInt
+                }
                 _ => ColumnType::Text,
             }
         }
