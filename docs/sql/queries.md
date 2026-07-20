@@ -35,7 +35,7 @@ ElyraSQL picks an access path automatically:
 | `indexed_col = <literal>` | secondary index | `O(log n + matches)` |
 | `col >/>=/</<= <literal>`, `BETWEEN` on PK/indexed col | ordered range scan | proportional to matches |
 | `ORDER BY <pk prefix> ASC\|DESC LIMIT n` (no filter) | clustered walk (forward/reverse), stop at `n` | `O(offset + n)` |
-| `ORDER BY <indexed NOT NULL col> ASC\|DESC LIMIT n` (no filter) | ordered index walk, stop at `n` | `O(offset + n)` |
+| `ORDER BY <indexed col> ASC\|DESC LIMIT n` | ordered index walk (+ NULL block), stop at `n` | `O(offset + n)` |
 | anything else | full table scan (streaming) | `O(n)` |
 
 Non-accelerated scans **stream** in bounded memory, so they never load the
@@ -44,12 +44,12 @@ whole table at once.
 An ordered `LIMIT` (a paged grid: `ORDER BY <col> ASC|DESC LIMIT n OFFSET k`) is
 served by an ordered index or clustered walk that stops after `k + n` rows —
 constant work per page, independent of table size. This applies to the primary
-key in **both** directions and to any secondary index whose columns are all
-`NOT NULL`. A `WHERE` filter is applied as a residual during the walk, so a
-filtered grid page stays on the fast path too; a very selective filter falls back
-to the sorter (bounded by `ELYRASQL_ORDER_SCAN_BUDGET`). See
-[limitations](../limitations.md) for the remaining fallbacks (nullable sort
-column, or inside a transaction).
+key in **both** directions and to a secondary index — including a **nullable
+single-column** index, where NULL-keyed rows are spliced in (last for `DESC`,
+first for `ASC`, matching MySQL). A `WHERE` filter is applied as a residual during
+the walk, so a filtered grid page stays on the fast path too; a very selective
+filter (or very rare NULLs on an `ASC` walk) falls back to the sorter, bounded by
+`ELYRASQL_ORDER_SCAN_BUDGET`. See [limitations](../limitations.md) for details.
 
 ## Joins
 

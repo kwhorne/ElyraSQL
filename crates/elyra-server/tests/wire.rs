@@ -1977,3 +1977,79 @@ async fn filtered_indexed_order_by_limit() {
         "selective residual falls back to sorter, still correct"
     );
 }
+
+// Nullable indexed ORDER BY ... LIMIT (ESQL-22): the index omits NULL-keyed rows,
+// so the NULL block is spliced in -- last for DESC, first for ASC (MySQL order).
+#[tokio::test]
+async fn nullable_indexed_order_by_limit() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop("CREATE TABLE t (id INT PRIMARY KEY, revenue INT)")
+        .await
+        .unwrap();
+    // ~1 in 8 rows has a NULL revenue.
+    let mut shadow: Vec<(i64, Option<i64>)> = Vec::new();
+    let mut vals = String::new();
+    let mut seed: u64 = 0x51ED;
+    for id in 1..=3000i64 {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let is_null = (seed >> 3) % 8 == 0;
+        let rev = if is_null {
+            None
+        } else {
+            Some(((seed >> 20) % 1_000_000) as i64)
+        };
+        shadow.push((id, rev));
+        if !vals.is_empty() {
+            vals.push(',');
+        }
+        match rev {
+            Some(v) => vals.push_str(&format!("({id},{v})")),
+            None => vals.push_str(&format!("({id},NULL)")),
+        }
+    }
+    c.query_drop(format!("INSERT INTO t VALUES {vals}"))
+        .await
+        .unwrap();
+    c.query_drop("CREATE INDEX idx_revenue ON t (revenue)")
+        .await
+        .unwrap();
+
+    // DESC: non-NULL descending, NULLs last. Compare the revenue sequence
+    // (NULL-keyed rows are ties, so only the value order is well-defined).
+    let got: Vec<Option<i64>> = c
+        .query_map(
+            "SELECT revenue FROM t ORDER BY revenue DESC LIMIT 40",
+            |rev: Option<i64>| rev,
+        )
+        .await
+        .unwrap();
+    let mut desc = shadow.clone();
+    desc.sort_by_key(|&(id, r)| (r.is_none(), std::cmp::Reverse(r), id));
+    let exp: Vec<Option<i64>> = desc.iter().take(40).map(|&(_, r)| r).collect();
+    assert_eq!(got, exp, "DESC nullable: non-NULL desc then NULLs");
+
+    // ASC: NULLs first, then non-NULL ascending.
+    let got: Vec<Option<i64>> = c
+        .query_map(
+            "SELECT revenue FROM t ORDER BY revenue LIMIT 40",
+            |rev: Option<i64>| rev,
+        )
+        .await
+        .unwrap();
+    let mut asc = shadow.clone();
+    asc.sort_by_key(|&(id, r)| (r.is_some(), r, id));
+    let exp: Vec<Option<i64>> = asc.iter().take(40).map(|&(_, r)| r).collect();
+    assert_eq!(got, exp, "ASC nullable: NULLs first then non-NULL asc");
+
+    // ASC with OFFSET spanning the NULL/non-NULL boundary.
+    let got: Vec<Option<i64>> = c
+        .query_map(
+            "SELECT revenue FROM t ORDER BY revenue LIMIT 20 OFFSET 30",
+            |rev: Option<i64>| rev,
+        )
+        .await
+        .unwrap();
+    let exp: Vec<Option<i64>> = asc.iter().skip(30).take(20).map(|&(_, r)| r).collect();
+    assert_eq!(got, exp, "ASC nullable with OFFSET");
+}

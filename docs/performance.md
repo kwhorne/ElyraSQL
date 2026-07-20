@@ -42,7 +42,7 @@ Ordered `LIMIT` / paged grids (300k rows, no filter):
 |-------|-----:|
 | `ORDER BY <pk> ASC LIMIT 40` | <1 ms |
 | `ORDER BY <pk> DESC LIMIT 40` | <1 ms |
-| `ORDER BY <indexed NOT NULL col> ASC\|DESC LIMIT 40` | <1 ms |
+| `ORDER BY <indexed col> ASC\|DESC LIMIT 40` (incl. nullable) | <1 ms |
 | `WHERE active=1 ORDER BY <indexed col> DESC LIMIT 40` | ~0.5 ms |
 | `WHERE region=3 ORDER BY <indexed col> LIMIT 40` (~10%) | ~1 ms |
 
@@ -57,10 +57,11 @@ selective filter falls back to the sorter (bounded by
 - **Clustered primary keys** and order-preserving encoding make point lookups
   and range scans B-tree operations.
 - **Ordered `LIMIT`** (a paged grid: `ORDER BY <col> ASC|DESC LIMIT n OFFSET k`)
-  walks the primary key (either direction) or a `NOT NULL` secondary index in
-  order and stops after `k + n` rows -- top-N without sorting the table. A `WHERE`
-  filter is applied as a residual during the walk (budget-guarded fallback for
-  very selective filters).
+  walks the primary key (either direction) or a secondary index in order and
+  stops after `k + n` rows -- top-N without sorting the table. Works on a nullable
+  single-column index (NULL rows spliced in per MySQL ordering). A `WHERE` filter
+  is applied as a residual during the walk (budget-guarded fallback for very
+  selective filters).
 - **Batched multi-get** fetches index matches in a single read transaction.
 - **Index nested-loop joins** avoid materializing the partner for selective
   joins; **hash joins** handle the general equi-join case in `O(n+m)`.

@@ -97,19 +97,24 @@ judge fit before deploying.
     - `ORDER BY <primary-key prefix> ASC|DESC LIMIT n` walks the clustered
       keyspace forward (ASC) or backward (DESC).
     - `ORDER BY <indexed column(s)> ASC|DESC LIMIT n` walks a secondary index in
-      key order and follows each entry to its row. Requires that **every column
-      of that index is `NOT NULL`** (indexes omit NULL tuples, so this keeps the
-      walk a complete ordering); a `COLLATE` override or an expression key skips
-      it.
+      key order and follows each entry to its row. A `COLLATE` override or an
+      expression key skips it. A **composite** index must have every column
+      `NOT NULL` (indexes omit NULL tuples, so a NULL in any key column would drop
+      a row from the walk).
+    - A **nullable single-column** index is supported: the ordered walk covers the
+      non-NULL rows and the NULL-keyed rows are spliced in as a block — last for
+      `DESC`, first for `ASC` (MySQL's NULL ordering). The NULL block is fetched by
+      a budgeted clustered scan; if NULLs are so rare that the budget
+      (`ELYRASQL_ORDER_SCAN_BUDGET`) is exhausted before the block is known
+      (mainly an `ASC` concern), it falls back to the sorter below.
     - A `WHERE` filter is applied as a residual **during** the ordered walk, so a
       filtered grid page (`WHERE ... ORDER BY <col> LIMIT n`) is still served
       without a full sort. To stay safe when the filter is very selective, the
-      walk is capped by an examine budget (`ELYRASQL_ORDER_SCAN_BUDGET`); if it
-      cannot fill `n` rows within budget it falls back to the sorter below (a
-      selective filter has few matches, so that sort is cheap).
-    - Sorting a **nullable** indexed column, or an ordered `LIMIT` **inside a
-      transaction**, falls back to the sorter below (correct, not yet
-      index-accelerated).
+      walk is capped by the same examine budget; if it cannot fill `n` rows within
+      budget it falls back to the sorter below (a selective filter has few matches,
+      so that sort is cheap).
+    - An ordered `LIMIT` **inside a transaction** falls back to the sorter below
+      (correct, not yet index-accelerated).
 - **Single-table** `ORDER BY` (the fallback) is memory-bounded: `ORDER BY ...
   LIMIT` uses a top-N heap and large unbounded sorts spill sorted runs to temp
   files (external merge sort, `ELYRASQL_SORT_MAX_ROWS`). This spilling path now

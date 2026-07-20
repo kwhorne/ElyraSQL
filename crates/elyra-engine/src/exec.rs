@@ -3991,36 +3991,107 @@ pub async fn select(
         // Indexed ORDER BY ... LIMIT fast path: `ORDER BY <indexed col> [ASC|DESC]
         // LIMIT n` (autocommit). Walk the secondary index in (reverse) key order,
         // following each entry to its row, apply the residual WHERE, and stop at
-        // `offset + n` -- ordered top-N without sorting the table. Restricted to
-        // NOT NULL index columns (see `secondary_order_index`) for correctness; a
-        // selective residual filter falls back via the budget (see above).
+        // `offset + n` -- ordered top-N without sorting the table. A selective
+        // residual falls back via the budget (see above). For a nullable single-
+        // column index the walk misses NULL-keyed rows, so the NULL block is
+        // spliced in: first for ASC, last for DESC.
         if let Some(lim) = limit {
             if !db.in_txn() && !selective_filter(&def, filter.as_ref())? {
-                if let Some((idx_name, rev)) = secondary_order_index(&def, &resolved) {
+                if let Some(plan) = secondary_order_plan(&def, &resolved) {
                     let need = offset.saturating_add(lim);
-                    let iprefix = index::index_scan_prefix(&def.name, &idx_name);
-                    let sch = def.schema.clone();
-                    let f = filter.clone();
-                    let budget = if f.is_some() {
+                    let iprefix = index::index_scan_prefix(&def.name, &plan.index);
+                    let has_filter = filter.is_some();
+                    let walk_budget = if has_filter {
                         ordered_scan_budget(need)
                     } else {
                         usize::MAX
                     };
-                    let init = OrderedWalk {
-                        rows: Vec::with_capacity(need.min(4096)),
-                        examined: 0,
-                        need,
-                        budget,
-                        budget_hit: false,
+
+                    // Index walk over the non-NULL rows, in order, residual-filtered.
+                    let run_walk = |want: usize| {
+                        let sch = def.schema.clone();
+                        let f = filter.clone();
+                        let iprefix = iprefix.clone();
+                        async move {
+                            db.raw_db()
+                                .scan_index_ordered_fold(
+                                    iprefix,
+                                    plan.rev,
+                                    OrderedWalk {
+                                        rows: Vec::with_capacity(want.min(4096)),
+                                        examined: 0,
+                                        need: want,
+                                        budget: walk_budget,
+                                        budget_hit: false,
+                                    },
+                                    move |w, _dk, v| ordered_walk_step(w, v, &f, &sch),
+                                )
+                                .await
+                        }
                     };
-                    let walk = db
-                        .raw_db()
-                        .scan_index_ordered_fold(iprefix, rev, init, move |w, _dk, v| {
-                            ordered_walk_step(w, v, &f, &sch)
-                        })
-                        .await?;
-                    if !walk.budget_hit {
-                        let mut rows = walk.rows;
+
+                    let mut result: Option<Vec<Vec<Value>>> = None;
+                    if !plan.nullable {
+                        let walk = run_walk(need).await?;
+                        if !walk.budget_hit {
+                            result = Some(walk.rows);
+                        }
+                    } else if !plan.rev {
+                        // ASC: NULLs sort first. Collect the NULL block, then fill
+                        // the remainder from the ascending index walk.
+                        let null_budget = ordered_scan_budget(need);
+                        let (nulls, null_bail) =
+                            collect_null_rows(db, &def, plan.col, &filter, need, null_budget)
+                                .await?;
+                        if !null_bail {
+                            let remaining = need.saturating_sub(nulls.len());
+                            let walk = if remaining > 0 {
+                                run_walk(remaining).await?
+                            } else {
+                                OrderedWalk {
+                                    rows: Vec::new(),
+                                    examined: 0,
+                                    need: 0,
+                                    budget: walk_budget,
+                                    budget_hit: false,
+                                }
+                            };
+                            if !walk.budget_hit {
+                                let mut rows = nulls;
+                                rows.extend(walk.rows);
+                                result = Some(rows);
+                            }
+                        }
+                    } else {
+                        // DESC: NULLs sort last. Fill from the descending index
+                        // walk; only if it is exhausted below `need` do NULLs enter
+                        // the top-N, so append the NULL block then.
+                        let walk = run_walk(need).await?;
+                        if !walk.budget_hit {
+                            if walk.rows.len() >= need {
+                                result = Some(walk.rows);
+                            } else {
+                                let remaining = need - walk.rows.len();
+                                let null_budget = ordered_scan_budget(need);
+                                let (nulls, null_bail) = collect_null_rows(
+                                    db,
+                                    &def,
+                                    plan.col,
+                                    &filter,
+                                    remaining,
+                                    null_budget,
+                                )
+                                .await?;
+                                if !null_bail {
+                                    let mut rows = walk.rows;
+                                    rows.extend(nulls);
+                                    result = Some(rows);
+                                }
+                            }
+                        }
+                    }
+
+                    if let Some(mut rows) = result {
                         apply_offset_limit(&mut rows, offset, limit);
                         let (schema, out) = project_exprs(&select.projection, &def.schema, &rows)?;
                         return Ok(QueryResult::Rows(RowStream::literal(schema, out)));
@@ -6582,12 +6653,30 @@ fn order_is_pk_prefix(def: &TableDef, order: &[(Expr, bool)], asc: bool) -> bool
     true
 }
 
-/// If `order` can be served by walking a secondary index in key order, return
-/// `(index name, reverse)`. Requires: all terms share a direction; the order
-/// columns are a prefix of the index columns; and **every** index column is
-/// NOT NULL — so every row appears exactly once in the index and the ordered
-/// walk is a complete, correct ordering (NULL tuples are omitted from indexes).
-fn secondary_order_index(def: &TableDef, order: &[(Expr, bool)]) -> Option<(String, bool)> {
+/// How a secondary index can serve an `ORDER BY ... LIMIT`.
+struct SecondaryOrder {
+    /// Index to walk.
+    index: String,
+    /// Walk in reverse key order (i.e. the `ORDER BY` is `DESC`).
+    rev: bool,
+    /// The leading order column (for the NULL test on the nullable path).
+    col: usize,
+    /// The index leaves out NULL tuples, so rows with a NULL in `col` are not in
+    /// the walk and must be spliced in as a NULL block (first for `ASC`, last for
+    /// `DESC`). `false` when every index column is `NOT NULL` (complete walk).
+    nullable: bool,
+}
+
+/// If `order` can be served by walking a secondary index in key order, describe
+/// how. Requires all terms to share a direction and the order columns to be a
+/// prefix of the index columns.
+///
+/// Because indexes omit NULL tuples, a nullable order column is only supported
+/// for a **single-column** index matching a **single-column** `ORDER BY` (so the
+/// only rows missing from the walk are exactly those with a NULL key, which the
+/// caller splices back in). A composite index must have every column `NOT NULL`,
+/// otherwise a row with a NULL in any index column would be silently missing.
+fn secondary_order_plan(def: &TableDef, order: &[(Expr, bool)]) -> Option<SecondaryOrder> {
     if order.is_empty() {
         return None;
     }
@@ -6606,12 +6695,76 @@ fn secondary_order_index(def: &TableDef, order: &[(Expr, bool)]) -> Option<(Stri
         if idx.cols[..ocols.len()] != ocols[..] {
             continue;
         }
-        if idx.cols.iter().any(|&c| def.schema.columns[c].nullable) {
-            continue;
+        let all_not_null = idx.cols.iter().all(|&c| !def.schema.columns[c].nullable);
+        if all_not_null {
+            return Some(SecondaryOrder {
+                index: idx.name.clone(),
+                rev: !asc,
+                col: ocols[0],
+                nullable: false,
+            });
         }
-        return Some((idx.name.clone(), !asc));
+        // Nullable key: only a single-column index over a single-column ORDER BY,
+        // where the missing rows are exactly the NULL-keyed ones.
+        if ocols.len() == 1 && idx.cols.len() == 1 {
+            return Some(SecondaryOrder {
+                index: idx.name.clone(),
+                rev: !asc,
+                col: ocols[0],
+                nullable: true,
+            });
+        }
     }
     None
+}
+
+/// Collect up to `want` rows whose `col` is NULL and that satisfy `filter`, by
+/// scanning the clustered data in one read transaction and examining at most
+/// `budget` rows. Returns `(rows, budget_hit)`: `budget_hit` is true if the
+/// budget was reached before `want` rows were found *and* the scan did not reach
+/// the end of the table — i.e. the NULL set is not fully known, so the caller
+/// should fall back. Any `want` NULL rows are a valid answer (NULLs are ties).
+async fn collect_null_rows(
+    db: &Session,
+    def: &TableDef,
+    col: usize,
+    filter: &Option<Expr>,
+    want: usize,
+    budget: usize,
+) -> Result<(Vec<Vec<Value>>, bool)> {
+    let prefix = data_prefix(&def.name);
+    let sch = def.schema.clone();
+    let f = filter.clone();
+    let (rows, _examined, budget_hit) = db
+        .raw_db()
+        .scan_fold_until(
+            prefix,
+            (Vec::<Vec<Value>>::new(), 0usize, false),
+            move |st, _k, v| {
+                let row: Vec<Value> =
+                    bincode::deserialize(v).map_err(|e| Error::Storage(e.to_string()))?;
+                st.1 += 1;
+                if row.get(col).map(|x| x.is_null()).unwrap_or(false) {
+                    let keep = match &f {
+                        Some(e) => predicate::matches(e, &sch, &row)?,
+                        None => true,
+                    };
+                    if keep {
+                        st.0.push(row);
+                    }
+                }
+                if st.0.len() >= want {
+                    return Ok(false);
+                }
+                if st.1 >= budget {
+                    st.2 = true;
+                    return Ok(false);
+                }
+                Ok(true)
+            },
+        )
+        .await?;
+    Ok((rows, budget_hit))
 }
 
 /// Accumulator for a budgeted ordered walk (`ORDER BY ... LIMIT` with a residual

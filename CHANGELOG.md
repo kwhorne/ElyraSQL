@@ -4,6 +4,20 @@ All notable changes to ElyraSQL are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **Nullable columns on indexed `ORDER BY ... LIMIT`.** A `NOT NULL` index is no
+  longer required: a **nullable single-column** index now serves an ordered
+  `LIMIT`, with the NULL-keyed rows (which indexes omit) spliced back in as a
+  block — last for `DESC`, first for `ASC`, matching MySQL's NULL ordering. The
+  NULL block is fetched by a budgeted clustered scan, so the common grid default
+  (`ORDER BY <col> DESC LIMIT n` on a mostly-populated column) stays a
+  sub-millisecond top-N instead of a full sort. Very rare NULLs on an `ASC` walk
+  fall back to the sorter (bounded by `ELYRASQL_ORDER_SCAN_BUDGET`). Composite
+  indexes still require every column to be `NOT NULL`.
+
 ## [1.4.4] - 2026-07-20
 
 Performance release: filtered paged grids (`WHERE ... ORDER BY <col> LIMIT n`) are
