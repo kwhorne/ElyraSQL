@@ -101,6 +101,14 @@ judge fit before deploying.
       expression key skips it. A **composite** index must have every column
       `NOT NULL` (indexes omit NULL tuples, so a NULL in any key column would drop
       a row from the walk).
+    - A **primary-key tiebreaker** stays on the fast path: since a non-unique
+      secondary index stores `(value, clustered pk)`, `ORDER BY <indexed col>
+      [DESC], id [DESC]` (a grid's stable-sort tiebreaker) walks the index
+      directly. All terms must share a direction and any trailing terms must be
+      the primary-key columns in order. (A nullable column with a tiebreaker only
+      takes the fast path when the NULL block is not reached — e.g. `DESC` with
+      enough non-NULL rows; otherwise it falls back, since the NULL block cannot be
+      tiebroken cheaply.)
     - A **nullable single-column** index is supported: the ordered walk covers the
       non-NULL rows and the NULL-keyed rows are spliced in as a block — last for
       `DESC`, first for `ASC` (MySQL's NULL ordering). The NULL block is fetched by

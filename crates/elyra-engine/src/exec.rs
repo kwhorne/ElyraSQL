@@ -4060,6 +4060,11 @@ pub async fn select(
                             paged = skip > 0;
                             result = Some(walk.rows);
                         }
+                    } else if !plan.rev && plan.has_tiebreaker {
+                        // ASC with a tiebreaker on a nullable column: the NULL block
+                        // sorts first and would need tiebreaker ordering within it,
+                        // which the walk cannot supply cheaply -- leave `result`
+                        // None to fall through to the sorter.
                     } else if !plan.rev {
                         // ASC: NULLs sort first. Collect the NULL block, then fill
                         // the remainder from the ascending index walk.
@@ -4094,6 +4099,10 @@ pub async fn select(
                         if !walk.budget_hit {
                             if walk.rows.len() >= need {
                                 result = Some(walk.rows);
+                            } else if plan.has_tiebreaker {
+                                // The NULL block would enter the top-N and needs
+                                // tiebreaker ordering within it; fall through to the
+                                // sorter instead.
                             } else {
                                 let remaining = need - walk.rows.len();
                                 let null_budget = ordered_scan_budget(need);
@@ -6693,17 +6702,25 @@ struct SecondaryOrder {
     /// the walk and must be spliced in as a NULL block (first for `ASC`, last for
     /// `DESC`). `false` when every index column is `NOT NULL` (complete walk).
     nullable: bool,
+    /// The `ORDER BY` extends past the index columns into the appended clustered
+    /// primary key (a stable-pagination tiebreaker like `..., id`). The non-NULL
+    /// walk still orders correctly, but a NULL block cannot be tiebroken cheaply,
+    /// so the nullable path bails to the sorter if the NULL block would be used.
+    has_tiebreaker: bool,
 }
 
 /// If `order` can be served by walking a secondary index in key order, describe
-/// how. Requires all terms to share a direction and the order columns to be a
-/// prefix of the index columns.
+/// how. Requires all terms to share a direction, and the order columns to be a
+/// prefix of the index's **walk order** — its columns followed by the appended
+/// clustered primary key for a non-unique index. That clustered suffix is why
+/// `ORDER BY <indexed col>, <pk...>` (a grid's stable-sort tiebreaker) is served
+/// by the same walk.
 ///
 /// Because indexes omit NULL tuples, a nullable order column is only supported
-/// for a **single-column** index matching a **single-column** `ORDER BY` (so the
-/// only rows missing from the walk are exactly those with a NULL key, which the
-/// caller splices back in). A composite index must have every column `NOT NULL`,
-/// otherwise a row with a NULL in any index column would be silently missing.
+/// for a **single-column** index (the only rows missing from the walk are then
+/// exactly the NULL-keyed ones, which the caller splices back in). A composite
+/// index must have every column `NOT NULL`, otherwise a row with a NULL in any
+/// index column would be silently missing.
 fn secondary_order_plan(def: &TableDef, order: &[(Expr, bool)]) -> Option<SecondaryOrder> {
     if order.is_empty() {
         return None;
@@ -6717,29 +6734,38 @@ fn secondary_order_plan(def: &TableDef, order: &[(Expr, bool)]) -> Option<Second
         ocols.push(order_col_index(def, e)?);
     }
     for idx in &def.indexes {
-        if idx.vector || idx.fulltext || idx.cols.len() < ocols.len() {
+        if idx.vector || idx.fulltext {
             continue;
         }
-        if idx.cols[..ocols.len()] != ocols[..] {
+        // The walk visits rows ordered by the index columns, then (for a
+        // non-unique index) the appended clustered primary key.
+        let mut walk_seq = idx.cols.clone();
+        if !idx.unique {
+            walk_seq.extend_from_slice(&def.pk_cols);
+        }
+        if ocols.len() > walk_seq.len() || ocols[..] != walk_seq[..ocols.len()] {
             continue;
         }
+        let has_tiebreaker = ocols.len() > idx.cols.len();
         let all_not_null = idx.cols.iter().all(|&c| !def.schema.columns[c].nullable);
         if all_not_null {
             return Some(SecondaryOrder {
                 index: idx.name.clone(),
                 rev: !asc,
-                col: ocols[0],
+                col: idx.cols[0],
                 nullable: false,
+                has_tiebreaker,
             });
         }
-        // Nullable key: only a single-column index over a single-column ORDER BY,
-        // where the missing rows are exactly the NULL-keyed ones.
-        if ocols.len() == 1 && idx.cols.len() == 1 {
+        // Nullable key: only a single-column index (the missing rows are exactly
+        // the NULL-keyed ones).
+        if idx.cols.len() == 1 {
             return Some(SecondaryOrder {
                 index: idx.name.clone(),
                 rev: !asc,
-                col: ocols[0],
+                col: idx.cols[0],
                 nullable: true,
+                has_tiebreaker,
             });
         }
     }

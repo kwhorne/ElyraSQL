@@ -2070,3 +2070,60 @@ async fn nullable_indexed_order_by_limit() {
     let exp: Vec<Option<i64>> = asc.iter().skip(30).take(20).map(|&(_, r)| r).collect();
     assert_eq!(got, exp, "ASC nullable with OFFSET");
 }
+
+// Compound ORDER BY with a PK tiebreaker (ESQL-25): a non-unique secondary index
+// stores (value, clustered pk), so walking it also orders by the trailing PK --
+// the stable-pagination pattern `ORDER BY <col> DESC, id DESC`.
+#[tokio::test]
+async fn compound_order_by_pk_tiebreaker() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop("CREATE TABLE t (id INT PRIMARY KEY, revenue INT)")
+        .await
+        .unwrap();
+    // Low-cardinality revenue so the id tiebreaker actually decides order; ~1/16
+    // rows NULL.
+    let mut shadow: Vec<(i64, Option<i64>)> = Vec::new();
+    let mut vals = String::new();
+    let mut seed: u64 = 0xC0FFEE;
+    for id in 1..=3000i64 {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let rev = if (seed >> 7) % 16 == 0 {
+            None
+        } else {
+            Some(((seed >> 20) % 20) as i64)
+        };
+        shadow.push((id, rev));
+        if !vals.is_empty() {
+            vals.push(',');
+        }
+        match rev {
+            Some(v) => vals.push_str(&format!("({id},{v})")),
+            None => vals.push_str(&format!("({id},NULL)")),
+        }
+    }
+    c.query_drop(format!("INSERT INTO t VALUES {vals}"))
+        .await
+        .unwrap();
+    c.query_drop("CREATE INDEX ix_rev ON t (revenue)")
+        .await
+        .unwrap();
+
+    // DESC, id DESC: non-NULL by (revenue desc, id desc); NULLs last.
+    let got: Vec<i64> = c
+        .query("SELECT id FROM t ORDER BY revenue DESC, id DESC LIMIT 40")
+        .await
+        .unwrap();
+    let mut desc = shadow.clone();
+    desc.sort_by_key(|&(id, r)| (r.is_none(), std::cmp::Reverse(r), std::cmp::Reverse(id)));
+    let exp: Vec<i64> = desc.iter().take(40).map(|&(id, _)| id).collect();
+    assert_eq!(got, exp, "compound DESC with id tiebreaker");
+
+    // Same, deep-ish OFFSET.
+    let got: Vec<i64> = c
+        .query("SELECT id FROM t ORDER BY revenue DESC, id DESC LIMIT 20 OFFSET 500")
+        .await
+        .unwrap();
+    let exp: Vec<i64> = desc.iter().skip(500).take(20).map(|&(id, _)| id).collect();
+    assert_eq!(got, exp, "compound DESC tiebreaker with OFFSET");
+}

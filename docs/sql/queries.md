@@ -46,7 +46,11 @@ served by an ordered index or clustered walk that stops after `k + n` rows —
 constant work per page, independent of table size. This applies to the primary
 key in **both** directions and to a secondary index — including a **nullable
 single-column** index, where NULL-keyed rows are spliced in (last for `DESC`,
-first for `ASC`, matching MySQL). A `WHERE` filter is applied as a residual during
+first for `ASC`, matching MySQL). Because a non-unique secondary index stores
+`(value, clustered primary key)`, a **tiebreaker on the primary key** stays on the
+fast path too: `ORDER BY <indexed col> DESC, id DESC` (the usual stable-pagination
+sort) walks the index directly. All order terms must share a direction, and any
+trailing terms must be the primary-key columns in order. A `WHERE` filter is applied as a residual during
 the walk, so a filtered grid page stays on the fast path too; a very selective
 filter (or very rare NULLs on an `ASC` walk) falls back to the sorter, bounded by
 `ELYRASQL_ORDER_SCAN_BUDGET`. See [limitations](../limitations.md) for details.

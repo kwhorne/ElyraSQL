@@ -4,6 +4,20 @@ All notable changes to ElyraSQL are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **Primary-key tiebreaker on indexed `ORDER BY ... LIMIT`.** A non-unique
+  secondary index stores `(value, clustered primary key)`, so walking it also
+  orders by the trailing PK. `ORDER BY <indexed col> DESC, id DESC` — the usual
+  stable-pagination sort a grid emits — is now served by the index walk instead of
+  a full sort (dropped from ~6 s to sub-millisecond at scale). All order terms must
+  share a direction and any trailing terms must be the primary-key columns in
+  order. On a nullable column a tiebreaker only stays on the fast path when the
+  NULL block is not reached (e.g. `DESC` with enough non-NULL rows); otherwise it
+  falls back to the sorter, since the NULL block cannot be tiebroken cheaply.
+
 ## [1.4.6] - 2026-07-20
 
 Performance release: deep `OFFSET` on paged grids no longer reads the skipped
