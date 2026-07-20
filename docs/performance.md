@@ -36,10 +36,25 @@ Range scans (200k rows):
 | Indexed range (`BETWEEN`, ~6k matches) | ~6 ms |
 | Non-indexed range (full scan) | ~18 ms |
 
+Ordered `LIMIT` / paged grids (300k rows, no filter):
+
+| Query | Time |
+|-------|-----:|
+| `ORDER BY <pk> ASC LIMIT 40` | <1 ms |
+| `ORDER BY <pk> DESC LIMIT 40` | <1 ms |
+| `ORDER BY <indexed NOT NULL col> ASC\|DESC LIMIT 40` | <1 ms |
+
+These walk an index/clustered keyspace and stop after `OFFSET + LIMIT` rows, so
+the cost is independent of table size (a full sort of the same data took several
+seconds).
+
 ## Why it's fast
 
 - **Clustered primary keys** and order-preserving encoding make point lookups
   and range scans B-tree operations.
+- **Ordered `LIMIT`** (a paged grid: `ORDER BY <col> ASC|DESC LIMIT n OFFSET k`,
+  no filter) walks the primary key (either direction) or a `NOT NULL` secondary
+  index in order and stops after `k + n` rows -- top-N without sorting the table.
 - **Batched multi-get** fetches index matches in a single read transaction.
 - **Index nested-loop joins** avoid materializing the partner for selective
   joins; **hash joins** handle the general equi-join case in `O(n+m)`.
@@ -49,7 +64,9 @@ Range scans (200k rows):
 
 ## Honest caveats
 
-- `ORDER BY`, grouped/aggregated output, and in-transaction reads materialize
-  their working set.
+- An **unaccelerated** `ORDER BY` (nullable sort column, a `WHERE` filter, an
+  expression key, or inside a transaction), grouped/aggregated output, and
+  in-transaction reads materialize their working set (memory-bounded: top-N heap
+  or external merge sort). Indexed ordered `LIMIT` (above) is the fast path.
 - Range and index nested-loop paths are single-column.
 - The vector HNSW index pays a one-time build cost after each table change.
