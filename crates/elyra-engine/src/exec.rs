@@ -3961,27 +3961,39 @@ pub async fn select(
                 let prefix = data_prefix(&def.name);
                 let sch = def.schema.clone();
                 let f = filter.clone();
+                // With no residual filter, skip the first `offset` rows without
+                // decoding them and collect just `lim`; otherwise collect `need`
+                // and slice locally (each row must be filter-checked to count).
+                let (skip, want) = if f.is_none() && offset > 0 {
+                    (offset, lim)
+                } else {
+                    (0, need)
+                };
                 let budget = if f.is_some() {
                     ordered_scan_budget(need)
                 } else {
                     usize::MAX
                 };
                 let init = OrderedWalk {
-                    rows: Vec::with_capacity(need.min(4096)),
+                    rows: Vec::with_capacity(want.min(4096)),
                     examined: 0,
-                    need,
+                    need: want,
                     budget,
                     budget_hit: false,
                 };
                 let walk = db
                     .raw_db()
-                    .scan_fold_rev_until(prefix, init, move |w, _k, v| {
+                    .scan_fold_rev_until(prefix, skip, init, move |w, _k, v| {
                         ordered_walk_step(w, v, &f, &sch)
                     })
                     .await?;
                 if !walk.budget_hit {
                     let mut rows = walk.rows;
-                    apply_offset_limit(&mut rows, offset, limit);
+                    if skip > 0 {
+                        rows.truncate(lim);
+                    } else {
+                        apply_offset_limit(&mut rows, offset, limit);
+                    }
                     let (schema, out) = project_exprs(&select.projection, &def.schema, &rows)?;
                     return Ok(QueryResult::Rows(RowStream::literal(schema, out)));
                 }
@@ -4008,7 +4020,9 @@ pub async fn select(
                     };
 
                     // Index walk over the non-NULL rows, in order, residual-filtered.
-                    let run_walk = |want: usize| {
+                    // `skip` steps over that many leading rows without a row lookup
+                    // (used only with no residual filter) for a cheap deep OFFSET.
+                    let run_walk = |skip: usize, want: usize| {
                         let sch = def.schema.clone();
                         let f = filter.clone();
                         let iprefix = iprefix.clone();
@@ -4017,6 +4031,7 @@ pub async fn select(
                                 .scan_index_ordered_fold(
                                     iprefix,
                                     plan.rev,
+                                    skip,
                                     OrderedWalk {
                                         rows: Vec::with_capacity(want.min(4096)),
                                         examined: 0,
@@ -4031,9 +4046,18 @@ pub async fn select(
                     };
 
                     let mut result: Option<Vec<Vec<Value>>> = None;
+                    // Whether the result rows already have OFFSET applied (via the
+                    // index-level skip) and so must not be offset again below.
+                    let mut paged = false;
                     if !plan.nullable {
-                        let walk = run_walk(need).await?;
+                        let (skip, want) = if !has_filter && offset > 0 {
+                            (offset, lim)
+                        } else {
+                            (0, need)
+                        };
+                        let walk = run_walk(skip, want).await?;
                         if !walk.budget_hit {
+                            paged = skip > 0;
                             result = Some(walk.rows);
                         }
                     } else if !plan.rev {
@@ -4046,7 +4070,7 @@ pub async fn select(
                         if !null_bail {
                             let remaining = need.saturating_sub(nulls.len());
                             let walk = if remaining > 0 {
-                                run_walk(remaining).await?
+                                run_walk(0, remaining).await?
                             } else {
                                 OrderedWalk {
                                     rows: Vec::new(),
@@ -4066,7 +4090,7 @@ pub async fn select(
                         // DESC: NULLs sort last. Fill from the descending index
                         // walk; only if it is exhausted below `need` do NULLs enter
                         // the top-N, so append the NULL block then.
-                        let walk = run_walk(need).await?;
+                        let walk = run_walk(0, need).await?;
                         if !walk.budget_hit {
                             if walk.rows.len() >= need {
                                 result = Some(walk.rows);
@@ -4092,7 +4116,11 @@ pub async fn select(
                     }
 
                     if let Some(mut rows) = result {
-                        apply_offset_limit(&mut rows, offset, limit);
+                        if paged {
+                            rows.truncate(lim);
+                        } else {
+                            apply_offset_limit(&mut rows, offset, limit);
+                        }
                         let (schema, out) = project_exprs(&select.projection, &def.schema, &rows)?;
                         return Ok(QueryResult::Rows(RowStream::literal(schema, out)));
                     }

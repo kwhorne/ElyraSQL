@@ -514,7 +514,13 @@ impl Db {
     /// Fold over rows whose key starts with `prefix` in **descending** key order,
     /// stopping early when `f` returns `false` (see
     /// [`Storage::scan_prefix_rev_until`]). Backs `ORDER BY <pk> DESC LIMIT`.
-    pub async fn scan_fold_rev_until<T, F>(&self, prefix: Vec<u8>, init: T, mut f: F) -> Result<T>
+    pub async fn scan_fold_rev_until<T, F>(
+        &self,
+        prefix: Vec<u8>,
+        skip: usize,
+        init: T,
+        mut f: F,
+    ) -> Result<T>
     where
         T: Send + 'static,
         F: FnMut(&mut T, &[u8], &[u8]) -> Result<bool> + Send + 'static,
@@ -522,7 +528,7 @@ impl Db {
         let storage = self.storage.clone();
         spawn_read(move || {
             let mut acc = init;
-            storage.scan_prefix_rev_until(&prefix, |k, v| f(&mut acc, k, v))?;
+            storage.scan_prefix_rev_until(&prefix, skip, |k, v| f(&mut acc, k, v))?;
             Ok(acc)
         })
         .await
@@ -535,6 +541,7 @@ impl Db {
         &self,
         index_prefix: Vec<u8>,
         rev: bool,
+        skip: usize,
         init: T,
         mut f: F,
     ) -> Result<T>
@@ -545,7 +552,7 @@ impl Db {
         let storage = self.storage.clone();
         spawn_read(move || {
             let mut acc = init;
-            storage.scan_index_ordered(&index_prefix, rev, |k, v| f(&mut acc, k, v))?;
+            storage.scan_index_ordered(&index_prefix, rev, skip, |k, v| f(&mut acc, k, v))?;
             Ok(acc)
         })
         .await

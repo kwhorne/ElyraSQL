@@ -4,6 +4,28 @@ All notable changes to ElyraSQL are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **Cheap deep `OFFSET` on indexed `ORDER BY ... LIMIT`.** With no residual
+  filter, the leading `OFFSET` rows are now stepped over at the index/clustered
+  level **without reading their rows** (the data key is not dereferenced), so
+  paging deep into a result costs index steps rather than `offset` row reads. On
+  600k rows `ORDER BY revenue LIMIT 40 OFFSET 500000` dropped from ~290 ms to
+  ~18 ms; reverse-PK deep offset is likewise cheap. Applies to the primary-key and
+  `NOT NULL` secondary-index walks; a residual filter still reads pre-offset rows
+  (they must be counted).
+
+### Notes
+
+- Sorting **`ASC` on a nullable column that holds (almost) no NULLs** still falls
+  back to a full sort: `ASC` places NULLs first, so the walk must establish the
+  NULL block before emitting the head, and confirming an empty NULL set is not
+  cheap without NULLs in the index. Declare such a column `NOT NULL` to keep it on
+  the fast path in both directions. Indexing NULL keys (to remove this fallback)
+  is planned as a separate, carefully-tested change.
+
 ## [1.4.5] - 2026-07-20
 
 Performance release: nullable sort columns now use the secondary index for paged

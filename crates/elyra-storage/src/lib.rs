@@ -587,7 +587,11 @@ impl Storage {
     /// order (largest first). Backs `ORDER BY <pk> DESC LIMIT n`: walk the
     /// clustered keyspace backwards and stop as soon as `n` rows are collected,
     /// instead of scanning and sorting the whole table.
-    pub fn scan_prefix_rev_until<F>(&self, prefix: &[u8], mut f: F) -> Result<()>
+    ///
+    /// The first `skip` keys are stepped over without invoking `f` (so their row
+    /// value is never decoded), making a deep `OFFSET` cheap. Only pass `skip > 0`
+    /// when there is no residual filter.
+    pub fn scan_prefix_rev_until<F>(&self, prefix: &[u8], skip: usize, mut f: F) -> Result<()>
     where
         F: FnMut(&[u8], &[u8]) -> Result<bool>,
     {
@@ -609,11 +613,16 @@ impl Storage {
         let range = t
             .range::<&[u8]>((Bound::Included(prefix), ub))
             .map_err(|e| Error::Storage(e.to_string()))?;
+        let mut remaining_skip = skip;
         for item in range.rev() {
             let (k, v) = item.map_err(|e| Error::Storage(e.to_string()))?;
             let key = k.value();
             if !key.starts_with(prefix) {
                 break;
+            }
+            if remaining_skip > 0 {
+                remaining_skip -= 1;
+                continue;
             }
             if !f(key, v.value())? {
                 break;
@@ -631,7 +640,18 @@ impl Storage {
     /// by the indexed columns — so `ORDER BY <indexed col> LIMIT n` can stop after
     /// `n` matches instead of sorting the whole table. One read transaction keeps
     /// the index walk and the row lookups on a single consistent snapshot.
-    pub fn scan_index_ordered<F>(&self, index_prefix: &[u8], rev: bool, mut f: F) -> Result<()>
+    ///
+    /// The first `skip` entries are stepped over **without** looking up their row
+    /// (their data key is not dereferenced), so a deep `OFFSET` costs index steps
+    /// rather than `offset` row reads. The caller must only pass `skip > 0` when
+    /// there is no residual filter (otherwise skipped rows might not have matched).
+    pub fn scan_index_ordered<F>(
+        &self,
+        index_prefix: &[u8],
+        rev: bool,
+        skip: usize,
+        mut f: F,
+    ) -> Result<()>
     where
         F: FnMut(&[u8], &[u8]) -> Result<bool>,
     {
@@ -651,6 +671,7 @@ impl Storage {
         let range = t
             .range::<&[u8]>((Bound::Included(index_prefix), ub))
             .map_err(|e| Error::Storage(e.to_string()))?;
+        let mut remaining_skip = skip;
         // Fetch the row referenced by one index entry (entry value = data key)
         // and hand it to `f`. Returns whether to continue.
         let mut visit = |data_key: &[u8]| -> Result<bool> {
@@ -664,6 +685,10 @@ impl Storage {
         if rev {
             for item in range.rev() {
                 let (_k, v) = item.map_err(|e| Error::Storage(e.to_string()))?;
+                if remaining_skip > 0 {
+                    remaining_skip -= 1;
+                    continue;
+                }
                 let data_key = v.value().to_vec();
                 if !visit(&data_key)? {
                     break;
@@ -672,6 +697,10 @@ impl Storage {
         } else {
             for item in range {
                 let (_k, v) = item.map_err(|e| Error::Storage(e.to_string()))?;
+                if remaining_skip > 0 {
+                    remaining_skip -= 1;
+                    continue;
+                }
                 let data_key = v.value().to_vec();
                 if !visit(&data_key)? {
                     break;

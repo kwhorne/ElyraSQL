@@ -52,6 +52,12 @@ seconds). A `WHERE` filter is applied as a residual during the walk; a very
 selective filter falls back to the sorter (bounded by
 `ELYRASQL_ORDER_SCAN_BUDGET`), which is cheap because it has few matches.
 
+A deep `OFFSET` (no filter) steps over the leading rows at the index level
+**without reading them**, so paging far into a result stays cheap (index steps,
+not row reads). Sorting `ASC` on a nullable column that holds (almost) no NULLs
+falls back to a full sort — declare such a column `NOT NULL` to keep it on the
+fast path (see [limitations](limitations.md)).
+
 ## Why it's fast
 
 - **Clustered primary keys** and order-preserving encoding make point lookups

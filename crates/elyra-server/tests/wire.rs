@@ -1903,6 +1903,23 @@ async fn indexed_order_by_limit() {
         .unwrap();
     let exp_vals: Vec<i64> = by_rev.iter().skip(20).take(10).map(|&(_, r)| r).collect();
     assert_eq!(got, exp_vals, "ordered walk with OFFSET");
+
+    // Deep OFFSET: the index-level skip steps over pre-offset rows without a row
+    // lookup, and must return exactly the same page as a full sort.
+    let got: Vec<i64> = c
+        .query("SELECT revenue FROM t ORDER BY revenue LIMIT 5 OFFSET 1900")
+        .await
+        .unwrap();
+    let exp_vals: Vec<i64> = by_rev.iter().skip(1900).take(5).map(|&(_, r)| r).collect();
+    assert_eq!(got, exp_vals, "secondary index deep OFFSET");
+
+    // Deep OFFSET on the reverse PK walk.
+    let got: Vec<i64> = c
+        .query("SELECT id FROM t ORDER BY id DESC LIMIT 5 OFFSET 1900")
+        .await
+        .unwrap();
+    let exp: Vec<i64> = (1..=2000).rev().skip(1900).take(5).collect();
+    assert_eq!(got, exp, "reverse PK deep OFFSET");
 }
 
 // Filtered indexed ORDER BY ... LIMIT (ESQL-21): a residual WHERE is applied

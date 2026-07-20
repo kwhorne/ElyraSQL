@@ -113,8 +113,20 @@ judge fit before deploying.
       walk is capped by the same examine budget; if it cannot fill `n` rows within
       budget it falls back to the sorter below (a selective filter has few matches,
       so that sort is cheap).
+    - **Deep `OFFSET`** on the fast path (no residual filter) steps over the
+      leading `OFFSET` rows at the index/clustered level **without reading their
+      rows**, so paging deep into a result stays cheap (index steps, not row
+      reads). With a residual filter the pre-offset rows must still be read to be
+      counted.
     - An ordered `LIMIT` **inside a transaction** falls back to the sorter below
       (correct, not yet index-accelerated).
+- **Ascending sort on a nullable column with (almost) no NULLs.** For `ASC`,
+  NULLs sort first, so the walk must know the NULL block before it can emit the
+  head. When the column is nullable but contains very few / zero actual NULLs, the
+  budgeted NULL scan cannot confirm the (empty) NULL set cheaply and falls back to
+  a full sort. If the column never holds NULLs, declare it `NOT NULL` — then both
+  `ASC` and `DESC` use the index walk directly (the `NOT NULL` fast path). A
+  future change may index NULL keys so this is unnecessary.
 - **Single-table** `ORDER BY` (the fallback) is memory-bounded: `ORDER BY ...
   LIMIT` uses a top-N heap and large unbounded sorts spill sorted runs to temp
   files (external merge sort, `ELYRASQL_SORT_MAX_ROWS`). This spilling path now
