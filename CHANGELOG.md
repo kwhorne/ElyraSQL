@@ -4,7 +4,10 @@ All notable changes to ElyraSQL are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.4.5] - 2026-07-20
+
+Performance release: nullable sort columns now use the secondary index for paged
+grids (top-N without a full sort). No on-disk format change.
 
 ### Added
 
@@ -1398,6 +1401,7 @@ core CRUD with `WHERE`/`ORDER BY`/`LIMIT`, indexes, aggregation and `GROUP BY`,
 joins, prepared statements, authentication and TLS, vector search (exact +
 HNSW), parallel OLAP aggregation, and transactions with snapshot isolation.
 
+[1.4.5]: https://github.com/kwhorne/ElyraSQL/releases/tag/v1.4.5
 [1.4.4]: https://github.com/kwhorne/ElyraSQL/releases/tag/v1.4.4
 [1.4.3]: https://github.com/kwhorne/ElyraSQL/releases/tag/v1.4.3
 [1.4.2]: https://github.com/kwhorne/ElyraSQL/releases/tag/v1.4.2
