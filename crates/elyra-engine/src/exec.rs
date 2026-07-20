@@ -3947,61 +3947,84 @@ pub async fn select(
         }
 
         // Reverse PK-ordered LIMIT fast path: `ORDER BY <pk prefix> DESC LIMIT n`
-        // with no filter (autocommit). Walk the clustered keyspace backwards and
-        // stop once `offset + n` rows are collected -- no full scan, no sort. The
-        // primary key is never NULL, so the reverse walk is a complete ordering.
+        // (autocommit). Walk the clustered keyspace backwards, apply the residual
+        // WHERE, and stop once `offset + n` rows are collected -- no full scan, no
+        // sort. The primary key is never NULL, so the reverse walk is a complete
+        // ordering. A residual filter is capped by `ordered_scan_budget`; if it is
+        // too selective to fill `need` within budget we fall through to the sorter.
         if let Some(lim) = limit {
-            if !db.in_txn() && filter.is_none() && order_is_pk_prefix(&def, &resolved, false) {
+            if !db.in_txn()
+                && order_is_pk_prefix(&def, &resolved, false)
+                && !selective_filter(&def, filter.as_ref())?
+            {
                 let need = offset.saturating_add(lim);
                 let prefix = data_prefix(&def.name);
-                let rows: Vec<Vec<Value>> = db
+                let sch = def.schema.clone();
+                let f = filter.clone();
+                let budget = if f.is_some() {
+                    ordered_scan_budget(need)
+                } else {
+                    usize::MAX
+                };
+                let init = OrderedWalk {
+                    rows: Vec::with_capacity(need.min(4096)),
+                    examined: 0,
+                    need,
+                    budget,
+                    budget_hit: false,
+                };
+                let walk = db
                     .raw_db()
-                    .scan_fold_rev_until(
-                        prefix,
-                        Vec::with_capacity(need.min(4096)),
-                        move |rows, _k, v| {
-                            let row: Vec<Value> = bincode::deserialize(v)
-                                .map_err(|e| Error::Storage(e.to_string()))?;
-                            rows.push(row);
-                            Ok(rows.len() < need)
-                        },
-                    )
+                    .scan_fold_rev_until(prefix, init, move |w, _k, v| {
+                        ordered_walk_step(w, v, &f, &sch)
+                    })
                     .await?;
-                let mut rows = rows;
-                apply_offset_limit(&mut rows, offset, limit);
-                let (schema, out) = project_exprs(&select.projection, &def.schema, &rows)?;
-                return Ok(QueryResult::Rows(RowStream::literal(schema, out)));
+                if !walk.budget_hit {
+                    let mut rows = walk.rows;
+                    apply_offset_limit(&mut rows, offset, limit);
+                    let (schema, out) = project_exprs(&select.projection, &def.schema, &rows)?;
+                    return Ok(QueryResult::Rows(RowStream::literal(schema, out)));
+                }
             }
         }
 
         // Indexed ORDER BY ... LIMIT fast path: `ORDER BY <indexed col> [ASC|DESC]
-        // LIMIT n` with no filter (autocommit). Walk the secondary index in
-        // (reverse) key order, following each entry to its row, and stop at
+        // LIMIT n` (autocommit). Walk the secondary index in (reverse) key order,
+        // following each entry to its row, apply the residual WHERE, and stop at
         // `offset + n` -- ordered top-N without sorting the table. Restricted to
-        // NOT NULL index columns (see `secondary_order_index`) for correctness.
+        // NOT NULL index columns (see `secondary_order_index`) for correctness; a
+        // selective residual filter falls back via the budget (see above).
         if let Some(lim) = limit {
-            if !db.in_txn() && filter.is_none() {
+            if !db.in_txn() && !selective_filter(&def, filter.as_ref())? {
                 if let Some((idx_name, rev)) = secondary_order_index(&def, &resolved) {
                     let need = offset.saturating_add(lim);
                     let iprefix = index::index_scan_prefix(&def.name, &idx_name);
-                    let rows: Vec<Vec<Value>> = db
+                    let sch = def.schema.clone();
+                    let f = filter.clone();
+                    let budget = if f.is_some() {
+                        ordered_scan_budget(need)
+                    } else {
+                        usize::MAX
+                    };
+                    let init = OrderedWalk {
+                        rows: Vec::with_capacity(need.min(4096)),
+                        examined: 0,
+                        need,
+                        budget,
+                        budget_hit: false,
+                    };
+                    let walk = db
                         .raw_db()
-                        .scan_index_ordered_fold(
-                            iprefix,
-                            rev,
-                            Vec::with_capacity(need.min(4096)),
-                            move |rows, _dk, v| {
-                                let row: Vec<Value> = bincode::deserialize(v)
-                                    .map_err(|e| Error::Storage(e.to_string()))?;
-                                rows.push(row);
-                                Ok(rows.len() < need)
-                            },
-                        )
+                        .scan_index_ordered_fold(iprefix, rev, init, move |w, _dk, v| {
+                            ordered_walk_step(w, v, &f, &sch)
+                        })
                         .await?;
-                    let mut rows = rows;
-                    apply_offset_limit(&mut rows, offset, limit);
-                    let (schema, out) = project_exprs(&select.projection, &def.schema, &rows)?;
-                    return Ok(QueryResult::Rows(RowStream::literal(schema, out)));
+                    if !walk.budget_hit {
+                        let mut rows = walk.rows;
+                        apply_offset_limit(&mut rows, offset, limit);
+                        let (schema, out) = project_exprs(&select.projection, &def.schema, &rows)?;
+                        return Ok(QueryResult::Rows(RowStream::literal(schema, out)));
+                    }
                 }
             }
         }
@@ -6589,6 +6612,62 @@ fn secondary_order_index(def: &TableDef, order: &[(Expr, bool)]) -> Option<(Stri
         return Some((idx.name.clone(), !asc));
     }
     None
+}
+
+/// Accumulator for a budgeted ordered walk (`ORDER BY ... LIMIT` with a residual
+/// `WHERE`). Rows are visited in order; a matching row is kept until `need` are
+/// collected. `budget` caps how many rows we examine before giving up so a very
+/// selective residual filter cannot turn the walk into a full point-read scan --
+/// on `budget_hit` the caller falls back to the streaming filter+sort path.
+struct OrderedWalk {
+    rows: Vec<Vec<Value>>,
+    examined: usize,
+    need: usize,
+    budget: usize,
+    budget_hit: bool,
+}
+
+/// One step of an ordered walk: decode the row, apply the residual filter, keep
+/// it if it matches, and decide whether to continue. Returns `false` (stop) once
+/// `need` rows are collected, or when the examine budget is exhausted (setting
+/// `budget_hit` so the caller falls back to the sorter).
+fn ordered_walk_step(
+    w: &mut OrderedWalk,
+    v: &[u8],
+    filter: &Option<Expr>,
+    schema: &Schema,
+) -> Result<bool> {
+    let row: Vec<Value> = bincode::deserialize(v).map_err(|e| Error::Storage(e.to_string()))?;
+    w.examined += 1;
+    let keep = match filter {
+        Some(e) => predicate::matches(e, schema, &row)?,
+        None => true,
+    };
+    if keep {
+        w.rows.push(row);
+    }
+    if w.rows.len() >= w.need {
+        return Ok(false);
+    }
+    if w.examined >= w.budget {
+        w.budget_hit = true;
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+/// Examine budget for a filtered ordered walk before falling back to the sorter.
+/// `ELYRASQL_ORDER_SCAN_BUDGET` overrides the default of `max(need * 256, 50k)`.
+/// Read per qualifying query (not per row), so it stays tunable at runtime.
+fn ordered_scan_budget(need: usize) -> usize {
+    match std::env::var("ELYRASQL_ORDER_SCAN_BUDGET")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+    {
+        Some(n) => n.max(need),
+        None => need.saturating_mul(256).max(50_000),
+    }
 }
 
 /// True when the filter can be resolved through a *selective* access path -- an

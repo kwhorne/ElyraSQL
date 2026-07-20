@@ -45,9 +45,11 @@ An ordered `LIMIT` (a paged grid: `ORDER BY <col> ASC|DESC LIMIT n OFFSET k`) is
 served by an ordered index or clustered walk that stops after `k + n` rows —
 constant work per page, independent of table size. This applies to the primary
 key in **both** directions and to any secondary index whose columns are all
-`NOT NULL`; see [limitations](../limitations.md) for when it falls back to the
-memory-bounded sorter (nullable sort column, a `WHERE` filter, or inside a
-transaction).
+`NOT NULL`. A `WHERE` filter is applied as a residual during the walk, so a
+filtered grid page stays on the fast path too; a very selective filter falls back
+to the sorter (bounded by `ELYRASQL_ORDER_SCAN_BUDGET`). See
+[limitations](../limitations.md) for the remaining fallbacks (nullable sort
+column, or inside a transaction).
 
 ## Joins
 

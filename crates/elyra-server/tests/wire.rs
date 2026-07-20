@@ -1904,3 +1904,76 @@ async fn indexed_order_by_limit() {
     let exp_vals: Vec<i64> = by_rev.iter().skip(20).take(10).map(|&(_, r)| r).collect();
     assert_eq!(got, exp_vals, "ordered walk with OFFSET");
 }
+
+// Filtered indexed ORDER BY ... LIMIT (ESQL-21): a residual WHERE is applied
+// during the ordered walk (fast path), and a very selective residual falls back
+// to the sorter -- both must be correct.
+#[tokio::test]
+async fn filtered_indexed_order_by_limit() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop("CREATE TABLE t (id INT PRIMARY KEY, revenue INT NOT NULL, active INT NOT NULL)")
+        .await
+        .unwrap();
+    let mut shadow: Vec<(i64, i64, i64)> = Vec::new();
+    let mut vals = String::new();
+    let mut seed: u64 = 0xDEAD_BEEF;
+    for id in 1..=4000i64 {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let rev = ((seed >> 20) % 1_000_000) as i64;
+        let active = ((seed >> 5) & 1) as i64; // ~50%
+        shadow.push((id, rev, active));
+        if !vals.is_empty() {
+            vals.push(',');
+        }
+        vals.push_str(&format!("({id},{rev},{active})"));
+    }
+    c.query_drop(format!("INSERT INTO t VALUES {vals}"))
+        .await
+        .unwrap();
+    c.query_drop("CREATE INDEX ix_rev ON t (revenue)")
+        .await
+        .unwrap();
+
+    // Non-selective residual (active = 1, ~50%) -> served by the ordered walk.
+    let got: Vec<i64> = c
+        .query("SELECT revenue FROM t WHERE active = 1 ORDER BY revenue DESC LIMIT 40")
+        .await
+        .unwrap();
+    let mut act: Vec<(i64, i64)> = shadow
+        .iter()
+        .filter(|&&(_, _, a)| a == 1)
+        .map(|&(id, r, _)| (id, r))
+        .collect();
+    act.sort_by_key(|&(id, r)| (std::cmp::Reverse(r), id));
+    let exp: Vec<i64> = act.iter().take(40).map(|&(_, r)| r).collect();
+    assert_eq!(got, exp, "filtered ordered walk (non-selective, fast path)");
+
+    // Filtered + OFFSET.
+    let got: Vec<i64> = c
+        .query("SELECT revenue FROM t WHERE active = 1 ORDER BY revenue DESC LIMIT 10 OFFSET 15")
+        .await
+        .unwrap();
+    let exp: Vec<i64> = act.iter().skip(15).take(10).map(|&(_, r)| r).collect();
+    assert_eq!(got, exp, "filtered ordered walk with OFFSET");
+
+    // Very selective residual (few matches) -> budget bail -> sorter fallback,
+    // still correct. Force an immediate bail via a tiny budget.
+    std::env::set_var("ELYRASQL_ORDER_SCAN_BUDGET", "1");
+    let got: Vec<i64> = c
+        .query("SELECT id FROM t WHERE revenue < 2000 ORDER BY revenue LIMIT 40")
+        .await
+        .unwrap();
+    std::env::remove_var("ELYRASQL_ORDER_SCAN_BUDGET");
+    let mut small: Vec<(i64, i64)> = shadow
+        .iter()
+        .filter(|&&(_, r, _)| r < 2000)
+        .map(|&(id, r, _)| (id, r))
+        .collect();
+    small.sort_by_key(|&(id, r)| (r, id));
+    let exp: Vec<i64> = small.iter().take(40).map(|&(id, _)| id).collect();
+    assert_eq!(
+        got, exp,
+        "selective residual falls back to sorter, still correct"
+    );
+}

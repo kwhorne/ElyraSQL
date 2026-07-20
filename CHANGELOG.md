@@ -4,6 +4,19 @@ All notable changes to ElyraSQL are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **Filtered indexed `ORDER BY ... LIMIT`.** A `WHERE` filter is now applied as a
+  residual **during** the ordered index/clustered walk, so a filtered grid page
+  (`WHERE ... ORDER BY <indexed col> LIMIT n`) is served without a full sort too
+  (previously only unfiltered ordered `LIMIT`s were accelerated). An examine
+  budget (`ELYRASQL_ORDER_SCAN_BUDGET`) caps the walk so a very selective filter
+  falls back to the memory-bounded sorter (cheap — few matches) instead of
+  degrading into a near-full point-read scan. On 300k rows a `WHERE active=1
+  ORDER BY revenue DESC LIMIT 40` runs in ~0.5 ms.
+
 ## [1.4.3] - 2026-07-20
 
 Performance release: ordered `LIMIT` (paged grids) no longer sorts the whole

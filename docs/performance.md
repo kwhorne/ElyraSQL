@@ -43,18 +43,24 @@ Ordered `LIMIT` / paged grids (300k rows, no filter):
 | `ORDER BY <pk> ASC LIMIT 40` | <1 ms |
 | `ORDER BY <pk> DESC LIMIT 40` | <1 ms |
 | `ORDER BY <indexed NOT NULL col> ASC\|DESC LIMIT 40` | <1 ms |
+| `WHERE active=1 ORDER BY <indexed col> DESC LIMIT 40` | ~0.5 ms |
+| `WHERE region=3 ORDER BY <indexed col> LIMIT 40` (~10%) | ~1 ms |
 
 These walk an index/clustered keyspace and stop after `OFFSET + LIMIT` rows, so
 the cost is independent of table size (a full sort of the same data took several
-seconds).
+seconds). A `WHERE` filter is applied as a residual during the walk; a very
+selective filter falls back to the sorter (bounded by
+`ELYRASQL_ORDER_SCAN_BUDGET`), which is cheap because it has few matches.
 
 ## Why it's fast
 
 - **Clustered primary keys** and order-preserving encoding make point lookups
   and range scans B-tree operations.
-- **Ordered `LIMIT`** (a paged grid: `ORDER BY <col> ASC|DESC LIMIT n OFFSET k`,
-  no filter) walks the primary key (either direction) or a `NOT NULL` secondary
-  index in order and stops after `k + n` rows -- top-N without sorting the table.
+- **Ordered `LIMIT`** (a paged grid: `ORDER BY <col> ASC|DESC LIMIT n OFFSET k`)
+  walks the primary key (either direction) or a `NOT NULL` secondary index in
+  order and stops after `k + n` rows -- top-N without sorting the table. A `WHERE`
+  filter is applied as a residual during the walk (budget-guarded fallback for
+  very selective filters).
 - **Batched multi-get** fetches index matches in a single read transaction.
 - **Index nested-loop joins** avoid materializing the partner for selective
   joins; **hash joins** handle the general equi-join case in `O(n+m)`.

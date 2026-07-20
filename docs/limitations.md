@@ -100,9 +100,16 @@ judge fit before deploying.
       key order and follows each entry to its row. Requires that **every column
       of that index is `NOT NULL`** (indexes omit NULL tuples, so this keeps the
       walk a complete ordering); a `COLLATE` override or an expression key skips
-      it. Sorting a **nullable** indexed column, or an ordered `LIMIT` **with a
-      `WHERE` filter**, currently falls back to the sorter below (correct, not yet
-      index-accelerated) — as does an ordered `LIMIT` **inside a transaction**.
+      it.
+    - A `WHERE` filter is applied as a residual **during** the ordered walk, so a
+      filtered grid page (`WHERE ... ORDER BY <col> LIMIT n`) is still served
+      without a full sort. To stay safe when the filter is very selective, the
+      walk is capped by an examine budget (`ELYRASQL_ORDER_SCAN_BUDGET`); if it
+      cannot fill `n` rows within budget it falls back to the sorter below (a
+      selective filter has few matches, so that sort is cheap).
+    - Sorting a **nullable** indexed column, or an ordered `LIMIT` **inside a
+      transaction**, falls back to the sorter below (correct, not yet
+      index-accelerated).
 - **Single-table** `ORDER BY` (the fallback) is memory-bounded: `ORDER BY ...
   LIMIT` uses a top-N heap and large unbounded sorts spill sorted runs to temp
   files (external merge sort, `ELYRASQL_SORT_MAX_ROWS`). This spilling path now
