@@ -4,9 +4,27 @@ All notable changes to ElyraSQL are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.4.7] - 2026-07-20
+
+Performance release: sorting on a **nullable** column now uses the secondary
+index in both directions (the last grid-sort gap). Adds a companion `indexnull::`
+keyspace for single-column indexes; **no change to existing on-disk data**, and
+indexes built before 1.4.7 keep working (rebuild to pick up the new behaviour).
 
 ### Added
+
+- **NULL-indexed ordered walks (removes the `ASC`-on-nullable full sort).**
+  Single-column B-tree indexes built on 1.4.7+ now store NULL-keyed rows under a
+  companion `indexnull::` keyspace (keyed by the clustered primary key, never
+  unique). An `ORDER BY <nullable col> [ASC|DESC] LIMIT` — with or without a PK
+  tiebreaker — is then a complete MySQL ordering by walking the value entries and
+  the NULL entries in one snapshot: NULLs first for `ASC`, last for `DESC`, each
+  ordered by the primary key. This closes the previous fallback where `ASC` on a
+  nullable column with few/zero NULLs degraded to a full sort (now sub-millisecond
+  at scale). Index maintenance (INSERT/UPDATE/DELETE, CREATE INDEX backfill,
+  TRUNCATE/DROP/RENAME) keeps the NULL entries consistent; multiple NULLs are
+  still allowed in a `UNIQUE` index. Indexes built before 1.4.7, and composite
+  indexes with a nullable column, use the previous handling.
 
 - **Primary-key tiebreaker on indexed `ORDER BY ... LIMIT`.** A non-unique
   secondary index stores `(value, clustered primary key)`, so walking it also
@@ -1440,6 +1458,7 @@ core CRUD with `WHERE`/`ORDER BY`/`LIMIT`, indexes, aggregation and `GROUP BY`,
 joins, prepared statements, authentication and TLS, vector search (exact +
 HNSW), parallel OLAP aggregation, and transactions with snapshot isolation.
 
+[1.4.7]: https://github.com/kwhorne/ElyraSQL/releases/tag/v1.4.7
 [1.4.6]: https://github.com/kwhorne/ElyraSQL/releases/tag/v1.4.6
 [1.4.5]: https://github.com/kwhorne/ElyraSQL/releases/tag/v1.4.5
 [1.4.4]: https://github.com/kwhorne/ElyraSQL/releases/tag/v1.4.4

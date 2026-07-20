@@ -710,6 +710,79 @@ impl Storage {
         Ok(())
     }
 
+    /// Like [`Storage::scan_index_ordered`] but walks **two** index prefixes in
+    /// sequence within one read transaction — `first` then `second`, each in the
+    /// same direction (`rev`) — dereferencing each entry's row. Backs an ordered
+    /// walk over a NULL-indexing secondary index, where the NULL-keyed entries
+    /// live under a separate prefix: for `ASC` the caller passes the NULL prefix
+    /// first (NULLs sort first), for `DESC` the value prefix first (NULLs last).
+    /// A single transaction keeps both ranges on one consistent snapshot.
+    pub fn scan_two_ordered<F>(
+        &self,
+        first: &[u8],
+        second: &[u8],
+        rev: bool,
+        skip: usize,
+        mut f: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&[u8], &[u8]) -> Result<bool>,
+    {
+        use std::ops::Bound;
+        let rtx = self
+            .db
+            .begin_read()
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        let t = rtx
+            .open_table(KV)
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        let mut remaining_skip = skip;
+        let mut stop = false;
+        for prefix in [first, second] {
+            if stop {
+                break;
+            }
+            let upper = prefix_upper_bound(prefix);
+            let ub = match &upper {
+                Some(u) => Bound::Excluded(u.as_slice()),
+                None => Bound::Unbounded,
+            };
+            let range = t
+                .range::<&[u8]>((Bound::Included(prefix), ub))
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            macro_rules! handle {
+                ($v:expr) => {{
+                    if remaining_skip > 0 {
+                        remaining_skip -= 1;
+                    } else {
+                        let dk = $v.value().to_vec();
+                        if let Some(row) = t
+                            .get(dk.as_slice())
+                            .map_err(|e| Error::Storage(e.to_string()))?
+                        {
+                            if !f(&dk, row.value())? {
+                                stop = true;
+                                break;
+                            }
+                        }
+                    }
+                }};
+            }
+            if rev {
+                for item in range.rev() {
+                    let (_k, v) = item.map_err(|e| Error::Storage(e.to_string()))?;
+                    handle!(v);
+                }
+            } else {
+                for item in range {
+                    let (_k, v) = item.map_err(|e| Error::Storage(e.to_string()))?;
+                    handle!(v);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Zero-copy iterate `[start, end)` (end exclusive), passing borrowed
     /// slices to `f`. Backs the parallel clustered scan: each worker folds a
     /// disjoint key sub-range in its own read transaction.

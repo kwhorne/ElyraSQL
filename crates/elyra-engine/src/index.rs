@@ -87,6 +87,23 @@ pub fn index_scan_prefix(table: &str, index: &str) -> Vec<u8> {
     index_prefix(table, index)
 }
 
+/// Key prefix for a single-column index's NULL-keyed entries (see
+/// [`catalog::IndexDef::indexes_nulls`]). Each entry is `prefix ++ clustered pk`
+/// with the row's data key as value, so walking this prefix yields the NULL rows
+/// ordered by primary key (the stable-pagination tiebreaker for the NULL block).
+pub fn indexnull_scan_prefix(table: &str, index: &str) -> Vec<u8> {
+    format!("indexnull::{table}::{index}::").into_bytes()
+}
+
+/// Entry key for a NULL-keyed row in a single-column index: the NULL prefix
+/// followed by the row's clustered primary key (so NULLs never collide and are
+/// ordered by PK).
+fn null_entry_key(table: &str, index: &str, data_key: &[u8]) -> Vec<u8> {
+    let mut k = indexnull_scan_prefix(table, index);
+    k.extend_from_slice(&data_key[data_prefix(table).len()..]);
+    k
+}
+
 /// Prefix for all entries with a given tuple of column values (equality),
 /// honoring each column's collation.
 fn value_prefix(
@@ -153,6 +170,14 @@ pub fn partition_entries_for_row(
         }
         let values: Vec<Value> = idx.cols.iter().map(|&c| row[c].clone()).collect();
         if values.iter().any(|v| v.is_null()) || keyenc::encode_key(&values).is_err() {
+            // Single-column NULL-indexing: record the NULL-keyed row under the
+            // `indexnull::` keyspace (never unique -- NULLs don't collide).
+            if idx.indexes_nulls && idx.cols.len() == 1 && values[0].is_null() {
+                nonuniq.push((
+                    null_entry_key(&def.name, &idx.name, data_key),
+                    data_key.to_vec(),
+                ));
+            }
             continue;
         }
         let entry = (
@@ -222,6 +247,13 @@ pub fn entries_for_row(
         }
         let values: Vec<Value> = idx.cols.iter().map(|&c| row[c].clone()).collect();
         if values.iter().any(|v| v.is_null()) || keyenc::encode_key(&values).is_err() {
+            // Single-column NULL-indexing (see `partition_entries_for_row`).
+            if idx.indexes_nulls && idx.cols.len() == 1 && values[0].is_null() {
+                out.push((
+                    null_entry_key(&def.name, &idx.name, data_key),
+                    data_key.to_vec(),
+                ));
+            }
             continue;
         }
         out.push((

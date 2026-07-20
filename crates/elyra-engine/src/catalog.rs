@@ -25,6 +25,14 @@ pub struct IndexDef {
     /// Per-column text collation, positional with `cols` (empty ⇒ all `Ci`).
     #[serde(default)]
     pub col_collations: Vec<elyra_core::Collation>,
+    /// Whether NULL-keyed rows are maintained as entries under the `indexnull::`
+    /// keyspace (single-column B-tree indexes built by 1.4.7+). When set, an
+    /// ordered `ORDER BY <col> LIMIT` walk over this index is a complete MySQL
+    /// ordering (NULLs first for ASC, last for DESC) with no data scan or
+    /// fallback. Older indexes deserialize this as `false` and keep the previous
+    /// NULL handling.
+    #[serde(default)]
+    pub indexes_nulls: bool,
 }
 
 impl IndexDef {
@@ -134,6 +142,12 @@ pub fn autoinc_key(table: &str) -> Vec<u8> {
 /// Prefix under which all secondary-index entries of a table live.
 pub fn index_table_prefix(table: &str) -> Vec<u8> {
     format!("index::{table}::").into_bytes()
+}
+
+/// Prefix under which all NULL-keyed index entries of a table live (see
+/// [`IndexDef::indexes_nulls`]).
+pub fn indexnull_table_prefix(table: &str) -> Vec<u8> {
+    format!("indexnull::{table}::").into_bytes()
 }
 
 pub fn catalog_key(table: &str) -> Vec<u8> {

@@ -23,8 +23,9 @@ use crate::zonemap;
 use elyra_olap::GroupAggregator;
 
 use crate::catalog::{
-    self, autoinc_key, catalog_key, data_key, data_prefix, index_table_prefix, rowid_key,
-    wcount_key, ColMeta, ForeignKey, IndexDef, RefAction, TableDef,
+    self, autoinc_key, catalog_key, data_key, data_prefix, index_table_prefix,
+    indexnull_table_prefix, rowid_key, wcount_key, ColMeta, ForeignKey, IndexDef, RefAction,
+    TableDef,
 };
 use crate::eval::eval_expr;
 use crate::keyenc;
@@ -262,6 +263,7 @@ pub async fn create_table(
                             vector: false,
                             fulltext: false,
                             col_collations: vec![collation],
+                            indexes_nulls: true,
                         });
                     }
                 }
@@ -332,6 +334,7 @@ pub async fn create_table(
                 });
                 let ucolls: Vec<elyra_core::Collation> =
                     idxs.iter().map(|&i| columns[i].collation).collect();
+                let single = idxs.len() == 1;
                 indexes.push(IndexDef {
                     name: iname,
                     cols: idxs,
@@ -339,6 +342,7 @@ pub async fn create_table(
                     vector: false,
                     fulltext: false,
                     col_collations: ucolls,
+                    indexes_nulls: single,
                 });
             }
             TableConstraint::Check { expr, .. } => checks.push(expr.to_string()),
@@ -373,6 +377,7 @@ pub async fn create_table(
                         vector: false,
                         fulltext: false,
                         col_collations: fkcolls,
+                        indexes_nulls: fk_cols.len() == 1,
                     });
                 }
                 foreign_keys.push(ForeignKey {
@@ -1727,7 +1732,11 @@ pub async fn truncate(db: &Session, name: &str) -> Result<QueryResult> {
         return Err(Error::Catalog(format!("no such table: {name}")));
     }
     let mut deletes = vec![rowid_key(name), autoinc_key(name)];
-    for prefix in [data_prefix(name), index_table_prefix(name)] {
+    for prefix in [
+        data_prefix(name),
+        index_table_prefix(name),
+        indexnull_table_prefix(name),
+    ] {
         let mut cursor: Option<Vec<u8>> = None;
         loop {
             let batch = db.scan_batch(prefix.clone(), cursor.clone(), 4096).await?;
@@ -2249,23 +2258,29 @@ async fn alter_rename_table(db: &Session, def: &mut TableDef, new: &str) -> Resu
         }
     }
 
-    // Delete all old index entries (keyed under the old table name).
-    let old_index_prefix = format!("index::{old}::").into_bytes();
-    let mut cursor: Option<Vec<u8>> = None;
-    loop {
-        let chunk = db
-            .scan_batch(old_index_prefix.clone(), cursor.clone(), 4096)
-            .await?;
-        if chunk.is_empty() {
-            break;
-        }
-        let last = chunk.len() < 4096;
-        cursor = chunk.last().map(|(k, _)| k.clone());
-        for (k, _) in chunk {
-            deletes.push(k);
-        }
-        if last {
-            break;
+    // Delete all old index entries (keyed under the old table name), including
+    // the NULL-keyed entries under `indexnull::` (rebuilt under the new name by
+    // `entries_for_row` above).
+    for old_index_prefix in [
+        format!("index::{old}::").into_bytes(),
+        format!("indexnull::{old}::").into_bytes(),
+    ] {
+        let mut cursor: Option<Vec<u8>> = None;
+        loop {
+            let chunk = db
+                .scan_batch(old_index_prefix.clone(), cursor.clone(), 4096)
+                .await?;
+            if chunk.is_empty() {
+                break;
+            }
+            let last = chunk.len() < 4096;
+            cursor = chunk.last().map(|(k, _)| k.clone());
+            for (k, _) in chunk {
+                deletes.push(k);
+            }
+            if last {
+                break;
+            }
         }
     }
 
@@ -2317,6 +2332,7 @@ pub async fn create_fulltext_index(
         vector: false,
         fulltext: true,
         col_collations: Vec::new(),
+        indexes_nulls: false,
     });
     let idx = def.indexes.last().unwrap().clone();
 
@@ -2397,6 +2413,9 @@ pub async fn create_index(db: &Session, ci: CreateIndex) -> Result<QueryResult> 
         cols.len() == 1 && matches!(def.schema.columns[cols[0]].ty, ColumnType::Vector(_));
     let col_collations: Vec<elyra_core::Collation> =
         cols.iter().map(|&c| def.collation_of(c)).collect();
+    // Single-column B-tree indexes maintain NULL-keyed entries so ordered
+    // `ORDER BY <col> LIMIT` walks are complete without a NULL scan.
+    let indexes_nulls = cols.len() == 1 && !is_vector;
     def.indexes.push(IndexDef {
         name,
         cols,
@@ -2404,6 +2423,7 @@ pub async fn create_index(db: &Session, ci: CreateIndex) -> Result<QueryResult> 
         vector: is_vector,
         fulltext: false,
         col_collations,
+        indexes_nulls,
     });
 
     // Persist the new catalog and backfill index entries for existing rows.
@@ -4045,17 +4065,65 @@ pub async fn select(
                         }
                     };
 
+                    // Two-range walk for a NULL-indexing index: the value entries
+                    // and the `indexnull::` NULL entries, in one snapshot. For ASC
+                    // the NULL prefix comes first (NULLs sort first); for DESC the
+                    // value prefix comes first (NULLs last). Both give the exact
+                    // MySQL ordering including a PK tiebreaker.
+                    let nprefix = index::indexnull_scan_prefix(&def.name, &plan.index);
+                    let run_two = |skip: usize, want: usize| {
+                        let sch = def.schema.clone();
+                        let f = filter.clone();
+                        let (first, second) = if plan.rev {
+                            (iprefix.clone(), nprefix.clone())
+                        } else {
+                            (nprefix.clone(), iprefix.clone())
+                        };
+                        async move {
+                            db.raw_db()
+                                .scan_two_ordered_fold(
+                                    first,
+                                    second,
+                                    plan.rev,
+                                    skip,
+                                    OrderedWalk {
+                                        rows: Vec::with_capacity(want.min(4096)),
+                                        examined: 0,
+                                        need: want,
+                                        budget: walk_budget,
+                                        budget_hit: false,
+                                    },
+                                    move |w, _dk, v| ordered_walk_step(w, v, &f, &sch),
+                                )
+                                .await
+                        }
+                    };
+
                     let mut result: Option<Vec<Vec<Value>>> = None;
                     // Whether the result rows already have OFFSET applied (via the
                     // index-level skip) and so must not be offset again below.
                     let mut paged = false;
-                    if !plan.nullable {
+                    if plan.null_mode == NullMode::None {
                         let (skip, want) = if !has_filter && offset > 0 {
                             (offset, lim)
                         } else {
                             (0, need)
                         };
                         let walk = run_walk(skip, want).await?;
+                        if !walk.budget_hit {
+                            paged = skip > 0;
+                            result = Some(walk.rows);
+                        }
+                    } else if plan.null_mode == NullMode::Indexed {
+                        // Complete walk (value entries + stored NULL entries) --
+                        // correct for both directions and PK tiebreakers, with a
+                        // cheap deep OFFSET via the shared skip.
+                        let (skip, want) = if !has_filter && offset > 0 {
+                            (offset, lim)
+                        } else {
+                            (0, need)
+                        };
+                        let walk = run_two(skip, want).await?;
                         if !walk.budget_hit {
                             paged = skip > 0;
                             result = Some(walk.rows);
@@ -6690,22 +6758,32 @@ fn order_is_pk_prefix(def: &TableDef, order: &[(Expr, bool)], asc: bool) -> bool
     true
 }
 
+/// How NULL-keyed rows (omitted from the index's value entries) are handled.
+#[derive(PartialEq)]
+enum NullMode {
+    /// Every index column is `NOT NULL` — the value walk is already complete.
+    None,
+    /// NULL rows are maintained under the `indexnull::` prefix (single-column
+    /// `indexes_nulls` index): a two-range walk is a complete MySQL ordering.
+    Indexed,
+    /// Legacy single-column nullable index without stored NULL entries: splice
+    /// the NULL block via a data scan, or fall back to the sorter.
+    Legacy,
+}
+
 /// How a secondary index can serve an `ORDER BY ... LIMIT`.
 struct SecondaryOrder {
     /// Index to walk.
     index: String,
     /// Walk in reverse key order (i.e. the `ORDER BY` is `DESC`).
     rev: bool,
-    /// The leading order column (for the NULL test on the nullable path).
+    /// The leading order column (for the NULL test on the legacy path).
     col: usize,
-    /// The index leaves out NULL tuples, so rows with a NULL in `col` are not in
-    /// the walk and must be spliced in as a NULL block (first for `ASC`, last for
-    /// `DESC`). `false` when every index column is `NOT NULL` (complete walk).
-    nullable: bool,
+    /// How NULL-keyed rows are handled.
+    null_mode: NullMode,
     /// The `ORDER BY` extends past the index columns into the appended clustered
-    /// primary key (a stable-pagination tiebreaker like `..., id`). The non-NULL
-    /// walk still orders correctly, but a NULL block cannot be tiebroken cheaply,
-    /// so the nullable path bails to the sorter if the NULL block would be used.
+    /// primary key (a stable-pagination tiebreaker like `..., id`). Only relevant
+    /// to the legacy path (a NULL block cannot be tiebroken cheaply there).
     has_tiebreaker: bool,
 }
 
@@ -6748,26 +6826,24 @@ fn secondary_order_plan(def: &TableDef, order: &[(Expr, bool)]) -> Option<Second
         }
         let has_tiebreaker = ocols.len() > idx.cols.len();
         let all_not_null = idx.cols.iter().all(|&c| !def.schema.columns[c].nullable);
-        if all_not_null {
-            return Some(SecondaryOrder {
-                index: idx.name.clone(),
-                rev: !asc,
-                col: idx.cols[0],
-                nullable: false,
-                has_tiebreaker,
-            });
-        }
-        // Nullable key: only a single-column index (the missing rows are exactly
-        // the NULL-keyed ones).
-        if idx.cols.len() == 1 {
-            return Some(SecondaryOrder {
-                index: idx.name.clone(),
-                rev: !asc,
-                col: idx.cols[0],
-                nullable: true,
-                has_tiebreaker,
-            });
-        }
+        let null_mode = if all_not_null {
+            NullMode::None
+        } else if idx.cols.len() == 1 && idx.indexes_nulls {
+            NullMode::Indexed
+        } else if idx.cols.len() == 1 {
+            NullMode::Legacy
+        } else {
+            // Composite index with a nullable column and no stored NULL entries:
+            // a NULL in any key column drops the row from the walk -- not safe.
+            continue;
+        };
+        return Some(SecondaryOrder {
+            index: idx.name.clone(),
+            rev: !asc,
+            col: idx.cols[0],
+            null_mode,
+            has_tiebreaker,
+        });
     }
     None
 }
@@ -12042,7 +12118,11 @@ pub async fn drop_table(db: &Session, name: &str, if_exists: bool) -> Result<Que
 
     // Collect the table's data and index keys in batches.
     let mut deletes = vec![catalog_key(name), rowid_key(name), autoinc_key(name)];
-    for prefix in [data_prefix(name), index_table_prefix(name)] {
+    for prefix in [
+        data_prefix(name),
+        index_table_prefix(name),
+        indexnull_table_prefix(name),
+    ] {
         let mut cursor: Option<Vec<u8>> = None;
         loop {
             let batch = db.scan_batch(prefix.clone(), cursor.clone(), 4096).await?;

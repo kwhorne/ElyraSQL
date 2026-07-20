@@ -2127,3 +2127,93 @@ async fn compound_order_by_pk_tiebreaker() {
     let exp: Vec<i64> = desc.iter().skip(500).take(20).map(|&(id, _)| id).collect();
     assert_eq!(got, exp, "compound DESC tiebreaker with OFFSET");
 }
+
+// NULL-indexed ordered walk (ESQL-24): a single-column index now stores NULL-keyed
+// rows under the indexnull:: keyspace, so ORDER BY on a nullable column -- ASC or
+// DESC, with a PK tiebreaker -- is a complete index walk (no data scan, no
+// fallback), and stays correct across mutations.
+#[tokio::test]
+async fn null_indexed_order_walk() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop("CREATE TABLE t (id INT PRIMARY KEY, revenue INT)")
+        .await
+        .unwrap();
+    // ~1/8 NULL, low cardinality so the id tiebreaker decides ties.
+    let mut shadow: std::collections::HashMap<i64, Option<i64>> = std::collections::HashMap::new();
+    let mut vals = String::new();
+    let mut seed: u64 = 0x24;
+    for id in 1..=2500i64 {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let rev = if (seed >> 5) % 8 == 0 {
+            None
+        } else {
+            Some(((seed >> 20) % 30) as i64)
+        };
+        shadow.insert(id, rev);
+        if !vals.is_empty() {
+            vals.push(',');
+        }
+        match rev {
+            Some(v) => vals.push_str(&format!("({id},{v})")),
+            None => vals.push_str(&format!("({id},NULL)")),
+        }
+    }
+    c.query_drop(format!("INSERT INTO t VALUES {vals}"))
+        .await
+        .unwrap();
+    c.query_drop("CREATE INDEX idx_revenue ON t (revenue)")
+        .await
+        .unwrap();
+
+    // Mutations must keep the NULL entries consistent.
+    c.query_drop("UPDATE t SET revenue = NULL WHERE id <= 20")
+        .await
+        .unwrap();
+    c.query_drop("UPDATE t SET revenue = 5 WHERE id BETWEEN 100 AND 110")
+        .await
+        .unwrap();
+    c.query_drop("DELETE FROM t WHERE id BETWEEN 300 AND 350")
+        .await
+        .unwrap();
+    for id in 1..=20 {
+        shadow.insert(id, None);
+    }
+    for id in 100..=110 {
+        shadow.insert(id, Some(5));
+    }
+    for id in 300..=350 {
+        shadow.remove(&id);
+    }
+
+    let asc_key = |&(id, r): &(i64, Option<i64>)| (r.is_some(), r, id);
+    let desc_key =
+        |&(id, r): &(i64, Option<i64>)| (r.is_none(), std::cmp::Reverse(r), std::cmp::Reverse(id));
+    let mut rows: Vec<(i64, Option<i64>)> = shadow.iter().map(|(&id, &r)| (id, r)).collect();
+
+    // ASC, id ASC: NULLs first (ordered by id), then ascending.
+    let got: Vec<i64> = c
+        .query("SELECT id FROM t ORDER BY revenue ASC, id ASC LIMIT 40")
+        .await
+        .unwrap();
+    rows.sort_by_key(asc_key);
+    let exp: Vec<i64> = rows.iter().take(40).map(|&(id, _)| id).collect();
+    assert_eq!(got, exp, "nullable ASC with id tiebreaker (indexed NULLs)");
+
+    // ASC with OFFSET spanning the NULL/non-NULL boundary.
+    let got: Vec<i64> = c
+        .query("SELECT id FROM t ORDER BY revenue ASC, id ASC LIMIT 20 OFFSET 30")
+        .await
+        .unwrap();
+    let exp: Vec<i64> = rows.iter().skip(30).take(20).map(|&(id, _)| id).collect();
+    assert_eq!(got, exp, "nullable ASC OFFSET across boundary");
+
+    // DESC, id DESC: descending, then NULLs last (ordered by id desc).
+    let got: Vec<i64> = c
+        .query("SELECT id FROM t ORDER BY revenue DESC, id DESC LIMIT 40")
+        .await
+        .unwrap();
+    rows.sort_by_key(desc_key);
+    let exp: Vec<i64> = rows.iter().take(40).map(|&(id, _)| id).collect();
+    assert_eq!(got, exp, "nullable DESC with id tiebreaker (indexed NULLs)");
+}

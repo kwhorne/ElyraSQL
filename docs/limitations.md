@@ -105,13 +105,14 @@ judge fit before deploying.
       secondary index stores `(value, clustered pk)`, `ORDER BY <indexed col>
       [DESC], id [DESC]` (a grid's stable-sort tiebreaker) walks the index
       directly. All terms must share a direction and any trailing terms must be
-      the primary-key columns in order. (A nullable column with a tiebreaker only
-      takes the fast path when the NULL block is not reached — e.g. `DESC` with
-      enough non-NULL rows; otherwise it falls back, since the NULL block cannot be
-      tiebroken cheaply.)
-    - A **nullable single-column** index is supported: the ordered walk covers the
-      non-NULL rows and the NULL-keyed rows are spliced in as a block — last for
-      `DESC`, first for `ASC` (MySQL's NULL ordering). The NULL block is fetched by
+      the primary-key columns in order.
+    - A **nullable single-column** index is fully supported in **both directions**
+      (including with a PK tiebreaker). Single-column indexes built on 1.4.7+ store
+      NULL-keyed rows under a companion `indexnull::` keyspace, so the ordered walk
+      is a complete MySQL ordering — NULLs first for `ASC`, last for `DESC`, each
+      ordered by the clustered PK — with no data scan and no fallback. (Indexes
+      built before 1.4.7 use the older NULL scan / sorter fallback until rebuilt;
+      a **composite** index still requires every column to be `NOT NULL`.) The NULL block is fetched by
       a budgeted clustered scan; if NULLs are so rare that the budget
       (`ELYRASQL_ORDER_SCAN_BUDGET`) is exhausted before the block is known
       (mainly an `ASC` concern), it falls back to the sorter below.
@@ -128,13 +129,6 @@ judge fit before deploying.
       counted.
     - An ordered `LIMIT` **inside a transaction** falls back to the sorter below
       (correct, not yet index-accelerated).
-- **Ascending sort on a nullable column with (almost) no NULLs.** For `ASC`,
-  NULLs sort first, so the walk must know the NULL block before it can emit the
-  head. When the column is nullable but contains very few / zero actual NULLs, the
-  budgeted NULL scan cannot confirm the (empty) NULL set cheaply and falls back to
-  a full sort. If the column never holds NULLs, declare it `NOT NULL` — then both
-  `ASC` and `DESC` use the index walk directly (the `NOT NULL` fast path). A
-  future change may index NULL keys so this is unnecessary.
 - **Single-table** `ORDER BY` (the fallback) is memory-bounded: `ORDER BY ...
   LIMIT` uses a top-N heap and large unbounded sorts spill sorted runs to temp
   files (external merge sort, `ELYRASQL_SORT_MAX_ROWS`). This spilling path now

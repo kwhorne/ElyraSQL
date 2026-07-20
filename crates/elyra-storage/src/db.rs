@@ -558,6 +558,32 @@ impl Db {
         .await
     }
 
+    /// Walk two index prefixes in sequence within one read transaction, folding
+    /// the referenced rows and stopping early when `f` returns `false` (see
+    /// [`Storage::scan_two_ordered`]). Backs an ordered walk over a NULL-indexing
+    /// secondary index (value prefix + NULL prefix).
+    pub async fn scan_two_ordered_fold<T, F>(
+        &self,
+        first: Vec<u8>,
+        second: Vec<u8>,
+        rev: bool,
+        skip: usize,
+        init: T,
+        mut f: F,
+    ) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnMut(&mut T, &[u8], &[u8]) -> Result<bool> + Send + 'static,
+    {
+        let storage = self.storage.clone();
+        spawn_read(move || {
+            let mut acc = init;
+            storage.scan_two_ordered(&first, &second, rev, skip, |k, v| f(&mut acc, k, v))?;
+            Ok(acc)
+        })
+        .await
+    }
+
     /// Fold over `[start, end)`, decoding from borrowed bytes in one read
     /// transaction (see [`Storage::scan_range_each`]).
     pub async fn scan_range_fold<T, F>(

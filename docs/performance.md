@@ -54,9 +54,9 @@ selective filter falls back to the sorter (bounded by
 
 A deep `OFFSET` (no filter) steps over the leading rows at the index level
 **without reading them**, so paging far into a result stays cheap (index steps,
-not row reads). Sorting `ASC` on a nullable column that holds (almost) no NULLs
-falls back to a full sort — declare such a column `NOT NULL` to keep it on the
-fast path (see [limitations](limitations.md)).
+not row reads). Sorting a **nullable** single-column index works on the fast path
+in both directions (NULL rows are indexed under a companion keyspace); see
+[limitations](limitations.md).
 
 ## Why it's fast
 

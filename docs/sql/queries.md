@@ -45,8 +45,9 @@ An ordered `LIMIT` (a paged grid: `ORDER BY <col> ASC|DESC LIMIT n OFFSET k`) is
 served by an ordered index or clustered walk that stops after `k + n` rows —
 constant work per page, independent of table size. This applies to the primary
 key in **both** directions and to a secondary index — including a **nullable
-single-column** index, where NULL-keyed rows are spliced in (last for `DESC`,
-first for `ASC`, matching MySQL). Because a non-unique secondary index stores
+single-column** index (built on 1.4.7+), whose NULL-keyed rows are indexed
+separately so the walk is a complete MySQL ordering (NULLs first for `ASC`, last
+for `DESC`). Because a non-unique secondary index stores
 `(value, clustered primary key)`, a **tiebreaker on the primary key** stays on the
 fast path too: `ORDER BY <indexed col> DESC, id DESC` (the usual stable-pagination
 sort) walks the index directly. All order terms must share a direction, and any
