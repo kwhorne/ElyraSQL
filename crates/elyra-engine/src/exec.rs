@@ -3946,6 +3946,66 @@ pub async fn select(
             }
         }
 
+        // Reverse PK-ordered LIMIT fast path: `ORDER BY <pk prefix> DESC LIMIT n`
+        // with no filter (autocommit). Walk the clustered keyspace backwards and
+        // stop once `offset + n` rows are collected -- no full scan, no sort. The
+        // primary key is never NULL, so the reverse walk is a complete ordering.
+        if let Some(lim) = limit {
+            if !db.in_txn() && filter.is_none() && order_is_pk_prefix(&def, &resolved, false) {
+                let need = offset.saturating_add(lim);
+                let prefix = data_prefix(&def.name);
+                let rows: Vec<Vec<Value>> = db
+                    .raw_db()
+                    .scan_fold_rev_until(
+                        prefix,
+                        Vec::with_capacity(need.min(4096)),
+                        move |rows, _k, v| {
+                            let row: Vec<Value> = bincode::deserialize(v)
+                                .map_err(|e| Error::Storage(e.to_string()))?;
+                            rows.push(row);
+                            Ok(rows.len() < need)
+                        },
+                    )
+                    .await?;
+                let mut rows = rows;
+                apply_offset_limit(&mut rows, offset, limit);
+                let (schema, out) = project_exprs(&select.projection, &def.schema, &rows)?;
+                return Ok(QueryResult::Rows(RowStream::literal(schema, out)));
+            }
+        }
+
+        // Indexed ORDER BY ... LIMIT fast path: `ORDER BY <indexed col> [ASC|DESC]
+        // LIMIT n` with no filter (autocommit). Walk the secondary index in
+        // (reverse) key order, following each entry to its row, and stop at
+        // `offset + n` -- ordered top-N without sorting the table. Restricted to
+        // NOT NULL index columns (see `secondary_order_index`) for correctness.
+        if let Some(lim) = limit {
+            if !db.in_txn() && filter.is_none() {
+                if let Some((idx_name, rev)) = secondary_order_index(&def, &resolved) {
+                    let need = offset.saturating_add(lim);
+                    let iprefix = index::index_scan_prefix(&def.name, &idx_name);
+                    let rows: Vec<Vec<Value>> = db
+                        .raw_db()
+                        .scan_index_ordered_fold(
+                            iprefix,
+                            rev,
+                            Vec::with_capacity(need.min(4096)),
+                            move |rows, _dk, v| {
+                                let row: Vec<Value> = bincode::deserialize(v)
+                                    .map_err(|e| Error::Storage(e.to_string()))?;
+                                rows.push(row);
+                                Ok(rows.len() < need)
+                            },
+                        )
+                        .await?;
+                    let mut rows = rows;
+                    apply_offset_limit(&mut rows, offset, limit);
+                    let (schema, out) = project_exprs(&select.projection, &def.schema, &rows)?;
+                    return Ok(QueryResult::Rows(RowStream::literal(schema, out)));
+                }
+            }
+        }
+
         // Memory-bounded ORDER BY for the non-accelerable autocommit case:
         // stream the filtered rows and sort with a top-N heap (when LIMIT is
         // small) or an external merge sort that spills to disk (OOM safety),
@@ -6463,28 +6523,72 @@ fn key_eq_values(
 /// composite) or a single-column range.
 /// True when `order` is a prefix of the primary key, all ascending -- i.e. the
 /// clustered scan order already satisfies the ORDER BY, so no sort is needed.
+/// Resolve an ORDER BY expression that is a plain (optionally qualified) column
+/// reference to its column index, or `None` for anything else.
+fn order_col_index(def: &TableDef, e: &Expr) -> Option<usize> {
+    let name = match e {
+        Expr::Identifier(id) => &id.value,
+        Expr::CompoundIdentifier(parts) => &parts.last()?.value,
+        _ => return None,
+    };
+    def.schema
+        .columns
+        .iter()
+        .position(|c| c.name.eq_ignore_ascii_case(name))
+}
+
 fn order_is_pk_asc_prefix(def: &TableDef, order: &[(Expr, bool)]) -> bool {
+    order_is_pk_prefix(def, order, true)
+}
+
+/// True when `order` matches a prefix of the primary key, every term in the same
+/// direction (`asc`). Backs the clustered forward (ASC) and reverse (DESC) scans.
+fn order_is_pk_prefix(def: &TableDef, order: &[(Expr, bool)], asc: bool) -> bool {
     if !def.has_pk() || order.is_empty() || order.len() > def.pk_cols.len() {
         return false;
     }
-    for (i, (e, asc)) in order.iter().enumerate() {
-        if !*asc {
+    for (i, (e, a)) in order.iter().enumerate() {
+        if *a != asc {
             return false;
         }
-        let name = match e {
-            Expr::Identifier(id) => &id.value,
-            Expr::CompoundIdentifier(parts) => match parts.last() {
-                Some(p) => &p.value,
-                None => return false,
-            },
+        match order_col_index(def, e) {
+            Some(ci) if ci == def.pk_cols[i] => {}
             _ => return false,
-        };
-        let col = def.pk_cols[i];
-        if !def.schema.columns[col].name.eq_ignore_ascii_case(name) {
-            return false;
         }
     }
     true
+}
+
+/// If `order` can be served by walking a secondary index in key order, return
+/// `(index name, reverse)`. Requires: all terms share a direction; the order
+/// columns are a prefix of the index columns; and **every** index column is
+/// NOT NULL — so every row appears exactly once in the index and the ordered
+/// walk is a complete, correct ordering (NULL tuples are omitted from indexes).
+fn secondary_order_index(def: &TableDef, order: &[(Expr, bool)]) -> Option<(String, bool)> {
+    if order.is_empty() {
+        return None;
+    }
+    let asc = order[0].1;
+    if order.iter().any(|(_, a)| *a != asc) {
+        return None;
+    }
+    let mut ocols = Vec::with_capacity(order.len());
+    for (e, _) in order {
+        ocols.push(order_col_index(def, e)?);
+    }
+    for idx in &def.indexes {
+        if idx.vector || idx.fulltext || idx.cols.len() < ocols.len() {
+            continue;
+        }
+        if idx.cols[..ocols.len()] != ocols[..] {
+            continue;
+        }
+        if idx.cols.iter().any(|&c| def.schema.columns[c].nullable) {
+            continue;
+        }
+        return Some((idx.name.clone(), !asc));
+    }
+    None
 }
 
 /// True when the filter can be resolved through a *selective* access path -- an

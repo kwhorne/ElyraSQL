@@ -80,6 +80,13 @@ fn index_prefix(table: &str, index: &str) -> Vec<u8> {
     format!("index::{table}::{index}::").into_bytes()
 }
 
+/// Public key prefix covering every entry of a secondary index, for an ordered
+/// index walk (`ORDER BY <indexed col> LIMIT`). Entries under this prefix are in
+/// ascending indexed-value order (the key encoding is order-preserving).
+pub fn index_scan_prefix(table: &str, index: &str) -> Vec<u8> {
+    index_prefix(table, index)
+}
+
 /// Prefix for all entries with a given tuple of column values (equality),
 /// honoring each column's collation.
 fn value_prefix(

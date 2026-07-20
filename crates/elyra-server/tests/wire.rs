@@ -1835,3 +1835,72 @@ async fn group_by_expression() {
     assert_eq!(p95.len(), 2);
     assert!(p95[0].1 > 0.0);
 }
+
+// Indexed ORDER BY ... LIMIT (ESQL-20): reverse primary-key scan and secondary-
+// index ordered scan return correct top-N without a full sort. Correctness is
+// checked against a locally computed expectation.
+#[tokio::test]
+async fn indexed_order_by_limit() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop("CREATE TABLE t (id INT PRIMARY KEY, revenue INT NOT NULL)")
+        .await
+        .unwrap();
+    // Deterministic pseudo-random revenue values.
+    let mut shadow: Vec<(i64, i64)> = Vec::new();
+    let mut vals = String::new();
+    let mut seed: u64 = 0x1234_5678;
+    for id in 1..=2000i64 {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let rev = ((seed >> 20) % 1_000_000) as i64;
+        shadow.push((id, rev));
+        if !vals.is_empty() {
+            vals.push(',');
+        }
+        vals.push_str(&format!("({id},{rev})"));
+    }
+    c.query_drop(format!("INSERT INTO t VALUES {vals}"))
+        .await
+        .unwrap();
+    c.query_drop("CREATE INDEX ix_rev ON t (revenue)")
+        .await
+        .unwrap();
+
+    // Reverse PK: ORDER BY id DESC LIMIT 40.
+    let got: Vec<i64> = c
+        .query("SELECT id FROM t ORDER BY id DESC LIMIT 40")
+        .await
+        .unwrap();
+    let exp: Vec<i64> = (1961..=2000).rev().collect();
+    assert_eq!(got, exp, "reverse PK top-N");
+
+    // Secondary index ASC: ORDER BY revenue LIMIT 40 (compare the ordered values).
+    let got: Vec<(i64, i64)> = c
+        .query("SELECT id, revenue FROM t ORDER BY revenue LIMIT 40")
+        .await
+        .unwrap();
+    let mut by_rev = shadow.clone();
+    by_rev.sort_by_key(|&(id, rev)| (rev, id));
+    let exp_vals: Vec<i64> = by_rev.iter().take(40).map(|&(_, r)| r).collect();
+    let got_vals: Vec<i64> = got.iter().map(|&(_, r)| r).collect();
+    assert_eq!(got_vals, exp_vals, "secondary index ASC top-N values");
+
+    // Secondary index DESC.
+    let got: Vec<(i64, i64)> = c
+        .query("SELECT id, revenue FROM t ORDER BY revenue DESC LIMIT 40")
+        .await
+        .unwrap();
+    let mut by_rev_d = shadow.clone();
+    by_rev_d.sort_by_key(|&(id, rev)| (std::cmp::Reverse(rev), id));
+    let exp_vals: Vec<i64> = by_rev_d.iter().take(40).map(|&(_, r)| r).collect();
+    let got_vals: Vec<i64> = got.iter().map(|&(_, r)| r).collect();
+    assert_eq!(got_vals, exp_vals, "secondary index DESC top-N values");
+
+    // OFFSET is honoured on the ordered walk.
+    let got: Vec<i64> = c
+        .query("SELECT revenue FROM t ORDER BY revenue LIMIT 10 OFFSET 20")
+        .await
+        .unwrap();
+    let exp_vals: Vec<i64> = by_rev.iter().skip(20).take(10).map(|&(_, r)| r).collect();
+    assert_eq!(got, exp_vals, "ordered walk with OFFSET");
+}

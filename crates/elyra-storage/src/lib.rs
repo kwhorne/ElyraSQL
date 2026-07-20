@@ -583,6 +583,104 @@ impl Storage {
         Ok(())
     }
 
+    /// Like [`Storage::scan_prefix_until`] but visits keys in **descending**
+    /// order (largest first). Backs `ORDER BY <pk> DESC LIMIT n`: walk the
+    /// clustered keyspace backwards and stop as soon as `n` rows are collected,
+    /// instead of scanning and sorting the whole table.
+    pub fn scan_prefix_rev_until<F>(&self, prefix: &[u8], mut f: F) -> Result<()>
+    where
+        F: FnMut(&[u8], &[u8]) -> Result<bool>,
+    {
+        use std::ops::Bound;
+        let rtx = self
+            .db
+            .begin_read()
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        let t = rtx
+            .open_table(KV)
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        // Bound the range to exactly this prefix's keyspace so `.rev()` starts at
+        // the prefix's last key (not the last key of the whole database).
+        let upper = prefix_upper_bound(prefix);
+        let ub = match &upper {
+            Some(u) => Bound::Excluded(u.as_slice()),
+            None => Bound::Unbounded,
+        };
+        let range = t
+            .range::<&[u8]>((Bound::Included(prefix), ub))
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        for item in range.rev() {
+            let (k, v) = item.map_err(|e| Error::Storage(e.to_string()))?;
+            let key = k.value();
+            if !key.starts_with(prefix) {
+                break;
+            }
+            if !f(key, v.value())? {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Walk secondary-index entries under `index_prefix` in key order (ascending,
+    /// or descending when `rev`) and, for each entry, look up the referenced data
+    /// row (the entry's value is the data key) in the **same** read transaction,
+    /// passing `(data_key, row_bytes)` to `f`. Stops when `f` returns `false`.
+    ///
+    /// Because the index key is order-preserving, this yields rows already sorted
+    /// by the indexed columns — so `ORDER BY <indexed col> LIMIT n` can stop after
+    /// `n` matches instead of sorting the whole table. One read transaction keeps
+    /// the index walk and the row lookups on a single consistent snapshot.
+    pub fn scan_index_ordered<F>(&self, index_prefix: &[u8], rev: bool, mut f: F) -> Result<()>
+    where
+        F: FnMut(&[u8], &[u8]) -> Result<bool>,
+    {
+        use std::ops::Bound;
+        let rtx = self
+            .db
+            .begin_read()
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        let t = rtx
+            .open_table(KV)
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        let upper = prefix_upper_bound(index_prefix);
+        let ub = match &upper {
+            Some(u) => Bound::Excluded(u.as_slice()),
+            None => Bound::Unbounded,
+        };
+        let range = t
+            .range::<&[u8]>((Bound::Included(index_prefix), ub))
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        // Fetch the row referenced by one index entry (entry value = data key)
+        // and hand it to `f`. Returns whether to continue.
+        let mut visit = |data_key: &[u8]| -> Result<bool> {
+            match t.get(data_key).map_err(|e| Error::Storage(e.to_string()))? {
+                Some(row) => f(data_key, row.value()),
+                // Dangling index entry (row already gone from this snapshot);
+                // skip it and keep going.
+                None => Ok(true),
+            }
+        };
+        if rev {
+            for item in range.rev() {
+                let (_k, v) = item.map_err(|e| Error::Storage(e.to_string()))?;
+                let data_key = v.value().to_vec();
+                if !visit(&data_key)? {
+                    break;
+                }
+            }
+        } else {
+            for item in range {
+                let (_k, v) = item.map_err(|e| Error::Storage(e.to_string()))?;
+                let data_key = v.value().to_vec();
+                if !visit(&data_key)? {
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Zero-copy iterate `[start, end)` (end exclusive), passing borrowed
     /// slices to `f`. Backs the parallel clustered scan: each worker folds a
     /// disjoint key sub-range in its own read transaction.

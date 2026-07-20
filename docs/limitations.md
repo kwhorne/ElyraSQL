@@ -91,9 +91,22 @@ judge fit before deploying.
   comma cross-joins by estimated (not just raw) row counts, reorders explicit
   INNER-join chains cost-based, and picks hash-join build sides by live size.
   Multi-column/correlated histograms are not modelled.
-- **Single-table** `ORDER BY` is memory-bounded: `ORDER BY ... LIMIT` uses a
-  top-N heap and large unbounded sorts spill sorted runs to temp files (external
-  merge sort, `ELYRASQL_SORT_MAX_ROWS`). This spilling path now runs **inside
+- **Indexed `ORDER BY ... LIMIT` (top-N without a sort).** With no `WHERE`
+  filter, an ordered `LIMIT` is served by an ordered index/clustered walk that
+  stops after `OFFSET + LIMIT` rows — no full scan, no sort:
+    - `ORDER BY <primary-key prefix> ASC|DESC LIMIT n` walks the clustered
+      keyspace forward (ASC) or backward (DESC).
+    - `ORDER BY <indexed column(s)> ASC|DESC LIMIT n` walks a secondary index in
+      key order and follows each entry to its row. Requires that **every column
+      of that index is `NOT NULL`** (indexes omit NULL tuples, so this keeps the
+      walk a complete ordering); a `COLLATE` override or an expression key skips
+      it. Sorting a **nullable** indexed column, or an ordered `LIMIT` **with a
+      `WHERE` filter**, currently falls back to the sorter below (correct, not yet
+      index-accelerated) — as does an ordered `LIMIT` **inside a transaction**.
+- **Single-table** `ORDER BY` (the fallback) is memory-bounded: `ORDER BY ...
+  LIMIT` uses a top-N heap and large unbounded sorts spill sorted runs to temp
+  files (external merge sort, `ELYRASQL_SORT_MAX_ROWS`). This spilling path now
+  runs **inside
   transactions too** (streaming the snapshot+overlay via the session cursor), not
   just in autocommit. `GROUP BY` with many distinct groups uses **partitioned
   spill** aggregation (rows routed to partitions by group-key hash, spilled to

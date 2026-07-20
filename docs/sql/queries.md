@@ -34,10 +34,20 @@ ElyraSQL picks an access path automatically:
 | `pk = <literal>` (all key columns) | clustered point lookup | `O(log n)` |
 | `indexed_col = <literal>` | secondary index | `O(log n + matches)` |
 | `col >/>=/</<= <literal>`, `BETWEEN` on PK/indexed col | ordered range scan | proportional to matches |
+| `ORDER BY <pk prefix> ASC\|DESC LIMIT n` (no filter) | clustered walk (forward/reverse), stop at `n` | `O(offset + n)` |
+| `ORDER BY <indexed NOT NULL col> ASC\|DESC LIMIT n` (no filter) | ordered index walk, stop at `n` | `O(offset + n)` |
 | anything else | full table scan (streaming) | `O(n)` |
 
 Non-accelerated scans **stream** in bounded memory, so they never load the
 whole table at once.
+
+An ordered `LIMIT` (a paged grid: `ORDER BY <col> ASC|DESC LIMIT n OFFSET k`) is
+served by an ordered index or clustered walk that stops after `k + n` rows —
+constant work per page, independent of table size. This applies to the primary
+key in **both** directions and to any secondary index whose columns are all
+`NOT NULL`; see [limitations](../limitations.md) for when it falls back to the
+memory-bounded sorter (nullable sort column, a `WHERE` filter, or inside a
+transaction).
 
 ## Joins
 

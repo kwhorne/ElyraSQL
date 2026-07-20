@@ -4,6 +4,22 @@ All notable changes to ElyraSQL are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **Indexed `ORDER BY ... LIMIT` (top-N without a full sort).** A paged, ordered
+  `LIMIT` with no `WHERE` filter is now served by an ordered walk that stops after
+  `OFFSET + LIMIT` rows instead of sorting the whole table:
+    - `ORDER BY <primary-key prefix> DESC LIMIT n` — reverse clustered scan
+      (forward/ASC was already fast).
+    - `ORDER BY <indexed column(s)> ASC|DESC LIMIT n` — ordered secondary-index
+      walk, when every column of that index is `NOT NULL`.
+  On a 300k-row table this took the three previously-unaccelerated grid sorts from
+  ~5–8 s (full sort) to well under 1 ms. Nullable sort columns, filtered ordered
+  `LIMIT`s, and ordered `LIMIT`s inside a transaction fall back to the existing
+  memory-bounded sorter (correct, not yet index-accelerated).
+
 ## [1.4.2] - 2026-07-17
 
 Analytics release: percentile aggregates and `GROUP BY` on an expression — the
