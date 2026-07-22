@@ -4,6 +4,36 @@ All notable changes to ElyraSQL are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.4.11] - 2026-07-22
+
+Robustness & cluster-security release: memory fail-safes for `IN (SELECT)` /
+`DISTINCT`, and optional TLS encryption for the replication transport. No on-disk
+format change.
+
+### Added
+
+- **TLS-encrypted replication (ESQL-30).** The primary↔replica stream (which
+  carries the whole data set) can now be encrypted: set
+  `ELYRASQL_CLUSTER_TLS_CERT`/`_KEY` on the primary and `ELYRASQL_CLUSTER_TLS_CA`
+  on the replica. The replica **verifies** the primary's certificate (no
+  accept-any mode, so it is not MITM-vulnerable), giving confidentiality + server
+  authentication; combined with `ELYRASQL_CLUSTER_SECRET` this is mutual
+  authentication. Plaintext remains the default (with a loud warning). The Raft
+  control plane is not yet TLS-wrapped (ESQL-31).
+- **Fail-safe memory bounds for `IN (SELECT ...)` and `DISTINCT` (ESQL-28).** An
+  `IN (SELECT ...)` over more than `ELYRASQL_IN_SUBQUERY_MAX` rows (default
+  1,000,000) or a `DISTINCT` over more than `ELYRASQL_DISTINCT_MAX` rows (default
+  5,000,000) now errors with a clear message instead of buffering an unbounded set
+  and risking OOM (rewrite `IN (SELECT)` as a `JOIN`/`EXISTS`).
+
+### Testing
+
+- Locked in **N-table left-deep join streaming** (ESQL-29) with a regression test:
+  chains of two or more `INNER`/`LEFT` equi-joins feeding `ORDER BY`/`GROUP BY`
+  stream through the spilling sorter/aggregator (the join output is never fully
+  materialised). The remaining materialising cases (`FULL`, non-equi, derived
+  table, `RIGHT`-in-a-chain) are correct, rare, and documented.
+
 ## [1.4.10] - 2026-07-22
 
 Vector release: the HNSW index is now maintained **incrementally** and **persisted**
@@ -1564,6 +1594,7 @@ core CRUD with `WHERE`/`ORDER BY`/`LIMIT`, indexes, aggregation and `GROUP BY`,
 joins, prepared statements, authentication and TLS, vector search (exact +
 HNSW), parallel OLAP aggregation, and transactions with snapshot isolation.
 
+[1.4.11]: https://github.com/kwhorne/ElyraSQL/releases/tag/v1.4.11
 [1.4.10]: https://github.com/kwhorne/ElyraSQL/releases/tag/v1.4.10
 [1.4.9]: https://github.com/kwhorne/ElyraSQL/releases/tag/v1.4.9
 [1.4.8]: https://github.com/kwhorne/ElyraSQL/releases/tag/v1.4.8
