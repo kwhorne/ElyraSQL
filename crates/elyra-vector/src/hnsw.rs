@@ -348,6 +348,53 @@ impl Hnsw {
     pub fn dim(&self) -> usize {
         self.dim
     }
+
+    /// The stored vector for a node (including tombstoned nodes), if in range.
+    pub fn vector(&self, node: u32) -> Option<&[f32]> {
+        self.vectors.get(node as usize).map(|v| v.as_slice())
+    }
+
+    /// Export the graph's persistent data (everything except transient scratch
+    /// state) so a caller can serialize and later restore it, avoiding a
+    /// cold-start rebuild. Clones the vectors/adjacency.
+    pub fn export(&self) -> HnswParts {
+        HnswParts {
+            dim: self.dim,
+            metric: self.metric,
+            vectors: self.vectors.clone(),
+            neighbors: self.neighbors.clone(),
+            entry: self.entry,
+            max_level: self.max_level,
+            rng_state: self.rng.0,
+        }
+    }
+
+    /// Reconstruct a graph from previously [`export`](Self::export)ed data.
+    pub fn from_parts(p: HnswParts) -> Self {
+        Hnsw {
+            metric: p.metric,
+            dim: p.dim,
+            visited_pool: std::sync::Mutex::new(Vec::new()),
+            vectors: p.vectors,
+            neighbors: p.neighbors,
+            entry: p.entry,
+            max_level: p.max_level,
+            rng: Rng(p.rng_state),
+        }
+    }
+}
+
+/// The persistent data of an [`Hnsw`] graph (no transient scratch state), for
+/// serialization by the caller. `elyra-vector` stays dependency-free, so this is
+/// plain public data the caller serializes however it likes.
+pub struct HnswParts {
+    pub dim: usize,
+    pub metric: Metric,
+    pub vectors: Vec<Vec<f32>>,
+    pub neighbors: Vec<Vec<Vec<u32>>>,
+    pub entry: u32,
+    pub max_level: usize,
+    pub rng_state: u64,
 }
 
 fn select_neighbors(found: &mut BinaryHeap<Cand>, m: usize) -> Vec<u32> {

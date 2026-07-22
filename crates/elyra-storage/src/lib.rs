@@ -248,6 +248,9 @@ fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
 /// Handle to an ElyraSQL storage file.
 pub struct Storage {
     db: Database,
+    /// The data file path (for deriving sibling artifacts like the vector-index
+    /// cache). `None` for in-memory/unknown backings.
+    path: Option<std::path::PathBuf>,
     /// Per-commit durability for data writes. `Immediate` (default) fsyncs on
     /// every commit; `Eventual` (relaxed "normal" mode) lets commits return
     /// before the fsync, with the group-commit writer forcing a durable flush
@@ -272,7 +275,8 @@ fn configured_durability() -> Durability {
 impl Storage {
     /// Open (or create) the single ElyraSQL database file at `path`.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let db = Database::create(path).map_err(|e| Error::Storage(e.to_string()))?;
+        let pathbuf = path.as_ref().to_path_buf();
+        let db = Database::create(&pathbuf).map_err(|e| Error::Storage(e.to_string()))?;
         // Ensure the KV table exists so first reads don't fail.
         let wtx = db
             .begin_write()
@@ -284,9 +288,15 @@ impl Storage {
         wtx.commit().map_err(|e| Error::Storage(e.to_string()))?;
         Ok(Self {
             db,
+            path: Some(pathbuf),
             durability: configured_durability(),
             flush_seq: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+
+    /// The data file path this storage was opened from, if known.
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
     }
 
     /// Begin a write transaction at the configured data-write durability.
@@ -355,6 +365,7 @@ impl Storage {
         wtx.commit().map_err(|e| Error::Storage(e.to_string()))?;
         Ok(Self {
             db,
+            path: None,
             durability: Durability::Immediate,
             flush_seq: std::sync::atomic::AtomicU64::new(0),
         })

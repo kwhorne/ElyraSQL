@@ -286,6 +286,12 @@ impl Db {
         self.binlog_dir.as_deref()
     }
 
+    /// The data file path this database was opened from, if known (used to derive
+    /// sibling artifacts such as the vector-index cache).
+    pub fn data_path(&self) -> Option<std::path::PathBuf> {
+        self.storage.path().map(|p| p.to_path_buf())
+    }
+
     /// Install a consensus layer (Raft). After this, mutations are proposed
     /// through it (on the leader) rather than committed directly.
     pub fn set_consensus(&self, c: Arc<dyn Consensus>) {

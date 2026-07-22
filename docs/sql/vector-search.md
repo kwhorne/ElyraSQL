@@ -67,13 +67,19 @@ exact search.
   (so the graph stays healthy). The scan cost of a reconcile is the same as the
   old rebuild scan; what is saved is the O(N) graph reconstruction.
 
-!!! note "Persistence & very-high-write workloads"
-    The graph is **not yet persisted** to disk, so it is rebuilt on the first
-    query after a restart (cold start) — tracked as ESQL-27. Reconcile still reads
-    all current rows to diff them, so an extremely high sustained write rate
-    interleaved with queries pays that scan repeatedly; a write-log delta (to make
-    reconcile O(delta) with no scan) is a further optimization. For steady bulk
-    ingestion, batch writes.
+- The built graph is **persisted** to a sibling cache directory `<data>.vidx/`
+  (like `<data>.raftstate`), so a restart **loads** the graph and reconciles any
+  changes since, instead of rebuilding from scratch (no cold start). The cache is
+  regenerable: it lives outside the authoritative single file (so it is not
+  replicated or in backups), and a missing / corrupt / wrong-version snapshot
+  falls back to a rebuild. The snapshot is written on the first build and on
+  compaction (not on every small write).
+
+!!! note "Very-high-write workloads"
+    Reconcile still reads all current rows to diff them, so an extremely high
+    sustained write rate interleaved with queries pays that scan repeatedly; a
+    write-log delta (to make reconcile O(delta) with no scan) is a further
+    optimization. For steady bulk ingestion, batch writes.
 - Without the pattern (e.g. with a `WHERE` filter, or cosine/inner-product),
   the query falls back to **exact** search, which is always correct.
 

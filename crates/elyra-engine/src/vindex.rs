@@ -16,11 +16,149 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use tokio::sync::Mutex as AsyncMutex;
 
+use serde::{Deserialize, Serialize};
+
 use crate::session::Session;
 use elyra_core::{Error, Result, Value};
-use elyra_vector::{Hnsw, Metric};
+use elyra_vector::{Hnsw, HnswParts, Metric};
 
 use crate::catalog::{data_prefix, wcount_key, TableDef};
+
+/// On-disk vector-index cache (see ESQL-27). The graph is a regenerable cache,
+/// so it lives in a sibling directory `<data>.vidx/` (like `<data>.raftstate`),
+/// not in the authoritative single file — keeping it out of replication, backups
+/// and the global write-sequence that gates the column cache.
+const SNAP_VERSION: u32 = 1;
+
+#[derive(Serialize, Deserialize)]
+struct IndexSnapshot {
+    version: u32,
+    wcount: u64,
+    metric: u8,
+    dim: usize,
+    vectors: Vec<Vec<f32>>,
+    neighbors: Vec<Vec<Vec<u32>>>,
+    entry: u32,
+    max_level: usize,
+    rng_state: u64,
+    node_key: Vec<Option<Vec<u8>>>,
+    tombstones: usize,
+}
+
+fn metric_to_u8(m: Metric) -> u8 {
+    match m {
+        Metric::L2 => 0,
+        Metric::Cosine => 1,
+        Metric::InnerProduct => 2,
+    }
+}
+fn metric_from_u8(b: u8) -> Metric {
+    match b {
+        1 => Metric::Cosine,
+        2 => Metric::InnerProduct,
+        _ => Metric::L2,
+    }
+}
+
+/// Path of the persisted snapshot for `key` under the data file's `.vidx` dir.
+fn snapshot_path(db: &Session, key: &str) -> Option<std::path::PathBuf> {
+    let data = db.data_path()?;
+    let mut dir = data.clone().into_os_string();
+    dir.push(".vidx");
+    let dir = std::path::PathBuf::from(dir);
+    // Hash the key so table/column names never produce an unsafe filename.
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut h);
+    Some(dir.join(format!("{:016x}.hnsw", h.finish())))
+}
+
+/// Serialize the current state to bytes (clones the graph data).
+fn snapshot_bytes(st: &IndexState) -> Option<Vec<u8>> {
+    let parts = st.hnsw.export();
+    let snap = IndexSnapshot {
+        version: SNAP_VERSION,
+        wcount: st.wcount,
+        metric: metric_to_u8(parts.metric),
+        dim: parts.dim,
+        vectors: parts.vectors,
+        neighbors: parts.neighbors,
+        entry: parts.entry,
+        max_level: parts.max_level,
+        rng_state: parts.rng_state,
+        node_key: st.node_key.clone(),
+        tombstones: st.tombstones,
+    };
+    bincode::serialize(&snap).ok()
+}
+
+/// Persist the state to disk (best-effort; failures are logged, not fatal —
+/// the cache is regenerable). The serialize + write runs off the async runtime.
+async fn persist(db: &Session, key: &str, cached: &CachedIndex) {
+    let Some(path) = snapshot_path(db, key) else {
+        return;
+    };
+    let bytes = {
+        let st = cached.state.read().unwrap_or_else(|e| e.into_inner());
+        snapshot_bytes(&st)
+    };
+    let Some(bytes) = bytes else { return };
+    let _ = tokio::task::spawn_blocking(move || {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        // Atomic replace: write to a temp file then rename.
+        let tmp = path.with_extension("tmp");
+        if std::fs::write(&tmp, &bytes).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    })
+    .await;
+}
+
+/// Load a persisted snapshot into a fresh `CachedIndex`, or `None` if absent,
+/// unreadable, corrupt, or a different format version (caller then rebuilds).
+async fn load(db: &Session, key: &str) -> Option<CachedIndex> {
+    let path = snapshot_path(db, key)?;
+    let bytes = tokio::task::spawn_blocking(move || std::fs::read(&path).ok())
+        .await
+        .ok()??;
+    let snap: IndexSnapshot = bincode::deserialize(&bytes).ok()?;
+    if snap.version != SNAP_VERSION {
+        return None;
+    }
+    let parts = HnswParts {
+        dim: snap.dim,
+        metric: metric_from_u8(snap.metric),
+        vectors: snap.vectors,
+        neighbors: snap.neighbors,
+        entry: snap.entry,
+        max_level: snap.max_level,
+        rng_state: snap.rng_state,
+    };
+    let hnsw = Hnsw::from_parts(parts);
+    // Rebuild the key->node and key->hash maps from the persisted node_key and
+    // the graph's stored vectors.
+    let mut key_node = HashMap::new();
+    let mut key_hash = HashMap::new();
+    for (node, slot) in snap.node_key.iter().enumerate() {
+        if let Some(k) = slot {
+            key_node.insert(k.clone(), node as u32);
+            if let Some(v) = hnsw.vector(node as u32) {
+                key_hash.insert(k.clone(), vec_hash(v));
+            }
+        }
+    }
+    Some(CachedIndex {
+        state: RwLock::new(IndexState {
+            wcount: snap.wcount,
+            hnsw,
+            node_key: snap.node_key,
+            key_node,
+            key_hash,
+            tombstones: snap.tombstones,
+        }),
+    })
+}
 
 /// Mutable graph state, guarded by a single `RwLock` so searches read
 /// concurrently while a reconcile mutates in place.
@@ -157,17 +295,31 @@ impl VectorRegistry {
         let (dim, current) = scan_current(db, def, col).await?;
 
         if let Some(cached) = existing {
-            // Reconcile the existing graph against `current` in place.
-            reconcile(&cached, dim, current, metric, wcount);
+            // Warm cache: reconcile the existing graph against `current` in place.
+            // Persist only when a (infrequent) full rebuild/compaction happened;
+            // small incremental deltas are cheap to replay from disk on restart.
+            let rebuilt = reconcile(&cached, dim, current, metric, wcount);
+            if rebuilt {
+                persist(db, &key, &cached).await;
+            }
             Ok(cached)
         } else {
-            // First build for this key.
-            let built = Arc::new(full_build(dim, current, metric, wcount));
+            // Cold: reuse a persisted snapshot if present (avoids the cold-start
+            // rebuild), reconciling it to the current data; otherwise build fresh.
+            let cached = match load(db, &key).await {
+                Some(idx) => {
+                    let idx = Arc::new(idx);
+                    reconcile(&idx, dim, current, metric, wcount);
+                    idx
+                }
+                None => Arc::new(full_build(dim, current, metric, wcount)),
+            };
+            persist(db, &key, &cached).await;
             self.inner
                 .write()
                 .unwrap_or_else(|e| e.into_inner())
-                .insert(key, built.clone());
-            Ok(built)
+                .insert(key, cached.clone());
+            Ok(cached)
         }
     }
 
@@ -267,13 +419,15 @@ fn full_build(
 
 /// Reconcile `cached` against the current row set: apply the changed rows
 /// incrementally, or fall back to a full rebuild for a large change / compaction.
+/// Returns `true` if a full rebuild (compaction) was performed (so the caller
+/// may persist the fresh snapshot).
 fn reconcile(
     cached: &CachedIndex,
     dim: usize,
     current: Vec<(Vec<u8>, Vec<f32>)>,
     metric: Metric,
     wcount: u64,
-) {
+) -> bool {
     // Diff current against the cached live set (read lock only for the compare).
     let mut inserts: Vec<(Vec<u8>, Vec<f32>, u64)> = Vec::new();
     let mut updates: Vec<(Vec<u8>, Vec<f32>, u64)> = Vec::new();
@@ -320,7 +474,7 @@ fn reconcile(
         let fresh = full_build(dim, current, metric, wcount);
         let mut st = cached.state.write().unwrap_or_else(|e| e.into_inner());
         *st = fresh.state.into_inner().unwrap_or_else(|e| e.into_inner());
-        return;
+        return true;
     }
 
     // Incremental apply under the write lock.
@@ -346,6 +500,7 @@ fn reconcile(
         st.key_hash.insert(k, h);
     }
     st.wcount = wcount;
+    false
 }
 
 #[cfg(test)]
@@ -480,6 +635,51 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn persisted_index_survives_cold_start() {
+        let _serial = BUILD_TEST_LOCK.lock().await;
+        let (db, path) = temp_db();
+        let sess = Session::new(db, std::sync::Arc::new(LockManager::new()));
+        let def = vector_table();
+        let mut puts = Vec::new();
+        for i in 0..300i64 {
+            let mut key = data_prefix("vt");
+            key.extend_from_slice(&i.to_le_bytes());
+            let row = vec![
+                Value::Int(i),
+                Value::Vector(vec![i as f32, (i % 7) as f32, 1.0, 0.5]),
+            ];
+            puts.push((key, bincode::serialize(&row).unwrap()));
+        }
+        sess.commit_write(puts, vec![]).await.unwrap();
+
+        // First registry: builds the graph and persists a snapshot.
+        let reg1 = VectorRegistry::new();
+        let before = build_count();
+        let _ = reg1.get(&sess, &def, 1, Metric::L2).await.unwrap();
+        assert_eq!(build_count() - before, 1, "one build on first use");
+        let built = build_count();
+
+        // Simulate a restart: a fresh registry (empty in-memory) over the same
+        // data must load the persisted graph, NOT rebuild it.
+        let reg2 = VectorRegistry::new();
+        let c = reg2.get(&sess, &def, 1, Metric::L2).await.unwrap();
+        assert_eq!(
+            build_count(),
+            built,
+            "cold start reused the on-disk snapshot instead of rebuilding"
+        );
+        // And it is correct.
+        let hit = c.search_keys(&[42.0, 0.0, 1.0, 0.5], 1, 64);
+        assert_eq!(id_of(&hit[0].0), 42, "loaded index returns correct nearest");
+
+        // Cleanup the .edb and the sibling .vidx dir.
+        let _ = std::fs::remove_file(&path);
+        let mut vidx = path.clone().into_os_string();
+        vidx.push(".vidx");
+        let _ = std::fs::remove_dir_all(std::path::PathBuf::from(vidx));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

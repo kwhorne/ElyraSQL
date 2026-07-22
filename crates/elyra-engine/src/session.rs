@@ -267,6 +267,11 @@ impl Session {
         self.db.clone()
     }
 
+    /// The data file path, if known (used to locate the vector-index cache).
+    pub fn data_path(&self) -> Option<std::path::PathBuf> {
+        self.db.data_path()
+    }
+
     // --- transaction control ---
 
     pub fn begin(&self) -> Result<()> {

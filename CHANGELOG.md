@@ -8,6 +8,15 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ### Added
 
+- **Persisted HNSW vector index (ESQL-27).** The built graph is now saved to a
+  sibling cache directory `<data>.vidx/`, so a restart **loads** it and reconciles
+  any changes since — no cold-start rebuild from a full table scan. It is kept
+  outside the authoritative single file (like `<data>.raftstate`), so it is not
+  replicated, not in backups, and does not touch the global write sequence that
+  gates the column cache; a missing / corrupt / wrong-version snapshot safely
+  falls back to a rebuild. The snapshot is written on first build and on
+  compaction (not on every write). Verified end-to-end: an index survives a server
+  restart and returns correct nearest-neighbours without rebuilding.
 - **Incremental HNSW vector-index maintenance (ESQL-26).** A write to a
   vector-indexed table no longer forces the next ANN query to rebuild the whole
   graph. The cached index is reconciled against storage instead: only the rows

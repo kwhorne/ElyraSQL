@@ -8,7 +8,7 @@
 //! The distance math below is real and used for exact search / tests today.
 
 pub mod hnsw;
-pub use hnsw::Hnsw;
+pub use hnsw::{Hnsw, HnswParts};
 
 /// Distance/similarity metrics supported by ElyraSQL vector search.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
