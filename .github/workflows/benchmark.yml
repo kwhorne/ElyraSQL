@@ -6,12 +6,17 @@ name: Benchmark (native Linux)
 # Manual trigger; results are written to the run summary.
 
 on:
+  # Manual runs (with a custom row count) plus an automatic monthly run on the
+  # native-Linux runners so performance is tracked over time without being a
+  # per-PR gate. Results are reported in the job log / summary, not enforced.
   workflow_dispatch:
     inputs:
       rows:
         description: "Rows for the OLAP benchmark"
         default: "1000000"
         required: false
+  schedule:
+    - cron: "0 5 1 * *" # 05:00 UTC on the 1st of each month
 
 permissions:
   contents: read
@@ -79,7 +84,7 @@ jobs:
 
       - name: OLAP benchmark (vs MySQL, PostgreSQL)
         run: |
-          python3 bench/olap.py --rows "${{ github.event.inputs.rows }}" \
+          python3 bench/olap.py --rows "${{ github.event.inputs.rows || '1000000' }}" \
             --engines elyra,postgres,mysql \
             --elyra-port 3310 --mysql-port 3308 --postgres-port 5432 2>&1 | tee /tmp/olap.txt
           { echo '## OLAP benchmark — native Linux'; echo '```'; cat /tmp/olap.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
