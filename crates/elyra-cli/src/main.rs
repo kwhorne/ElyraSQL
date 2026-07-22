@@ -401,13 +401,24 @@ async fn run() -> anyhow::Result<()> {
             let db = Db::open(&data)?;
             let engine = Engine::new(db.clone());
 
-            // Apply the primary's stream in the background; exit if it ends.
+            // Apply the primary's stream in the background. `run_replica`
+            // reconnects transparently on stream drops and only returns when the
+            // primary requests a full resync (binlog gap) -- which needs a fresh
+            // re-bootstrap, i.e. a process restart (the file is wiped on startup
+            // above). Exit with EX_TEMPFAIL (75) so a supervisor treats it as a
+            // restartable transient condition rather than a crash.
             let rdb = db.clone();
             tokio::spawn(async move {
-                if let Err(e) = elyra_server::run_replica(primary, rdb).await {
-                    tracing::error!(error = %e, "replication stopped; exiting for restart");
-                    std::process::exit(1);
+                match elyra_server::run_replica(primary, rdb).await {
+                    Ok(()) => {
+                        tracing::info!("replication ended; restarting to re-bootstrap");
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "replication stopped; restarting to re-bootstrap");
+                    }
                 }
+                // Flush tracing output before terminating the process.
+                std::process::exit(75);
             });
 
             let auth = std::sync::Arc::new(elyra_server::Auth::open().with_db(db));

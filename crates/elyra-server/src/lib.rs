@@ -397,10 +397,11 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for ElyraShim {
         let user = self.user();
         self.procs.begin_query(self.conn_id, &sql);
         let start = std::time::Instant::now();
-        let res = self
-            .engine
-            .execute_as(&sql, privilege, &user, &self.session)
-            .await;
+        let res = with_query_timeout(
+            self.engine
+                .execute_as(&sql, privilege, &user, &self.session),
+        )
+        .await;
         self.metrics.record(&sql, res.is_ok(), start.elapsed());
         self.procs.end_query(self.conn_id);
         if let Some(a) = &self.audit {
@@ -449,9 +450,11 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for ElyraShim {
         let user = self.user();
         self.procs.begin_query(self.conn_id, query);
         let start = std::time::Instant::now();
-        let res = self
-            .engine
-            .execute_as(query, privilege, &user, &self.session)
+        let res =
+            with_query_timeout(
+                self.engine
+                    .execute_as(query, privilege, &user, &self.session),
+            )
             .await;
         self.metrics.record(query, res.is_ok(), start.elapsed());
         self.procs.end_query(self.conn_id);
@@ -635,6 +638,39 @@ pub(crate) fn env_flag(var: &str) -> bool {
             .as_deref(),
         Some("1" | "true" | "yes" | "on")
     )
+}
+
+/// Optional per-query wall-clock timeout (`ELYRASQL_QUERY_TIMEOUT_MS`; `0`/unset
+/// = no limit). Read once.
+fn query_timeout() -> Option<std::time::Duration> {
+    use std::sync::OnceLock;
+    static T: OnceLock<Option<std::time::Duration>> = OnceLock::new();
+    *T.get_or_init(|| {
+        std::env::var("ELYRASQL_QUERY_TIMEOUT_MS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .filter(|&ms| ms > 0)
+            .map(std::time::Duration::from_millis)
+    })
+}
+
+/// Run a query future under the configured timeout, if any. On expiry the client
+/// receives a query error immediately; CPU-bound work already handed to a
+/// blocking thread may finish in the background, but the connection is unblocked.
+async fn with_query_timeout<T, F>(fut: F) -> std::result::Result<T, elyra_core::Error>
+where
+    F: std::future::Future<Output = std::result::Result<T, elyra_core::Error>>,
+{
+    match query_timeout() {
+        Some(d) => match tokio::time::timeout(d, fut).await {
+            Ok(r) => r,
+            Err(_) => Err(elyra_core::Error::Query(format!(
+                "query exceeded ELYRASQL_QUERY_TIMEOUT_MS ({} ms)",
+                d.as_millis()
+            ))),
+        },
+        None => fut.await,
+    }
 }
 
 /// Bind and serve ElyraSQL over the MySQL protocol until cancelled.
