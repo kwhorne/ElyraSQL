@@ -18,7 +18,10 @@ judge fit before deploying.
   INTO`, `CLOSE`) and **condition handlers** (`DECLARE {CONTINUE|EXIT} HANDLER
   FOR {NOT FOUND | SQLEXCEPTION | SQLSTATE '...' | <code>} <action>`) are
   supported; a handler action is a single statement (not a `BEGIN ... END`
-  block), and handlers are scoped to the whole procedure body.
+  block), and handlers are scoped to the whole procedure body. **`OPEN` buffers
+  the cursor's full result set in memory** (it is not a streaming server-side
+  cursor), so cursors are intended for the modest result sets typical of
+  procedural logic, not for iterating huge tables.
 - Row-level triggers are supported: `CREATE TRIGGER name {BEFORE|AFTER}
   {INSERT|UPDATE|DELETE} ON t FOR EACH ROW <body>`, with `NEW.col`/`OLD.col`.
   BEFORE bodies support `SET NEW.col = expr`; AFTER bodies run arbitrary DML.
@@ -202,7 +205,11 @@ judge fit before deploying.
 
 - **Snapshot** isolation (default, first-committer-wins) and **serializable**
   isolation (opt-in), both optimistic (validate-on-commit; conflicts abort with
-  error `1213` rather than blocking).
+  error `1213` rather than blocking). Serializable validates every range the
+  transaction scanned by re-reading it at commit, so commit cost scales with the
+  read set; a single scanned range over `ELYRASQL_SERIALIZABLE_MAX_RANGE` rows
+  (default 5,000,000) aborts the commit (fail-safe against unbounded memory)
+  rather than materializing without limit.
 - `SAVEPOINT` / `ROLLBACK TO SAVEPOINT` / `RELEASE SAVEPOINT` are supported.
 - `SELECT ... FOR UPDATE` / `FOR SHARE` provide **optimistic** row locking: a
   locked row that another transaction changes aborts your commit. Row locking is

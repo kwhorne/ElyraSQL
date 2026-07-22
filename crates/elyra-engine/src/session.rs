@@ -102,6 +102,17 @@ fn txn_max_bytes() -> usize {
         .unwrap_or(1usize << 30)
 }
 
+/// Max rows in a single scanned range that a SERIALIZABLE commit will
+/// materialize for phantom validation (`ELYRASQL_SERIALIZABLE_MAX_RANGE`,
+/// default 5,000,000). A larger range aborts the commit rather than risking OOM.
+fn serializable_max_range() -> usize {
+    std::env::var("ELYRASQL_SERIALIZABLE_MAX_RANGE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(5_000_000)
+}
+
 fn txn_overflow(budget: usize) -> Error {
     Error::Query(format!(
         "transaction write buffer exceeded {budget} bytes; COMMIT or ROLLBACK \
@@ -409,10 +420,24 @@ impl Session {
         // commit to detect phantoms / concurrent range changes.
         let mut range_snaps: Vec<RangeSnapshot> = Vec::new();
         if serializable {
+            // SERIALIZABLE validates every scanned range by re-reading it at
+            // commit, so the read set is materialized. Bound that memory: refuse
+            // (fail-safe, never silently miss a phantom) a range larger than
+            // `ELYRASQL_SERIALIZABLE_MAX_RANGE` rather than risk OOM.
+            let cap = serializable_max_range();
             for (start, end) in ranges {
                 let snap = snapshot.clone();
                 let (s, e) = (start.clone(), end.clone());
-                let content = spawn(move || snap.scan_range(&s, e.as_deref(), usize::MAX)).await?;
+                let limit = cap.saturating_add(1);
+                let content = spawn(move || snap.scan_range(&s, e.as_deref(), limit)).await?;
+                if content.len() > cap {
+                    // Transaction was already cleared above -> this aborts it.
+                    return Err(Error::Query(format!(
+                        "SERIALIZABLE commit read a range of over {cap} rows; narrow the \
+                         predicate, raise ELYRASQL_SERIALIZABLE_MAX_RANGE, or use a lower \
+                         isolation level"
+                    )));
+                }
                 range_snaps.push(RangeSnapshot {
                     start,
                     end,
