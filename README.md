@@ -43,7 +43,7 @@ workload — served over the protocol your stack already knows.
 **[→ Get started in 60 seconds](#quick-start)** &nbsp;·&nbsp;
 **[→ Full documentation](https://elyracode.com/docs/sql-server)**
 
-> **Stable release: v1.4.8.** A broad, MySQL-compatible SQL engine: full
+> **Stable release: v1.4.9.** A broad, MySQL-compatible SQL engine: full
 > DDL/DML, all join types (INNER/LEFT/RIGHT/FULL/CROSS, streamed for large
 > analytical joins), subqueries (correlated too), CTEs (incl. `WITH RECURSIVE`),
 > window functions, `GROUP BY ... WITH ROLLUP`, set operations, transactions
@@ -175,7 +175,7 @@ mysql -h 127.0.0.1 -P 3307 -u root -p
 SELECT 1;
 SELECT 1 + 1 AS two;
 SELECT 'hei fra ElyraSQL' AS msg;
-SELECT VERSION();   -- 8.0.0-ElyraSQL-1.4.8
+SELECT VERSION();   -- 8.0.0-ElyraSQL-1.4.9
 ```
 
 ## Configuration
@@ -204,8 +204,8 @@ Static Linux binaries (x86_64 and aarch64) are attached to each
 
 ```bash
 curl -L -o elyrasql.tar.gz \
-  https://github.com/kwhorne/ElyraSQL/releases/download/v1.4.8/elyrasql-1.4.8-linux-x86_64.tar.gz
-tar xzf elyrasql.tar.gz && ./elyrasql-1.4.8-linux-x86_64/elyrasql serve
+  https://github.com/kwhorne/ElyraSQL/releases/download/v1.4.9/elyrasql-1.4.9-linux-x86_64.tar.gz
+tar xzf elyrasql.tar.gz && ./elyrasql-1.4.9-linux-x86_64/elyrasql serve
 ```
 
 ## Docker
@@ -213,7 +213,7 @@ tar xzf elyrasql.tar.gz && ./elyrasql-1.4.8-linux-x86_64/elyrasql serve
 Multi-arch image (amd64 + arm64) on GHCR:
 
 ```bash
-docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.4.8
+docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.4.9
 # with auth + a persistent volume:
 docker run -p 3307:3307 -v elyra:/var/lib/elyrasql \
   -e ELYRASQL_USER=root -e ELYRASQL_PASSWORD=secret \

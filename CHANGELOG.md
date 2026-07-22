@@ -4,6 +4,45 @@ All notable changes to ElyraSQL are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.4.9] - 2026-07-21
+
+Reliability & cache-efficiency pass from a second codebase review. Also documents
+several architectural gaps honestly (with tracking issues) rather than rushing
+correctness-sensitive rewrites. No on-disk format change.
+
+### Fixed
+
+- **Lock-poison recovery.** The vector-index registry, the OLAP column cache, and
+  the HNSW scratch-buffer pool now recover a poisoned lock via `into_inner()`
+  instead of `.unwrap()` panicking. These guard only self-healing caches / reusable
+  scratch pools, so a panic in one query no longer cascades into a whole-process
+  crash on the next lock acquisition (worst case: a stale/missing cache entry that
+  is rebuilt).
+- The MySQL connection handler no longer panics on a TLS-capability mismatch
+  (carried from 1.4.8): the one connection is dropped with a clean error.
+
+### Changed
+
+- **Column cache eviction is now approximate-LRU** instead of arbitrary: each
+  cached table carries an atomic `last_used` tick bumped on read (no lock
+  upgrade), and eviction drops the least-recently-used entries to fit the budget.
+
+### Documented (known limitations, with tracking issues)
+
+- Vector (HNSW) index rebuilds fully on any table write and is not persisted
+  (cold start) — best for read-heavy / batch-updated embedding workloads today
+  (ESQL-26 incremental maintenance, ESQL-27 persistence).
+- `WHERE col IN (SELECT ...)` and `DISTINCT` collection are in-memory (no spill);
+  correlated subqueries run as `O(N×M)` nested loops (ESQL-28).
+- Joins of more than two tables / complex expressions use the materialising path
+  (ESQL-29).
+- Intra-cluster Raft/replication traffic is authenticated (cluster secret) but not
+  encrypted (ESQL-30).
+- Isolation: all four standard levels are accepted; `SERIALIZABLE` and snapshot are
+  the two engines (snapshot is at least as strong as `READ UNCOMMITTED`/
+  `READ COMMITTED`/`REPEATABLE READ`), and `@@transaction_isolation` reports
+  `REPEATABLE-READ`.
+
 ## [1.4.8] - 2026-07-21
 
 Hardening pass from an external review — safer defaults, a query timeout, bounded
@@ -1494,6 +1533,7 @@ core CRUD with `WHERE`/`ORDER BY`/`LIMIT`, indexes, aggregation and `GROUP BY`,
 joins, prepared statements, authentication and TLS, vector search (exact +
 HNSW), parallel OLAP aggregation, and transactions with snapshot isolation.
 
+[1.4.9]: https://github.com/kwhorne/ElyraSQL/releases/tag/v1.4.9
 [1.4.8]: https://github.com/kwhorne/ElyraSQL/releases/tag/v1.4.8
 [1.4.7]: https://github.com/kwhorne/ElyraSQL/releases/tag/v1.4.7
 [1.4.6]: https://github.com/kwhorne/ElyraSQL/releases/tag/v1.4.6
