@@ -4,6 +4,42 @@ All notable changes to ElyraSQL are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+Hardening pass from an external review — safer defaults, a query timeout, bounded
+memory on an edge path, and more direct tests. No on-disk format change.
+
+### Security
+
+- **Safe-by-default open auth.** With no accounts configured (every client would
+  be `Admin`), the server now *refuses to start* when bound to a non-loopback
+  address. Override by configuring accounts, binding to localhost (the default,
+  so local dev is unchanged), or setting `ELYRASQL_ALLOW_OPEN_AUTH=1`.
+- **Replication exposure guard.** The replication endpoint (authenticated only
+  when `ELYRASQL_CLUSTER_SECRET` is set) refuses a non-loopback bind without a
+  secret unless `ELYRASQL_ALLOW_OPEN_AUTH=1`; warns loudly when unauthenticated.
+
+### Added
+
+- **Per-query timeout** `ELYRASQL_QUERY_TIMEOUT_MS` (0 = off): a statement running
+  longer returns a clean error and unblocks the client.
+- **`ELYRASQL_SERIALIZABLE_MAX_RANGE`** (default 5,000,000): a `SERIALIZABLE`
+  commit whose validation would materialize a larger scanned range now aborts
+  fail-safe instead of risking unbounded memory.
+
+### Changed / Fixed
+
+- The connection handler no longer panics on a TLS-capability mismatch; the one
+  connection is dropped with a clean error.
+- The replica restarts with a clear, deliberate `EX_TEMPFAIL` (75) exit on a
+  resync-driven re-bootstrap instead of a bare `exit(1)`.
+
+### Testing
+
+- Direct unit tests for the `ORDER BY` planning helpers in `exec.rs` (previously
+  covered only indirectly), plus unit tests for the bind-exposure classifier.
+- Benchmarks now also run on a monthly CI schedule (still non-gating).
+
 ## [1.4.7] - 2026-07-20
 
 Performance release: sorting on a **nullable** column now uses the secondary
