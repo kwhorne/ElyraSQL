@@ -53,23 +53,27 @@ When a query matches the pattern `ORDER BY VEC_DISTANCE(col, q) LIMIT k` with no
 nearest-neighbour search — typically **sub-millisecond**, versus a full scan for
 exact search.
 
-- The index is **cached in memory** and **rebuilt when the table changes**
-  (rebuild-when-stale), which suits read-heavy embedding workloads. Rebuilds are
-  **single-flight**: if many queries arrive at once after a write, only one
-  rebuilds the index while the others wait for and share its result, so a burst
-  of concurrent queries can't trigger a stampede of parallel full-table scans.
+- The index is **cached in memory** and **incrementally reconciled** when the
+  table changes: on the first query after a write, only the rows that were
+  inserted, updated or deleted since the last reconcile are applied to the
+  existing graph (new vectors inserted, removed/superseded ones soft-tombstoned),
+  rather than rebuilding all N vectors. So a single `INSERT` into a 500k-row
+  vector table adds one node instead of rebuilding 500k. The change set is
+  detected content-wise (per-row vector hash), so `INSERT`/`UPDATE`/`DELETE` are
+  all handled correctly. Reconciles are **single-flight**: a burst of concurrent
+  queries after a write triggers exactly one reconcile, shared by all.
+- A **full rebuild** is used only for the first build, for a change as large as
+  the table itself, or to **compact** when too many nodes have been tombstoned
+  (so the graph stays healthy). The scan cost of a reconcile is the same as the
+  old rebuild scan; what is saved is the O(N) graph reconstruction.
 
-!!! warning "Rebuild cost on write-heavy vector workloads"
-    The cache is invalidated by **any** write to the table (tracked by a per-table
-    write counter), and the next vector query then rebuilds the **whole** HNSW
-    graph from a full table scan — it is not yet maintained incrementally. On a
-    large, frequently-mutated vector table this is expensive (a single insert
-    makes the next ANN query rebuild the entire graph). The graph is also **not
-    persisted**, so it is rebuilt on the first query after a restart (cold start).
-    ElyraSQL is best suited to **read-heavy / batch-updated** embedding workloads
-    today; incremental maintenance and on-disk persistence are planned
-    (ESQL-26 / ESQL-27). For steady high-write vector ingestion, batch writes and
-    keep queries off the table during ingestion.
+!!! note "Persistence & very-high-write workloads"
+    The graph is **not yet persisted** to disk, so it is rebuilt on the first
+    query after a restart (cold start) — tracked as ESQL-27. Reconcile still reads
+    all current rows to diff them, so an extremely high sustained write rate
+    interleaved with queries pays that scan repeatedly; a write-log delta (to make
+    reconcile O(delta) with no scan) is a further optimization. For steady bulk
+    ingestion, batch writes.
 - Without the pattern (e.g. with a `WHERE` filter, or cosine/inner-product),
   the query falls back to **exact** search, which is always correct.
 

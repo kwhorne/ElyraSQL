@@ -1,10 +1,10 @@
 //! A compact, dependency-free HNSW index (Hierarchical Navigable Small
 //! World) for approximate nearest-neighbour search.
 //!
-//! Built in one batch from a set of vectors, then queried many times. ElyraSQL
-//! rebuilds it from the single-file data when the table changes, so there is
-//! no incremental insert/delete to keep consistent — the graph is always a
-//! faithful snapshot.
+//! Built in one batch from a set of vectors, then queried many times, and also
+//! grown incrementally via [`Hnsw::insert_one`] so a single new row does not
+//! force a full rebuild. Deletions are handled one level up (in the caller) by
+//! soft-tombstoning a node id and periodically compacting via a fresh build.
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
@@ -66,6 +66,8 @@ pub struct Hnsw {
     neighbors: Vec<Vec<Vec<u32>>>,
     entry: u32,
     max_level: usize,
+    /// Level-assignment RNG, kept so incremental inserts continue the sequence.
+    rng: Rng,
 }
 
 /// Ordered by distance; used as a max-heap (farthest on top).
@@ -116,13 +118,13 @@ impl Hnsw {
             neighbors: Vec::with_capacity(n),
             entry: 0,
             max_level: 0,
+            rng: Rng(0x9E3779B97F4A7C15),
         };
-        let mut rng = Rng(0x9E3779B97F4A7C15);
         let ml = 1.0 / (M as f32).ln();
         let mut visited = Visited::new(n);
 
         for node in 0..n {
-            let level = ((-rng.next_f32().max(1e-9).ln()) * ml) as usize;
+            let level = ((-idx.rng.next_f32().max(1e-9).ln()) * ml) as usize;
             idx.neighbors.push(vec![Vec::new(); level + 1]);
             if node == 0 {
                 idx.entry = 0;
@@ -132,6 +134,44 @@ impl Hnsw {
             idx.insert(node as u32, level, &mut visited);
         }
         idx
+    }
+
+    /// Number of nodes in the graph (including any soft-tombstoned by the caller).
+    pub fn len(&self) -> usize {
+        self.vectors.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.vectors.is_empty()
+    }
+
+    /// Insert one vector into the existing graph and return its node id. Used for
+    /// incremental maintenance so a single new row does not trigger a full
+    /// rebuild. `v.len()` must equal [`Hnsw::dim`].
+    pub fn insert_one(&mut self, v: Vec<f32>) -> u32 {
+        let id = self.vectors.len() as u32;
+        let ml = 1.0 / (M as f32).ln();
+        let level = ((-self.rng.next_f32().max(1e-9).ln()) * ml) as usize;
+        self.vectors.push(v);
+        self.neighbors.push(vec![Vec::new(); level + 1]);
+        if id == 0 {
+            self.entry = 0;
+            self.max_level = level;
+            return 0;
+        }
+        let mut visited = self
+            .visited_pool
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop()
+            .unwrap_or_else(|| Visited::new(self.vectors.len()));
+        visited.ensure(self.vectors.len());
+        self.insert(id, level, &mut visited);
+        self.visited_pool
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(visited);
+        id
     }
 
     fn dist_to(&self, node: u32, q: &[f32]) -> f32 {
@@ -290,7 +330,7 @@ impl Hnsw {
         let mut visited = self
             .visited_pool
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .pop()
             .unwrap_or_else(|| Visited::new(self.vectors.len()));
         visited.ensure(self.vectors.len());
@@ -360,6 +400,40 @@ mod tests {
         }
         let recall = hits as f32 / total as f32;
         assert!(recall > 0.85, "recall too low: {recall}");
+    }
+
+    #[test]
+    fn incremental_insert_keeps_recall() {
+        // Build a small seed graph, then grow it one vector at a time with
+        // insert_one; recall vs. brute force must stay high.
+        let mut rng = Rng(7);
+        let dim = 16;
+        let n = 2000;
+        let vectors: Vec<Vec<f32>> = (0..n)
+            .map(|_| (0..dim).map(|_| rng.next_f32()).collect())
+            .collect();
+        let seed = 200;
+        let mut index = Hnsw::build(vectors[..seed].to_vec(), dim, Metric::L2);
+        for v in &vectors[seed..] {
+            index.insert_one(v.clone());
+        }
+        assert_eq!(index.len(), n);
+
+        let k = 10;
+        let (mut hits, mut total) = (0, 0);
+        for _ in 0..100 {
+            let q: Vec<f32> = (0..dim).map(|_| rng.next_f32()).collect();
+            let exact: std::collections::HashSet<u32> =
+                brute_force(&vectors, &q, k).into_iter().collect();
+            for (node, _) in index.search(&q, k, 64) {
+                if exact.contains(&node) {
+                    hits += 1;
+                }
+                total += 1;
+            }
+        }
+        let recall = hits as f32 / total as f32;
+        assert!(recall > 0.85, "incremental recall too low: {recall}");
     }
 
     #[test]

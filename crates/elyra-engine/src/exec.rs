@@ -3878,11 +3878,8 @@ pub async fn select(
                     .any(|i| i.vector && i.single_col() == Some(col))
                 {
                     let cached = vindex.get(db, &def, col, Metric::L2).await?;
-                    let hits = cached.index.search(&q, k, (k * 4).max(64));
-                    let keys: Vec<Vec<u8>> = hits
-                        .iter()
-                        .map(|(node, _)| cached.keys[*node as usize].clone())
-                        .collect();
+                    let hits = cached.search_keys(&q, k, (k * 4).max(64));
+                    let keys: Vec<Vec<u8>> = hits.iter().map(|(key, _)| key.clone()).collect();
                     let blobs = db.multi_get(keys).await?;
                     let mut rows = Vec::with_capacity(blobs.len());
                     for bytes in blobs.into_iter().flatten() {
@@ -10141,11 +10138,11 @@ async fn hybrid_select(
         )));
     }
     let cached = vindex.get(db, def, vec_ci, Metric::L2).await?;
-    let hits = cached.index.search(&qvec, fanout, (fanout * 2).max(64));
+    let hits = cached.search_keys(&qvec, fanout, (fanout * 2).max(64));
     let vec_rank: HashMap<Vec<u8>, usize> = hits
         .iter()
         .enumerate()
-        .map(|(rank, (node, _))| (cached.keys[*node as usize].clone(), rank))
+        .map(|(rank, (key, _))| (key.clone(), rank))
         .collect();
 
     // --- Full-text ranking (term-frequency over stemmed query terms) ---

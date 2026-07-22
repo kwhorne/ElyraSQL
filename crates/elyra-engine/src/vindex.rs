@@ -1,12 +1,17 @@
-//! In-memory vector-index (HNSW) registry with rebuild-when-stale caching.
+//! In-memory vector-index (HNSW) registry with incremental, stale-aware caching.
 //!
 //! ElyraSQL keeps the authoritative vectors in the single file. The HNSW graph
-//! is a cached, memory-resident snapshot keyed by `table.column`. Whenever the
-//! table's write counter advances, the cached index is considered stale and
-//! rebuilt from storage on the next query. This keeps ANN results correct
-//! without any incremental graph maintenance.
+//! is a cached, memory-resident snapshot keyed by `table.column`. When the
+//! table's write counter advances, the next query **reconciles** the cache
+//! against storage: rows that changed since the last reconcile are inserted or
+//! soft-tombstoned in the existing graph (O(delta) graph work), rather than
+//! rebuilding all N vectors from scratch. A full rebuild is used only for the
+//! first build, for a large change, or to compact when too many nodes are dead.
+//! The diff is content-based (per-row vector hash), so it is correct for
+//! INSERT / UPDATE / DELETE regardless of the coarse write counter.
 
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, RwLock};
 
 use tokio::sync::Mutex as AsyncMutex;
@@ -17,11 +22,61 @@ use elyra_vector::{Hnsw, Metric};
 
 use crate::catalog::{data_prefix, wcount_key, TableDef};
 
-/// A cached HNSW plus the data key for each graph node.
+/// Mutable graph state, guarded by a single `RwLock` so searches read
+/// concurrently while a reconcile mutates in place.
+struct IndexState {
+    wcount: u64,
+    hnsw: Hnsw,
+    /// `node_key[node]` = the row's data key, or `None` if the node is a
+    /// soft-tombstoned (deleted/superseded) graph waypoint.
+    node_key: Vec<Option<Vec<u8>>>,
+    /// Live data key -> node id.
+    key_node: HashMap<Vec<u8>, u32>,
+    /// Live data key -> vector content hash (for change detection).
+    key_hash: HashMap<Vec<u8>, u64>,
+    /// Count of tombstoned nodes (drives compaction).
+    tombstones: usize,
+}
+
+/// A cached HNSW index over one `table.column`.
 pub struct CachedIndex {
-    pub wcount: u64,
-    pub keys: Vec<Vec<u8>>,
-    pub index: Hnsw,
+    state: RwLock<IndexState>,
+}
+
+impl CachedIndex {
+    /// Approximate nearest neighbours as `(data_key, distance)`, tombstoned nodes
+    /// filtered out. Over-fetches to absorb tombstoned hits and still return `k`.
+    pub fn search_keys(&self, q: &[f32], k: usize, ef: usize) -> Vec<(Vec<u8>, f32)> {
+        let st = self.state.read().unwrap_or_else(|e| e.into_inner());
+        if st.hnsw.is_empty() || k == 0 {
+            return Vec::new();
+        }
+        let want = k
+            .saturating_add(st.tombstones.min(k.saturating_mul(4)))
+            .max(k)
+            + 1;
+        let hits = st.hnsw.search(q, want, ef.max(want));
+        let mut out = Vec::with_capacity(k);
+        for (node, d) in hits {
+            if let Some(Some(key)) = st.node_key.get(node as usize) {
+                out.push((key.clone(), d));
+                if out.len() >= k {
+                    break;
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Content hash of a vector for change detection (order-sensitive over the bits).
+fn vec_hash(v: &[f32]) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    v.len().hash(&mut h);
+    for &x in v {
+        x.to_bits().hash(&mut h);
+    }
+    h.finish()
 }
 
 #[derive(Clone, Default)]
@@ -59,7 +114,13 @@ impl VectorRegistry {
             .get(&key)
             .cloned()
         {
-            if cached.wcount == wcount {
+            if cached
+                .state
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .wcount
+                == wcount
+            {
                 return Ok(cached);
             }
         }
@@ -74,25 +135,40 @@ impl VectorRegistry {
         // waited for the lock. Re-read the write counter in case more writes
         // landed meanwhile, then reuse a cached index that already matches it.
         let wcount = read_wcount(db, &def.name).await?;
-        if let Some(cached) = self
+        let existing = self
             .inner
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .get(&key)
-            .cloned()
-        {
-            if cached.wcount == wcount {
-                return Ok(cached);
+            .cloned();
+        if let Some(cached) = &existing {
+            if cached
+                .state
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .wcount
+                == wcount
+            {
+                return Ok(cached.clone());
             }
         }
 
-        // (Re)build from storage.
-        let built = Arc::new(build(db, def, col, metric, wcount).await?);
-        self.inner
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(key, built.clone());
-        Ok(built)
+        // Scan the authoritative vectors once (same I/O the old full rebuild paid).
+        let (dim, current) = scan_current(db, def, col).await?;
+
+        if let Some(cached) = existing {
+            // Reconcile the existing graph against `current` in place.
+            reconcile(&cached, dim, current, metric, wcount);
+            Ok(cached)
+        } else {
+            // First build for this key.
+            let built = Arc::new(full_build(dim, current, metric, wcount));
+            self.inner
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(key, built.clone());
+            Ok(built)
+        }
     }
 
     /// The shared build lock for `key`, creating it on first use.
@@ -123,20 +199,17 @@ pub fn build_count() -> u64 {
     BUILDS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-async fn build(
+/// Scan the table's non-empty vectors from `col`, in clustered order, as
+/// `(data_key, vector)` pairs plus the dimensionality.
+async fn scan_current(
     db: &Session,
     def: &TableDef,
     col: usize,
-    metric: Metric,
-    wcount: u64,
-) -> Result<CachedIndex> {
-    BUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+) -> Result<(usize, Vec<(Vec<u8>, Vec<f32>)>)> {
     let prefix = data_prefix(&def.name);
     let mut cursor: Option<Vec<u8>> = None;
-    let mut vectors: Vec<Vec<f32>> = Vec::new();
-    let mut keys: Vec<Vec<u8>> = Vec::new();
+    let mut out: Vec<(Vec<u8>, Vec<f32>)> = Vec::new();
     let mut dim = 0usize;
-
     loop {
         let chunk = db.scan_batch(prefix.clone(), cursor.clone(), 4096).await?;
         if chunk.is_empty() {
@@ -150,8 +223,7 @@ async fn build(
             if let Some(Value::Vector(vec)) = row.get(col) {
                 if !vec.is_empty() {
                     dim = vec.len();
-                    vectors.push(vec.clone());
-                    keys.push(k);
+                    out.push((k, vec.clone()));
                 }
             }
         }
@@ -159,13 +231,121 @@ async fn build(
             break;
         }
     }
+    Ok((dim, out))
+}
 
-    let index = Hnsw::build(vectors, dim, metric);
-    Ok(CachedIndex {
-        wcount,
-        keys,
-        index,
-    })
+/// Build a fresh index from the full current set (initial build / compaction).
+fn full_build(
+    dim: usize,
+    current: Vec<(Vec<u8>, Vec<f32>)>,
+    metric: Metric,
+    wcount: u64,
+) -> CachedIndex {
+    BUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut vectors = Vec::with_capacity(current.len());
+    let mut node_key = Vec::with_capacity(current.len());
+    let mut key_node = HashMap::with_capacity(current.len());
+    let mut key_hash = HashMap::with_capacity(current.len());
+    for (node, (k, v)) in current.into_iter().enumerate() {
+        key_hash.insert(k.clone(), vec_hash(&v));
+        key_node.insert(k.clone(), node as u32);
+        node_key.push(Some(k));
+        vectors.push(v);
+    }
+    let hnsw = Hnsw::build(vectors, dim, metric);
+    CachedIndex {
+        state: RwLock::new(IndexState {
+            wcount,
+            hnsw,
+            node_key,
+            key_node,
+            key_hash,
+            tombstones: 0,
+        }),
+    }
+}
+
+/// Reconcile `cached` against the current row set: apply the changed rows
+/// incrementally, or fall back to a full rebuild for a large change / compaction.
+fn reconcile(
+    cached: &CachedIndex,
+    dim: usize,
+    current: Vec<(Vec<u8>, Vec<f32>)>,
+    metric: Metric,
+    wcount: u64,
+) {
+    // Diff current against the cached live set (read lock only for the compare).
+    let mut inserts: Vec<(Vec<u8>, Vec<f32>, u64)> = Vec::new();
+    let mut updates: Vec<(Vec<u8>, Vec<f32>, u64)> = Vec::new();
+    let mut seen: std::collections::HashSet<Vec<u8>> =
+        std::collections::HashSet::with_capacity(current.len());
+    {
+        let st = cached.state.read().unwrap_or_else(|e| e.into_inner());
+        for (k, v) in &current {
+            seen.insert(k.clone());
+            let h = vec_hash(v);
+            match st.key_hash.get(k) {
+                Some(&old) if old == h => {} // unchanged
+                Some(_) => updates.push((k.clone(), v.clone(), h)),
+                None => inserts.push((k.clone(), v.clone(), h)),
+            }
+        }
+    }
+    // Deletions: live keys no longer present.
+    let deletes: Vec<Vec<u8>> = {
+        let st = cached.state.read().unwrap_or_else(|e| e.into_inner());
+        st.key_node
+            .keys()
+            .filter(|k| !seen.contains(*k))
+            .cloned()
+            .collect()
+    };
+
+    let delta = inserts.len() + updates.len() + deletes.len();
+    let n = current.len();
+
+    // Decide: full rebuild vs. incremental. Rebuild when the change is as large
+    // as the data, or when compaction is warranted (too many dead nodes would
+    // remain), or the set is tiny (rebuild is cheap and keeps the graph pristine).
+    let tombs_after = {
+        let st = cached.state.read().unwrap_or_else(|e| e.into_inner());
+        st.tombstones + deletes.len() + updates.len()
+    };
+    let live_after = n;
+    // Only rebuild when something actually changed and it is a large change,
+    // compaction is due, or the set is tiny (rebuild is trivially cheap then).
+    let rebuild = delta > 0 && (n < 256 || delta >= n.max(1) || tombs_after > live_after);
+
+    if rebuild {
+        let fresh = full_build(dim, current, metric, wcount);
+        let mut st = cached.state.write().unwrap_or_else(|e| e.into_inner());
+        *st = fresh.state.into_inner().unwrap_or_else(|e| e.into_inner());
+        return;
+    }
+
+    // Incremental apply under the write lock.
+    let mut st = cached.state.write().unwrap_or_else(|e| e.into_inner());
+    // Deletes + the old side of updates -> tombstone.
+    for k in deletes.iter().chain(updates.iter().map(|(k, _, _)| k)) {
+        if let Some(node) = st.key_node.remove(k) {
+            if let Some(slot) = st.node_key.get_mut(node as usize) {
+                if slot.is_some() {
+                    *slot = None;
+                    st.tombstones += 1;
+                }
+            }
+            st.key_hash.remove(k);
+        }
+    }
+    // Inserts + the new side of updates -> new graph node.
+    for (k, v, h) in inserts.into_iter().chain(updates) {
+        let node = st.hnsw.insert_one(v);
+        debug_assert_eq!(node as usize, st.node_key.len());
+        st.node_key.push(Some(k.clone()));
+        st.key_node.insert(k.clone(), node);
+        st.key_hash.insert(k, h);
+    }
+    st.wcount = wcount;
 }
 
 #[cfg(test)]
@@ -175,6 +355,10 @@ mod tests {
     use crate::lockmgr::LockManager;
     use elyra_core::{ColumnDef, ColumnType, Schema};
     use elyra_storage::Db;
+
+    // `build_count()` is a process-global counter, so the two tests that assert
+    // on it must not overlap. Serialize them on a shared async lock.
+    static BUILD_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     fn temp_db() -> (Db, std::path::PathBuf) {
         let mut p = std::env::temp_dir();
@@ -205,8 +389,102 @@ mod tests {
         }
     }
 
+    async fn bump(sess: &Session) -> (Vec<u8>, Vec<u8>) {
+        let next = read_wcount(sess, "vt").await.unwrap() + 1;
+        (wcount_key("vt"), next.to_le_bytes().to_vec())
+    }
+    // Write one (id, vector) row and bump the write counter (like a real DML).
+    async fn put(sess: &Session, id: i64, v: [f32; 4]) {
+        let mut key = data_prefix("vt");
+        key.extend_from_slice(&id.to_le_bytes());
+        let row = vec![Value::Int(id), Value::Vector(v.to_vec())];
+        let wc = bump(sess).await;
+        sess.commit_write(vec![(key, bincode::serialize(&row).unwrap()), wc], vec![])
+            .await
+            .unwrap();
+    }
+    async fn del(sess: &Session, id: i64) {
+        let mut key = data_prefix("vt");
+        key.extend_from_slice(&id.to_le_bytes());
+        let wc = bump(sess).await;
+        sess.commit_write(vec![wc], vec![key]).await.unwrap();
+    }
+    fn id_of(key: &[u8]) -> i64 {
+        let n = key.len();
+        i64::from_le_bytes(key[n - 8..].try_into().unwrap())
+    }
+
+    #[tokio::test]
+    async fn incremental_reconcile_insert_update_delete() {
+        let _serial = BUILD_TEST_LOCK.lock().await;
+        let (db, path) = temp_db();
+        let sess = Session::new(db, std::sync::Arc::new(LockManager::new()));
+        let def = vector_table();
+        // Seed 300 rows (> the 256 rebuild floor) clustered far from the probes.
+        let mut puts = Vec::new();
+        for i in 0..300i64 {
+            let mut key = data_prefix("vt");
+            key.extend_from_slice(&i.to_le_bytes());
+            let row = vec![
+                Value::Int(i),
+                Value::Vector(vec![i as f32, (i % 7) as f32, 1.0, 0.5]),
+            ];
+            puts.push((key, bincode::serialize(&row).unwrap()));
+        }
+        sess.commit_write(puts, vec![]).await.unwrap();
+
+        let reg = VectorRegistry::new();
+        // `build_count` is a process-global counter (other tests may bump it in
+        // parallel), so assert a tolerant total at the end: an incremental
+        // implementation does ONE build here, a rebuild-every-query one does four.
+        let before = build_count();
+        let _ = reg.get(&sess, &def, 1, Metric::L2).await.unwrap();
+
+        // INSERT a distinctive vector; the next query must find it.
+        put(&sess, 1000, [42.5, 2.5, 1.0, 0.5]).await;
+        let c = reg.get(&sess, &def, 1, Metric::L2).await.unwrap();
+        let hit = c.search_keys(&[42.5, 2.5, 1.0, 0.5], 1, 64);
+        assert_eq!(id_of(&hit[0].0), 1000, "new row is searchable");
+
+        // UPDATE the vector in place; the query must reflect the new location.
+        put(&sess, 1000, [180.5, 4.5, 1.0, 0.5]).await;
+        let c = reg.get(&sess, &def, 1, Metric::L2).await.unwrap();
+        let near_old = c.search_keys(&[42.5, 2.5, 1.0, 0.5], 1, 64);
+        assert_ne!(
+            id_of(&near_old[0].0),
+            1000,
+            "old vector location no longer id 1000"
+        );
+        let near_new = c.search_keys(&[180.5, 4.5, 1.0, 0.5], 1, 64);
+        assert_eq!(
+            id_of(&near_new[0].0),
+            1000,
+            "updated vector found at new location"
+        );
+
+        // DELETE it; it must disappear from results.
+        del(&sess, 1000).await;
+        let c = reg.get(&sess, &def, 1, Metric::L2).await.unwrap();
+        let after_del = c.search_keys(&[180.5, 4.5, 1.0, 0.5], 5, 64);
+        assert!(
+            after_del.iter().all(|(k, _)| id_of(k) != 1000),
+            "deleted row must not appear"
+        );
+
+        // Incremental: at most one build here (+ tolerate one concurrent test's
+        // build), never four (one rebuild per query).
+        assert!(
+            build_count() - before <= 2,
+            "should reconcile incrementally, not rebuild every query (builds={})",
+            build_count() - before
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_stale_queries_rebuild_index_only_once() {
+        let _serial = BUILD_TEST_LOCK.lock().await;
         let (db, path) = temp_db();
         let sess = std::sync::Arc::new(Session::new(db, std::sync::Arc::new(LockManager::new())));
         let def = std::sync::Arc::new(vector_table());
@@ -246,7 +524,11 @@ mod tests {
         // Exactly one build, and every caller saw the same fully-populated index.
         assert_eq!(build_count() - before, 1, "single-flight must rebuild once");
         for r in &results {
-            assert_eq!(r.keys.len(), 500);
+            assert_eq!(
+                r.state.read().unwrap().key_node.len(),
+                500,
+                "index must hold all 500 rows"
+            );
         }
         // A subsequent call hits the fresh cache (no extra build).
         let _ = reg.get(&sess, &def, 1, Metric::L2).await.unwrap();

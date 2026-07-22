@@ -4,6 +4,23 @@ All notable changes to ElyraSQL are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **Incremental HNSW vector-index maintenance (ESQL-26).** A write to a
+  vector-indexed table no longer forces the next ANN query to rebuild the whole
+  graph. The cached index is reconciled against storage instead: only the rows
+  inserted / updated / deleted since the last reconcile are applied to the
+  existing graph (new vectors inserted via `Hnsw::insert_one`, removed or
+  superseded ones soft-tombstoned and filtered from results), detected by a
+  content hash so all of INSERT/UPDATE/DELETE are correct. A single insert into a
+  500k-row index now adds one node instead of rebuilding 500k. A full rebuild is
+  reserved for the first build, a change as large as the table, or compaction when
+  too many nodes are tombstoned. Verified end-to-end (insert/update/delete
+  reflected in `VEC_DISTANCE` search) with recall-preserving tests. The graph is
+  still memory-only (rebuilt cold on restart — ESQL-27).
+
 ## [1.4.9] - 2026-07-21
 
 Reliability & cache-efficiency pass from a second codebase review. Also documents
