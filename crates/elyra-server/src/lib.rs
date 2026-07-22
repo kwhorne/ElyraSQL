@@ -846,7 +846,15 @@ async fn handle_connection(
         AsyncMysqlIntermediary::init_before_ssl(&mut shim, &mut r, &mut w, &tls).await?;
 
     if is_ssl {
-        let cfg = tls.expect("client negotiated TLS without a server config");
+        // Defensive: a client should only reach here when the server advertised
+        // TLS, but never panic on a malformed/hostile handshake -- drop the one
+        // connection with a clean error instead.
+        let Some(cfg) = tls else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "client requested TLS but the server has no TLS configuration",
+            ));
+        };
         secure_run_with_options(shim, w, opts, cfg, init).await
     } else {
         // Buffer the socket writes. opensrv issues one `write_vectored` syscall
