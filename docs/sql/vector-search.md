@@ -58,6 +58,18 @@ exact search.
   **single-flight**: if many queries arrive at once after a write, only one
   rebuilds the index while the others wait for and share its result, so a burst
   of concurrent queries can't trigger a stampede of parallel full-table scans.
+
+!!! warning "Rebuild cost on write-heavy vector workloads"
+    The cache is invalidated by **any** write to the table (tracked by a per-table
+    write counter), and the next vector query then rebuilds the **whole** HNSW
+    graph from a full table scan — it is not yet maintained incrementally. On a
+    large, frequently-mutated vector table this is expensive (a single insert
+    makes the next ANN query rebuild the entire graph). The graph is also **not
+    persisted**, so it is rebuilt on the first query after a restart (cold start).
+    ElyraSQL is best suited to **read-heavy / batch-updated** embedding workloads
+    today; incremental maintenance and on-disk persistence are planned
+    (ESQL-26 / ESQL-27). For steady high-write vector ingestion, batch writes and
+    keep queries off the table during ingestion.
 - Without the pattern (e.g. with a `WHERE` filter, or cosine/inner-product),
   the query falls back to **exact** search, which is always correct.
 

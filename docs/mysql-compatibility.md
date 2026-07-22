@@ -72,6 +72,16 @@ gaps:
   are not parsed (parser limitations); `&`, `|`, `^` bitwise operators work.
 - Vector search and `VEC_DISTANCE(...)` are ElyraSQL extensions (they mirror
   MySQL 9's vector direction but are not identical).
+- **Isolation levels:** `SET TRANSACTION ISOLATION LEVEL ...` is accepted for all
+  four standard levels, but only two engines exist — `SERIALIZABLE` (opt-in) and
+  **snapshot** isolation, which backs everything else. Snapshot is *at least as
+  strong* as `READ UNCOMMITTED`, `READ COMMITTED`, and `REPEATABLE READ` (no dirty
+  reads, repeatable reads, no phantoms within a transaction), so a client that
+  asks for `READ COMMITTED` gets more isolation, never less. The one behavioural
+  difference: a long transaction under snapshot does **not** see other
+  transactions' commits mid-flight (it reads a consistent snapshot from `BEGIN`),
+  whereas true `READ COMMITTED` would. `@@transaction_isolation` reports
+  `REPEATABLE-READ` (MySQL's default), which is what most ORMs expect.
 - `SHOW` and `information_schema` cover what GUI tools and drivers need to
   connect and browse (`tables`, `columns`, `engines`, `schemata`, `views`,
   `routines`, `triggers`, `events`, `statistics`, `partitions`); it is not the

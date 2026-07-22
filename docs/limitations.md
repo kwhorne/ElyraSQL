@@ -176,7 +176,14 @@ judge fit before deploying.
   `ORDER BY`/`GROUP BY` (correct, but not memory-bounded on very large such
   joins). `FULL` needs unmatched-build-side tracking; non-equi joins have no hash
   key to stream on; a derived table is materialised first. These shapes are rare
-  and the materialising path is correct.
+  and the materialising path is correct. Streaming left-deep chains of **more than
+  two** tables (and complex join expressions) is tracked in ESQL-29; today they
+  take the materialising `join_select` path.
+- **`WHERE col IN (SELECT ...)` and `DISTINCT` collection are in-memory** (unlike
+  `ORDER BY`/`GROUP BY`, which spill): the subquery's result set and the distinct
+  set are buffered in RAM, so a query over an enormous such set can run out of
+  memory. Bounding/spilling these is tracked in ESQL-28. Correlated subqueries
+  execute as a nested loop (re-run per driving row, `O(N×M)`), not yet decorrelated.
 - Uncommitted transaction writes are buffered in memory (not spilled to disk)
   until `COMMIT`/`ROLLBACK`. To keep this bounded, a transaction that stages more
   than `ELYRASQL_TXN_MAX_BYTES` (default 1 GiB) of writes has its next write
@@ -289,10 +296,11 @@ judge fit before deploying.
   value on every node) to require a challenge-response handshake
   (`SHA1(secret‖nonce)`, constant-time) on every Raft control and replication
   connection, so an unauthenticated peer cannot inject fake writes or votes.
-  Password hashes are compared in **constant time**. The internal Raft/
-  replication traffic is not yet encrypted, so for **confidentiality** run it on
-  a trusted/private network (or a VPN/WireGuard); mutual TLS for internal
-  traffic is planned.
+  Password hashes are compared in **constant time**. Exposing the replication
+  endpoint on a non-loopback address **without** a secret is refused unless
+  `ELYRASQL_ALLOW_OPEN_AUTH=1`. The internal Raft/replication traffic is not yet
+  encrypted, so for **confidentiality** run it on a trusted/private network (or a
+  VPN/WireGuard); mutual TLS for internal traffic is planned (ESQL-30).
 - **Password hardening.** New passwords (`CREATE USER` / `ALTER USER` / `SET
   PASSWORD`) must satisfy a strength policy: minimum length
   (`ELYRASQL_PASSWORD_MIN_LEN`, default 8) and a letters+digits requirement
