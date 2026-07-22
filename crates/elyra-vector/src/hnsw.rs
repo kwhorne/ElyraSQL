@@ -295,7 +295,10 @@ impl Hnsw {
             .unwrap_or_else(|| Visited::new(self.vectors.len()));
         visited.ensure(self.vectors.len());
         let heap = self.search_layer(q, &[ep], ef.max(k), 0, &mut visited);
-        self.visited_pool.lock().unwrap().push(visited);
+        self.visited_pool
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(visited);
         let mut out: Vec<(u32, f32)> = heap.into_iter().map(|c| (c.node, c.dist)).collect();
         out.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
         out.truncate(k);

@@ -51,6 +51,16 @@ pub struct CachedTable {
     /// Indexed by base column; `None` for non-numeric (uncached) columns.
     pub cols: Vec<Option<ColArray>>,
     pub bytes: usize,
+    /// Monotonic tick of the last access, for approximate-LRU eviction. Updated
+    /// atomically on `get` (no lock upgrade needed).
+    pub last_used: std::sync::atomic::AtomicU64,
+}
+
+/// Next value of the global access clock (drives approximate LRU).
+fn next_tick() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static CLOCK: AtomicU64 = AtomicU64::new(1);
+    CLOCK.fetch_add(1, Ordering::Relaxed)
 }
 
 type Map = HashMap<String, std::sync::Arc<CachedTable>>;
@@ -78,8 +88,15 @@ pub fn enabled() -> bool {
 
 /// Fetch a cached table iff it exists and its `wseq` matches `epoch`.
 pub fn get(table: &str, epoch: u64) -> Option<std::sync::Arc<CachedTable>> {
-    let g = cache().read().unwrap();
-    g.get(table).filter(|t| t.wseq == epoch).cloned()
+    let g = cache().read().unwrap_or_else(|e| e.into_inner());
+    let hit = g.get(table).filter(|t| t.wseq == epoch).cloned();
+    if let Some(t) = &hit {
+        // Mark as most-recently-used for approximate-LRU eviction (atomic, so no
+        // read->write lock upgrade).
+        t.last_used
+            .store(next_tick(), std::sync::atomic::Ordering::Relaxed);
+    }
+    hit
 }
 
 /// Store a freshly built table, evicting others if the budget would be exceeded.
@@ -90,12 +107,15 @@ pub fn store(table: &str, ct: std::sync::Arc<CachedTable>) {
     if ct.bytes > budget {
         return;
     }
-    let mut g = cache().write().unwrap();
+    let mut g = cache().write().unwrap_or_else(|e| e.into_inner());
     g.remove(table);
     let mut total: usize = g.values().map(|t| t.bytes).sum();
-    // Evict arbitrary entries until the newcomer fits (simple bound, not LRU).
+    // Evict the least-recently-used entries until the newcomer fits.
     while total + ct.bytes > budget {
-        let victim = g.keys().next().cloned();
+        let victim = g
+            .iter()
+            .min_by_key(|(_, t)| t.last_used.load(std::sync::atomic::Ordering::Relaxed))
+            .map(|(k, _)| k.clone());
         match victim {
             Some(k) => {
                 if let Some(v) = g.remove(&k) {
@@ -105,6 +125,8 @@ pub fn store(table: &str, ct: std::sync::Arc<CachedTable>) {
             None => break,
         }
     }
+    ct.last_used
+        .store(next_tick(), std::sync::atomic::Ordering::Relaxed);
     g.insert(table.to_string(), ct);
 }
 
@@ -171,6 +193,7 @@ pub fn build(schema: &Schema, wseq: u64, blobs: &[Vec<u8>]) -> Result<CachedTabl
         nrows: blobs.len(),
         cols,
         bytes,
+        last_used: std::sync::atomic::AtomicU64::new(0),
     })
 }
 

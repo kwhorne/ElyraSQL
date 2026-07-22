@@ -52,7 +52,13 @@ impl VectorRegistry {
         let wcount = read_wcount(db, &def.name).await?;
 
         // Fast path: cached and fresh.
-        if let Some(cached) = self.inner.read().unwrap().get(&key).cloned() {
+        if let Some(cached) = self
+            .inner
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .cloned()
+        {
             if cached.wcount == wcount {
                 return Ok(cached);
             }
@@ -68,7 +74,13 @@ impl VectorRegistry {
         // waited for the lock. Re-read the write counter in case more writes
         // landed meanwhile, then reuse a cached index that already matches it.
         let wcount = read_wcount(db, &def.name).await?;
-        if let Some(cached) = self.inner.read().unwrap().get(&key).cloned() {
+        if let Some(cached) = self
+            .inner
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .cloned()
+        {
             if cached.wcount == wcount {
                 return Ok(cached);
             }
@@ -76,7 +88,10 @@ impl VectorRegistry {
 
         // (Re)build from storage.
         let built = Arc::new(build(db, def, col, metric, wcount).await?);
-        self.inner.write().unwrap().insert(key, built.clone());
+        self.inner
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, built.clone());
         Ok(built)
     }
 
