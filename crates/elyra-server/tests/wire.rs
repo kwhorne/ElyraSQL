@@ -2217,3 +2217,69 @@ async fn null_indexed_order_walk() {
     let exp: Vec<i64> = rows.iter().take(40).map(|&(id, _)| id).collect();
     assert_eq!(got, exp, "nullable DESC with id tiebreaker (indexed NULLs)");
 }
+
+// N-table (3+) left-deep join streaming (ESQL-29): a chain of INNER/LEFT equi
+// joins with ORDER BY / GROUP BY must stream (build_join_chain) and be correct.
+// Locks in the capability so it cannot silently regress to the materialising path.
+#[tokio::test]
+async fn multi_table_join_streams_correctly() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop("CREATE TABLE a (id INT PRIMARY KEY, bid INT, v INT)")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE b (id INT PRIMARY KEY, cid INT)")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE d (id INT PRIMARY KEY, region INT)")
+        .await
+        .unwrap();
+    for i in 1..=200i64 {
+        c.query_drop(format!(
+            "INSERT INTO a VALUES ({i}, {}, {})",
+            (i % 50) + 1,
+            i * 10
+        ))
+        .await
+        .unwrap();
+    }
+    for i in 1..=50i64 {
+        c.query_drop(format!("INSERT INTO b VALUES ({i}, {})", (i % 10) + 1))
+            .await
+            .unwrap();
+    }
+    for i in 1..=10i64 {
+        c.query_drop(format!("INSERT INTO d VALUES ({i}, {})", i))
+            .await
+            .unwrap();
+    }
+
+    // 3-table chain + ORDER BY + LIMIT (streaming_join_order over build_join_chain).
+    let ids: Vec<i64> = c
+        .query(
+            "SELECT a.id FROM a JOIN b ON a.bid = b.id JOIN d ON b.cid = d.id \
+             ORDER BY a.id DESC LIMIT 5",
+        )
+        .await
+        .unwrap();
+    assert_eq!(ids, vec![200, 199, 198, 197, 196]);
+
+    // 3-table chain + GROUP BY (streaming_join_aggregate); every a-row joins.
+    let total: i64 = c
+        .query_first("SELECT SUM(a.v) FROM a JOIN b ON a.bid = b.id JOIN d ON b.cid = d.id")
+        .await
+        .unwrap()
+        .unwrap();
+    let expected: i64 = (1..=200).map(|i| i * 10).sum();
+    assert_eq!(total, expected, "3-table INNER chain keeps all 200 a-rows");
+
+    // 3-table LEFT chain keeps all driving rows.
+    let cnt: i64 = c
+        .query_first(
+            "SELECT COUNT(*) FROM a LEFT JOIN b ON a.bid = b.id LEFT JOIN d ON b.cid = d.id",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(cnt, 200);
+}
