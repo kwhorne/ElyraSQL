@@ -3393,6 +3393,7 @@ pub async fn select(
                 schema.columns.iter().map(|c| c.collation).collect();
             let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
             let mut out: Vec<Vec<Value>> = Vec::new();
+            let cap = distinct_max();
             loop {
                 let batch = stream.next_batch(8192).await?;
                 if batch.is_empty() {
@@ -3401,6 +3402,12 @@ pub async fn select(
                 for row in batch {
                     if seen.insert(Value::row_collation_key_coll(&row, &colls)) {
                         out.push(row);
+                        if out.len() > cap {
+                            return Err(Error::Query(format!(
+                                "SELECT DISTINCT exceeded {cap} distinct rows; narrow the query \
+                                 or raise ELYRASQL_DISTINCT_MAX"
+                            )));
+                        }
                     }
                 }
             }
@@ -6936,6 +6943,28 @@ fn ordered_walk_step(
     Ok(true)
 }
 
+/// Read a positive `usize` from `var`, else `default`.
+fn env_usize(var: &str, default: usize) -> usize {
+    std::env::var(var)
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(default)
+}
+
+/// Max rows an `IN (SELECT ...)` may materialize into an in-memory value list
+/// (`ELYRASQL_IN_SUBQUERY_MAX`, default 1,000,000). Beyond this the query errors
+/// fail-safe instead of buffering an unbounded list and evaluating it O(N×M).
+fn in_subquery_max() -> usize {
+    env_usize("ELYRASQL_IN_SUBQUERY_MAX", 1_000_000)
+}
+
+/// Max distinct rows `SELECT DISTINCT` may buffer (`ELYRASQL_DISTINCT_MAX`,
+/// default 5,000,000) before erroring fail-safe rather than risking OOM.
+fn distinct_max() -> usize {
+    env_usize("ELYRASQL_DISTINCT_MAX", 5_000_000)
+}
+
 /// Examine budget for a filtered ordered walk before falling back to the sorter.
 /// `ELYRASQL_ORDER_SCAN_BUDGET` overrides the default of `max(need * 256, 50k)`.
 /// Read per qualifying query (not per row), so it stays tunable at runtime.
@@ -9677,6 +9706,17 @@ async fn run_subquery(
     vindex: &VectorRegistry,
     q: &SqlQuery,
 ) -> Result<Vec<Vec<Value>>> {
+    run_subquery_capped(db, vindex, q, usize::MAX).await
+}
+
+/// Like [`run_subquery`] but errors fail-safe if the result exceeds `cap` rows,
+/// so an `IN (SELECT ...)` over an enormous set cannot exhaust memory.
+async fn run_subquery_capped(
+    db: &Session,
+    vindex: &VectorRegistry,
+    q: &SqlQuery,
+    cap: usize,
+) -> Result<Vec<Vec<Value>>> {
     // Boxed to break the select -> resolve -> run -> select async cycle.
     match Box::pin(select(db, vindex, q)).await? {
         QueryResult::Rows(mut stream) => {
@@ -9687,6 +9727,12 @@ async fn run_subquery(
                     break;
                 }
                 rows.extend(batch);
+                if rows.len() > cap {
+                    return Err(Error::Query(format!(
+                        "subquery returned more than {cap} rows for IN (...); use a JOIN or \
+                         EXISTS, or raise ELYRASQL_IN_SUBQUERY_MAX"
+                    )));
+                }
             }
             Ok(rows)
         }
@@ -9860,7 +9906,7 @@ fn resolve_subqueries<'a>(
                 negated,
             } => {
                 let inner = resolve_subqueries(db, vindex, *expr).await?;
-                let rows = run_subquery(db, vindex, &subquery).await?;
+                let rows = run_subquery_capped(db, vindex, &subquery, in_subquery_max()).await?;
                 let list = rows
                     .iter()
                     .filter_map(|r| r.first())

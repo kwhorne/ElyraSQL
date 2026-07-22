@@ -180,9 +180,12 @@ judge fit before deploying.
   two** tables (and complex join expressions) is tracked in ESQL-29; today they
   take the materialising `join_select` path.
 - **`WHERE col IN (SELECT ...)` and `DISTINCT` collection are in-memory** (unlike
-  `ORDER BY`/`GROUP BY`, which spill): the subquery's result set and the distinct
-  set are buffered in RAM, so a query over an enormous such set can run out of
-  memory. Bounding/spilling these is tracked in ESQL-28. Correlated subqueries
+  `ORDER BY`/`GROUP BY`, which spill): the subquery's value list and the distinct
+  set are buffered in RAM. To stay fail-safe rather than OOM, these are **bounded**
+  — an `IN (SELECT ...)` over more than `ELYRASQL_IN_SUBQUERY_MAX` rows (default
+  1,000,000) or a `DISTINCT` over more than `ELYRASQL_DISTINCT_MAX` rows (default
+  5,000,000) errors with a clear message (rewrite `IN (SELECT)` as a `JOIN`/
+  `EXISTS`). True disk-spilling for these is a future step. Correlated subqueries
   execute as a nested loop (re-run per driving row, `O(N×M)`), not yet decorrelated.
 - Uncommitted transaction writes are buffered in memory (not spilled to disk)
   until `COMMIT`/`ROLLBACK`. To keep this bounded, a transaction that stages more
