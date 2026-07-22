@@ -4,7 +4,12 @@ All notable changes to ElyraSQL are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.4.10] - 2026-07-22
+
+Vector release: the HNSW index is now maintained **incrementally** and **persisted**
+across restarts, so write-heavy and post-restart vector workloads no longer pay a
+full graph rebuild. The on-disk cache lives in a sibling `<data>.vidx/` directory,
+so the authoritative single file is unchanged.
 
 ### Added
 
@@ -1559,6 +1564,7 @@ core CRUD with `WHERE`/`ORDER BY`/`LIMIT`, indexes, aggregation and `GROUP BY`,
 joins, prepared statements, authentication and TLS, vector search (exact +
 HNSW), parallel OLAP aggregation, and transactions with snapshot isolation.
 
+[1.4.10]: https://github.com/kwhorne/ElyraSQL/releases/tag/v1.4.10
 [1.4.9]: https://github.com/kwhorne/ElyraSQL/releases/tag/v1.4.9
 [1.4.8]: https://github.com/kwhorne/ElyraSQL/releases/tag/v1.4.8
 [1.4.7]: https://github.com/kwhorne/ElyraSQL/releases/tag/v1.4.7
