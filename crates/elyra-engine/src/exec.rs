@@ -12272,3 +12272,118 @@ fn parse_vector(s: &str, dim: u32) -> Result<Vec<f32>> {
     }
     Ok(vals)
 }
+
+#[cfg(test)]
+mod plan_tests {
+    use super::{
+        order_col_index, order_is_pk_prefix, ordered_scan_budget, secondary_order_plan, NullMode,
+    };
+    use crate::catalog::{IndexDef, TableDef};
+    use elyra_core::{ColumnDef, ColumnType, Schema};
+    use sqlparser::ast::{Expr, Ident};
+
+    fn idx(name: &str, cols: Vec<usize>, unique: bool, indexes_nulls: bool) -> IndexDef {
+        IndexDef {
+            name: name.into(),
+            cols,
+            unique,
+            vector: false,
+            fulltext: false,
+            col_collations: Vec::new(),
+            indexes_nulls,
+        }
+    }
+
+    // Table t(id INT PK, revenue INT NULL, grp INT NOT NULL) with a nullable
+    // single-column index on revenue and a NOT NULL one on grp.
+    fn tbl() -> TableDef {
+        TableDef {
+            name: "t".into(),
+            schema: Schema::new(vec![
+                ColumnDef::new("id", ColumnType::Int, false),
+                ColumnDef::new("revenue", ColumnType::Int, true),
+                ColumnDef::new("grp", ColumnType::Int, false),
+            ]),
+            pk_cols: vec![0],
+            indexes: vec![
+                idx("ix_rev", vec![1], false, true),
+                idx("ix_grp", vec![2], false, true),
+            ],
+            col_meta: Vec::new(),
+            checks: Vec::new(),
+            foreign_keys: Vec::new(),
+        }
+    }
+
+    fn ob(name: &str, asc: bool) -> (Expr, bool) {
+        (Expr::Identifier(Ident::new(name)), asc)
+    }
+
+    #[test]
+    fn resolves_order_columns() {
+        let t = tbl();
+        assert_eq!(
+            order_col_index(&t, &Expr::Identifier(Ident::new("revenue"))),
+            Some(1)
+        );
+        assert_eq!(
+            order_col_index(&t, &Expr::Identifier(Ident::new("grp"))),
+            Some(2)
+        );
+        assert_eq!(
+            order_col_index(&t, &Expr::Identifier(Ident::new("nope"))),
+            None
+        );
+    }
+
+    #[test]
+    fn pk_prefix_direction() {
+        let t = tbl();
+        assert!(order_is_pk_prefix(&t, &[ob("id", true)], true));
+        assert!(order_is_pk_prefix(&t, &[ob("id", false)], false));
+        assert!(!order_is_pk_prefix(&t, &[ob("id", true)], false));
+        assert!(!order_is_pk_prefix(&t, &[ob("revenue", true)], true));
+    }
+
+    #[test]
+    fn secondary_plan_null_modes() {
+        let t = tbl();
+        // Nullable single-column index -> Indexed (NULLs stored).
+        let p = secondary_order_plan(&t, &[ob("revenue", false)]).unwrap();
+        assert_eq!(p.index, "ix_rev");
+        assert!(p.rev); // DESC
+        assert!(p.null_mode == NullMode::Indexed);
+        assert!(!p.has_tiebreaker);
+
+        // NOT NULL single-column index -> None (complete walk, no NULL block).
+        let p = secondary_order_plan(&t, &[ob("grp", true)]).unwrap();
+        assert_eq!(p.index, "ix_grp");
+        assert!(p.null_mode == NullMode::None);
+
+        // Legacy (no stored NULLs) on a nullable column.
+        let mut t2 = tbl();
+        t2.indexes[0].indexes_nulls = false;
+        let p = secondary_order_plan(&t2, &[ob("revenue", true)]).unwrap();
+        assert!(p.null_mode == NullMode::Legacy);
+    }
+
+    #[test]
+    fn secondary_plan_pk_tiebreaker() {
+        let t = tbl();
+        // The non-unique index appends the clustered PK, so `revenue, id` matches.
+        let p = secondary_order_plan(&t, &[ob("revenue", false), ob("id", false)]).unwrap();
+        assert_eq!(p.index, "ix_rev");
+        assert!(p.has_tiebreaker);
+        // Mixed directions cannot use one walk.
+        assert!(secondary_order_plan(&t, &[ob("revenue", true), ob("id", false)]).is_none());
+        // A trailing non-PK column is not the clustered suffix.
+        assert!(secondary_order_plan(&t, &[ob("revenue", false), ob("grp", false)]).is_none());
+    }
+
+    #[test]
+    fn scan_budget_default() {
+        // max(256 * need, 50_000)
+        assert_eq!(ordered_scan_budget(40), 50_000);
+        assert_eq!(ordered_scan_budget(1000), 256_000);
+    }
+}
