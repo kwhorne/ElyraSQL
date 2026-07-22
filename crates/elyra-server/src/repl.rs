@@ -84,6 +84,25 @@ async fn recv_msg<R: AsyncRead + Unpin>(r: &mut R) -> std::io::Result<Option<Rep
 
 /// Serve the replication endpoint on the primary.
 pub async fn serve_replication(addr: String, db: Db) -> std::io::Result<()> {
+    // The replication stream exposes the full data set and is only authenticated
+    // when a cluster secret is configured. Refuse to expose it to non-loopback
+    // peers without one, unless explicitly overridden.
+    if crate::listen_is_exposed(&addr)
+        && !crate::cluster::has_cluster_secret()
+        && !crate::env_flag("ELYRASQL_ALLOW_OPEN_AUTH")
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "refusing to expose the replication endpoint on {addr} without \
+                 authentication. Set ELYRASQL_CLUSTER_SECRET (shared by primary and \
+                 replicas), bind it to localhost, or set ELYRASQL_ALLOW_OPEN_AUTH=1."
+            ),
+        ));
+    }
+    if !crate::cluster::has_cluster_secret() {
+        warn!(%addr, "replication endpoint is UNAUTHENTICATED - set ELYRASQL_CLUSTER_SECRET for production");
+    }
     let listener = TcpListener::bind(&addr).await?;
     info!(%addr, "ElyraSQL replication endpoint listening");
     loop {

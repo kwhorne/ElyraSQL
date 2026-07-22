@@ -607,17 +607,67 @@ fn write_cell<W: AsyncWrite + Send + Unpin>(
     }
 }
 
+/// Whether a bind address accepts connections from outside the local host.
+/// Loopback (`127.0.0.0/8`, `::1`, `localhost`) is considered local; the
+/// wildcard (`0.0.0.0`, `::`), routable IPs, and unresolved hostnames are treated
+/// as exposed (conservatively, so an unknown host does not silently open access).
+pub(crate) fn listen_is_exposed(listen: &str) -> bool {
+    let host = match listen.rsplit_once(':') {
+        Some((h, _)) => h.trim_start_matches('[').trim_end_matches(']'),
+        None => listen,
+    };
+    if host.eq_ignore_ascii_case("localhost") {
+        return false;
+    }
+    match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => !ip.is_loopback(),
+        Err(_) => true,
+    }
+}
+
+/// Whether `var` is set to a truthy value (`1`/`true`/`yes`/`on`).
+pub(crate) fn env_flag(var: &str) -> bool {
+    matches!(
+        std::env::var(var)
+            .ok()
+            .as_deref()
+            .map(|s| s.trim().to_ascii_lowercase())
+            .as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
+
 /// Bind and serve ElyraSQL over the MySQL protocol until cancelled.
 pub async fn serve(config: ServerConfig, engine: Engine) -> std::io::Result<()> {
     // Reclaim spill/aggregation temp files leaked by prior instances that were
     // killed (SIGKILL skips Drop cleanup); only removes files owned by dead PIDs.
     elyra_engine::cleanup_stale_tempfiles();
+
+    // Safe-by-default: refuse to expose an open (no-credentials, everyone-Admin)
+    // server to non-loopback clients unless explicitly allowed. Local development
+    // (the default 127.0.0.1 bind) is unaffected.
+    if config.auth.is_open() {
+        if listen_is_exposed(&config.listen) && !env_flag("ELYRASQL_ALLOW_OPEN_AUTH") {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "refusing to start: authentication is OPEN (every client gets Admin) \
+                     but the listener {} accepts remote connections. Configure accounts \
+                     (--user/--password or --auth USER:PASS:ROLE), bind to localhost, or \
+                     set ELYRASQL_ALLOW_OPEN_AUTH=1 to override.",
+                    config.listen
+                ),
+            ));
+        }
+        warn!(
+            "authentication is OPEN (no credentials required, every client gets Admin) - \
+             configure --user/--password/--auth for production"
+        );
+    }
+
     let listener = TcpListener::bind(&config.listen).await?;
     let tls_enabled = config.tls.is_some();
     info!(addr = %config.listen, tls = tls_enabled, "ElyraSQL accepting MySQL-protocol connections");
-    if config.auth.is_open() {
-        warn!("authentication is OPEN (no credentials required) - set --user/--password for production");
-    }
 
     let engine = Arc::new(engine);
     let auth = config.auth;
@@ -771,5 +821,29 @@ async fn handle_connection(
         // (TLS is left unbuffered: its handshake needs immediate flushes.)
         let w = tokio::io::BufWriter::with_capacity(64 * 1024, w);
         plain_run_with_options(shim, w, opts, init).await
+    }
+}
+
+#[cfg(test)]
+mod guard_tests {
+    use super::listen_is_exposed;
+
+    #[test]
+    fn loopback_binds_are_local() {
+        assert!(!listen_is_exposed("127.0.0.1:3307"));
+        assert!(!listen_is_exposed("127.0.0.5:3307"));
+        assert!(!listen_is_exposed("[::1]:3307"));
+        assert!(!listen_is_exposed("localhost:3307"));
+        assert!(!listen_is_exposed("LOCALHOST:3307"));
+    }
+
+    #[test]
+    fn wildcard_and_routable_binds_are_exposed() {
+        assert!(listen_is_exposed("0.0.0.0:3307"));
+        assert!(listen_is_exposed("[::]:3307"));
+        assert!(listen_is_exposed("192.168.1.10:3307"));
+        assert!(listen_is_exposed("10.0.0.5:3307"));
+        // An unresolved hostname is treated as exposed (conservative).
+        assert!(listen_is_exposed("db.internal:3307"));
     }
 }

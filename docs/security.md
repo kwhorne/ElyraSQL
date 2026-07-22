@@ -30,9 +30,20 @@ elyrasql serve \
 ```
 
 !!! danger "Open mode"
-    With no users configured, ElyraSQL accepts **any** login and logs a loud
-    warning. This is for local development only. Always configure credentials
-    before exposing the server.
+    With no users configured, ElyraSQL accepts **any** login as `Admin`. This is
+    for local development only.
+
+    **Safe by default:** the server *refuses to start* in open mode when its
+    listener is bound to a non-loopback address (e.g. `0.0.0.0`, a routable IP, or
+    a hostname) — the common way to accidentally expose a credential-less database.
+    To run anyway you must either configure accounts (`--user`/`--password` or
+    `--auth USER:PASS:ROLE`), keep the bind on `localhost` (the default), or set
+    `ELYRASQL_ALLOW_OPEN_AUTH=1` to explicitly override. The default
+    `127.0.0.1:3307` bind is unaffected, so local development is unchanged.
+
+    The **replication endpoint** is likewise guarded: it is only authenticated
+    when `ELYRASQL_CLUSTER_SECRET` is set, so exposing it on a non-loopback address
+    without a secret is refused unless `ELYRASQL_ALLOW_OPEN_AUTH=1` is set.
 
 ## Roles
 

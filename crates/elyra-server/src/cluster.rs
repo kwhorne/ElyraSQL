@@ -873,6 +873,12 @@ fn cluster_secret() -> Option<Vec<u8>> {
         .map(String::into_bytes)
 }
 
+/// Whether a pre-shared cluster secret is configured (gates exposing the
+/// unauthenticated replication/control endpoints to remote peers).
+pub(crate) fn has_cluster_secret() -> bool {
+    cluster_secret().is_some()
+}
+
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
