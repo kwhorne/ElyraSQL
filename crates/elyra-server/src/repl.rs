@@ -12,12 +12,65 @@
 
 use std::io::{Error, ErrorKind};
 
+use std::sync::Arc;
+
 use elyra_storage::{Db, WriteEvent};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast::error::RecvError;
+use tokio_rustls::rustls::pki_types::ServerName;
+use tokio_rustls::rustls::{ClientConfig, RootCertStore, ServerConfig};
+use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tracing::{info, warn};
+
+/// Server-side TLS for the replication endpoint, from `ELYRASQL_CLUSTER_TLS_CERT`
+/// + `ELYRASQL_CLUSTER_TLS_KEY`. `None` (plaintext) unless both are set.
+fn cluster_server_tls() -> Option<Arc<ServerConfig>> {
+    let cert = std::env::var("ELYRASQL_CLUSTER_TLS_CERT").ok()?;
+    let key = std::env::var("ELYRASQL_CLUSTER_TLS_KEY").ok()?;
+    match crate::load_tls(&cert, &key) {
+        Ok(cfg) => Some(Arc::new(cfg)),
+        Err(e) => {
+            warn!(error = %e, "cluster TLS cert/key failed to load; replication stays plaintext");
+            None
+        }
+    }
+}
+
+/// Client-side TLS for connecting to the primary, from `ELYRASQL_CLUSTER_TLS_CA`
+/// (roots that must verify the primary's certificate) plus an optional
+/// `ELYRASQL_CLUSTER_TLS_SERVER_NAME` (defaults to `localhost`). The primary's
+/// certificate IS verified — there is no accept-any-cert mode.
+fn cluster_client_tls() -> std::io::Result<Option<(TlsConnector, ServerName<'static>)>> {
+    let Some(ca) = std::env::var("ELYRASQL_CLUSTER_TLS_CA").ok() else {
+        return Ok(None);
+    };
+    use std::io::{Error, ErrorKind};
+    let mut roots = RootCertStore::empty();
+    let certs = rustls_pemfile::certs(&mut std::io::BufReader::new(std::fs::File::open(&ca)?))
+        .collect::<Result<Vec<_>, _>>()?;
+    for c in certs {
+        roots
+            .add(c)
+            .map_err(|e| Error::new(ErrorKind::InvalidInput, e))?;
+    }
+    let provider = Arc::new(tokio_rustls::rustls::crypto::ring::default_provider());
+    let cfg = ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| Error::new(ErrorKind::InvalidInput, e))?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let name = std::env::var("ELYRASQL_CLUSTER_TLS_SERVER_NAME")
+        .unwrap_or_else(|_| "localhost".to_string());
+    let server_name =
+        ServerName::try_from(name).map_err(|e| Error::new(ErrorKind::InvalidInput, e))?;
+    Ok(Some((TlsConnector::from(Arc::new(cfg)), server_name)))
+}
+
+/// A boxable duplex transport (plain TCP or TLS) for the replica connect path.
+trait DuplexStream: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> DuplexStream for T {}
 
 /// One framed replication message.
 #[derive(Serialize, Deserialize)]
@@ -103,24 +156,40 @@ pub async fn serve_replication(addr: String, db: Db) -> std::io::Result<()> {
     if !crate::cluster::has_cluster_secret() {
         warn!(%addr, "replication endpoint is UNAUTHENTICATED - set ELYRASQL_CLUSTER_SECRET for production");
     }
+    let tls = cluster_server_tls().map(TlsAcceptor::from);
     let listener = TcpListener::bind(&addr).await?;
-    info!(%addr, "ElyraSQL replication endpoint listening");
+    info!(%addr, tls = tls.is_some(), "ElyraSQL replication endpoint listening");
+    if tls.is_none() {
+        warn!(%addr, "replication transport is UNENCRYPTED - set ELYRASQL_CLUSTER_TLS_CERT/KEY, or run it on a private network/VPN");
+    }
     loop {
         let (stream, peer) = listener.accept().await?;
         let db = db.clone();
+        let tls = tls.clone();
         tokio::spawn(async move {
             info!(%peer, "replica connected");
-            if let Err(e) = handle_replica(stream, db).await {
+            let res = match tls {
+                Some(acceptor) => match acceptor.accept(stream).await {
+                    Ok(s) => handle_replica(s, db).await,
+                    Err(e) => Err(e),
+                },
+                None => handle_replica(stream, db).await,
+            };
+            if let Err(e) = res {
                 warn!(%peer, error = %e, "replica stream ended");
             }
         });
     }
 }
 
-async fn handle_replica(mut stream: TcpStream, db: Db) -> std::io::Result<()> {
+async fn handle_replica<S>(mut stream: S, db: Db) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     // Authenticate the replica (no-op unless a cluster secret is configured).
+    // Runs over whatever transport `S` is (plain TCP or a TLS stream).
     crate::cluster::auth_accept(&mut stream).await?;
-    let (mut rd, mut stream) = stream.into_split();
+    let (mut rd, mut stream) = tokio::io::split(stream);
 
     // First message tells us how far the replica has already caught up.
     let last_lsn = match recv_msg(&mut rd).await? {
@@ -219,8 +288,8 @@ async fn handle_replica(mut stream: TcpStream, db: Db) -> std::io::Result<()> {
 /// Stream an incremental catch-up (binlog delta) to a reconnecting replica.
 /// Returns `false` if the primary cannot serve it (no binlog, or the needed
 /// segments were purged) so the caller can ask the replica to resync.
-async fn incremental_catchup(
-    stream: &mut tokio::net::tcp::OwnedWriteHalf,
+async fn incremental_catchup<W: AsyncWrite + Unpin>(
+    stream: &mut W,
     db: &Db,
     last_lsn: u64,
     snap_lsn: u64,
@@ -267,9 +336,14 @@ async fn incremental_catchup(
 /// drops; returns only when the primary asks for a clean resync (the caller
 /// should wipe the file and restart).
 pub async fn run_replica(primary: String, db: Db) -> std::io::Result<()> {
+    // Verify-the-primary TLS, if configured (once; reused each reconnect).
+    let client_tls = cluster_client_tls()?;
+    if client_tls.is_none() {
+        warn!(%primary, "replication transport is UNENCRYPTED - set ELYRASQL_CLUSTER_TLS_CA, or run it on a private network/VPN");
+    }
     loop {
         let last_lsn = read_applied_lsn(&db).await;
-        let stream = match TcpStream::connect(&primary).await {
+        let tcp = match TcpStream::connect(&primary).await {
             Ok(s) => s,
             Err(e) => {
                 warn!(%primary, error = %e, "connect failed; retrying");
@@ -277,10 +351,21 @@ pub async fn run_replica(primary: String, db: Db) -> std::io::Result<()> {
                 continue;
             }
         };
-        info!(%primary, last_lsn, "connected to primary");
-        let mut stream = stream;
+        // Optionally wrap in TLS (the primary's certificate is verified).
+        let mut stream: Box<dyn DuplexStream> = match &client_tls {
+            Some((connector, name)) => match connector.connect(name.clone(), tcp).await {
+                Ok(s) => Box::new(s),
+                Err(e) => {
+                    warn!(%primary, error = %e, "TLS handshake with primary failed; retrying");
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    continue;
+                }
+            },
+            None => Box::new(tcp),
+        };
+        info!(%primary, last_lsn, tls = client_tls.is_some(), "connected to primary");
         crate::cluster::auth_connect(&mut stream).await?;
-        let (mut rd, mut wr) = stream.into_split();
+        let (mut rd, mut wr) = tokio::io::split(stream);
         send_msg(&mut wr, &ReplMsg::Hello { last_lsn }).await?;
 
         let mut snap_pairs = 0u64;

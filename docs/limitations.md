@@ -301,9 +301,14 @@ judge fit before deploying.
   connection, so an unauthenticated peer cannot inject fake writes or votes.
   Password hashes are compared in **constant time**. Exposing the replication
   endpoint on a non-loopback address **without** a secret is refused unless
-  `ELYRASQL_ALLOW_OPEN_AUTH=1`. The internal Raft/replication traffic is not yet
-  encrypted, so for **confidentiality** run it on a trusted/private network (or a
-  VPN/WireGuard); mutual TLS for internal traffic is planned (ESQL-30).
+  `ELYRASQL_ALLOW_OPEN_AUTH=1`. The **replication** transport can be **encrypted
+  with TLS**: set `ELYRASQL_CLUSTER_TLS_CERT`/`_KEY` on the primary and
+  `ELYRASQL_CLUSTER_TLS_CA` on the replica (which then *verifies* the primary's
+  certificate — a wrong/self-signed-mismatch cert is rejected), giving
+  confidentiality + server authentication, with the shared secret authenticating
+  the replica (mutual auth). The **Raft control plane** (votes/AppendEntries) is
+  not yet TLS-wrapped (ESQL-31); until then run cluster control traffic on a
+  trusted/private network (or a VPN/WireGuard).
 - **Password hardening.** New passwords (`CREATE USER` / `ALTER USER` / `SET
   PASSWORD`) must satisfy a strength policy: minimum length
   (`ELYRASQL_PASSWORD_MIN_LEN`, default 8) and a letters+digits requirement

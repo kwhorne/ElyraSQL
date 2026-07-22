@@ -897,7 +897,10 @@ fn response(secret: &[u8], nonce: &[u8]) -> [u8; 20] {
 }
 
 /// Server side of the handshake: send a nonce, verify the peer's response.
-pub async fn auth_accept(stream: &mut TcpStream) -> std::io::Result<()> {
+/// Generic over the transport so it also runs over a TLS stream.
+pub async fn auth_accept<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    stream: &mut S,
+) -> std::io::Result<()> {
     let Some(secret) = cluster_secret() else {
         return Ok(());
     };
@@ -916,7 +919,10 @@ pub async fn auth_accept(stream: &mut TcpStream) -> std::io::Result<()> {
 }
 
 /// Client side of the handshake: read the nonce, send the response.
-pub async fn auth_connect(stream: &mut TcpStream) -> std::io::Result<()> {
+/// Generic over the transport so it also runs over a TLS stream.
+pub async fn auth_connect<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    stream: &mut S,
+) -> std::io::Result<()> {
     let Some(secret) = cluster_secret() else {
         return Ok(());
     };

@@ -45,6 +45,13 @@ elyrasql serve \
     when `ELYRASQL_CLUSTER_SECRET` is set, so exposing it on a non-loopback address
     without a secret is refused unless `ELYRASQL_ALLOW_OPEN_AUTH=1` is set.
 
+    **Encrypting replication:** set `ELYRASQL_CLUSTER_TLS_CERT` + `_KEY` on the
+    primary and `ELYRASQL_CLUSTER_TLS_CA` on the replica. The replica then verifies
+    the primary's certificate (a mismatched cert is rejected — not accept-any), so
+    the stream is confidential and the primary is authenticated, while the shared
+    secret authenticates the replica (mutual authentication). The Raft control
+    plane is not yet TLS-wrapped; run it on a trusted network for now.
+
 ## Roles
 
 Privileges are hierarchical: `read` < `write` < `admin`. The engine enforces the
