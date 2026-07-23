@@ -9,7 +9,8 @@ drivers connect without modification.
 - **Prepared statements** (`COM_STMT_PREPARE`/`EXECUTE`) — typed parameters
   (including `DATE`/`DATETIME`/`TIME` from the binary protocol), value escaping,
   statement reuse; used by many ORMs and drivers.
-- **Authentication** — `mysql_native_password`.
+- **Authentication** — `mysql_native_password` by **default** (widest driver
+  compatibility), with `caching_sha2_password` available opt-in (see below).
 - **TLS** — clients may negotiate SSL.
 - **Handshake** — reports a MySQL-looking version, e.g. `8.0.0-ElyraSQL-1.4.11`,
   and answers the session/introspection queries clients send on connect
@@ -47,8 +48,26 @@ cascading deletes -- runs cleanly.
 
 - `mysql` / `mariadb` command-line clients
 - PyMySQL, mysql-connector-python
+- PHP PDO / Laravel Eloquent
+- Rust drivers `sqlx` and `mysql_async` (the latter backs ElyraSQL's own
+  observability sink — DB-verified end to end)
 - DBeaver, MySQL Workbench (via the standard MySQL driver)
 - Any language driver that speaks the MySQL protocol
+
+### Authentication plugin
+
+ElyraSQL advertises **`mysql_native_password`** by default. This is the pragmatic
+choice for driver compatibility: the client completes the simple challenge/response
+handshake (`SHA1(SHA1(password))`) with no key exchange, so PDO, PyMySQL,
+mysql-connector, `sqlx`, and `mysql_async` all connect out of the box.
+
+`caching_sha2_password` (MySQL 8's default) is available opt-in via
+`ELYRASQL_AUTH_PLUGIN=caching_sha2_password`. ElyraSQL performs **full
+authentication** every time (it keeps no fast-auth cache): the password is read
+over the TLS channel, or — on a plaintext connection — RSA-encrypted with the
+server's public key and decrypted server-side. Prefer **TLS** when using it, and
+note that some drivers (e.g. `mysql_async`) are happiest on `mysql_native_password`
+and may stumble on the full-auth exchange — the default already avoids this.
 
 ## Differences and gaps
 
