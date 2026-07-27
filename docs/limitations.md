@@ -285,11 +285,13 @@ judge fit before deploying.
       the timeout as a latency bound for I/O-waiting queries, not a CPU guard, and
       restrict who can run arbitrary SQL (ESQL-32).
     - Connections are capped by `ELYRASQL_MAX_CONNECTIONS` (default 151, as in
-      MySQL) and surplus connections get error 1040, but — unlike MySQL — **no
-      extra slot is reserved for administrators**, so an operator can be locked
-      out of a saturated server (ESQL-36). Prepared statements and streamed
-      parameter data are bounded too (`ELYRASQL_MAX_PREPARED_STMTS`,
-      `ELYRASQL_MAX_ALLOWED_PACKET`).
+      MySQL); surplus connections get error 1040, and — as in MySQL — one extra
+      slot is reserved for `Admin` accounts so an operator is not locked out.
+      Note that a non-admin can still occupy that reserved slot for the duration
+      of its handshake before being refused, so a flood of connection attempts can
+      briefly delay an administrator (MySQL behaves the same way). Prepared
+      statements and streamed parameter data are bounded too
+      (`ELYRASQL_MAX_PREPARED_STMTS`, `ELYRASQL_MAX_ALLOWED_PACKET`).
 - Multiple persistent accounts with `CREATE USER`/`GRANT`/`REVOKE`. Privileges
   are tracked and **enforced per action**: the individual DML privileges
   `INSERT`, `UPDATE` and `DELETE` are checked separately, per target table, so a

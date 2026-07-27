@@ -17,8 +17,17 @@ All notable changes to ElyraSQL are documented here. The format is based on
   the real reason instead of a bare connection reset — and refusals are exposed as
   `elyrasql_connections_refused_total` for alerting. Slots use the same RAII
   permit pattern as prepared statements, so they are returned when a connection
-  ends however it ends. Unlike MySQL there is no extra slot reserved for
-  administrators yet (ESQL-36). `0` disables the limit.
+  ends however it ends. `0` disables the limit.
+- **A connection slot is reserved for administrators (ESQL-36).** As in MySQL, one
+  connection *beyond* `ELYRASQL_MAX_CONNECTIONS` is admitted, and it is served only
+  if it authenticates as an `Admin` account — so an operator can still connect to
+  diagnose and `KILL` sessions on a saturated server. A non-admin that takes the
+  slot is refused with **1040** *after* authenticating, deliberately reporting "too
+  many connections" rather than an authentication failure, which would wrongly
+  suggest bad credentials (verified: a wrong password still returns an auth error,
+  not 1040). This required a decision that can only be made once the account is
+  known, so `elyra-wire` gained a `post_auth_check` hook in its shim contract
+  (defaulting to "allow", so other implementors are unaffected).
 - **Streamed statement parameters are bounded (ESQL-35).**
   `COM_STMT_SEND_LONG_DATA` appended to a per-statement buffer that is only
   cleared by an execute, so a client that streamed data and never executed could

@@ -177,6 +177,20 @@ pub trait AsyncMysqlShim<W: Send> {
         true
     }
 
+    /// Last chance to refuse a session *after* the credentials checked out but
+    /// before the connection is acknowledged.
+    ///
+    /// Returning `Some((kind, message))` sends that error instead of the OK packet
+    /// and ends the connection. This exists because some admission decisions can
+    /// only be made once the account is known — notably a connection slot reserved
+    /// for administrators, which MySQL also grants only after authentication.
+    /// Reporting the real reason (e.g. "too many connections") matters: refusing
+    /// during authentication instead would mislead the client into thinking the
+    /// credentials were wrong.
+    async fn post_auth_check(&self, _username: &[u8]) -> Option<(ErrorKind, String)> {
+        None
+    }
+
     /// `caching_sha2_password`: whether this account needs a password, so the
     /// full-authentication exchange must run (false for open mode / no-password
     /// accounts, which succeed immediately).
@@ -720,6 +734,15 @@ where
                     .await?;
                     self.writer.flush_all().await?;
                     return Err(io::Error::new(io::ErrorKind::PermissionDenied, err_msg).into());
+                }
+
+                // The credentials are good, but the backend may still decline the
+                // session now that it knows who is connecting (e.g. a connection
+                // slot reserved for administrators).
+                if let Some((kind, msg)) = self.shim.post_auth_check(username).await {
+                    writers::write_err(kind, msg.as_bytes(), &mut self.writer).await?;
+                    self.writer.flush_all().await?;
+                    return Err(io::Error::new(io::ErrorKind::PermissionDenied, msg).into());
                 }
 
                 if let Some(Ok(db)) = handshake.db.as_ref().map(|x| std::str::from_utf8(x)) {

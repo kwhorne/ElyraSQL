@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use elyra_engine::{Engine, QueryResult, Session};
@@ -115,8 +115,13 @@ fn max_connections() -> usize {
     })
 }
 
-/// Connections currently being served.
+/// Connections currently being served against the main budget.
 static CONNS_LIVE: AtomicUsize = AtomicUsize::new(0);
+
+/// Whether the single administrator-reserved slot (the one *above* the limit) is
+/// in use. MySQL keeps the same reserve so an operator is never locked out of a
+/// saturated server.
+static RESERVE_TAKEN: AtomicBool = AtomicBool::new(false);
 
 /// An RAII slot in the connection budget, released on `Drop`.
 ///
@@ -124,21 +129,45 @@ static CONNS_LIVE: AtomicUsize = AtomicUsize::new(0);
 /// connection that ends normally, one that dies mid-query, and one whose task
 /// unwinds all return their slot. A leaked slot would permanently shrink the
 /// server's capacity.
-struct ConnPermit;
+struct ConnPermit {
+    /// True when this connection took the administrator-reserved slot, in which
+    /// case it is only allowed to proceed for an `Admin` account (checked once
+    /// authentication reveals who is connecting).
+    reserved: bool,
+}
 
 impl ConnPermit {
-    /// Reserve a connection slot, or `None` when the server is full.
+    /// Reserve a connection slot. Falls back to the administrator-reserved slot
+    /// when the main budget is full; `None` means refuse the connection outright.
     fn acquire() -> Option<Self> {
         let limit = max_connections();
         if limit == 0 {
             // Limit disabled: still count, so metrics/tests can observe it.
             CONNS_LIVE.fetch_add(1, Ordering::AcqRel);
-            return Some(ConnPermit);
+            return Some(ConnPermit { reserved: false });
         }
         let mut cur = CONNS_LIVE.load(Ordering::Relaxed);
         loop {
             if cur >= limit {
-                return None;
+                // Main budget exhausted: offer the reserved slot. Whoever takes it
+                // must still prove they are an administrator after authenticating,
+                // otherwise the session is refused with 1040.
+                //
+                // Written as an explicit match on purpose: `ConnPermit` has a `Drop`
+                // that releases the slot, so it must only be *constructed* when the
+                // exchange actually succeeded. Combinators that take the value
+                // eagerly (`bool::then_some`) would build a permit even on failure
+                // and immediately drop it, releasing the slot held by another
+                // connection.
+                return match RESERVE_TAKEN.compare_exchange(
+                    false,
+                    true,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => Some(ConnPermit { reserved: true }),
+                    Err(_) => None,
+                };
             }
             match CONNS_LIVE.compare_exchange_weak(
                 cur,
@@ -146,13 +175,13 @@ impl ConnPermit {
                 Ordering::AcqRel,
                 Ordering::Relaxed,
             ) {
-                Ok(_) => return Some(ConnPermit),
+                Ok(_) => return Some(ConnPermit { reserved: false }),
                 Err(observed) => cur = observed,
             }
         }
     }
 
-    /// Live connection count (used to assert the accounting in tests).
+    /// Live connection count against the main budget (asserted in tests).
     #[cfg(test)]
     fn live() -> usize {
         CONNS_LIVE.load(Ordering::Relaxed)
@@ -161,7 +190,11 @@ impl ConnPermit {
 
 impl Drop for ConnPermit {
     fn drop(&mut self) {
-        CONNS_LIVE.fetch_sub(1, Ordering::AcqRel);
+        if self.reserved {
+            RESERVE_TAKEN.store(false, Ordering::Release);
+        } else {
+            CONNS_LIVE.fetch_sub(1, Ordering::AcqRel);
+        }
     }
 }
 
@@ -232,6 +265,9 @@ pub struct ElyraShim {
     conn_id: u32,
     /// Authenticated user name (for per-table grant checks).
     user: std::sync::Mutex<String>,
+    /// True when this connection took the administrator-reserved slot above
+    /// `max_connections`; only an `Admin` account may use it.
+    on_reserved_slot: bool,
     /// Replica/non-leader mode: cap every connection at read-only (dynamic).
     read_only: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Optional audit log.
@@ -270,6 +306,7 @@ impl ElyraShim {
         conn_id: u32,
         read_only: std::sync::Arc<std::sync::atomic::AtomicBool>,
         audit: Option<Arc<AuditLog>>,
+        on_reserved_slot: bool,
     ) -> Self {
         let session = engine.session();
         Self {
@@ -284,6 +321,7 @@ impl ElyraShim {
             procs,
             conn_id,
             user: std::sync::Mutex::new(String::new()),
+            on_reserved_slot,
             read_only,
             audit,
         }
@@ -423,6 +461,32 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for ElyraShim {
             self.on_auth_success(username);
         }
         ok
+    }
+
+    /// Enforce the administrator-reserved connection slot.
+    ///
+    /// The main budget was already full when this connection was accepted, so it is
+    /// only allowed to continue for an `Admin` account — that is the whole point of
+    /// the reserve: an operator must still be able to get in to diagnose and `KILL`
+    /// sessions on a saturated server. Anyone else is told the truth (1040, too many
+    /// connections) rather than an authentication error, which would be misleading
+    /// since their credentials were fine.
+    async fn post_auth_check(&self, _username: &[u8]) -> Option<(ErrorKind, String)> {
+        if !self.on_reserved_slot {
+            return None;
+        }
+        let privilege = *self.privilege.lock().unwrap_or_else(|e| e.into_inner());
+        if privilege == elyra_core::Privilege::Admin {
+            return None;
+        }
+        Some((
+            ErrorKind::ER_CON_COUNT_ERROR,
+            format!(
+                "Too many connections (limit {}); the remaining slot is reserved for \
+                 administrators",
+                max_connections()
+            ),
+        ))
     }
 
     async fn caching_sha2_requires_password(&self, username: &[u8]) -> bool {
@@ -915,6 +979,7 @@ pub async fn serve(config: ServerConfig, engine: Engine) -> std::io::Result<()> 
             warn!(%peer, limit = max_connections(), "refused connection: too many connections");
             continue;
         };
+        let on_reserved_slot = permit.reserved;
         let engine = (*engine).clone();
         let auth = auth.clone();
         let tls = tls.clone();
@@ -936,6 +1001,7 @@ pub async fn serve(config: ServerConfig, engine: Engine) -> std::io::Result<()> 
                 conn_id,
                 read_only,
                 audit,
+                on_reserved_slot,
             )
             .await;
             procs.deregister(conn_id);
@@ -1003,11 +1069,21 @@ async fn handle_connection(
     conn_id: u32,
     read_only: std::sync::Arc<std::sync::atomic::AtomicBool>,
     audit: Option<Arc<AuditLog>>,
+    on_reserved_slot: bool,
 ) -> std::io::Result<()> {
     use elyra_wire::{plain_run_with_options, secure_run_with_options, IntermediaryOptions};
 
     let (mut r, mut w) = stream.into_split();
-    let mut shim = ElyraShim::new(engine, auth, metrics, procs, conn_id, read_only, audit);
+    let mut shim = ElyraShim::new(
+        engine,
+        auth,
+        metrics,
+        procs,
+        conn_id,
+        read_only,
+        audit,
+        on_reserved_slot,
+    );
     let opts = IntermediaryOptions::default();
 
     // Read the handshake first; the client tells us whether it wants TLS.
@@ -1145,31 +1221,83 @@ mod guard_tests {
         assert_eq!(ConnPermit::live(), before);
     }
 
-    // At the limit, acquiring fails (the caller then refuses with 1040) and the
-    // budget is fully reclaimed once the held permits drop.
+    // The main budget admits exactly `max_connections` normal slots; beyond that
+    // only the single administrator reserve is offered, and everything is fully
+    // reclaimed once the permits drop.
     #[test]
     fn conn_budget_is_enforced_and_reclaimed() {
         let _guard = BUDGET_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let limit = max_connections();
         assert!(limit > 0, "test assumes the limit is enabled");
         let before = ConnPermit::live();
-        let mut held = Vec::new();
+        let mut normal = Vec::new();
+        let mut reserved = Vec::new();
         while let Some(p) = ConnPermit::acquire() {
-            held.push(p);
-            assert!(held.len() <= limit, "acquired more slots than the limit");
+            if p.reserved {
+                reserved.push(p);
+            } else {
+                normal.push(p);
+            }
+            assert!(
+                normal.len() + reserved.len() <= limit + 1,
+                "acquired more slots than the limit plus the reserve"
+            );
         }
-        assert_eq!(ConnPermit::live(), limit, "budget should be exhausted");
+        assert_eq!(
+            ConnPermit::live(),
+            limit,
+            "main budget should be exhausted (the reserve is counted separately)"
+        );
+        assert_eq!(reserved.len(), 1, "exactly one reserved slot");
         assert!(
             ConnPermit::acquire().is_none(),
-            "must refuse past the limit"
+            "must refuse once the budget and the reserve are both taken"
         );
-        // Freeing one slot admits exactly one more connection.
-        held.pop();
-        let one = ConnPermit::acquire();
-        assert!(one.is_some(), "a freed slot must be reusable");
+        // Freeing one normal slot admits exactly one more normal connection.
+        normal.pop();
+        let one = ConnPermit::acquire().expect("a freed slot must be reusable");
+        assert!(!one.reserved, "a freed normal slot is handed out as normal");
         assert!(ConnPermit::acquire().is_none(), "still full");
         drop(one);
+        drop(reserved);
+        drop(normal);
+        assert_eq!(ConnPermit::live(), before);
+    }
+
+    // Once the main budget is full, one extra slot is still handed out (marked
+    // reserved) so an administrator can always get in; a second attempt is refused.
+    #[test]
+    fn admin_slot_is_reserved_above_the_limit() {
+        let _guard = BUDGET_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let limit = max_connections();
+        let before = ConnPermit::live();
+        let mut held = Vec::new();
+        while let Some(p) = ConnPermit::acquire() {
+            if p.reserved {
+                held.push(p);
+                break;
+            }
+            held.push(p);
+            assert!(held.len() <= limit + 1);
+        }
+        // Exactly `limit` normal slots plus one reserved.
+        assert_eq!(held.len(), limit - before + 1);
+        assert!(
+            held.last().unwrap().reserved,
+            "the extra slot is the reserve"
+        );
+        assert!(
+            ConnPermit::acquire().is_none(),
+            "the reserve holds only one connection"
+        );
+        // Releasing the reserved slot makes it available again (and does not
+        // corrupt the main budget).
+        held.pop();
+        let again = ConnPermit::acquire().expect("reserve freed");
+        assert!(again.reserved);
+        drop(again);
         drop(held);
         assert_eq!(ConnPermit::live(), before);
+        assert!(ConnPermit::acquire().is_some_and(|p| !p.reserved));
     }
 }
