@@ -276,7 +276,7 @@ judge fit before deploying.
 - **Resource limits (denial-of-service surface).** Several bounds exist:
   expression depth, frame size, `IN (SELECT)` / `DISTINCT` row caps, recursive-CTE
   and stored-procedure loop caps, a `SERIALIZABLE` range cap, and a byte budget for
-  string-expanding functions (`ELYRASQL_MAX_STRING_BYTES`, returning `NULL` past it
+  string-expanding functions (`ELYRASQL_MAX_ALLOWED_PACKET`, returning `NULL` past it
   as MySQL does past `max_allowed_packet`). Two gaps remain, both tracked:
     - **A CPU-heavy query occupies a runtime worker thread**, and enough concurrent
       heavy queries can make the server unresponsive to *new* connections.
@@ -284,13 +284,12 @@ judge fit before deploying.
       statement that yields, so a long synchronous loop runs to completion. Treat
       the timeout as a latency bound for I/O-waiting queries, not a CPU guard, and
       restrict who can run arbitrary SQL (ESQL-32).
-    - **There is no `max_connections` limit** (ESQL-33), so an authenticated client
-      can still grow server memory / file-descriptor use by opening connections.
-      Put the server behind a connection pool or proxy if untrusted clients can
-      reach it. (Prepared statements *are* capped server-wide — see
-      `ELYRASQL_MAX_PREPARED_STMTS` — but a client that streams
-      `COM_STMT_SEND_LONG_DATA` without executing can still buffer without bound,
-      tracked as ESQL-35.)
+    - Connections are capped by `ELYRASQL_MAX_CONNECTIONS` (default 151, as in
+      MySQL) and surplus connections get error 1040, but — unlike MySQL — **no
+      extra slot is reserved for administrators**, so an operator can be locked
+      out of a saturated server (ESQL-36). Prepared statements and streamed
+      parameter data are bounded too (`ELYRASQL_MAX_PREPARED_STMTS`,
+      `ELYRASQL_MAX_ALLOWED_PACKET`).
 - Multiple persistent accounts with `CREATE USER`/`GRANT`/`REVOKE`. Privileges
   are tracked and **enforced per action**: the individual DML privileges
   `INSERT`, `UPDATE` and `DELETE` are checked separately, per target table, so a

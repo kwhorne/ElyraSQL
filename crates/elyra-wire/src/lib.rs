@@ -102,6 +102,24 @@ pub use crate::resultset::{InitWriter, QueryResultWriter, RowWriter, StatementMe
 pub use crate::value::{decode::to_naive_datetime, ToMysqlValue, Value, ValueInner};
 use crate::{commands::ClientHandshake, packet_reader::PacketReader, packet_writer::PacketWriter};
 
+/// Refuse a connection *before* the handshake by writing a single MySQL ERR
+/// packet, then flushing.
+///
+/// This is how MySQL reports a connection it will not serve at all (notably
+/// `ER_CON_COUNT_ERROR`, "Too many connections"): instead of the usual initial
+/// handshake, the very first packet the client receives is the error, with
+/// sequence id 0. Clients recognise it and report the real reason rather than a
+/// bare connection reset.
+pub async fn write_initial_error<W: AsyncWrite + Unpin>(
+    stream: W,
+    kind: ErrorKind,
+    msg: &[u8],
+) -> io::Result<()> {
+    let mut w = PacketWriter::new(stream);
+    writers::write_err(kind, msg, &mut w).await?;
+    w.flush_all().await
+}
+
 const SCRAMBLE_SIZE: usize = 20;
 const MYSQL_NATIVE_PASSWORD: &str = "mysql_native_password";
 const CACHING_SHA2_PASSWORD: &str = "caching_sha2_password";
@@ -242,11 +260,63 @@ pub struct IntermediaryOptions {
     pub reject_connection_on_dbname_absence: bool,
 }
 
-#[derive(Default)]
+/// Budget for one client-facing payload, mirroring MySQL's `max_allowed_packet`
+/// (same default, 64 MiB). Used here to bound parameter data streamed with
+/// `COM_STMT_SEND_LONG_DATA`. Configurable via `ELYRASQL_MAX_ALLOWED_PACKET`.
+fn max_allowed_packet() -> usize {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<usize> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("ELYRASQL_MAX_ALLOWED_PACKET")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n >= 1024)
+            .unwrap_or(64 << 20)
+    })
+}
+
+#[derive(Debug, Default)]
 struct StatementData {
     long_data: HashMap<u16, Vec<u8>>,
     bound_types: Vec<(myc::constants::ColumnType, bool)>,
     params: u16,
+    /// Bytes currently buffered across all `long_data` parameters.
+    long_data_bytes: usize,
+    /// Set once streamed parameter data passed the budget. `COM_STMT_SEND_LONG_DATA`
+    /// has no reply, so the failure is reported at execute time instead (as MySQL
+    /// does), and nothing further is buffered for this statement.
+    long_data_overflow: bool,
+}
+
+impl StatementData {
+    /// Buffer one `COM_STMT_SEND_LONG_DATA` chunk, enforcing `limit` across all
+    /// parameters of this statement.
+    ///
+    /// Once the budget is passed the already-buffered data is released
+    /// immediately (rather than held until the client happens to execute) and
+    /// every later chunk is discarded. The command has no reply, so the caller
+    /// reports the failure at execute time.
+    fn push_long_data(&mut self, param: u16, data: &[u8], limit: usize) {
+        if self.long_data_overflow {
+            return;
+        }
+        if self.long_data_bytes.saturating_add(data.len()) > limit {
+            self.long_data_overflow = true;
+            self.long_data = HashMap::new();
+            self.long_data_bytes = 0;
+            return;
+        }
+        self.long_data_bytes += data.len();
+        self.long_data.entry(param).or_default().extend(data);
+    }
+
+    /// Drop any buffered parameter data and clear the overflow flag, so the
+    /// statement can be reused. Called after every execute, successful or not.
+    fn reset_long_data(&mut self) {
+        self.long_data.clear();
+        self.long_data_bytes = 0;
+        self.long_data_overflow = false;
+    }
 }
 
 const AUTH_PLUGIN_DATA_PART_1_LENGTH: usize = 8;
@@ -775,33 +845,43 @@ where
                                     format!("asked to execute unknown statement {}", stmt),
                                 )
                             })?;
-                            {
-                                let params = params::ParamParser::new(params, state);
-                                let w = QueryResultWriter::new(
+                            if state.long_data_overflow {
+                                // Streamed parameter data went over
+                                // `max_allowed_packet`. COM_STMT_SEND_LONG_DATA has
+                                // no reply, so this is the first chance to tell the
+                                // client -- which is also where MySQL reports it.
+                                state.reset_long_data();
+                                writers::write_err(
+                                    ErrorKind::ER_NET_PACKET_TOO_LARGE,
+                                    b"Got a packet bigger than 'max_allowed_packet' bytes",
                                     &mut self.writer,
-                                    true,
-                                    self.client_capabilities,
-                                );
-                                self.shim.on_execute(stmt, params, w).await?;
+                                )
+                                .await?;
+                            } else {
+                                {
+                                    let params = params::ParamParser::new(params, state);
+                                    let w = QueryResultWriter::new(
+                                        &mut self.writer,
+                                        true,
+                                        self.client_capabilities,
+                                    );
+                                    self.shim.on_execute(stmt, params, w).await?;
+                                }
+                                state.reset_long_data();
                             }
-                            state.long_data.clear();
                         }
                         Command::SendLongData { stmt, param, data } => {
-                            stmts
-                                .get_mut(&stmt)
-                                .ok_or_else(|| {
-                                    io::Error::new(
-                                        io::ErrorKind::InvalidData,
-                                        format!(
-                                            "got long data packet for unknown statement {}",
-                                            stmt
-                                        ),
-                                    )
-                                })?
-                                .long_data
-                                .entry(param)
-                                .or_insert_with(Vec::new)
-                                .extend(data);
+                            let state = stmts.get_mut(&stmt).ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    format!("got long data packet for unknown statement {}", stmt),
+                                )
+                            })?;
+                            // Bound the accumulated parameter data. This command
+                            // has no reply and the buffer is only cleared by an
+                            // execute, so an unbounded stream that never executes
+                            // would otherwise grow memory without limit.
+                            state.push_long_data(param, data, max_allowed_packet());
                         }
                         Command::Close(stmt) => {
                             self.shim.on_close(stmt).await;
@@ -867,5 +947,65 @@ where
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod long_data_tests {
+    use super::StatementData;
+
+    #[test]
+    fn buffers_parameter_data_within_budget() {
+        let mut s = StatementData::default();
+        s.push_long_data(0, b"hello ", 1024);
+        s.push_long_data(0, b"world", 1024);
+        s.push_long_data(1, b"second", 1024);
+        assert!(!s.long_data_overflow);
+        assert_eq!(s.long_data_bytes, 17);
+        assert_eq!(s.long_data.get(&0).unwrap().as_slice(), b"hello world");
+        assert_eq!(s.long_data.get(&1).unwrap().as_slice(), b"second");
+    }
+
+    // The budget spans all parameters of the statement, and passing it must free
+    // the buffer immediately rather than hold it until the client executes.
+    #[test]
+    fn overflow_releases_the_buffer_and_latches() {
+        let mut s = StatementData::default();
+        s.push_long_data(0, &[b'x'; 600], 1000);
+        assert!(!s.long_data_overflow);
+        s.push_long_data(1, &[b'y'; 600], 1000);
+        assert!(s.long_data_overflow, "combined size must exceed the budget");
+        assert_eq!(s.long_data_bytes, 0, "buffer must be released at once");
+        assert!(s.long_data.is_empty());
+        // Later chunks are discarded rather than accumulating.
+        s.push_long_data(0, &[b'z'; 10], 1000);
+        assert!(s.long_data.is_empty());
+        assert_eq!(s.long_data_bytes, 0);
+        assert!(s.long_data_overflow);
+    }
+
+    // After an execute (which reports any overflow) the statement is reusable and
+    // must not carry the previous payload or the error flag forward.
+    #[test]
+    fn reset_makes_the_statement_reusable() {
+        let mut s = StatementData::default();
+        s.push_long_data(0, &[b'x'; 2000], 1000);
+        assert!(s.long_data_overflow);
+        s.reset_long_data();
+        assert!(!s.long_data_overflow);
+        assert_eq!(s.long_data_bytes, 0);
+        s.push_long_data(0, b"fresh", 1000);
+        assert_eq!(s.long_data.get(&0).unwrap().as_slice(), b"fresh");
+        assert_eq!(s.long_data_bytes, 5);
+    }
+
+    // A single chunk larger than the whole budget must not be buffered at all.
+    #[test]
+    fn oversized_single_chunk_is_rejected() {
+        let mut s = StatementData::default();
+        s.push_long_data(0, &[b'x'; 5000], 1000);
+        assert!(s.long_data_overflow);
+        assert!(s.long_data.is_empty());
+        assert_eq!(s.long_data_bytes, 0);
     }
 }

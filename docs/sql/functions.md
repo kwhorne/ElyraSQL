@@ -60,7 +60,7 @@ operator.
 `SUBSTRING` positions are 1-based (position `0` yields the empty string).
 
 `REPEAT`, `SPACE`, `LPAD` and `RPAD` return `NULL` when the result would exceed
-`ELYRASQL_MAX_STRING_BYTES` (default 64 MiB) — the same behaviour as MySQL past
+`ELYRASQL_MAX_ALLOWED_PACKET` (default 64 MiB) — the same behaviour as MySQL past
 `max_allowed_packet`, so `SPACE(10000000000)` is `NULL` rather than a 10 GB
 allocation.
 

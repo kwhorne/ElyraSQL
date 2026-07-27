@@ -934,13 +934,14 @@ fn wire(v: &Value) -> Option<String> {
 /// `LPAD`, `RPAD`). MySQL bounds these by `max_allowed_packet` and returns NULL
 /// when the result would exceed it; ElyraSQL does the same so one expression
 /// cannot allocate unbounded memory (`SPACE(1e10)` would otherwise ask for 10 GB).
-/// Configurable via `ELYRASQL_MAX_STRING_BYTES` (default 64 MiB, MySQL's default
-/// `max_allowed_packet`).
+/// Configurable via `ELYRASQL_MAX_ALLOWED_PACKET` (default 64 MiB, exactly MySQL's
+/// `max_allowed_packet` default). The same variable bounds streamed statement
+/// parameters (`COM_STMT_SEND_LONG_DATA`), matching MySQL's single knob.
 fn max_string_bytes() -> usize {
     use std::sync::OnceLock;
     static CACHE: OnceLock<usize> = OnceLock::new();
     *CACHE.get_or_init(|| {
-        std::env::var("ELYRASQL_MAX_STRING_BYTES")
+        std::env::var("ELYRASQL_MAX_ALLOWED_PACKET")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|&n| n >= 1024)
@@ -1153,7 +1154,7 @@ fn eval_scalar(name: &str, a: &[Value]) -> Result<Option<Value>> {
         "trim" => str1(a, |s| s.trim().to_string()),
         "ltrim" => str1(a, |s| s.trim_start().to_string()),
         "rtrim" => str1(a, |s| s.trim_end().to_string()),
-        // Bounded by ELYRASQL_MAX_STRING_BYTES: an oversized result is NULL, as
+        // Bounded by ELYRASQL_MAX_ALLOWED_PACKET: an oversized result is NULL, as
         // in MySQL, rather than an unbounded allocation.
         "space" => match nnum(a, 0).and_then(|n| expand_count(n, 1)) {
             Some(n) => Value::Text(" ".repeat(n)),

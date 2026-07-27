@@ -2382,3 +2382,21 @@ async fn prepared_statement_slots_are_reclaimed_on_close() {
         c.close(stmt).await.unwrap();
     }
 }
+
+// Connections are capped server-wide (MySQL's max_connections), so a slot MUST be
+// returned when a connection ends. Cycling through far more connections than the
+// 151 default would start failing with error 1040 partway through if the permit
+// leaked on disconnect.
+#[tokio::test]
+async fn connection_slots_are_reclaimed_on_disconnect() {
+    let srv = TestServer::start().await;
+    for i in 0..500u32 {
+        let mut c = srv.conn().await;
+        let got: Option<u32> = c
+            .query_first("SELECT 1")
+            .await
+            .unwrap_or_else(|e| panic!("connection {i} failed (slot leak?): {e}"));
+        assert_eq!(got, Some(1));
+        drop(c);
+    }
+}

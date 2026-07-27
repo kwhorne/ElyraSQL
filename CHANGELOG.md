@@ -8,6 +8,30 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ### Added
 
+- **Connection admission control (ESQL-33).** The listener accepted connections
+  without limit, so a client could exhaust memory and file descriptors just by
+  connecting. Concurrent connections are now bounded by
+  `ELYRASQL_MAX_CONNECTIONS`, mirroring MySQL's `max_connections` **and its
+  default of 151**. A surplus connection receives error **1040** (`Too many
+  connections`) as its first packet — the same thing MySQL does, so clients report
+  the real reason instead of a bare connection reset — and refusals are exposed as
+  `elyrasql_connections_refused_total` for alerting. Slots use the same RAII
+  permit pattern as prepared statements, so they are returned when a connection
+  ends however it ends. Unlike MySQL there is no extra slot reserved for
+  administrators yet (ESQL-36). `0` disables the limit.
+- **Streamed statement parameters are bounded (ESQL-35).**
+  `COM_STMT_SEND_LONG_DATA` appended to a per-statement buffer that is only
+  cleared by an execute, so a client that streamed data and never executed could
+  grow memory without limit — side-stepping the statement cap below, since one
+  statement was enough. Accumulated parameter data is now bounded by
+  `ELYRASQL_MAX_ALLOWED_PACKET`; passing it releases the buffer **immediately**
+  and fails the following `EXECUTE` with error **1153** (`Got a packet bigger than
+  'max_allowed_packet' bytes`), after which the statement is reusable. The error
+  is deliberately reported at execute time because `COM_STMT_SEND_LONG_DATA` has
+  no reply in the protocol — which is also where MySQL reports it. Verified with a
+  raw-protocol client: 3 MiB streamed against a 1 MiB budget left the server at
+  14 MB RSS, and legitimate long data (300 KiB in three chunks) still assembles
+  correctly.
 - **Prepared statements are capped server-wide (ESQL-34).** A client could
   previously `COM_STMT_PREPARE` without ever closing, growing the per-connection
   statement map without limit. The number of live prepared statements is now
@@ -38,12 +62,17 @@ All notable changes to ElyraSQL are documented here. The format is based on
 - **Denial-of-service: unbounded string expansion.** `REPEAT`, `SPACE`, `LPAD`
   and `RPAD` allocated whatever the arguments asked for, so `SPACE(10000000000)`
   requested 10 GB and `REPEAT('x', 200000000)` grew the process to 414 MB from a
-  single query. They now return `NULL` past `ELYRASQL_MAX_STRING_BYTES` (default
+  single query. They now return `NULL` past `ELYRASQL_MAX_ALLOWED_PACKET` (default
   64 MiB) — the same behaviour as MySQL past `max_allowed_packet`, whose default
   is also 64 MiB (verified against MySQL 8.4).
 
 ### Changed
 
+- The string-expansion budget introduced in this same unreleased cycle is now
+  named **`ELYRASQL_MAX_ALLOWED_PACKET`** (was `ELYRASQL_MAX_STRING_BYTES`). It is
+  the same 64 MiB default, but it now also bounds streamed statement parameters,
+  so one knob covers both — exactly as MySQL's `max_allowed_packet` does. No
+  released version used the old name.
 - **`ELYRASQL_QUERY_TIMEOUT_MS` is now documented accurately.** It can only
   interrupt a statement that yields; it does **not** preempt a long synchronous
   CPU loop (verified: a 2 s timeout did not stop the `NTILE` spin above). The

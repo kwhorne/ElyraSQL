@@ -41,6 +41,7 @@ pub struct Metrics {
     slow: AtomicU64,
     conns_current: AtomicU64,
     conns_total: AtomicU64,
+    conns_refused: AtomicU64,
     slow_ms: u128,
 }
 
@@ -58,6 +59,7 @@ impl Metrics {
             slow: AtomicU64::new(0),
             conns_current: AtomicU64::new(0),
             conns_total: AtomicU64::new(0),
+            conns_refused: AtomicU64::new(0),
             slow_ms,
         }
     }
@@ -69,6 +71,12 @@ impl Metrics {
 
     pub fn disconnect(&self) {
         self.conns_current.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// A connection refused because the server was at `max_connections`. Exposed
+    /// so operators can alert on hitting the limit rather than guessing.
+    pub fn refused(&self) {
+        self.conns_refused.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record a completed query: bump counters, and slow-log if over threshold.
@@ -126,6 +134,12 @@ impl Metrics {
             "elyrasql_connections_total",
             "Total connections since start",
             g(&self.conns_total),
+        );
+        counter(
+            &mut s,
+            "elyrasql_connections_refused_total",
+            "Connections refused because max_connections was reached",
+            g(&self.conns_refused),
         );
         counter(
             &mut s,

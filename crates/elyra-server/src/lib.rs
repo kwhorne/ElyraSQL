@@ -101,6 +101,70 @@ fn max_prepared_stmts() -> usize {
 /// Number of prepared statements currently live across all connections.
 static PREPARED_LIVE: AtomicUsize = AtomicUsize::new(0);
 
+/// Maximum client connections served at once, mirroring MySQL's `max_connections`
+/// (same default, 151). Surplus connections are refused with error 1040 before the
+/// handshake. Configurable via `ELYRASQL_MAX_CONNECTIONS`; `0` disables the limit.
+fn max_connections() -> usize {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<usize> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("ELYRASQL_MAX_CONNECTIONS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(151)
+    })
+}
+
+/// Connections currently being served.
+static CONNS_LIVE: AtomicUsize = AtomicUsize::new(0);
+
+/// An RAII slot in the connection budget, released on `Drop`.
+///
+/// As with [`StmtPermit`], dropping is what keeps the accounting honest: a
+/// connection that ends normally, one that dies mid-query, and one whose task
+/// unwinds all return their slot. A leaked slot would permanently shrink the
+/// server's capacity.
+struct ConnPermit;
+
+impl ConnPermit {
+    /// Reserve a connection slot, or `None` when the server is full.
+    fn acquire() -> Option<Self> {
+        let limit = max_connections();
+        if limit == 0 {
+            // Limit disabled: still count, so metrics/tests can observe it.
+            CONNS_LIVE.fetch_add(1, Ordering::AcqRel);
+            return Some(ConnPermit);
+        }
+        let mut cur = CONNS_LIVE.load(Ordering::Relaxed);
+        loop {
+            if cur >= limit {
+                return None;
+            }
+            match CONNS_LIVE.compare_exchange_weak(
+                cur,
+                cur + 1,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(ConnPermit),
+                Err(observed) => cur = observed,
+            }
+        }
+    }
+
+    /// Live connection count (used to assert the accounting in tests).
+    #[cfg(test)]
+    fn live() -> usize {
+        CONNS_LIVE.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for ConnPermit {
+    fn drop(&mut self) {
+        CONNS_LIVE.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// An RAII slot in the global prepared-statement budget.
 ///
 /// Releasing on `Drop` is what makes the accounting safe: a statement freed by
@@ -832,6 +896,25 @@ pub async fn serve(config: ServerConfig, engine: Engine) -> std::io::Result<()> 
     static CONN_SEQ: AtomicU32 = AtomicU32::new(0);
     loop {
         let (stream, peer) = listener.accept().await?;
+        // Admission control: refuse surplus connections the way MySQL does, with
+        // error 1040 as the first packet instead of the handshake, so clients
+        // report "Too many connections" rather than a bare reset. Held for the
+        // whole connection and released on drop.
+        let Some(permit) = ConnPermit::acquire() else {
+            metrics.refused();
+            tokio::spawn(async move {
+                let (_r, w) = stream.into_split();
+                let msg = format!("Too many connections (limit {})", max_connections());
+                let _ = elyra_wire::write_initial_error(
+                    w,
+                    elyra_wire::ErrorKind::ER_CON_COUNT_ERROR,
+                    msg.as_bytes(),
+                )
+                .await;
+            });
+            warn!(%peer, limit = max_connections(), "refused connection: too many connections");
+            continue;
+        };
         let engine = (*engine).clone();
         let auth = auth.clone();
         let tls = tls.clone();
@@ -857,6 +940,9 @@ pub async fn serve(config: ServerConfig, engine: Engine) -> std::io::Result<()> 
             .await;
             procs.deregister(conn_id);
             metrics.disconnect();
+            // Explicit so the permit's lifetime (and why it is held this long) is
+            // obvious: the slot is only returned once the connection is finished.
+            drop(permit);
             if let Err(e) = res {
                 error!(%peer, error = %e, "connection ended with error");
             }
@@ -953,7 +1039,9 @@ async fn handle_connection(
 
 #[cfg(test)]
 mod guard_tests {
-    use super::{listen_is_exposed, max_prepared_stmts, Prepared, StmtPermit};
+    use super::{
+        listen_is_exposed, max_connections, max_prepared_stmts, ConnPermit, Prepared, StmtPermit,
+    };
     use std::collections::HashMap;
 
     /// The prepared-statement budget is deliberately *global*, so these tests
@@ -1041,5 +1129,47 @@ mod guard_tests {
         );
         drop(held);
         assert_eq!(StmtPermit::live(), before);
+    }
+
+    // Connection slots must be returned on drop, or the server would permanently
+    // lose capacity every time a connection ended.
+    #[test]
+    fn conn_permits_are_released_on_drop() {
+        let _guard = BUDGET_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let before = ConnPermit::live();
+        {
+            let _a = ConnPermit::acquire().expect("slot available");
+            let _b = ConnPermit::acquire().expect("slot available");
+            assert_eq!(ConnPermit::live(), before + 2);
+        }
+        assert_eq!(ConnPermit::live(), before);
+    }
+
+    // At the limit, acquiring fails (the caller then refuses with 1040) and the
+    // budget is fully reclaimed once the held permits drop.
+    #[test]
+    fn conn_budget_is_enforced_and_reclaimed() {
+        let _guard = BUDGET_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let limit = max_connections();
+        assert!(limit > 0, "test assumes the limit is enabled");
+        let before = ConnPermit::live();
+        let mut held = Vec::new();
+        while let Some(p) = ConnPermit::acquire() {
+            held.push(p);
+            assert!(held.len() <= limit, "acquired more slots than the limit");
+        }
+        assert_eq!(ConnPermit::live(), limit, "budget should be exhausted");
+        assert!(
+            ConnPermit::acquire().is_none(),
+            "must refuse past the limit"
+        );
+        // Freeing one slot admits exactly one more connection.
+        held.pop();
+        let one = ConnPermit::acquire();
+        assert!(one.is_some(), "a freed slot must be reusable");
+        assert!(ConnPermit::acquire().is_none(), "still full");
+        drop(one);
+        drop(held);
+        assert_eq!(ConnPermit::live(), before);
     }
 }
