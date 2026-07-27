@@ -2359,3 +2359,26 @@ async fn string_expansion_is_bounded() {
         assert_eq!(n, Some(None), "{q} must be NULL, not a huge allocation");
     }
 }
+
+// Prepared statements are capped server-wide (MySQL's max_prepared_stmt_count),
+// so the slot MUST be returned when a statement is closed. Preparing far more
+// distinct statements than the limit (the driver evicts and closes as it goes)
+// therefore has to keep working: if closing leaked its slot, this would start
+// failing with error 1461 partway through.
+#[tokio::test]
+async fn prepared_statement_slots_are_reclaimed_on_close() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    // Comfortably more than the 16382 default limit.
+    for i in 0..20_000u32 {
+        // Distinct SQL each time so the driver cannot serve it from its cache;
+        // it closes evicted statements, which must return their slots.
+        let stmt = c
+            .prep(format!("SELECT ? + {i}"))
+            .await
+            .unwrap_or_else(|e| panic!("prepare {i} failed (slot leak?): {e}"));
+        let got: Option<u32> = c.exec_first(&stmt, (1u32,)).await.unwrap();
+        assert_eq!(got, Some(i + 1));
+        c.close(stmt).await.unwrap();
+    }
+}

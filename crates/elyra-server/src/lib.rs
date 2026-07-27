@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use elyra_engine::{Engine, QueryResult, Session};
@@ -81,9 +81,75 @@ pub fn load_tls(
 // opensrv-mysql), which also implements caching_sha2_password auth.
 
 /// A parsed prepared statement: the SQL template and its placeholder count.
+/// Server-wide limit on live prepared statements, mirroring MySQL's
+/// `max_prepared_stmt_count` (same default, 16382). The limit is global rather
+/// than per connection for the same reason MySQL's is: a per-connection cap does
+/// not bound total memory when the number of connections is itself unbounded.
+/// Configurable via `ELYRASQL_MAX_PREPARED_STMTS`.
+fn max_prepared_stmts() -> usize {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<usize> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("ELYRASQL_MAX_PREPARED_STMTS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(16_382)
+    })
+}
+
+/// Number of prepared statements currently live across all connections.
+static PREPARED_LIVE: AtomicUsize = AtomicUsize::new(0);
+
+/// An RAII slot in the global prepared-statement budget.
+///
+/// Releasing on `Drop` is what makes the accounting safe: a statement freed by
+/// `COM_STMT_CLOSE`, a connection that goes away without closing its statements,
+/// and an unwind all release their slots automatically. A manual decrement on
+/// each exit path would risk *leaking* slots, and a leaked global counter would
+/// eventually refuse every prepare server-wide - worse than the unbounded growth
+/// this replaces.
+struct StmtPermit;
+
+impl StmtPermit {
+    /// Reserve one slot, or `None` when the server-wide limit is reached.
+    fn acquire() -> Option<Self> {
+        let limit = max_prepared_stmts();
+        let mut cur = PREPARED_LIVE.load(Ordering::Relaxed);
+        loop {
+            if cur >= limit {
+                return None;
+            }
+            match PREPARED_LIVE.compare_exchange_weak(
+                cur,
+                cur + 1,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(StmtPermit),
+                Err(observed) => cur = observed,
+            }
+        }
+    }
+
+    /// Live count across all connections (used to assert the accounting in tests).
+    #[cfg(test)]
+    fn live() -> usize {
+        PREPARED_LIVE.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for StmtPermit {
+    fn drop(&mut self) {
+        PREPARED_LIVE.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 struct Prepared {
     sql: String,
     params: usize,
+    /// Holds this statement's slot in the global budget; released on drop.
+    _permit: StmtPermit,
 }
 
 /// Per-connection protocol handler.
@@ -321,6 +387,22 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for ElyraShim {
         info: StatementMetaWriter<'a, W>,
     ) -> Result<(), Self::Error> {
         let param_count = prepared::count_placeholders(query);
+        // Reserve a slot in the server-wide budget first: without this an
+        // authenticated client could prepare without ever closing and grow
+        // memory unboundedly. MySQL answers the same case with 1461.
+        let Some(permit) = StmtPermit::acquire() else {
+            let limit = max_prepared_stmts();
+            return info
+                .error(
+                    ErrorKind::ER_MAX_PREPARED_STMT_COUNT_REACHED,
+                    format!(
+                        "Can't create more than max_prepared_stmt_count statements \
+                         (current value: {limit})"
+                    )
+                    .as_bytes(),
+                )
+                .await;
+        };
         let id = self.next_id;
         self.next_id += 1;
         self.stmts.insert(
@@ -328,6 +410,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for ElyraShim {
             Prepared {
                 sql: query.to_string(),
                 params: param_count,
+                _permit: permit,
             },
         );
 
@@ -870,7 +953,12 @@ async fn handle_connection(
 
 #[cfg(test)]
 mod guard_tests {
-    use super::listen_is_exposed;
+    use super::{listen_is_exposed, max_prepared_stmts, Prepared, StmtPermit};
+    use std::collections::HashMap;
+
+    /// The prepared-statement budget is deliberately *global*, so these tests
+    /// must not run concurrently with each other (one exhausts the budget).
+    static BUDGET_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn loopback_binds_are_local() {
@@ -889,5 +977,69 @@ mod guard_tests {
         assert!(listen_is_exposed("10.0.0.5:3307"));
         // An unresolved hostname is treated as exposed (conservative).
         assert!(listen_is_exposed("db.internal:3307"));
+    }
+
+    // The prepared-statement budget must be released on every path, since a
+    // leaked global counter would eventually refuse every prepare server-wide.
+    #[test]
+    fn stmt_permits_are_released_on_drop() {
+        let _guard = BUDGET_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let before = StmtPermit::live();
+        {
+            let _a = StmtPermit::acquire().expect("slot available");
+            let _b = StmtPermit::acquire().expect("slot available");
+            assert_eq!(StmtPermit::live(), before + 2);
+        }
+        // Both permits dropped -> budget fully returned.
+        assert_eq!(StmtPermit::live(), before);
+    }
+
+    // Dropping the owning `Prepared` (statement closed, or connection gone
+    // without closing) must also return the slot.
+    #[test]
+    fn dropping_prepared_returns_its_slot() {
+        let _guard = BUDGET_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let before = StmtPermit::live();
+        let mut stmts: HashMap<u32, Prepared> = HashMap::new();
+        for id in 0..5u32 {
+            stmts.insert(
+                id,
+                Prepared {
+                    sql: "SELECT 1".into(),
+                    params: 0,
+                    _permit: StmtPermit::acquire().expect("slot available"),
+                },
+            );
+        }
+        assert_eq!(StmtPermit::live(), before + 5);
+        // Explicit close of one statement.
+        stmts.remove(&0);
+        assert_eq!(StmtPermit::live(), before + 4);
+        // Connection teardown drops the whole map at once.
+        drop(stmts);
+        assert_eq!(StmtPermit::live(), before);
+    }
+
+    // Past the limit, acquiring fails instead of growing without bound - and the
+    // budget is still fully reclaimed afterwards.
+    #[test]
+    fn stmt_budget_is_enforced_and_reclaimed() {
+        let _guard = BUDGET_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let limit = max_prepared_stmts();
+        let before = StmtPermit::live();
+        let mut held = Vec::new();
+        while let Some(p) = StmtPermit::acquire() {
+            held.push(p);
+            // Guard against a runaway loop if the limit were misread.
+            assert!(held.len() <= limit, "acquired more slots than the limit");
+        }
+        assert_eq!(StmtPermit::live(), limit, "budget should be exhausted");
+        assert_eq!(held.len(), limit - before);
+        assert!(
+            StmtPermit::acquire().is_none(),
+            "must refuse past the limit"
+        );
+        drop(held);
+        assert_eq!(StmtPermit::live(), before);
     }
 }

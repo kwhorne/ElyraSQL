@@ -6,6 +6,24 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **Prepared statements are capped server-wide (ESQL-34).** A client could
+  previously `COM_STMT_PREPARE` without ever closing, growing the per-connection
+  statement map without limit. The number of live prepared statements is now
+  bounded across all connections by `ELYRASQL_MAX_PREPARED_STMTS`, mirroring
+  MySQL's `max_prepared_stmt_count` **and its default of 16382**; past the limit a
+  prepare is answered with error **1461** (`Can't create more than
+  max_prepared_stmt_count statements`) and the connection remains usable. The
+  limit is global rather than per connection for the same reason MySQL's is: a
+  per-connection cap bounds nothing while the connection count itself is unbounded
+  (ESQL-33). Slots are tracked with an RAII permit, so they are returned when a
+  statement is closed, when a connection ends *without* closing its statements,
+  and on an unwind — a leaked global counter would otherwise eventually refuse
+  every prepare server-wide. Wire behaviour differential-verified against real
+  MySQL 8.4 (identical: three prepares accepted at a limit of three, then error
+  1461 with SQLSTATE 42000).
+
 ### Fixed
 
 - **Denial-of-service: `NTILE()` iterated its bucket argument.** `NTILE(N)`

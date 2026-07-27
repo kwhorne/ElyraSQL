@@ -284,10 +284,13 @@ judge fit before deploying.
       statement that yields, so a long synchronous loop runs to completion. Treat
       the timeout as a latency bound for I/O-waiting queries, not a CPU guard, and
       restrict who can run arbitrary SQL (ESQL-32).
-    - **There is no `max_connections` limit** (ESQL-33) and **no cap on prepared
-      statements per connection** (ESQL-34), so an authenticated client can grow
-      server memory / file-descriptor use. Put the server behind a connection pool
-      or proxy if untrusted clients can reach it.
+    - **There is no `max_connections` limit** (ESQL-33), so an authenticated client
+      can still grow server memory / file-descriptor use by opening connections.
+      Put the server behind a connection pool or proxy if untrusted clients can
+      reach it. (Prepared statements *are* capped server-wide — see
+      `ELYRASQL_MAX_PREPARED_STMTS` — but a client that streams
+      `COM_STMT_SEND_LONG_DATA` without executing can still buffer without bound,
+      tracked as ESQL-35.)
 - Multiple persistent accounts with `CREATE USER`/`GRANT`/`REVOKE`. Privileges
   are tracked and **enforced per action**: the individual DML privileges
   `INSERT`, `UPDATE` and `DELETE` are checked separately, per target table, so a
