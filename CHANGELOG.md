@@ -4,9 +4,30 @@ All notable changes to ElyraSQL are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.4.12] - 2026-07-27
+
+Hardening release. A code audit found two denial-of-service vectors that a single
+authenticated client could use to take the server down; both are fixed at the root.
+The rest of the release closes the remaining unbounded-resource gaps — connections,
+prepared statements and streamed parameters are now all bounded with
+MySQL-compatible limits, errors and defaults — and completes inter-node encryption
+by wrapping the Raft control plane in TLS. No on-disk format change.
 
 ### Added
+
+- **TLS encryption for the Raft control plane (ESQL-31).** Leader election
+  (`RequestVote`) and `AppendEntries` now run over TLS when the cluster TLS
+  variables are set, completing inter-node encryption (replication was already
+  covered by ESQL-30). It reuses the same `ELYRASQL_CLUSTER_TLS_CERT`/`_KEY`
+  (the certificate each node presents), `ELYRASQL_CLUSTER_TLS_CA` (roots used to
+  verify peers), and `ELYRASQL_CLUSTER_TLS_SERVER_NAME`. Each node **verifies**
+  its peers' certificates, so a node that cannot verify a peer cannot form the
+  cluster with it. The control-plane framing (`send`/`recv`), `handle_control`,
+  and `append_rpc` were generalised over the transport, and peer connections are
+  now a boxed TCP-or-TLS stream. Plaintext remains the default (with a warning).
+  Verified end-to-end: a 3-node cluster elects a leader and replicates writes via
+  Raft over TLS with the correct CA, and forms **no** cluster (no leader elected,
+  all writes rejected) when peers present a certificate a wrong CA cannot verify.
 
 - **Connection admission control (ESQL-33).** The listener accepted connections
   without limit, so a client could exhaust memory and file descriptors just by
@@ -87,22 +108,6 @@ All notable changes to ElyraSQL are documented here. The format is based on
   CPU loop (verified: a 2 s timeout did not stop the `NTILE` spin above). The
   previous wording implied the client was always unblocked. Treat it as a latency
   bound for I/O-waiting queries, not a CPU-DoS guard (ESQL-32).
-
-### Added
-
-- **TLS encryption for the Raft control plane (ESQL-31).** Leader election
-  (`RequestVote`) and `AppendEntries` now run over TLS when the cluster TLS
-  variables are set, completing inter-node encryption (replication was already
-  covered by ESQL-30). It reuses the same `ELYRASQL_CLUSTER_TLS_CERT`/`_KEY`
-  (the certificate each node presents), `ELYRASQL_CLUSTER_TLS_CA` (roots used to
-  verify peers), and `ELYRASQL_CLUSTER_TLS_SERVER_NAME`. Each node **verifies**
-  its peers' certificates, so a node that cannot verify a peer cannot form the
-  cluster with it. The control-plane framing (`send`/`recv`), `handle_control`,
-  and `append_rpc` were generalised over the transport, and peer connections are
-  now a boxed TCP-or-TLS stream. Plaintext remains the default (with a warning).
-  Verified end-to-end: a 3-node cluster elects a leader and replicates writes via
-  Raft over TLS with the correct CA, and forms **no** cluster (no leader elected,
-  all writes rejected) when peers present a certificate a wrong CA cannot verify.
 
 ## [1.4.11] - 2026-07-22
 
@@ -1694,6 +1699,7 @@ core CRUD with `WHERE`/`ORDER BY`/`LIMIT`, indexes, aggregation and `GROUP BY`,
 joins, prepared statements, authentication and TLS, vector search (exact +
 HNSW), parallel OLAP aggregation, and transactions with snapshot isolation.
 
+[1.4.12]: https://github.com/kwhorne/ElyraSQL/releases/tag/v1.4.12
 [1.4.11]: https://github.com/kwhorne/ElyraSQL/releases/tag/v1.4.11
 [1.4.10]: https://github.com/kwhorne/ElyraSQL/releases/tag/v1.4.10
 [1.4.9]: https://github.com/kwhorne/ElyraSQL/releases/tag/v1.4.9
