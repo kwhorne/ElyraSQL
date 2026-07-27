@@ -930,6 +930,43 @@ fn wire(v: &Value) -> Option<String> {
         v.to_wire_string()
     }
 }
+/// Byte budget for a single string-expanding function result (`REPEAT`, `SPACE`,
+/// `LPAD`, `RPAD`). MySQL bounds these by `max_allowed_packet` and returns NULL
+/// when the result would exceed it; ElyraSQL does the same so one expression
+/// cannot allocate unbounded memory (`SPACE(1e10)` would otherwise ask for 10 GB).
+/// Configurable via `ELYRASQL_MAX_STRING_BYTES` (default 64 MiB, MySQL's default
+/// `max_allowed_packet`).
+fn max_string_bytes() -> usize {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<usize> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("ELYRASQL_MAX_STRING_BYTES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n >= 1024)
+            .unwrap_or(64 << 20)
+    })
+}
+
+/// A non-negative count from a numeric argument, or `None` when it is negative,
+/// NaN, or so large that the result could not fit the string budget. Callers turn
+/// `None` into NULL, matching MySQL's over-`max_allowed_packet` behaviour.
+fn expand_count(n: f64, unit_bytes: usize) -> Option<usize> {
+    if !n.is_finite() || n < 0.0 {
+        return Some(0);
+    }
+    let limit = max_string_bytes();
+    // f64 -> usize saturates, so compare before converting.
+    if n > limit as f64 {
+        return None;
+    }
+    let count = n as usize;
+    if count.checked_mul(unit_bytes.max(1))? > limit {
+        return None;
+    }
+    Some(count)
+}
+
 fn sstr(a: &[Value], i: usize) -> Option<String> {
     a.get(i).and_then(wire)
 }
@@ -1116,8 +1153,10 @@ fn eval_scalar(name: &str, a: &[Value]) -> Result<Option<Value>> {
         "trim" => str1(a, |s| s.trim().to_string()),
         "ltrim" => str1(a, |s| s.trim_start().to_string()),
         "rtrim" => str1(a, |s| s.trim_end().to_string()),
-        "space" => match nnum(a, 0) {
-            Some(n) => Value::Text(" ".repeat(n.max(0.0) as usize)),
+        // Bounded by ELYRASQL_MAX_STRING_BYTES: an oversized result is NULL, as
+        // in MySQL, rather than an unbounded allocation.
+        "space" => match nnum(a, 0).and_then(|n| expand_count(n, 1)) {
+            Some(n) => Value::Text(" ".repeat(n)),
             None => Value::Null,
         },
         "bit_count" => match nnum(a, 0) {
@@ -1134,7 +1173,10 @@ fn eval_scalar(name: &str, a: &[Value]) -> Result<Option<Value>> {
         // CONV(n, from_base, to_base): base conversion, returned as text.
         "conv" => conv_fn(a),
         "repeat" => match (sstr(a, 0), nnum(a, 1)) {
-            (Some(s), Some(n)) => Value::Text(s.repeat(n.max(0.0) as usize)),
+            (Some(s), Some(n)) => match expand_count(n, s.len()) {
+                Some(n) => Value::Text(s.repeat(n)),
+                None => Value::Null,
+            },
             _ => Value::Null,
         },
         "replace" => match (sstr(a, 0), sstr(a, 1), sstr(a, 2)) {
@@ -1670,8 +1712,10 @@ fn pad(a: &[Value], left: bool) -> Value {
         Some(s) => s,
         None => return Value::Null,
     };
-    let len = match nnum(a, 1) {
-        Some(n) => n.max(0.0) as usize,
+    // A pad length past the string budget yields NULL (MySQL behaviour) instead
+    // of allocating an arbitrarily large result.
+    let len = match nnum(a, 1).and_then(|n| expand_count(n, 1)) {
+        Some(n) => n,
         None => return Value::Null,
     };
     let padstr = sstr(a, 2).unwrap_or_else(|| " ".to_string());

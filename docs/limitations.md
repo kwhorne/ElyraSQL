@@ -273,6 +273,21 @@ judge fit before deploying.
 
 ## Security & operations
 
+- **Resource limits (denial-of-service surface).** Several bounds exist:
+  expression depth, frame size, `IN (SELECT)` / `DISTINCT` row caps, recursive-CTE
+  and stored-procedure loop caps, a `SERIALIZABLE` range cap, and a byte budget for
+  string-expanding functions (`ELYRASQL_MAX_STRING_BYTES`, returning `NULL` past it
+  as MySQL does past `max_allowed_packet`). Two gaps remain, both tracked:
+    - **A CPU-heavy query occupies a runtime worker thread**, and enough concurrent
+      heavy queries can make the server unresponsive to *new* connections.
+      `ELYRASQL_QUERY_TIMEOUT_MS` does **not** help here: it can only interrupt a
+      statement that yields, so a long synchronous loop runs to completion. Treat
+      the timeout as a latency bound for I/O-waiting queries, not a CPU guard, and
+      restrict who can run arbitrary SQL (ESQL-32).
+    - **There is no `max_connections` limit** (ESQL-33) and **no cap on prepared
+      statements per connection** (ESQL-34), so an authenticated client can grow
+      server memory / file-descriptor use. Put the server behind a connection pool
+      or proxy if untrusted clients can reach it.
 - Multiple persistent accounts with `CREATE USER`/`GRANT`/`REVOKE`. Privileges
   are tracked and **enforced per action**: the individual DML privileges
   `INSERT`, `UPDATE` and `DELETE` are checked separately, per target table, so a

@@ -59,6 +59,11 @@ operator.
 `LENGTH` returns the byte length and `CHAR_LENGTH` the character count;
 `SUBSTRING` positions are 1-based (position `0` yields the empty string).
 
+`REPEAT`, `SPACE`, `LPAD` and `RPAD` return `NULL` when the result would exceed
+`ELYRASQL_MAX_STRING_BYTES` (default 64 MiB) — the same behaviour as MySQL past
+`max_allowed_packet`, so `SPACE(10000000000)` is `NULL` rather than a 10 GB
+allocation.
+
 Pattern matching: `str LIKE pattern`, and `str REGEXP pattern` / `str RLIKE
 pattern` (POSIX-style regular expressions, with `NOT REGEXP`).
 

@@ -6,6 +6,32 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **Denial-of-service: `NTILE()` iterated its bucket argument.** `NTILE(N)`
+  looped `N` times regardless of table size, so `NTILE(1000000000000)` on a
+  10-row table pinned a CPU core **indefinitely** — and the work continued after
+  the client disconnected. With one such query per core the server stopped
+  answering *new* connections entirely (measured: 16 queries → 1449% CPU, a fresh
+  `SELECT 1` timing out). Buckets are now assigned per row (O(rows)), which also
+  matches MySQL for a bucket count larger than the row count (each row in its own
+  bucket, surplus buckets empty). Distributions differential-verified against
+  real MySQL 8.4 (`NTILE(3)`/`(4)`/`(7)`/`(20)`).
+- **Denial-of-service: unbounded string expansion.** `REPEAT`, `SPACE`, `LPAD`
+  and `RPAD` allocated whatever the arguments asked for, so `SPACE(10000000000)`
+  requested 10 GB and `REPEAT('x', 200000000)` grew the process to 414 MB from a
+  single query. They now return `NULL` past `ELYRASQL_MAX_STRING_BYTES` (default
+  64 MiB) — the same behaviour as MySQL past `max_allowed_packet`, whose default
+  is also 64 MiB (verified against MySQL 8.4).
+
+### Changed
+
+- **`ELYRASQL_QUERY_TIMEOUT_MS` is now documented accurately.** It can only
+  interrupt a statement that yields; it does **not** preempt a long synchronous
+  CPU loop (verified: a 2 s timeout did not stop the `NTILE` spin above). The
+  previous wording implied the client was always unblocked. Treat it as a latency
+  bound for I/O-waiting queries, not a CPU-DoS guard (ESQL-32).
+
 ### Added
 
 - **TLS encryption for the Raft control plane (ESQL-31).** Leader election

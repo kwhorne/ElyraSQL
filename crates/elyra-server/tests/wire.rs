@@ -2283,3 +2283,79 @@ async fn multi_table_join_streams_correctly() {
         .unwrap();
     assert_eq!(cnt, 200);
 }
+
+// A query-supplied NTILE bucket count must cost O(rows), not O(buckets): before
+// this was fixed, NTILE(1e12) spun a CPU core forever (and survived client
+// disconnect), so a tiny query could take the whole server down. Also pins the
+// MySQL-verified distribution.
+#[tokio::test]
+async fn ntile_is_bounded_by_row_count() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop("CREATE TABLE nt (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    for i in 1..=10 {
+        c.query_drop(format!("INSERT INTO nt VALUES ({i})"))
+            .await
+            .unwrap();
+    }
+    // Distributions verified against real MySQL 8.4.
+    for (buckets, want) in [
+        (3u64, vec![1, 1, 1, 1, 2, 2, 2, 3, 3, 3]),
+        (4, vec![1, 1, 1, 2, 2, 2, 3, 3, 4, 4]),
+        (7, vec![1, 1, 2, 2, 3, 3, 4, 5, 6, 7]),
+        (20, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]),
+    ] {
+        let got: Vec<i64> = c
+            .query(format!(
+                "SELECT NTILE({buckets}) OVER (ORDER BY id) FROM nt"
+            ))
+            .await
+            .unwrap();
+        assert_eq!(got, want, "NTILE({buckets})");
+    }
+    // The DoS case: a huge bucket count must return immediately (each row in its
+    // own bucket, extra buckets empty - MySQL's answer too).
+    let started = std::time::Instant::now();
+    let got: Vec<i64> = c
+        .query("SELECT NTILE(1000000000000) OVER (ORDER BY id) FROM nt")
+        .await
+        .unwrap();
+    assert_eq!(got, (1..=10).collect::<Vec<i64>>());
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "NTILE with a huge bucket count must not iterate buckets"
+    );
+}
+
+// String-expanding functions must not allocate unbounded memory: past the byte
+// budget they return NULL, exactly as MySQL does past max_allowed_packet.
+#[tokio::test]
+async fn string_expansion_is_bounded() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    // Within budget: normal results.
+    let n: Option<u64> = c.query_first("SELECT LENGTH(SPACE(100))").await.unwrap();
+    assert_eq!(n, Some(Some(100)).flatten());
+    let n: Option<u64> = c
+        .query_first("SELECT LENGTH(REPEAT('ab', 500))")
+        .await
+        .unwrap();
+    assert_eq!(n, Some(1000));
+    let n: Option<u64> = c
+        .query_first("SELECT LENGTH(LPAD('a', 8, '-'))")
+        .await
+        .unwrap();
+    assert_eq!(n, Some(8));
+    // Over budget: NULL, not a multi-gigabyte allocation (MySQL-verified).
+    for q in [
+        "SELECT LENGTH(SPACE(10000000000))",
+        "SELECT LENGTH(REPEAT('x', 200000000))",
+        "SELECT LENGTH(LPAD('a', 10000000000, '-'))",
+        "SELECT LENGTH(RPAD('a', 10000000000, '-'))",
+    ] {
+        let n: Option<Option<u64>> = c.query_first(q).await.unwrap();
+        assert_eq!(n, Some(None), "{q} must be NULL, not a huge allocation");
+    }
+}

@@ -8858,17 +8858,24 @@ fn compute_partition(
             let n = idxs.len();
             // Distribute n rows into `buckets` groups; the first (n % buckets)
             // groups get one extra row (MySQL semantics).
-            let base = n / buckets;
-            let rem = n % buckets;
-            let mut pos = 0usize;
-            for b in 0..buckets {
-                let size = base + if b < rem { 1 } else { 0 };
-                for _ in 0..size {
-                    if pos < n {
-                        result[idxs[pos]] = Value::Int(b as i64 + 1);
-                        pos += 1;
-                    }
-                }
+            //
+            // Computed per row (O(rows)), never per bucket: `buckets` comes from
+            // the query, so iterating it would let `NTILE(1e12)` spin a CPU core
+            // regardless of table size. Buckets beyond the row count are simply
+            // empty, which is also what MySQL reports.
+            let base = n / buckets; // rows in a "small" bucket
+            let rem = n % buckets; // number of "large" buckets (base + 1 rows)
+            let big = rem * (base + 1); // rows covered by the large buckets
+            for (i, &row) in idxs.iter().enumerate() {
+                let bucket = if i < big {
+                    i / (base + 1)
+                } else {
+                    // `base == 0` implies `big == n`, so this branch is only
+                    // reached with a non-zero divisor; `checked_div` keeps that
+                    // panic-free without relying on the reasoning.
+                    (i - big).checked_div(base).map_or(i, |q| rem + q)
+                };
+                result[row] = Value::Int(bucket as i64 + 1);
             }
         }
         "first_value" => {
