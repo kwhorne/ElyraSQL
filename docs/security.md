@@ -49,8 +49,12 @@ elyrasql serve \
     primary and `ELYRASQL_CLUSTER_TLS_CA` on the replica. The replica then verifies
     the primary's certificate (a mismatched cert is rejected — not accept-any), so
     the stream is confidential and the primary is authenticated, while the shared
-    secret authenticates the replica (mutual authentication). The Raft control
-    plane is not yet TLS-wrapped; run it on a trusted network for now.
+    secret authenticates the replica (mutual authentication). The **Raft control
+    plane** (leader election + AppendEntries) uses the same `ELYRASQL_CLUSTER_TLS_*`
+    variables and is encrypted the same way — each node presents its certificate
+    and verifies its peers' certificates, so a node that cannot verify its peers
+    cannot join the cluster. All inter-node traffic (consensus + replication) is
+    therefore encrypted when the cluster TLS variables are set.
 
 ## Roles
 

@@ -26,7 +26,7 @@ use tracing::{info, warn};
 
 /// Server-side TLS for the replication endpoint, from `ELYRASQL_CLUSTER_TLS_CERT`
 /// + `ELYRASQL_CLUSTER_TLS_KEY`. `None` (plaintext) unless both are set.
-fn cluster_server_tls() -> Option<Arc<ServerConfig>> {
+pub(crate) fn cluster_server_tls() -> Option<Arc<ServerConfig>> {
     let cert = std::env::var("ELYRASQL_CLUSTER_TLS_CERT").ok()?;
     let key = std::env::var("ELYRASQL_CLUSTER_TLS_KEY").ok()?;
     match crate::load_tls(&cert, &key) {
@@ -42,7 +42,7 @@ fn cluster_server_tls() -> Option<Arc<ServerConfig>> {
 /// (roots that must verify the primary's certificate) plus an optional
 /// `ELYRASQL_CLUSTER_TLS_SERVER_NAME` (defaults to `localhost`). The primary's
 /// certificate IS verified — there is no accept-any-cert mode.
-fn cluster_client_tls() -> std::io::Result<Option<(TlsConnector, ServerName<'static>)>> {
+pub(crate) fn cluster_client_tls() -> std::io::Result<Option<(TlsConnector, ServerName<'static>)>> {
     let Some(ca) = std::env::var("ELYRASQL_CLUSTER_TLS_CA").ok() else {
         return Ok(None);
     };
@@ -68,9 +68,26 @@ fn cluster_client_tls() -> std::io::Result<Option<(TlsConnector, ServerName<'sta
     Ok(Some((TlsConnector::from(Arc::new(cfg)), server_name)))
 }
 
-/// A boxable duplex transport (plain TCP or TLS) for the replica connect path.
-trait DuplexStream: AsyncRead + AsyncWrite + Unpin + Send {}
+/// A boxable duplex transport (plain TCP or TLS) for the replica connect path
+/// and the Raft control plane.
+pub(crate) trait DuplexStream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> DuplexStream for T {}
+
+/// Process-wide cached client TLS config for outbound cluster connections
+/// (Raft RPCs reuse this rather than re-parsing the CA on every call). A load
+/// error is logged once and treated as "no TLS" (plaintext), matching the
+/// replica path.
+pub(crate) fn cluster_client_tls_cached() -> Option<(TlsConnector, ServerName<'static>)> {
+    use std::sync::OnceLock;
+    static C: OnceLock<Option<(TlsConnector, ServerName<'static>)>> = OnceLock::new();
+    C.get_or_init(|| {
+        cluster_client_tls().unwrap_or_else(|e| {
+            warn!(error = %e, "cluster client TLS config failed to load; cluster connections stay plaintext");
+            None
+        })
+    })
+    .clone()
+}
 
 /// One framed replication message.
 #[derive(Serialize, Deserialize)]

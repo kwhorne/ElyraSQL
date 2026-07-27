@@ -24,8 +24,14 @@ use std::time::{Duration, Instant};
 use elyra_storage::{Consensus, Db, WriteOp};
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio_rustls::TlsAcceptor;
+
+use crate::repl::{cluster_client_tls_cached, cluster_server_tls, DuplexStream};
+
+/// A boxed, possibly-TLS control-plane connection to a peer.
+type PeerConn = Box<dyn DuplexStream>;
 use tokio::sync::{oneshot, watch, Notify};
 use tracing::{info, warn};
 
@@ -288,7 +294,11 @@ impl Node {
     /// Start the control listener and the election / replication loops.
     pub async fn run(self: Arc<Self>) -> std::io::Result<()> {
         let listener = TcpListener::bind(&self.cfg.control_listen).await?;
-        info!(id = self.cfg.id, addr = %self.cfg.control_listen, "raft control plane listening");
+        let tls = cluster_server_tls().map(TlsAcceptor::from);
+        info!(id = self.cfg.id, addr = %self.cfg.control_listen, tls = tls.is_some(), "raft control plane listening");
+        if tls.is_none() {
+            warn!(id = self.cfg.id, addr = %self.cfg.control_listen, "raft control plane is UNENCRYPTED - set ELYRASQL_CLUSTER_TLS_CERT/KEY, or run it on a private network/VPN");
+        }
         let srv = self.clone();
         tokio::spawn(async move {
             loop {
@@ -296,8 +306,19 @@ impl Node {
                     Ok((stream, _)) => {
                         let _ = stream.set_nodelay(true);
                         let n = srv.clone();
+                        let tls = tls.clone();
                         tokio::spawn(async move {
-                            let _ = n.handle_control(stream).await;
+                            match tls {
+                                Some(acceptor) => match acceptor.accept(stream).await {
+                                    Ok(s) => {
+                                        let _ = n.handle_control(s).await;
+                                    }
+                                    Err(e) => warn!(error = %e, "control TLS handshake failed"),
+                                },
+                                None => {
+                                    let _ = n.handle_control(stream).await;
+                                }
+                            }
                         });
                     }
                     Err(e) => warn!(error = %e, "control accept failed"),
@@ -308,8 +329,12 @@ impl Node {
         Ok(())
     }
 
-    async fn handle_control(&self, mut stream: TcpStream) -> std::io::Result<()> {
+    async fn handle_control<S>(&self, mut stream: S) -> std::io::Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         // Authenticate the peer (no-op unless a cluster secret is configured).
+        // Runs over whatever transport `S` is (plain TCP or a TLS stream).
         auth_accept(&mut stream).await?;
         // Loop over messages so a leader can reuse one connection for many
         // AppendEntries (batched throughput); one-shot RPCs simply send one
@@ -485,7 +510,7 @@ impl Node {
     async fn main_loop(self: Arc<Self>) {
         // Persistent AppendEntries connections to followers, reused across rounds
         // for batched throughput; cleared when we stop being leader.
-        let mut conns: HashMap<u64, TcpStream> = HashMap::new();
+        let mut conns: HashMap<u64, PeerConn> = HashMap::new();
         loop {
             let (role, deadline) = {
                 let s = self.state.lock().unwrap();
@@ -602,7 +627,7 @@ impl Node {
 
     /// One leader replication round: push entries to every follower, collect
     /// acks, advance the commit index, and apply newly committed entries.
-    async fn replicate_round(self: &Arc<Self>, conns: &mut HashMap<u64, TcpStream>) {
+    async fn replicate_round(self: &Arc<Self>, conns: &mut HashMap<u64, PeerConn>) {
         let term = {
             let s = self.state.lock().unwrap();
             if s.role != Role::Leader {
@@ -671,9 +696,8 @@ impl Node {
                 Some(r) => Some(r),
                 None => {
                     conns.remove(&peer.id);
-                    match TcpStream::connect(&peer.control_addr).await {
+                    match connect_peer(&peer.control_addr).await {
                         Ok(mut s) => {
-                            let _ = s.set_nodelay(true);
                             if auth_connect(&mut s).await.is_err() {
                                 conns.remove(&peer.id);
                                 continue;
@@ -834,7 +858,7 @@ pub async fn follow_leadership(node: Arc<Node>, read_only: Arc<AtomicBool>) {
     }
 }
 
-async fn send(stream: &mut TcpStream, m: &Msg) -> std::io::Result<()> {
+async fn send<W: AsyncWrite + Unpin>(stream: &mut W, m: &Msg) -> std::io::Result<()> {
     let bytes = bincode::serialize(m).map_err(|e| Error::other(e.to_string()))?;
     stream
         .write_all(&(bytes.len() as u32).to_le_bytes())
@@ -845,7 +869,7 @@ async fn send(stream: &mut TcpStream, m: &Msg) -> std::io::Result<()> {
 
 /// Read one framed message; `None` on a clean end-of-stream.
 /// Reject absurd frame lengths (corrupt/malicious peer) before allocating.
-async fn recv(stream: &mut TcpStream) -> std::io::Result<Option<Msg>> {
+async fn recv<R: AsyncRead + Unpin>(stream: &mut R) -> std::io::Result<Option<Msg>> {
     let mut len = [0u8; 4];
     match stream.read_exact(&mut len).await {
         Ok(_) => {}
@@ -934,10 +958,23 @@ pub async fn auth_connect<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpi
 
 /// One-shot request/response RPC to a peer with a short timeout (elections,
 /// membership).
+/// Open a control-plane connection to a peer: plain TCP, or TLS (verifying the
+/// peer's certificate against `ELYRASQL_CLUSTER_TLS_CA`) when configured.
+async fn connect_peer(addr: &str) -> std::io::Result<PeerConn> {
+    let stream = TcpStream::connect(addr).await?;
+    let _ = stream.set_nodelay(true);
+    match cluster_client_tls_cached() {
+        Some((connector, name)) => {
+            let tls = connector.connect(name, stream).await?;
+            Ok(Box::new(tls))
+        }
+        None => Ok(Box::new(stream)),
+    }
+}
+
 async fn rpc(addr: &str, m: &Msg) -> std::io::Result<Msg> {
     let fut = async {
-        let mut stream = TcpStream::connect(addr).await?;
-        let _ = stream.set_nodelay(true);
+        let mut stream = connect_peer(addr).await?;
         auth_connect(&mut stream).await?;
         send(&mut stream, m).await?;
         recv(&mut stream)
@@ -950,7 +987,10 @@ async fn rpc(addr: &str, m: &Msg) -> std::io::Result<Msg> {
 }
 
 /// Send an AppendEntries on a persistent connection and await the ack (bounded).
-async fn append_rpc(stream: &mut TcpStream, m: &Msg) -> std::io::Result<Msg> {
+async fn append_rpc<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    m: &Msg,
+) -> std::io::Result<Msg> {
     let fut = async {
         send(stream, m).await?;
         recv(stream)
@@ -1023,5 +1063,22 @@ mod tests {
         assert_eq!(mk(0), 1);
         assert_eq!(mk(2), 2);
         assert_eq!(mk(4), 3);
+    }
+
+    // The control-plane framing must work over any AsyncRead+AsyncWrite transport
+    // (this is what lets it run over a TLS stream, not just a raw TcpStream).
+    #[tokio::test]
+    async fn send_recv_roundtrip_over_generic_stream() {
+        let (mut a, mut b) = tokio::io::duplex(4096);
+        send(&mut a, &Msg::CtlAck { ok: true }).await.unwrap();
+        send(&mut a, &Msg::RemovePeer { id: 7 }).await.unwrap();
+        assert!(matches!(
+            recv(&mut b).await.unwrap(),
+            Some(Msg::CtlAck { ok: true })
+        ));
+        assert!(matches!(
+            recv(&mut b).await.unwrap(),
+            Some(Msg::RemovePeer { id: 7 })
+        ));
     }
 }

@@ -4,6 +4,24 @@ All notable changes to ElyraSQL are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **TLS encryption for the Raft control plane (ESQL-31).** Leader election
+  (`RequestVote`) and `AppendEntries` now run over TLS when the cluster TLS
+  variables are set, completing inter-node encryption (replication was already
+  covered by ESQL-30). It reuses the same `ELYRASQL_CLUSTER_TLS_CERT`/`_KEY`
+  (the certificate each node presents), `ELYRASQL_CLUSTER_TLS_CA` (roots used to
+  verify peers), and `ELYRASQL_CLUSTER_TLS_SERVER_NAME`. Each node **verifies**
+  its peers' certificates, so a node that cannot verify a peer cannot form the
+  cluster with it. The control-plane framing (`send`/`recv`), `handle_control`,
+  and `append_rpc` were generalised over the transport, and peer connections are
+  now a boxed TCP-or-TLS stream. Plaintext remains the default (with a warning).
+  Verified end-to-end: a 3-node cluster elects a leader and replicates writes via
+  Raft over TLS with the correct CA, and forms **no** cluster (no leader elected,
+  all writes rejected) when peers present a certificate a wrong CA cannot verify.
+
 ## [1.4.11] - 2026-07-22
 
 Robustness & cluster-security release: memory fail-safes for `IN (SELECT)` /

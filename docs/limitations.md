@@ -306,9 +306,10 @@ judge fit before deploying.
   `ELYRASQL_CLUSTER_TLS_CA` on the replica (which then *verifies* the primary's
   certificate — a wrong/self-signed-mismatch cert is rejected), giving
   confidentiality + server authentication, with the shared secret authenticating
-  the replica (mutual auth). The **Raft control plane** (votes/AppendEntries) is
-  not yet TLS-wrapped (ESQL-31); until then run cluster control traffic on a
-  trusted/private network (or a VPN/WireGuard).
+  the replica (mutual auth). The **Raft control plane** (votes/AppendEntries) uses
+  the **same** `ELYRASQL_CLUSTER_TLS_*` settings and is now likewise TLS-encrypted
+  with peer-certificate verification, so all inter-node cluster traffic
+  (replication + consensus) can be encrypted.
 - **Password hardening.** New passwords (`CREATE USER` / `ALTER USER` / `SET
   PASSWORD`) must satisfy a strength policy: minimum length
   (`ELYRASQL_PASSWORD_MIN_LEN`, default 8) and a letters+digits requirement

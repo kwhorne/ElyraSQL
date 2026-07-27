@@ -74,6 +74,15 @@ A write is only accepted while a node believes it is the leader for the current
 term (fencing). Election needs a **majority**, so run an odd number of nodes
 (3 or 5) to tolerate 1 or 2 failures without split-brain.
 
+**Securing inter-node traffic.** Set `ELYRASQL_CLUSTER_SECRET` (shared secret;
+required to expose the endpoints off loopback) so peers authenticate each other,
+and set `ELYRASQL_CLUSTER_TLS_CERT`/`_KEY` (the certificate each node presents)
+plus `ELYRASQL_CLUSTER_TLS_CA` (roots used to verify peers) to **encrypt** both
+the replication stream and the Raft control plane. Each node verifies its peers'
+certificates, so a node that cannot verify a peer will not form the cluster with
+it. Use `ELYRASQL_CLUSTER_TLS_SERVER_NAME` if the certificate's SAN is not
+`localhost`.
+
 Because replication is asynchronous, a newly elected leader may be missing the
 old leader's last unreplicated writes; on a leadership change a follower
 re-bootstraps from the new leader. There is no synchronous/quorum commit.
