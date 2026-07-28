@@ -8,6 +8,20 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ### Fixed
 
+- **A materialising join could exhaust memory and kill the process (ESQL-39).**
+  `FULL`, non-equi, derived-table and cross joins buffer their output, with no cap
+  and no spilling: 8 concurrent 3-way cross joins over a 4000-row table took the
+  process from 97 MB to **97 GB** RSS, after which the OS killed it — no panic and
+  nothing logged. A single authenticated client could do this with one short query.
+  Buffered rows are now bounded per join by `ELYRASQL_JOIN_MAX_ROWS` (default 10M)
+  and across all concurrent joins by `ELYRASQL_JOIN_MAX_ROWS_TOTAL` (default 20M),
+  both reserved through an RAII guard so a join that finishes, errors or unwinds
+  returns its share. The per-join cap alone would not have bounded the server, since
+  memory scales with concurrency. The same workload now plateaus at **5.4 GB** with
+  the server healthy, and an unconstrained join fails with a message naming the
+  limit rather than being killed. Streaming joins are unaffected — they never hold
+  the join output.
+
 - **Wrong join results: the hash-join key was corrupted (ESQL-40).** Present in
   1.4.12. The key was a collation key pushed through `from_utf8_lossy`, but a
   collation key is an order-preserving **binary** encoding — so every byte that is

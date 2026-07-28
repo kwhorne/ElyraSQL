@@ -290,10 +290,13 @@ judge fit before deploying.
       blocking threads).
     - **A materialising join buffers its output in memory** (`FULL`, non-equi,
       derived-table and cross joins — the shapes the streaming paths do not cover).
-      There is no cap and no spilling, so a few concurrent large joins can exhaust
-      memory and get the process killed: measured, 8 concurrent 3-way cross joins
-      over a 4000-row table took the process from 97 MB to 97 GB RSS (ESQL-39).
-      Until that is bounded, avoid unconstrained joins on untrusted input.
+      It is now bounded by `ELYRASQL_JOIN_MAX_ROWS` per join and
+      `ELYRASQL_JOIN_MAX_ROWS_TOTAL` across all of them, so an unconstrained join
+      fails with a clear error instead of growing until the process is killed:
+      8 concurrent 3-way cross joins over a 4000-row table went from 97 GB RSS and a
+      killed process to a **5.4 GB plateau** with the server healthy. These are
+      fail-safe caps, not spilling — a join that legitimately needs more output must
+      raise the limit or be reshaped (ESQL-39 tracks real spilling).
     - Connections are capped by `ELYRASQL_MAX_CONNECTIONS` (default 151, as in
       MySQL); surplus connections get error 1040, and — as in MySQL — one extra
       slot is reserved for `Admin` accounts so an operator is not locked out.

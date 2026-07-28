@@ -2572,3 +2572,46 @@ async fn join_results_are_exact_across_the_byte_boundary() {
     assert_eq!(rows.len(), 8);
     assert_eq!(rows.iter().map(|(_, n)| n).sum::<i64>(), 400);
 }
+
+// A materialising join must not buffer without limit: an unconstrained cross join
+// used to grow until the OS killed the process. It now fails with a clear, tunable
+// error, while ordinary joins are unaffected.
+#[tokio::test]
+async fn unbounded_join_fails_instead_of_exhausting_memory() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop("CREATE TABLE jb (id INT PRIMARY KEY, v INT)")
+        .await
+        .unwrap();
+    for i in 1..=900 {
+        c.query_drop(format!("INSERT INTO jb VALUES ({i}, {})", i % 3))
+            .await
+            .unwrap();
+    }
+
+    // A normal, selective join still works.
+    let got: Option<i64> = c
+        .query_first("SELECT COUNT(*) FROM jb a JOIN jb b ON a.id = b.id")
+        .await
+        .unwrap();
+    assert_eq!(got, Some(900));
+
+    // 900^3 with a non-equi predicate: far past any sane budget, so it must be
+    // refused rather than buffered.
+    let err = c
+        .query_drop("SELECT COUNT(*) FROM jb a, jb b, jb c WHERE a.v + b.v + c.v >= 0")
+        .await
+        .expect_err("an unbounded join product must be refused");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("ELYRASQL_JOIN_MAX_ROWS"),
+        "the error should name the limit so it can be tuned, got: {msg}"
+    );
+
+    // The session stays usable and the budget is returned, so later joins work.
+    let got: Option<i64> = c
+        .query_first("SELECT COUNT(*) FROM jb a JOIN jb b ON a.id = b.id")
+        .await
+        .unwrap();
+    assert_eq!(got, Some(900));
+}

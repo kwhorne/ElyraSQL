@@ -4733,6 +4733,9 @@ fn expand_join_chain(
     out: &mut Vec<Vec<Value>>,
     check: &mut elyra_core::cancel::CancelCheck,
 ) -> Result<()> {
+    // One driving row's buffers live only for this call, so the reservation is
+    // taken and released here.
+    let mut budget = JoinBudget::new();
     let mut partials = vec![driving];
     for step in steps {
         let mut next = Vec::new();
@@ -4752,6 +4755,8 @@ fn expand_join_chain(
             if let Some(rows) = matches {
                 for m in rows {
                     check.tick()?;
+                    // One driving row's fan-out is multiplicative across steps.
+                    budget.account(next.len())?;
                     let mut c = row.clone();
                     c.extend_from_slice(m);
                     next.push(c);
@@ -6455,10 +6460,14 @@ fn combine(
     // The product of two relations is quadratic, so this is the loop a cross
     // join spends its time in: check the statement's deadline as we go.
     let mut check = elyra_core::cancel::CancelCheck::new(cancel.clone());
+    // Bound the buffered product: without this a cross join grows until the
+    // process is killed. Released when this join finishes, errors, or unwinds.
+    let mut budget = JoinBudget::new();
     for l in lrows {
         let mut matched = false;
         for (ri, r) in rrows.iter().enumerate() {
             check.tick()?;
+            budget.account(out.len())?;
             let mut combined = l.clone();
             combined.extend_from_slice(r);
             let keep = match on {
@@ -6506,9 +6515,10 @@ fn hash_join(
     cancel: &std::sync::Arc<elyra_core::cancel::QueryCancel>,
 ) -> Result<Vec<Vec<Value>>> {
     // A hash join over large inputs can emit far more rows than either side, so
-    // it needs its own deadline checks (its caller only checks the nested-loop
-    // fallback).
+    // it needs its own deadline checks and row budget (its caller only guards the
+    // nested-loop fallback).
     let mut check = elyra_core::cancel::CancelCheck::new(cancel.clone());
+    let mut budget = JoinBudget::new();
     use std::collections::HashMap;
     let llen = lschema.columns.len();
     let rlen = rschema.columns.len();
@@ -6542,6 +6552,7 @@ fn hash_join(
                 if let Some(idxs) = table.get(&k) {
                     for &i in idxs {
                         check.tick()?;
+                        budget.account(out.len())?;
                         let mut combined = lrows[i].clone();
                         combined.extend_from_slice(r);
                         out.push(combined);
@@ -6572,6 +6583,7 @@ fn hash_join(
                 if let Some(idxs) = table.get(&k) {
                     for &i in idxs {
                         check.tick()?;
+                        budget.account(out.len())?;
                         let mut combined = l.clone();
                         combined.extend_from_slice(&rrows[i]);
                         out.push(combined);
@@ -6641,6 +6653,11 @@ fn merge_join_inner(l: KeyedRows, r: KeyedRows) -> Option<Vec<Vec<Value>>> {
                 }
                 for a in &l[i..ie] {
                     for b in &r[j..je] {
+                        // Over budget: give up on the merge path and let the
+                        // caller's hash join report the limit with a clear error.
+                        if out.len() > join_max_rows() {
+                            return None;
+                        }
                         let mut combined = a.1.clone();
                         combined.extend_from_slice(b.1);
                         out.push(combined);
@@ -7089,6 +7106,111 @@ fn in_subquery_max() -> usize {
 /// default 5,000,000) before erroring fail-safe rather than risking OOM.
 fn distinct_max() -> usize {
     env_usize("ELYRASQL_DISTINCT_MAX", 5_000_000)
+}
+
+/// Max rows a **materialising** join may buffer (`ELYRASQL_JOIN_MAX_ROWS`, default
+/// 10,000,000) before erroring fail-safe rather than risking OOM.
+///
+/// The streaming join paths are unaffected: they never hold the join output, so
+/// they are bounded by the spilling sorter/aggregator instead. This guards the
+/// shapes that still materialise — `FULL`, non-equi, derived-table and cross joins
+/// — where the product of the inputs can dwarf both of them (a 3-way cross join
+/// over a 4000-row table reaches ~1.3 billion rows, which took a process from
+/// 97 MB to 97 GB RSS before the OS killed it).
+fn join_max_rows() -> usize {
+    env_usize("ELYRASQL_JOIN_MAX_ROWS", 10_000_000)
+}
+
+/// Budget for rows buffered by **all** materialising joins at once
+/// (`ELYRASQL_JOIN_MAX_ROWS_TOTAL`, default 20,000,000).
+///
+/// A per-join cap alone does not bound the server: N concurrent joins each buffer
+/// up to their own limit, so memory still scales with concurrency. This ceiling is
+/// shared, so a burst of large joins is refused rather than swapping the machine.
+fn join_max_rows_total() -> usize {
+    env_usize("ELYRASQL_JOIN_MAX_ROWS_TOTAL", 20_000_000)
+}
+
+/// Rows currently buffered across all materialising joins.
+static JOIN_ROWS_LIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// An RAII reservation in the join row budget, enforcing both the per-join cap and
+/// the shared ceiling.
+///
+/// Reservations are released on drop, so a join that finishes, errors, or unwinds
+/// returns its share. As with the connection and prepared-statement budgets this
+/// matters more than the check itself: a leaked reservation would permanently
+/// shrink what later joins are allowed to do.
+struct JoinBudget {
+    /// Rows currently reserved from the shared ceiling by this join.
+    reserved: usize,
+}
+
+impl JoinBudget {
+    /// Rows reserved at a time, so the shared counter is touched rarely rather
+    /// than per output row.
+    const BLOCK: usize = 65_536;
+
+    fn new() -> Self {
+        Self { reserved: 0 }
+    }
+
+    /// Account for a join that has buffered `rows` rows so far, growing the
+    /// reservation as needed. Errors when either the per-join cap or the shared
+    /// ceiling is reached, with a message that says how to proceed.
+    #[inline]
+    fn account(&mut self, rows: usize) -> Result<()> {
+        if rows <= self.reserved {
+            return Ok(());
+        }
+        let cap = join_max_rows();
+        if rows > cap {
+            return Err(Error::Query(format!(
+                "join would materialise more than {cap} rows (ELYRASQL_JOIN_MAX_ROWS); \
+                 add a join condition or a more selective WHERE, or raise the limit"
+            )));
+        }
+        // Grow the reservation in blocks, never past the per-join cap.
+        let want = rows.next_multiple_of(Self::BLOCK).min(cap);
+        let extra = want - self.reserved;
+        let total = join_max_rows_total();
+        let mut cur = JOIN_ROWS_LIVE.load(std::sync::atomic::Ordering::Relaxed);
+        loop {
+            if cur + extra > total {
+                return Err(Error::Query(format!(
+                    "concurrent joins would buffer more than {total} rows in total \
+                     (ELYRASQL_JOIN_MAX_ROWS_TOTAL); retry when the server is less \
+                     busy, make the join more selective, or raise the limit"
+                )));
+            }
+            match JOIN_ROWS_LIVE.compare_exchange_weak(
+                cur,
+                cur + extra,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    self.reserved = want;
+                    return Ok(());
+                }
+                Err(observed) => cur = observed,
+            }
+        }
+    }
+
+    /// Rows reserved across all joins (asserted in tests).
+    #[cfg(test)]
+    fn live() -> usize {
+        JOIN_ROWS_LIVE.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl Drop for JoinBudget {
+    fn drop(&mut self) {
+        if self.reserved > 0 {
+            JOIN_ROWS_LIVE.fetch_sub(self.reserved, std::sync::atomic::Ordering::AcqRel);
+        }
+    }
 }
 
 /// Examine budget for a filtered ordered walk before falling back to the sorter.
@@ -12743,5 +12865,84 @@ mod cancel_tests {
             err.to_string().contains("cancelled"),
             "expected a cancellation error, got: {err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod join_budget_tests {
+    use super::{join_max_rows, join_max_rows_total, JoinBudget};
+
+    /// The shared budget is global, so these must not run concurrently.
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn reservation_is_released_on_drop() {
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let before = JoinBudget::live();
+        {
+            let mut b = JoinBudget::new();
+            b.account(1).unwrap();
+            assert!(
+                JoinBudget::live() > before,
+                "accounting rows must reserve from the shared budget"
+            );
+            b.account(JoinBudget::BLOCK * 2).unwrap();
+        }
+        assert_eq!(
+            JoinBudget::live(),
+            before,
+            "the reservation must be returned when the join ends"
+        );
+    }
+
+    #[test]
+    fn per_join_cap_is_enforced() {
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let before = JoinBudget::live();
+        let mut b = JoinBudget::new();
+        let err = b
+            .account(join_max_rows() + 1)
+            .expect_err("past the per-join cap must fail");
+        assert!(
+            err.to_string().contains("ELYRASQL_JOIN_MAX_ROWS"),
+            "the error should name the knob: {err}"
+        );
+        drop(b);
+        assert_eq!(JoinBudget::live(), before);
+    }
+
+    // A per-join cap alone does not bound the server: concurrent joins must share
+    // a ceiling, and it must be fully reclaimed afterwards.
+    #[test]
+    fn shared_ceiling_bounds_concurrent_joins() {
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let before = JoinBudget::live();
+        let total = join_max_rows_total();
+        let per = join_max_rows();
+        let mut held = Vec::new();
+        let mut refused = false;
+        // Each "join" reserves up to the per-join cap; enough of them must be
+        // refused by the shared ceiling rather than all succeeding.
+        for _ in 0..(total / per + 2) {
+            let mut b = JoinBudget::new();
+            match b.account(per) {
+                Ok(()) => held.push(b),
+                Err(e) => {
+                    assert!(
+                        e.to_string().contains("ELYRASQL_JOIN_MAX_ROWS_TOTAL"),
+                        "the error should name the shared knob: {e}"
+                    );
+                    refused = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            refused,
+            "the shared ceiling must refuse a burst of large joins"
+        );
+        assert!(JoinBudget::live() <= total);
+        drop(held);
+        assert_eq!(JoinBudget::live(), before, "budget must be fully reclaimed");
     }
 }
