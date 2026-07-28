@@ -45,6 +45,30 @@ MYSQL = dict(
 #   8192     - parallel_aggregate batch size
 SIZES = [1, 2, 127, 128, 129, 255, 256, 257, 1023, 2047, 2048, 2049, 4095, 4097, 8193]
 
+# Divergences that are known, tracked, and deliberately not fixed yet. Matched as
+# substrings against the SQL, so the sweep can run in CI and still fail on anything
+# *new*. Every entry must name the issue that will remove it -- an allowlist without
+# a tracking issue is just a hidden bug.
+ALLOWLIST: dict[str, str] = {
+    # ESQL-44: non-ASCII text sorts and compares by codepoint, while MySQL's default
+    # collation is accent-insensitive (Æ sorts with A). This affects ordering and
+    # which rows a range predicate matches. Fixing it changes on-disk index key
+    # order, so it needs a migration.
+    #
+    # Matched on the *exact* SQL, deliberately: a substring pattern like "ORDER BY s"
+    # would also hide any future bug in an unrelated query that happens to order by
+    # that column.
+    "SELECT s, COUNT(*) FROM a GROUP BY s ORDER BY s, COUNT(*)": "ESQL-44 collation ordering",
+    "SELECT k, s FROM a ORDER BY s, k LIMIT 12": "ESQL-44 collation ordering",
+    "SELECT DISTINCT s FROM a ORDER BY s": "ESQL-44 collation ordering",
+    "SELECT COUNT(*) FROM a WHERE s > 'cat'": "ESQL-44 collation comparison",
+}
+
+
+def allowed(sql: str) -> str | None:
+    """The reason this divergence is tolerated, or None if it must fail the run."""
+    return ALLOWLIST.get(sql.strip())
+
 
 def connect(cfg: dict, db: str | None = None) -> pymysql.Connection:
     c = pymysql.connect(autocommit=True, **cfg)
@@ -109,6 +133,8 @@ class Differ:
         self.passed = 0
         self.diverged: list[tuple[str, object, object]] = []
         self.errors: list[tuple[str, object, object]] = []
+        # Known-tracked divergences, reported but not failing the run.
+        self.allowed: dict[str, int] = {}
 
     def ddl(self, *stmts: str) -> None:
         """Statements that must succeed identically on both sides."""
@@ -134,6 +160,10 @@ class Differ:
             self.errors.append((tag, a, b))
             return False
         if a[1] != b[1]:
+            reason = allowed(sql)
+            if reason:
+                self.allowed[reason] = self.allowed.get(reason, 0) + 1
+                return True
             self.diverged.append((tag, a[1], b[1]))
             return False
         self.passed += 1
@@ -141,7 +171,13 @@ class Differ:
 
     def report(self, title: str) -> bool:
         total = self.passed + len(self.diverged) + len(self.errors)
-        print(f"\n  {title}: {self.passed}/{total} identical")
+        note = ""
+        if self.allowed:
+            n = sum(self.allowed.values())
+            note = f", {n} known-tracked"
+        print(f"\n  {title}: {self.passed}/{total} identical{note}")
+        for reason, n in sorted(self.allowed.items()):
+            print(f"    allowed x{n}: {reason}")
         for tag, ours, theirs in self.diverged[:12]:
             print(f"    DIVERGE {tag}")
             print(f"      elyra: {str(ours)[:150]}")

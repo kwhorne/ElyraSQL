@@ -94,3 +94,42 @@ minimal reproduction (schema, statements, expected vs. actual).
 
 By contributing you agree that your contributions are licensed under the MIT
 License.
+
+## Scenario suite
+
+Beyond the unit and wire tests, `tests/scenarios/` holds end-to-end scenarios that
+run in CI (`.github/workflows/scenarios.yml`):
+
+- **`s1_threshold_sweep.py`** replays one query battery at row counts that *bracket
+  every internal threshold* (1, 2, 127, 128, 129, 255, 256, 257, 2047, 2048, 2049,
+  4095, 4097, 8193) and diffs every result against a real MySQL 8.4. Three
+  wrong-result bugs reached released versions because the existing tests all sat
+  below those boundaries — the hash-join key only collided for integers ≥ 128, the
+  spurious aggregate rows only appeared once the spill-partition path was used, and
+  the `DISTINCT` inflation only appeared once parallel aggregation kicked in. **When
+  adding a query shape, add it here too, not only as a small unit test.**
+- **`s2_robustness.py`** asserts invariants that must hold no matter how the server
+  is abused: every acknowledged commit survives `SIGKILL`, uncommitted work does
+  not, concurrent transfers conserve their total, a mid-write kill leaves no torn
+  transactions, and budgets and connection slots are reclaimed after exhaustion.
+- **`s3_perf_security.py`** measures a performance profile against MySQL
+  (informational — ratios on a shared runner are noise) and gates on security:
+  per-action privilege enforcement, administrative statements being refused for
+  non-admins, hostile input stored as data with byte-exact round-trip, and error
+  messages leaking no internal names or paths.
+
+Known divergences are allowlisted in `harness.py` by **exact SQL**, and each entry
+must name the issue that will remove it. Exact matching is deliberate: a substring
+pattern such as `"ORDER BY s"` would also hide a future bug in any unrelated query
+that happens to order by that column.
+
+Run them locally against a build under test:
+
+```bash
+cargo build --release -p elyra-cli
+./target/release/elyrasql serve --data /tmp/scen.edb --listen 127.0.0.1:3400 &
+cd tests/scenarios
+ELYRA_PORT=3400 ELYRA_PASSWORD= MYSQL_PORT=3308 python3 s1_threshold_sweep.py
+python3 s2_robustness.py 3400 /tmp/rb.edb ../../target/release/elyrasql
+ELYRA_PORT=3400 python3 s3_perf_security.py
+```

@@ -1,0 +1,124 @@
+name: Scenarios
+
+# End-to-end scenario suite: correctness across internal thresholds, robustness
+# under crashes and concurrency, and security enforcement.
+#
+# Why this exists: three wrong-result bugs (ESQL-40, ESQL-41, ESQL-42/45) reached
+# released versions because every unit and wire test sat *below* the internal
+# thresholds where they lived -- the hash-join key only collided for integers >= 128,
+# the spurious aggregate rows only appeared once the spill-partition path was used,
+# and the DISTINCT inflation only appeared once parallel aggregation kicked in.
+#
+# The threshold sweep replays one query battery at sizes bracketing each of those
+# boundaries and diffs every result against a real MySQL 8.4, so a bug that only
+# appears past a byte boundary, a join-strategy switch or a spill partition fails the
+# build. Known, tracked divergences are allowlisted by *exact* SQL in the harness, so
+# a near-miss of an allowlisted query still fails.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "30 4 * * *" # nightly 04:30 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  correctness:
+    name: Threshold sweep vs MySQL 8.4
+    runs-on: ubuntu-24.04
+
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: root
+        ports:
+          - 3390:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -proot"
+          --health-interval=5s --health-timeout=5s --health-retries=20
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build ElyraSQL
+        run: cargo build --release -p elyra-cli
+
+      - name: Python driver
+        run: pip install --quiet pymysql
+
+      - name: Start ElyraSQL
+        run: |
+          ./target/release/elyrasql serve --data /tmp/scen.edb --listen 127.0.0.1:3307 &
+          for i in $(seq 1 40); do
+            python3 -c "import pymysql; pymysql.connect(host='127.0.0.1',port=3307,user='root')" 2>/dev/null && break
+            sleep 1
+          done
+
+      - name: Threshold sweep
+        working-directory: tests/scenarios
+        env:
+          ELYRA_PORT: 3307
+          ELYRA_PASSWORD: ""
+          MYSQL_PORT: 3390
+        run: python3 s1_threshold_sweep.py
+
+  robustness:
+    name: Durability & concurrency invariants
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build ElyraSQL
+        run: cargo build --release -p elyra-cli
+
+      - name: Python driver
+        run: pip install --quiet pymysql
+
+      # Starts and SIGKILLs the server repeatedly, so it needs the binary rather
+      # than a long-lived service: every acknowledged commit must survive a hard
+      # kill, uncommitted work must not, concurrent transfers must conserve their
+      # total, and budgets must be reclaimed after resource exhaustion.
+      - name: Robustness invariants
+        run: |
+          python3 tests/scenarios/s2_robustness.py 3400 /tmp/rb.edb ./target/release/elyrasql
+
+  security:
+    name: Privilege enforcement & hostile input
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build ElyraSQL
+        run: cargo build --release -p elyra-cli
+
+      - name: Python driver
+        run: pip install --quiet pymysql
+
+      - name: Start ElyraSQL
+        run: |
+          ./target/release/elyrasql serve --data /tmp/sec.edb --listen 127.0.0.1:3400 &
+          for i in $(seq 1 40); do
+            python3 -c "import pymysql; pymysql.connect(host='127.0.0.1',port=3400,user='root')" 2>/dev/null && break
+            sleep 1
+          done
+
+      # Performance ratios are too noisy on a shared runner to gate a build, so the
+      # perf section is skipped here (the benchmark workflow covers that on its own
+      # schedule); the privilege and hostile-input checks are deterministic and are
+      # the gate.
+      - name: Security enforcement
+        env:
+          ELYRA_PORT: 3400
+          SKIP_PERF: "1"
+        run: python3 tests/scenarios/s3_perf_security.py

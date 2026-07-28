@@ -4,6 +4,26 @@ All notable changes to ElyraSQL are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **Scenario suite runs in CI** (`.github/workflows/scenarios.yml`). The
+  threshold-sweep, robustness and security scenarios added in 1.4.14 now gate every
+  push and pull request, plus a nightly run:
+    - *Threshold sweep* replays one query battery at row counts bracketing each
+      internal threshold and diffs against a real MySQL 8.4 service. Known
+      divergences are allowlisted by **exact SQL** with the issue that will remove
+      them; a near-miss of an allowlisted query still fails, which was verified
+      deliberately (`ORDER BY s ASC` is not covered by the entry for `ORDER BY s`).
+    - *Robustness* asserts durability and concurrency invariants against a server it
+      repeatedly `SIGKILL`s.
+    - *Security* gates on per-action privilege enforcement and hostile input; the
+      performance section is skipped there, since ratios on a shared runner are too
+      noisy to gate a build.
+  This closes the gap that let three wrong-result bugs reach released versions:
+  every one of them hid *below* the thresholds the previous tests exercised.
+
 ## [1.4.14] - 2026-07-28
 
 **Correctness release — upgrade from 1.4.13 is strongly recommended.** Two aggregate
