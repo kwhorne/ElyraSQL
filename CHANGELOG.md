@@ -8,6 +8,16 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ### Fixed
 
+- **`col IN (...)` on an indexed column now uses the index (ESQL-46).** It was not
+  recognised as index-usable at all, so even `g IN (1,2,3,4,5)` scanned the whole
+  table and tested membership per row — 4.51 ms against MySQL's 0.33 ms, which does
+  five index lookups. Values are now looked up through the index and unioned by
+  storage key. Keys are collected before any row is fetched, so a list covering too
+  much of the table (the same budget as a range) falls back to a scan having paid
+  only for key lookups, and the rows that do qualify are fetched in one batched read
+  rather than one per value. Measured on 200k rows: `IN (5 values)` **4.51 ms →
+  1.26 ms**. A long list is still dominated by the fallback scan evaluating the list
+  per row, which needs set membership in the compiled predicate (tracked).
 - **A secondary-index range was used regardless of how much of the table it matched
   (ESQL-46).** An index range fetches every matching row by key, which is roughly an
   order of magnitude dearer per row than a sequential decode, so a wide range was far

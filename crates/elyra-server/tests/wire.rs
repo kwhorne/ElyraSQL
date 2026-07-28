@@ -2888,3 +2888,74 @@ async fn wide_index_ranges_return_correct_rows() {
     let want: Vec<i64> = (1..=20_000i64).filter(|&i| amt(i) > 0).take(5).collect();
     assert_eq!(rows, want);
 }
+
+// `col IN (literals)` on an indexed column is served by index lookups rather than a
+// scan that tests membership per row. The planner may still choose a scan for a wide
+// list, so this pins the *results* across every shape that path has to get right --
+// duplicates, NULL in the list, negative literals, NOT IN, a residual conjunct, the
+// primary key, strings, and LIMIT over the deduplicated set.
+#[tokio::test]
+async fn in_list_lookups_return_correct_rows() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop("CREATE TABLE il (id INT PRIMARY KEY, g INT, s VARCHAR(16))")
+        .await
+        .unwrap();
+    for lo in (1..=8_000).step_by(1000) {
+        let vals: Vec<String> = (lo..lo + 1000)
+            .map(|i| format!("({i},{},'v{}')", i % 40, i % 40))
+            .collect();
+        c.query_drop(format!("INSERT INTO il VALUES {}", vals.join(",")))
+            .await
+            .unwrap();
+    }
+    c.query_drop("CREATE INDEX ix_g ON il (g)").await.unwrap();
+    c.query_drop("CREATE INDEX ix_s ON il (s)").await.unwrap();
+
+    let per_group = 8_000 / 40; // 200
+    for (sql, want) in [
+        ("SELECT COUNT(*) FROM il WHERE g IN (1,2,3,4,5)", 5 * per_group),
+        // Duplicates must not double-count, and a NULL element matches nothing.
+        ("SELECT COUNT(*) FROM il WHERE g IN (1,1,2,2,NULL,3)", 3 * per_group),
+        ("SELECT COUNT(*) FROM il WHERE g IN (-1,-2)", 0),
+        ("SELECT COUNT(*) FROM il WHERE g IN (7)", per_group),
+        // NOT IN is the complement and must not use the lookup path.
+        (
+            "SELECT COUNT(*) FROM il WHERE g NOT IN (1,2,3,4,5)",
+            8_000 - 5 * per_group,
+        ),
+        // A residual conjunct is re-applied to the fetched rows.
+        (
+            "SELECT COUNT(*) FROM il WHERE g IN (1,2) AND id > 4000",
+            (1..=8_000i64).filter(|&i| (i % 40 == 1 || i % 40 == 2) && i > 4000).count() as i64,
+        ),
+        ("SELECT COUNT(*) FROM il WHERE id IN (1,2,3,4,5)", 5),
+        ("SELECT COUNT(*) FROM il WHERE id IN (1,1,2)", 2),
+        ("SELECT COUNT(*) FROM il WHERE s IN ('v1','v2')", 2 * per_group),
+        // A list covering the whole table falls back to a scan; still exact.
+        (
+            "SELECT COUNT(*) FROM il WHERE g IN (0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39)",
+            8_000,
+        ),
+        // OR of two INs must not be mistaken for one index-usable list.
+        ("SELECT COUNT(*) FROM il WHERE g IN (1) OR g IN (2)", 2 * per_group),
+    ] {
+        let got: Option<i64> = c.query_first(sql).await.unwrap();
+        assert_eq!(got, Some(want), "{sql}");
+    }
+
+    // Aggregates and ordered output over the lookup path.
+    let got: Option<i64> = c
+        .query_first("SELECT SUM(id) FROM il WHERE g IN (7,8,9)")
+        .await
+        .unwrap();
+    let want: i64 = (1..=8_000i64)
+        .filter(|&i| (7..=9).contains(&(i % 40)))
+        .sum();
+    assert_eq!(got, Some(want));
+    let rows: Vec<i64> = c
+        .query("SELECT id FROM il WHERE g IN (1,2) ORDER BY id LIMIT 5")
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![1, 2, 41, 42, 81]);
+}

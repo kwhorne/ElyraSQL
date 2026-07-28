@@ -5311,6 +5311,35 @@ async fn lookup_rows_by_eq(
     ))
 }
 
+/// Storage keys of the rows where `col` equals `value`, without fetching them.
+///
+/// Keys first, rows later: an `IN` list can be unioned and size-checked against the
+/// index-range budget while it is still cheap, so abandoning a too-wide list costs
+/// only the key lookups.
+async fn lookup_keys_by_eq(
+    db: &Session,
+    def: &TableDef,
+    col: usize,
+    value: &Value,
+) -> Result<Vec<Vec<u8>>> {
+    if def.pk_cols == [col] {
+        let key = data_key(
+            &def.name,
+            &keyenc::encode_coll(value, def.collation_of(col))?,
+        );
+        // The primary key identifies at most one row, but it still has to exist.
+        return Ok(if db.get(key.clone()).await?.is_some() {
+            vec![key]
+        } else {
+            Vec::new()
+        });
+    }
+    let Some(idx) = index::index_on(def, col) else {
+        return Ok(Vec::new());
+    };
+    index::lookup_eq(db, &def.name, idx, std::slice::from_ref(value)).await
+}
+
 /// If `on` is `A = B` with one operand referencing only the driving side and
 /// the other a plain column of the partner, return `(driving_key_expr,
 /// partner_col_index)` for an index nested-loop probe.
@@ -6919,6 +6948,81 @@ fn eq_col_literal(def: &TableDef, filter: Option<&Expr>) -> Result<Option<(usize
 /// Extract equality values for every column in `key_cols` from the filter's
 /// AND-conjuncts (coerced to column type). `None` if any key column lacks an
 /// equality — i.e. the key is not fully specified.
+/// The constant value of `e`, or `None` if it references a column or is otherwise
+/// row-dependent.
+///
+/// Evaluated against an empty row rather than pattern-matched on `Expr::Value`, so
+/// forms like `-5` (a unary minus over a literal) and `TRUE` are handled with the
+/// same semantics the interpreter uses.
+fn literal_value(e: &Expr) -> Option<Value> {
+    static EMPTY: std::sync::OnceLock<Schema> = std::sync::OnceLock::new();
+    let schema = EMPTY.get_or_init(|| Schema::new(Vec::new()));
+    predicate::eval_row(e, schema, &[]).ok()
+}
+
+/// `col IN (literal, ...)` on a PK or indexed column, as (column index, values).
+///
+/// Recognised so the values can be looked up through the index instead of scanning
+/// the table and testing membership per row. MySQL turns the same shape into one
+/// index lookup per value, which is why `g IN (1,2,3,4,5)` cost it 0.33ms against
+/// our 4.51ms full scan before this existed.
+///
+/// Only a *whole-filter* `IN` (or one AND-conjunct of it) qualifies; the remaining
+/// conjuncts are re-applied to the fetched rows, so the result is identical to a
+/// scan either way.
+fn in_list_lookup(def: &TableDef, filter: Option<&Expr>) -> Result<Option<(usize, Vec<Value>)>> {
+    let Some(f) = filter else { return Ok(None) };
+    let mut conj = Vec::new();
+    split_and(f, &mut conj);
+    for c in conj {
+        let Expr::InList {
+            expr,
+            list,
+            negated: false,
+        } = c
+        else {
+            continue;
+        };
+        // NOT IN cannot use the index: it selects the complement.
+        let Some(name) = ident_name(expr.as_ref()) else {
+            continue;
+        };
+        let short = name.rsplit('.').next().unwrap_or(name);
+        let Some(col) = def
+            .schema
+            .columns
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(short))
+        else {
+            continue;
+        };
+        if def.pk_cols != [col] && index::index_on(def, col).is_none() {
+            continue;
+        }
+        // Every element must be a literal; a column reference or expression would
+        // have to be evaluated per row, which is the thing being avoided.
+        let mut vals = Vec::with_capacity(list.len());
+        let mut all_literal = true;
+        for item in list.iter() {
+            match literal_value(item) {
+                Some(v) if !v.is_null() => vals.push(v),
+                // A NULL in the list never matches (and only affects the
+                // three-valued outcome of a non-match, which the residual filter
+                // re-applies), so it can be skipped for lookup purposes.
+                Some(_) => {}
+                None => {
+                    all_literal = false;
+                    break;
+                }
+            }
+        }
+        if all_literal && !vals.is_empty() {
+            return Ok(Some((col, vals)));
+        }
+    }
+    Ok(None)
+}
+
 fn key_eq_values(
     def: &TableDef,
     filter: Option<&Expr>,
@@ -7366,6 +7470,9 @@ fn accelerable(def: &TableDef, filter: Option<&Expr>) -> Result<bool> {
             return Ok(true);
         }
     }
+    if in_list_lookup(def, filter)?.is_some() {
+        return Ok(true);
+    }
     Ok(range_bounds(def, filter)?.is_some())
 }
 
@@ -7545,6 +7652,57 @@ async fn collect_matches_inner(
                 }
             }
             return Ok(Some(out));
+        }
+    }
+
+    // `col IN (literals)` on a PK or indexed column: look each value up through the
+    // index instead of scanning and testing membership per row. Bounded by the same
+    // budget as a range, so a list matching most of the table still scans.
+    if let Some((col, vals)) = in_list_lookup(def, filter)? {
+        let budget = index_range_budget(db, def).await?;
+        // Collect the storage keys for every value *before* fetching any row: keys
+        // are cheap, rows are not. If the list turns out to cover too much of the
+        // table, the fallback to a scan then costs nothing but the key lookups.
+        let mut seen = std::collections::HashSet::new();
+        let mut keys: Vec<Vec<u8>> = Vec::new();
+        let mut over_budget = false;
+        for v in &vals {
+            for k in lookup_keys_by_eq(db, def, col, v).await? {
+                // Dedupe so the result is a set: duplicate literals, or a value
+                // appearing under several index entries, must not emit a row twice.
+                if seen.insert(k.clone()) {
+                    keys.push(k);
+                }
+            }
+            if budget.is_some_and(|b| keys.len() > b) {
+                over_budget = true;
+                break;
+            }
+        }
+        if !over_budget {
+            // One batched read for the whole list rather than one per value.
+            let blobs = db.multi_get(keys.clone()).await?;
+            for (k, blob) in keys.into_iter().zip(blobs) {
+                let Some(b) = blob else { continue };
+                let row: Vec<Value> =
+                    bincode::deserialize(&b).map_err(|e| Error::Storage(e.to_string()))?;
+                if let Some(f) = filter {
+                    if !predicate::matches(f, &def.schema, &row)? {
+                        continue;
+                    }
+                }
+                out.push((k, row));
+                if let Some(l) = limit {
+                    if out.len() >= l {
+                        return Ok(Some(out));
+                    }
+                }
+            }
+            return Ok(Some(out));
+        }
+        out.clear();
+        if bail_on_wide_range {
+            return Ok(None);
         }
     }
 
