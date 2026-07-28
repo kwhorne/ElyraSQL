@@ -20,8 +20,22 @@ import traceback
 
 import pymysql
 
-ELYRA = dict(host="127.0.0.1", port=3307, user="root", password="elyra")
-MYSQL = dict(host="127.0.0.1", port=3308, user="root", password="root")
+# Overridable so the same battery can run against the container image or a local
+# build under test: ELYRA_PORT / ELYRA_PASSWORD / MYSQL_PORT.
+import os
+
+ELYRA = dict(
+    host="127.0.0.1",
+    port=int(os.environ.get("ELYRA_PORT", "3307")),
+    user="root",
+    password=os.environ.get("ELYRA_PASSWORD", "elyra"),
+)
+MYSQL = dict(
+    host="127.0.0.1",
+    port=int(os.environ.get("MYSQL_PORT", "3308")),
+    user="root",
+    password="root",
+)
 
 # Row counts that bracket internal thresholds, so a query shape is exercised on
 # both sides of each one:

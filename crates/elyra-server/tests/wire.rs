@@ -2671,6 +2671,42 @@ async fn distinct_aggregates_are_exact_at_scale() {
     assert!(rows.iter().all(|&(_, n)| n == 1));
     let n: Option<i64> = c.query_first("SELECT COUNT(*) FROM da").await.unwrap();
     assert_eq!(n, Some(20_000));
+
+    // Many distinct values spanning the 128..255 byte range: the distinct set used
+    // to be keyed on a lossily UTF-8-converted collation key, so those values
+    // collided and COUNT(DISTINCT) *under*-counted (258 of 500) - the opposite error
+    // to the worker-count inflation above, and the two masked each other.
+    c.query_drop("CREATE TABLE dw (k INT PRIMARY KEY, w INT)")
+        .await
+        .unwrap();
+    for lo in (1..=20_000).step_by(1000) {
+        let vals: Vec<String> = (lo..lo + 1000)
+            .map(|i| format!("({i},{})", i % 500))
+            .collect();
+        c.query_drop(format!("INSERT INTO dw VALUES {}", vals.join(",")))
+            .await
+            .unwrap();
+    }
+    let n: Option<i64> = c
+        .query_first("SELECT COUNT(DISTINCT w) FROM dw")
+        .await
+        .unwrap();
+    assert_eq!(
+        n,
+        Some(500),
+        "distinct keys must not collide across byte values"
+    );
+    let n: Option<i64> = c
+        .query_first("SELECT SUM(DISTINCT w) FROM dw")
+        .await
+        .unwrap();
+    assert_eq!(n, Some((0..500).sum::<i64>()));
+    // Cross-check against an independent path that computes the same thing.
+    let n: Option<i64> = c
+        .query_first("SELECT COUNT(*) FROM (SELECT DISTINCT w FROM dw) x")
+        .await
+        .unwrap();
+    assert_eq!(n, Some(500));
 }
 
 // Functions that return an integer must be typed as one even when their argument

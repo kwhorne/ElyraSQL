@@ -107,7 +107,7 @@ struct Acc {
     bits: i64,
     bits_init: bool,
     extreme: Option<Value>,
-    distinct: HashSet<String>,
+    distinct: HashSet<Vec<u8>>,
     concat: Vec<String>,
     /// Facet value -> count map (for `FACET(col)`).
     facet: HashMap<String, i64>,
@@ -368,10 +368,7 @@ fn update(acc: &mut Acc, func: AggFunc, val: Option<Value>, distinct: bool) {
             if let Some(v) = val {
                 if !v.is_null() {
                     if distinct {
-                        if acc
-                            .distinct
-                            .insert(String::from_utf8_lossy(&v.collation_key()).into_owned())
-                        {
+                        if acc.distinct.insert(v.collation_key()) {
                             acc.count += 1;
                         }
                     } else {
@@ -383,11 +380,7 @@ fn update(acc: &mut Acc, func: AggFunc, val: Option<Value>, distinct: bool) {
         AggFunc::Sum | AggFunc::Avg => {
             if let Some(v) = val {
                 if let Some(n) = num(&v) {
-                    if distinct
-                        && !acc
-                            .distinct
-                            .insert(String::from_utf8_lossy(&v.collation_key()).into_owned())
-                    {
+                    if distinct && !acc.distinct.insert(v.collation_key()) {
                         return;
                     }
                     acc.sum += n;
@@ -424,7 +417,7 @@ fn update(acc: &mut Acc, func: AggFunc, val: Option<Value>, distinct: bool) {
                 if !v.is_null() {
                     let s = v.to_wire_string().unwrap_or_default();
                     if distinct {
-                        if acc.distinct.insert(s.clone()) {
+                        if acc.distinct.insert(v.collation_key()) {
                             acc.concat.push(s);
                         }
                     } else {

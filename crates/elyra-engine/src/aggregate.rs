@@ -51,13 +51,23 @@ impl AggPlan {
         &self.group_cols
     }
 
-    /// Whether any aggregate uses `DISTINCT`.
+    /// Whether any aggregate cannot be computed by merging independent partial
+    /// results, so the aggregation must stay single-pass.
     ///
-    /// Such an aggregate cannot be computed by merging independent partial results:
-    /// merging is additive for the counter/sum/concat, so a value seen by two
-    /// partials is counted twice. Callers use this to stay on the single-pass path.
-    pub fn has_distinct(&self) -> bool {
-        self.aggs.iter().any(|a| a.distinct)
+    /// Only `DISTINCT` aggregates are at risk, and only some of them. Merging
+    /// unions the distinct *set*, so `COUNT(DISTINCT x)` is safe: its result is the
+    /// size of that union. But `SUM`/`AVG`/`GROUP_CONCAT` accumulate a value
+    /// alongside the set and merge it additively, so a value seen by two partials
+    /// would be added twice -- those must not be split.
+    pub fn has_unmergeable_distinct(&self) -> bool {
+        use elyra_olap::AggFunc::*;
+        self.aggs.iter().any(|a| {
+            a.distinct
+                && matches!(
+                    a.func,
+                    Sum | Avg | GroupConcat | StddevPop | StddevSamp | VarPop | VarSamp
+                )
+        })
     }
 
     pub fn arg_exprs(&self) -> &[Expr] {

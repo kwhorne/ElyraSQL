@@ -19,6 +19,17 @@ All notable changes to ElyraSQL are documented here. The format is based on
   derived from the merged set, and aggregations containing a DISTINCT stay on the
   single-pass path. Verified identical for 1/2/4/8/16 workers on 20k rows and
   differentially against MySQL 8.4.
+- **`COUNT(DISTINCT)` undercounted (ESQL-45).** Present in 1.4.13 and earlier, and
+  the same root cause as the join-key bug fixed in 1.4.13 (ESQL-40) in a second
+  place: the aggregator's distinct set was keyed by a collation key pushed through
+  `from_utf8_lossy`, so values whose encoding contained a non-UTF-8 byte collided.
+  `COUNT(DISTINCT g)` over 500 distinct integers returned **258**. It stayed hidden
+  because ESQL-42 inflated the same results by the worker count while this deflated
+  them, so the two bugs partly cancelled. The set is now keyed on raw bytes, which
+  also means merging partials unions it correctly -- so `COUNT(DISTINCT)` keeps its
+  parallelism (200k rows: 17.7ms single-threaded, 2.7ms on 16 workers), and only
+  aggregates whose *value* merges additively (`SUM`/`AVG`/`GROUP_CONCAT`/`STDDEV`/
+  `VAR` with DISTINCT) stay single-pass.
 - **Integer-returning functions over an aggregate came back as text.**
   `LENGTH(GROUP_CONCAT(s))` reached the client as the string `"23"` instead of the
   number `23` (likewise `CHAR_LENGTH`, `ASCII`, `INSTR`, and the date-part

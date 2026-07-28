@@ -11569,12 +11569,12 @@ async fn scan_aggregate_fast(
     // its key buffer, so grouped aggregation no longer thrashes the allocator
     // across threads. `ELYRASQL_AGG_WORKERS` overrides the degree of parallelism
     // (0/1 = single-threaded); default is min(cores, 8).
-    // A DISTINCT aggregate must NOT be split across workers: partial results merge
-    // additively (count/sum/concat), so a value seen by two workers is counted
-    // twice -- COUNT(DISTINCT x) came out as `workers x` the correct answer, and
-    // AVG(DISTINCT x) happened to look right only because both halves of the ratio
-    // were inflated equally. Stay single-pass for those.
-    let workers = if plan.has_distinct() {
+    // A DISTINCT aggregate whose value merges additively (SUM/AVG/GROUP_CONCAT) must
+    // NOT be split across workers: a value seen by two workers would be added
+    // twice. COUNT(DISTINCT) is safe because merging unions the distinct set and
+    // the result is that union.s size, so it keeps its parallelism.
+
+    let workers = if plan.has_unmergeable_distinct() {
         1
     } else {
         agg_workers()
@@ -12103,12 +12103,12 @@ async fn parallel_aggregate(
     plan: &AggPlan,
 ) -> Result<GroupAggregator> {
     const BATCH: usize = 8192;
-    // A DISTINCT aggregate must NOT be split across workers: partial results merge
-    // additively (count/sum/concat), so a value seen by two workers is counted
-    // twice -- COUNT(DISTINCT x) came out as `workers x` the correct answer, and
-    // AVG(DISTINCT x) happened to look right only because both halves of the ratio
-    // were inflated equally. Stay single-pass for those.
-    let workers = if plan.has_distinct() {
+    // A DISTINCT aggregate whose value merges additively (SUM/AVG/GROUP_CONCAT) must
+    // NOT be split across workers: a value seen by two workers would be added
+    // twice. COUNT(DISTINCT) is safe because merging unions the distinct set and
+    // the result is that union.s size, so it keeps its parallelism.
+
+    let workers = if plan.has_unmergeable_distinct() {
         1
     } else {
         std::thread::available_parallelism()
