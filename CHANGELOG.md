@@ -4,6 +4,33 @@ All notable changes to ElyraSQL are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **`ORDER BY` on a non-projected column failed alongside a window function.**
+  `SELECT amt, RANK() OVER (ORDER BY amt) FROM t ORDER BY id` was rejected with
+  "ORDER BY references unknown output column", while the same query without the window
+  function worked and MySQL accepts both. The window path only had the output columns
+  to sort by; it now falls back to the base row, which is still index-aligned with the
+  output. Found by a regression test written for the optimisation below — the test
+  caught a compatibility gap rather than a regression.
+
+### Changed
+
+- **Window functions are 25–35% faster (ESQL-46).** The projection was rebuilt for
+  every row: `map_expr` cloned the whole expression tree, the window list was searched
+  by *deep* `Expr` equality, a literal node was allocated from the value, and the
+  result was re-interpreted — per row, per projection item. Each item is now classified
+  once (is a window call / contains one / contains none), so the ordinary shapes do no
+  expression work at all. Partition keys are also raw collation bytes instead of a
+  `String` built by mapping each byte through `as char` (which re-encodes every byte
+  ≥ 0x80 as multi-byte UTF-8) with a clone per row, and an unpartitioned window skips
+  the hashing entirely. Measured on 200k rows: `LAG`/`LEAD` **48.5 ms → 32.9 ms**
+  (parity with MySQL), `SUM` over a partition **64.5 ms → 40.9 ms**, partitioned
+  `ROW_NUMBER` **77.0 ms → 54.0 ms**. The remaining gap is materialising every row
+  before computing, which needs streaming windows.
+
 ## [1.4.15] - 2026-07-28
 
 Query-planning release. Three related defects made ElyraSQL do far more work than

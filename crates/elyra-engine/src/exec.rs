@@ -9055,27 +9055,64 @@ async fn window_select(
         win_values.push((we.clone(), vals));
     }
 
-    // Build output rows: substitute each window result, then evaluate.
+    // Classify each projection item once, instead of rebuilding its expression for
+    // every row.
+    //
+    // The original code called `map_expr` per row per item, which cloned the whole
+    // expression tree, searched the window list by *deep* `Expr` equality, and
+    // allocated a literal node from the value -- then re-interpreted the result. For
+    // the ordinary shapes (`SELECT id, ROW_NUMBER() OVER (...) FROM t`) none of that
+    // is needed: the item either *is* a window expression, whose value is already
+    // computed per row, or contains none at all.
+    enum Out<'a> {
+        /// The item is exactly window expression `k`: take the precomputed value.
+        Window(usize),
+        /// The item contains no window function: evaluate it against the row.
+        Plain(&'a Expr),
+        /// A window function nested inside a larger expression (e.g. `rn + 1`):
+        /// substitute and evaluate, as before.
+        Mixed(&'a Expr),
+    }
+    let mut plan: Vec<Out> = Vec::with_capacity(select.projection.len());
+    for item in &select.projection {
+        let expr = match item {
+            SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => e,
+            other => {
+                return Err(Error::Unsupported(format!(
+                    "projection item not supported with window functions: {other}"
+                )))
+            }
+        };
+        if let Some(k) = win_values.iter().position(|(we, _)| we == expr) {
+            plan.push(Out::Window(k));
+        } else {
+            let mut nested = Vec::new();
+            collect_window_exprs(expr, &mut nested);
+            plan.push(if nested.is_empty() {
+                Out::Plain(expr)
+            } else {
+                Out::Mixed(expr)
+            });
+        }
+    }
+
     let mut out_rows: Vec<Vec<Value>> = Vec::with_capacity(rows.len());
     for (i, row) in rows.iter().enumerate() {
-        let subst = |e: &Expr| -> Option<Expr> {
-            win_values
-                .iter()
-                .find(|(we, _)| we == e)
-                .map(|(_, vals)| value_to_expr(&vals[i]))
-        };
-        let mut vals = Vec::with_capacity(select.projection.len());
-        for item in &select.projection {
-            let expr = match item {
-                SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => e,
-                other => {
-                    return Err(Error::Unsupported(format!(
-                        "projection item not supported with window functions: {other}"
-                    )))
+        let mut vals = Vec::with_capacity(plan.len());
+        for out in &plan {
+            vals.push(match out {
+                Out::Window(k) => win_values[*k].1[i].clone(),
+                Out::Plain(e) => predicate::eval_row(e, schema, row)?,
+                Out::Mixed(e) => {
+                    let subst = |x: &Expr| -> Option<Expr> {
+                        win_values
+                            .iter()
+                            .find(|(we, _)| we == x)
+                            .map(|(_, vs)| value_to_expr(&vs[i]))
+                    };
+                    predicate::eval_row(&map_expr(e, &subst), schema, row)?
                 }
-            };
-            let bound = map_expr(expr, &subst);
-            vals.push(predicate::eval_row(&bound, schema, row)?);
+            });
         }
         out_rows.push(vals);
     }
@@ -9104,7 +9141,35 @@ async fn window_select(
         });
     }
     let out_schema = Schema::new(cols);
-    order_output_rows(&mut out_rows, &out_schema, order_exprs)?;
+
+    // ORDER BY may reference an output column *or* a base-table column that is not
+    // projected -- MySQL allows both, and rejecting the latter made queries like
+    // `SELECT amt, RANK() OVER (...) FROM t ORDER BY id` fail here while succeeding
+    // without the window function. Sort a permutation so a key can be taken from
+    // either side: the base rows and the output rows are still index-aligned.
+    if !order_exprs.is_empty() {
+        let mut perm: Vec<usize> = (0..out_rows.len()).collect();
+        let mut keys: Vec<Vec<Value>> = Vec::with_capacity(out_rows.len());
+        for (i, orow) in out_rows.iter().enumerate() {
+            let mut k = Vec::with_capacity(order_exprs.len());
+            for (e, _) in order_exprs {
+                // Prefer the output column (so an alias or a projected expression
+                // wins, as elsewhere), then fall back to the base row.
+                let v = match predicate::eval_row(e, &out_schema, orow) {
+                    Ok(v) => v,
+                    Err(_) => predicate::eval_row(e, schema, &rows[i])?,
+                };
+                k.push(v);
+            }
+            keys.push(k);
+        }
+        perm.sort_by(|&a, &b| cmp_order_keys(&keys[a], &keys[b], order_exprs));
+        let mut sorted = Vec::with_capacity(out_rows.len());
+        for i in perm {
+            sorted.push(std::mem::take(&mut out_rows[i]));
+        }
+        out_rows = sorted;
+    }
     apply_offset_limit(&mut out_rows, offset, limit);
     Ok(QueryResult::Rows(RowStream::literal(out_schema, out_rows)))
 }
@@ -9216,24 +9281,34 @@ fn compute_window(rows: &[Vec<Value>], schema: &Schema, func: &Expr) -> Result<V
     let args = fn_arg_exprs(f);
 
     // Partition rows (preserving first-seen order), then sort each partition.
-    let mut partitions: Vec<(String, Vec<usize>)> = Vec::new();
-    let mut index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    for (i, row) in rows.iter().enumerate() {
-        let mut key = String::new();
-        for p in &spec.partition_by {
-            key.extend(
-                predicate::eval_row(p, schema, row)?
-                    .collation_key()
-                    .iter()
-                    .map(|b| *b as char),
-            );
-            key.push('\u{1}');
+    //
+    // Keys are raw collation-key bytes. They used to be built as a `String` by
+    // mapping each byte through `as char`, which re-encodes every byte >= 0x80 as a
+    // multi-byte UTF-8 sequence, and the key was cloned once per row for the map
+    // lookup.
+    let mut partitions: Vec<Vec<usize>> = Vec::new();
+    if spec.partition_by.is_empty() {
+        // No PARTITION BY: one partition over every row, so skip the hashing
+        // entirely -- this is the shape `OVER (ORDER BY ...)` takes.
+        partitions.push((0..rows.len()).collect());
+    } else {
+        let mut index: std::collections::HashMap<Vec<u8>, usize> = std::collections::HashMap::new();
+        let mut key = Vec::new();
+        for (i, row) in rows.iter().enumerate() {
+            key.clear();
+            for p in &spec.partition_by {
+                key.extend_from_slice(&predicate::eval_row(p, schema, row)?.collation_key());
+                key.push(1);
+            }
+            match index.get(key.as_slice()) {
+                // Existing partition: no allocation on the hot path.
+                Some(&slot) => partitions[slot].push(i),
+                None => {
+                    index.insert(key.clone(), partitions.len());
+                    partitions.push(vec![i]);
+                }
+            }
         }
-        let slot = *index.entry(key.clone()).or_insert_with(|| {
-            partitions.push((key, Vec::new()));
-            partitions.len() - 1
-        });
-        partitions[slot].1.push(i);
     }
 
     let order: Vec<(Expr, bool)> = spec
@@ -9244,7 +9319,7 @@ fn compute_window(rows: &[Vec<Value>], schema: &Schema, func: &Expr) -> Result<V
     let ordered = !order.is_empty();
 
     let mut result = vec![Value::Null; rows.len()];
-    for (_, mut idxs) in partitions {
+    for mut idxs in partitions {
         if ordered {
             let key_of = |i: usize| -> Result<Vec<Value>> {
                 order

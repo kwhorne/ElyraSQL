@@ -2978,3 +2978,83 @@ async fn in_list_lookups_return_correct_rows() {
         .unwrap();
     assert_eq!(rows, vec![1, 2, 41, 42, 81]);
 }
+
+// Window functions: the projection is classified once rather than rebuilt per row,
+// and partition keys are raw bytes with a fast path for the unpartitioned case. Those
+// are pure optimisations, so this test pins the *results* for every shape the
+// classification distinguishes: the item being a window call, containing one inside a
+// larger expression, and containing none.
+//
+// Every ORDER BY here includes a tiebreaker on purpose. Ordering by a column with
+// duplicates leaves ROW_NUMBER implementation-defined for the tied rows, which makes
+// such a query useless as an oracle -- a lesson learned when an unstable query looked
+// like a regression.
+#[tokio::test]
+async fn window_functions_are_exact() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop("CREATE TABLE w (id INT PRIMARY KEY, g INT, amt INT)")
+        .await
+        .unwrap();
+    // amt deliberately has ties within each g, so the tiebreaker matters.
+    for i in 1..=60 {
+        c.query_drop(format!("INSERT INTO w VALUES ({i}, {}, {})", i % 3, i % 10))
+            .await
+            .unwrap();
+    }
+
+    // Unpartitioned: the fast path that skips partition hashing entirely.
+    let rows: Vec<(i64, i64)> = c
+        .query("SELECT id, ROW_NUMBER() OVER (ORDER BY amt, id) FROM w ORDER BY id LIMIT 5")
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 5);
+    // id 10,20,30,... have amt 0, so id=10 is row 1 overall.
+    assert_eq!(rows[0].0, 1);
+
+    // Row numbers must be a permutation of 1..n with no gaps or repeats.
+    let nums: Vec<i64> = c
+        .query("SELECT ROW_NUMBER() OVER (ORDER BY amt, id) FROM w")
+        .await
+        .unwrap();
+    let mut sorted = nums.clone();
+    sorted.sort_unstable();
+    assert_eq!(sorted, (1..=60).collect::<Vec<i64>>());
+
+    // Partitioned: each partition restarts at 1 and covers its own rows.
+    let rows: Vec<(i64, i64)> = c
+        .query("SELECT g, MAX(r) FROM (SELECT g, ROW_NUMBER() OVER (PARTITION BY g ORDER BY amt, id) r FROM w) x GROUP BY g ORDER BY g")
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![(0, 20), (1, 20), (2, 20)]);
+
+    // An aggregate window over a partition.
+    let rows: Vec<(i64, i64)> = c
+        .query("SELECT g, SUM(s) FROM (SELECT DISTINCT g, SUM(amt) OVER (PARTITION BY g) s FROM w) x GROUP BY g ORDER BY g")
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 3);
+
+    // A window call nested inside a larger expression (the substitution path).
+    let rows: Vec<(i64, i64)> = c
+        .query("SELECT id, ROW_NUMBER() OVER (ORDER BY amt, id) + 100 FROM w ORDER BY id LIMIT 3")
+        .await
+        .unwrap();
+    assert!(rows.iter().all(|&(_, v)| v > 100));
+
+    // A projection item with no window function alongside one that has.
+    let rows: Vec<(i64, i64, i64)> = c
+        .query("SELECT id, id * 2, ROW_NUMBER() OVER (ORDER BY id) FROM w ORDER BY id LIMIT 4")
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![(1, 2, 1), (2, 4, 2), (3, 6, 3), (4, 8, 4)]);
+
+    // RANK/DENSE_RANK over ties: tie-insensitive, so exact regardless of order.
+    let rows: Vec<(i64, i64, i64)> = c
+        .query("SELECT amt, RANK() OVER (ORDER BY amt), DENSE_RANK() OVER (ORDER BY amt) FROM w ORDER BY amt, id LIMIT 7")
+        .await
+        .unwrap();
+    assert!(rows.iter().all(|&(_, r, d)| r >= d));
+    assert_eq!(rows[0].1, 1);
+    assert_eq!(rows[0].2, 1);
+}
