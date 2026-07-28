@@ -16,12 +16,22 @@ All notable changes to ElyraSQL are documented here. The format is based on
   much of the table (the same budget as a range) falls back to a scan having paid
   only for key lookups, and the rows that do qualify are fetched in one batched read
   rather than one per value. Measured on 200k rows: `IN (5 values)` **4.51 ms →
-  1.26 ms**. A long list is still dominated by the fallback scan evaluating the list
-  per row, which needs set membership in the compiled predicate (tracked).
+  1.26 ms**. Long lists are handled by the compiled predicate (below) rather than the
+  index.
   List elements are coerced to the column's type before being encoded as keys —
   PDO binds integers as quoted strings, so `id IN ('1','2')` on an INT primary key is
   the ordinary shape from Laravel's `whereIn`; without coercion the lookup found
   nothing where a scan found the rows.
+- **`IN` is now a set membership test in the compiled predicate (ESQL-46).** When a
+  scan is the right plan, `column IN (numeric literals)` compiles to a hash-set test
+  instead of walking the list for every row — 500 literals over 200k rows was 100M
+  comparisons. Values are hashed canonically so `0.0`/`-0.0` agree, and the set's
+  span is exposed as zone-map bounds so chunks outside it can still be skipped.
+  Measured on 200k rows: `IN (500 literals)` **101.8 ms → 5.7 ms** (0.62x MySQL),
+  `IN (subquery ~500)` 81.2 ms → 30.8 ms, and `IN` on an unindexed column 3.3 ms
+  (0.35x MySQL). Shapes whose three-valued semantics the compiled form cannot
+  reproduce — a `NULL` element, a non-numeric column, a non-literal element, an empty
+  list — are declined so the interpreter keeps ownership of them.
 - **A secondary-index range was used regardless of how much of the table it matched
   (ESQL-46).** An index range fetches every matching row by key, which is roughly an
   order of magnitude dearer per row than a sequential decode, so a wide range was far
