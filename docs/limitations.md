@@ -277,7 +277,8 @@ judge fit before deploying.
   expression depth, frame size, `IN (SELECT)` / `DISTINCT` row caps, recursive-CTE
   and stored-procedure loop caps, a `SERIALIZABLE` range cap, and a byte budget for
   string-expanding functions (`ELYRASQL_MAX_ALLOWED_PACKET`, returning `NULL` past it
-  as MySQL does past `max_allowed_packet`). Two gaps remain, both tracked:
+  as MySQL does past `max_allowed_packet`). The behaviour that matters most in
+  practice:
     - **CPU-heavy queries no longer monopolise the server.** Long synchronous
       stretches (join products, sorts, aggregation over materialised rows) run via
       `block_in_place`, and the streaming join loops yield periodically, so the

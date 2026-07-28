@@ -4,23 +4,21 @@ All notable changes to ElyraSQL are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.4.13] - 2026-07-28
+
+**Correctness release — upgrade from 1.4.12 is strongly recommended.** Two bugs in
+1.4.12 returned *wrong results* for ordinary joins: hash-join keys collided for
+integers in 128..255 (so a 1:1 join could return a cartesian product), and a bare
+aggregate over a join appended 256 spurious zero rows. Neither raised an error, so
+affected queries looked like they worked. Both are fixed and covered by the
+differential battery, which grew from 183 to 203 cases against real MySQL 8.4.
+
+The release also stops a single query from being able to kill the process
+(unbounded join buffering), keeps the server responsive under CPU-heavy queries
+without any configuration, and makes `ELYRASQL_QUERY_TIMEOUT_MS` genuinely
+enforceable. No on-disk format change.
 
 ### Fixed
-
-- **A materialising join could exhaust memory and kill the process (ESQL-39).**
-  `FULL`, non-equi, derived-table and cross joins buffer their output, with no cap
-  and no spilling: 8 concurrent 3-way cross joins over a 4000-row table took the
-  process from 97 MB to **97 GB** RSS, after which the OS killed it — no panic and
-  nothing logged. A single authenticated client could do this with one short query.
-  Buffered rows are now bounded per join by `ELYRASQL_JOIN_MAX_ROWS` (default 10M)
-  and across all concurrent joins by `ELYRASQL_JOIN_MAX_ROWS_TOTAL` (default 20M),
-  both reserved through an RAII guard so a join that finishes, errors or unwinds
-  returns its share. The per-join cap alone would not have bounded the server, since
-  memory scales with concurrency. The same workload now plateaus at **5.4 GB** with
-  the server healthy, and an unconstrained join fails with a message naming the
-  limit rather than being killed. Streaming joins are unaffected — they never hold
-  the join output.
 
 - **Wrong join results: the hash-join key was corrupted (ESQL-40).** Present in
   1.4.12. The key was a collation key pushed through `from_utf8_lossy`, but a
@@ -43,6 +41,20 @@ All notable changes to ElyraSQL are documented here. The format is based on
   Clients reading only the first row (most ORMs, for a scalar aggregate) saw the
   correct value, which is why this went unnoticed.
 
+- **A materialising join could exhaust memory and kill the process (ESQL-39).**
+  `FULL`, non-equi, derived-table and cross joins buffer their output, with no cap
+  and no spilling: 8 concurrent 3-way cross joins over a 4000-row table took the
+  process from 97 MB to **97 GB** RSS, after which the OS killed it — no panic and
+  nothing logged. A single authenticated client could do this with one short query.
+  Buffered rows are now bounded per join by `ELYRASQL_JOIN_MAX_ROWS` (default 10M)
+  and across all concurrent joins by `ELYRASQL_JOIN_MAX_ROWS_TOTAL` (default 20M),
+  both reserved through an RAII guard so a join that finishes, errors or unwinds
+  returns its share. The per-join cap alone would not have bounded the server, since
+  memory scales with concurrency. The same workload now plateaus at **5.4 GB** with
+  the server healthy, and an unconstrained join fails with a message naming the
+  limit rather than being killed. Streaming joins are unaffected — they never hold
+  the join output.
+
 - **A CPU-heavy query no longer makes the server unresponsive (ESQL-38).**
   Statement execution shares the async runtime's workers with the connection
   listener and every other session, so a long *synchronous* stretch — a join
@@ -55,18 +67,6 @@ All notable changes to ElyraSQL are documented here. The format is based on
   so this protects the default setup: 32 concurrent runaway queries (2× the core
   count) now leave a new connection answered in under 0.1 s. The query deadline
   from the previous entry still applies on top when configured.
-
-- **`REGEXP` ignored the operand's collation (ESQL-37).** MySQL applies the
-  operand's collation to `REGEXP`/`RLIKE`, and its default collation is
-  case-insensitive, so `SELECT 'Hello' REGEXP 'h'` returns 1 there but returned 0
-  here — silently different rows for any query relying on it. Case-sensitivity now
-  follows the collation the same way comparisons already did: case-insensitive by
-  default, case-sensitive for a `_bin` operand, with an inline `(?-i)` still
-  overriding it. `REGEXP_REPLACE`/`REGEXP_SUBSTR` receive already-evaluated values,
-  so they use MySQL's default (case-insensitive) behaviour, which is also what
-  MySQL returns for `REGEXP_REPLACE('a1B2','[b]','x')` → `a1x2`. All expectations
-  were taken from real MySQL 8.4 before implementing, and 12 REGEXP cases were
-  added to the differential battery (now 195 cases, 0 divergences).
 
 - **`ELYRASQL_QUERY_TIMEOUT_MS` now actually stops a runaway statement
   (ESQL-32).** It previously wrapped execution in a wall-clock timeout, which can
@@ -94,6 +94,17 @@ All notable changes to ElyraSQL are documented here. The format is based on
   limit), shared by `REGEXP`/`RLIKE`, `REGEXP_REPLACE` and `REGEXP_SUBSTR`. A
   `COUNT(*)` with a `REGEXP` filter over 800k rows went from **not finishing inside
   a 2-second budget to 0.12 s**.
+- **`REGEXP` ignored the operand's collation (ESQL-37).** MySQL applies the
+  operand's collation to `REGEXP`/`RLIKE`, and its default collation is
+  case-insensitive, so `SELECT 'Hello' REGEXP 'h'` returns 1 there but returned 0
+  here — silently different rows for any query relying on it. Case-sensitivity now
+  follows the collation the same way comparisons already did: case-insensitive by
+  default, case-sensitive for a `_bin` operand, with an inline `(?-i)` still
+  overriding it. `REGEXP_REPLACE`/`REGEXP_SUBSTR` receive already-evaluated values,
+  so they use MySQL's default (case-insensitive) behaviour, which is also what
+  MySQL returns for `REGEXP_REPLACE('a1B2','[b]','x')` → `a1x2`. All expectations
+  were taken from real MySQL 8.4 before implementing, and 12 REGEXP cases were
+  added to the differential battery (now 195 cases, 0 divergences).
 
 ## [1.4.12] - 2026-07-27
 
@@ -1790,6 +1801,7 @@ core CRUD with `WHERE`/`ORDER BY`/`LIMIT`, indexes, aggregation and `GROUP BY`,
 joins, prepared statements, authentication and TLS, vector search (exact +
 HNSW), parallel OLAP aggregation, and transactions with snapshot isolation.
 
+[1.4.13]: https://github.com/kwhorne/ElyraSQL/releases/tag/v1.4.13
 [1.4.12]: https://github.com/kwhorne/ElyraSQL/releases/tag/v1.4.12
 [1.4.11]: https://github.com/kwhorne/ElyraSQL/releases/tag/v1.4.11
 [1.4.10]: https://github.com/kwhorne/ElyraSQL/releases/tag/v1.4.10
