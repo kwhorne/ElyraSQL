@@ -304,7 +304,10 @@ pub fn eval_row(expr: &Expr, schema: &Schema, row: &[Value]) -> Result<Value> {
                 text.to_wire_string().unwrap_or_default(),
                 pat.to_wire_string().unwrap_or_default(),
             );
-            let re = compiled_regex(&p)?;
+            // MySQL applies the operand's collation: case-insensitive by default,
+            // case-sensitive for a `_bin` operand.
+            let ci = cmp_collation(expr, pattern, schema) != Collation::Bin;
+            let re = compiled_regex(&p, ci)?;
             Ok(Value::Bool(re.is_match(&t) != *negated))
         }
         Expr::Substring {
@@ -942,20 +945,26 @@ fn wire(v: &Value) -> Option<String> {
 /// pattern built from a column) cannot grow it without limit; on overflow it is
 /// cleared rather than evicted one by one, which keeps the hot path a single
 /// read-lock lookup with no bookkeeping.
-fn compiled_regex(pattern: &str) -> Result<std::sync::Arc<regex::Regex>> {
+/// `case_insensitive` follows the operand's collation, as MySQL does: its default
+/// collation is case-insensitive (so `'Hello' REGEXP 'h'` is true), while a
+/// `_bin` operand matches case-sensitively. An inline `(?-i)` in the pattern still
+/// overrides the flag, again matching MySQL.
+fn compiled_regex(pattern: &str, case_insensitive: bool) -> Result<std::sync::Arc<regex::Regex>> {
     use std::collections::HashMap;
     use std::sync::{Arc, OnceLock, RwLock};
 
-    /// Distinct patterns kept before the cache is cleared.
+    /// Distinct patterns kept per case-sensitivity before the cache is cleared.
     const MAX_PATTERNS: usize = 256;
 
-    static CACHE: OnceLock<RwLock<HashMap<String, Arc<regex::Regex>>>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| RwLock::new(HashMap::new()));
+    // One map per case-sensitivity, so a lookup can borrow the pattern instead of
+    // allocating a composite key on every row.
+    type Cache = [HashMap<String, Arc<regex::Regex>>; 2];
+    static CACHE: OnceLock<RwLock<Cache>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| RwLock::new([HashMap::new(), HashMap::new()]));
+    let slot = usize::from(case_insensitive);
 
     // Fast path: a shared read lock, so parallel scan workers do not serialise.
-    if let Some(re) = cache
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
+    if let Some(re) = cache.read().unwrap_or_else(|e| e.into_inner())[slot]
         .get(pattern)
         .cloned()
     {
@@ -963,14 +972,16 @@ fn compiled_regex(pattern: &str) -> Result<std::sync::Arc<regex::Regex>> {
     }
 
     let re = Arc::new(
-        regex::Regex::new(pattern)
+        regex::RegexBuilder::new(pattern)
+            .case_insensitive(case_insensitive)
+            .build()
             .map_err(|e| Error::Query(format!("invalid regular expression: {e}")))?,
     );
     let mut w = cache.write().unwrap_or_else(|e| e.into_inner());
-    if w.len() >= MAX_PATTERNS {
-        w.clear();
+    if w[slot].len() >= MAX_PATTERNS {
+        w[slot].clear();
     }
-    w.insert(pattern.to_string(), re.clone());
+    w[slot].insert(pattern.to_string(), re.clone());
     Ok(re)
 }
 
@@ -1440,14 +1451,19 @@ fn eval_scalar(name: &str, a: &[Value]) -> Result<Option<Value>> {
             None => Value::Null,
         },
         "regexp_replace" => match (sstr(a, 0), sstr(a, 1), sstr(a, 2)) {
-            (Some(s), Some(pat), Some(rep)) => match compiled_regex(&pat) {
+            // These receive already-evaluated values, so the operand's collation is
+            // no longer available; use MySQL's default (case-insensitive), which is
+            // what it returns for `REGEXP_REPLACE('a1B2','[b]','x')` -> `a1x2`.
+            // MySQL rejects a binary-charset argument here outright, so the `_bin`
+            // case is not a silent divergence.
+            (Some(s), Some(pat), Some(rep)) => match compiled_regex(&pat, true) {
                 Ok(re) => Value::Text(re.replace_all(&s, rep.as_str()).into_owned()),
                 Err(_) => Value::Null,
             },
             _ => Value::Null,
         },
         "regexp_substr" => match (sstr(a, 0), sstr(a, 1)) {
-            (Some(s), Some(pat)) => match compiled_regex(&pat) {
+            (Some(s), Some(pat)) => match compiled_regex(&pat, true) {
                 Ok(re) => re
                     .find(&s)
                     .map(|m| Value::Text(m.as_str().to_string()))

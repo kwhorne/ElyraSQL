@@ -8,6 +8,18 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ### Fixed
 
+- **`REGEXP` ignored the operand's collation (ESQL-37).** MySQL applies the
+  operand's collation to `REGEXP`/`RLIKE`, and its default collation is
+  case-insensitive, so `SELECT 'Hello' REGEXP 'h'` returns 1 there but returned 0
+  here — silently different rows for any query relying on it. Case-sensitivity now
+  follows the collation the same way comparisons already did: case-insensitive by
+  default, case-sensitive for a `_bin` operand, with an inline `(?-i)` still
+  overriding it. `REGEXP_REPLACE`/`REGEXP_SUBSTR` receive already-evaluated values,
+  so they use MySQL's default (case-insensitive) behaviour, which is also what
+  MySQL returns for `REGEXP_REPLACE('a1B2','[b]','x')` → `a1x2`. All expectations
+  were taken from real MySQL 8.4 before implementing, and 12 REGEXP cases were
+  added to the differential battery (now 195 cases, 0 divergences).
+
 - **`ELYRASQL_QUERY_TIMEOUT_MS` now actually stops a runaway statement
   (ESQL-32).** It previously wrapped execution in a wall-clock timeout, which can
   only take effect at an `.await` point — so a long stretch of synchronous CPU work

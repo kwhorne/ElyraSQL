@@ -96,6 +96,11 @@ FIXTURES = [
     "CREATE TABLE d (id INT PRIMARY KEY, n INT, f DOUBLE, s VARCHAR(32), dt DATE)",
     "INSERT INTO d VALUES (1,10,1.5,'apple','2024-01-15'),(2,-3,2.5,'Banana',NULL),"
     "(3,NULL,NULL,NULL,'2024-02-29'),(4,0,0.0,'','2000-01-01')",
+    # Case-sensitivity fixture: `s` uses the default (case-insensitive) collation,
+    # `sb` an explicit binary one, so REGEXP/comparison collation can be compared.
+    "DROP TABLE IF EXISTS cs",
+    "CREATE TABLE cs (s VARCHAR(20), sb VARCHAR(20) COLLATE utf8mb4_bin)",
+    "INSERT INTO cs VALUES ('Hello','Hello')",
 ]
 
 # (category, sql). Kept side-effect free (SELECTs) except the fixtures above.
@@ -222,6 +227,21 @@ CASES = [
     ("like", "SELECT 'abc' REGEXP '^a.c$'"),
     ("like", "SELECT NULL LIKE '%'"),
     ("like", "SELECT 'abc' LIKE NULL"),
+    # REGEXP follows the operand collation: case-insensitive by default (MySQL's
+    # default collation is _ci), and an inline (?-i) still overrides it.
+    ("regexp", "SELECT 'Hello' REGEXP 'h'"),
+    ("regexp", "SELECT 'hello' REGEXP 'H'"),
+    ("regexp", "SELECT 'Hello' REGEXP '(?-i)h'"),
+    ("regexp", "SELECT 'Hello' NOT REGEXP 'h'"),
+    ("regexp", "SELECT 'Hello' RLIKE 'ELL'"),
+    ("regexp", "SELECT REGEXP_REPLACE('a1B2','[b]','x')"),
+    ("regexp", "SELECT REGEXP_SUBSTR('ABC','b')"),
+    ("regexp", "SELECT NULL REGEXP 'a'"),
+    ("regexp", "SELECT 'a' REGEXP NULL"),
+    # A _bin operand matches case-sensitively.
+    ("regexp", "SELECT sb REGEXP 'h' FROM cs"),
+    ("regexp", "SELECT sb REGEXP 'H' FROM cs"),
+    ("regexp", "SELECT s REGEXP 'h' FROM cs"),
     # DIV integer division
     ("arith", "SELECT 7 DIV 2"),
     ("arith", "SELECT -7 DIV 2"),

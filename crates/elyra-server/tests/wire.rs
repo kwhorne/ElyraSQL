@@ -2400,3 +2400,47 @@ async fn connection_slots_are_reclaimed_on_disconnect() {
         drop(c);
     }
 }
+
+// REGEXP follows the operand's collation, as MySQL does: case-insensitive under
+// the default collation, case-sensitive for a `_bin` column. All expectations
+// below were verified against real MySQL 8.4.
+#[tokio::test]
+async fn regexp_case_sensitivity_follows_collation() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop("CREATE TABLE cs (s VARCHAR(20), sb VARCHAR(20) COLLATE utf8mb4_bin)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO cs VALUES ('Hello','Hello')")
+        .await
+        .unwrap();
+
+    for (sql, want) in [
+        // Default collation is case-insensitive.
+        ("SELECT 'Hello' REGEXP 'h'", 1i64),
+        ("SELECT 'hello' REGEXP 'H'", 1),
+        ("SELECT 'Hello' RLIKE 'ELL'", 1),
+        ("SELECT 'Hello' NOT REGEXP 'h'", 0),
+        ("SELECT s REGEXP 'h' FROM cs", 1),
+        // An inline flag still overrides the collation default.
+        ("SELECT 'Hello' REGEXP '(?-i)h'", 0),
+        // A _bin operand is case-sensitive.
+        ("SELECT sb REGEXP 'h' FROM cs", 0),
+        ("SELECT sb REGEXP 'H' FROM cs", 1),
+    ] {
+        let got: Option<i64> = c.query_first(sql).await.unwrap();
+        assert_eq!(got, Some(want), "{sql}");
+    }
+
+    // The scalar regex functions use MySQL's default (case-insensitive) too.
+    let got: Option<String> = c
+        .query_first("SELECT REGEXP_REPLACE('a1B2','[b]','x')")
+        .await
+        .unwrap();
+    assert_eq!(got.as_deref(), Some("a1x2"));
+    let got: Option<String> = c
+        .query_first("SELECT REGEXP_SUBSTR('ABC','b')")
+        .await
+        .unwrap();
+    assert_eq!(got.as_deref(), Some("B"));
+}
