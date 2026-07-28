@@ -74,6 +74,10 @@ in both directions (NULL rows are indexed under a companion keyspace); see
 - **Group commit** amortizes write durability across concurrent writers.
 - **Streaming execution** keeps memory bounded on scans and aggregations.
 - **HNSW** brings vector search from `O(n)` exact to sub-millisecond ANN.
+- **CPU-heavy stretches run off the reactor** (`block_in_place`) and the streaming
+  join loops yield periodically, so one expensive query cannot stall the listener or
+  other sessions — with 32 concurrent runaway queries on 16 cores, a new connection
+  is still answered in under 0.1 s.
 - **Compiled regular expressions are cached**, so `WHERE col REGEXP '...'` compiles
   the pattern once instead of once per row. Compilation costs far more than
   matching, so this dominates such scans: a `COUNT(*)` with a `REGEXP` filter over

@@ -2444,3 +2444,50 @@ async fn regexp_case_sensitivity_follows_collation() {
         .unwrap();
     assert_eq!(got.as_deref(), Some("B"));
 }
+
+// A CPU-heavy query must not monopolise a runtime worker: the server has to keep
+// serving other sessions while one grinds away, with no query timeout configured.
+// This is the property that keeps the listener responsive under load.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn heavy_query_does_not_block_other_sessions() {
+    let srv = TestServer::start().await;
+    let mut setup = srv.conn().await;
+    setup
+        .query_drop("CREATE TABLE h (id INT PRIMARY KEY, v INT)")
+        .await
+        .unwrap();
+    for i in 1..=250 {
+        setup
+            .query_drop(format!("INSERT INTO h VALUES ({i}, {})", i % 3))
+            .await
+            .unwrap();
+    }
+
+    // Saturate both workers with a materialising join that takes real CPU time.
+    let mut hogs = Vec::new();
+    for _ in 0..2 {
+        let mut c = srv.conn().await;
+        hogs.push(tokio::spawn(async move {
+            let _: Result<Option<i64>, _> = c
+                .query_first("SELECT COUNT(*) FROM h a, h b, h c WHERE a.v = b.v AND b.v = c.v")
+                .await;
+        }));
+    }
+    // Give them time to get going.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    // A different session must still be served promptly.
+    let mut probe = srv.conn().await;
+    let started = std::time::Instant::now();
+    let got: Option<i64> = probe.query_first("SELECT COUNT(*) FROM h").await.unwrap();
+    let waited = started.elapsed();
+    assert_eq!(got, Some(250));
+    assert!(
+        waited < std::time::Duration::from_secs(10),
+        "a concurrent session waited {waited:?} behind CPU-heavy queries"
+    );
+    // The hogs have served their purpose; abort rather than wait them out.
+    for h in hogs {
+        h.abort();
+    }
+}

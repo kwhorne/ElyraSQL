@@ -4389,32 +4389,41 @@ async fn join_select(
     // WHERE over the joined rows.
     if let Some(f) = &filter {
         let mut check = db.cancel_check();
-        let mut kept = Vec::with_capacity(rows.len());
-        for row in rows.into_iter() {
-            check.tick()?;
-            if predicate::matches(f, &schema, &row)? {
-                kept.push(row);
+        rows = cpu_bound(|| -> Result<Vec<Vec<Value>>> {
+            let mut kept = Vec::with_capacity(rows.len());
+            for row in rows.into_iter() {
+                check.tick()?;
+                if predicate::matches(f, &schema, &row)? {
+                    kept.push(row);
+                }
             }
-        }
-        rows = kept;
+            Ok(kept)
+        })?;
     }
 
     // Aggregation / grouping.
     if !group_by.is_empty() || aggregate::projection_has_aggregate(&select.projection) {
-        let (osch, orows) = aggregate::run(&schema, &select.projection, &group_by, rows)?;
-        let mut orows = apply_having(select.having.as_ref(), &select.projection, &osch, orows)?;
-        order_output_rows(&mut orows, &osch, &order_exprs)?;
-        apply_offset_limit(&mut orows, offset, limit);
+        // Aggregating and ordering materialised rows is pure CPU work.
+        let (osch, orows) = cpu_bound(|| -> Result<(Schema, Vec<Vec<Value>>)> {
+            let (osch, orows) = aggregate::run(&schema, &select.projection, &group_by, rows)?;
+            let mut orows = apply_having(select.having.as_ref(), &select.projection, &osch, orows)?;
+            order_output_rows(&mut orows, &osch, &order_exprs)?;
+            apply_offset_limit(&mut orows, offset, limit);
+            Ok((osch, orows))
+        })?;
         return Ok(QueryResult::Rows(RowStream::literal(osch, orows)));
     }
 
     // ORDER BY + projection.
     let resolved = resolve_order_aliases(&order_exprs, &select.projection, &schema);
-    if !resolved.is_empty() {
-        sort_full_rows(&mut rows, &schema, &resolved, &db.cancel_token())?;
-    }
-    apply_offset_limit(&mut rows, offset, limit);
-    let (osch, out) = project_exprs(&select.projection, &schema, &rows)?;
+    let cancel = db.cancel_token();
+    let (osch, out) = cpu_bound(|| -> Result<(Schema, Vec<Vec<Value>>)> {
+        if !resolved.is_empty() {
+            sort_full_rows(&mut rows, &schema, &resolved, &cancel)?;
+        }
+        apply_offset_limit(&mut rows, offset, limit);
+        project_exprs(&select.projection, &schema, &rows)
+    })?;
     Ok(QueryResult::Rows(RowStream::literal(osch, out)))
 }
 
@@ -4664,6 +4673,60 @@ async fn build_join_chain(
 /// Expand one driving row through the built chain into full combined rows (the
 /// cartesian product of matches at each step; LEFT joins NULL-extend unmatched
 /// left rows). `out` is appended to.
+/// Run a CPU-bound stretch without monopolising an async worker thread.
+///
+/// Statement execution shares the runtime's workers with the connection listener
+/// and every other session, so a long synchronous stretch (a join product, a sort,
+/// an aggregation over materialised rows) makes the server unresponsive - new
+/// connections are not even accepted. `block_in_place` hands the current worker
+/// over to this work and lets the runtime bring up a replacement, so everything
+/// else keeps being polled.
+///
+/// Unlike a deadline check this needs no configuration, so it protects the default
+/// setup where no query timeout is set. Falls back to calling `f` directly on a
+/// current-thread runtime (used by unit tests), where `block_in_place` is not
+/// permitted.
+fn cpu_bound<T>(f: impl FnOnce() -> T) -> T {
+    use tokio::runtime::{Handle, RuntimeFlavor};
+    match Handle::try_current().map(|h| h.runtime_flavor()) {
+        Ok(RuntimeFlavor::MultiThread) => tokio::task::block_in_place(f),
+        _ => f(),
+    }
+}
+
+/// Cooperative yielding for a long-running async loop.
+///
+/// Statement execution shares the async runtime's worker threads with the
+/// connection listener and every other session, so a long synchronous stretch
+/// inside one query makes the whole server unresponsive - including to *new*
+/// connections, which never get accepted. Handing the worker back periodically
+/// lets other tasks progress; the query resumes on its next poll, so throughput
+/// is essentially unchanged while latency for everyone else stays bounded.
+///
+/// This is independent of the query deadline (`CancelCheck`): it keeps the server
+/// responsive even when no timeout is configured, which is the default.
+struct Pacer {
+    tick: u32,
+}
+
+impl Pacer {
+    /// Iterations between yields. Large enough that the yield is noise, small
+    /// enough that no single query monopolises a worker for long.
+    const INTERVAL: u32 = 256;
+
+    fn new() -> Self {
+        Self { tick: 0 }
+    }
+
+    #[inline]
+    async fn tick(&mut self) {
+        self.tick = self.tick.wrapping_add(1);
+        if self.tick % Self::INTERVAL == 0 {
+            tokio::task::yield_now().await;
+        }
+    }
+}
+
 fn expand_join_chain(
     driving: Vec<Value>,
     steps: &[JoinChainStep],
@@ -4776,6 +4839,7 @@ async fn streaming_join_aggregate(
     let mut cursor: Option<Vec<u8>> = None;
     let mut combined_buf: Vec<Vec<Value>> = Vec::new();
     let mut check = db.cancel_check();
+    let mut pacer = Pacer::new();
     loop {
         let batch = db.scan_batch(prefix.clone(), cursor.clone(), 4096).await?;
         if batch.is_empty() {
@@ -4784,6 +4848,9 @@ async fn streaming_join_aggregate(
         let last = batch.len() < 4096;
         cursor = batch.last().map(|(k, _)| k.clone());
         for (_, v) in batch {
+            // Expanding one driving row is synchronous and can be large, so give
+            // the runtime a chance to run other tasks between rows.
+            pacer.tick().await;
             let l: Vec<Value> =
                 bincode::deserialize(&v).map_err(|e| Error::Storage(e.to_string()))?;
             combined_buf.clear();
@@ -4897,6 +4964,7 @@ async fn streaming_join_order(
     let mut cursor: Option<Vec<u8>> = None;
     let mut combined_buf: Vec<Vec<Value>> = Vec::new();
     let mut check = db.cancel_check();
+    let mut pacer = Pacer::new();
     loop {
         let batch = db.scan_batch(prefix.clone(), cursor.clone(), 4096).await?;
         if batch.is_empty() {
@@ -4905,6 +4973,9 @@ async fn streaming_join_order(
         let last = batch.len() < 4096;
         cursor = batch.last().map(|(k, _)| k.clone());
         for (_, v) in batch {
+            // Expanding one driving row is synchronous and can be large, so give
+            // the runtime a chance to run other tasks between rows.
+            pacer.tick().await;
             let l: Vec<Value> =
                 bincode::deserialize(&v).map_err(|e| Error::Storage(e.to_string()))?;
             combined_buf.clear();
@@ -5570,15 +5641,18 @@ async fn build_from(
             cur_rows = br;
             first = false;
         } else {
-            let (c, r) = combine(
-                &cur_cols,
-                &cur_rows,
-                &bc,
-                &br,
-                JoinKind::Inner,
-                None,
-                &db.cancel_token(),
-            )?;
+            let cancel = db.cancel_token();
+            let (c, r) = cpu_bound(|| {
+                combine(
+                    &cur_cols,
+                    &cur_rows,
+                    &bc,
+                    &br,
+                    JoinKind::Inner,
+                    None,
+                    &cancel,
+                )
+            })?;
             cur_cols = c;
             cur_rows = r;
         }
@@ -5640,15 +5714,9 @@ async fn build_from(
             // Fallback: materialise the partner (with pushdown) and hash/nested join.
             let (jc, mut jr) = load_relation(db, vindex, &join.relation, conjuncts).await?;
             jr = apply_pushdown(jr, &jc, conjuncts)?;
-            let (c, r) = combine(
-                &cur_cols,
-                &cur_rows,
-                &jc,
-                &jr,
-                kind,
-                on.as_ref(),
-                &db.cancel_token(),
-            )?;
+            let cancel = db.cancel_token();
+            let (c, r) =
+                cpu_bound(|| combine(&cur_cols, &cur_rows, &jc, &jr, kind, on.as_ref(), &cancel))?;
             cur_cols = c;
             cur_rows = r;
         }
@@ -6157,15 +6225,18 @@ async fn build_inner_join_reordered(
         let idx = remaining.remove(pos);
         let rcols = std::mem::take(&mut loaded[idx].cols);
         let rrows = std::mem::take(&mut loaded[idx].rows);
-        let (c, r) = combine(
-            &cur_cols,
-            &cur_rows,
-            &rcols,
-            &rrows,
-            JoinKind::Inner,
-            Some(&pred),
-            &db.cancel_token(),
-        )?;
+        let cancel = db.cancel_token();
+        let (c, r) = cpu_bound(|| {
+            combine(
+                &cur_cols,
+                &cur_rows,
+                &rcols,
+                &rrows,
+                JoinKind::Inner,
+                Some(&pred),
+                &cancel,
+            )
+        })?;
         cur_cols = c;
         cur_rows = r;
     }

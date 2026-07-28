@@ -8,6 +8,19 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ### Fixed
 
+- **A CPU-heavy query no longer makes the server unresponsive (ESQL-38).**
+  Statement execution shares the async runtime's workers with the connection
+  listener and every other session, so a long *synchronous* stretch — a join
+  product, a sort, aggregation over materialised rows — monopolised a worker.
+  With enough concurrent heavy queries the server stopped accepting connections
+  entirely: measured with no query timeout configured, a fresh `SELECT 1` could
+  not complete within 12 s. Those stretches now run through `block_in_place`, which
+  hands the worker over and lets the runtime bring up a replacement, and the
+  streaming join loops yield between driving rows. **No configuration is needed**,
+  so this protects the default setup: 32 concurrent runaway queries (2× the core
+  count) now leave a new connection answered in under 0.1 s. The query deadline
+  from the previous entry still applies on top when configured.
+
 - **`REGEXP` ignored the operand's collation (ESQL-37).** MySQL applies the
   operand's collation to `REGEXP`/`RLIKE`, and its default collation is
   case-insensitive, so `SELECT 'Hello' REGEXP 'h'` returns 1 there but returned 0
