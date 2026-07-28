@@ -4,7 +4,23 @@ All notable changes to ElyraSQL are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.4.14] - 2026-07-28
+
+**Correctness release — upgrade from 1.4.13 is strongly recommended.** Two aggregate
+bugs in 1.4.13 returned *wrong values* without any error. `COUNT(DISTINCT)` was
+affected in both directions at once: it was multiplied by the parallel worker count
+(so the answer depended on the machine's CPU count) and simultaneously deflated by
+key collisions. The two defects partly cancelled, which is exactly why they survived
+release. `GROUP_CONCAT` also ignored its `ORDER BY` entirely.
+
+These were found by a new threshold-sweep scenario harness that replays one query
+battery at sizes bracketing every internal threshold and diffs every result against
+a reference MySQL 8.4 — built because the wrong-result bugs fixed in 1.4.13 had all
+hidden *below* those thresholds. Robustness and security were verified in the same
+pass: 13/13 durability and concurrency invariants hold (acknowledged commits survive
+`SIGKILL`, no torn transactions after a mid-write kill with six concurrent writers,
+totals conserved across ~3000 concurrent transfers) and 21/21 privilege and hostile-
+input checks pass. No on-disk format change.
 
 ### Fixed
 
@@ -1853,6 +1869,7 @@ core CRUD with `WHERE`/`ORDER BY`/`LIMIT`, indexes, aggregation and `GROUP BY`,
 joins, prepared statements, authentication and TLS, vector search (exact +
 HNSW), parallel OLAP aggregation, and transactions with snapshot isolation.
 
+[1.4.14]: https://github.com/kwhorne/ElyraSQL/releases/tag/v1.4.14
 [1.4.13]: https://github.com/kwhorne/ElyraSQL/releases/tag/v1.4.13
 [1.4.12]: https://github.com/kwhorne/ElyraSQL/releases/tag/v1.4.12
 [1.4.11]: https://github.com/kwhorne/ElyraSQL/releases/tag/v1.4.11
