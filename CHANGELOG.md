@@ -4,7 +4,31 @@ All notable changes to ElyraSQL are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.4.15] - 2026-07-28
+
+Query-planning release. Three related defects made ElyraSQL do far more work than
+necessary on ordinary filters, all found by measuring against a reference MySQL
+rather than by inspection:
+
+- a range on a secondary index was executed as an index walk **regardless of how much
+  of the table it matched**, so `WHERE amt > 0` cost 124 ms where the identical row
+  set written as a non-index-usable `amt <> -1` cost 2.7 ms;
+- `col IN (...)` was not recognised as index-usable **at all**, so even a five-element
+  list scanned the whole table;
+- and when a scan *was* right, `IN` was interpreted per row, so a 500-element list
+  meant 100 million comparisons.
+
+Measured on 200 000 rows: `amt > 0` **124 ms → 16.5 ms**, `IN (500 literals)`
+**102 ms → 5.7 ms**, `IN (5 literals)` **4.5 ms → 1.3 ms**, and a scalar-subquery
+filter **68.7 ms → 12.2 ms** — the last one had been recorded as a separate problem
+and turned out to be the range defect all along. Several of these are now faster than
+MySQL on the same data.
+
+Because plan selection changed, correctness was verified more widely than usual: the
+threshold sweep against MySQL 8.4, the 203-case differential battery, and the client
+suites (Laravel/Eloquent, PHP native prepares, PyMySQL). That last group earned its
+place — it caught a regression in this very work, described below. No on-disk format
+change.
 
 ### Fixed
 
@@ -1933,6 +1957,7 @@ core CRUD with `WHERE`/`ORDER BY`/`LIMIT`, indexes, aggregation and `GROUP BY`,
 joins, prepared statements, authentication and TLS, vector search (exact +
 HNSW), parallel OLAP aggregation, and transactions with snapshot isolation.
 
+[1.4.15]: https://github.com/kwhorne/ElyraSQL/releases/tag/v1.4.15
 [1.4.14]: https://github.com/kwhorne/ElyraSQL/releases/tag/v1.4.14
 [1.4.13]: https://github.com/kwhorne/ElyraSQL/releases/tag/v1.4.13
 [1.4.12]: https://github.com/kwhorne/ElyraSQL/releases/tag/v1.4.12

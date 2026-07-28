@@ -74,6 +74,13 @@ in both directions (NULL rows are indexed under a companion keyspace); see
 - **Group commit** amortizes write durability across concurrent writers.
 - **Streaming execution** keeps memory bounded on scans and aggregations.
 - **HNSW** brings vector search from `O(n)` exact to sub-millisecond ANN.
+- **`IN` lists use the index, or a hash set.** `col IN (...)` on an indexed column is
+  served by index lookups unioned by storage key (bounded by the same budget as a
+  range, so a list covering most of the table falls back to a scan having paid only
+  for key lookups). When a scan *is* the right plan, a numeric `IN` list compiles to
+  an O(1) membership test rather than being walked per row, and the set's span is
+  exposed to zone maps so chunks outside it are still skipped. Measured on 200k rows:
+  `IN (5 values)` **4.5 ms → 1.3 ms**, `IN (500 values)` **102 ms → 5.7 ms**.
 - **Index ranges are used only when they pay.** A secondary-index range fetches each
   matching row by key, which costs far more per row than a sequential decode, so a
   range matching more than `ELYRASQL_INDEX_RANGE_MAX_FRACTION` of the table falls back
