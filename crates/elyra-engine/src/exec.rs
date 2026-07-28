@@ -11569,7 +11569,16 @@ async fn scan_aggregate_fast(
     // its key buffer, so grouped aggregation no longer thrashes the allocator
     // across threads. `ELYRASQL_AGG_WORKERS` overrides the degree of parallelism
     // (0/1 = single-threaded); default is min(cores, 8).
-    let workers = agg_workers();
+    // A DISTINCT aggregate must NOT be split across workers: partial results merge
+    // additively (count/sum/concat), so a value seen by two workers is counted
+    // twice -- COUNT(DISTINCT x) came out as `workers x` the correct answer, and
+    // AVG(DISTINCT x) happened to look right only because both halves of the ratio
+    // were inflated equally. Stay single-pass for those.
+    let workers = if plan.has_distinct() {
+        1
+    } else {
+        agg_workers()
+    };
     if workers > 1 {
         if let Some(ranges) = pk_split_ranges(&raw, def, &prefix, workers).await? {
             // One snapshot shared by every worker: the parallel range scans then
@@ -12094,9 +12103,18 @@ async fn parallel_aggregate(
     plan: &AggPlan,
 ) -> Result<GroupAggregator> {
     const BATCH: usize = 8192;
-    let workers = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
+    // A DISTINCT aggregate must NOT be split across workers: partial results merge
+    // additively (count/sum/concat), so a value seen by two workers is counted
+    // twice -- COUNT(DISTINCT x) came out as `workers x` the correct answer, and
+    // AVG(DISTINCT x) happened to look right only because both halves of the ratio
+    // were inflated equally. Stay single-pass for those.
+    let workers = if plan.has_distinct() {
+        1
+    } else {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+    };
     let prefix = data_prefix(&def.name);
     let schema = def.schema.clone();
     // Only decode the columns this aggregation actually reads (filter + group +

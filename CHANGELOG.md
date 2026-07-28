@@ -4,6 +4,37 @@ All notable changes to ElyraSQL are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **DISTINCT aggregates were multiplied by the parallel worker count (ESQL-42).**
+  Present in 1.4.13 and earlier. `COUNT(DISTINCT g)` returned `8 x workers` for 8
+  distinct values, so the answer **depended on the machine's CPU count** and was
+  only correct with a single worker. Parallel aggregation merges partial results
+  additively, which is right for COUNT/SUM/MIN/MAX but double-counts a value seen
+  by two workers. `SUM(DISTINCT)` and `GROUP_CONCAT(DISTINCT)` were wrong the same
+  way; `AVG(DISTINCT)` *looked* correct only because numerator and denominator were
+  inflated equally, which is why spot checks missed it. DISTINCT counts are now
+  derived from the merged set, and aggregations containing a DISTINCT stay on the
+  single-pass path. Verified identical for 1/2/4/8/16 workers on 20k rows and
+  differentially against MySQL 8.4.
+- **Integer-returning functions over an aggregate came back as text.**
+  `LENGTH(GROUP_CONCAT(s))` reached the client as the string `"23"` instead of the
+  number `23` (likewise `CHAR_LENGTH`, `ASCII`, `INSTR`, and the date-part
+  functions), because computed-column type inference defaulted to `Text`. They are
+  now typed as integers, so arithmetic and client-side decoding behave as in MySQL.
+
+### Added
+
+- **Threshold-sweep scenario harness** (`tests/scenarios/`). Both wrong-result bugs
+  fixed in 1.4.13 (and ESQL-42 above) shipped because every existing test sat
+  *below* the internal thresholds where they lived. The harness replays one query
+  battery at sizes bracketing each threshold (1, 2, 127, 128, 129, 255, 256, 257,
+  2047, 2048, 2049, 4095, 4097, 8193) and diffs every result against a reference
+  MySQL 8.4, so a bug that only appears past a byte boundary, a join-strategy switch
+  or a spill partition surfaces as a divergence.
+
 ## [1.4.13] - 2026-07-28
 
 **Correctness release — upgrade from 1.4.12 is strongly recommended.** Two bugs in

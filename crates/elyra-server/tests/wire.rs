@@ -2615,3 +2615,95 @@ async fn unbounded_join_fails_instead_of_exhausting_memory() {
         .unwrap();
     assert_eq!(got, Some(900));
 }
+
+// DISTINCT aggregates must not be split across parallel scan workers: partial
+// results merge additively, so a value seen by two workers was counted twice.
+// COUNT(DISTINCT x) came out as `workers x` the right answer -- machine-dependent
+// wrong results. Expectations verified against real MySQL 8.4.
+#[tokio::test]
+async fn distinct_aggregates_are_exact_at_scale() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop("CREATE TABLE da (k INT PRIMARY KEY, g INT, s VARCHAR(10))")
+        .await
+        .unwrap();
+    // Large enough to trigger the parallel aggregation paths.
+    for lo in (1..=20_000).step_by(1000) {
+        let vals: Vec<String> = (lo..lo + 1000)
+            .map(|i| format!("({i},{},'w{}')", i % 8, i % 8))
+            .collect();
+        c.query_drop(format!("INSERT INTO da VALUES {}", vals.join(",")))
+            .await
+            .unwrap();
+    }
+    let n: Option<i64> = c
+        .query_first("SELECT COUNT(DISTINCT g) FROM da")
+        .await
+        .unwrap();
+    assert_eq!(
+        n,
+        Some(8),
+        "COUNT(DISTINCT) must not scale with worker count"
+    );
+    let n: Option<i64> = c
+        .query_first("SELECT SUM(DISTINCT g) FROM da")
+        .await
+        .unwrap();
+    assert_eq!(n, Some(28), "SUM(DISTINCT) must not double-count");
+    let n: Option<i64> = c
+        .query_first("SELECT COUNT(DISTINCT s) FROM da")
+        .await
+        .unwrap();
+    assert_eq!(n, Some(8));
+    // AVG(DISTINCT) looked correct even when broken (both halves of the ratio were
+    // inflated equally), so it is pinned too.
+    let v: Option<f64> = c
+        .query_first("SELECT AVG(DISTINCT g) FROM da")
+        .await
+        .unwrap();
+    assert_eq!(v, Some(3.5));
+    // Grouped DISTINCT and the plain aggregates must stay correct.
+    let rows: Vec<(i64, i64)> = c
+        .query("SELECT g, COUNT(DISTINCT s) FROM da GROUP BY g ORDER BY g")
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 8);
+    assert!(rows.iter().all(|&(_, n)| n == 1));
+    let n: Option<i64> = c.query_first("SELECT COUNT(*) FROM da").await.unwrap();
+    assert_eq!(n, Some(20_000));
+}
+
+// Functions that return an integer must be typed as one even when their argument
+// is an aggregate: `LENGTH(GROUP_CONCAT(s))` used to reach the client as the
+// string "23" rather than the number 23.
+#[tokio::test]
+async fn integer_functions_over_aggregates_keep_their_type() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop("CREATE TABLE it (k INT PRIMARY KEY, s VARCHAR(10))")
+        .await
+        .unwrap();
+    for i in 1..=50 {
+        c.query_drop(format!("INSERT INTO it VALUES ({i}, 'w{}')", i % 8))
+            .await
+            .unwrap();
+    }
+    // Decoding into i64 only succeeds if the column is typed as an integer.
+    let n: Option<i64> = c
+        .query_first("SELECT LENGTH(MAX(s)) FROM it")
+        .await
+        .unwrap();
+    assert_eq!(n, Some(2));
+    let n: Option<i64> = c
+        .query_first("SELECT CHAR_LENGTH(MAX(s)) FROM it")
+        .await
+        .unwrap();
+    assert_eq!(n, Some(2));
+    let n: Option<i64> = c.query_first("SELECT ASCII(MAX(s)) FROM it").await.unwrap();
+    assert_eq!(n, Some(119));
+    let n: Option<i64> = c
+        .query_first("SELECT LENGTH(MAX(s)) + 1 FROM it")
+        .await
+        .unwrap();
+    assert_eq!(n, Some(3));
+}

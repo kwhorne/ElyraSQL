@@ -597,7 +597,12 @@ fn finish(acc: &Acc, spec: &AggSpec) -> Value {
             };
             Value::Float(result)
         }
-        AggFunc::CountStar | AggFunc::Count => Value::Int(acc.count),
+        AggFunc::CountStar => Value::Int(acc.count),
+        // Derive DISTINCT counts from the merged set rather than the counter: the
+        // counter is merged additively, which double-counts a value that appeared
+        // in more than one partial aggregate (e.g. two parallel scan workers).
+        AggFunc::Count if spec.distinct => Value::Int(acc.distinct.len() as i64),
+        AggFunc::Count => Value::Int(acc.count),
         AggFunc::Sum => {
             if acc.count == 0 {
                 Value::Null

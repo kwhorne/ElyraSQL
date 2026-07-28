@@ -51,6 +51,15 @@ impl AggPlan {
         &self.group_cols
     }
 
+    /// Whether any aggregate uses `DISTINCT`.
+    ///
+    /// Such an aggregate cannot be computed by merging independent partial results:
+    /// merging is additive for the counter/sum/concat, so a value seen by two
+    /// partials is counted twice. Callers use this to stay on the single-pass path.
+    pub fn has_distinct(&self) -> bool {
+        self.aggs.iter().any(|a| a.distinct)
+    }
+
     pub fn arg_exprs(&self) -> &[Expr] {
         &self.arg_exprs
     }
@@ -694,6 +703,17 @@ fn infer_computed_type(expr: &Expr) -> ColumnType {
             match n.as_str() {
                 "round" | "abs" | "ceil" | "ceiling" | "floor" | "sqrt" | "pow" | "power"
                 | "sum" | "avg" | "count" | "min" | "max" | "truncate" | "mod" => ColumnType::Float,
+                // Functions that return an integer even though their argument is
+                // text. Without this they defaulted to `Text`, so e.g.
+                // `LENGTH(GROUP_CONCAT(s))` came back to the client as the string
+                // "23" instead of the number 23.
+                "length" | "char_length" | "character_length" | "octet_length" | "bit_length"
+                | "instr" | "locate" | "position" | "ascii" | "ord" | "field" | "find_in_set"
+                | "bit_count" | "crc32" | "unix_timestamp" | "to_days" | "datediff" | "day"
+                | "dayofmonth" | "dayofweek" | "dayofyear" | "month" | "year" | "hour"
+                | "minute" | "second" | "week" | "weekday" | "quarter" | "strcmp" | "sign" => {
+                    ColumnType::Int
+                }
                 _ => ColumnType::Text,
             }
         }
