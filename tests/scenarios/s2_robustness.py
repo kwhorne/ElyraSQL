@@ -272,15 +272,21 @@ def recovers_from_resource_exhaustion() -> None:
     rows = ",".join(f"({i},{i % 7})" for i in range(1, 3001))
     cur.execute(f"INSERT INTO big VALUES {rows}")
 
-    # Repeatedly trigger the join cap.
+    # Repeatedly trigger the join ceilings. A *cross* join no longer qualifies: those
+    # stream now, so they complete instead of being refused (and would run for a very
+    # long time at this size). A non-equi join is a shape the streaming chain declines,
+    # so it materialises and the ceilings apply -- which is what this checks.
     refused = 0
-    for _ in range(15):
+    for _ in range(5):
         try:
-            cur.execute("SELECT COUNT(*) FROM big a, big b, big c WHERE a.v + b.v + c.v >= 0")
+            cur.execute(
+                "SELECT COUNT(*) FROM big a JOIN big b ON a.v < b.v "
+                "JOIN big c ON a.v < c.v JOIN big d ON a.v < d.v"
+            )
             cur.fetchall()
         except Exception:
             refused += 1
-    check("oversized joins are refused, not fatal", refused > 0, f"{refused}/15 refused")
+    check("oversized joins are refused, not fatal", refused > 0, f"{refused}/5 refused")
 
     # The budget must be fully released: a legitimate join still works afterwards.
     cur.execute("SELECT COUNT(*) FROM big a JOIN big b ON a.id = b.id")

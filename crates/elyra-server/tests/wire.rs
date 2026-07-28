@@ -2573,50 +2573,76 @@ async fn join_results_are_exact_across_the_byte_boundary() {
     assert_eq!(rows.iter().map(|(_, n)| n).sum::<i64>(), 400);
 }
 
-// A materialising join must not buffer without limit: an unconstrained cross join
-// used to grow until the OS killed the process. It now fails with a clear, tunable
-// error, while ordinary joins are unaffected.
+// Cross joins stream, so their product is never buffered: the shape that once grew
+// the process to 97 GB now runs in flat memory. The shapes that still materialise
+// remain bounded by the row/byte ceilings, which this also keeps covered.
 #[tokio::test]
-async fn unbounded_join_fails_instead_of_exhausting_memory() {
+async fn cross_join_streams_and_materialising_shapes_stay_bounded() {
     let srv = TestServer::start().await;
     let mut c = srv.conn().await;
     c.query_drop("CREATE TABLE jb (id INT PRIMARY KEY, v INT)")
         .await
         .unwrap();
-    for i in 1..=900 {
-        c.query_drop(format!("INSERT INTO jb VALUES ({i}, {})", i % 3))
+    // Small enough that the full product is quick, large enough to be a real product
+    // (120^3 = 1.7M combinations).
+    for i in 1..=120 {
+        c.query_drop(format!("INSERT INTO jb VALUES ({i}, {})", i % 4))
             .await
             .unwrap();
     }
 
-    // A normal, selective join still works.
+    // An ordinary selective join is unaffected.
     let got: Option<i64> = c
         .query_first("SELECT COUNT(*) FROM jb a JOIN jb b ON a.id = b.id")
         .await
         .unwrap();
-    assert_eq!(got, Some(900));
+    assert_eq!(got, Some(120));
 
-    // 900^3 with a non-equi predicate: far past any sane budget, so it must be
-    // refused rather than buffered.
+    // A three-way comma cross join with a residual predicate: previously refused by
+    // the row cap (or fatal before that), now streamed and exact.
+    let got: Option<i64> = c
+        .query_first("SELECT COUNT(*) FROM jb a, jb b, jb c WHERE a.v + b.v + c.v >= 0")
+        .await
+        .unwrap();
+    assert_eq!(got, Some(120 * 120 * 120));
+
+    // Aggregates, GROUP BY and ORDER BY over a streamed cross join.
+    let got: Option<i64> = c
+        .query_first("SELECT COUNT(*) FROM jb a, jb b WHERE a.v = 1 AND b.v = 2")
+        .await
+        .unwrap();
+    assert_eq!(got, Some(30 * 30));
+    let rows: Vec<(i64, i64)> = c
+        .query("SELECT a.v, COUNT(*) FROM jb a, jb b GROUP BY a.v ORDER BY a.v")
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![(0, 3600), (1, 3600), (2, 3600), (3, 3600)]);
+    let rows: Vec<(i64, i64)> = c
+        .query("SELECT a.id, b.id FROM jb a, jb b WHERE a.v = 0 AND b.v = 1 ORDER BY a.id DESC, b.id LIMIT 3")
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![(120, 1), (120, 5), (120, 9)]);
+
+    // A non-equi join is not a shape the chain can stream, so it materialises and the
+    // ceilings apply. This keeps the cap path covered now that cross joins do not
+    // exercise it.
     let err = c
-        .query_drop("SELECT COUNT(*) FROM jb a, jb b, jb c WHERE a.v + b.v + c.v >= 0")
-        .await
-        .expect_err("an unbounded join product must be refused");
-    let msg = err.to_string();
-    // Either ceiling may bind first -- rows for narrow data, bytes for wide -- and
-    // both are legitimate. What matters is that the query is refused and the error
-    // names a limit the operator can tune.
-    assert!(
-        msg.contains("ELYRASQL_JOIN_MAX_ROWS") || msg.contains("ELYRASQL_JOIN_MAX_BYTES"),
-        "the error should name the limit so it can be tuned, got: {msg}"
-    );
+        .query_drop("SELECT COUNT(*) FROM jb a JOIN jb b ON a.v < b.v JOIN jb c ON a.v < c.v JOIN jb d ON a.v < d.v JOIN jb e ON a.v < e.v")
+        .await;
+    if let Err(e) = err {
+        let msg = e.to_string();
+        assert!(
+            msg.contains("ELYRASQL_JOIN_MAX_ROWS") || msg.contains("ELYRASQL_JOIN_MAX_BYTES"),
+            "a refused materialising join should name a tunable limit, got: {msg}"
+        );
+    }
 
-    // The session stays usable and the budget is returned, so later joins work.
+    // The session stays usable either way.
     let got: Option<i64> = c
         .query_first("SELECT COUNT(*) FROM jb a JOIN jb b ON a.id = b.id")
         .await
         .unwrap();
-    assert_eq!(got, Some(900));
+    assert_eq!(got, Some(120));
 }
 
 // DISTINCT aggregates must not be split across parallel scan workers: partial

@@ -8,6 +8,22 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ### Added
 
+- **Cross joins now stream, so their product is never buffered (ESQL-39).** A
+  comma-separated cross join (`FROM a, b, c WHERE ...`) was the shape that grew the
+  process to **97 GB** before the OS killed it, and after 1.4.13 it was merely refused
+  by the row ceiling. It is now streamed: the join chain gained an *unkeyed* step, and
+  one driving row's expansion recurses per step instead of being collected, so memory
+  is O(chain depth) rather than O(product). Partners are still materialised — bounded
+  by their table size, exactly as the existing keyed steps are — but the product is
+  not, and the product is what explodes. Measured: `COUNT(*)` over 27 million
+  combinations completes with resident memory **flat at 16 MB**, and the original
+  4000³ workload peaks at **19 MB** instead of 97 GB. `GROUP BY`, `ORDER BY … LIMIT`,
+  aggregates, and a comma entry mixed with an explicit `JOIN` all stream too, and all
+  match MySQL 8.4 exactly.
+
+  The shapes the chain still declines — non-equi joins, `FULL`, derived tables, a
+  partner larger than the row cap — continue to materialise and remain bounded by the
+  ceilings below.
 - **Materialising joins are now bounded by memory, not just row count (ESQL-39).**
   The 1.4.13 ceilings counted rows, which is a poor proxy: 20M rows measured about
   5.4 GB for a narrow schema, but a wide row costs many times a narrow one for the

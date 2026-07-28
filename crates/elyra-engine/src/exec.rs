@@ -4542,14 +4542,34 @@ async fn streaming_nlj_select(
 /// One built step of a left-deep streaming hash join: the partner relation
 /// materialised into a hash table, plus the info needed to probe it from the
 /// accumulated left row.
-struct JoinChainStep {
-    /// Partner rows keyed by the collated partner join key.
+/// How one chain step finds its partner rows for a given left row.
+enum Partner {
+    /// Equi-join: partner rows in a hash table keyed by the collated join key,
+    /// probed with `probe_key` evaluated over the left schema.
+    Keyed(Box<KeyedPartner>),
+    /// Cross join (a comma-separated table with no join condition): every left row
+    /// pairs with every partner row.
+    ///
+    /// This is what lets `FROM a, b, c WHERE ...` stream. The partners are
+    /// materialised -- as the keyed steps already do -- but the *product* never is,
+    /// and the product is what explodes: 4000 rows three ways is 1.3 billion
+    /// combinations, which previously grew the process to 97 GB before the OS killed
+    /// it. Streaming it into the spilling sorter/aggregator keeps memory flat.
+    All(Vec<Vec<Value>>),
+}
+
+/// Hash table and probe expression for an equi-join step. Boxed inside [`Partner`]
+/// so a cross-join step (a plain `Vec`) does not carry its size.
+struct KeyedPartner {
     table: std::collections::HashMap<Vec<u8>, Vec<Vec<Value>>>,
-    /// Expr (over `left_schema`) that produces the probe key for a left row.
     probe_key: Expr,
+    coll: elyra_core::Collation,
+}
+
+struct JoinChainStep {
+    partner: Partner,
     /// Schema of the accumulated left side at this step (driving ++ prior partners).
     left_schema: Schema,
-    coll: elyra_core::Collation,
     /// Number of partner columns (for LEFT-join NULL extension).
     plen: usize,
     left_outer: bool,
@@ -4605,9 +4625,14 @@ fn apply_perm(row: &[Value], perm: &[usize]) -> Vec<Value> {
 /// the shape is not a plain-table INNER/LEFT equi-join chain we can stream.
 async fn build_join_chain(
     db: &Session,
+    from: &[TableWithJoins],
     twj: &TableWithJoins,
 ) -> Result<Option<(Schema, Vec<JoinChainStep>, Schema)>> {
-    if !matches!(twj.relation, TableFactor::Table { .. }) || twj.joins.is_empty() {
+    // Something must be joined: either explicit JOINs on the first entry, or further
+    // comma-separated tables.
+    if !matches!(twj.relation, TableFactor::Table { .. })
+        || (twj.joins.is_empty() && from.len() < 2)
+    {
         return Ok(None);
     }
     let (_ddef, dcols) = resolve_table(db, &twj.relation).await?;
@@ -4657,22 +4682,67 @@ async fn build_join_chain(
         }
 
         steps.push(JoinChainStep {
-            table,
-            probe_key: lkey,
+            partner: Partner::Keyed(Box::new(KeyedPartner {
+                table,
+                probe_key: lkey,
+                coll,
+            })),
             left_schema,
-            coll,
             plen: pcols.len(),
             left_outer: kind == JoinKind::Left,
         });
         left_cols.extend(pcols);
     }
+
+    // Comma-separated tables after the first are cross joins: no condition, so every
+    // left row pairs with every partner row. Streaming these is the point of the
+    // unkeyed step -- the partners are materialised (bounded by their table size, as
+    // the keyed steps already are) while the product, which is what explodes, is not.
+    for extra in &from[1..] {
+        if !matches!(extra.relation, TableFactor::Table { .. }) || !extra.joins.is_empty() {
+            // A derived table, or a comma entry that itself carries JOINs: leave the
+            // whole query to the materialising path rather than half-handle it.
+            return Ok(None);
+        }
+        let (pdef, pcols) = resolve_table(db, &extra.relation).await?;
+        let left_schema = Schema::new(left_cols.clone());
+        let mut rows: Vec<Vec<Value>> = Vec::new();
+        let prefix = data_prefix(&pdef.name);
+        let mut cursor: Option<Vec<u8>> = None;
+        // A partner larger than the per-join row cap would defeat the purpose, so
+        // decline and let the materialising path apply its budget instead.
+        let cap = join_max_rows();
+        loop {
+            let batch = db.scan_batch(prefix.clone(), cursor.clone(), 8192).await?;
+            if batch.is_empty() {
+                break;
+            }
+            let last = batch.len() < 8192;
+            cursor = batch.last().map(|(k, _)| k.clone());
+            for (_, v) in batch {
+                rows.push(bincode::deserialize(&v).map_err(|e| Error::Storage(e.to_string()))?);
+            }
+            if rows.len() > cap {
+                return Ok(None);
+            }
+            if last {
+                break;
+            }
+        }
+        steps.push(JoinChainStep {
+            partner: Partner::All(rows),
+            left_schema,
+            plen: pcols.len(),
+            // A cross join has no unmatched case to preserve.
+            left_outer: false,
+        });
+        left_cols.extend(pcols);
+    }
+
     let combined = Schema::new(left_cols);
     Ok(Some((dschema, steps, combined)))
 }
 
-/// Expand one driving row through the built chain into full combined rows (the
-/// cartesian product of matches at each step; LEFT joins NULL-extend unmatched
-/// left rows). `out` is appended to.
 /// Run a CPU-bound stretch without monopolising an async worker thread.
 ///
 /// Statement execution shares the runtime's workers with the connection listener
@@ -4693,7 +4763,6 @@ fn cpu_bound<T>(f: impl FnOnce() -> T) -> T {
         _ => f(),
     }
 }
-
 /// Cooperative yielding for a long-running async loop.
 ///
 /// Statement execution shares the async runtime's worker threads with the
@@ -4727,51 +4796,53 @@ impl Pacer {
     }
 }
 
-fn expand_join_chain(
-    driving: Vec<Value>,
+/// Stream one driving row's combinations through the chain, calling `emit` for each
+/// completed row instead of collecting them.
+///
+/// Recursing per step keeps memory at O(chain depth) regardless of the product's
+/// size. That is what lets `FROM a, b, c WHERE ...` run at all: one driving row of a
+/// 4000x4000 cross product is 16 million combinations, so buffering even a single
+/// row's expansion is not an option -- it previously grew the process to 97 GB before
+/// the OS killed it.
+fn stream_join_chain(
+    left: &[Value],
     steps: &[JoinChainStep],
-    out: &mut Vec<Vec<Value>>,
     check: &mut elyra_core::cancel::CancelCheck,
+    emit: &mut dyn FnMut(Vec<Value>) -> Result<()>,
 ) -> Result<()> {
-    // One driving row's buffers live only for this call, so the reservation is
-    // taken and released here.
-    let mut budget = JoinBudget::new();
-    let mut partials = vec![driving];
-    for step in steps {
-        let mut next = Vec::new();
-        for row in &partials {
-            // One driving row can fan out to a very large number of combinations
-            // (each step multiplies), all produced synchronously here - so the
-            // deadline has to be checked inside the expansion, not just per
-            // driving row.
-            check.tick()?;
-            let key = predicate::eval_row(&step.probe_key, &step.left_schema, row)?;
-            let matches: Option<&Vec<Vec<Value>>> = if key.is_null() {
+    let Some((step, rest)) = steps.split_first() else {
+        return emit(left.to_vec());
+    };
+    let matches: Option<&Vec<Vec<Value>>> = match &step.partner {
+        Partner::Keyed(k) => {
+            let key = predicate::eval_row(&k.probe_key, &step.left_schema, left)?;
+            if key.is_null() {
+                // A NULL join key matches nothing; a LEFT join still NULL-extends.
                 None
             } else {
-                key_bytes_coll(&key, step.coll).and_then(|k| step.table.get(&k))
-            };
-            let matched = matches.map(|v| !v.is_empty()).unwrap_or(false);
-            if let Some(rows) = matches {
-                for m in rows {
-                    check.tick()?;
-                    // One driving row's fan-out is multiplicative across steps.
-                    budget.account(next.len())?;
-                    let mut c = row.clone();
-                    c.extend_from_slice(m);
-                    budget.sample(&c);
-                    next.push(c);
-                }
-            }
-            if step.left_outer && !matched {
-                let mut c = row.clone();
-                c.extend(std::iter::repeat_n(Value::Null, step.plen));
-                next.push(c);
+                key_bytes_coll(&key, k.coll).and_then(|b| k.table.get(&b))
             }
         }
-        partials = next;
+        // Cross join: every partner row pairs with this left row.
+        Partner::All(rows) => Some(rows),
+    };
+    let mut matched = false;
+    if let Some(rows) = matches {
+        for m in rows {
+            check.tick()?;
+            matched = true;
+            let mut c = Vec::with_capacity(left.len() + m.len());
+            c.extend_from_slice(left);
+            c.extend_from_slice(m);
+            stream_join_chain(&c, rest, check, emit)?;
+        }
     }
-    out.extend(partials);
+    if step.left_outer && !matched {
+        let mut c = Vec::with_capacity(left.len() + step.plen);
+        c.extend_from_slice(left);
+        c.extend(std::iter::repeat_n(Value::Null, step.plen));
+        stream_join_chain(&c, rest, check, emit)?;
+    }
     Ok(())
 }
 
@@ -4798,7 +4869,10 @@ async fn streaming_join_aggregate(
     limit: Option<usize>,
 ) -> Result<Option<QueryResult>> {
     // Reads inside a transaction must see the write overlay -> materialising path.
-    if db.in_txn() || select.distinct.is_some() || select.from.len() != 1 {
+    // `from.len() > 1` is a comma cross join, which build_join_chain now streams via
+    // unkeyed steps; it declines anything it cannot handle, so this only needs to
+    // reject an empty FROM.
+    if db.in_txn() || select.distinct.is_some() || select.from.is_empty() {
         return Ok(None);
     }
     // A two-table RIGHT join is streamed by rewriting it to `B LEFT JOIN A` and
@@ -4807,7 +4881,7 @@ async fn streaming_join_aggregate(
     let twj = swapped.as_ref().unwrap_or(&select.from[0]);
     // Build the (left-deep) join chain: each partner into a hash table, driving
     // streamed. Handles two or more tables.
-    let Some((dschema, steps, schema)) = build_join_chain(db, twj).await? else {
+    let Some((dschema, steps, schema)) = build_join_chain(db, &select.from, twj).await? else {
         return Ok(None);
     };
     let (ddef, _) = resolve_table(db, &twj.relation).await?;
@@ -4860,22 +4934,23 @@ async fn streaming_join_aggregate(
             let l: Vec<Value> =
                 bincode::deserialize(&v).map_err(|e| Error::Storage(e.to_string()))?;
             combined_buf.clear();
-            expand_join_chain(l, &steps, &mut combined_buf, &mut check)?;
-            for combined in combined_buf.drain(..) {
+            // Stream the expansion straight into the aggregator: a cross join's
+            // product must never be buffered, not even for one driving row.
+            stream_join_chain(&l, &steps, &mut check, &mut |combined| {
                 let combined = match &reorder {
                     Some(perm) => apply_perm(&combined, perm),
                     None => combined,
                 };
                 if !keep(&combined)? {
-                    continue;
+                    return Ok(());
                 }
                 let fed = if extend {
                     plan.extend_row(&combined)?
                 } else {
                     combined
                 };
-                sa.feed_extended(fed)?;
-            }
+                sa.feed_extended(fed)
+            })?;
         }
         if last {
             break;
@@ -4912,7 +4987,10 @@ async fn streaming_join_order(
     limit: Option<usize>,
 ) -> Result<Option<QueryResult>> {
     // Reads inside a transaction must see the write overlay -> materialising path.
-    if db.in_txn() || select.distinct.is_some() || select.from.len() != 1 {
+    // `from.len() > 1` is a comma cross join, which build_join_chain now streams via
+    // unkeyed steps; it declines anything it cannot handle, so this only needs to
+    // reject an empty FROM.
+    if db.in_txn() || select.distinct.is_some() || select.from.is_empty() {
         return Ok(None);
     }
     // A two-table RIGHT join is streamed by rewriting it to `B LEFT JOIN A` and
@@ -4921,7 +4999,7 @@ async fn streaming_join_order(
     let twj = swapped.as_ref().unwrap_or(&select.from[0]);
     // Build the (left-deep) join chain: each partner into a hash table, driving
     // left to be streamed. Handles two or more tables.
-    let Some((dschema, steps, schema)) = build_join_chain(db, twj).await? else {
+    let Some((dschema, steps, schema)) = build_join_chain(db, &select.from, twj).await? else {
         return Ok(None);
     };
     let (ddef, _) = resolve_table(db, &twj.relation).await?;
@@ -4985,8 +5063,9 @@ async fn streaming_join_order(
             let l: Vec<Value> =
                 bincode::deserialize(&v).map_err(|e| Error::Storage(e.to_string()))?;
             combined_buf.clear();
-            expand_join_chain(l, &steps, &mut combined_buf, &mut check)?;
-            for combined in combined_buf.drain(..) {
+            // Stream into the spilling sorter for the same reason as the
+            // aggregate path: the product is never held, only the top-N / spill.
+            stream_join_chain(&l, &steps, &mut check, &mut |combined| {
                 let combined = match &reorder {
                     Some(perm) => apply_perm(&combined, perm),
                     None => combined,
@@ -4998,7 +5077,8 @@ async fn streaming_join_order(
                         .collect::<Result<Vec<_>>>()?;
                     sorter.push(keys, combined)?;
                 }
-            }
+                Ok(())
+            })?;
         }
         if last {
             break;
