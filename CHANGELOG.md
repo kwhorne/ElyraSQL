@@ -6,6 +6,26 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **A secondary-index range was used regardless of how much of the table it matched
+  (ESQL-46).** An index range fetches every matching row by key, which is roughly an
+  order of magnitude dearer per row than a sequential decode, so a wide range was far
+  slower than simply scanning: `COUNT(*) FROM perf WHERE amt > 0` took **124 ms**,
+  while the identical row set expressed as `amt <> -1` — not index-usable, therefore
+  scanned — took 2.7 ms. Ranges now fall back to a scan past
+  `ELYRASQL_INDEX_RANGE_MAX_FRACTION` (default 6%) of the table, decided *after* the
+  index keys are walked but *before* any row is fetched, so a misjudged range costs
+  only a key-only walk. Row counts come from `ANALYZE` statistics when present,
+  otherwise from a key count cached per table and write epoch. Primary-key ranges are
+  untouched, being sequential reads.
+
+  Measured on 200k rows: `amt > 0` 124 ms → **16.5 ms**, `amt > 49999` 62.8 ms →
+  9.2 ms, `g > 250` 50.1 ms → 9.0 ms, and selective ranges unchanged (`amt > 99000`
+  1.2 ms). This also removed what looked like a separate scalar-subquery problem:
+  `WHERE amt > (SELECT AVG(amt) FROM perf)` went 68.7 ms → **12.2 ms**, now slightly
+  faster than MySQL — the subquery was never the cost, the wide range was.
+
 ### Added
 
 - **Scenario suite runs in CI** (`.github/workflows/scenarios.yml`). The

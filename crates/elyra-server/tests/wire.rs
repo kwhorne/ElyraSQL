@@ -2811,3 +2811,80 @@ async fn group_concat_honours_its_order_by() {
         .unwrap();
     assert_eq!(got.map(|s| s.split(',').count()), Some(12));
 }
+
+// A secondary-index range must not be used when it matches most of the table: the
+// index fetches every matching row by key, which is far dearer per row than a
+// sequential decode. The observable contract is correctness (the planner may choose
+// either strategy), so this pins the *results* across the selectivity spectrum,
+// including right at the fallback threshold.
+#[tokio::test]
+async fn wide_index_ranges_return_correct_rows() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop("CREATE TABLE ir (id INT PRIMARY KEY, g INT, amt INT)")
+        .await
+        .unwrap();
+    // 20k rows: past the small-table floor, so the budget actually applies.
+    for lo in (1..=20_000).step_by(1000) {
+        let vals: Vec<String> = (lo..lo + 1000)
+            .map(|i| format!("({i},{},{})", i % 100, (i * 7919) % 20000))
+            .collect();
+        c.query_drop(format!("INSERT INTO ir VALUES {}", vals.join(",")))
+            .await
+            .unwrap();
+    }
+    c.query_drop("CREATE INDEX ix_amt ON ir (amt)")
+        .await
+        .unwrap();
+    c.query_drop("CREATE INDEX ix_g ON ir (g)").await.unwrap();
+
+    // Independently computed expectations from the same generator.
+    let amt = |i: i64| (i * 7919) % 20000;
+    for (sql, want) in [
+        // Very selective: the index is used.
+        (
+            "SELECT COUNT(*) FROM ir WHERE amt > 19900",
+            (1..=20_000i64).filter(|&i| amt(i) > 19900).count() as i64,
+        ),
+        // Around the fallback threshold.
+        (
+            "SELECT COUNT(*) FROM ir WHERE amt > 18800",
+            (1..=20_000i64).filter(|&i| amt(i) > 18800).count() as i64,
+        ),
+        // Wide: falls back to a scan, and must still be exact.
+        (
+            "SELECT COUNT(*) FROM ir WHERE amt > 0",
+            (1..=20_000i64).filter(|&i| amt(i) > 0).count() as i64,
+        ),
+        ("SELECT COUNT(*) FROM ir WHERE amt >= 0", 20_000),
+        (
+            "SELECT COUNT(*) FROM ir WHERE g > 50",
+            (1..=20_000i64).filter(|&i| i % 100 > 50).count() as i64,
+        ),
+        (
+            "SELECT COUNT(*) FROM ir WHERE amt BETWEEN 5000 AND 15000",
+            (1..=20_000i64)
+                .filter(|&i| (5000..=15000).contains(&amt(i)))
+                .count() as i64,
+        ),
+        // A primary-key range is a sequential read and is never diverted.
+        ("SELECT COUNT(*) FROM ir WHERE id > 10000", 10_000),
+    ] {
+        let got: Option<i64> = c.query_first(sql).await.unwrap();
+        assert_eq!(got, Some(want), "{sql}");
+    }
+
+    // The fallback must also preserve non-COUNT aggregates and row output.
+    let got: Option<i64> = c
+        .query_first("SELECT SUM(amt) FROM ir WHERE amt > 0")
+        .await
+        .unwrap();
+    let want: i64 = (1..=20_000i64).map(amt).filter(|&a| a > 0).sum();
+    assert_eq!(got, Some(want));
+    let rows: Vec<i64> = c
+        .query("SELECT id FROM ir WHERE amt > 0 ORDER BY id LIMIT 5")
+        .await
+        .unwrap();
+    let want: Vec<i64> = (1..=20_000i64).filter(|&i| amt(i) > 0).take(5).collect();
+    assert_eq!(rows, want);
+}

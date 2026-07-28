@@ -5491,6 +5491,76 @@ fn as_between(def: &TableDef, expr: &Expr) -> Result<Option<(usize, Value, Value
 }
 
 /// Range scan over the clustered (PK) data keyspace.
+/// Fraction of a table a secondary-index range may match before a sequential scan
+/// is the cheaper plan (`ELYRASQL_INDEX_RANGE_MAX_FRACTION`, default 0.06).
+///
+/// An index range walk pays a *random* keyed fetch per matching row; a sequential
+/// scan decodes rows in storage order, which is roughly an order of magnitude
+/// cheaper per row. So the index only wins while it matches a small slice of the
+/// table. Measured on 200k rows: `amt > 99000` (~1% of rows) took 1.2ms via the
+/// index, while `amt > 0` (~100%) took 124ms -- against 2.7ms for the same row set
+/// expressed as `amt <> -1`, which is not index-usable and therefore scanned.
+fn index_range_max_fraction() -> f64 {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<f64> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("ELYRASQL_INDEX_RANGE_MAX_FRACTION")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|f| *f > 0.0 && *f <= 1.0)
+            .unwrap_or(0.06)
+    })
+}
+
+/// Approximate row count for planning, cached per (table, write epoch).
+///
+/// Prefers the `ANALYZE` row count (a single key read). Without statistics it counts
+/// keys once per epoch -- a key-only scan, far cheaper than the row fetches the
+/// estimate is there to avoid -- and reuses that until the table is next written.
+async fn table_rows(db: &Session, def: &TableDef) -> Result<u64> {
+    if let Some(st) = catalog::load_stats(db, &def.name).await? {
+        if st.rows > 0 {
+            return Ok(st.rows);
+        }
+    }
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    type Cache = HashMap<String, (u64, u64)>; // table -> (epoch, rows)
+    static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let epoch = db.raw_db().write_epoch()?;
+    if let Some(&(e, rows)) = cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&def.name)
+    {
+        if e == epoch {
+            return Ok(rows);
+        }
+    }
+    let rows = db.raw_db().count_prefix(data_prefix(&def.name)).await?;
+    cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(def.name.clone(), (epoch, rows));
+    Ok(rows)
+}
+
+/// Upper bound on index entries worth fetching for a range, or `None` when the
+/// table is small enough that either plan is cheap.
+async fn index_range_budget(db: &Session, def: &TableDef) -> Result<Option<usize>> {
+    let rows = table_rows(db, def).await?;
+    // Below this a full scan is a few milliseconds anyway, so skip the estimate and
+    // the risk of mis-planning a tiny table.
+    const SMALL_TABLE: u64 = 4096;
+    if rows <= SMALL_TABLE {
+        return Ok(None);
+    }
+    Ok(Some(
+        ((rows as f64) * index_range_max_fraction()).max(1.0) as usize
+    ))
+}
+
 async fn clustered_range(
     db: &Session,
     def: &TableDef,
@@ -5548,15 +5618,27 @@ async fn clustered_range(
 }
 
 /// Range scan via a secondary index, then batch-fetch the rows.
+/// Fetch the rows a secondary-index range matches, or `None` when the range covers
+/// more of the table than `budget` allows and a sequential scan is the better plan.
+///
+/// The bail-out happens *after* the index keys are walked but *before* the rows are
+/// fetched, so a misjudged range costs only a key-only walk -- not the random row
+/// fetches that make a wide index range slow in the first place.
 async fn index_range(
     db: &Session,
     def: &TableDef,
     idx: &IndexDef,
     rq: &RangeQuery,
-) -> Result<Vec<(Vec<u8>, Vec<Value>)>> {
+    budget: Option<usize>,
+) -> Result<Option<Vec<(Vec<u8>, Vec<Value>)>>> {
     let lo = rq.lo.as_ref().map(|(v, i)| (v, *i));
     let hi = rq.hi.as_ref().map(|(v, i)| (v, *i));
     let data_keys = index::lookup_range(db, &def.name, idx, lo, hi).await?;
+    if let Some(b) = budget {
+        if data_keys.len() > b {
+            return Ok(None);
+        }
+    }
     let blobs = db.multi_get(data_keys.clone()).await?;
     let mut out = Vec::new();
     for (k, blob) in data_keys.into_iter().zip(blobs) {
@@ -5567,7 +5649,7 @@ async fn index_range(
             ));
         }
     }
-    Ok(out)
+    Ok(Some(out))
 }
 
 /// Build the joined row set from a FROM clause (comma cross-joins + explicit
@@ -7320,6 +7402,34 @@ async fn collect_matches(
     filter: Option<&Expr>,
     limit: Option<usize>,
 ) -> Result<Vec<(Vec<u8>, Vec<Value>)>> {
+    // `false`: fall back to a sequential scan internally, so every existing caller
+    // keeps getting a complete result.
+    Ok(collect_matches_inner(db, def, filter, limit, false)
+        .await?
+        .expect("scan fallback always yields a result"))
+}
+
+/// As [`collect_matches`], but returns `None` when the filter is a *secondary*-index
+/// range covering more of the table than the index is worth for.
+///
+/// Callers that have a cheaper way to scan the whole table (the columnar aggregate
+/// paths) use this so a wide range does not materialise every row just to aggregate
+/// it -- `COUNT(*) ... WHERE amt > 0` should cost what the unfiltered scan costs.
+async fn collect_matches_narrow(
+    db: &Session,
+    def: &TableDef,
+    filter: Option<&Expr>,
+) -> Result<Option<Vec<(Vec<u8>, Vec<Value>)>>> {
+    collect_matches_inner(db, def, filter, None, true).await
+}
+
+async fn collect_matches_inner(
+    db: &Session,
+    def: &TableDef,
+    filter: Option<&Expr>,
+    limit: Option<usize>,
+    bail_on_wide_range: bool,
+) -> Result<Option<Vec<(Vec<u8>, Vec<Value>)>>> {
     let mut out = Vec::new();
 
     let recheck = |row: &[Value]| -> Result<bool> {
@@ -7388,7 +7498,7 @@ async fn collect_matches(
                             }
                         }
                     }
-                    return Ok(out);
+                    return Ok(Some(out));
                 }
             }
         }
@@ -7408,7 +7518,7 @@ async fn collect_matches(
                     out.push((key, row));
                 }
             }
-            return Ok(out);
+            return Ok(Some(out));
         }
     }
 
@@ -7428,39 +7538,49 @@ async fn collect_matches(
                         out.push((data_key, row));
                         if let Some(l) = limit {
                             if out.len() >= l {
-                                return Ok(out);
+                                return Ok(Some(out));
                             }
                         }
                     }
                 }
             }
-            return Ok(out);
+            return Ok(Some(out));
         }
     }
 
     // Range fast path: `col > x` / `BETWEEN` on a PK or indexed column uses an
     // ordered range scan, then re-applies the full filter.
     if let Some(rq) = range_bounds(def, filter)? {
+        // A clustered (primary-key) range is a sequential read, so it is always
+        // worth taking. A *secondary* index range pays a random fetch per row, so it
+        // is only worth taking while it matches a small slice of the table --
+        // otherwise fall through to the sequential scan below.
         let candidates = if def.pk_cols == [rq.col] {
-            clustered_range(db, def, &rq).await?
+            Some(clustered_range(db, def, &rq).await?)
         } else {
             let idx = index::index_on(def, rq.col).expect("range_bounds checked index");
-            index_range(db, def, idx, &rq).await?
+            let budget = index_range_budget(db, def).await?;
+            index_range(db, def, idx, &rq, budget).await?
         };
-        for (k, row) in candidates {
-            if let Some(f) = filter {
-                if !predicate::matches(f, &def.schema, &row)? {
-                    continue;
+        if let Some(candidates) = candidates {
+            for (k, row) in candidates {
+                if let Some(f) = filter {
+                    if !predicate::matches(f, &def.schema, &row)? {
+                        continue;
+                    }
+                }
+                out.push((k, row));
+                if let Some(l) = limit {
+                    if out.len() >= l {
+                        return Ok(Some(out));
+                    }
                 }
             }
-            out.push((k, row));
-            if let Some(l) = limit {
-                if out.len() >= l {
-                    return Ok(out);
-                }
-            }
+            return Ok(Some(out));
         }
-        return Ok(out);
+        if bail_on_wide_range {
+            return Ok(None);
+        }
     }
 
     let prefix = data_prefix(&def.name);
@@ -7483,7 +7603,7 @@ async fn collect_matches(
                 out.push((k, row));
                 if let Some(l) = limit {
                     if out.len() >= l {
-                        return Ok(out);
+                        return Ok(Some(out));
                     }
                 }
             }
@@ -7492,7 +7612,7 @@ async fn collect_matches(
             break;
         }
     }
-    Ok(out)
+    Ok(Some(out))
 }
 
 fn table_of(twj: &TableWithJoins) -> Result<String> {
@@ -10727,17 +10847,21 @@ async fn olap_aggregate(
         // Equality or range on a PK/indexed column: aggregate just the matching
         // rows fetched via the index, rather than scanning the whole table.
         if accelerable(def, Some(f))? {
-            let rows = collect_matches(db, def, Some(f), None).await?;
-            let mut agg = plan.new_aggregator();
-            let extend = !plan.arg_exprs().is_empty();
-            for (_, row) in rows {
-                if extend {
-                    agg.feed(&plan.extend_row(&row)?);
-                } else {
-                    agg.feed(&row);
+            // `None` means the filter is a secondary-index range covering too much
+            // of the table to be worth the index; fall through to the scan below
+            // rather than materialising every row just to aggregate it.
+            if let Some(rows) = collect_matches_narrow(db, def, Some(f)).await? {
+                let mut agg = plan.new_aggregator();
+                let extend = !plan.arg_exprs().is_empty();
+                for (_, row) in rows {
+                    if extend {
+                        agg.feed(&plan.extend_row(&row)?);
+                    } else {
+                        agg.feed(&row);
+                    }
                 }
+                return Ok(agg);
             }
-            return Ok(agg);
         }
     }
     // Autocommit full scans decode directly from borrowed storage bytes in a

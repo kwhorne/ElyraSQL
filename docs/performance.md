@@ -74,6 +74,13 @@ in both directions (NULL rows are indexed under a companion keyspace); see
 - **Group commit** amortizes write durability across concurrent writers.
 - **Streaming execution** keeps memory bounded on scans and aggregations.
 - **HNSW** brings vector search from `O(n)` exact to sub-millisecond ANN.
+- **Index ranges are used only when they pay.** A secondary-index range fetches each
+  matching row by key, which costs far more per row than a sequential decode, so a
+  range matching more than `ELYRASQL_INDEX_RANGE_MAX_FRACTION` of the table falls back
+  to a scan. Measured on 200k rows: `COUNT(*) WHERE amt > 0` went from **124 ms to
+  16.5 ms**, `amt > 49999` from 62.8 ms to 9.2 ms, while a selective `amt > 99000`
+  still takes the index at 1.2 ms. The check happens after the index keys are walked
+  but before any row is fetched, so a misjudged range costs only a key-only walk.
 - **CPU-heavy stretches run off the reactor** (`block_in_place`) and the streaming
   join loops yield periodically, so one expensive query cannot stall the listener or
   other sessions — with 32 concurrent runaway queries on 16 cores, a new connection
