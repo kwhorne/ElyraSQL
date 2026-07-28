@@ -2743,3 +2743,71 @@ async fn integer_functions_over_aggregates_keep_their_type() {
         .unwrap();
     assert_eq!(n, Some(3));
 }
+
+// GROUP_CONCAT must honour its own ORDER BY. It previously parsed the clause and
+// ignored it, returning values in scan order. All expectations verified against
+// real MySQL 8.4. Note the deliberate use of sort keys that are *not* the
+// concatenated column: ordering by the aggregate's own argument would pass even
+// when the sort-key columns are never decoded.
+#[tokio::test]
+async fn group_concat_honours_its_order_by() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop("CREATE TABLE gc (k INT PRIMARY KEY, g INT, s VARCHAR(8), n INT)")
+        .await
+        .unwrap();
+    // s runs counter to k, so scan order and sorted order differ visibly.
+    for i in 1..=12 {
+        c.query_drop(format!(
+            "INSERT INTO gc VALUES ({i}, {}, 'w{}', {})",
+            i % 3,
+            13 - i,
+            i % 4
+        ))
+        .await
+        .unwrap();
+    }
+    for (sql, want) in [
+        (
+            "SELECT GROUP_CONCAT(DISTINCT s ORDER BY s) FROM gc",
+            "w1,w10,w11,w12,w2,w3,w4,w5,w6,w7,w8,w9",
+        ),
+        (
+            "SELECT GROUP_CONCAT(DISTINCT s ORDER BY s DESC) FROM gc",
+            "w9,w8,w7,w6,w5,w4,w3,w2,w12,w11,w10,w1",
+        ),
+        // Ordering by a column other than the concatenated one.
+        (
+            "SELECT GROUP_CONCAT(s ORDER BY k) FROM gc",
+            "w12,w11,w10,w9,w8,w7,w6,w5,w4,w3,w2,w1",
+        ),
+        (
+            "SELECT GROUP_CONCAT(s ORDER BY k DESC) FROM gc",
+            "w1,w2,w3,w4,w5,w6,w7,w8,w9,w10,w11,w12",
+        ),
+        // Multiple keys, mixed directions, and a custom separator.
+        (
+            "SELECT GROUP_CONCAT(s ORDER BY n, k DESC) FROM gc",
+            "w1,w5,w9,w4,w8,w12,w3,w7,w11,w2,w6,w10",
+        ),
+        (
+            "SELECT GROUP_CONCAT(DISTINCT s ORDER BY s DESC SEPARATOR '|') FROM gc",
+            "w9|w8|w7|w6|w5|w4|w3|w2|w12|w11|w10|w1",
+        ),
+    ] {
+        let got: Option<String> = c.query_first(sql).await.unwrap();
+        assert_eq!(got.as_deref(), Some(want), "{sql}");
+    }
+    // Per group, and unordered GROUP_CONCAT still works.
+    let rows: Vec<(i64, String)> = c
+        .query("SELECT g, GROUP_CONCAT(s ORDER BY k) FROM gc GROUP BY g ORDER BY g")
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0].1, "w10,w7,w4,w1");
+    let got: Option<String> = c
+        .query_first("SELECT GROUP_CONCAT(s) FROM gc")
+        .await
+        .unwrap();
+    assert_eq!(got.map(|s| s.split(',').count()), Some(12));
+}

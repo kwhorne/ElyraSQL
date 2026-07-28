@@ -201,7 +201,12 @@ impl AggPlan {
         let base = self.input_schema.columns.len();
         self.aggs
             .iter()
-            .filter_map(|a| a.arg_col)
+            // An aggregate reads its argument column and, for an ordered
+            // GROUP_CONCAT, its sort-key columns. Both bypass `arg_exprs`, so both
+            // must be declared here or the scan decodes them as NULL -- which for
+            // the sort keys made every key compare equal and silently left the
+            // values in scan order.
+            .flat_map(|a| a.arg_col.into_iter().chain(a.order.iter().map(|&(c, _)| c)))
             .filter(|&c| c < base)
             .collect()
     }
@@ -382,6 +387,23 @@ fn agg_separator(f: &sqlparser::ast::Function) -> Option<String> {
     None
 }
 
+/// The `ORDER BY` inside an aggregate call, e.g.
+/// `GROUP_CONCAT(s ORDER BY s DESC)`. Returned as (expression, ascending) pairs.
+fn agg_order(f: &sqlparser::ast::Function) -> Vec<(Expr, bool)> {
+    let FunctionArguments::List(list) = &f.args else {
+        return Vec::new();
+    };
+    for c in &list.clauses {
+        if let sqlparser::ast::FunctionArgumentClause::OrderBy(items) = c {
+            return items
+                .iter()
+                .map(|o| (o.expr.clone(), o.asc.unwrap_or(true)))
+                .collect();
+        }
+    }
+    Vec::new()
+}
+
 fn agg_arg(f: &sqlparser::ast::Function) -> (Option<&Expr>, bool) {
     let FunctionArguments::List(list) = &f.args else {
         return (None, false);
@@ -556,6 +578,18 @@ fn register_agg(
         AggFunc::BitOr | AggFunc::BitAnd | AggFunc::BitXor => ColumnType::UInt,
         AggFunc::Sum | AggFunc::Min | AggFunc::Max => arg_ty.unwrap_or(ColumnType::Float),
     };
+    let mut order = Vec::new();
+    for (e, asc) in agg_order(f) {
+        let idx = match ident_of(&e).and_then(|nm| col_index(schema, &nm).ok()) {
+            Some(i) => i,
+            None => {
+                let i = schema.columns.len() + arg_exprs.len();
+                arg_exprs.push(e);
+                i
+            }
+        };
+        order.push((idx, asc));
+    }
     let slot = aggs.len();
     aggs.push(AggSpec {
         func,
@@ -564,6 +598,7 @@ fn register_agg(
         separator: agg_separator(f),
         facet_top: facet_top_of(f),
         percentile: percentile_of(f),
+        order,
     });
     agg_types.push(ty);
     Ok(slot)

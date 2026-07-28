@@ -94,6 +94,11 @@ pub struct AggSpec {
     pub facet_top: Option<usize>,
     /// `PERCENTILE(col, p)` fraction in 0..1 (`MEDIAN` = 0.5).
     pub percentile: Option<f64>,
+    /// `GROUP_CONCAT(x ORDER BY ...)`: the sort keys as (column index in the fed
+    /// row, ascending). Empty means "no ordering requested", in which case values
+    /// keep scan order. The keys are collected per value and applied at `finish`,
+    /// so the result is well-defined even when partial aggregates are merged.
+    pub order: Vec<(usize, bool)>,
 }
 
 #[derive(Clone)]
@@ -109,6 +114,9 @@ struct Acc {
     extreme: Option<Value>,
     distinct: HashSet<Vec<u8>>,
     concat: Vec<String>,
+    /// Sort keys for `concat`, one entry per collected value (empty when the
+    /// aggregate has no ORDER BY).
+    concat_keys: Vec<Vec<Value>>,
     /// Facet value -> count map (for `FACET(col)`).
     facet: HashMap<String, i64>,
     /// Numeric values collected for `PERCENTILE`/`MEDIAN`.
@@ -131,6 +139,7 @@ impl Acc {
             bits_init: false,
             extreme: None,
             distinct: HashSet::new(),
+            concat_keys: Vec::new(),
             concat: Vec::new(),
             facet: HashMap::new(),
             pvals: Vec::new(),
@@ -225,7 +234,7 @@ impl GroupAggregator {
                 let v = spec
                     .arg_col
                     .map(|c| row.get(c).cloned().unwrap_or(Value::Null));
-                update(&mut entry.1[i], spec.func, v, spec.distinct);
+                update(&mut entry.1[i], spec, v, row);
             }
             return true;
         }
@@ -238,7 +247,7 @@ impl GroupAggregator {
             let v = spec
                 .arg_col
                 .map(|c| row.get(c).cloned().unwrap_or(Value::Null));
-            update(&mut accs[i], spec.func, v, spec.distinct);
+            update(&mut accs[i], spec, v, row);
         }
         self.groups
             .insert(self.key_buf.clone(), (row.to_vec(), accs));
@@ -361,7 +370,9 @@ fn group_key_into(
     }
 }
 
-fn update(acc: &mut Acc, func: AggFunc, val: Option<Value>, distinct: bool) {
+fn update(acc: &mut Acc, spec: &AggSpec, val: Option<Value>, row: &[Value]) {
+    let func = spec.func;
+    let distinct = spec.distinct;
     match func {
         AggFunc::CountStar => acc.count += 1,
         AggFunc::Count => {
@@ -416,11 +427,20 @@ fn update(acc: &mut Acc, func: AggFunc, val: Option<Value>, distinct: bool) {
             if let Some(v) = val {
                 if !v.is_null() {
                     let s = v.to_wire_string().unwrap_or_default();
-                    if distinct {
-                        if acc.distinct.insert(v.collation_key()) {
-                            acc.concat.push(s);
-                        }
+                    let keep = if distinct {
+                        acc.distinct.insert(v.collation_key())
                     } else {
+                        true
+                    };
+                    if keep {
+                        if !spec.order.is_empty() {
+                            acc.concat_keys.push(
+                                spec.order
+                                    .iter()
+                                    .map(|&(c, _)| row.get(c).cloned().unwrap_or(Value::Null))
+                                    .collect(),
+                            );
+                        }
                         acc.concat.push(s);
                     }
                 }
@@ -520,6 +540,7 @@ fn merge_acc(a: &mut Acc, b: Acc, func: AggFunc) {
     a.has_decimal |= b.has_decimal;
     a.float_sum |= b.float_sum;
     a.concat.extend(b.concat);
+    a.concat_keys.extend(b.concat_keys);
     for (k, c) in b.facet {
         *a.facet.entry(k).or_insert(0) += c;
     }
@@ -552,7 +573,32 @@ fn finish(acc: &Acc, spec: &AggSpec) -> Value {
                 Value::Null
             } else {
                 let sep = spec.separator.as_deref().unwrap_or(",");
-                Value::Text(acc.concat.join(sep))
+                // Apply the aggregate's own ORDER BY here rather than while
+                // collecting, so the result is the same whether the rows arrived in
+                // one pass or as merged partial aggregates.
+                if spec.order.is_empty() || acc.concat_keys.len() != acc.concat.len() {
+                    Value::Text(acc.concat.join(sep))
+                } else {
+                    let mut idx: Vec<usize> = (0..acc.concat.len()).collect();
+                    idx.sort_by(|&x, &y| {
+                        for (i, &(_, asc)) in spec.order.iter().enumerate() {
+                            let a = acc.concat_keys[x].get(i);
+                            let b = acc.concat_keys[y].get(i);
+                            let ord = match (a, b) {
+                                (Some(a), Some(b)) => value_cmp(a, b),
+                                _ => Ordering::Equal,
+                            };
+                            let ord = if asc { ord } else { ord.reverse() };
+                            if ord != Ordering::Equal {
+                                return ord;
+                            }
+                        }
+                        Ordering::Equal
+                    });
+                    let ordered: Vec<&str> =
+                        idx.into_iter().map(|i| acc.concat[i].as_str()).collect();
+                    Value::Text(ordered.join(sep))
+                }
             }
         }
         AggFunc::Facet => {

@@ -19,6 +19,16 @@ All notable changes to ElyraSQL are documented here. The format is based on
   derived from the merged set, and aggregations containing a DISTINCT stay on the
   single-pass path. Verified identical for 1/2/4/8/16 workers on 20k rows and
   differentially against MySQL 8.4.
+- **`GROUP_CONCAT` ignored its `ORDER BY` (ESQL-43).** The clause parsed but was
+  never applied, so values were concatenated in scan order --
+  `GROUP_CONCAT(s ORDER BY s DESC)` returned the same string as with no ordering.
+  Sort keys are now collected per value and applied when the aggregate finishes, so
+  the result is well-defined even when partial aggregates are merged. Fixing it
+  exposed a second defect: sort-key columns were not declared as columns the
+  aggregate reads, so the scan decoded them as NULL, every key compared equal and
+  the values silently stayed in scan order -- only visible when ordering by a column
+  other than the concatenated one. Verified against MySQL 8.4 across 12 shapes
+  (ASC/DESC, multiple keys, DISTINCT, `SEPARATOR`, and per group).
 - **`COUNT(DISTINCT)` undercounted (ESQL-45).** Present in 1.4.13 and earlier, and
   the same root cause as the join-key bug fixed in 1.4.13 (ESQL-40) in a second
   place: the aggregator's distinct set was keyed by a collation key pushed through
