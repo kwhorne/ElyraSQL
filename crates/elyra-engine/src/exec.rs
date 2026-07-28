@@ -1650,7 +1650,7 @@ async fn run_virtual_select(
 
     let resolved = resolve_order_aliases(order_exprs, &select.projection, &schema);
     if !resolved.is_empty() {
-        sort_full_rows(&mut rows, &schema, &resolved)?;
+        sort_full_rows(&mut rows, &schema, &resolved, &db.cancel_token())?;
     }
     apply_offset_limit(&mut rows, offset, limit);
     let (osch, out) = project_exprs(&select.projection, &schema, &rows)?;
@@ -3896,7 +3896,7 @@ pub async fn select(
                         );
                     }
                     // Order the candidate set by exact distance for a clean top-k.
-                    sort_full_rows(&mut rows, &def.schema, &resolved)?;
+                    sort_full_rows(&mut rows, &def.schema, &resolved, &db.cancel_token())?;
                     rows.truncate(k);
                     let (schema, out) = project_exprs(&select.projection, &def.schema, &rows)?;
                     return Ok(QueryResult::Rows(RowStream::literal(schema, out)));
@@ -4260,7 +4260,7 @@ pub async fn select(
 
         let mut rows = scan_rows(db, &def, filter.as_ref()).await?;
         if !resolved.is_empty() {
-            sort_full_rows(&mut rows, &def.schema, &resolved)?;
+            sort_full_rows(&mut rows, &def.schema, &resolved, &db.cancel_token())?;
         }
         apply_offset_limit(&mut rows, offset, limit);
         let (schema, out) = project_exprs(&select.projection, &def.schema, &rows)?;
@@ -4388,8 +4388,10 @@ async fn join_select(
 
     // WHERE over the joined rows.
     if let Some(f) = &filter {
+        let mut check = db.cancel_check();
         let mut kept = Vec::with_capacity(rows.len());
         for row in rows.into_iter() {
+            check.tick()?;
             if predicate::matches(f, &schema, &row)? {
                 kept.push(row);
             }
@@ -4409,7 +4411,7 @@ async fn join_select(
     // ORDER BY + projection.
     let resolved = resolve_order_aliases(&order_exprs, &select.projection, &schema);
     if !resolved.is_empty() {
-        sort_full_rows(&mut rows, &schema, &resolved)?;
+        sort_full_rows(&mut rows, &schema, &resolved, &db.cancel_token())?;
     }
     apply_offset_limit(&mut rows, offset, limit);
     let (osch, out) = project_exprs(&select.projection, &schema, &rows)?;
@@ -4666,11 +4668,17 @@ fn expand_join_chain(
     driving: Vec<Value>,
     steps: &[JoinChainStep],
     out: &mut Vec<Vec<Value>>,
+    check: &mut elyra_core::cancel::CancelCheck,
 ) -> Result<()> {
     let mut partials = vec![driving];
     for step in steps {
         let mut next = Vec::new();
         for row in &partials {
+            // One driving row can fan out to a very large number of combinations
+            // (each step multiplies), all produced synchronously here - so the
+            // deadline has to be checked inside the expansion, not just per
+            // driving row.
+            check.tick()?;
             let key = predicate::eval_row(&step.probe_key, &step.left_schema, row)?;
             let matches: Option<&Vec<Vec<Value>>> = if key.is_null() {
                 None
@@ -4680,6 +4688,7 @@ fn expand_join_chain(
             let matched = matches.map(|v| !v.is_empty()).unwrap_or(false);
             if let Some(rows) = matches {
                 for m in rows {
+                    check.tick()?;
                     let mut c = row.clone();
                     c.extend_from_slice(m);
                     next.push(c);
@@ -4766,6 +4775,7 @@ async fn streaming_join_aggregate(
     let prefix = data_prefix(&ddef.name);
     let mut cursor: Option<Vec<u8>> = None;
     let mut combined_buf: Vec<Vec<Value>> = Vec::new();
+    let mut check = db.cancel_check();
     loop {
         let batch = db.scan_batch(prefix.clone(), cursor.clone(), 4096).await?;
         if batch.is_empty() {
@@ -4777,7 +4787,7 @@ async fn streaming_join_aggregate(
             let l: Vec<Value> =
                 bincode::deserialize(&v).map_err(|e| Error::Storage(e.to_string()))?;
             combined_buf.clear();
-            expand_join_chain(l, &steps, &mut combined_buf)?;
+            expand_join_chain(l, &steps, &mut combined_buf, &mut check)?;
             for combined in combined_buf.drain(..) {
                 let combined = match &reorder {
                     Some(perm) => apply_perm(&combined, perm),
@@ -4886,6 +4896,7 @@ async fn streaming_join_order(
     let prefix = data_prefix(&ddef.name);
     let mut cursor: Option<Vec<u8>> = None;
     let mut combined_buf: Vec<Vec<Value>> = Vec::new();
+    let mut check = db.cancel_check();
     loop {
         let batch = db.scan_batch(prefix.clone(), cursor.clone(), 4096).await?;
         if batch.is_empty() {
@@ -4897,7 +4908,7 @@ async fn streaming_join_order(
             let l: Vec<Value> =
                 bincode::deserialize(&v).map_err(|e| Error::Storage(e.to_string()))?;
             combined_buf.clear();
-            expand_join_chain(l, &steps, &mut combined_buf)?;
+            expand_join_chain(l, &steps, &mut combined_buf, &mut check)?;
             for combined in combined_buf.drain(..) {
                 let combined = match &reorder {
                     Some(perm) => apply_perm(&combined, perm),
@@ -5020,7 +5031,7 @@ async fn join_correlated_select(
 
     let resolved_order = resolve_order_aliases(&order_exprs, &select.projection, &schema);
     if !resolved_order.is_empty() {
-        sort_full_rows(&mut kept, &schema, &resolved_order)?;
+        sort_full_rows(&mut kept, &schema, &resolved_order, &db.cancel_token())?;
     }
     apply_offset_limit(&mut kept, offset, limit);
 
@@ -5559,7 +5570,15 @@ async fn build_from(
             cur_rows = br;
             first = false;
         } else {
-            let (c, r) = combine(&cur_cols, &cur_rows, &bc, &br, JoinKind::Inner, None)?;
+            let (c, r) = combine(
+                &cur_cols,
+                &cur_rows,
+                &bc,
+                &br,
+                JoinKind::Inner,
+                None,
+                &db.cancel_token(),
+            )?;
             cur_cols = c;
             cur_rows = r;
         }
@@ -5591,7 +5610,9 @@ async fn build_from(
             if let Some((driving_key, pcol, pdef, pcols)) = nlj {
                 let plen = pcols.len();
                 let mut out = Vec::new();
+                let mut check = db.cancel_check();
                 for l in &cur_rows {
+                    check.tick()?;
                     let v = predicate::eval_row(&driving_key, &driving_schema, l)?;
                     let matches = if v.is_null() {
                         Vec::new()
@@ -5619,7 +5640,15 @@ async fn build_from(
             // Fallback: materialise the partner (with pushdown) and hash/nested join.
             let (jc, mut jr) = load_relation(db, vindex, &join.relation, conjuncts).await?;
             jr = apply_pushdown(jr, &jc, conjuncts)?;
-            let (c, r) = combine(&cur_cols, &cur_rows, &jc, &jr, kind, on.as_ref())?;
+            let (c, r) = combine(
+                &cur_cols,
+                &cur_rows,
+                &jc,
+                &jr,
+                kind,
+                on.as_ref(),
+                &db.cancel_token(),
+            )?;
             cur_cols = c;
             cur_rows = r;
         }
@@ -6135,6 +6164,7 @@ async fn build_inner_join_reordered(
             &rrows,
             JoinKind::Inner,
             Some(&pred),
+            &db.cancel_token(),
         )?;
         cur_cols = c;
         cur_rows = r;
@@ -6298,6 +6328,7 @@ fn join_kind(op: &JoinOperator) -> Result<(JoinKind, Option<Expr>)> {
 
 /// Combine two materialised relations under a join kind. Equi-`ON` INNER/LEFT
 /// use a hash join; everything else (RIGHT/FULL, non-equi) is nested-loop.
+#[allow(clippy::too_many_arguments)]
 fn combine(
     lcols: &[ColumnDef],
     lrows: &[Vec<Value>],
@@ -6305,6 +6336,7 @@ fn combine(
     rrows: &[Vec<Value>],
     kind: JoinKind,
     on: Option<&Expr>,
+    cancel: &std::sync::Arc<elyra_core::cancel::QueryCancel>,
 ) -> Result<(Vec<ColumnDef>, Vec<Vec<Value>>)> {
     let mut cols = lcols.to_vec();
     cols.extend_from_slice(rcols);
@@ -6337,7 +6369,7 @@ fn combine(
                         }
                     }
                 }
-                let rows = hash_join(lrows, rrows, &lschema, &rschema, &lkey, &rkey, kind)?;
+                let rows = hash_join(lrows, rrows, &lschema, &rschema, &lkey, &rkey, kind, cancel)?;
                 return Ok((cols, rows));
             }
         }
@@ -6349,9 +6381,13 @@ fn combine(
     let mut out = Vec::new();
     let mut right_matched = vec![false; rrows.len()];
 
+    // The product of two relations is quadratic, so this is the loop a cross
+    // join spends its time in: check the statement's deadline as we go.
+    let mut check = elyra_core::cancel::CancelCheck::new(cancel.clone());
     for l in lrows {
         let mut matched = false;
         for (ri, r) in rrows.iter().enumerate() {
+            check.tick()?;
             let mut combined = l.clone();
             combined.extend_from_slice(r);
             let keep = match on {
@@ -6396,7 +6432,12 @@ fn hash_join(
     lkey: &Expr,
     rkey: &Expr,
     kind: JoinKind,
+    cancel: &std::sync::Arc<elyra_core::cancel::QueryCancel>,
 ) -> Result<Vec<Vec<Value>>> {
+    // A hash join over large inputs can emit far more rows than either side, so
+    // it needs its own deadline checks (its caller only checks the nested-loop
+    // fallback).
+    let mut check = elyra_core::cancel::CancelCheck::new(cancel.clone());
     use std::collections::HashMap;
     let llen = lschema.columns.len();
     let rlen = rschema.columns.len();
@@ -6417,16 +6458,19 @@ fn hash_join(
     if build_left {
         let mut table: HashMap<String, Vec<usize>> = HashMap::new();
         for (i, l) in lrows.iter().enumerate() {
+            check.tick()?;
             if let Some(k) = key_str_coll(&predicate::eval_row(lkey, lschema, l)?, coll) {
                 table.entry(k).or_default().push(i);
             }
         }
         for r in rrows {
+            check.tick()?;
             let probe = key_str_coll(&predicate::eval_row(rkey, rschema, r)?, coll);
             let mut matched = false;
             if let Some(k) = probe {
                 if let Some(idxs) = table.get(&k) {
                     for &i in idxs {
+                        check.tick()?;
                         let mut combined = lrows[i].clone();
                         combined.extend_from_slice(r);
                         out.push(combined);
@@ -6444,16 +6488,19 @@ fn hash_join(
     } else {
         let mut table: HashMap<String, Vec<usize>> = HashMap::new();
         for (i, r) in rrows.iter().enumerate() {
+            check.tick()?;
             if let Some(k) = key_str_coll(&predicate::eval_row(rkey, rschema, r)?, coll) {
                 table.entry(k).or_default().push(i);
             }
         }
         for l in lrows {
+            check.tick()?;
             let probe = key_str_coll(&predicate::eval_row(lkey, lschema, l)?, coll);
             let mut matched = false;
             if let Some(k) = probe {
                 if let Some(idxs) = table.get(&k) {
                     for &i in idxs {
+                        check.tick()?;
                         let mut combined = l.clone();
                         combined.extend_from_slice(&rrows[i]);
                         out.push(combined);
@@ -9604,7 +9651,7 @@ async fn correlated_select(
 
     let resolved = resolve_order_aliases(order_exprs, &select.projection, &def.schema);
     if !resolved.is_empty() {
-        sort_full_rows(&mut matched, &def.schema, &resolved)?;
+        sort_full_rows(&mut matched, &def.schema, &resolved, &db.cancel_token())?;
     }
     apply_offset_limit(&mut matched, offset, limit);
 
@@ -10432,9 +10479,16 @@ async fn olap_aggregate(
                 let mut handles = Vec::with_capacity(ranges.len());
                 for (start, end) in ranges {
                     let snap = snap.clone();
+                    // Each worker observes the deadline itself: aborting only the
+                    // awaiting task would leave these threads burning a core each.
+                    let mut check = db.cancel_check();
                     handles.push(tokio::task::spawn_blocking(move || -> Result<u64> {
+                        // May start after the deadline (the pool queues workers):
+                        // check before touching any data.
+                        check.tick_now()?;
                         let mut acc = 0u64;
                         snap.scan_range_each(&start, &end, |_k, _v| {
+                            check.tick()?;
                             acc += 1;
                             Ok(())
                         })?;
@@ -10672,9 +10726,14 @@ async fn scan_columnar_scalar(
             for (start, end) in ranges {
                 let snap = snap.clone();
                 let specs = specs.to_vec();
+                let mut check = db.cancel_check();
                 handles.push(tokio::task::spawn_blocking(move || -> Result<_> {
+                    check.tick_now()?;
                     let mut st = ColAgg::new(&specs, ncols);
-                    snap.scan_range_each(&start, &end, |_k, v| st.feed(v))?;
+                    snap.scan_range_each(&start, &end, |_k, v| {
+                        check.tick()?;
+                        st.feed(v)
+                    })?;
                     Ok(st)
                 }));
             }
@@ -10690,7 +10749,15 @@ async fn scan_columnar_scalar(
         }
     }
     let st = ColAgg::new(specs, ncols);
-    let mut st = raw.scan_fold(prefix, st, |st, _k, v| st.feed(v)).await?;
+    // Runs on a blocking thread, which a wall-clock timeout cannot interrupt, so
+    // the deadline has to be observed from inside the scan itself.
+    let mut check = db.cancel_check();
+    let mut st = raw
+        .scan_fold(prefix, st, move |st, _k, v| {
+            check.tick()?;
+            st.feed(v)
+        })
+        .await?;
     st.flush();
     Ok(st.finish())
 }
@@ -11012,9 +11079,14 @@ async fn scan_columnar_group(
                 let specs = specs.to_vec();
                 let needed = needed.clone();
                 let cf = cfilter.clone();
+                let mut check = db.cancel_check();
                 handles.push(tokio::task::spawn_blocking(move || -> Result<_> {
+                    check.tick_now()?;
                     let mut st = ColGroup::new(group_col, &specs, ncols, needed, cf);
-                    snap.scan_range_each(&start, &end, |_k, v| st.feed(v))?;
+                    snap.scan_range_each(&start, &end, |_k, v| {
+                        check.tick()?;
+                        st.feed(v)
+                    })?;
                     Ok(st)
                 }));
             }
@@ -11030,7 +11102,12 @@ async fn scan_columnar_group(
         }
         None => {
             let st = ColGroup::new(group_col, specs, ncols, needed.clone(), cfilter.clone());
-            raw.scan_fold(prefix, st, |st, _k, v| st.feed(v)).await?
+            let mut check = db.cancel_check();
+            raw.scan_fold(prefix, st, move |st, _k, v| {
+                check.tick()?;
+                st.feed(v)
+            })
+            .await?
         }
     };
     if result.overflow {
@@ -11053,10 +11130,16 @@ async fn get_or_build_zonemap(
     let raw = db.raw_db();
     let prefix = data_prefix(&def.name);
     let upper = prefix_successor(&prefix);
+    let mut check = db.cancel_check();
     let b = raw
-        .scan_fold(prefix, zonemap::Builder::new(&def.schema), |b, k, v| {
-            b.feed(k, v)
-        })
+        .scan_fold(
+            prefix,
+            zonemap::Builder::new(&def.schema),
+            move |b, k, v| {
+                check.tick()?;
+                b.feed(k, v)
+            },
+        )
         .await?;
     if raw.write_epoch()? != epoch {
         return Ok(None);
@@ -11303,8 +11386,13 @@ async fn scan_aggregate_fast(
                     arg_exprs.clone(),
                 );
                 let mut agg0 = plan.new_aggregator();
+                let mut check = db.cancel_check();
                 handles.push(tokio::task::spawn_blocking(move || -> Result<_> {
-                    snap.scan_range_each(&start, &end, |k, v| body(&mut agg0, k, v))?;
+                    check.tick_now()?;
+                    snap.scan_range_each(&start, &end, |k, v| {
+                        check.tick()?;
+                        body(&mut agg0, k, v)
+                    })?;
                     Ok(agg0)
                 }));
             }
@@ -11320,8 +11408,13 @@ async fn scan_aggregate_fast(
     }
 
     // Fallback: single-pass full-prefix scan.
-    let body = make_body(filter, cfilter, needed, schema, arg_exprs);
-    raw.scan_fold(prefix, plan.new_aggregator(), body).await
+    let mut body = make_body(filter, cfilter, needed, schema, arg_exprs);
+    let mut check = db.cancel_check();
+    raw.scan_fold(prefix, plan.new_aggregator(), move |acc, k, v| {
+        check.tick()?;
+        body(acc, k, v)
+    })
+    .await
 }
 
 /// Split the clustered keyspace of a single-integer-PK table into up to `n`
@@ -11819,9 +11912,12 @@ async fn parallel_aggregate(
         let sch = schema.clone();
         let arg_exprs = plan.arg_exprs().to_vec();
         let needed = needed.clone();
+        let mut check = db.cancel_check();
         handles.push(tokio::task::spawn_blocking(
             move || -> Result<GroupAggregator> {
+                check.tick_now()?;
                 for b in &blobs {
+                    check.tick()?;
                     let row: Vec<Value> = match &needed {
                         Some(mask) => rowdec::decode_projected(b, ncols, mask)?,
                         None => {
@@ -11906,10 +12002,18 @@ fn expr_collation(e: &Expr, schema: &Schema) -> elyra_core::Collation {
     elyra_core::Collation::Ci
 }
 
-fn sort_full_rows(rows: &mut [Vec<Value>], schema: &Schema, order: &[(Expr, bool)]) -> Result<()> {
-    // Precompute sort keys once per row.
+fn sort_full_rows(
+    rows: &mut [Vec<Value>],
+    schema: &Schema,
+    order: &[(Expr, bool)],
+    cancel: &std::sync::Arc<elyra_core::cancel::QueryCancel>,
+) -> Result<()> {
+    // Precompute sort keys once per row. Evaluating a key can be arbitrarily
+    // expensive (any expression), so observe the deadline while doing it.
+    let mut check = elyra_core::cancel::CancelCheck::new(cancel.clone());
     let mut keyed: Vec<(Vec<Value>, usize)> = Vec::with_capacity(rows.len());
     for (i, row) in rows.iter().enumerate() {
+        check.tick()?;
         let mut keys = Vec::with_capacity(order.len());
         for (e, _) in order {
             keys.push(predicate::eval_row(e, schema, row)?);
@@ -12435,5 +12539,120 @@ mod plan_tests {
         // max(256 * need, 50_000)
         assert_eq!(ordered_scan_budget(40), 50_000);
         assert_eq!(ordered_scan_budget(1000), 256_000);
+    }
+}
+
+#[cfg(test)]
+mod cancel_tests {
+    use crate::Engine;
+    use elyra_core::Privilege;
+    use elyra_storage::Db;
+
+    /// A cancelled statement must stop inside the engine's row loops and report
+    /// it, rather than running to completion. Uses an explicit cancel (not the
+    /// timeout) so the test does not depend on process-wide env configuration.
+    #[tokio::test]
+    async fn cancelled_statement_aborts_scan() {
+        let db = Db::in_memory().unwrap();
+        let engine = Engine::new(db);
+        let sess = engine.session();
+        engine
+            .execute(
+                "CREATE TABLE t (id INT PRIMARY KEY, v INT)",
+                Privilege::Admin,
+                &sess,
+            )
+            .await
+            .unwrap();
+        for i in 1..=3000 {
+            engine
+                .execute(
+                    &format!("INSERT INTO t VALUES ({i}, {})", i % 9),
+                    Privilege::Admin,
+                    &sess,
+                )
+                .await
+                .unwrap();
+        }
+        // Sanity: the query succeeds while the statement is not cancelled.
+        engine
+            .execute(
+                "SELECT COUNT(*) FROM t WHERE v > 0",
+                Privilege::Admin,
+                &sess,
+            )
+            .await
+            .map(|_| ())
+            .expect("baseline query should succeed");
+
+        // Now ask the session to stop; the next statement must refuse to grind
+        // through its rows.
+        sess.cancel_token().cancel();
+        let err = engine
+            .execute(
+                "SELECT COUNT(*) FROM t WHERE v > 0",
+                Privilege::Admin,
+                &sess,
+            )
+            .await
+            .map(|_| ())
+            .expect_err("a cancelled statement must not run to completion");
+        assert!(
+            err.to_string().contains("cancelled"),
+            "expected a cancellation error, got: {err}"
+        );
+
+        // Clearing the cancellation makes the session usable again.
+        sess.disarm_cancel();
+        engine
+            .execute(
+                "SELECT COUNT(*) FROM t WHERE v > 0",
+                Privilege::Admin,
+                &sess,
+            )
+            .await
+            .map(|_| ())
+            .expect("session should be reusable after the cancellation is cleared");
+    }
+
+    /// A join that explodes must also observe cancellation: the expansion of a
+    /// single driving row is where a runaway join spends its time.
+    #[tokio::test]
+    async fn cancelled_statement_aborts_join_expansion() {
+        let db = Db::in_memory().unwrap();
+        let engine = Engine::new(db);
+        let sess = engine.session();
+        engine
+            .execute(
+                "CREATE TABLE j (id INT PRIMARY KEY, v INT)",
+                Privilege::Admin,
+                &sess,
+            )
+            .await
+            .unwrap();
+        for i in 1..=400 {
+            engine
+                .execute(
+                    &format!("INSERT INTO j VALUES ({i}, {})", i % 3),
+                    Privilege::Admin,
+                    &sess,
+                )
+                .await
+                .unwrap();
+        }
+        sess.cancel_token().cancel();
+        let err = engine
+            .execute(
+                "SELECT a.id FROM j a, j b, j c WHERE a.v = b.v AND b.v = c.v ORDER BY a.id DESC",
+                Privilege::Admin,
+                &sess,
+            )
+            .await
+            .map(|_| ())
+            .expect_err("a cancelled join must abort");
+        assert!(
+            err.to_string().contains("cancelled"),
+            "expected a cancellation error, got: {err}"
+        );
     }
 }

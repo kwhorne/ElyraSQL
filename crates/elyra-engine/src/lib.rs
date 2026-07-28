@@ -773,6 +773,10 @@ impl Engine {
         user: &str,
         sess: &Session,
     ) -> Result<Vec<QueryResult>> {
+        // Apply the query timeout for the duration of this statement. Held as a
+        // guard so every exit path clears it, and nesting-aware so a trigger or
+        // procedure body inherits the outer deadline instead of resetting it.
+        let _cancel = CancelGuard::new(sess);
         // Reject pathologically deep expressions before any parsing/evaluation so
         // a hostile query can't overflow the worker stack and abort the process.
         guard_sql_complexity(sql)?;
@@ -2000,6 +2004,30 @@ fn is_operator_keyword(k: Keyword) -> bool {
 /// with a normal SQL error so the connection survives and other clients are
 /// unaffected. If tokenizing fails we return `Ok(())` and let the parser produce
 /// the real syntax error.
+/// Arms a session's query deadline for one statement and clears it on drop, so
+/// every exit path — including `?` and an unwind — leaves the session with no
+/// stale deadline. Nesting-aware: only the outermost statement owns the token, so
+/// a trigger or procedure body inherits the outer deadline.
+struct CancelGuard<'a> {
+    sess: &'a Session,
+    armed_here: bool,
+}
+
+impl<'a> CancelGuard<'a> {
+    fn new(sess: &'a Session) -> Self {
+        let armed_here = sess.arm_cancel_if_idle();
+        Self { sess, armed_here }
+    }
+}
+
+impl Drop for CancelGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed_here {
+            self.sess.disarm_cancel();
+        }
+    }
+}
+
 pub fn guard_sql_complexity(sql: &str) -> Result<()> {
     let dialect = MySqlDialect {};
     let tokens = match Tokenizer::new(&dialect, sql).tokenize() {

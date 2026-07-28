@@ -86,6 +86,11 @@ pub struct Session {
     last_insert_id: std::sync::atomic::AtomicI64,
     /// `ROW_COUNT()` -- rows changed by the last DML (-1 after a SELECT/DDL).
     row_count: std::sync::atomic::AtomicI64,
+    /// Cooperative cancellation for the statement currently running on this
+    /// session: armed with the query timeout on entry, checked inside the hot row
+    /// loops so a runaway statement stops burning CPU instead of running to
+    /// completion after the client has already been given up on.
+    cancel: Arc<elyra_core::cancel::QueryCancel>,
 }
 
 fn is_meta(k: &[u8]) -> bool {
@@ -133,7 +138,42 @@ impl Session {
             held_locks: Mutex::new(Vec::new()),
             last_insert_id: std::sync::atomic::AtomicI64::new(0),
             row_count: std::sync::atomic::AtomicI64::new(-1),
+            cancel: Arc::new(elyra_core::cancel::QueryCancel::new()),
         }
+    }
+
+    /// Cancellation token for the statement running on this session. Cloned into
+    /// the row loops (including work handed to blocking threads, which a
+    /// `tokio::time::timeout` cannot reach).
+    pub fn cancel_token(&self) -> Arc<elyra_core::cancel::QueryCancel> {
+        self.cancel.clone()
+    }
+
+    /// A checker for a hot row loop, sampling the token every N rows.
+    pub fn cancel_check(&self) -> elyra_core::cancel::CancelCheck {
+        elyra_core::cancel::CancelCheck::new(self.cancel.clone())
+    }
+
+    /// Apply the configured query timeout to a statement that is about to run,
+    /// unless a deadline is already in force.
+    ///
+    /// Returns whether this call armed the token, so the caller knows whether it
+    /// owns the disarm. A nested statement (a trigger body, a procedure) must
+    /// **inherit** the outer deadline rather than start a fresh budget — otherwise
+    /// a long chain of nested statements could run indefinitely, and finishing a
+    /// nested statement would clear the outer statement's deadline.
+    pub fn arm_cancel_if_idle(&self) -> bool {
+        let timeout = elyra_core::cancel::query_timeout();
+        if timeout.is_none() || self.cancel.is_armed() {
+            return false;
+        }
+        self.cancel.arm(timeout);
+        true
+    }
+
+    /// Clear the deadline once the statement is done.
+    pub fn disarm_cancel(&self) {
+        self.cancel.disarm();
     }
 
     /// Value returned by `LAST_INSERT_ID()`.

@@ -278,12 +278,16 @@ judge fit before deploying.
   and stored-procedure loop caps, a `SERIALIZABLE` range cap, and a byte budget for
   string-expanding functions (`ELYRASQL_MAX_ALLOWED_PACKET`, returning `NULL` past it
   as MySQL does past `max_allowed_packet`). Two gaps remain, both tracked:
-    - **A CPU-heavy query occupies a runtime worker thread**, and enough concurrent
-      heavy queries can make the server unresponsive to *new* connections.
-      `ELYRASQL_QUERY_TIMEOUT_MS` does **not** help here: it can only interrupt a
-      statement that yields, so a long synchronous loop runs to completion. Treat
-      the timeout as a latency bound for I/O-waiting queries, not a CPU guard, and
-      restrict who can run arbitrary SQL (ESQL-32).
+    - **A CPU-heavy query occupies a runtime worker thread.** Setting
+      `ELYRASQL_QUERY_TIMEOUT_MS` now genuinely bounds this: the engine checks the
+      deadline inside its row loops, so a runaway statement is aborted and stops
+      consuming CPU (including work already handed to blocking threads).
+      Measured with the timeout set, 16 concurrent runaway joins still left the
+      server answering new connections, with no CPU left burning afterwards.
+      **With no timeout configured** — the default, as in MySQL — there is no
+      deadline to check, so enough concurrent heavy queries can still make the
+      server unresponsive to *new* connections (ESQL-38). Set a timeout if
+      untrusted or ad-hoc SQL can reach the server.
     - Connections are capped by `ELYRASQL_MAX_CONNECTIONS` (default 151, as in
       MySQL); surplus connections get error 1040, and — as in MySQL — one extra
       slot is reserved for `Admin` accounts so an operator is not locked out.

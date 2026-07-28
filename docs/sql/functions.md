@@ -65,7 +65,10 @@ operator.
 allocation.
 
 Pattern matching: `str LIKE pattern`, and `str REGEXP pattern` / `str RLIKE
-pattern` (POSIX-style regular expressions, with `NOT REGEXP`).
+pattern` (POSIX-style regular expressions, with `NOT REGEXP`). Compiled patterns
+are cached, so a constant pattern is compiled once per server rather than once per
+row. Note that `REGEXP` currently matches **case-sensitively**, unlike MySQL, whose
+default `_ci` collation makes it case-insensitive (ESQL-37).
 
 ## Math
 

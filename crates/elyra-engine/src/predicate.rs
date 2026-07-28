@@ -304,8 +304,7 @@ pub fn eval_row(expr: &Expr, schema: &Schema, row: &[Value]) -> Result<Value> {
                 text.to_wire_string().unwrap_or_default(),
                 pat.to_wire_string().unwrap_or_default(),
             );
-            let re = regex::Regex::new(&p)
-                .map_err(|e| Error::Query(format!("invalid regular expression: {e}")))?;
+            let re = compiled_regex(&p)?;
             Ok(Value::Bool(re.is_match(&t) != *negated))
         }
         Expr::Substring {
@@ -930,6 +929,51 @@ fn wire(v: &Value) -> Option<String> {
         v.to_wire_string()
     }
 }
+/// Compile `pattern`, reusing a previously compiled regular expression when the
+/// same pattern is seen again.
+///
+/// `REGEXP` / `RLIKE` / `REGEXP_REPLACE` / `REGEXP_SUBSTR` evaluate their pattern
+/// argument **per row**, and compiling a regular expression costs orders of
+/// magnitude more than matching with it. Profiling a `WHERE s REGEXP '...'` scan
+/// showed essentially the whole query being spent inside `Regex::new`, recompiling
+/// the same constant pattern for every row.
+///
+/// The cache is bounded so a query that generates many distinct patterns (a
+/// pattern built from a column) cannot grow it without limit; on overflow it is
+/// cleared rather than evicted one by one, which keeps the hot path a single
+/// read-lock lookup with no bookkeeping.
+fn compiled_regex(pattern: &str) -> Result<std::sync::Arc<regex::Regex>> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, OnceLock, RwLock};
+
+    /// Distinct patterns kept before the cache is cleared.
+    const MAX_PATTERNS: usize = 256;
+
+    static CACHE: OnceLock<RwLock<HashMap<String, Arc<regex::Regex>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| RwLock::new(HashMap::new()));
+
+    // Fast path: a shared read lock, so parallel scan workers do not serialise.
+    if let Some(re) = cache
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(pattern)
+        .cloned()
+    {
+        return Ok(re);
+    }
+
+    let re = Arc::new(
+        regex::Regex::new(pattern)
+            .map_err(|e| Error::Query(format!("invalid regular expression: {e}")))?,
+    );
+    let mut w = cache.write().unwrap_or_else(|e| e.into_inner());
+    if w.len() >= MAX_PATTERNS {
+        w.clear();
+    }
+    w.insert(pattern.to_string(), re.clone());
+    Ok(re)
+}
+
 /// Byte budget for a single string-expanding function result (`REPEAT`, `SPACE`,
 /// `LPAD`, `RPAD`). MySQL bounds these by `max_allowed_packet` and returns NULL
 /// when the result would exceed it; ElyraSQL does the same so one expression
@@ -1396,14 +1440,14 @@ fn eval_scalar(name: &str, a: &[Value]) -> Result<Option<Value>> {
             None => Value::Null,
         },
         "regexp_replace" => match (sstr(a, 0), sstr(a, 1), sstr(a, 2)) {
-            (Some(s), Some(pat), Some(rep)) => match regex::Regex::new(&pat) {
+            (Some(s), Some(pat), Some(rep)) => match compiled_regex(&pat) {
                 Ok(re) => Value::Text(re.replace_all(&s, rep.as_str()).into_owned()),
                 Err(_) => Value::Null,
             },
             _ => Value::Null,
         },
         "regexp_substr" => match (sstr(a, 0), sstr(a, 1)) {
-            (Some(s), Some(pat)) => match regex::Regex::new(&pat) {
+            (Some(s), Some(pat)) => match compiled_regex(&pat) {
                 Ok(re) => re
                     .find(&s)
                     .map(|m| Value::Text(m.as_str().to_string()))

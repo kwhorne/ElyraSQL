@@ -74,6 +74,10 @@ in both directions (NULL rows are indexed under a companion keyspace); see
 - **Group commit** amortizes write durability across concurrent writers.
 - **Streaming execution** keeps memory bounded on scans and aggregations.
 - **HNSW** brings vector search from `O(n)` exact to sub-millisecond ANN.
+- **Compiled regular expressions are cached**, so `WHERE col REGEXP '...'` compiles
+  the pattern once instead of once per row. Compilation costs far more than
+  matching, so this dominates such scans: a `COUNT(*)` with a `REGEXP` filter over
+  800k rows went from failing to finish inside a 2-second budget to **0.12 s**.
 
 ## Honest caveats
 

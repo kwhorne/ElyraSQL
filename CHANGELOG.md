@@ -4,6 +4,37 @@ All notable changes to ElyraSQL are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **`ELYRASQL_QUERY_TIMEOUT_MS` now actually stops a runaway statement
+  (ESQL-32).** It previously wrapped execution in a wall-clock timeout, which can
+  only take effect at an `.await` point — so a long stretch of synchronous CPU work
+  ignored it entirely, and work already handed to a blocking thread ran to
+  completion even after the client had given up. Measured before the fix: a 3-way
+  cross join with a 2-second timeout gave the client nothing for 25 s and kept a
+  core busy afterwards. The engine now carries a per-statement deadline and checks
+  it inside its hot row loops — table scans, the nested-loop product, hash-join
+  build and probe, join-chain expansion, sort-key evaluation, and **each parallel
+  scan worker** (the case a wall-clock timeout can never reach). Every runaway
+  shape tested (cross join, exploding equi-join with `ORDER BY`/`GROUP BY`,
+  high-cardinality `GROUP BY`, expression sort over 800k rows) now aborts at the
+  deadline with **zero** CPU left running, and with the timeout set the server kept
+  answering new connections while 16 runaway queries were in flight. The deadline
+  is armed per statement by a guard, so it is cleared on every exit path, and a
+  trigger or procedure body inherits the outer statement's deadline rather than
+  starting a fresh budget. `ELYRASQL_QUERY_TIMEOUT_MS` remains off by default, as in
+  MySQL — with no timeout configured there is still no deadline to check
+  (ESQL-38).
+- **`REGEXP` compiled its pattern once per row.** Found by profiling the above: a
+  `WHERE s REGEXP '...'` scan spent essentially all its time in `Regex::new`,
+  recompiling the same constant pattern for every row. Compiled patterns are now
+  cached (bounded, so patterns built from column values cannot grow it without
+  limit), shared by `REGEXP`/`RLIKE`, `REGEXP_REPLACE` and `REGEXP_SUBSTR`. A
+  `COUNT(*)` with a `REGEXP` filter over 800k rows went from **not finishing inside
+  a 2-second budget to 0.12 s**.
+
 ## [1.4.12] - 2026-07-27
 
 Hardening release. A code audit found two denial-of-service vectors that a single
