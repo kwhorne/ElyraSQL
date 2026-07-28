@@ -4544,7 +4544,7 @@ async fn streaming_nlj_select(
 /// accumulated left row.
 struct JoinChainStep {
     /// Partner rows keyed by the collated partner join key.
-    table: std::collections::HashMap<String, Vec<Vec<Value>>>,
+    table: std::collections::HashMap<Vec<u8>, Vec<Vec<Value>>>,
     /// Expr (over `left_schema`) that produces the probe key for a left row.
     probe_key: Expr,
     /// Schema of the accumulated left side at this step (driving ++ prior partners).
@@ -4632,7 +4632,7 @@ async fn build_join_chain(
         let coll = join_key_collation(&lkey, &left_schema, &rkey, &pschema);
 
         // Materialise the partner into a hash table keyed by its join key.
-        let mut table: std::collections::HashMap<String, Vec<Vec<Value>>> =
+        let mut table: std::collections::HashMap<Vec<u8>, Vec<Vec<Value>>> =
             std::collections::HashMap::new();
         let prefix = data_prefix(&pdef.name);
         let mut cursor: Option<Vec<u8>> = None;
@@ -4647,7 +4647,7 @@ async fn build_join_chain(
                 let row: Vec<Value> =
                     bincode::deserialize(&v).map_err(|e| Error::Storage(e.to_string()))?;
                 let key = predicate::eval_row(&rkey, &pschema, &row)?;
-                if let Some(k) = key_str_coll(&key, coll) {
+                if let Some(k) = key_bytes_coll(&key, coll) {
                     table.entry(k).or_default().push(row);
                 }
             }
@@ -4746,7 +4746,7 @@ fn expand_join_chain(
             let matches: Option<&Vec<Vec<Value>>> = if key.is_null() {
                 None
             } else {
-                key_str_coll(&key, step.coll).and_then(|k| step.table.get(&k))
+                key_bytes_coll(&key, step.coll).and_then(|k| step.table.get(&k))
             };
             let matched = matches.map(|v| !v.is_empty()).unwrap_or(false);
             if let Some(rows) = matches {
@@ -6527,16 +6527,16 @@ fn hash_join(
     let mut out = Vec::new();
 
     if build_left {
-        let mut table: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut table: HashMap<Vec<u8>, Vec<usize>> = HashMap::new();
         for (i, l) in lrows.iter().enumerate() {
             check.tick()?;
-            if let Some(k) = key_str_coll(&predicate::eval_row(lkey, lschema, l)?, coll) {
+            if let Some(k) = key_bytes_coll(&predicate::eval_row(lkey, lschema, l)?, coll) {
                 table.entry(k).or_default().push(i);
             }
         }
         for r in rrows {
             check.tick()?;
-            let probe = key_str_coll(&predicate::eval_row(rkey, rschema, r)?, coll);
+            let probe = key_bytes_coll(&predicate::eval_row(rkey, rschema, r)?, coll);
             let mut matched = false;
             if let Some(k) = probe {
                 if let Some(idxs) = table.get(&k) {
@@ -6557,16 +6557,16 @@ fn hash_join(
             }
         }
     } else {
-        let mut table: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut table: HashMap<Vec<u8>, Vec<usize>> = HashMap::new();
         for (i, r) in rrows.iter().enumerate() {
             check.tick()?;
-            if let Some(k) = key_str_coll(&predicate::eval_row(rkey, rschema, r)?, coll) {
+            if let Some(k) = key_bytes_coll(&predicate::eval_row(rkey, rschema, r)?, coll) {
                 table.entry(k).or_default().push(i);
             }
         }
         for l in lrows {
             check.tick()?;
-            let probe = key_str_coll(&predicate::eval_row(lkey, lschema, l)?, coll);
+            let probe = key_bytes_coll(&predicate::eval_row(lkey, lschema, l)?, coll);
             let mut matched = false;
             if let Some(k) = probe {
                 if let Some(idxs) = table.get(&k) {
@@ -6657,11 +6657,19 @@ fn merge_join_inner(l: KeyedRows, r: KeyedRows) -> Option<Vec<Vec<Value>>> {
 /// Hash-key string under an explicit collation; `None` for NULL (never matches,
 /// per SQL). `Bin` keeps text case-sensitive so an equi-join on a `_bin` column
 /// matches by exact bytes.
-fn key_str_coll(v: &Value, coll: elyra_core::Collation) -> Option<String> {
+/// Hash-join key for `v` under `coll`, or `None` for NULL (which never matches).
+///
+/// The key is the collation key's **raw bytes**. It must not be turned into a
+/// `String`: a collation key is an order-preserving binary encoding, so any byte
+/// that is not valid UTF-8 would be replaced by U+FFFD and unrelated values would
+/// collide into one key -- producing extra join rows. That is not theoretical: it
+/// made every integer in 128..255 hash to the same key, so `a JOIN b ON a.id =
+/// b.id` returned a cartesian product of those 128 ids.
+fn key_bytes_coll(v: &Value, coll: elyra_core::Collation) -> Option<Vec<u8>> {
     if v.is_null() {
         None
     } else {
-        Some(String::from_utf8_lossy(&v.collation_key_coll(coll)).into_owned())
+        Some(v.collation_key_coll(coll))
     }
 }
 
@@ -11655,11 +11663,21 @@ impl<'p> SpillAgg<'p> {
         let mut out_rows: Vec<Vec<Value>> = resident_rows;
         for p in 0..self.parts.len() {
             let mut agg = self.plan.new_aggregator();
+            let mut any = false;
             self.parts.drain_each(p, |row| {
                 // Rows were already filtered and extended before spilling.
+                any = true;
                 agg.feed(&row);
                 Ok(())
             })?;
+            // An empty partition contributes nothing. It must be skipped rather
+            // than finalised: for an aggregate with no GROUP BY, finalising an
+            // empty group set legitimately means "bare aggregate over zero rows"
+            // and yields one row (`COUNT(*)` -> 0), so finalising all 256 empty
+            // partitions appended 256 bogus zero rows after the real result.
+            if !any {
+                continue;
+            }
             if agg.overflowed() {
                 return Err(Error::Query(format!(
                     "GROUP BY partition still exceeds the group limit ({}); raise \

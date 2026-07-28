@@ -8,6 +8,27 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ### Fixed
 
+- **Wrong join results: the hash-join key was corrupted (ESQL-40).** Present in
+  1.4.12. The key was a collation key pushed through `from_utf8_lossy`, but a
+  collation key is an order-preserving **binary** encoding — so every byte that is
+  not valid UTF-8 became U+FFFD and unrelated values collided into one key. Every
+  integer in **128..255** hashed identically, so `SELECT COUNT(*) FROM t a JOIN t b
+  ON a.id = b.id` on 300 rows returned **16556** instead of 300: those 128 ids
+  formed a cartesian product. It affected ordinary equi-joins (hash join and the
+  streaming N-table path) on integer keys in that range and on non-ASCII text keys;
+  small tables escaped it only because the index nested-loop path handles them.
+  The hash tables are now keyed on the raw collation-key bytes. Verified exact for
+  n = 10…5000, zero mismatched pairs, and 9 join shapes matching real MySQL 8.4.
+- **A bare aggregate over a join returned 256 spurious zero rows (ESQL-41).**
+  Present in 1.4.12. `SELECT COUNT(*) FROM p JOIN q ON …` returned 257 rows — the
+  right value, then 256 rows of `0`, constant regardless of table size.
+  `SpillAgg::finalize` finalised all 256 spill partitions including the empty ones,
+  and for an aggregate with **no GROUP BY** finalising an empty group set correctly
+  means "zero rows in, one row out". Empty partitions are now skipped; an empty
+  join still returns a single `0`, and `GROUP BY` over a join was never affected.
+  Clients reading only the first row (most ORMs, for a scalar aggregate) saw the
+  correct value, which is why this went unnoticed.
+
 - **A CPU-heavy query no longer makes the server unresponsive (ESQL-38).**
   Statement execution shares the async runtime's workers with the connection
   listener and every other session, so a long *synchronous* stretch — a join

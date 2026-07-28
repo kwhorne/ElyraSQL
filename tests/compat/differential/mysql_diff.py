@@ -98,6 +98,14 @@ FIXTURES = [
     "(3,NULL,NULL,NULL,'2024-02-29'),(4,0,0.0,'','2000-01-01')",
     # Case-sensitivity fixture: `s` uses the default (case-insensitive) collation,
     # `sb` an explicit binary one, so REGEXP/comparison collation can be compared.
+    # Join fixture spanning the 128..255 byte range.
+    "DROP TABLE IF EXISTS jn",
+    "CREATE TABLE jn (id INT PRIMARY KEY, g INT)",
+    *[
+        "INSERT INTO jn VALUES "
+        + ",".join(f"({i},{i % 8})" for i in range(lo, min(lo + 100, 401)))
+        for lo in range(1, 401, 100)
+    ],
     "DROP TABLE IF EXISTS cs",
     "CREATE TABLE cs (s VARCHAR(20), sb VARCHAR(20) COLLATE utf8mb4_bin)",
     "INSERT INTO cs VALUES ('Hello','Hello')",
@@ -227,6 +235,18 @@ CASES = [
     ("like", "SELECT 'abc' REGEXP '^a.c$'"),
     ("like", "SELECT NULL LIKE '%'"),
     ("like", "SELECT 'abc' LIKE NULL"),
+    # Join key encoding: a collation key is binary, so lossy UTF-8 conversion used
+    # to collapse every value whose key contained a byte >= 0x80 (ids 128..255) into
+    # one hash key, and a bare aggregate over a join emitted one bogus row per
+    # empty spill partition.
+    ("join", "SELECT COUNT(*) FROM jn a JOIN jn b ON a.id = b.id"),
+    ("join", "SELECT COUNT(*) FROM jn a JOIN jn b ON a.id = b.id WHERE a.id <> b.id"),
+    ("join", "SELECT COUNT(*) FROM jn a JOIN jn b ON a.id = b.id WHERE a.id BETWEEN 128 AND 255"),
+    ("join", "SELECT MIN(a.id), MAX(a.id), SUM(a.id) FROM jn a JOIN jn b ON a.id = b.id"),
+    ("join", "SELECT COUNT(*) FROM jn a JOIN jn b ON a.g = b.g"),
+    ("join", "SELECT COUNT(*) FROM jn a LEFT JOIN jn b ON a.id = b.id"),
+    ("join", "SELECT COUNT(*) FROM jn a JOIN jn b ON a.id = b.id WHERE a.id < 0"),
+    ("join", "SELECT a.g, COUNT(*) FROM jn a JOIN jn b ON a.id = b.id GROUP BY a.g ORDER BY a.g"),
     # REGEXP follows the operand collation: case-insensitive by default (MySQL's
     # default collation is _ci), and an inline (?-i) still overrides it.
     ("regexp", "SELECT 'Hello' REGEXP 'h'"),

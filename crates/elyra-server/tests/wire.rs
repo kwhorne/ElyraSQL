@@ -2491,3 +2491,84 @@ async fn heavy_query_does_not_block_other_sessions() {
         h.abort();
     }
 }
+
+// Two correctness bugs that shipped in 1.4.12, both in the join paths.
+//
+// 1. The hash-join key was a collation key pushed through `from_utf8_lossy`, so
+//    every byte that is not valid UTF-8 became U+FFFD and unrelated values
+//    collided. Every integer in 128..255 hashed to one key, so a 1:1 join on those
+//    ids returned their cartesian product.
+// 2. `SpillAgg::finalize` finalised all 256 spill partitions including the empty
+//    ones, and for an aggregate with **no GROUP BY** finalising an empty group set
+//    legitimately means "zero rows in, one row out" — so 256 bogus zero rows were
+//    appended after the real result.
+//
+// Expectations verified against real MySQL 8.4.
+#[tokio::test]
+async fn join_results_are_exact_across_the_byte_boundary() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop("CREATE TABLE jl (id INT PRIMARY KEY, g INT)")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE jr (id INT PRIMARY KEY, g INT)")
+        .await
+        .unwrap();
+    // Spans 128..255, where the key encoding used to collapse.
+    for i in 1..=400 {
+        c.query_drop(format!("INSERT INTO jl VALUES ({i}, {})", i % 8))
+            .await
+            .unwrap();
+        c.query_drop(format!("INSERT INTO jr VALUES ({i}, {})", i % 8))
+            .await
+            .unwrap();
+    }
+
+    // A 1:1 join on the primary key must return exactly one row per key, and a
+    // bare aggregate over it exactly one row.
+    let rows: Vec<i64> = c
+        .query("SELECT COUNT(*) FROM jl a JOIN jr b ON a.id = b.id")
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![400],
+        "bare aggregate over a join must be one row"
+    );
+
+    // No pair may mismatch: a collision would produce a.id <> b.id pairs.
+    let rows: Vec<i64> = c
+        .query("SELECT COUNT(*) FROM jl a JOIN jr b ON a.id = b.id WHERE a.id <> b.id")
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![0], "join keys must not collide");
+
+    // Only the ids that used to collide.
+    let rows: Vec<i64> = c
+        .query("SELECT COUNT(*) FROM jl a JOIN jr b ON a.id = b.id WHERE a.id BETWEEN 128 AND 255")
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![128]);
+
+    // Other aggregate shapes over a join: still exactly one row each.
+    let rows: Vec<(i64, i64, i64)> = c
+        .query("SELECT MIN(a.id), MAX(a.id), SUM(a.id) FROM jl a JOIN jr b ON a.id = b.id")
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![(1, 400, 80200)]);
+
+    // An empty join still yields the single zero row.
+    let rows: Vec<i64> = c
+        .query("SELECT COUNT(*) FROM jl a JOIN jr b ON a.id = b.id WHERE a.id < 0")
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![0]);
+
+    // GROUP BY over a join was already correct; keep it pinned.
+    let rows: Vec<(i64, i64)> = c
+        .query("SELECT a.g, COUNT(*) FROM jl a JOIN jr b ON a.id = b.id GROUP BY a.g ORDER BY a.g")
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 8);
+    assert_eq!(rows.iter().map(|(_, n)| n).sum::<i64>(), 400);
+}
