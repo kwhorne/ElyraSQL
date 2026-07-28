@@ -2944,6 +2944,25 @@ async fn in_list_lookups_return_correct_rows() {
         assert_eq!(got, Some(want), "{sql}");
     }
 
+    // Literals of a different type than the column must be coerced before they are
+    // encoded as index keys. PDO binds integers as quoted strings, so this is the
+    // ordinary shape from Laravel's whereIn - and without coercion the lookup found
+    // nothing while a scan found the rows.
+    for (sql, want) in [
+        ("SELECT COUNT(*) FROM il WHERE id IN ('1','2')", 2i64),
+        ("SELECT COUNT(*) FROM il WHERE id IN ('1',2)", 2),
+        ("SELECT COUNT(*) FROM il WHERE id IN (1.0,2.0)", 2),
+        (
+            "SELECT COUNT(*) FROM il WHERE g IN ('1','2')",
+            2 * per_group,
+        ),
+        // Not representable in the column type: matches nothing, as in MySQL.
+        ("SELECT COUNT(*) FROM il WHERE id IN ('abc')", 0),
+    ] {
+        let got: Option<i64> = c.query_first(sql).await.unwrap();
+        assert_eq!(got, Some(want), "{sql}");
+    }
+
     // Aggregates and ordered output over the lookup path.
     let got: Option<i64> = c
         .query_first("SELECT SUM(id) FROM il WHERE g IN (7,8,9)")

@@ -6999,24 +6999,40 @@ fn in_list_lookup(def: &TableDef, filter: Option<&Expr>) -> Result<Option<(usize
         if def.pk_cols != [col] && index::index_on(def, col).is_none() {
             continue;
         }
-        // Every element must be a literal; a column reference or expression would
-        // have to be evaluated per row, which is the thing being avoided.
+        // Every element must be a literal that can be coerced to the column's
+        // type. Both halves matter:
+        //  - a column reference or expression would have to be evaluated per row,
+        //    which is the thing being avoided;
+        //  - a literal of a different type must be coerced before it is encoded as
+        //    a key, or the lookup silently finds nothing. PDO sends bound integers
+        //    as quoted strings, so `id IN ('1','2')` on an INT primary key is the
+        //    normal shape from Laravel, not an edge case -- without coercion it
+        //    returned zero rows while a scan returned two.
+        let coldef = &def.schema.columns[col];
         let mut vals = Vec::with_capacity(list.len());
-        let mut all_literal = true;
+        let mut usable = true;
         for item in list.iter() {
             match literal_value(item) {
-                Some(v) if !v.is_null() => vals.push(v),
-                // A NULL in the list never matches (and only affects the
-                // three-valued outcome of a non-match, which the residual filter
-                // re-applies), so it can be skipped for lookup purposes.
-                Some(_) => {}
+                // A NULL never matches, and only affects the three-valued outcome
+                // of a non-match, which the residual filter re-applies -- so it can
+                // be skipped for lookup purposes.
+                Some(v) if v.is_null() => {}
+                Some(v) => match coerce(v, &coldef.ty, &coldef.name) {
+                    Ok(c) => vals.push(c),
+                    // Not representable in the column's type: fall back to a scan
+                    // rather than guess at the comparison semantics.
+                    Err(_) => {
+                        usable = false;
+                        break;
+                    }
+                },
                 None => {
-                    all_literal = false;
+                    usable = false;
                     break;
                 }
             }
         }
-        if all_literal && !vals.is_empty() {
+        if usable && !vals.is_empty() {
             return Ok(Some((col, vals)));
         }
     }

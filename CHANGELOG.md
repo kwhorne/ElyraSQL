@@ -18,6 +18,10 @@ All notable changes to ElyraSQL are documented here. The format is based on
   rather than one per value. Measured on 200k rows: `IN (5 values)` **4.51 ms →
   1.26 ms**. A long list is still dominated by the fallback scan evaluating the list
   per row, which needs set membership in the compiled predicate (tracked).
+  List elements are coerced to the column's type before being encoded as keys —
+  PDO binds integers as quoted strings, so `id IN ('1','2')` on an INT primary key is
+  the ordinary shape from Laravel's `whereIn`; without coercion the lookup found
+  nothing where a scan found the rows.
 - **A secondary-index range was used regardless of how much of the table it matched
   (ESQL-46).** An index range fetches every matching row by key, which is roughly an
   order of magnitude dearer per row than a sequential decode, so a wide range was far
