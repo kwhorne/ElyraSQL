@@ -4759,6 +4759,7 @@ fn expand_join_chain(
                     budget.account(next.len())?;
                     let mut c = row.clone();
                     c.extend_from_slice(m);
+                    budget.sample(&c);
                     next.push(c);
                 }
             }
@@ -6581,6 +6582,7 @@ fn combine(
             budget.account(out.len())?;
             let mut combined = l.clone();
             combined.extend_from_slice(r);
+            budget.sample(&combined);
             let keep = match on {
                 Some(e) => predicate::matches(e, &schema, &combined)?,
                 None => true,
@@ -6666,6 +6668,7 @@ fn hash_join(
                         budget.account(out.len())?;
                         let mut combined = lrows[i].clone();
                         combined.extend_from_slice(r);
+                        budget.sample(&combined);
                         out.push(combined);
                         matched = true;
                     }
@@ -6697,6 +6700,7 @@ fn hash_join(
                         budget.account(out.len())?;
                         let mut combined = l.clone();
                         combined.extend_from_slice(&rrows[i]);
+                        budget.sample(&combined);
                         out.push(combined);
                         matched = true;
                     }
@@ -7333,6 +7337,52 @@ fn join_max_rows_total() -> usize {
     env_usize("ELYRASQL_JOIN_MAX_ROWS_TOTAL", 20_000_000)
 }
 
+/// Memory ceiling for rows buffered by **all** materialising joins at once
+/// (`ELYRASQL_JOIN_MAX_BYTES`, default 2 GiB).
+///
+/// The row-count ceiling above is a poor proxy for memory: 20M rows measured about
+/// 5.4 GB for a narrow schema, but a wide one costs several times that for the same
+/// count. This bound is what actually protects the process, with the row count kept
+/// as a cheap secondary guard.
+fn join_max_bytes() -> usize {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<usize> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("ELYRASQL_JOIN_MAX_BYTES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n >= 1 << 20)
+            .unwrap_or(2 << 30)
+    })
+}
+
+/// Rough heap cost of one buffered row.
+///
+/// Each row is a `Vec<Value>`, so the allocation header and the per-`Value` size
+/// dominate for narrow rows, while `Text`/`Blob`/`Vector` payloads dominate for wide
+/// ones. Estimated once from a sample row rather than measured per row: the budget
+/// only needs the right order of magnitude to keep the process alive.
+fn estimated_row_bytes(row: &[Value]) -> usize {
+    const VEC_OVERHEAD: usize = 32;
+    VEC_OVERHEAD
+        + row
+            .iter()
+            .map(|v| {
+                std::mem::size_of::<Value>()
+                    + match v {
+                        Value::Text(s) => s.len(),
+                        Value::Bytes(b) => b.len(),
+                        Value::Vector(f) => f.len() * std::mem::size_of::<f32>(),
+                        Value::Json(j) => j.len(),
+                        _ => 0,
+                    }
+            })
+            .sum::<usize>()
+}
+
+/// Bytes currently reserved across all materialising joins.
+static JOIN_BYTES_LIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// Rows currently buffered across all materialising joins.
 static JOIN_ROWS_LIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
@@ -7346,6 +7396,11 @@ static JOIN_ROWS_LIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::Atomi
 struct JoinBudget {
     /// Rows currently reserved from the shared ceiling by this join.
     reserved: usize,
+    /// Bytes currently reserved from the shared memory ceiling by this join.
+    reserved_bytes: usize,
+    /// Estimated heap cost of one row, sampled from the first row this join buffers.
+    /// `None` until the first sample, since the width is not known before that.
+    row_bytes: Option<usize>,
 }
 
 impl JoinBudget {
@@ -7354,7 +7409,20 @@ impl JoinBudget {
     const BLOCK: usize = 65_536;
 
     fn new() -> Self {
-        Self { reserved: 0 }
+        Self {
+            reserved: 0,
+            reserved_bytes: 0,
+            row_bytes: None,
+        }
+    }
+
+    /// Sample the row width once, so the byte budget reflects this join's rows
+    /// rather than an assumed size. Called with the first row the join buffers.
+    #[inline]
+    fn sample(&mut self, row: &[Value]) {
+        if self.row_bytes.is_none() {
+            self.row_bytes = Some(estimated_row_bytes(row).max(1));
+        }
     }
 
     /// Account for a join that has buffered `rows` rows so far, growing the
@@ -7393,6 +7461,41 @@ impl JoinBudget {
             ) {
                 Ok(_) => {
                     self.reserved = want;
+                    // Row counts are only a proxy; the ceiling that actually keeps
+                    // the process alive is memory, so reserve bytes for the same
+                    // rows using this join's sampled row width.
+                    if let Some(per_row) = self.row_bytes {
+                        let want_bytes = want.saturating_mul(per_row);
+                        if want_bytes > self.reserved_bytes {
+                            let extra_bytes = want_bytes - self.reserved_bytes;
+                            let total_bytes = join_max_bytes();
+                            let mut curb =
+                                JOIN_BYTES_LIVE.load(std::sync::atomic::Ordering::Relaxed);
+                            loop {
+                                if curb + extra_bytes > total_bytes {
+                                    return Err(Error::Query(format!(
+                                        "concurrent joins would buffer more than {} MiB in \
+                                         total (ELYRASQL_JOIN_MAX_BYTES); retry when the \
+                                         server is less busy, make the join more selective, \
+                                         or raise the limit",
+                                        total_bytes / (1 << 20)
+                                    )));
+                                }
+                                match JOIN_BYTES_LIVE.compare_exchange_weak(
+                                    curb,
+                                    curb + extra_bytes,
+                                    std::sync::atomic::Ordering::AcqRel,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                ) {
+                                    Ok(_) => {
+                                        self.reserved_bytes = want_bytes;
+                                        break;
+                                    }
+                                    Err(observed) => curb = observed,
+                                }
+                            }
+                        }
+                    }
                     return Ok(());
                 }
                 Err(observed) => cur = observed,
@@ -7411,6 +7514,9 @@ impl Drop for JoinBudget {
     fn drop(&mut self) {
         if self.reserved > 0 {
             JOIN_ROWS_LIVE.fetch_sub(self.reserved, std::sync::atomic::Ordering::AcqRel);
+        }
+        if self.reserved_bytes > 0 {
+            JOIN_BYTES_LIVE.fetch_sub(self.reserved_bytes, std::sync::atomic::Ordering::AcqRel);
         }
     }
 }
@@ -13300,6 +13406,34 @@ mod join_budget_tests {
         );
         drop(b);
         assert_eq!(JoinBudget::live(), before);
+    }
+
+    // The byte ceiling is what actually protects the process: a row count is only a
+    // proxy, and a wide row costs many times what a narrow one does.
+    #[test]
+    fn byte_ceiling_accounts_for_row_width() {
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let narrow = [elyra_core::Value::Int(1), elyra_core::Value::Int(2)];
+        let wide = [
+            elyra_core::Value::Text("x".repeat(4096)),
+            elyra_core::Value::Int(1),
+        ];
+        assert!(
+            super::estimated_row_bytes(&wide) > 10 * super::estimated_row_bytes(&narrow),
+            "a 4 KiB text row must cost far more than two integers"
+        );
+        // Sampling is what ties the reservation to this join's actual width.
+        let mut b = JoinBudget::new();
+        b.sample(&wide);
+        b.account(1).unwrap();
+        let after_wide = super::JOIN_BYTES_LIVE.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(after_wide > 0, "reserving rows must reserve bytes too");
+        drop(b);
+        assert_eq!(
+            super::JOIN_BYTES_LIVE.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "byte reservation must be returned on drop"
+        );
     }
 
     // A per-join cap alone does not bound the server: concurrent joins must share

@@ -6,6 +6,25 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **Materialising joins are now bounded by memory, not just row count (ESQL-39).**
+  The 1.4.13 ceilings counted rows, which is a poor proxy: 20M rows measured about
+  5.4 GB for a narrow schema, but a wide row costs many times a narrow one for the
+  same count, so the row ceiling could be satisfied while memory was not.
+  `ELYRASQL_JOIN_MAX_BYTES` (default 2 GiB) bounds the bytes buffered across all
+  concurrent joins, with each join sampling the width of the rows it actually emits
+  (left ++ right, not just the driving row — sampling only the left side
+  under-estimated a two-table join by roughly half). Verified with 1.5 KB rows and
+  eight concurrent cross joins against a 512 MiB ceiling: the byte ceiling is what
+  binds (14 604 refusals naming it, none naming the row ceiling), the process stays
+  healthy, and a legitimate join afterwards still works, so nothing leaks.
+
+  Documented honestly as **approximate**: reservations are taken in blocks and the
+  allocator retains freed memory, so peak RSS ran ~2.3x the ceiling in that test.
+  It is a safety net that keeps the process alive, not an accounting guarantee.
+  Real spilling for the shapes that still materialise remains open on ESQL-39.
+
 ### Fixed
 
 - **`ORDER BY` on a non-projected column failed alongside a window function.**

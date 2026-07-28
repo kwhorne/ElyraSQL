@@ -2603,8 +2603,11 @@ async fn unbounded_join_fails_instead_of_exhausting_memory() {
         .await
         .expect_err("an unbounded join product must be refused");
     let msg = err.to_string();
+    // Either ceiling may bind first -- rows for narrow data, bytes for wide -- and
+    // both are legitimate. What matters is that the query is refused and the error
+    // names a limit the operator can tune.
     assert!(
-        msg.contains("ELYRASQL_JOIN_MAX_ROWS"),
+        msg.contains("ELYRASQL_JOIN_MAX_ROWS") || msg.contains("ELYRASQL_JOIN_MAX_BYTES"),
         "the error should name the limit so it can be tuned, got: {msg}"
     );
 
