@@ -13,7 +13,23 @@ pub fn fold(s: &str) -> String {
         o.make_ascii_lowercase();
         o
     } else {
-        s.to_lowercase()
+        // Accent-insensitive: fold to the base letters MySQL gives the same primary
+        // weight, including the expansions (ae, ss, oe). This is what makes `Ærlig`
+        // sort between `ål` and `Ape` rather than after `zz`, and `café` = `cafe`.
+        let mut o = String::with_capacity(s.len());
+        for c in s.chars() {
+            if c.is_ascii() {
+                o.push(c.to_ascii_lowercase());
+            } else if let Some(f) = crate::collfold::fold_char(c) {
+                o.push_str(f);
+            } else {
+                // No ASCII primary weight (þ, ŋ, ...): case-fold only.
+                for l in c.to_lowercase() {
+                    o.push(l);
+                }
+            }
+        }
+        o
     }
 }
 
@@ -32,7 +48,8 @@ pub fn fold_cmp(a: &str, b: &str) -> Ordering {
         }
         ab.len().cmp(&bb.len())
     } else {
-        a.to_lowercase().cmp(&b.to_lowercase())
+        // Must agree with `fold`, or ordering and equality would disagree.
+        fold(a).cmp(&fold(b))
     }
 }
 
@@ -736,6 +753,67 @@ mod value_props {
         #[test]
         fn collation_key_deterministic(v in any_value()) {
             prop_assert_eq!(v.collation_key(), v.collation_key());
+        }
+    }
+}
+
+#[cfg(test)]
+mod collation_ai_tests {
+    use super::{fold, fold_cmp};
+    use std::cmp::Ordering;
+
+    // Every expectation here was measured from a real utf8mb4_0900_ai_ci column
+    // rather than assumed; the first reading was taken through a latin1 connection
+    // and was wrong, which is why these are pinned.
+    #[test]
+    fn folds_accents_and_expansions_like_mysql() {
+        for (a, b) in [
+            ("Æ", "æ"),
+            ("a", "á"),
+            ("e", "é"),
+            ("o", "ø"),
+            ("a", "å"),
+            ("ae", "æ"),
+            ("ss", "ß"),
+            ("u", "ü"),
+            ("cafe", "café"),
+            ("Strasse", "Straße"),
+            ("oe", "œ"),
+        ] {
+            assert_eq!(fold(a), fold(b), "{a} and {b} must fold equal");
+            assert_eq!(fold_cmp(a, b), Ordering::Equal, "{a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn orders_non_ascii_by_base_letter() {
+        // MySQL's order for this exact set: Ærlig folds to "aerlig", ål to "al",
+        // øl to "ol", Straße to "strasse" -- so they interleave with ASCII words
+        // instead of sorting after z.
+        let mut v = vec![
+            "zz", "Ape", "Ærlig", "cat", "øl", "ål", "cafe", "Straße", "ape",
+        ];
+        v.sort_by(|a, b| fold_cmp(a, b).then_with(|| a.cmp(b)));
+        assert_eq!(
+            v,
+            vec!["Ærlig", "ål", "Ape", "ape", "cafe", "cat", "øl", "Straße", "zz"]
+        );
+    }
+
+    #[test]
+    fn letters_with_their_own_weight_are_not_folded_to_ascii() {
+        // MySQL gives þ its own primary weight, so folding it to "th" would be
+        // wrong. It case-folds only.
+        assert_eq!(fold("Þ"), fold("þ"));
+        assert_ne!(fold("þ"), fold("th"));
+    }
+
+    #[test]
+    fn ascii_is_unchanged_so_existing_keys_keep_their_bytes() {
+        // The migration relies on this: pure-ASCII keys fold identically, so those
+        // databases need no data rewritten.
+        for s in ["Ape", "cat", "ZZ_9", "a-b_c"] {
+            assert_eq!(fold(s), s.to_ascii_lowercase());
         }
     }
 }

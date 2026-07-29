@@ -288,6 +288,9 @@ async fn run() -> anyhow::Result<()> {
                 db.set_sync_policy(1, semi_sync_ms, sync_strict);
             }
             let engine = Engine::new(db.clone());
+            // Before any connection is accepted, so no query sees a half-migrated
+            // keyspace. A database whose indexed text is pure ASCII is untouched.
+            engine.migrate_collation().await?;
 
             let mut entries: Vec<(String, String, elyra_core::Privilege)> = Vec::new();
             if let Some(u) = user {

@@ -512,9 +512,9 @@ fn system_variables() -> Vec<(&'static str, String)> {
         ("character_set_results", "utf8mb4".into()),
         ("character_set_server", "utf8mb4".into()),
         ("character_set_system", "utf8mb3".into()),
-        ("collation_connection", "utf8mb4_general_ci".into()),
-        ("collation_database", "utf8mb4_general_ci".into()),
-        ("collation_server", "utf8mb4_general_ci".into()),
+        ("collation_connection", "utf8mb4_0900_ai_ci".into()),
+        ("collation_database", "utf8mb4_0900_ai_ci".into()),
+        ("collation_server", "utf8mb4_0900_ai_ci".into()),
         ("default_storage_engine", "InnoDB".into()),
         ("event_scheduler", "OFF".into()),
         ("foreign_key_checks", "ON".into()),
@@ -754,7 +754,7 @@ pub async fn show_table_status(db: &Session) -> Result<QueryResult> {
             Value::Null,                              // Create_time
             Value::Null,                              // Update_time
             Value::Null,                              // Check_time
-            Value::Text("utf8mb4_general_ci".into()), // Collation
+            Value::Text("utf8mb4_0900_ai_ci".into()), // Collation
             Value::Null,                              // Checksum
             Value::Text(String::new()),               // Create_options
             Value::Text(String::new()),               // Comment
@@ -1041,7 +1041,7 @@ async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec
                     let is_text = matches!(c.ty, ColumnType::Text | ColumnType::Json);
                     let collation = match (is_text, c.collation) {
                         (true, elyra_core::Collation::Bin) => Value::Text("utf8mb4_bin".into()),
-                        (true, _) => Value::Text("utf8mb4_general_ci".into()),
+                        (true, _) => Value::Text("utf8mb4_0900_ai_ci".into()),
                         (false, _) => Value::Null,
                     };
                     let charset = if is_text {
@@ -1432,8 +1432,8 @@ async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec
                         Value::Text(String::new()),
                         Value::Text("root@%".into()),
                         Value::Text("utf8mb4".into()),
-                        Value::Text("utf8mb4_general_ci".into()),
-                        Value::Text("utf8mb4_general_ci".into()),
+                        Value::Text("utf8mb4_0900_ai_ci".into()),
+                        Value::Text("utf8mb4_0900_ai_ci".into()),
                     ]);
                 }
                 after = batch.last().map(|(k, _)| k.clone());
@@ -1496,8 +1496,8 @@ async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec
                         Value::Text(String::new()),
                         Value::Text("root@%".into()),
                         Value::Text("utf8mb4".into()),
-                        Value::Text("utf8mb4_general_ci".into()),
-                        Value::Text("utf8mb4_general_ci".into()),
+                        Value::Text("utf8mb4_0900_ai_ci".into()),
+                        Value::Text("utf8mb4_0900_ai_ci".into()),
                     ]);
                 }
                 after = batch.last().map(|(k, _)| k.clone());
@@ -1541,7 +1541,7 @@ async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec
                         Value::Text("root@%".into()),
                         Value::Text("DEFINER".into()),
                         Value::Text("utf8mb4".into()),
-                        Value::Text("utf8mb4_general_ci".into()),
+                        Value::Text("utf8mb4_0900_ai_ci".into()),
                     ]);
                 }
                 after = batch.last().map(|(k, _)| k.clone());
@@ -1602,7 +1602,7 @@ async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec
                         Value::Text("def".into()),
                         Value::Text(s.into()),
                         Value::Text("utf8mb4".into()),
-                        Value::Text("utf8mb4_general_ci".into()),
+                        Value::Text("utf8mb4_0900_ai_ci".into()),
                         Value::Null,
                     ]
                 })

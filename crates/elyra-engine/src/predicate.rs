@@ -434,7 +434,7 @@ pub fn eval_row(expr: &Expr, schema: &Schema, row: &[Value]) -> Result<Value> {
                 return Ok(Value::Null);
             }
             let esc = escape_char.as_ref().and_then(|s| s.chars().next());
-            // Default collation is case-insensitive (utf8mb4_general_ci), as is
+            // Default collation is case-insensitive (utf8mb4_0900_ai_ci), as is
             // ILIKE, so both match case-insensitively.
             let m = like_eval(
                 &text.to_wire_string().unwrap_or_default(),
@@ -902,7 +902,7 @@ pub fn system_var(raw: &str) -> Value {
         | "character_set_server"
         | "character_set_database" => text("utf8mb4"),
         "collation_connection" | "collation_server" | "collation_database" => {
-            text("utf8mb4_general_ci")
+            text("utf8mb4_0900_ai_ci")
         }
         "time_zone" => text("SYSTEM"),
         "system_time_zone" => text("UTC"),

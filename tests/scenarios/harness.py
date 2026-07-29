@@ -50,18 +50,10 @@ SIZES = [1, 2, 127, 128, 129, 255, 256, 257, 1023, 2047, 2048, 2049, 4095, 4097,
 # *new*. Every entry must name the issue that will remove it -- an allowlist without
 # a tracking issue is just a hidden bug.
 ALLOWLIST: dict[str, str] = {
-    # ESQL-44: non-ASCII text sorts and compares by codepoint, while MySQL's default
-    # collation is accent-insensitive (Æ sorts with A). This affects ordering and
-    # which rows a range predicate matches. Fixing it changes on-disk index key
-    # order, so it needs a migration.
-    #
-    # Matched on the *exact* SQL, deliberately: a substring pattern like "ORDER BY s"
-    # would also hide any future bug in an unrelated query that happens to order by
-    # that column.
-    "SELECT s, COUNT(*) FROM a GROUP BY s ORDER BY s, COUNT(*)": "ESQL-44 collation ordering",
-    "SELECT k, s FROM a ORDER BY s, k LIMIT 12": "ESQL-44 collation ordering",
-    "SELECT DISTINCT s FROM a ORDER BY s": "ESQL-44 collation ordering",
-    "SELECT COUNT(*) FROM a WHERE s > 'cat'": "ESQL-44 collation comparison",
+    # Empty: every previously tolerated divergence has been fixed. Entries are matched
+    # on the *exact* SQL, deliberately -- a substring pattern like "ORDER BY s" would
+    # also hide a future bug in an unrelated query that happens to order by that
+    # column. Each entry must name the issue that will remove it.
 }
 
 

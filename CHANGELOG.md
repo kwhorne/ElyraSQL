@@ -6,6 +6,51 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed
+
+- **The default collation is now `utf8mb4_0900_ai_ci`, matching MySQL 8 (ESQL-44).**
+  The default character set was already `utf8mb4`. The default collation was
+  `utf8mb4_general_ci`: case-insensitive but *accent-sensitive*, ordering non-ASCII
+  text by codepoint. That put `Ærlig` after `zz` and made `WHERE s > 'cat'` match a
+  different set of rows than MySQL — wrong answers for Nordic and other European
+  text, not merely a different sort order.
+
+  Text now folds to the base letters MySQL gives the same primary weight, including
+  the expansions: `æ`→`ae`, `ß`→`ss`, `œ`→`oe`, `ø`→`o`, `å`→`a`, `é`→`e`. So
+  `'café' = 'cafe'`, `'Straße' = 'Strasse'`, and ordering interleaves with ASCII:
+  `Ærlig, ål, Ape, ape, cafe, café, cat, øl, Strasse, Straße, zz`.
+
+  The folding table is **derived from MySQL's own weight strings** rather than
+  written by hand, so it cannot disagree with the collation it implements. (Reading
+  the spec through the `mysql` CLI, which connects as `latin1_swedish_ci`, initially
+  reported `'Æ' = 'æ'` as false — measuring through a correctly configured client
+  was necessary to get this right.)
+
+  **The advertised collation string changed in the same release as the semantics,
+  never before it.** Reporting `utf8mb4_0900_ai_ci` while implementing something
+  else would mislead ORMs and migration tools that read `@@collation_server`.
+
+  *Known limitation:* characters with their own primary weight in MySQL (`þ`, `ŋ`,
+  `ı`) are case-folded but not reduced to ASCII, and non-Latin scripts order by
+  codepoint rather than full UCA weights.
+
+- **Automatic migration for existing databases (ESQL-44).** The collation folding
+  feeds the on-disk key encoding, so this changes the bytes under which text is
+  stored: secondary indexes, `UNIQUE` constraints and **text primary keys**. Without
+  a migration a row written as `æble` would afterwards be looked up as `aeble` and
+  not be found — silent row loss.
+
+  Databases now carry a collation version. On open, an older database has its text
+  index entries rebuilt and its text-primary-key rows re-keyed, before any connection
+  is accepted, so no query can observe a half-migrated keyspace. Each table migrates
+  in a single transaction, so a crash leaves it on one side or the other. Two rows
+  whose keys become equal under the new folding (`æ` and `ae`) are reported as a
+  collision naming both keys rather than one silently overwriting the other.
+
+  **Pure-ASCII keys fold identically and are not rewritten**, so most databases
+  migrate with no data movement at all.
+
+
 ### Added
 
 - **Cross joins now stream, so their product is never buffered (ESQL-39).** A

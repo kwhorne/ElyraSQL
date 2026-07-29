@@ -5,6 +5,7 @@
 //! vocabulary of values, types and errors.
 
 pub mod cancel;
+mod collfold;
 pub mod datetime;
 pub mod error;
 pub mod json;

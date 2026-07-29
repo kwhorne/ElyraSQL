@@ -98,10 +98,38 @@ CREATE TABLE orders (
   blocks), `CASCADE` (deletes children), and `SET NULL`. Referencing columns
   are automatically indexed.
 
-## Collation (case sensitivity)
+## Character set and collation
 
-Text is **case-insensitive by default** (`'Foo' = 'foo'`). Declare a column with
-a binary collation to make it case-sensitive:
+The default character set is **`utf8mb4`** and the default collation is
+**`utf8mb4_0900_ai_ci`**, matching MySQL 8. That collation is both
+case-insensitive and *accent-insensitive*, so text sorts and compares by base
+letter:
+
+```sql
+SELECT 'café' = 'cafe';      -- 1
+SELECT 'Straße' = 'Strasse';  -- 1
+SELECT 'Æ' = 'æ';             -- 1
+SELECT 'ae' = 'æ';            -- 1  (æ expands to ae)
+```
+
+Ordering follows the same folding, so Nordic and other European text interleaves
+with ASCII instead of sorting after `z`:
+
+```
+Ærlig, ål, Ape, ape, cafe, café, cat, øl, Strasse, Straße, zz
+```
+
+(`Ærlig` folds to `aerlig`, `ål` to `al`, `øl` to `ol`, `Straße` to `strasse`.)
+
+The folding table is derived from MySQL's own primary weights, so equality and
+ordering agree with MySQL for Latin text. **Known limitation:** characters that
+have their own primary weight in MySQL (`þ`, `ŋ`, `ı`) are case-folded but not
+reduced to ASCII, and non-Latin scripts (Greek, Cyrillic, CJK) order by codepoint
+rather than full UCA weights.
+
+### Case-sensitive columns
+
+Declare a column with a binary collation to make it case-sensitive:
 
 ```sql
 CREATE TABLE tokens (

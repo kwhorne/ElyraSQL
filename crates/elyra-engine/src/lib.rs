@@ -11,6 +11,7 @@ mod aggspill;
 mod aiembed;
 mod catalog;
 mod colcache;
+pub mod collmig;
 mod cpred;
 mod eval;
 mod exec;
@@ -88,6 +89,15 @@ impl Engine {
     /// Parse and execute one or more `;`-separated statements, enforcing that
     /// each statement is permitted at the caller's `privilege` level.
     /// Create a per-connection session over the shared database.
+    /// Bring the database up to the current collation version, re-keying text
+    /// primary keys and rebuilding text index entries if the folding changed.
+    ///
+    /// Must run before the server accepts connections: no query may observe a
+    /// half-migrated keyspace.
+    pub async fn migrate_collation(&self) -> elyra_core::Result<()> {
+        crate::collmig::migrate(&self.session()).await
+    }
+
     pub fn session(&self) -> Session {
         Session::new(self.db.clone(), self.locks.clone())
     }
