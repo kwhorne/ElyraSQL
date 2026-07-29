@@ -12,7 +12,7 @@ drivers connect without modification.
 - **Authentication** — `mysql_native_password` by **default** (widest driver
   compatibility), with `caching_sha2_password` available opt-in (see below).
 - **TLS** — clients may negotiate SSL.
-- **Handshake** — reports a MySQL-looking version, e.g. `8.0.0-ElyraSQL-1.4.15`,
+- **Handshake** — reports a MySQL-looking version, e.g. `8.0.0-ElyraSQL-1.5.0`,
   and answers the session/introspection queries clients send on connect
   (`SELECT @@version_comment`, `SELECT VERSION()`, `SET ...`,
   `SHOW VARIABLES/STATUS/COLLATION/DATABASES/TABLE STATUS`, and the
@@ -68,6 +68,23 @@ over the TLS channel, or — on a plaintext connection — RSA-encrypted with th
 server's public key and decrypted server-side. Prefer **TLS** when using it, and
 note that some drivers (e.g. `mysql_async`) are happiest on `mysql_native_password`
 and may stumble on the full-auth exchange — the default already avoids this.
+
+## Character set and collation
+
+The default character set is `utf8mb4` and the default collation is
+`utf8mb4_0900_ai_ci`, matching MySQL 8. The collation is case- **and**
+accent-insensitive: `'café' = 'cafe'`, `'Straße' = 'Strasse'`, `'ae' = 'æ'`, and
+ordering interleaves non-ASCII with ASCII (`Ærlig, ål, Ape, cafe, cat, øl, zz`).
+
+The folding table is derived from MySQL's own `WEIGHT_STRING` output, so equality
+and ordering agree with MySQL for Latin text. Characters that have their own
+primary weight in MySQL (`þ`, `ŋ`, `ı`) are case-folded but not reduced to ASCII,
+and non-Latin scripts (Greek, Cyrillic, CJK) order by codepoint rather than full
+UCA weights.
+
+A database created by ElyraSQL before 1.5.0 is migrated automatically on first
+open: text index entries are rebuilt and text primary keys re-keyed, before any
+connection is accepted. Databases whose indexed text is pure ASCII are unaffected.
 
 ## Differences and gaps
 

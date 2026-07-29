@@ -6,6 +6,24 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-07-29
+
+A behaviour-changing release: the default collation becomes MySQL's
+`utf8mb4_0900_ai_ci`, so non-ASCII text sorts and compares by base letter. That
+changes **which rows a query returns** for Nordic and other European text, and it
+changes the bytes under which text is stored -- so existing databases are migrated
+automatically on open. Alongside it, comma cross joins now stream instead of being
+materialised, which was the last shape that could exhaust memory.
+
+The threshold sweep against MySQL 8.4 now passes with an **empty allowlist**: all 51
+queries at 15 row counts return byte-identical results. Every previously tolerated
+divergence is gone.
+
+**On-disk change:** text indexes and text primary keys are re-keyed on first open by
+1.5.0. The migration runs before connections are accepted and commits one table at a
+time, so a crash leaves each table fully on one side. Databases whose indexed text is
+pure ASCII are not rewritten. Downgrading to 1.4.x after upgrading is not supported.
+
 ### Changed
 
 - **The default collation is now `utf8mb4_0900_ai_ci`, matching MySQL 8 (ESQL-44).**
@@ -50,6 +68,18 @@ All notable changes to ElyraSQL are documented here. The format is based on
   **Pure-ASCII keys fold identically and are not rewritten**, so most databases
   migrate with no data movement at all.
 
+- **Window functions are 25–35% faster (ESQL-46).** The projection was rebuilt for
+  every row: `map_expr` cloned the whole expression tree, the window list was searched
+  by *deep* `Expr` equality, a literal node was allocated from the value, and the
+  result was re-interpreted — per row, per projection item. Each item is now classified
+  once (is a window call / contains one / contains none), so the ordinary shapes do no
+  expression work at all. Partition keys are also raw collation bytes instead of a
+  `String` built by mapping each byte through `as char` (which re-encodes every byte
+  ≥ 0x80 as multi-byte UTF-8) with a clone per row, and an unpartitioned window skips
+  the hashing entirely. Measured on 200k rows: `LAG`/`LEAD` **48.5 ms → 32.9 ms**
+  (parity with MySQL), `SUM` over a partition **64.5 ms → 40.9 ms**, partitioned
+  `ROW_NUMBER` **77.0 ms → 54.0 ms**. The remaining gap is materialising every row
+  before computing, which needs streaming windows.
 
 ### Added
 
@@ -96,20 +126,6 @@ All notable changes to ElyraSQL are documented here. The format is based on
   output. Found by a regression test written for the optimisation below — the test
   caught a compatibility gap rather than a regression.
 
-### Changed
-
-- **Window functions are 25–35% faster (ESQL-46).** The projection was rebuilt for
-  every row: `map_expr` cloned the whole expression tree, the window list was searched
-  by *deep* `Expr` equality, a literal node was allocated from the value, and the
-  result was re-interpreted — per row, per projection item. Each item is now classified
-  once (is a window call / contains one / contains none), so the ordinary shapes do no
-  expression work at all. Partition keys are also raw collation bytes instead of a
-  `String` built by mapping each byte through `as char` (which re-encodes every byte
-  ≥ 0x80 as multi-byte UTF-8) with a clone per row, and an unpartitioned window skips
-  the hashing entirely. Measured on 200k rows: `LAG`/`LEAD` **48.5 ms → 32.9 ms**
-  (parity with MySQL), `SUM` over a partition **64.5 ms → 40.9 ms**, partitioned
-  `ROW_NUMBER` **77.0 ms → 54.0 ms**. The remaining gap is materialising every row
-  before computing, which needs streaming windows.
 
 ## [1.4.15] - 2026-07-28
 
@@ -2064,6 +2080,7 @@ core CRUD with `WHERE`/`ORDER BY`/`LIMIT`, indexes, aggregation and `GROUP BY`,
 joins, prepared statements, authentication and TLS, vector search (exact +
 HNSW), parallel OLAP aggregation, and transactions with snapshot isolation.
 
+[1.5.0]: https://github.com/kwhorne/ElyraSQL/releases/tag/v1.5.0
 [1.4.15]: https://github.com/kwhorne/ElyraSQL/releases/tag/v1.4.15
 [1.4.14]: https://github.com/kwhorne/ElyraSQL/releases/tag/v1.4.14
 [1.4.13]: https://github.com/kwhorne/ElyraSQL/releases/tag/v1.4.13
