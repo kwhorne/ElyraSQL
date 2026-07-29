@@ -74,10 +74,29 @@ jobs:
     needs: build
     runs-on: ubuntu-24.04
     steps:
+      - uses: actions/checkout@v7
+
       - uses: actions/download-artifact@v8
         with:
           path: artifacts
           merge-multiple: true
+
+      # The release body used to be only the auto-generated compare link, so
+      # everything written in CHANGELOG.md -- which is where the substance is --
+      # never reached the release page. Extract this version's section instead.
+      - name: Release notes from CHANGELOG
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          awk -v v="## [$VERSION]" '
+            index($0, v) == 1 { inside = 1; next }
+            inside && /^## \[/ { exit }
+            inside { print }
+          ' CHANGELOG.md > RELEASE_NOTES.md
+          if [ ! -s RELEASE_NOTES.md ]; then
+            echo "No CHANGELOG section for $VERSION" >&2
+            exit 1
+          fi
+          wc -l RELEASE_NOTES.md
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
@@ -85,4 +104,6 @@ jobs:
           files: |
             artifacts/elyrasql-*.tar.gz
             artifacts/elyrasql-*.tar.gz.sha256
+          body_path: RELEASE_NOTES.md
+          append_body: true
           generate_release_notes: true
