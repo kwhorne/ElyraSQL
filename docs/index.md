@@ -18,14 +18,16 @@ vector search and parallel analytical (OLAP) aggregation — all under one brand
   `VECTOR(n)` columns with exact and HNSW approximate nearest-neighbour search.
 
 - :material-lightning-bolt: **Fast**
-  Sub-millisecond point lookups, index nested-loop joins, and cached ANN.
+  Sub-millisecond point lookups and cached ANN; joins and `ORDER BY ... LIMIT`
+  read only the columns a query uses, and stream instead of buffering.
 
 </div>
 
 ## Highlights
 
-- **Full SQL surface** — DDL, CRUD, `JOIN` (INNER/LEFT/RIGHT/FULL/CROSS),
-  `WHERE`, `ORDER BY`, `LIMIT`/`OFFSET`, aggregation with `GROUP BY`.
+- **Full SQL surface** — DDL, CRUD, `JOIN` (INNER/LEFT/RIGHT/FULL/CROSS, and
+  non-equi conditions like `ON a.id < b.id`), `WHERE`, `ORDER BY`,
+  `LIMIT`/`OFFSET`, aggregation with `GROUP BY`.
 - **Rich types** — `BIGINT`, `DOUBLE`, `TEXT`, `BLOB`, `BOOL`, `DATE`,
   `DATETIME`, `TIME`, `DECIMAL`, `JSON`, and `VECTOR`.
 - **Indexing** — clustered primary keys (single or composite), secondary

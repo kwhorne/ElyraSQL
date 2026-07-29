@@ -39,7 +39,11 @@ ElyraSQL picks an access path automatically:
 | anything else | full table scan (streaming) | `O(n)` |
 
 Non-accelerated scans **stream** in bounded memory, so they never load the
-whole table at once.
+whole table at once. When such a scan feeds an `ORDER BY ... LIMIT k`, only the
+filter and sort-key columns are decoded to test a row against the top-N heap; the
+full row is built only for the rows that make the cut. With `LIMIT 100` over
+200,000 rows that is ~199,900 rows never materialised (95 ms → 31 ms on
+12-column rows).
 
 An ordered `LIMIT` (a paged grid: `ORDER BY <col> ASC|DESC LIMIT n OFFSET k`) is
 served by an ordered index or clustered walk that stops after `k + n` rows —
@@ -91,8 +95,17 @@ FROM users u LEFT JOIN orders o ON u.id = o.user_id;
   sorter/aggregator (partner sides built into hash tables), so it is bounded by
   the result/hash state, not the full join output — including N-table left-deep
   chains and comma joins. A two-table `RIGHT JOIN` is rewritten to the equivalent
-  `LEFT JOIN` (columns reordered back). `FULL` and non-equi joins use nested-loop
-  and materialise before sorting/grouping.
+  `LEFT JOIN` (columns reordered back). Only the columns the query actually reads
+  are decoded and carried through the join, so its cost no longer scales with how
+  wide the rows are.
+- **Non-equi joins stream too** (since 1.6.0): an `ON` with no equality to hash on
+  (`ON a.id < b.id`, a `BETWEEN` band join) pairs every row and applies the
+  condition per pair, feeding the same spilling sorter/aggregator — bounded
+  memory, but `O(n x m)` time, so bound it with `ELYRASQL_QUERY_TIMEOUT_MS`. When
+  an `ON` mixes an equality with other conditions (`ON a.k = b.k AND a.x > b.x`),
+  the equality is hashed and the rest applied as a residual, keeping it `O(n+m)`.
+  A residual is an `ON` condition, not a `WHERE`: a pair it rejects is unmatched,
+  so a `LEFT JOIN` still NULL-extends. `FULL` joins still materialise.
 - Single-table `WHERE` conjuncts are **pushed down** to each relation before
   the join to reduce work.
 
