@@ -6,6 +6,45 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-07-29
+
+A performance release built on one finding: **two slow-join reports were the same
+defect measured from two directions**, and fixing it once turned into a rewrite of
+how row-oriented paths handle rows. Row shapes that used to scale with the *width*
+of a row now scale with what the query actually reads.
+
+Measured on 200,000 rows, both binaries run alternately against the **same data
+file** (medians of 5, two rounds; MySQL 8.4 on the same host for reference):
+
+| shape | 1.5.1 | 1.6.0 | | MySQL 8.4 |
+|---|---:|---:|---|---:|
+| `ORDER BY int LIMIT 100`, 12-column rows | 95 ms | **31 ms** | 3.0x | 55 ms |
+| `ORDER BY int LIMIT 100`, 3-column rows | 44 ms | **22 ms** | 2.0x | 28 ms |
+| `ORDER BY text LIMIT 100`, 12-column rows | 98 ms | **39 ms** | 2.5x | 57 ms |
+| 1:1 join on a PK, `COUNT(*)`, 12-column | 492 ms | **150 ms** | 3.3x | 91 ms |
+| 1:1 join on a PK, `COUNT(*)`, 3-column | 270 ms | **106 ms** | 2.5x | 71 ms |
+| 1:N join emitting 40M rows, 12-column | 33 298 ms | **1130 ms** | **29x** | 535 ms |
+| 1:N join emitting 40M rows, 3-column | 12 112 ms | **768 ms** | **16x** | 529 ms |
+| join + `ORDER BY ... LIMIT 100` | 514 ms | **157 ms** | 3.3x | 31 ms |
+| `ORDER BY` with no `LIMIT` (control) | 1951 ms | 1964 ms | — | 1869 ms |
+| `COUNT(*)` scan (control) | 3.0 ms | 3.0 ms | — | 9.7 ms |
+
+The controls are the point of the table as much as the gains: an unbounded sort and
+a plain scan did not move, so nothing was traded away. The per-change numbers in
+the entries below are deltas against the build each change landed on, which is why
+they are smaller than the release-over-release figures here.
+
+It also removes a class of query that used to be *refused*: a non-equi join
+(`ON a.id < b.id`, a `BETWEEN` band join) now streams instead of materialising
+into the memory ceilings. And it fixes a **wrong-results** bug in join planning
+that was found by verifying the above differentially against MySQL rather than by
+a report.
+
+A minor rather than patch bump: non-equi joins answer queries that previously
+errored, which is observable behaviour. There is no on-disk format change and no
+migration — 1.5.x databases open unchanged, and 1.6.0 databases still open in
+1.5.x.
+
 ### Fixed
 
 - **A join `ON` condition spanning both tables was hashed as if it were an equi
@@ -131,6 +170,45 @@ All notable changes to ElyraSQL are documented here. The format is based on
   differential battery (0 divergences), the threshold sweep at all 15 sizes
   (51/51 identical at each), the robustness scenario (13/13 invariants) and the
   full workspace test suite.
+
+### Notes
+
+- **`ESQL-47` and `ESQL-48`, filed against 1.5.1, are both closed by this release.**
+  They were reported as separate problems (joins 10-16x MySQL; `ORDER BY ... LIMIT k`
+  ~2x) and turned out to be the same defect — row-oriented paths materialising every
+  column of every row — which is why they were fixed once, as [ESQL-49], rather than
+  patched twice.
+- **The honest trade in non-equi joins:** memory is now bounded but *time* is not, and
+  the join row/byte ceilings no longer bound those shapes. An `O(n x m)` join answers
+  instead of being refused, so bound it with `ELYRASQL_QUERY_TIMEOUT_MS`, which
+  interrupts one promptly and leaves the session usable. There is still no
+  index-driven inequality (band) join, which is where MySQL wins these outright
+  (`ON b.id BETWEEN a.id AND a.id + 2`: 32 ms there, 3507 ms here). Documented in
+  [limitations](docs/limitations.md) rather than left to be discovered.
+- **Attempted, measured and reverted:** `Value::Text(Arc<str>)`, to make text clones a
+  refcount bump ([ESQL-52]). It is a trade, not a win — an `Arc<str>` costs ~25% more
+  to build and ~60% more in a build/read/drop cycle, so a text-key join gained 19%
+  while a plain `WHERE s LIKE '...'` scan lost 38%. Filters and scans are more common
+  than fanout joins on text keys, so it was reverted rather than shipped on the
+  strength of the one number that motivated it. The measurements are on the issue so
+  the experiment is not repeated blindly. What survived is the decoder unification
+  above.
+- **Verification for the whole release**, all against a reference MySQL 8.4 on the same
+  host: the 203-case differential battery (0 divergences), the threshold sweep (51/51
+  queries identical at each of 15 row counts bracketing every internal threshold), a
+  20-shape join battery written for this work (non-equi, band, `LEFT` with residual,
+  equality-plus-residual, multi-step chains, NULL keys, `GROUP BY`/`ORDER BY` over
+  each — 0 divergences), the robustness scenario (13/13 invariants including
+  crash-recovery and resource exhaustion), the full workspace suite, clippy and fmt.
+- **No migration.** No on-disk format change: 1.5.x databases open unchanged, and
+  databases written by 1.6.0 still open in 1.5.x. Verified by round-tripping a
+  database between the two builds, including non-ASCII text, JSON, NULLs and a text
+  index lookup.
+
+[ESQL-47]: https://wirelabs.youtrack.cloud/issue/ESQL-47
+[ESQL-48]: https://wirelabs.youtrack.cloud/issue/ESQL-48
+[ESQL-49]: https://wirelabs.youtrack.cloud/issue/ESQL-49
+[ESQL-52]: https://wirelabs.youtrack.cloud/issue/ESQL-52
 
 ## [1.5.1] - 2026-07-29
 

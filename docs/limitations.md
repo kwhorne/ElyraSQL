@@ -78,8 +78,9 @@ judge fit before deploying.
   (the smaller relation for INNER; an index nested-loop join when the driving
   side is small and the partner is indexed). Large INNER equi-joins whose inputs
   are already sorted on the join key (e.g. clustered primary-key scans) use a
-  streaming **merge join** (no hash table, ordered output). `FULL` and non-equi
-  joins use nested-loop.
+  streaming **merge join** (no hash table, ordered output). Non-equi joins pair
+  every row and apply the `ON` condition per pair, streamed (see below); `FULL`
+  joins use a materialising nested loop.
 - Explicit **INNER-join chains over base tables are reordered cost-based**: the
   planner drives from the smallest relation and always extends along an
   equi-join predicate, keeping intermediate results small. Reordering is
@@ -188,9 +189,9 @@ judge fit before deploying.
   join result (correct, but not memory-bounded on very large such joins; the
   `ELYRASQL_JOIN_MAX_ROWS`/`_BYTES` ceilings apply there). `FULL` needs
   unmatched-build-side tracking; a derived table is materialised first. These
-  shapes are rare and the materialising path is correct. Streaming left-deep chains of **more than
-  two** tables (and complex join expressions) is tracked in ESQL-29; today they
-  take the materialising `join_select` path.
+  shapes are rare and the materialising path is correct. Left-deep chains of more
+  than two tables *do* stream; a join expression the chain builder cannot analyse
+  takes the materialising `join_select` path.
 - **`WHERE col IN (SELECT ...)` and `DISTINCT` collection are in-memory** (unlike
   `ORDER BY`/`GROUP BY`, which spill): the subquery's value list and the distinct
   set are buffered in RAM. To stay fail-safe rather than OOM, these are **bounded**
@@ -301,15 +302,20 @@ judge fit before deploying.
       deadline on top, which the engine enforces inside its row loops so a runaway
       statement is aborted and stops consuming CPU (including work already handed to
       blocking threads).
-    - **A materialising join buffers its output in memory** (`FULL`, non-equi,
-      derived-table and cross joins — the shapes the streaming paths do not cover).
-      It is now bounded by `ELYRASQL_JOIN_MAX_ROWS` per join and
-      `ELYRASQL_JOIN_MAX_ROWS_TOTAL` across all of them, so an unconstrained join
-      fails with a clear error instead of growing until the process is killed:
-      8 concurrent 3-way cross joins over a 4000-row table went from 97 GB RSS and a
-      killed process to a **5.4 GB plateau** with the server healthy. These are
-      fail-safe caps, not spilling — a join that legitimately needs more output must
-      raise the limit or be reshaped (ESQL-39 tracks real spilling).
+    - **A materialising join buffers its output in memory** (`FULL`, derived-table
+      and multi-table `RIGHT` joins, plus any join whose output is neither
+      aggregated nor ordered — the shapes with no streaming consumer to feed).
+      It is bounded by `ELYRASQL_JOIN_MAX_ROWS` per join and
+      `ELYRASQL_JOIN_MAX_ROWS_TOTAL` / `ELYRASQL_JOIN_MAX_BYTES` across all of them,
+      so an unconstrained join fails with a clear error instead of growing until the
+      process is killed. These are fail-safe caps, not spilling — such a join must
+      raise the limit or be reshaped.
+
+      Since 1.6.0, **cross and non-equi joins no longer materialise at all**, so
+      they never reach those ceilings: a three-way `ON a.id < b.id` over 20,000 rows
+      used to fill 2136 MB and then be refused, and now holds the server at its
+      34 MB idle footprint. The trade is that their *time* is unbounded — use
+      `ELYRASQL_QUERY_TIMEOUT_MS` to bound that.
     - Connections are capped by `ELYRASQL_MAX_CONNECTIONS` (default 151, as in
       MySQL); surplus connections get error 1040, and — as in MySQL — one extra
       slot is reserved for `Admin` accounts so an operator is not locked out.

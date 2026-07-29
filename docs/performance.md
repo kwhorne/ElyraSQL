@@ -99,11 +99,12 @@ in both directions (NULL rows are indexed under a companion keyspace); see
   `NULL` placeholders at their own position, so nothing downstream shifts):
   - `ORDER BY ... LIMIT k` decodes only the filter and sort-key columns, runs the
     top-N admission test, and pays for the full row only for the rows that make
-    the cut. On 200k rows with 12 columns: **94 ms → 29 ms**.
+    the cut. On 200k rows with 12 columns: **95 ms → 31 ms**, which is faster than
+    MySQL 8.4 on the same host (56 ms).
   - Streaming joins decode each side with the same mask, so a `COUNT(*)` or a
-    single-column `SUM` over a join stops copying columns nobody selected. On a
-    200k-row 1:1 join of two 12-column tables: **488 ms → 226 ms**, and the cost
-    of *widening* the rows drops with it (wide/narrow went from 1.8x to 1.35x).
+    single-column `SUM` over a join stops copying columns nobody selected. This
+    was the larger half of the 1:1 join gain below (488 ms → 226 ms on its own,
+    before the allocation work took it to 150 ms).
 
   `SELECT *` genuinely reads every column and is unaffected, as is any query
   whose expressions can't be attributed to columns statically — those decode
@@ -123,9 +124,10 @@ in both directions (NULL rows are indexed under a companion keyspace); see
   - a wide partner whose columns the query mostly ignores has only the read
     positions written per combination.
 
-  On 200k-row joins: 1:1 on a primary key **214 ms → 132 ms**; a 1:N join emitting
-  40M rows **8.6 s → 0.98 s** (12-column rows) and 3.7 s → 0.77 s (3-column). The
-  width sensitivity is gone — 0.98 s vs 0.77 s where it used to be 8.6 s vs 3.7 s.
+  Release over release (1.5.1 vs 1.6.0, same data file, 200k rows): a 1:1 join on a
+  primary key **492 ms → 150 ms**, and a 1:N join emitting 40M rows
+  **33.3 s → 1.13 s** on 12-column rows and 12.1 s → 0.77 s on 3-column ones — so
+  the cost of *widening* the rows fell from 2.7x to 1.5x.
 - **Compiled regular expressions are cached**, so `WHERE col REGEXP '...'` compiles
   the pattern once instead of once per row. Compilation costs far more than
   matching, so this dominates such scans: a `COUNT(*)` with a `REGEXP` filter over

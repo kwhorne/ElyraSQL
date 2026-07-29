@@ -99,7 +99,11 @@ What this shows:
   ~0.86 ms — an order of magnitude faster than the full scan it replaces.
 - **Vector ANN pays a one-time build cost** (rebuild-when-stale). Ideal for
   read-heavy embedding/RAG workloads; write-heavy vector tables rebuild often.
-- **`ORDER BY` / `GROUP BY` / joins materialise** their working set in memory.
+- **`ORDER BY`, `GROUP BY` and joins are streamed and memory-bounded**, and since
+  1.6.0 they decode only the columns a query reads: an `ORDER BY ... LIMIT k`
+  builds a row only once it beats the top-N heap, and a join never allocates per
+  emitted row. `bench/latemat.py` measures both at two row widths and two join
+  fanouts, which is what separates per-row from per-key cost.
 - Numbers are from a developer laptop; treat them as relative, not absolute.
   Re-run `bench/benchmark.py` on your target hardware.
 

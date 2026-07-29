@@ -16,6 +16,17 @@ ElyraSQL targets **Ubuntu 24.04+** for production but runs anywhere Rust does.
     done, so an interrupted upgrade simply resumes on the next start. **Take a backup
     first, and note that downgrading to 1.4.x afterwards is not supported.**
 
+!!! info "Upgrading to 1.6.0"
+
+    No on-disk format change and no migration: a 1.5.x database opens unchanged, and a
+    database written by 1.6.0 still opens in 1.5.x. One behaviour change worth knowing
+    before you upgrade: a **non-equi join** (`ON a.id < b.id`, a `BETWEEN` band join)
+    used to be refused once its intermediate result hit
+    `ELYRASQL_JOIN_MAX_ROWS`/`_BYTES`. It now streams, so such a query *answers* —
+    with bounded memory but `O(n x m)` time. If you relied on the ceilings to stop
+    runaway joins, set [`ELYRASQL_QUERY_TIMEOUT_MS`](configuration.md) instead; it
+    interrupts one promptly and leaves the session usable.
+
 ## Static binaries
 
 Each [release](https://github.com/kwhorne/ElyraSQL/releases) ships fully static
@@ -23,7 +34,7 @@ Each [release](https://github.com/kwhorne/ElyraSQL/releases) ships fully static
 dependency.
 
 ```bash
-VER=1.5.1
+VER=1.6.0
 ARCH=x86_64   # or aarch64
 curl -L -o elyrasql.tar.gz \
   https://github.com/kwhorne/ElyraSQL/releases/download/v${VER}/elyrasql-${VER}-linux-${ARCH}.tar.gz
@@ -41,8 +52,8 @@ Each archive contains the `elyrasql` binary, `README`, `LICENSE`, and a sample
 Multi-arch image (`amd64` + `arm64`) on the GitHub Container Registry:
 
 ```bash
-docker pull ghcr.io/kwhorne/elyrasql:1.5.1   # or :latest
-docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.5.1
+docker pull ghcr.io/kwhorne/elyrasql:1.6.0   # or :latest
+docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.6.0
 ```
 
 The image is ~15 MB, runs as a non-root user, stores data in the

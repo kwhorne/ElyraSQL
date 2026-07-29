@@ -52,6 +52,43 @@ queries, and is within noise of the field on bulk insert and indexed lookups.
 PostgreSQL keeps a small edge on the sub-millisecond point/range queries (mature
 tuple format + planner); those are already well under a millisecond.
 
+## Row-oriented paths — the 1.6.0 work
+
+The core-SQL table above measures *selective* shapes. The shapes that used to be
+weak were the ones that emit or scan many rows, where the cost scaled with how
+wide a row is rather than with what the query reads. 1.6.0 fixed that. Both
+binaries were run **alternately against the same data file** (medians of 5, two
+rounds, 200,000 rows; MySQL 8.4 on the same host for reference):
+
+| Shape | 1.5.1 | 1.6.0 | | MySQL 8.4 |
+|---|---:|---:|---|---:|
+| `ORDER BY int LIMIT 100`, 12-column rows | 95 | **31** | 3.0x | 56 |
+| `ORDER BY int LIMIT 100`, 3-column rows | 44 | **22** | 2.0x | 28 |
+| `ORDER BY text LIMIT 100`, 12-column rows | 98 | **39** | 2.5x | 57 |
+| 1:1 join on a PK, `COUNT(*)`, 12-column | 492 | **150** | 3.3x | 91 |
+| 1:1 join on a PK, `COUNT(*)`, 3-column | 270 | **106** | 2.5x | 71 |
+| 1:N join emitting 40M rows, 12-column | 33 298 | **1130** | **29x** | 535 |
+| 1:N join emitting 40M rows, 3-column | 12 112 | **768** | **16x** | 529 |
+| join + `ORDER BY ... LIMIT 100` | 514 | **157** | 3.3x | 31 |
+| `ORDER BY` with no `LIMIT` (control) | 1951 | 1964 | — | 1869 |
+| `COUNT(*)` scan (control) | 3.0 | 3.0 | — | 9.7 |
+
+Three things to read from this rather than just the ratios. First, **the width
+sensitivity is what identified the defect and it is what closed**: the 40M-row
+join was 2.7x slower on 12-column rows than on 3-column ones and is now 1.5x
+(MySQL: 1.01x). Second, **the controls did not move** — an unbounded sort and a
+plain scan are the same as in 1.5.1, so nothing was traded away for these gains.
+Third, the two join rows differ only in *fanout* (200k emitted vs 40M from the
+same inputs), which is what separates per-key cost from per-emitted-row cost; a
+single row count would have hidden which one was being fixed.
+
+Where MySQL is still ahead: joins emitting very many rows (1.8x) and the joined
+`ORDER BY ... LIMIT` shape (4.5x, where it appears not to materialise every
+joined row before the top-N), plus index-driven inequality joins, which ElyraSQL
+does not plan at all — a `BETWEEN` band join is 32 ms there against 3507 ms here.
+Reproduce all of the above with [`bench/latemat.py`](bench/latemat.py), which
+varies row width and join fanout deliberately.
+
 ## Notes
 
 - **Bulk insert** trails only at tiny (2k-row) autocommit batches, where
@@ -61,5 +98,9 @@ tuple format + planner); those are already well under a millisecond.
 - **ClickHouse** is intentionally excluded: it is a columnar engine, a different
   architecture class, not a like-for-like target for a row store. It can be
   added with `bench/olap.py --engines elyra,clickhouse`.
-- Reproduce locally with [`bench/compare.py`](bench/compare.py) (core SQL) and
-  [`bench/olap.py`](bench/olap.py) (OLAP); numbers vary ±10–20% run-to-run.
+- Reproduce locally with [`bench/compare.py`](bench/compare.py) (core SQL),
+  [`bench/olap.py`](bench/olap.py) (OLAP) and
+  [`bench/latemat.py`](bench/latemat.py) (row width and join fanout); numbers vary
+  ±10–20% run-to-run, so compare medians and re-run A/B against the *same* data
+  file — comparing across freshly loaded files produced a 20% phantom difference
+  during the 1.6.0 work.

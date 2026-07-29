@@ -43,9 +43,10 @@ workload — served over the protocol your stack already knows.
 **[→ Get started in 60 seconds](#quick-start)** &nbsp;·&nbsp;
 **[→ Full documentation](https://elyracode.com/docs/sql-server)**
 
-> **Stable release: v1.5.1.** A broad, MySQL-compatible SQL engine: full
+> **Stable release: v1.6.0.** A broad, MySQL-compatible SQL engine: full
 > DDL/DML, all join types (INNER/LEFT/RIGHT/FULL/CROSS, streamed for large
-> analytical joins), subqueries (correlated too), CTEs (incl. `WITH RECURSIVE`),
+> analytical joins — including non-equi and cross joins, which never buffer the
+> product), subqueries (correlated too), CTEs (incl. `WITH RECURSIVE`),
 > window functions, `GROUP BY ... WITH ROLLUP`, set operations, transactions
 > (snapshot + serializable), a large function catalog with exact `DECIMAL` and
 > `BIGINT UNSIGNED`, MySQL's `utf8mb4` / `utf8mb4_0900_ai_ci` accent-insensitive
@@ -176,7 +177,7 @@ mysql -h 127.0.0.1 -P 3307 -u root -p
 SELECT 1;
 SELECT 1 + 1 AS two;
 SELECT 'hei fra ElyraSQL' AS msg;
-SELECT VERSION();   -- 8.0.0-ElyraSQL-1.5.1
+SELECT VERSION();   -- 8.0.0-ElyraSQL-1.6.0
 ```
 
 ## Configuration
@@ -198,6 +199,15 @@ full-table `COUNT` and bulk insert** and matches PostgreSQL on full-scan
 `COUNT`; PK lookup ~0.2 ms, selective join ~0.27 ms, cached vector ANN
 ~0.3 ms, bulk ingest ~183k rows/s.
 
+**1.6.0 makes row-oriented paths read only the columns a query uses**, so their
+cost no longer scales with how wide the rows are. Same data file, 1.5.1 vs 1.6.0,
+200k rows: `ORDER BY x LIMIT 100` over 12-column rows **95 ms → 31 ms** (MySQL
+8.4: 55 ms), a 1:1 join on a primary key **492 ms → 150 ms**, and a join emitting
+40M rows **33.3 s → 1.13 s**. An unbounded sort and a plain scan are unchanged —
+nothing was traded away. Non-equi joins (`ON a.id < b.id`) now stream instead of
+being refused by the memory ceilings: bounded memory, but `O(n x m)` time, so
+bound them with `ELYRASQL_QUERY_TIMEOUT_MS`.
+
 ## Install
 
 Static Linux binaries (x86_64 and aarch64) are attached to each
@@ -205,8 +215,8 @@ Static Linux binaries (x86_64 and aarch64) are attached to each
 
 ```bash
 curl -L -o elyrasql.tar.gz \
-  https://github.com/kwhorne/ElyraSQL/releases/download/v1.5.1/elyrasql-1.5.1-linux-x86_64.tar.gz
-tar xzf elyrasql.tar.gz && ./elyrasql-1.5.1-linux-x86_64/elyrasql serve
+  https://github.com/kwhorne/ElyraSQL/releases/download/v1.6.0/elyrasql-1.6.0-linux-x86_64.tar.gz
+tar xzf elyrasql.tar.gz && ./elyrasql-1.6.0-linux-x86_64/elyrasql serve
 ```
 
 ## Docker
@@ -214,7 +224,7 @@ tar xzf elyrasql.tar.gz && ./elyrasql-1.5.1-linux-x86_64/elyrasql serve
 Multi-arch image (amd64 + arm64) on GHCR:
 
 ```bash
-docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.5.1
+docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.6.0
 # with auth + a persistent volume:
 docker run -p 3307:3307 -v elyra:/var/lib/elyrasql \
   -e ELYRASQL_USER=root -e ELYRASQL_PASSWORD=secret \
