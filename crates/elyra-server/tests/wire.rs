@@ -2777,6 +2777,75 @@ async fn cross_join_streams_and_materialising_shapes_stay_bounded() {
     assert_eq!(got, Some(120));
 }
 
+/// A join `ON` whose sides are expressions must be attributed to the right
+/// relation. `equi_keys` asked "does this expression reference only left-schema
+/// columns?" through a resolver that falls back to matching on the bare column
+/// name, so in `ON a.v + b.v = 4` the reference `b.v` matched `a.v` and the whole
+/// sum was taken as the *probe key*, with the literal `4` as the partner key --
+/// a hash join on a condition that is not an equality between the two sides.
+/// The result was silently wrong (2x the rows), not an error. Expectations
+/// verified against MySQL 8.4.
+#[tokio::test]
+async fn join_on_expression_is_attributed_to_the_right_side() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop("CREATE TABLE ja (id INT PRIMARY KEY, v INT)")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE jb2 (id INT PRIMARY KEY, v INT)")
+        .await
+        .unwrap();
+    for i in 1..=40 {
+        c.query_drop(format!("INSERT INTO ja VALUES ({i}, {})", i % 4))
+            .await
+            .unwrap();
+        c.query_drop(format!("INSERT INTO jb2 VALUES ({i}, {})", i % 4))
+            .await
+            .unwrap();
+    }
+
+    // 10 rows per v on each side. a.v + b.v = 4 holds for (1,3), (2,2), (3,1)
+    // -> 3 x 100 = 300.
+    let got: Option<i64> = c
+        .query_first("SELECT COUNT(*) FROM ja a JOIN jb2 b ON a.v + b.v = 4")
+        .await
+        .unwrap();
+    assert_eq!(got, Some(300), "ON expression spanning both sides");
+
+    // a.id + b.id = 41 holds for id = 1..40 paired with 40..1 -> 40.
+    let got: Option<i64> = c
+        .query_first("SELECT COUNT(*) FROM ja a JOIN jb2 b ON a.id + b.id = 41")
+        .await
+        .unwrap();
+    assert_eq!(got, Some(40));
+
+    // The same shape under LEFT: every left row matches something here, and the
+    // count must not double.
+    let got: Option<i64> = c
+        .query_first("SELECT COUNT(*) FROM ja a LEFT JOIN jb2 b ON a.v + b.v = 4")
+        .await
+        .unwrap();
+    assert_eq!(got, Some(310), "10 unmatched left rows (v = 0) + 300");
+
+    // Ordinary equi joins, including an expression on one side only, are
+    // unaffected -- the attribution must not become too strict either.
+    let got: Option<i64> = c
+        .query_first("SELECT COUNT(*) FROM ja a JOIN jb2 b ON a.id = b.id")
+        .await
+        .unwrap();
+    assert_eq!(got, Some(40));
+    let got: Option<i64> = c
+        .query_first("SELECT COUNT(*) FROM ja a JOIN jb2 b ON a.id = b.id + 0")
+        .await
+        .unwrap();
+    assert_eq!(got, Some(40));
+    let got: Option<i64> = c
+        .query_first("SELECT COUNT(*) FROM ja a JOIN jb2 b ON a.v = b.v")
+        .await
+        .unwrap();
+    assert_eq!(got, Some(400));
+}
+
 // DISTINCT aggregates must not be split across parallel scan workers: partial
 // results merge additively, so a value seen by two workers was counted twice.
 // COUNT(DISTINCT x) came out as `workers x` the right answer -- machine-dependent

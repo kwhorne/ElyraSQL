@@ -7177,8 +7177,24 @@ fn refs_in_schema(expr: &Expr, schema: &Schema) -> bool {
     if !collect_refs(expr, &mut refs) {
         return false;
     }
-    refs.iter()
-        .all(|r| predicate::resolve_index(r, schema).is_ok())
+    // In a joined schema the columns are qualified (`a.v`, `b.v`), and a
+    // *qualified* reference must match the qualifier: `predicate::resolve_index`
+    // falls back to matching on the bare suffix, which is right when resolving a
+    // value but wrong when deciding which side of a join an expression belongs
+    // to -- it would report `b.v` as living in the left schema because `a.v` ends
+    // the same way. A bare reference keeps the unique-suffix rule, which is how
+    // `col` resolves against a joined schema in the first place.
+    let qualified = schema.columns.iter().any(|c| c.name.contains('.'));
+    refs.iter().all(|r| {
+        if qualified && r.contains('.') {
+            schema
+                .columns
+                .iter()
+                .any(|c| c.name.eq_ignore_ascii_case(r))
+        } else {
+            predicate::resolve_index(r, schema).is_ok()
+        }
+    })
 }
 
 /// Collect column references from `expr`. Returns false if the expression

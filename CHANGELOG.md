@@ -6,6 +6,22 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **A join `ON` condition spanning both tables was hashed as if it were an equi
+  key, returning wrong results (ESQL-51).** `ON a.v + b.v = 4` returned
+  2 500 000 rows where MySQL returns 1 250 000, and `ON a.id + b.id = 5000`
+  returned one row too many — silently, with no error. Side attribution
+  (`refs_in_schema`) resolved column references through the resolver's
+  bare-name fallback, so `b.v` matched the left schema's `a.v` and the whole sum
+  was judged left-only; the partner was then hashed under the constant `4` and
+  probed with `a.v + b.v` evaluated on the left row alone, where `b.v` resolves
+  back to `a.v`. A qualified reference now has to match the qualifier when the
+  schema is a joined (qualified) one; bare references and single-table schemas
+  are unchanged, so ordinary equi joins keep their hash path. Found by running a
+  join battery differentially against MySQL 8.4 while working on ESQL-39;
+  present since joins on expressions were supported.
+
 ### Performance
 
 - **Row paths no longer decode columns the query never reads (ESQL-49, covering
