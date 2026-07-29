@@ -148,7 +148,14 @@ pub fn check_password_policy(pw: &str) -> Result<()> {
 /// True if `sql` (already trimmed) begins a user-management statement we handle.
 pub fn is_user_stmt(head: &str) -> bool {
     let h = head.trim_start();
-    let starts = |kw: &str| h.len() >= kw.len() && h[..kw.len()].eq_ignore_ascii_case(kw);
+    // Compare bytes, not a string slice: `h[..kw.len()]` panics when that offset lands
+    // inside a multi-byte character, which any statement containing non-ASCII text can
+    // do -- `SELECT 'æ'='ae'` has a character spanning bytes 8..10, and "drop user" is
+    // 9 bytes long.
+    let starts = |kw: &str| {
+        let (hb, kb) = (h.as_bytes(), kw.as_bytes());
+        hb.len() >= kb.len() && hb[..kb.len()].eq_ignore_ascii_case(kb)
+    };
     starts("create user")
         || starts("drop user")
         || starts("alter user")

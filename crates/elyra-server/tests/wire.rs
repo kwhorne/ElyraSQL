@@ -3087,3 +3087,32 @@ async fn window_functions_are_exact() {
     assert_eq!(rows[0].1, 1);
     assert_eq!(rows[0].2, 1);
 }
+
+// Statements containing non-ASCII text must not panic the connection. The keyword
+// sniffers sliced the SQL by byte offset, so a multi-byte character straddling that
+// offset (`SELECT 'æ'='ae'` -- 'æ' spans bytes 8..10, "drop user" is 9 bytes) aborted
+// the worker. Newly reachable once the default collation made such literals ordinary.
+#[tokio::test]
+async fn non_ascii_literals_do_not_panic_the_connection() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    for sql in [
+        "SELECT 'æ'='ae'",
+        "SELECT 'café'='cafe'",
+        "SELECT 'Straße'='Strasse'",
+        "SELECT 'ø'='o'",
+        "SELECT 'Ærlig' < 'cat'",
+    ] {
+        let got: Option<i64> = c.query_first(sql).await.unwrap_or_else(|e| {
+            panic!("{sql} should evaluate, got: {e}");
+        });
+        assert_eq!(
+            got,
+            Some(1),
+            "{sql} should be true under utf8mb4_0900_ai_ci"
+        );
+    }
+    // The session survives and still works.
+    let got: Option<i64> = c.query_first("SELECT 1").await.unwrap();
+    assert_eq!(got, Some(1));
+}

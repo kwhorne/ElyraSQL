@@ -118,6 +118,16 @@ pure ASCII are not rewritten. Downgrading to 1.4.x after upgrading is not suppor
 
 ### Fixed
 
+- **A statement containing non-ASCII text could panic the connection.** The keyword
+  sniffers that detect user-management and procedure statements sliced the SQL by
+  byte offset (`sql[..kw.len()]`), which panics when that offset lands inside a
+  multi-byte character: `SELECT 'æ'='ae'` has a character spanning bytes 8..10 and
+  `"drop user"` is 9 bytes long, so the worker aborted and the client saw a lost
+  connection. Both sniffers now compare bytes. Found by running the release
+  reproduction against the Docker image rather than trusting a clean test suite —
+  the accent-insensitive collation makes such literals ordinary, so this moved from
+  obscure to reachable.
+
 - **`ORDER BY` on a non-projected column failed alongside a window function.**
   `SELECT amt, RANK() OVER (ORDER BY amt) FROM t ORDER BY id` was rejected with
   "ORDER BY references unknown output column", while the same query without the window

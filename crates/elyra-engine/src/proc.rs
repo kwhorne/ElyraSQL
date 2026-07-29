@@ -177,7 +177,11 @@ fn split_parts(body: &str) -> Vec<String> {
 }
 
 fn kw_at(s: &str, kw: &str) -> bool {
-    s.len() >= kw.len() && s[..kw.len()].eq_ignore_ascii_case(kw)
+    // Byte comparison rather than `s[..kw.len()]`, which panics when that offset falls
+    // inside a multi-byte character -- reachable from any statement containing
+    // non-ASCII text.
+    let (sb, kb) = (s.as_bytes(), kw.as_bytes());
+    sb.len() >= kb.len() && sb[..kb.len()].eq_ignore_ascii_case(kb)
 }
 
 /// Classify an inline statement (after THEN/ELSE/DO/LOOP) into a ProcStmt.
