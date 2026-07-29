@@ -84,14 +84,43 @@ pub async fn migrate(db: &Session) -> Result<()> {
             continue;
         }
 
+        // Old index entries go first, so the rebuild below cannot leave a stale key
+        // from the previous folding behind. Deleted in batches for the same reason
+        // the rows are: a large table must not be held in memory.
+        for p in [
+            catalog::index_table_prefix(table),
+            catalog::indexnull_table_prefix(table),
+        ] {
+            let mut cur: Option<Vec<u8>> = None;
+            loop {
+                let batch = db.scan_batch(p.clone(), cur.clone(), 4096).await?;
+                if batch.is_empty() {
+                    break;
+                }
+                let last = batch.len() < 4096;
+                cur = batch.last().map(|(k, _)| k.clone());
+                let dels: Vec<Vec<u8>> = batch.into_iter().map(|(k, _)| k).collect();
+                if !dels.is_empty() {
+                    db.commit_write(vec![], dels).await?;
+                }
+                if last {
+                    break;
+                }
+            }
+        }
+
         let prefix = catalog::data_prefix(table);
         let mut puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         let mut dels: Vec<Vec<u8>> = Vec::new();
         let mut cursor: Option<Vec<u8>> = None;
-        let mut touched = false;
-        // New PK bytes -> the row that claimed them, so a collision introduced by
-        // folding (`æ` and `ae` becoming equal) is reported rather than silently
-        // overwriting one of the two rows.
+        // New PK bytes -> the old key that claimed them, so a collision introduced by
+        // folding (`æ` and `ae` becoming equal) is reported rather than one row
+        // silently overwriting the other.
+        //
+        // Scoped to the current batch and cleared on flush: rows from earlier batches
+        // are already committed, so the storage probe below finds those. Keeping it
+        // for the whole table made peak memory grow linearly with row count (954 MB
+        // at 900k rows), which defeats the point of batching at all.
         let mut claimed: std::collections::HashMap<Vec<u8>, Vec<u8>> =
             std::collections::HashMap::new();
 
@@ -118,13 +147,20 @@ pub async fn migrate(db: &Session) -> Result<()> {
                     let encoded = crate::keyenc::encode_key_coll(&vals, &def.pk_collations())?;
                     let newk = catalog::data_key(table, &encoded);
                     if newk != k {
-                        if let Some(other) = claimed.get(&newk) {
+                        // Either another re-keyed row already claimed these bytes, or a
+                        // row that needs no re-keying is already sitting on them (`ae`
+                        // where this row is `æ`).
+                        let clash = match claimed.get(&newk) {
+                            Some(other) => Some(other.clone()),
+                            None => db.get(newk.clone()).await?.map(|_| newk.clone()),
+                        };
+                        if let Some(other) = clash {
                             return Err(Error::Query(format!(
-                                "collation migration: rows with primary keys {} and {} in table \
+                                "collation migration: primary keys {} and {} in table \
                                  `{table}` become equal under the accent-insensitive default \
                                  collation (utf8mb4_0900_ai_ci); remove or change one of them, \
                                  then restart",
-                                String::from_utf8_lossy(other),
+                                String::from_utf8_lossy(&other),
                                 String::from_utf8_lossy(&k),
                             )));
                         }
@@ -136,46 +172,25 @@ pub async fn migrate(db: &Session) -> Result<()> {
                     }
                 }
 
-                // Index entries are derived, so rebuild them at the (possibly new) key.
-                if needs_refold(&row, &key_cols) || key != k {
-                    touched = true;
-                }
                 puts.extend(index::entries_for_row(&def, &row, &key)?);
             }
+
+            // Flush per scan batch. A whole large table cannot be buffered: at 300k
+            // rows this reached 441 MB, and an out-of-memory here kills *startup*,
+            // which is worse than any query failing. Re-running the migration is
+            // idempotent -- an already re-keyed row encodes to the key it is already
+            // stored under -- so a crash mid-table is simply resumed on next open,
+            // because the version marker is only written once every table is done.
+            if !puts.is_empty() || !dels.is_empty() {
+                db.commit_write(std::mem::take(&mut puts), std::mem::take(&mut dels))
+                    .await?;
+            }
+            claimed.clear();
             if last {
                 break;
             }
         }
 
-        if !touched {
-            // Pure-ASCII keys fold identically; nothing to rewrite.
-            continue;
-        }
-
-        // Drop the old index entries wholesale before writing the rebuilt ones, so
-        // stale keys from the previous folding cannot survive.
-        for p in [
-            catalog::index_table_prefix(table),
-            catalog::indexnull_table_prefix(table),
-        ] {
-            let mut cur: Option<Vec<u8>> = None;
-            loop {
-                let batch = db.scan_batch(p.clone(), cur.clone(), 4096).await?;
-                if batch.is_empty() {
-                    break;
-                }
-                let last = batch.len() < 4096;
-                cur = batch.last().map(|(k, _)| k.clone());
-                for (k, _) in batch {
-                    dels.push(k);
-                }
-                if last {
-                    break;
-                }
-            }
-        }
-
-        db.commit_write(puts, dels).await?;
         migrated_tables += 1;
     }
 

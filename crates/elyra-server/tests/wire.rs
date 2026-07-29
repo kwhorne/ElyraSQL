@@ -3116,3 +3116,38 @@ async fn non_ascii_literals_do_not_panic_the_connection() {
     let got: Option<i64> = c.query_first("SELECT 1").await.unwrap();
     assert_eq!(got, Some(1));
 }
+
+// Once the default collation is accent-insensitive, two keys that fold together are a
+// genuine duplicate. The collation migration reports exactly this as a collision when
+// it finds the pair in existing data rather than dropping one of the rows; here the
+// same rule is checked at insert time, which is the path every new database takes.
+#[tokio::test]
+async fn keys_that_fold_together_collide_instead_of_silently_replacing() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop("CREATE TABLE cm (name VARCHAR(60) PRIMARY KEY, n INT)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO cm VALUES ('aeble', 1)")
+        .await
+        .unwrap();
+    let err = c.query_drop("INSERT INTO cm VALUES ('\u{e6}ble', 2)").await;
+    assert!(
+        err.is_err(),
+        "'\u{e6}ble' folds to 'aeble' and must be refused as a duplicate key"
+    );
+    // The original row is untouched -- the second insert must not have replaced it.
+    let got: Option<i64> = c
+        .query_first("SELECT n FROM cm WHERE name = 'aeble'")
+        .await
+        .unwrap();
+    assert_eq!(got, Some(1));
+    let got: Option<i64> = c.query_first("SELECT COUNT(*) FROM cm").await.unwrap();
+    assert_eq!(got, Some(1));
+    // Both spellings find the surviving row.
+    let got: Option<i64> = c
+        .query_first("SELECT n FROM cm WHERE name = '\u{e6}ble'")
+        .await
+        .unwrap();
+    assert_eq!(got, Some(1));
+}

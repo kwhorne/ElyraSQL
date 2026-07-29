@@ -6,6 +6,55 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.5.1] - 2026-07-29
+
+A hardening patch found by auditing 1.5.0 rather than by a bug report: the collation
+migration introduced in 1.5.0 held every write for a table in memory, which could
+exhaust memory **at startup** on a large database -- a failure mode worse than any
+query failing, because the server never comes up.
+
+### Fixed
+
+- **The collation migration could run out of memory on a large table (ESQL-44).**
+  All index entries and re-keyed rows for a table were accumulated into one `Vec`
+  before a single commit. Measured on a table with a non-ASCII text primary key and a
+  text index: **441 MB at 300k rows**, growing linearly to **954 MB at 900k**. A table
+  an order of magnitude larger would not have started at all.
+
+  Writes are now flushed per scan batch, old index entries are deleted in batches
+  before the rebuild, and the duplicate-detection set is scoped to the current batch
+  (rows from earlier batches are already committed, so a storage probe finds those).
+  Peak memory at 900k rows: **954 MB → 437 MB**, and now sub-linear — 3x the rows
+  costs 1.27x the memory rather than 3x.
+
+  Batching replaced per-table atomicity with **idempotent resume**: an already
+  re-keyed row encodes to the key it is already stored under, and the version marker
+  is only written once every table completes, so an interrupted upgrade is simply
+  redone on the next start. The 1.5.0 documentation claimed per-table atomicity and
+  has been corrected rather than left to mislead.
+
+  Collision reporting is unchanged and was re-verified across the new batch boundary:
+  a colliding pair seeded 6000 rows apart is still caught, names both keys, and
+  refuses to start.
+
+### Notes
+
+Also audited and found **not** to be problems, recorded so the checks are not repeated
+blindly: usernames are compared as raw bytes and are unaffected by the accent-
+insensitive collation (`ådmin`, `admın`, `ADMIN` are all rejected against an `admin`
+account); privilege enforcement, hostile-input handling and the durability invariants
+are unchanged.
+
+Two long-standing performance gaps were measured and filed rather than rushed:
+joins that emit many rows are 10-16x MySQL ([ESQL-47]) and `ORDER BY ... LIMIT k` on
+an unindexed column is ~2x ([ESQL-48]). Both were verified against a 1.4.15 binary and
+are **not** regressions from 1.5.0. They sit in the hot join and sort paths, where
+four wrong-results bugs have shipped before, so they get their own focused work.
+
+[ESQL-47]: https://wirelabs.youtrack.cloud/issue/ESQL-47
+[ESQL-48]: https://wirelabs.youtrack.cloud/issue/ESQL-48
+
+
 ## [1.5.0] - 2026-07-29
 
 A behaviour-changing release: the default collation becomes MySQL's
@@ -60,8 +109,9 @@ pure ASCII are not rewritten. Downgrading to 1.4.x after upgrading is not suppor
 
   Databases now carry a collation version. On open, an older database has its text
   index entries rebuilt and its text-primary-key rows re-keyed, before any connection
-  is accepted, so no query can observe a half-migrated keyspace. Each table migrates
-  in a single transaction, so a crash leaves it on one side or the other. Two rows
+  is accepted, so no query can observe a half-migrated keyspace. The migration is
+  idempotent and the version marker is written only once every table is done, so an
+  interrupted upgrade resumes on the next start. Two rows
   whose keys become equal under the new folding (`æ` and `ae`) are reported as a
   collision naming both keys rather than one silently overwriting the other.
 
@@ -2090,6 +2140,7 @@ core CRUD with `WHERE`/`ORDER BY`/`LIMIT`, indexes, aggregation and `GROUP BY`,
 joins, prepared statements, authentication and TLS, vector search (exact +
 HNSW), parallel OLAP aggregation, and transactions with snapshot isolation.
 
+[1.5.1]: https://github.com/kwhorne/ElyraSQL/releases/tag/v1.5.1
 [1.5.0]: https://github.com/kwhorne/ElyraSQL/releases/tag/v1.5.0
 [1.4.15]: https://github.com/kwhorne/ElyraSQL/releases/tag/v1.4.15
 [1.4.14]: https://github.com/kwhorne/ElyraSQL/releases/tag/v1.4.14

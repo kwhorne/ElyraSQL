@@ -2,17 +2,19 @@
 
 ElyraSQL targets **Ubuntu 24.04+** for production but runs anywhere Rust does.
 
-!!! warning "Upgrading to 1.5.0"
+!!! warning "Upgrading to 1.5.0 or later"
 
-    1.5.0 changes the default collation to `utf8mb4_0900_ai_ci`, which changes the
+    1.5.0 changed the default collation to `utf8mb4_0900_ai_ci`, which changes the
     bytes under which text is stored. A database created by an earlier version is
-    migrated automatically the first time 1.5.0 opens it: text index entries are
+    migrated automatically the first time 1.5.0 or later opens it: text index entries are
     rebuilt and text primary keys re-keyed, before any connection is accepted.
     Databases whose indexed text is pure ASCII are not rewritten.
 
-    The migration commits one table at a time, so an interrupted upgrade leaves each
-    table fully migrated or fully untouched. **Take a backup first, and note that
-    downgrading to 1.4.x afterwards is not supported.**
+    The migration writes in batches so that a large table cannot exhaust memory at
+    startup, and it is **idempotent**: an already re-keyed row encodes to the key it
+    is already stored under. The version marker is written only once every table is
+    done, so an interrupted upgrade simply resumes on the next start. **Take a backup
+    first, and note that downgrading to 1.4.x afterwards is not supported.**
 
 ## Static binaries
 
@@ -21,7 +23,7 @@ Each [release](https://github.com/kwhorne/ElyraSQL/releases) ships fully static
 dependency.
 
 ```bash
-VER=1.5.0
+VER=1.5.1
 ARCH=x86_64   # or aarch64
 curl -L -o elyrasql.tar.gz \
   https://github.com/kwhorne/ElyraSQL/releases/download/v${VER}/elyrasql-${VER}-linux-${ARCH}.tar.gz
@@ -39,8 +41,8 @@ Each archive contains the `elyrasql` binary, `README`, `LICENSE`, and a sample
 Multi-arch image (`amd64` + `arm64`) on the GitHub Container Registry:
 
 ```bash
-docker pull ghcr.io/kwhorne/elyrasql:1.5.0   # or :latest
-docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.5.0
+docker pull ghcr.io/kwhorne/elyrasql:1.5.1   # or :latest
+docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.5.1
 ```
 
 The image is ~15 MB, runs as a non-root user, stores data in the
