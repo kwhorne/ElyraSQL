@@ -53,6 +53,15 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ### Performance
 
+- **One row decoder instead of two (ESQL-52).** Full-row decoding went through
+  `bincode`/serde while projected decoding used the hand-written decoder added for
+  ESQL-49. The hand-written one is ~17% faster on a wide row containing text
+  (47 ms vs 56 ms per 200k 16-column rows), so both paths now share it and
+  `bincode` is kept only as the authoritative fallback for anything it does not
+  recognise. End to end this is modest, because ESQL-49 already routes the hot
+  shapes through the projected decoder: `SELECT DISTINCT` over a text column
+  112 → 99 ms, a text-key join 1775 → 1718 ms, everything else within noise.
+
 - **Streaming joins no longer allocate per emitted row (ESQL-50).** With decoding
   fixed by ESQL-49, what was left was allocation and copying per combination: a
   200k-row 1:1 join spent a third of its time merely *tearing down* the partner

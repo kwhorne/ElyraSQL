@@ -5,7 +5,7 @@
 //! `LIMIT`/`OFFSET`, then project — all with bounded memory. The server
 //! drains batches straight to the wire.
 
-use elyra_core::{ColumnType, Error, Result, Schema, Value};
+use elyra_core::{ColumnType, Result, Schema, Value};
 use elyra_storage::Db;
 use sqlparser::ast::Expr;
 
@@ -148,8 +148,7 @@ impl Scan {
             }
 
             for (_, value) in chunk {
-                let row: Vec<Value> =
-                    bincode::deserialize(&value).map_err(|e| Error::Storage(e.to_string()))?;
+                let row: Vec<Value> = crate::rowdec::decode_row(&value)?;
 
                 // WHERE
                 if let Some(f) = &self.filter {

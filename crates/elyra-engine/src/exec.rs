@@ -2130,8 +2130,7 @@ async fn alter_add_column(
         let last = chunk.len() < 4096;
         cursor = chunk.last().map(|(k, _)| k.clone());
         for (k, v) in chunk {
-            let mut row: Vec<Value> =
-                bincode::deserialize(&v).map_err(|e| Error::Storage(e.to_string()))?;
+            let mut row: Vec<Value> = rowdec::decode_row(&v)?;
             row.push(default.clone());
             puts.push((
                 k,
@@ -2191,8 +2190,7 @@ async fn alter_drop_column(db: &Session, def: &mut TableDef, name: &str) -> Resu
         let last = chunk.len() < 4096;
         cursor = chunk.last().map(|(k, _)| k.clone());
         for (k, v) in chunk {
-            let mut row: Vec<Value> =
-                bincode::deserialize(&v).map_err(|e| Error::Storage(e.to_string()))?;
+            let mut row: Vec<Value> = rowdec::decode_row(&v)?;
             if idx < row.len() {
                 row.remove(idx);
             }
@@ -2247,8 +2245,7 @@ async fn alter_rename_table(db: &Session, def: &mut TableDef, new: &str) -> Resu
         for (old_key, v) in chunk {
             let clustered = &old_key[old_prefix.len()..];
             let new_key = data_key(new, clustered);
-            let row: Vec<Value> =
-                bincode::deserialize(&v).map_err(|e| Error::Storage(e.to_string()))?;
+            let row: Vec<Value> = rowdec::decode_row(&v)?;
             deletes.push(old_key);
             puts.push((new_key.clone(), v));
             puts.extend(index::entries_for_row(def, &row, &new_key)?);
@@ -2348,8 +2345,7 @@ pub async fn create_fulltext_index(
         let last = chunk.len() < 4096;
         cursor = chunk.last().map(|(k, _)| k.clone());
         for (k, v) in chunk {
-            let row: Vec<Value> =
-                bincode::deserialize(&v).map_err(|e| Error::Storage(e.to_string()))?;
+            let row: Vec<Value> = rowdec::decode_row(&v)?;
             for (ek, ev) in index::entries_for_row(
                 &TableDef {
                     indexes: vec![idx.clone()],
@@ -2438,8 +2434,7 @@ pub async fn create_index(db: &Session, ci: CreateIndex) -> Result<QueryResult> 
         let last = chunk.len() < 4096;
         cursor = chunk.last().map(|(k, _)| k.clone());
         for (k, v) in chunk {
-            let row: Vec<Value> =
-                bincode::deserialize(&v).map_err(|e| Error::Storage(e.to_string()))?;
+            let row: Vec<Value> = rowdec::decode_row(&v)?;
             puts.extend(index::entries_for_row(&def, &row, &k)?);
         }
         if last {
@@ -2766,8 +2761,7 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
                     "Duplicate entry for key 'PRIMARY' on '{name}'"
                 )));
             }
-            let old_row: Vec<Value> =
-                bincode::deserialize(old_enc).map_err(|e| Error::Storage(e.to_string()))?;
+            let old_row: Vec<Value> = rowdec::decode_row(old_enc)?;
             deletes.extend(index::entry_keys_for_row(&def, &old_row, &key)?);
             let new_row = if replace {
                 row
@@ -3924,8 +3918,7 @@ pub async fn select(
                     rows = db
                         .raw_db()
                         .scan_fold_until(prefix, rows, move |rows, _k, v| {
-                            let row: Vec<Value> = bincode::deserialize(v)
-                                .map_err(|e| Error::Storage(e.to_string()))?;
+                            let row: Vec<Value> = rowdec::decode_row(v)?;
                             let keep = match &f {
                                 Some(e) => predicate::matches(e, &sch, &row)?,
                                 None => true,
@@ -3947,8 +3940,7 @@ pub async fn select(
                         let last = batch.len() < 8192;
                         cursor = batch.last().map(|(k, _)| k.clone());
                         for (_, v) in batch {
-                            let row: Vec<Value> = bincode::deserialize(&v)
-                                .map_err(|e| Error::Storage(e.to_string()))?;
+                            let row: Vec<Value> = rowdec::decode_row(&v)?;
                             if let Some(f) = &filter {
                                 if !predicate::matches(f, &def.schema, &row)? {
                                     continue;
@@ -4270,9 +4262,7 @@ pub async fn select(
                         continue;
                     }
                     let row: Vec<Value> = match &probe {
-                        Some(_) => {
-                            bincode::deserialize(&v).map_err(|e| Error::Storage(e.to_string()))?
-                        }
+                        Some(_) => rowdec::decode_row(&v)?,
                         // Already the full row -- take it and leave a fresh
                         // buffer behind for the next iteration.
                         None => std::mem::take(&mut probe_buf),
@@ -4529,8 +4519,7 @@ async fn streaming_nlj_select(
         let last = batch.len() < 4096;
         cursor = batch.last().map(|(k, _)| k.clone());
         for (_, v) in batch {
-            let l: Vec<Value> =
-                bincode::deserialize(&v).map_err(|e| Error::Storage(e.to_string()))?;
+            let l: Vec<Value> = rowdec::decode_row(&v)?;
             let key = predicate::eval_row(&driving_key, &driving_schema, &l)?;
             let matches = if key.is_null() {
                 Vec::new()
@@ -5191,7 +5180,7 @@ fn decode_partner_row(
     match mask {
         Some(m) => rowdec::decode_projected_into(bytes, plen, m, out)?,
         None => {
-            *out = bincode::deserialize(bytes).map_err(|e| Error::Storage(e.to_string()))?;
+            *out = rowdec::decode_row(bytes)?;
         }
     }
     // A stored row whose arity differs from the schema (mid-migration) would
@@ -7934,8 +7923,7 @@ async fn collect_null_rows(
             prefix,
             (Vec::<Vec<Value>>::new(), 0usize, false),
             move |st, _k, v| {
-                let row: Vec<Value> =
-                    bincode::deserialize(v).map_err(|e| Error::Storage(e.to_string()))?;
+                let row: Vec<Value> = rowdec::decode_row(v)?;
                 st.1 += 1;
                 if row.get(col).map(|x| x.is_null()).unwrap_or(false) {
                     let keep = match &f {
@@ -7983,7 +7971,7 @@ fn ordered_walk_step(
     filter: &Option<Expr>,
     schema: &Schema,
 ) -> Result<bool> {
-    let row: Vec<Value> = bincode::deserialize(v).map_err(|e| Error::Storage(e.to_string()))?;
+    let row: Vec<Value> = rowdec::decode_row(v)?;
     w.examined += 1;
     let keep = match filter {
         Some(e) => predicate::matches(e, schema, &row)?,
@@ -8425,8 +8413,7 @@ async fn collect_matches_inner(
                     let blobs = db.multi_get(cand.clone()).await?;
                     for (k, b) in cand.into_iter().zip(blobs) {
                         if let Some(bytes) = b {
-                            let row: Vec<Value> = bincode::deserialize(&bytes)
-                                .map_err(|e| Error::Storage(e.to_string()))?;
+                            let row: Vec<Value> = rowdec::decode_row(&bytes)?;
                             if recheck(&row)? {
                                 out.push((k, row));
                                 if let Some(l) = limit {
@@ -8451,8 +8438,7 @@ async fn collect_matches_inner(
                 &keyenc::encode_key_coll(&vals, &def.pk_collations())?,
             );
             if let Some(bytes) = db.get(key.clone()).await? {
-                let row: Vec<Value> =
-                    bincode::deserialize(&bytes).map_err(|e| Error::Storage(e.to_string()))?;
+                let row: Vec<Value> = rowdec::decode_row(&bytes)?;
                 if recheck(&row)? {
                     out.push((key, row));
                 }
@@ -8471,8 +8457,7 @@ async fn collect_matches_inner(
             let blobs = db.multi_get(data_keys.clone()).await?;
             for (data_key, blob) in data_keys.into_iter().zip(blobs) {
                 if let Some(bytes) = blob {
-                    let row: Vec<Value> =
-                        bincode::deserialize(&bytes).map_err(|e| Error::Storage(e.to_string()))?;
+                    let row: Vec<Value> = rowdec::decode_row(&bytes)?;
                     if recheck(&row)? {
                         out.push((data_key, row));
                         if let Some(l) = limit {
@@ -8516,8 +8501,7 @@ async fn collect_matches_inner(
             let blobs = db.multi_get(keys.clone()).await?;
             for (k, blob) in keys.into_iter().zip(blobs) {
                 let Some(b) = blob else { continue };
-                let row: Vec<Value> =
-                    bincode::deserialize(&b).map_err(|e| Error::Storage(e.to_string()))?;
+                let row: Vec<Value> = rowdec::decode_row(&b)?;
                 if let Some(f) = filter {
                     if !predicate::matches(f, &def.schema, &row)? {
                         continue;
@@ -8583,8 +8567,7 @@ async fn collect_matches_inner(
         let last = chunk.len() < 4096;
         cursor = chunk.last().map(|(k, _)| k.clone());
         for (k, v) in chunk {
-            let row: Vec<Value> =
-                bincode::deserialize(&v).map_err(|e| Error::Storage(e.to_string()))?;
+            let row: Vec<Value> = rowdec::decode_row(&v)?;
             let keep = match filter {
                 Some(f) => predicate::matches(f, &def.schema, &row)?,
                 None => true,
@@ -11665,8 +11648,7 @@ async fn hybrid_select(
             let last = batch.len() < 4096;
             cursor = batch.last().map(|(k, _)| k.clone());
             for (kk, v) in batch {
-                let row: Vec<Value> =
-                    bincode::deserialize(&v).map_err(|e| Error::Storage(e.to_string()))?;
+                let row: Vec<Value> = rowdec::decode_row(&v)?;
                 if let Some(Value::Text(txt)) = row.get(text_ci) {
                     let doc: HashSet<String> = crate::ft::tokenize(txt).into_iter().collect();
                     let hitn = terms.iter().filter(|t| doc.contains(*t)).count() as u32;
@@ -11714,8 +11696,7 @@ async fn hybrid_select(
     let mut results: Vec<(Vec<Value>, f64)> = Vec::new();
     for ((_, score), blob) in scored.iter().zip(blobs) {
         let Some(bytes) = blob else { continue };
-        let row: Vec<Value> =
-            bincode::deserialize(&bytes).map_err(|e| Error::Storage(e.to_string()))?;
+        let row: Vec<Value> = rowdec::decode_row(&bytes)?;
         if let Some(f) = filter {
             if !predicate::matches(f, &def.schema, &row)? {
                 continue;
@@ -13074,8 +13055,7 @@ async fn partitioned_aggregate(
         let last = batch.len() < 8192;
         cursor = batch.last().map(|(k, _)| k.clone());
         for (_, v) in batch {
-            let row: Vec<Value> =
-                bincode::deserialize(&v).map_err(|e| Error::Storage(e.to_string()))?;
+            let row: Vec<Value> = rowdec::decode_row(&v)?;
             if let Some(f) = &filter {
                 if !predicate::matches(f, &def.schema, &row)? {
                     continue;
@@ -13675,8 +13655,7 @@ pub async fn analyze_table(db: &Session, name: &str) -> Result<QueryResult> {
         let last = batch.len() < 8192;
         cursor = batch.last().map(|(k, _)| k.clone());
         for (_, v) in &batch {
-            let row: Vec<Value> =
-                bincode::deserialize(v).map_err(|e| Error::Storage(e.to_string()))?;
+            let row: Vec<Value> = rowdec::decode_row(v)?;
             for (i, val) in row.iter().enumerate().take(ncols) {
                 if val.is_null() {
                     nulls[i] += 1;

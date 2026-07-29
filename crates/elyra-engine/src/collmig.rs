@@ -132,8 +132,7 @@ pub async fn migrate(db: &Session) -> Result<()> {
             let last = chunk.len() < 4096;
             cursor = chunk.last().map(|(k, _)| k.clone());
             for (k, v) in chunk {
-                let row: Vec<Value> =
-                    bincode::deserialize(&v).map_err(|e| Error::Storage(e.to_string()))?;
+                let row: Vec<Value> = crate::rowdec::decode_row(&v)?;
 
                 // Re-key the row itself if its clustered key contains non-ASCII text.
                 let mut key = k.clone();

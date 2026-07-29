@@ -58,6 +58,28 @@ pub fn decode_projected(bytes: &[u8], ncols: usize, needed: &[bool]) -> Result<V
     Ok(out)
 }
 
+/// Decode every column of a stored row.
+///
+/// Equivalent to `bincode::deserialize::<Vec<Value>>`, and the same decoder the
+/// projected path uses, so the two cannot disagree about a value encoding. Falls
+/// back to `bincode` for anything it does not recognise, which keeps `bincode`
+/// authoritative for the format.
+pub fn decode_row(bytes: &[u8]) -> Result<Vec<Value>> {
+    let mut c = Cur { b: bytes, p: 0 };
+    let Ok(count) = c.u64() else {
+        return bincode::deserialize(bytes).map_err(|e| Error::Storage(e.to_string()));
+    };
+    let ncols = count as usize;
+    let mut out = Vec::with_capacity(ncols.min(1024));
+    match decode_cols(&mut c, ncols, None, &mut out) {
+        Ok(true) => Ok(out),
+        // Unknown tag or truncated stream: let bincode decide (and report).
+        Ok(false) | Err(_) => {
+            bincode::deserialize(bytes).map_err(|e| Error::Storage(e.to_string()))
+        }
+    }
+}
+
 /// Like [`decode_projected`] but decodes into a caller-owned buffer (cleared
 /// first), so a scan can reuse one allocation across millions of rows.
 pub fn decode_projected_into(
@@ -76,9 +98,29 @@ pub fn decode_projected_into(
             bincode::deserialize::<Vec<Value>>(bytes).map_err(|e| Error::Storage(e.to_string()))?;
         return Ok(());
     }
+    if !decode_cols(&mut c, count, Some(needed), out)? {
+        *out =
+            bincode::deserialize::<Vec<Value>>(bytes).map_err(|e| Error::Storage(e.to_string()))?;
+    }
+    Ok(())
+}
+
+/// Decode `count` columns from `c`, materialising those `needed` marks (or all of
+/// them when it is `None`). Shared by the projected and the full decoder so the
+/// two can never drift apart on a value encoding.
+///
+/// Returns `false` for a value tag it does not know, meaning the caller must fall
+/// back to `bincode`, which is the authoritative decoder; `out` is then undefined
+/// and must be discarded.
+fn decode_cols(
+    c: &mut Cur<'_>,
+    count: usize,
+    needed: Option<&[bool]>,
+    out: &mut Vec<Value>,
+) -> Result<bool> {
     for i in 0..count {
         let tag = c.u32()?;
-        let want = needed.get(i).copied().unwrap_or(true);
+        let want = needed.is_none_or(|n| n.get(i).copied().unwrap_or(true));
         let v = match tag {
             0 => Value::Null,
             1 => {
@@ -178,16 +220,12 @@ pub fn decode_projected_into(
                     Value::Null
                 }
             }
-            // Unknown variant tag: bail out to a full, authoritative decode.
-            _ => {
-                *out = bincode::deserialize::<Vec<Value>>(bytes)
-                    .map_err(|e| Error::Storage(e.to_string()))?;
-                return Ok(());
-            }
+            // Unknown variant tag: bail out to the authoritative decoder.
+            _ => return Ok(false),
         };
         out.push(v);
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Extract the numeric (`Int`/`Float`/`Bool`) values of selected columns from a
