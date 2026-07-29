@@ -33,7 +33,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: CPU info
-        run: echo "cores: $(nproc)"; free -h | head -2
+        # Block scalar: an unquoted YAML value cannot contain ": ", which made
+        # this whole file unparseable -- so every trigger of this workflow failed
+        # instantly and the nightly soak never actually ran.
+        run: |
+          echo "cores: $(nproc)"
+          free -h | head -2
 
       - name: Build
         run: cargo build --release -p elyra-cli
