@@ -204,6 +204,38 @@ impl Sorter {
         }
     }
 
+    /// Would a row with these sort keys be kept if pushed right now?
+    ///
+    /// This is the *admission test* callers use for late materialisation: with
+    /// `ORDER BY x LIMIT 100` over 200k rows, ~199,900 rows lose the test, so
+    /// building their `keys`/`row` vectors (and decoding the columns behind
+    /// them) is pure waste. Compute the keys into a scratch buffer, ask here,
+    /// and only materialise on `true`.
+    ///
+    /// The test is deliberately the *same* comparison [`push`](Self::push)
+    /// makes, in the same order, so a row admitted here is exactly a row `push`
+    /// would have kept -- an admission test that disagreed with the heap
+    /// comparator on even one tie would silently return wrong rows.
+    /// Outside top-N mode every row is retained, so it is always `true`.
+    pub fn admits(&self, keys: &[Value]) -> bool {
+        if !self.topn {
+            return true;
+        }
+        let n = self.offset.saturating_add(self.limit.unwrap_or(0));
+        if n == 0 {
+            return false;
+        }
+        if self.heap.len() < n {
+            return true;
+        }
+        match self.heap.peek() {
+            Some(top) => cmp_keys(keys, &top.keys, &self.asc, &self.colls) == Ordering::Less,
+            // Unreachable (n > 0 and the heap is full), but keeping the row is
+            // the safe answer: `push` decides for real.
+            None => true,
+        }
+    }
+
     /// Feed one row with its precomputed sort keys.
     pub fn push(&mut self, keys: Vec<Value>, row: Vec<Value>) -> Result<()> {
         if self.topn {
@@ -350,6 +382,80 @@ impl Drop for Sorter {
         for (p, _) in &self.runs {
             let _ = std::fs::remove_file(p);
         }
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+
+    /// Deterministic pseudo-random ints with heavy ties, so the admission test
+    /// meets the tie cases where a disagreement with the heap comparator would
+    /// silently change which rows a `LIMIT` returns.
+    fn keys_seq(n: usize, distinct: i64) -> Vec<i64> {
+        let mut s = 12345u64;
+        (0..n)
+            .map(|_| {
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((s >> 33) as i64) % distinct
+            })
+            .collect()
+    }
+
+    fn sorter(asc: bool, offset: usize, limit: Option<usize>) -> Sorter {
+        Sorter::new(vec![asc], vec![Collation::Ci], offset, limit, 1_000_000)
+    }
+
+    /// Skipping every row `admits` rejects must produce byte-identical output to
+    /// pushing every row -- that equivalence is the whole safety argument for
+    /// late materialisation.
+    #[test]
+    fn admission_test_agrees_with_push() {
+        for (asc, offset, limit) in [
+            (true, 0, Some(1)),
+            (true, 0, Some(10)),
+            (false, 0, Some(10)),
+            (true, 5, Some(10)),
+            (true, 0, Some(5000)), // limit exceeds the input
+            (true, 0, None),       // unbounded: nothing may be rejected
+            (true, 3, None),
+        ] {
+            for distinct in [3, 40, 1000] {
+                let mut all = sorter(asc, offset, limit);
+                let mut admitted = sorter(asc, offset, limit);
+                let mut skipped = 0usize;
+                for (i, k) in keys_seq(500, distinct).into_iter().enumerate() {
+                    let keys = vec![Value::Int(k)];
+                    let row = vec![Value::Int(k), Value::Int(i as i64)];
+                    all.push(keys.clone(), row.clone()).unwrap();
+                    if admitted.admits(&keys) {
+                        admitted.push(keys, row).unwrap();
+                    } else {
+                        skipped += 1;
+                    }
+                }
+                assert_eq!(
+                    all.finish().unwrap(),
+                    admitted.finish().unwrap(),
+                    "asc={asc} offset={offset} limit={limit:?} distinct={distinct}"
+                );
+                match limit {
+                    None => assert_eq!(skipped, 0, "unbounded sorts must admit every row"),
+                    // A limit wider than the input keeps everything.
+                    Some(l) if offset + l >= 500 => assert_eq!(skipped, 0),
+                    Some(_) => assert!(skipped > 0, "expected the top-N test to reject rows"),
+                }
+            }
+        }
+    }
+
+    /// `LIMIT 0` keeps nothing, so nothing should ever be materialised for it.
+    #[test]
+    fn zero_limit_admits_nothing() {
+        let s = sorter(true, 0, Some(0));
+        assert!(!s.admits(&[Value::Int(1)]));
     }
 }
 

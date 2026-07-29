@@ -491,6 +491,138 @@ async fn join_order_by_streaming() {
     assert_eq!(rows, vec![(3, Some("C".into())), (6, Some("C".into()))]);
 }
 
+/// Late materialisation (ESQL-49), single table: `ORDER BY ... LIMIT` decodes
+/// only the filter and sort-key columns until a row wins the top-N admission
+/// test. Rows must still come back complete and in the right order, and the
+/// filter must see columns nothing else references.
+#[tokio::test]
+async fn ordered_limit_late_materialisation_returns_complete_rows() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop("CREATE TABLE lm_t (k INT PRIMARY KEY, n INT, s VARCHAR(16), pad VARCHAR(16))")
+        .await
+        .unwrap();
+    let vals = (1..=200)
+        .map(|i| format!("({i},{},'s{}','pad{i}')", (i * 37) % 200, i % 7))
+        .collect::<Vec<_>>()
+        .join(",");
+    c.query_drop(format!("INSERT INTO lm_t VALUES {vals}"))
+        .await
+        .unwrap();
+
+    // ORDER BY and WHERE on columns outside the projection; the payload column
+    // is only ever read for the rows that survive.
+    let rows: Vec<(i64, String)> = c
+        .query("SELECT k, pad FROM lm_t WHERE s = 's3' ORDER BY n LIMIT 3")
+        .await
+        .unwrap();
+    let expect: Vec<(i64, String)> = {
+        let mut v: Vec<(i64, i64)> = (1..=200i64)
+            .filter(|i| i % 7 == 3)
+            .map(|i| (i, (i * 37) % 200))
+            .collect();
+        v.sort_by_key(|&(k, n)| (n, k));
+        v.into_iter()
+            .take(3)
+            .map(|(k, _)| (k, format!("pad{k}")))
+            .collect()
+    };
+    assert_eq!(rows, expect);
+
+    // OFFSET must still be honoured by the heap, and DESC too.
+    let rows: Vec<(i64,)> = c
+        .query("SELECT k FROM lm_t ORDER BY n DESC LIMIT 2 OFFSET 1")
+        .await
+        .unwrap();
+    let mut all: Vec<(i64, i64)> = (1..=200i64).map(|i| (i, (i * 37) % 200)).collect();
+    all.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    assert_eq!(rows, vec![(all[1].0,), (all[2].0,)]);
+}
+
+/// Late materialisation (ESQL-49): the streaming join paths decode only the
+/// columns a query reads. Every column that is read but *not* projected -- the
+/// join key, a WHERE column, an ORDER BY key, an aggregate argument -- must
+/// still be materialised, and columns of the same bare name on both sides must
+/// not be confused. Getting that wrong yields NULLs or wrong values silently
+/// rather than an error, so it is asserted here on values, not just row counts.
+#[tokio::test]
+async fn join_late_materialisation_reads_unprojected_columns() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    // Deliberately identical column names on both sides (`g`, `s`): a mask built
+    // by bare-name matching would map `r.g` onto `l.g`.
+    c.query_drop("CREATE TABLE lm_l (k INT PRIMARY KEY, g INT, s VARCHAR(16), pad VARCHAR(16))")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE lm_r (k INT PRIMARY KEY, g INT, s VARCHAR(16), pad VARCHAR(16))")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO lm_l VALUES (1,10,'a','pl1'),(2,20,'b','pl2'),(3,30,'c','pl3')")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO lm_r VALUES (1,11,'x','pr1'),(2,22,'y','pr2'),(3,33,'z','pr3')")
+        .await
+        .unwrap();
+
+    // COUNT(*) reads no column of either side -- but the join key still must be.
+    let n: Vec<i64> = c
+        .query("SELECT COUNT(*) FROM lm_l JOIN lm_r ON lm_l.k = lm_r.k")
+        .await
+        .unwrap();
+    assert_eq!(n, vec![3]);
+
+    // Aggregate argument and WHERE column, neither of them projected.
+    let n: Vec<i64> = c
+        .query("SELECT SUM(lm_r.g) FROM lm_l JOIN lm_r ON lm_l.k = lm_r.k WHERE lm_l.g > 10")
+        .await
+        .unwrap();
+    assert_eq!(n, vec![55], "same-named columns on both sides confused");
+
+    // GROUP BY on the partner's `s`, projecting only the aggregate.
+    let mut rows: Vec<(String, i64)> = c
+        .query("SELECT lm_r.s, COUNT(*) FROM lm_l JOIN lm_r ON lm_l.k = lm_r.k GROUP BY lm_r.s")
+        .await
+        .unwrap();
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![("x".into(), 1), ("y".into(), 1), ("z".into(), 1)]
+    );
+
+    // ORDER BY a column that is neither projected nor filtered: with LIMIT this
+    // is the top-N admission path, which must not drop or reorder rows.
+    let rows: Vec<(i64, String)> = c
+        .query(
+            "SELECT lm_l.k, lm_l.s FROM lm_l JOIN lm_r ON lm_l.k = lm_r.k \
+             ORDER BY lm_r.g DESC LIMIT 2",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![(3, "c".into()), (2, "b".into())]);
+
+    // `SELECT *` reads every column, including the ones nothing else touches.
+    type WideRow = (i64, i64, String, String, i64, i64, String, String);
+    let rows: Vec<WideRow> = c
+        .query("SELECT * FROM lm_l JOIN lm_r ON lm_l.k = lm_r.k ORDER BY lm_l.k LIMIT 1")
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![(
+            1,
+            10,
+            "a".into(),
+            "pl1".into(),
+            1,
+            11,
+            "x".into(),
+            "pr1".into()
+        )]
+    );
+}
+
 /// Join + GROUP BY where the partner is NOT indexed on the join key, so the
 /// streaming path declines and the materialising `join_select` handles the
 /// aggregation. Same correct result -- this guards the fallback path.

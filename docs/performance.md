@@ -92,6 +92,22 @@ in both directions (NULL rows are indexed under a companion keyspace); see
   join loops yield periodically, so one expensive query cannot stall the listener or
   other sessions — with 32 concurrent runaway queries on 16 cores, a new connection
   is still answered in under 0.1 s.
+- **Columns no query reads are never decoded.** Rows are stored as one encoded
+  blob, so materialising a column costs an allocation for every `TEXT`/`JSON`
+  value — which is pure waste when nothing reads it. Scans decode only the
+  columns a query references (unread ones are skipped in place and stand in as
+  `NULL` placeholders at their own position, so nothing downstream shifts):
+  - `ORDER BY ... LIMIT k` decodes only the filter and sort-key columns, runs the
+    top-N admission test, and pays for the full row only for the rows that make
+    the cut. On 200k rows with 12 columns: **94 ms → 29 ms**.
+  - Streaming joins decode each side with the same mask, so a `COUNT(*)` or a
+    single-column `SUM` over a join stops copying columns nobody selected. On a
+    200k-row 1:1 join of two 12-column tables: **488 ms → 226 ms**, and the cost
+    of *widening* the rows drops with it (wide/narrow went from 1.8x to 1.35x).
+
+  `SELECT *` genuinely reads every column and is unaffected, as is any query
+  whose expressions can't be attributed to columns statically — those decode
+  everything, exactly as before.
 - **Compiled regular expressions are cached**, so `WHERE col REGEXP '...'` compiles
   the pattern once instead of once per row. Compilation costs far more than
   matching, so this dominates such scans: a `COUNT(*)` with a `REGEXP` filter over

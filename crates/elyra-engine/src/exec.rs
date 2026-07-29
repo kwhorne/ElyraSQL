@@ -4228,6 +4228,15 @@ pub async fn select(
                 .collect();
             let mut sorter =
                 crate::sort::Sorter::new(asc, colls, offset, limit, crate::sort::sort_max_rows());
+            // Late materialisation: with a small LIMIT nearly every scanned row
+            // loses the top-N admission test, so decode only the columns the
+            // filter and the ORDER BY keys read, and pay for the full row (every
+            // TEXT column is a String allocation) only once a row is admitted.
+            // `None` = an expression we can't attribute to columns -> decode all.
+            let probe = order_probe_mask(&def.schema, filter.as_ref(), &resolved);
+            let ncols = def.schema.columns.len();
+            let mut probe_buf: Vec<Value> = Vec::with_capacity(ncols);
+            let mut keys: Vec<Value> = Vec::with_capacity(resolved.len());
             loop {
                 let batch = db.scan_batch(prefix.clone(), cursor.clone(), 8192).await?;
                 if batch.is_empty() {
@@ -4236,18 +4245,39 @@ pub async fn select(
                 let last = batch.len() < 8192;
                 cursor = batch.last().map(|(k, _)| k.clone());
                 for (_, v) in batch {
-                    let row: Vec<Value> =
-                        bincode::deserialize(&v).map_err(|e| Error::Storage(e.to_string()))?;
+                    // Probe row: either the projected subset (unread columns are
+                    // NULL placeholders at their original positions) or, when we
+                    // couldn't build a mask, the fully decoded row.
+                    match &probe {
+                        Some(mask) => {
+                            rowdec::decode_projected_into(&v, ncols, mask, &mut probe_buf)?
+                        }
+                        None => {
+                            probe_buf = bincode::deserialize(&v)
+                                .map_err(|e| Error::Storage(e.to_string()))?
+                        }
+                    }
                     if let Some(f) = &filter {
-                        if !predicate::matches(f, &def.schema, &row)? {
+                        if !predicate::matches(f, &def.schema, &probe_buf)? {
                             continue;
                         }
                     }
-                    let mut keys = Vec::with_capacity(resolved.len());
+                    keys.clear();
                     for (e, _) in &resolved {
-                        keys.push(predicate::eval_row(e, &def.schema, &row)?);
+                        keys.push(predicate::eval_row(e, &def.schema, &probe_buf)?);
                     }
-                    sorter.push(keys, row)?;
+                    if !sorter.admits(&keys) {
+                        continue;
+                    }
+                    let row: Vec<Value> = match &probe {
+                        Some(_) => {
+                            bincode::deserialize(&v).map_err(|e| Error::Storage(e.to_string()))?
+                        }
+                        // Already the full row -- take it and leave a fresh
+                        // buffer behind for the next iteration.
+                        None => std::mem::take(&mut probe_buf),
+                    };
+                    sorter.push(std::mem::take(&mut keys), row)?;
                 }
                 if last {
                     break;
@@ -4617,17 +4647,45 @@ fn apply_perm(row: &[Value], perm: &[usize]) -> Vec<Value> {
     perm.iter().map(|&i| row[i].clone()).collect()
 }
 
+/// The built chain: driving schema, the per-join steps, the combined output
+/// schema, and the decode mask for the driving table's own rows (`None` =
+/// decode every column).
+struct JoinChain {
+    dschema: Schema,
+    steps: Vec<JoinChainStep>,
+    schema: Schema,
+    dmask: Option<Vec<bool>>,
+}
+
+/// One resolved relation of the chain, before its rows are read: resolving is
+/// catalog-only, so the whole chain (and therefore the combined schema) is known
+/// before a single row is decoded -- which is what lets the caller say which
+/// columns it will actually read.
+struct PendingStep {
+    def: TableDef,
+    pcols: Vec<ColumnDef>,
+    left_schema: Schema,
+    /// `None` for a comma cross join; otherwise (probe key, partner key,
+    /// collation, LEFT?).
+    keys: Option<(Expr, Expr, elyra_core::Collation, bool)>,
+}
+
 /// Build a left-deep streaming hash join for a `TableWithJoins` (a driving table
 /// plus a chain of `JOIN`s). Each partner is materialised into a hash table
 /// keyed by the equi-join key connecting it to the accumulated left side; the
-/// driving table is left to be streamed by the caller. Returns the driving
-/// schema, the per-join steps, and the combined output schema -- or `None` when
-/// the shape is not a plain-table INNER/LEFT equi-join chain we can stream.
+/// driving table is left to be streamed by the caller. Returns `None` when the
+/// shape is not a plain-table INNER/LEFT equi-join chain we can stream.
+///
+/// `needed` is asked, once the combined schema is known but before any row is
+/// read, which columns the query actually reads; the partners are then decoded
+/// with only those columns materialised (see [`JoinChain::dmask`] for the
+/// driving side).
 async fn build_join_chain(
     db: &Session,
     from: &[TableWithJoins],
     twj: &TableWithJoins,
-) -> Result<Option<(Schema, Vec<JoinChainStep>, Schema)>> {
+    needed: &(dyn Fn(&Schema) -> Option<Vec<bool>> + Sync),
+) -> Result<Option<JoinChain>> {
     // Something must be joined: either explicit JOINs on the first entry, or further
     // comma-separated tables.
     if !matches!(twj.relation, TableFactor::Table { .. })
@@ -4638,7 +4696,9 @@ async fn build_join_chain(
     let (_ddef, dcols) = resolve_table(db, &twj.relation).await?;
     let dschema = Schema::new(dcols.clone());
     let mut left_cols = dcols;
-    let mut steps = Vec::with_capacity(twj.joins.len());
+    let mut pending: Vec<PendingStep> = Vec::with_capacity(twj.joins.len());
+
+    // --- Resolve pass: catalog only, no rows read. ---
     for join in &twj.joins {
         if !matches!(join.relation, TableFactor::Table { .. }) {
             return Ok(None);
@@ -4655,43 +4715,13 @@ async fn build_join_chain(
             return Ok(None);
         };
         let coll = join_key_collation(&lkey, &left_schema, &rkey, &pschema);
-
-        // Materialise the partner into a hash table keyed by its join key.
-        let mut table: std::collections::HashMap<Vec<u8>, Vec<Vec<Value>>> =
-            std::collections::HashMap::new();
-        let prefix = data_prefix(&pdef.name);
-        let mut cursor: Option<Vec<u8>> = None;
-        loop {
-            let batch = db.scan_batch(prefix.clone(), cursor.clone(), 8192).await?;
-            if batch.is_empty() {
-                break;
-            }
-            let last = batch.len() < 8192;
-            cursor = batch.last().map(|(k, _)| k.clone());
-            for (_, v) in batch {
-                let row: Vec<Value> =
-                    bincode::deserialize(&v).map_err(|e| Error::Storage(e.to_string()))?;
-                let key = predicate::eval_row(&rkey, &pschema, &row)?;
-                if let Some(k) = key_bytes_coll(&key, coll) {
-                    table.entry(k).or_default().push(row);
-                }
-            }
-            if last {
-                break;
-            }
-        }
-
-        steps.push(JoinChainStep {
-            partner: Partner::Keyed(Box::new(KeyedPartner {
-                table,
-                probe_key: lkey,
-                coll,
-            })),
+        left_cols.extend(pcols.clone());
+        pending.push(PendingStep {
+            def: pdef,
+            pcols,
             left_schema,
-            plen: pcols.len(),
-            left_outer: kind == JoinKind::Left,
+            keys: Some((lkey, rkey, coll, kind == JoinKind::Left)),
         });
-        left_cols.extend(pcols);
     }
 
     // Comma-separated tables after the first are cross joins: no condition, so every
@@ -4706,41 +4736,167 @@ async fn build_join_chain(
         }
         let (pdef, pcols) = resolve_table(db, &extra.relation).await?;
         let left_schema = Schema::new(left_cols.clone());
-        let mut rows: Vec<Vec<Value>> = Vec::new();
-        let prefix = data_prefix(&pdef.name);
-        let mut cursor: Option<Vec<u8>> = None;
-        // A partner larger than the per-join row cap would defeat the purpose, so
-        // decline and let the materialising path apply its budget instead.
-        let cap = join_max_rows();
-        loop {
-            let batch = db.scan_batch(prefix.clone(), cursor.clone(), 8192).await?;
-            if batch.is_empty() {
-                break;
-            }
-            let last = batch.len() < 8192;
-            cursor = batch.last().map(|(k, _)| k.clone());
-            for (_, v) in batch {
-                rows.push(bincode::deserialize(&v).map_err(|e| Error::Storage(e.to_string()))?);
-            }
-            if rows.len() > cap {
-                return Ok(None);
-            }
-            if last {
-                break;
-            }
-        }
-        steps.push(JoinChainStep {
-            partner: Partner::All(rows),
+        left_cols.extend(pcols.clone());
+        pending.push(PendingStep {
+            def: pdef,
+            pcols,
             left_schema,
-            plen: pcols.len(),
-            // A cross join has no unmatched case to preserve.
-            left_outer: false,
+            keys: None,
         });
-        left_cols.extend(pcols);
     }
 
     let combined = Schema::new(left_cols);
-    Ok(Some((dschema, steps, combined)))
+
+    // --- Late materialisation: which combined columns does the query read? ---
+    // Everything outside the mask is decoded as a NULL placeholder at its own
+    // position, so a join between two 12-column tables under `COUNT(*)` copies
+    // 24 cheap NULLs per emitted row instead of allocating 24 Strings.
+    let mut mask = needed(&combined);
+    // Every step probes its hash table with a key evaluated over the accumulated
+    // left row, so those columns must be materialised even when the query never
+    // selects them -- otherwise the key reads as NULL and the join matches
+    // nothing. `left_schema` is a prefix of the combined schema, so its indices
+    // are combined indices.
+    if let Some(m) = mask.as_mut() {
+        let mut give_up = false;
+        for p in &pending {
+            let Some((lkey, _, _, _)) = &p.keys else {
+                continue;
+            };
+            let mut refs = Vec::new();
+            if !collect_col_refs(lkey, &p.left_schema, &mut refs) {
+                give_up = true;
+                break;
+            }
+            for i in refs {
+                if i < m.len() {
+                    m[i] = true;
+                }
+            }
+        }
+        if give_up {
+            mask = None;
+        }
+    }
+    let mask = mask;
+    let dlen = dschema.columns.len();
+    let dmask = mask.as_ref().map(|m| m[..dlen].to_vec());
+
+    // --- Materialise pass: read each partner's rows, projected. ---
+    let mut steps = Vec::with_capacity(pending.len());
+    let mut off = dlen;
+    for p in pending {
+        let plen = p.pcols.len();
+        let pschema = Schema::new(p.pcols);
+        // The partner's own join key must be decoded whatever the query reads,
+        // or the hash table would be keyed on NULL.
+        let pmask = mask.as_ref().and_then(|m| {
+            let mut sub = m[off..off + plen].to_vec();
+            if let Some((_, rkey, _, _)) = &p.keys {
+                let mut refs = Vec::new();
+                if !collect_col_refs(rkey, &pschema, &mut refs) {
+                    return None; // key we can't attribute -> decode all of it
+                }
+                for i in refs {
+                    if i < sub.len() {
+                        sub[i] = true;
+                    }
+                }
+            }
+            Some(sub)
+        });
+        let prefix = data_prefix(&p.def.name);
+        let mut cursor: Option<Vec<u8>> = None;
+        let mut decoded: Vec<Value> = Vec::with_capacity(plen);
+
+        match p.keys {
+            Some((lkey, rkey, coll, left_outer)) => {
+                // Materialise the partner into a hash table keyed by its join key.
+                let mut table: std::collections::HashMap<Vec<u8>, Vec<Vec<Value>>> =
+                    std::collections::HashMap::new();
+                loop {
+                    let batch = db.scan_batch(prefix.clone(), cursor.clone(), 8192).await?;
+                    if batch.is_empty() {
+                        break;
+                    }
+                    let last = batch.len() < 8192;
+                    cursor = batch.last().map(|(k, _)| k.clone());
+                    for (_, v) in batch {
+                        let row: Vec<Value> = match &pmask {
+                            Some(pm) => {
+                                rowdec::decode_projected_into(&v, plen, pm, &mut decoded)?;
+                                std::mem::take(&mut decoded)
+                            }
+                            None => bincode::deserialize(&v)
+                                .map_err(|e| Error::Storage(e.to_string()))?,
+                        };
+                        let key = predicate::eval_row(&rkey, &pschema, &row)?;
+                        if let Some(k) = key_bytes_coll(&key, coll) {
+                            table.entry(k).or_default().push(row);
+                        }
+                    }
+                    if last {
+                        break;
+                    }
+                }
+                steps.push(JoinChainStep {
+                    partner: Partner::Keyed(Box::new(KeyedPartner {
+                        table,
+                        probe_key: lkey,
+                        coll,
+                    })),
+                    left_schema: p.left_schema,
+                    plen,
+                    left_outer,
+                });
+            }
+            None => {
+                let mut rows: Vec<Vec<Value>> = Vec::new();
+                // A partner larger than the per-join row cap would defeat the purpose, so
+                // decline and let the materialising path apply its budget instead.
+                let cap = join_max_rows();
+                loop {
+                    let batch = db.scan_batch(prefix.clone(), cursor.clone(), 8192).await?;
+                    if batch.is_empty() {
+                        break;
+                    }
+                    let last = batch.len() < 8192;
+                    cursor = batch.last().map(|(k, _)| k.clone());
+                    for (_, v) in batch {
+                        rows.push(match &pmask {
+                            Some(pm) => {
+                                rowdec::decode_projected_into(&v, plen, pm, &mut decoded)?;
+                                std::mem::take(&mut decoded)
+                            }
+                            None => bincode::deserialize(&v)
+                                .map_err(|e| Error::Storage(e.to_string()))?,
+                        });
+                    }
+                    if rows.len() > cap {
+                        return Ok(None);
+                    }
+                    if last {
+                        break;
+                    }
+                }
+                steps.push(JoinChainStep {
+                    partner: Partner::All(rows),
+                    left_schema: p.left_schema,
+                    plen,
+                    // A cross join has no unmatched case to preserve.
+                    left_outer: false,
+                });
+            }
+        }
+        off += plen;
+    }
+
+    Ok(Some(JoinChain {
+        dschema,
+        steps,
+        schema: combined,
+        dmask,
+    }))
 }
 
 /// Run a CPU-bound stretch without monopolising an async worker thread.
@@ -4793,6 +4949,16 @@ impl Pacer {
         if self.tick % Self::INTERVAL == 0 {
             tokio::task::yield_now().await;
         }
+    }
+}
+
+/// Decode one driving-table row, materialising only the columns the query reads
+/// (`None` = all of them). Skipped columns become `Value::Null` at their own
+/// position, so the combined row's layout is unchanged.
+fn decode_driving_row(bytes: &[u8], ncols: usize, mask: Option<&[bool]>) -> Result<Vec<Value>> {
+    match mask {
+        Some(m) => rowdec::decode_projected(bytes, ncols, m),
+        None => bincode::deserialize(bytes).map_err(|e| Error::Storage(e.to_string())),
     }
 }
 
@@ -4879,11 +5045,49 @@ async fn streaming_join_aggregate(
     // reordering the output columns back to (A, B) below.
     let swapped = rewrite_right_join(&select.from[0]);
     let twj = swapped.as_ref().unwrap_or(&select.from[0]);
+    // Which combined columns does this aggregation read? Everything else is
+    // decoded as a NULL placeholder, so `COUNT(*)` over a join of two wide
+    // tables stops allocating a String per column per emitted row.
+    //
+    // A rewritten RIGHT join permutes the combined row after the chain, so the
+    // mask (built against the pre-permutation layout) would not line up: decode
+    // everything there rather than reason about the inverse permutation.
+    // ORDER BY and HAVING are applied to the *grouped output*, not to combined
+    // rows, so they contribute no columns here.
+    let pruned = swapped.is_none();
+    let needed = |combined: &Schema| -> Option<Vec<bool>> {
+        if !pruned {
+            return None;
+        }
+        let plan = aggregate::build_plan(combined, &select.projection, group_by).ok()?;
+        let direct: Vec<usize> = plan
+            .group_cols()
+            .iter()
+            .copied()
+            .chain(plan.agg_input_cols())
+            .collect();
+        join_needed_mask(
+            combined,
+            filter,
+            &select.projection,
+            group_by,
+            None,
+            &[],
+            &direct,
+        )
+    };
     // Build the (left-deep) join chain: each partner into a hash table, driving
     // streamed. Handles two or more tables.
-    let Some((dschema, steps, schema)) = build_join_chain(db, &select.from, twj).await? else {
+    let Some(JoinChain {
+        dschema,
+        steps,
+        schema,
+        dmask,
+    }) = build_join_chain(db, &select.from, twj, &needed).await?
+    else {
         return Ok(None);
     };
+    let dlen = dschema.columns.len();
     let (ddef, _) = resolve_table(db, &twj.relation).await?;
 
     let reorder: Option<Vec<usize>> = swapped.as_ref().map(|_| {
@@ -4931,8 +5135,7 @@ async fn streaming_join_aggregate(
             // Expanding one driving row is synchronous and can be large, so give
             // the runtime a chance to run other tasks between rows.
             pacer.tick().await;
-            let l: Vec<Value> =
-                bincode::deserialize(&v).map_err(|e| Error::Storage(e.to_string()))?;
+            let l: Vec<Value> = decode_driving_row(&v, dlen, dmask.as_deref())?;
             combined_buf.clear();
             // Stream the expansion straight into the aggregator: a cross join's
             // product must never be buffered, not even for one driving row.
@@ -4997,11 +5200,37 @@ async fn streaming_join_order(
     // reordering the output columns back to (A, B) below.
     let swapped = rewrite_right_join(&select.from[0]);
     let twj = swapped.as_ref().unwrap_or(&select.from[0]);
+    // Which combined columns does this query read (WHERE, projection, ORDER BY)?
+    // The rest are decoded as NULL placeholders at their own positions. A
+    // rewritten RIGHT join permutes the combined row after the chain, so the
+    // mask would not line up -- decode everything there.
+    let pruned = swapped.is_none();
+    let needed = |combined: &Schema| -> Option<Vec<bool>> {
+        if !pruned {
+            return None;
+        }
+        join_needed_mask(
+            combined,
+            filter,
+            &select.projection,
+            &[],
+            select.having.as_ref(),
+            order_exprs,
+            &[],
+        )
+    };
     // Build the (left-deep) join chain: each partner into a hash table, driving
     // left to be streamed. Handles two or more tables.
-    let Some((dschema, steps, schema)) = build_join_chain(db, &select.from, twj).await? else {
+    let Some(JoinChain {
+        dschema,
+        steps,
+        schema,
+        dmask,
+    }) = build_join_chain(db, &select.from, twj, &needed).await?
+    else {
         return Ok(None);
     };
+    let dlen = dschema.columns.len();
     let (ddef, _) = resolve_table(db, &twj.relation).await?;
 
     // For a rewritten RIGHT join, restore the query's (A, B) column order in both
@@ -5046,6 +5275,7 @@ async fn streaming_join_order(
     );
     let prefix = data_prefix(&ddef.name);
     let mut cursor: Option<Vec<u8>> = None;
+    let mut keybuf: Vec<Value> = Vec::with_capacity(resolved.len());
     let mut combined_buf: Vec<Vec<Value>> = Vec::new();
     let mut check = db.cancel_check();
     let mut pacer = Pacer::new();
@@ -5060,8 +5290,7 @@ async fn streaming_join_order(
             // Expanding one driving row is synchronous and can be large, so give
             // the runtime a chance to run other tasks between rows.
             pacer.tick().await;
-            let l: Vec<Value> =
-                bincode::deserialize(&v).map_err(|e| Error::Storage(e.to_string()))?;
+            let l: Vec<Value> = decode_driving_row(&v, dlen, dmask.as_deref())?;
             combined_buf.clear();
             // Stream into the spilling sorter for the same reason as the
             // aggregate path: the product is never held, only the top-N / spill.
@@ -5071,11 +5300,16 @@ async fn streaming_join_order(
                     None => combined,
                 };
                 if keep(&combined)? {
-                    let keys = resolved
-                        .iter()
-                        .map(|(e, _)| predicate::eval_row(e, &schema, &combined))
-                        .collect::<Result<Vec<_>>>()?;
-                    sorter.push(keys, combined)?;
+                    // Evaluate the keys into a reusable buffer and run the top-N
+                    // admission test first: under `LIMIT k` almost every joined
+                    // row loses it, and a losing row should not cost a key Vec.
+                    keybuf.clear();
+                    for (e, _) in &resolved {
+                        keybuf.push(predicate::eval_row(e, &schema, &combined)?);
+                    }
+                    if sorter.admits(&keybuf) {
+                        sorter.push(std::mem::take(&mut keybuf), combined)?;
+                    }
                 }
                 Ok(())
             })?;
@@ -12549,26 +12783,33 @@ async fn index_count_eq(db: &Session, def: &TableDef, filter: &Expr) -> Result<O
 /// which case the caller must conservatively assume *all* columns are needed.
 fn collect_col_refs(e: &Expr, schema: &Schema, out: &mut Vec<usize>) -> bool {
     use sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArguments};
+    // Resolve exactly as `predicate::eval_row` does, or give up. Anything else
+    // risks marking the wrong column: in a joined schema the columns are
+    // qualified (`a.k`, `b.k`), so matching on the bare suffix alone would map
+    // `b.k` onto `a.k` -- the mask would then skip the column the query reads
+    // and it would decode as NULL, silently wrong.
     let find = |name: &str, out: &mut Vec<usize>| -> bool {
-        match schema
-            .columns
-            .iter()
-            .position(|c| c.name.eq_ignore_ascii_case(name))
-        {
-            Some(i) => {
+        match predicate::resolve_index(name, schema) {
+            Ok(i) => {
                 out.push(i);
                 true
             }
-            None => false,
+            // Unknown or ambiguous (and niladic functions like
+            // CURRENT_TIMESTAMP, which are not columns) -> decode everything.
+            Err(_) => false,
         }
     };
     match e {
         Expr::Value(_) | Expr::TypedString { .. } => true,
         Expr::Identifier(id) => find(&id.value, out),
-        Expr::CompoundIdentifier(parts) => match parts.last() {
-            Some(p) => find(&p.value, out),
-            None => false,
-        },
+        Expr::CompoundIdentifier(parts) => {
+            let qualified = parts
+                .iter()
+                .map(|i| i.value.as_str())
+                .collect::<Vec<_>>()
+                .join(".");
+            find(&qualified, out)
+        }
         Expr::BinaryOp { left, right, .. } => {
             collect_col_refs(left, schema, out) && collect_col_refs(right, schema, out)
         }
@@ -12625,6 +12866,92 @@ fn collect_col_refs(e: &Expr, schema: &Schema, out: &mut Vec<usize>) -> bool {
         // Anything else (subqueries, MATCH, JSON access, ...) -> be safe.
         _ => false,
     }
+}
+
+/// The set of columns of a *joined* (combined) schema that a query actually
+/// reads: WHERE, projection, GROUP BY, HAVING, ORDER BY, plus any column an
+/// aggregator reads directly by index. `None` means "decode every column" --
+/// which is also the honest answer for `SELECT *`, since it reads them all.
+///
+/// The mask never moves a column: unread columns are decoded as `Value::Null`
+/// placeholders *at their original positions*, so every downstream consumer
+/// (filters, projections, ORDER BY, aggregates, nested chain steps) keeps
+/// indexing the combined row exactly as before. That is deliberate -- pruning
+/// positions instead would mean remapping indices in five places, where a
+/// single wrong index yields wrong values rather than an error.
+#[allow(clippy::too_many_arguments)]
+fn join_needed_mask(
+    schema: &Schema,
+    filter: Option<&Expr>,
+    projection: &[sqlparser::ast::SelectItem],
+    group_by: &[Expr],
+    having: Option<&Expr>,
+    order: &[(Expr, bool)],
+    direct_cols: &[usize],
+) -> Option<Vec<bool>> {
+    let mut refs: Vec<usize> = Vec::new();
+    for e in filter.into_iter().chain(having) {
+        if !collect_col_refs(e, schema, &mut refs) {
+            return None;
+        }
+    }
+    for item in projection {
+        match item {
+            sqlparser::ast::SelectItem::UnnamedExpr(e)
+            | sqlparser::ast::SelectItem::ExprWithAlias { expr: e, .. } => {
+                if !collect_col_refs(e, schema, &mut refs) {
+                    return None;
+                }
+            }
+            // `SELECT *` / `SELECT t.*` genuinely reads every column.
+            _ => return None,
+        }
+    }
+    for e in group_by.iter().chain(order.iter().map(|(e, _)| e)) {
+        if !collect_col_refs(e, schema, &mut refs) {
+            return None;
+        }
+    }
+    refs.extend_from_slice(direct_cols);
+    let mut mask = vec![false; schema.columns.len()];
+    for i in refs {
+        if i < mask.len() {
+            mask[i] = true;
+        }
+    }
+    Some(mask)
+}
+
+/// The set of columns needed to *decide* whether an ordered row is worth
+/// materialising: the filter plus every ORDER BY key expression. `None` means
+/// "couldn't determine statically -> decode all".
+///
+/// Note this deliberately excludes the projection: the point is to run the
+/// filter and the top-N admission test on a cheap partial row, then decode the
+/// full row only for the rows that survive both.
+fn order_probe_mask(
+    schema: &Schema,
+    filter: Option<&Expr>,
+    order: &[(Expr, bool)],
+) -> Option<Vec<bool>> {
+    let mut refs: Vec<usize> = Vec::new();
+    if let Some(f) = filter {
+        if !collect_col_refs(f, schema, &mut refs) {
+            return None;
+        }
+    }
+    for (e, _) in order {
+        if !collect_col_refs(e, schema, &mut refs) {
+            return None;
+        }
+    }
+    let mut mask = vec![false; schema.columns.len()];
+    for i in refs {
+        if i < mask.len() {
+            mask[i] = true;
+        }
+    }
+    Some(mask)
 }
 
 /// The set of columns an aggregation reads: filter + group-by + aggregate

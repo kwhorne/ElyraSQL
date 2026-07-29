@@ -6,6 +6,42 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+### Performance
+
+- **Row paths no longer decode columns the query never reads (ESQL-49, covering
+  ESQL-47 and ESQL-48).** Two reports — joins being slow, and `ORDER BY ... LIMIT`
+  being slow — turned out to be the same defect measured from two directions:
+  row-oriented paths materialised every column of every row. Since a row is one
+  encoded blob, each unread `TEXT` column costs a `String` allocation, so the
+  cost scaled with row *width* rather than with anything the query asked for.
+
+  Both paths now decode only the columns a query references. Unread columns are
+  skipped in place and left as `NULL` placeholders **at their original
+  positions**, so filters, projections, `ORDER BY`, aggregates and nested join
+  steps keep indexing rows exactly as before — no index remapping, and therefore
+  no class of silently-wrong results.
+
+  - `ORDER BY ... LIMIT k`: the sorter grew an admission test (`Sorter::admits`),
+    which is the same comparison `push` makes. The scan evaluates the sort keys
+    from a partial row, asks whether the row would be kept, and decodes the full
+    row only if it would. With `LIMIT 100` over 200k rows that is ~199,900 rows
+    that are no longer built and immediately dropped. Measured on 200k rows,
+    12 columns: **94 ms → 29 ms** (3.2x); narrow rows 45 ms → 21 ms.
+  - Streaming joins: the join chain is now resolved (catalog only) before any row
+    is read, so the combined schema — and with it the set of columns the query
+    reads — is known before both the partner hash tables and the driving scan
+    decode anything. Join keys are always materialised, whatever the projection
+    says. Measured on a 200k-row 1:1 join of two 12-column tables:
+    `COUNT(*)` **488 ms → 226 ms**, and the width sensitivity that identified the
+    defect flattened (wide/narrow 1.8x → 1.35x).
+
+  `SELECT *`, rewritten `RIGHT` joins (whose output columns are permuted after
+  the join) and any expression that can't be attributed to columns statically
+  decode every column, exactly as before. Verified with the 203-case MySQL
+  differential battery (0 divergences), the threshold sweep at all 15 sizes
+  (51/51 identical at each), the robustness scenario (13/13 invariants) and the
+  full workspace test suite.
+
 ## [1.5.1] - 2026-07-29
 
 A hardening patch found by auditing 1.5.0 rather than by a bug report: the collation
