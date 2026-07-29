@@ -53,6 +53,42 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ### Performance
 
+- **Streaming joins no longer allocate per emitted row (ESQL-50).** With decoding
+  fixed by ESQL-49, what was left was allocation and copying per combination: a
+  200k-row 1:1 join spent a third of its time merely *tearing down* the partner
+  hash table. The join path was rebuilt around reuse and borrowing:
+
+  - The combined row is assembled in one scratch buffer per chain depth and the
+    consumer *borrows* it, so an aggregate that keeps nothing (`COUNT(*)`, `SUM`)
+    or a top-N row that loses admission costs no allocation at all.
+  - The left half is copied once per driving row instead of once per combination.
+  - Partner rows are stored flat — `n` values per row in one allocation per join
+    key — rather than a `Vec` per row inside a `Vec` per key. For a unique key
+    that inner `Vec` existed to hold exactly one row.
+  - Join keys are encoded into a reusable buffer when probing and stored inline
+    (up to 22 bytes, which covers every integer and short string key), so neither
+    building nor probing the table allocates per row.
+  - A wide partner whose columns the query mostly ignores has only the *read*
+    positions written per combination, the rest staying at the `NULL` laid down
+    once per driving row.
+  - Join keys and qualified column references are resolved to a column index once
+    at plan time instead of by name per row; `predicate::eval_row` no longer
+    builds a `String` for a qualified reference on every row it evaluates, which
+    helps filters and `ORDER BY` keys too, not just joins.
+
+  Measured on 200k rows (medians of 5): 1:1 join on a primary key **214 → 132 ms**;
+  a 1:N join emitting 40M rows **8621 → 981 ms** with 12-column rows and
+  3741 → 765 ms with 3-column rows — so the width sensitivity that identified the
+  original defect is gone (1.28x, from 2.3x). Joined `ORDER BY ... LIMIT`
+  224 → 138 ms. Non-join shapes are unchanged, as intended.
+
+  Two measurements changed the design and are worth recording. Choosing the copy
+  strategy per row cost 24% on a 40M-row join *even when the branch never went the
+  other way* (739 → 917 ms), so the strategy is a const parameter and chains that
+  cannot benefit are compiled without the branch. And selective copying is only
+  faster when it skips enough columns — a 7-column partner got slower with it —
+  so the cheaper strategy is chosen per join from the widths.
+
 - **Row paths no longer decode columns the query never reads (ESQL-49, covering
   ESQL-47 and ESQL-48).** Two reports — joins being slow, and `ORDER BY ... LIMIT`
   being slow — turned out to be the same defect measured from two directions:

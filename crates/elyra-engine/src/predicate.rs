@@ -36,13 +36,10 @@ pub fn eval_row(expr: &Expr, schema: &Schema, row: &[Value]) -> Result<Value> {
                 ));
             }
             // Qualified reference like `t.col` -> match a combined-schema
-            // column named "t.col".
-            let qualified = parts
-                .iter()
-                .map(|i| i.value.as_str())
-                .collect::<Vec<_>>()
-                .join(".");
-            resolve(&qualified, schema, row)
+            // column named "t.col". Resolved without joining the parts into a
+            // String: this runs once per row.
+            let idx = resolve_index_parts(parts, schema)?;
+            Ok(row.get(idx).cloned().unwrap_or(Value::Null))
         }
         Expr::Function(f) => eval_function(f, schema, row),
         Expr::InList {
@@ -2549,6 +2546,72 @@ fn resolve(name: &str, schema: &Schema, row: &[Value]) -> Result<Value> {
     Ok(row.get(idx).cloned().unwrap_or(Value::Null))
 }
 
+/// True if `col` equals `parts` joined by `.`, case-insensitively, without
+/// building that joined string.
+fn eq_dotted(col: &str, parts: &[sqlparser::ast::Ident]) -> bool {
+    let mut rest = col;
+    for (i, p) in parts.iter().enumerate() {
+        if i > 0 {
+            match rest.strip_prefix('.') {
+                Some(r) => rest = r,
+                None => return false,
+            }
+        }
+        if rest.len() < p.value.len() {
+            return false;
+        }
+        let (head, tail) = rest.split_at(p.value.len());
+        if !head.eq_ignore_ascii_case(&p.value) {
+            return false;
+        }
+        rest = tail;
+    }
+    rest.is_empty()
+}
+
+/// [`resolve_index`] for an already-split qualified reference (`t.col` arrives
+/// as parts). Same two-stage rule, but it does not allocate: evaluating a
+/// qualified column per row used to build a `String` for the joined name and
+/// resolve it again for every row, which showed up in profiles of joins and
+/// filters alike.
+pub fn resolve_index_parts(parts: &[sqlparser::ast::Ident], schema: &Schema) -> Result<usize> {
+    if let Some(i) = schema
+        .columns
+        .iter()
+        .position(|c| eq_dotted(&c.name, parts))
+    {
+        return Ok(i);
+    }
+    let Some(last) = parts.last() else {
+        return Err(Error::Catalog("unknown column".into()));
+    };
+    fn bare(n: &str) -> &str {
+        n.rsplit('.').next().unwrap_or(n)
+    }
+    let mut hit = None;
+    let mut n = 0usize;
+    for (i, c) in schema.columns.iter().enumerate() {
+        if bare(&c.name).eq_ignore_ascii_case(&last.value) {
+            n += 1;
+            hit = Some(i);
+        }
+    }
+    match (n, hit) {
+        (1, Some(i)) => Ok(i),
+        (0, _) => Err(Error::Catalog(format!("unknown column: {}", dotted(parts)))),
+        _ => Err(Error::Query(format!("ambiguous column: {}", dotted(parts)))),
+    }
+}
+
+/// The dotted form of a qualified reference, for error messages only.
+fn dotted(parts: &[sqlparser::ast::Ident]) -> String {
+    parts
+        .iter()
+        .map(|i| i.value.as_str())
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
 /// Resolve a column reference to an index. Handles both single-table (bare
 /// names) and joined (qualified "table.col") schemas: exact match first, then
 /// a unique bare-suffix match (so `col` resolves against `t.col`).
@@ -2925,5 +2988,74 @@ fn bool3(v: &Value) -> Option<bool> {
         None
     } else {
         Some(truthy(v))
+    }
+}
+
+#[cfg(test)]
+mod resolve_tests {
+    use super::*;
+    use elyra_core::{ColumnDef, ColumnType};
+
+    fn ident(s: &str) -> sqlparser::ast::Ident {
+        sqlparser::ast::Ident::new(s)
+    }
+    fn parts(s: &str) -> Vec<sqlparser::ast::Ident> {
+        s.split('.').map(ident).collect()
+    }
+    fn schema(names: &[&str]) -> Schema {
+        Schema::new(
+            names
+                .iter()
+                .map(|n| ColumnDef::new(*n, ColumnType::Int, true))
+                .collect(),
+        )
+    }
+
+    /// The allocation-free parts resolver must agree with the string resolver on
+    /// every shape: exact qualified match, bare-suffix match, ambiguity and
+    /// absence. A disagreement would read the wrong column, silently.
+    #[test]
+    fn parts_resolver_agrees_with_string_resolver() {
+        let cases: Vec<(Schema, &str)> = vec![
+            (schema(&["a.k", "a.v", "b.k", "b.v"]), "b.v"),
+            (schema(&["a.k", "a.v", "b.k", "b.v"]), "B.V"),
+            (schema(&["a.k", "a.v", "b.k", "b.v"]), "v"),
+            (schema(&["a.k", "a.v", "b.k", "b.v"]), "c.v"),
+            (schema(&["a.k", "a.v"]), "a.v"),
+            (schema(&["a.k", "a.v"]), "v"),
+            (schema(&["k", "v"]), "t.v"),
+            (schema(&["k", "v"]), "v"),
+            (schema(&["k", "v"]), "nope"),
+            (schema(&["db.t.v", "db.t.k"]), "db.t.v"),
+            (schema(&["db.t.v", "db.t.k"]), "t.v"),
+        ];
+        for (sch, name) in cases {
+            let p = parts(name);
+            let by_str = resolve_index(name, &sch);
+            let by_parts = resolve_index_parts(&p, &sch);
+            match (&by_str, &by_parts) {
+                (Ok(a), Ok(b)) => assert_eq!(a, b, "{name} in {:?}", cols(&sch)),
+                (Err(_), Err(_)) => {}
+                _ => panic!(
+                    "disagreement for {name} in {:?}: {by_str:?} vs {by_parts:?}",
+                    cols(&sch)
+                ),
+            }
+        }
+    }
+
+    fn cols(s: &Schema) -> Vec<&str> {
+        s.columns.iter().map(|c| c.name.as_str()).collect()
+    }
+
+    #[test]
+    fn eq_dotted_is_exact() {
+        assert!(eq_dotted("a.k", &parts("a.k")));
+        assert!(eq_dotted("A.K", &parts("a.k")));
+        assert!(!eq_dotted("a.k", &parts("a")));
+        assert!(!eq_dotted("a.kk", &parts("a.k")));
+        assert!(!eq_dotted("aa.k", &parts("a.k")));
+        assert!(!eq_dotted("a.k", &parts("a.k.x")));
+        assert!(eq_dotted("k", &parts("k")));
     }
 }

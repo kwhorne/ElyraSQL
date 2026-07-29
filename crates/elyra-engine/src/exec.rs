@@ -4579,7 +4579,8 @@ enum Partner {
     Keyed(Box<KeyedPartner>),
     /// Every left row is paired with every partner row: a comma cross join (no
     /// condition at all) or a join whose `ON` has no equality to hash on, in
-    /// which case [`JoinChainStep::cond`] filters the pairs.
+    /// which case [`JoinChainStep::cond`] filters the pairs. Rows are stored
+    /// flat, `plen` values each, as in [`Slot`].
     ///
     /// This is what lets `FROM a, b, c WHERE ...` and `ON a.id < b.id` stream.
     /// The partners are materialised -- as the keyed steps already do -- but the
@@ -4587,15 +4588,113 @@ enum Partner {
     /// is 1.3 billion combinations, which previously grew the process to 97 GB
     /// before the OS killed it. Streaming it into the spilling
     /// sorter/aggregator keeps memory flat.
-    All(Vec<Vec<Value>>),
+    All(Vec<Value>),
 }
+
+/// A collation-encoded join key.
+///
+/// Short keys -- every integer, date and short string, i.e. nearly every join key
+/// there is -- live inline, so building the hash table costs no allocation per
+/// partner row. A `Vec<u8>` key meant 200k allocations *and* 200k frees on a
+/// 200k-row join, and the teardown showed up in profiles as plainly as the build.
+///
+/// `Borrow<[u8]>` lets the table be probed with a plain slice, so probing an
+/// already-encoded key allocates nothing either. That makes `Hash` consistency
+/// load-bearing: both variants hash exactly as `[u8]` does, or a lookup by slice
+/// would miss an inline key and the join would silently lose rows.
+#[derive(Clone, Debug)]
+enum JoinKey {
+    Inline { len: u8, buf: [u8; JoinKey::INLINE] },
+    Heap(Box<[u8]>),
+}
+
+impl JoinKey {
+    const INLINE: usize = 22;
+
+    fn from_bytes(b: &[u8]) -> Self {
+        if b.len() <= Self::INLINE {
+            let mut buf = [0u8; Self::INLINE];
+            buf[..b.len()].copy_from_slice(b);
+            JoinKey::Inline {
+                len: b.len() as u8,
+                buf,
+            }
+        } else {
+            JoinKey::Heap(b.into())
+        }
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        match self {
+            JoinKey::Inline { len, buf } => &buf[..*len as usize],
+            JoinKey::Heap(b) => b,
+        }
+    }
+}
+
+impl std::borrow::Borrow<[u8]> for JoinKey {
+    fn borrow(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+impl PartialEq for JoinKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_bytes() == other.as_bytes()
+    }
+}
+impl Eq for JoinKey {}
+impl std::hash::Hash for JoinKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        // Delegate to `[u8]`'s own hashing: `Borrow<[u8]>` requires that a key
+        // and its borrowed form hash identically.
+        std::hash::Hash::hash(self.as_bytes(), state)
+    }
+}
+
+/// The partner rows sharing one join key, stored flat: `plen` values per row in
+/// one allocation. A `Vec<Vec<Value>>` cost three allocations per partner row
+/// (the key, the row, and the vector holding it), and on a 200k-row 1:1 join
+/// their *teardown* alone was a third of the query -- for a unique join key, the
+/// inner vector existed to hold exactly one row.
+type Slot = Vec<Value>;
 
 /// Hash table and probe expression for an equi-join step. Boxed inside [`Partner`]
 /// so a cross-join step (a plain `Vec`) does not carry its size.
 struct KeyedPartner {
-    table: std::collections::HashMap<Vec<u8>, Vec<Vec<Value>>>,
+    table: std::collections::HashMap<JoinKey, Slot>,
     probe_key: Expr,
+    /// Position of `probe_key` in the left schema when it is a plain column
+    /// reference (nearly always). Resolving the name instead costs a lookup --
+    /// and, for a qualified reference, a `String` -- on every driving row.
+    probe_col: Option<usize>,
     coll: elyra_core::Collation,
+}
+
+impl KeyedPartner {
+    /// The join key for one left row.
+    fn probe(&self, left_schema: &Schema, left: &[Value]) -> Result<Value> {
+        match self.probe_col {
+            Some(i) => Ok(left.get(i).cloned().unwrap_or(Value::Null)),
+            None => predicate::eval_row(&self.probe_key, left_schema, left),
+        }
+    }
+
+    /// Partner rows for a (non-NULL) key, flat (`plen` values per row). The key
+    /// is encoded into `buf` so probing does not allocate per driving row.
+    fn lookup<'a>(&'a self, key: &Value, buf: &mut Vec<u8>) -> Option<&'a [Value]> {
+        buf.clear();
+        key.push_collation_key_coll(buf, self.coll);
+        self.table.get(buf.as_slice()).map(|s| s.as_slice())
+    }
+}
+
+/// Per-chain-depth scratch: the combined row being built, and the encoded probe
+/// key. Owned by the caller so a whole join costs a fixed number of buffers
+/// rather than two allocations per emitted row.
+#[derive(Default)]
+struct ChainBuf {
+    row: Vec<Value>,
+    key: Vec<u8>,
 }
 
 struct JoinChainStep {
@@ -4614,6 +4713,13 @@ struct JoinChainStep {
     /// so a LEFT join still NULL-extends the left row. Applying it as a filter
     /// instead would silently drop those rows.
     cond: Option<(Expr, Schema)>,
+    /// Partner positions the query reads (`None` = all of them). Every other
+    /// position is `NULL` in the stored partner rows -- that is what late
+    /// materialisation (ESQL-49) put there -- so the combined row only needs
+    /// those positions written per combination, the rest staying at the `NULL`
+    /// laid down once per driving row. On a 12-column partner under `COUNT(*)`
+    /// that is one write per emitted row instead of twelve.
+    pcopy: Option<Vec<usize>>,
 }
 
 /// Rewrite a two-table `A RIGHT JOIN B ON c` into the equivalent
@@ -4653,9 +4759,12 @@ fn right_join_reorder(nb: usize, na: usize) -> Vec<usize> {
     perm
 }
 
-/// Reorder one row's columns by `perm` (logical position i <- physical perm[i]).
-fn apply_perm(row: &[Value], perm: &[usize]) -> Vec<Value> {
-    perm.iter().map(|&i| row[i].clone()).collect()
+/// Reorder one row's columns by `perm` (logical position i <- physical perm[i])
+/// into a reusable buffer: this runs per emitted row on the streaming join paths.
+fn apply_perm_into(row: &[Value], perm: &[usize], out: &mut Vec<Value>) {
+    out.clear();
+    out.reserve(perm.len());
+    out.extend(perm.iter().map(|&i| row[i].clone()));
 }
 
 /// The built chain: driving schema, the per-join steps, the combined output
@@ -4887,6 +4996,29 @@ async fn build_join_chain(
             }
             Some(sub)
         });
+        // Which partner positions the combined row has to carry per combination --
+        // but only when writing just those is cheaper than copying the whole
+        // partner half.
+        //
+        // Copying the half is a tight clone loop into reserved space; writing
+        // single positions costs a bounds check and a drop of the previous value
+        // each, which measured ~10x more per value on a 40M-row 1:N join (a
+        // narrow 7-column partner got *slower* with selective copying: 742 ->
+        // 898 ms, while a 16-column one got faster: 1196 -> 945 ms). So take
+        // whichever the widths say is cheaper. This holds only because ESQL-49
+        // already made the skipped values `NULL` -- cloning them is cheap; if
+        // they were still `String`s the selective path would always win.
+        const SELECTIVE_COPY_WEIGHT: usize = 10;
+        let pcopy: Option<Vec<usize>> = pmask
+            .as_ref()
+            .map(|m| -> Vec<usize> {
+                m.iter()
+                    .enumerate()
+                    .filter(|(_, &want)| want)
+                    .map(|(i, _)| i)
+                    .collect()
+            })
+            .filter(|cols| cols.len() * SELECTIVE_COPY_WEIGHT < plen);
         let prefix = data_prefix(&p.def.name);
         let mut cursor: Option<Vec<u8>> = None;
         let mut decoded: Vec<Value> = Vec::with_capacity(plen);
@@ -4894,8 +5026,12 @@ async fn build_join_chain(
         match p.keys {
             Some((lkey, rkey, coll)) => {
                 // Materialise the partner into a hash table keyed by its join key.
-                let mut table: std::collections::HashMap<Vec<u8>, Vec<Vec<Value>>> =
+                let mut table: std::collections::HashMap<JoinKey, Slot> =
                     std::collections::HashMap::new();
+                // The partner key is nearly always a plain column; resolve it once
+                // instead of per partner row.
+                let rcol = expr_col_index(&rkey, &pschema);
+                let mut kbuf: Vec<u8> = Vec::new();
                 loop {
                     let batch = db.scan_batch(prefix.clone(), cursor.clone(), 8192).await?;
                     if batch.is_empty() {
@@ -4904,17 +5040,25 @@ async fn build_join_chain(
                     let last = batch.len() < 8192;
                     cursor = batch.last().map(|(k, _)| k.clone());
                     for (_, v) in batch {
-                        let row: Vec<Value> = match &pmask {
-                            Some(pm) => {
-                                rowdec::decode_projected_into(&v, plen, pm, &mut decoded)?;
-                                std::mem::take(&mut decoded)
-                            }
-                            None => bincode::deserialize(&v)
-                                .map_err(|e| Error::Storage(e.to_string()))?,
+                        // Decode into the reusable buffer, then *move* the values
+                        // into the key's flat slot: no per-row allocation at all.
+                        decode_partner_row(&v, plen, pmask.as_deref(), &mut decoded)?;
+                        let key = match rcol {
+                            Some(i) => decoded.get(i).cloned().unwrap_or(Value::Null),
+                            None => predicate::eval_row(&rkey, &pschema, &decoded)?,
                         };
-                        let key = predicate::eval_row(&rkey, &pschema, &row)?;
-                        if let Some(k) = key_bytes_coll(&key, coll) {
-                            table.entry(k).or_default().push(row);
+                        if key.is_null() {
+                            continue; // a NULL key matches nothing
+                        }
+                        kbuf.clear();
+                        key.push_collation_key_coll(&mut kbuf, coll);
+                        match table.get_mut(kbuf.as_slice()) {
+                            Some(slot) => slot.append(&mut decoded),
+                            None => {
+                                let mut slot: Slot = Vec::with_capacity(plen);
+                                slot.append(&mut decoded);
+                                table.insert(JoinKey::from_bytes(&kbuf), slot);
+                            }
                         }
                     }
                     if last {
@@ -4924,6 +5068,7 @@ async fn build_join_chain(
                 steps.push(JoinChainStep {
                     partner: Partner::Keyed(Box::new(KeyedPartner {
                         table,
+                        probe_col: expr_col_index(&lkey, &p.left_schema),
                         probe_key: lkey,
                         coll,
                     })),
@@ -4931,10 +5076,13 @@ async fn build_join_chain(
                     plen,
                     left_outer: p.left_outer,
                     cond: p.cond,
+                    pcopy,
                 });
             }
             None => {
-                let mut rows: Vec<Vec<Value>> = Vec::new();
+                // Flat, `plen` values per row (as the keyed slots are).
+                let mut rows: Vec<Value> = Vec::new();
+                let mut nrows = 0usize;
                 // A partner larger than the per-join row cap would defeat the purpose, so
                 // decline and let the materialising path apply its budget instead.
                 let cap = join_max_rows();
@@ -4946,16 +5094,11 @@ async fn build_join_chain(
                     let last = batch.len() < 8192;
                     cursor = batch.last().map(|(k, _)| k.clone());
                     for (_, v) in batch {
-                        rows.push(match &pmask {
-                            Some(pm) => {
-                                rowdec::decode_projected_into(&v, plen, pm, &mut decoded)?;
-                                std::mem::take(&mut decoded)
-                            }
-                            None => bincode::deserialize(&v)
-                                .map_err(|e| Error::Storage(e.to_string()))?,
-                        });
+                        decode_partner_row(&v, plen, pmask.as_deref(), &mut decoded)?;
+                        rows.append(&mut decoded);
+                        nrows += 1;
                     }
-                    if rows.len() > cap {
+                    if nrows > cap {
                         return Ok(None);
                     }
                     if last {
@@ -4968,6 +5111,7 @@ async fn build_join_chain(
                     plen,
                     left_outer: p.left_outer,
                     cond: p.cond,
+                    pcopy,
                 });
             }
         }
@@ -5035,6 +5179,30 @@ impl Pacer {
     }
 }
 
+/// Decode one partner row into a reusable buffer, materialising only the columns
+/// the query reads (`None` = all of them). The buffer always ends up `plen` long,
+/// which is what lets the partner rows be stored flat.
+fn decode_partner_row(
+    bytes: &[u8],
+    plen: usize,
+    mask: Option<&[bool]>,
+    out: &mut Vec<Value>,
+) -> Result<()> {
+    match mask {
+        Some(m) => rowdec::decode_projected_into(bytes, plen, m, out)?,
+        None => {
+            *out = bincode::deserialize(bytes).map_err(|e| Error::Storage(e.to_string()))?;
+        }
+    }
+    // A stored row whose arity differs from the schema (mid-migration) would
+    // break the flat stride, so pad or truncate to the schema width -- the same
+    // shape the decoder guarantees for a well-formed row.
+    if out.len() != plen {
+        out.resize(plen, Value::Null);
+    }
+    Ok(())
+}
+
 /// Decode one driving-table row, materialising only the columns the query reads
 /// (`None` = all of them). Skipped columns become `Value::Null` at their own
 /// position, so the combined row's layout is unchanged.
@@ -5053,23 +5221,63 @@ fn decode_driving_row(bytes: &[u8], ncols: usize, mask: Option<&[bool]>) -> Resu
 /// 4000x4000 cross product is 16 million combinations, so buffering even a single
 /// row's expansion is not an option -- it previously grew the process to 97 GB before
 /// the OS killed it.
-fn stream_join_chain(
+/// Enter the chain, choosing the copy strategy once per query.
+///
+/// `SELECTIVE` is a const parameter rather than a per-row test because the mere
+/// *presence* of the selective branch in the loop cost ~24% on a 40M-row join
+/// where it was never taken (739 -> 917 ms): the function grew and the code
+/// generated for the common path changed with it. Chains that cannot benefit are
+/// therefore compiled without that branch at all.
+fn stream_chain(
+    selective: bool,
     left: &[Value],
     steps: &[JoinChainStep],
+    bufs: &mut [ChainBuf],
     check: &mut elyra_core::cancel::CancelCheck,
-    emit: &mut dyn FnMut(Vec<Value>) -> Result<()>,
+    emit: &mut dyn FnMut(&[Value]) -> Result<()>,
+) -> Result<()> {
+    if selective {
+        stream_join_chain::<true>(left, steps, bufs, check, emit)
+    } else {
+        stream_join_chain::<false>(left, steps, bufs, check, emit)
+    }
+}
+
+/// True when at least one step reads few enough partner columns that writing
+/// just those beats copying the partner half.
+fn chain_is_selective(steps: &[JoinChainStep]) -> bool {
+    steps.iter().any(|s| s.pcopy.is_some())
+}
+
+fn stream_join_chain<const SELECTIVE: bool>(
+    left: &[Value],
+    steps: &[JoinChainStep],
+    bufs: &mut [ChainBuf],
+    check: &mut elyra_core::cancel::CancelCheck,
+    emit: &mut dyn FnMut(&[Value]) -> Result<()>,
 ) -> Result<()> {
     let Some((step, rest)) = steps.split_first() else {
-        return emit(left.to_vec());
+        return emit(left);
     };
-    let matches: Option<&Vec<Vec<Value>>> = match &step.partner {
+    // One scratch row per chain depth, owned by the caller: a 1:N join emits far
+    // more combinations than it has partner keys, and allocating (and dropping) a
+    // combined row for each of them was the largest per-row cost left after
+    // ESQL-49. `emit` therefore borrows the row and clones only if it keeps it.
+    let (buf, rest_bufs) = bufs
+        .split_first_mut()
+        .expect("one scratch buffer per chain step");
+    let ChainBuf {
+        row: buf,
+        key: kbuf,
+    } = buf;
+    let matches: Option<&[Value]> = match &step.partner {
         Partner::Keyed(k) => {
-            let key = predicate::eval_row(&k.probe_key, &step.left_schema, left)?;
+            let key = k.probe(&step.left_schema, left)?;
             if key.is_null() {
                 // A NULL join key matches nothing; a LEFT join still NULL-extends.
                 None
             } else {
-                key_bytes_coll(&key, k.coll).and_then(|b| k.table.get(&b))
+                k.lookup(&key, kbuf)
             }
         }
         // Cross join: every partner row pairs with this left row.
@@ -5077,25 +5285,64 @@ fn stream_join_chain(
     };
     let mut matched = false;
     if let Some(rows) = matches {
-        for m in rows {
-            check.tick()?;
-            let mut c = Vec::with_capacity(left.len() + m.len());
-            c.extend_from_slice(left);
-            c.extend_from_slice(m);
-            if let Some((cond, sch)) = &step.cond {
-                if !predicate::matches(cond, sch, &c)? {
-                    continue; // fails the ON condition: not a match
+        // The left half is the same for every partner row, so copy it once and
+        // rewrite only the partner half per combination. With a fanout of 200
+        // that is 199 copies of the left row saved out of every 200.
+        let base = left.len();
+        let stride = step.plen.max(1);
+        buf.clear();
+        buf.reserve(base + step.plen);
+        buf.extend_from_slice(left);
+        // The two copy strategies get a loop each, with everything they need in
+        // locals: reading `step` per emitted row (or choosing the strategy there)
+        // measured 20%+ on a 40M-row join, even when the choice never changed.
+        let cond = step.cond.as_ref();
+        match &step.pcopy {
+            // Compiled away entirely unless this chain has a step that benefits.
+            Some(cols) if SELECTIVE => {
+                // Lay the partner half down as NULL once; only the read positions
+                // are rewritten per combination, and they are rewritten every
+                // time, so no value from a previous partner row can survive.
+                buf.extend(std::iter::repeat_n(Value::Null, step.plen));
+                for m in rows.chunks(stride) {
+                    check.tick()?;
+                    for &i in cols {
+                        buf[base + i] = m[i].clone();
+                    }
+                    if let Some((c, sch)) = cond {
+                        if !predicate::matches(c, sch, buf)? {
+                            continue; // fails the ON condition: not a match
+                        }
+                    }
+                    matched = true;
+                    stream_join_chain::<SELECTIVE>(buf, rest, rest_bufs, check, emit)?;
                 }
             }
-            matched = true;
-            stream_join_chain(&c, rest, check, emit)?;
+            _ => {
+                for m in rows.chunks(stride) {
+                    check.tick()?;
+                    buf.truncate(base);
+                    buf.extend_from_slice(m);
+                    if let Some((c, sch)) = cond {
+                        if !predicate::matches(c, sch, buf)? {
+                            continue; // fails the ON condition: not a match
+                        }
+                    }
+                    matched = true;
+                    stream_join_chain::<SELECTIVE>(buf, rest, rest_bufs, check, emit)?;
+                }
+            }
         }
     }
+
     if step.left_outer && !matched {
-        let mut c = Vec::with_capacity(left.len() + step.plen);
-        c.extend_from_slice(left);
-        c.extend(std::iter::repeat_n(Value::Null, step.plen));
-        stream_join_chain(&c, rest, check, emit)?;
+        // Rebuilt from scratch: the loop above may have written partner values
+        // into `buf` for pairs the ON condition then rejected.
+        buf.clear();
+        buf.reserve(left.len() + step.plen);
+        buf.extend_from_slice(left);
+        buf.extend(std::iter::repeat_n(Value::Null, step.plen));
+        stream_join_chain::<SELECTIVE>(buf, rest, rest_bufs, check, emit)?;
     }
     Ok(())
 }
@@ -5209,7 +5456,10 @@ async fn streaming_join_aggregate(
     let mut sa = SpillAgg::new(&plan);
     let prefix = data_prefix(&ddef.name);
     let mut cursor: Option<Vec<u8>> = None;
-    let mut combined_buf: Vec<Vec<Value>> = Vec::new();
+    let selective = chain_is_selective(&steps);
+    let mut bufs: Vec<ChainBuf> = (0..steps.len()).map(|_| ChainBuf::default()).collect();
+    let mut permbuf: Vec<Value> = Vec::new();
+    let mut fedbuf: Vec<Value> = Vec::new();
     let mut check = db.cancel_check();
     let mut pacer = Pacer::new();
     loop {
@@ -5224,24 +5474,35 @@ async fn streaming_join_aggregate(
             // the runtime a chance to run other tasks between rows.
             pacer.tick().await;
             let l: Vec<Value> = decode_driving_row(&v, dlen, dmask.as_deref())?;
-            combined_buf.clear();
             // Stream the expansion straight into the aggregator: a cross join's
-            // product must never be buffered, not even for one driving row.
-            stream_join_chain(&l, &steps, &mut check, &mut |combined| {
-                let combined = match &reorder {
-                    Some(perm) => apply_perm(&combined, perm),
-                    None => combined,
-                };
-                if !keep(&combined)? {
-                    return Ok(());
-                }
-                let fed = if extend {
-                    plan.extend_row(&combined)?
-                } else {
-                    combined
-                };
-                sa.feed_extended(fed)
-            })?;
+            // product must never be buffered, not even for one driving row. The
+            // row is borrowed, so an aggregate that keeps nothing (COUNT(*), SUM)
+            // costs no allocation per emitted row at all.
+            stream_chain(
+                selective,
+                &l,
+                &steps,
+                &mut bufs,
+                &mut check,
+                &mut |combined| {
+                    let combined: &[Value] = match &reorder {
+                        Some(perm) => {
+                            apply_perm_into(combined, perm, &mut permbuf);
+                            &permbuf
+                        }
+                        None => combined,
+                    };
+                    if !keep(combined)? {
+                        return Ok(());
+                    }
+                    if extend {
+                        plan.extend_row_into(combined, &mut fedbuf)?;
+                        sa.feed_extended(&fedbuf)
+                    } else {
+                        sa.feed_extended(combined)
+                    }
+                },
+            )?;
         }
         if last {
             break;
@@ -5364,7 +5625,9 @@ async fn streaming_join_order(
     let prefix = data_prefix(&ddef.name);
     let mut cursor: Option<Vec<u8>> = None;
     let mut keybuf: Vec<Value> = Vec::with_capacity(resolved.len());
-    let mut combined_buf: Vec<Vec<Value>> = Vec::new();
+    let selective = chain_is_selective(&steps);
+    let mut bufs: Vec<ChainBuf> = (0..steps.len()).map(|_| ChainBuf::default()).collect();
+    let mut permbuf: Vec<Value> = Vec::new();
     let mut check = db.cancel_check();
     let mut pacer = Pacer::new();
     loop {
@@ -5379,28 +5642,37 @@ async fn streaming_join_order(
             // the runtime a chance to run other tasks between rows.
             pacer.tick().await;
             let l: Vec<Value> = decode_driving_row(&v, dlen, dmask.as_deref())?;
-            combined_buf.clear();
             // Stream into the spilling sorter for the same reason as the
             // aggregate path: the product is never held, only the top-N / spill.
-            stream_join_chain(&l, &steps, &mut check, &mut |combined| {
-                let combined = match &reorder {
-                    Some(perm) => apply_perm(&combined, perm),
-                    None => combined,
-                };
-                if keep(&combined)? {
-                    // Evaluate the keys into a reusable buffer and run the top-N
-                    // admission test first: under `LIMIT k` almost every joined
-                    // row loses it, and a losing row should not cost a key Vec.
-                    keybuf.clear();
-                    for (e, _) in &resolved {
-                        keybuf.push(predicate::eval_row(e, &schema, &combined)?);
+            stream_chain(
+                selective,
+                &l,
+                &steps,
+                &mut bufs,
+                &mut check,
+                &mut |combined| {
+                    let combined: &[Value] = match &reorder {
+                        Some(perm) => {
+                            apply_perm_into(combined, perm, &mut permbuf);
+                            &permbuf
+                        }
+                        None => combined,
+                    };
+                    if keep(combined)? {
+                        // Evaluate the keys into a reusable buffer and run the top-N
+                        // admission test first: under `LIMIT k` almost every joined
+                        // row loses it, and a losing row should not be copied at all.
+                        keybuf.clear();
+                        for (e, _) in &resolved {
+                            keybuf.push(predicate::eval_row(e, &schema, combined)?);
+                        }
+                        if sorter.admits(&keybuf) {
+                            sorter.push(std::mem::take(&mut keybuf), combined.to_vec())?;
+                        }
                     }
-                    if sorter.admits(&keybuf) {
-                        sorter.push(std::mem::take(&mut keybuf), combined)?;
-                    }
-                }
-                Ok(())
-            })?;
+                    Ok(())
+                },
+            )?;
         }
         if last {
             break;
@@ -7199,6 +7471,26 @@ fn merge_join_inner(l: KeyedRows, r: KeyedRows) -> Option<Vec<Vec<Value>>> {
 /// collide into one key -- producing extra join rows. That is not theoretical: it
 /// made every integer in 128..255 hash to the same key, so `a JOIN b ON a.id =
 /// b.id` returned a cartesian product of those 128 ids.
+/// The schema position of `e` when it is a plain (possibly qualified) column
+/// reference, resolved exactly as `predicate::eval_row` would resolve it.
+/// `None` for anything else, which keeps the general expression path.
+fn expr_col_index(e: &Expr, schema: &Schema) -> Option<usize> {
+    match e {
+        // A bare identifier is only certainly a column when it matches one
+        // exactly: `eval_row` reads `@@var` as a system variable and a name like
+        // CURRENT_TIMESTAMP as a niladic function whenever it is *not* an exact
+        // column name, and the fast path must not disagree with it.
+        Expr::Identifier(id) => schema
+            .columns
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(&id.value)),
+        // `@@session.var` arrives here too, and fails to resolve -> None.
+        Expr::CompoundIdentifier(parts) => predicate::resolve_index_parts(parts, schema).ok(),
+        Expr::Nested(inner) => expr_col_index(inner, schema),
+        _ => None,
+    }
+}
+
 fn key_bytes_coll(v: &Value, coll: elyra_core::Collation) -> Option<Vec<u8>> {
     if v.is_null() {
         None
@@ -12671,15 +12963,16 @@ impl<'p> SpillAgg<'p> {
     /// Feed a row that has already had `extend_row` applied (when the plan needs
     /// argument expressions). Resident groups aggregate in memory; overflow-group
     /// rows spill.
-    fn feed_extended(&mut self, fed: Vec<Value>) -> Result<()> {
-        if !self.resident.try_feed(&fed) {
+    fn feed_extended(&mut self, fed: &[Value]) -> Result<()> {
+        if !self.resident.try_feed(fed) {
             let gk: Vec<Value> = self
                 .group_cols
                 .iter()
                 .map(|&c| fed.get(c).cloned().unwrap_or(Value::Null))
                 .collect();
             let p = crate::aggspill::partition_of(&Value::row_collation_key(&gk), SPILL_PARTS);
-            self.parts.route(p, fed)?;
+            // Only a spilled row needs to be owned.
+            self.parts.route(p, fed.to_vec())?;
         }
         Ok(())
     }
@@ -12761,6 +13054,7 @@ async fn partitioned_aggregate(
     // Single pass over the table, feeding the shared resident+spill aggregator.
     let extend = !plan.arg_exprs().is_empty();
     let mut sa = SpillAgg::new(plan);
+    let mut fedbuf: Vec<Value> = Vec::new();
     let prefix = data_prefix(&def.name);
     // In autocommit, pin one snapshot so this multi-batch scan reads a single
     // consistent view (concurrent commits are all-or-nothing across the whole
@@ -12787,8 +13081,12 @@ async fn partitioned_aggregate(
                     continue;
                 }
             }
-            let fed = if extend { plan.extend_row(&row)? } else { row };
-            sa.feed_extended(fed)?;
+            if extend {
+                plan.extend_row_into(&row, &mut fedbuf)?;
+                sa.feed_extended(&fedbuf)?;
+            } else {
+                sa.feed_extended(&row)?;
+            }
         }
         if last {
             break;
@@ -13980,5 +14278,57 @@ mod join_budget_tests {
         assert!(JoinBudget::live() <= total);
         drop(held);
         assert_eq!(JoinBudget::live(), before, "budget must be fully reclaimed");
+    }
+}
+
+#[cfg(test)]
+mod join_key_tests {
+    use super::JoinKey;
+    use std::collections::HashMap;
+    use std::hash::{BuildHasher, RandomState};
+
+    fn hash_of<H: std::hash::Hash + ?Sized>(rs: &RandomState, v: &H) -> u64 {
+        rs.hash_one(v)
+    }
+
+    /// Both variants must hash and compare exactly as the borrowed slice does --
+    /// otherwise a lookup by slice misses an inline key and the join silently
+    /// drops rows. Checked across the inline/heap boundary.
+    #[test]
+    fn hashes_and_compares_as_the_borrowed_slice() {
+        let rs = RandomState::new();
+        for len in [0usize, 1, 8, 9, 21, 22, 23, 24, 64, 300] {
+            let bytes: Vec<u8> = (0..len).map(|i| (i * 31 % 251) as u8).collect();
+            let k = JoinKey::from_bytes(&bytes);
+            assert_eq!(k.as_bytes(), &bytes[..], "round-trip at len {len}");
+            assert_eq!(
+                hash_of(&rs, &k),
+                hash_of(&rs, &bytes[..]),
+                "key must hash as its slice at len {len}"
+            );
+            let heap = JoinKey::Heap(bytes.clone().into_boxed_slice());
+            assert_eq!(
+                k, heap,
+                "variants with equal bytes must be equal (len {len})"
+            );
+            assert_eq!(
+                hash_of(&rs, &k),
+                hash_of(&rs, &heap),
+                "variants with equal bytes must hash equally (len {len})"
+            );
+        }
+    }
+
+    #[test]
+    fn probing_by_slice_finds_both_representations() {
+        let mut m: HashMap<JoinKey, u32> = HashMap::new();
+        let short = b"short-key".to_vec();
+        let long = vec![7u8; 100];
+        m.insert(JoinKey::from_bytes(&short), 1);
+        m.insert(JoinKey::from_bytes(&long), 2);
+        assert_eq!(m.get(short.as_slice()), Some(&1));
+        assert_eq!(m.get(long.as_slice()), Some(&2));
+        assert_eq!(m.get(b"missing".as_slice()), None);
+        assert_eq!(m.len(), 2);
     }
 }

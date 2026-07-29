@@ -101,6 +101,13 @@ def main():
         ("join 1:1 SUM(one col) wide", "SELECT SUM(aw.n) FROM aw JOIN bw ON aw.k = bw.k"),
         ("join ORDER BY LIMIT   wide",
          "SELECT aw.k, bw.n FROM aw JOIN bw ON aw.k = bw.k ORDER BY bw.n LIMIT 100"),
+        # Fanout axis (ESQL-50): the 1:1 joins above pay one hash *key* per
+        # emitted row, so per-key and per-emitted-row costs are indistinguishable.
+        # Joining on `g` (1000 distinct values over n rows) keeps the same key
+        # count while multiplying the emitted rows, which separates the two.
+        ("join 1:N COUNT(*)     narrow", "SELECT COUNT(*) FROM an JOIN bn ON an.g = bn.g"),
+        ("join 1:N COUNT(*)     wide", "SELECT COUNT(*) FROM aw JOIN bw ON aw.g = bw.g"),
+        ("join 1:N SUM(one col) wide", "SELECT SUM(aw.n) FROM aw JOIN bw ON aw.g = bw.g"),
     ]
 
     print(f"\n{a.label} — {n} rows (median of 5, ms)\n")

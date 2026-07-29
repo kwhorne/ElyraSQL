@@ -491,6 +491,123 @@ async fn join_order_by_streaming() {
     assert_eq!(rows, vec![(3, Some("C".into())), (6, Some("C".into()))]);
 }
 
+/// ESQL-50: the streaming join builds each combined row in a reusable buffer,
+/// and for a *wide* partner whose columns the query mostly ignores it writes only
+/// the read positions, leaving the rest at the NULL laid down once per driving
+/// row. That makes two things silently breakable: a value from one partner row
+/// surviving into the next combination, and a pair rejected by a residual `ON`
+/// leaving its values behind. Both are asserted here on values.
+///
+/// The partner is deliberately 14 columns wide, because the selective copy is
+/// only chosen when it beats copying the whole partner half.
+#[tokio::test]
+async fn wide_partner_rows_do_not_leak_between_combinations() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    let pad = (0..10)
+        .map(|i| format!("p{i} VARCHAR(16)"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    c.query_drop(format!(
+        "CREATE TABLE wl (k INT PRIMARY KEY, g INT, v INT, s VARCHAR(16), {pad})"
+    ))
+    .await
+    .unwrap();
+    c.query_drop(format!(
+        "CREATE TABLE wr (k INT PRIMARY KEY, g INT, v INT, s VARCHAR(16), {pad})"
+    ))
+    .await
+    .unwrap();
+    // Two partner rows per key so a leak between combinations is observable, and
+    // one row with a NULL key, which must match nothing.
+    for i in 1..=6 {
+        let p = (0..10)
+            .map(|j| format!("'l{i}-{j}'"))
+            .collect::<Vec<_>>()
+            .join(",");
+        c.query_drop(format!(
+            "INSERT INTO wl VALUES ({i}, {}, {i}, 'l{i}', {p})",
+            i % 3
+        ))
+        .await
+        .unwrap();
+        let p = (0..10)
+            .map(|j| format!("'r{i}-{j}'"))
+            .collect::<Vec<_>>()
+            .join(",");
+        c.query_drop(format!(
+            "INSERT INTO wr VALUES ({i}, {}, {}, 'r{i}', {p})",
+            i % 3,
+            i * 10
+        ))
+        .await
+        .unwrap();
+    }
+    c.query_drop(
+        "INSERT INTO wr VALUES (99, NULL, 0, 'null-key', 'x','x','x','x','x','x','x','x','x','x')",
+    )
+    .await
+    .unwrap();
+
+    // 6 left rows x 2 partners per g-group (g = 1,2,0 -> two rows each).
+    let got: Option<i64> = c
+        .query_first("SELECT COUNT(*) FROM wl JOIN wr ON wl.g = wr.g")
+        .await
+        .unwrap();
+    assert_eq!(got, Some(12), "NULL-keyed partner row must match nothing");
+
+    // Exactly one partner column is read, so this takes the selective copy. Each
+    // combination must see *its own* partner value.
+    let rows: Vec<(i64, i64)> = c
+        .query("SELECT wl.k, wr.v FROM wl JOIN wr ON wl.g = wr.g ORDER BY wl.k, wr.v")
+        .await
+        .unwrap();
+    let mut expect: Vec<(i64, i64)> = Vec::new();
+    for l in 1..=6i64 {
+        for r in 1..=6i64 {
+            if l % 3 == r % 3 {
+                expect.push((l, r * 10));
+            }
+        }
+    }
+    expect.sort();
+    assert_eq!(rows, expect, "partner value leaked across combinations");
+
+    // A residual ON rejects some pairs; a LEFT join must then NULL-extend rather
+    // than show the rejected pair's values.
+    let rows: Vec<(i64, Option<i64>)> = c
+        .query(
+            "SELECT wl.k, wr.v FROM wl LEFT JOIN wr ON wl.g = wr.g AND wr.v > 40 \
+             ORDER BY wl.k, wr.v",
+        )
+        .await
+        .unwrap();
+    let mut expect: Vec<(i64, Option<i64>)> = Vec::new();
+    for l in 1..=6i64 {
+        let ms: Vec<i64> = (1..=6i64)
+            .filter(|r| l % 3 == r % 3 && r * 10 > 40)
+            .map(|r| r * 10)
+            .collect();
+        if ms.is_empty() {
+            expect.push((l, None));
+        } else {
+            for m in ms {
+                expect.push((l, Some(m)));
+            }
+        }
+    }
+    expect.sort();
+    assert_eq!(rows, expect, "rejected pair leaked into the NULL-extension");
+
+    // Reading many partner columns takes the whole-half copy instead: same answer.
+    let rows: Vec<(i64, i64, String, String)> = c
+        .query("SELECT wl.k, wr.v, wr.s, wr.p9 FROM wl JOIN wr ON wl.k = wr.k ORDER BY wl.k")
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 6);
+    assert_eq!(rows[2], (3, 30, "r3".into(), "r3-9".into()));
+}
+
 /// Late materialisation (ESQL-49), single table: `ORDER BY ... LIMIT` decodes
 /// only the filter and sort-key columns until a row wins the top-N admission
 /// test. Rows must still come back complete and in the right order, and the

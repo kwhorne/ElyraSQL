@@ -108,6 +108,24 @@ in both directions (NULL rows are indexed under a companion keyspace); see
   `SELECT *` genuinely reads every column and is unaffected, as is any query
   whose expressions can't be attributed to columns statically — those decode
   everything, exactly as before.
+- **A streaming join allocates nothing per emitted row.** Once decoding was out of
+  the way, what remained was allocation and copying per combination, so the join
+  path was rebuilt around reuse:
+  - the combined row is built in one scratch buffer per chain depth and *borrowed*
+    by the consumer, so an aggregate that keeps nothing (`COUNT(*)`, `SUM`) or a
+    `LIMIT` that rejects the row costs no allocation at all;
+  - the left half is copied once per driving row, not once per combination (with a
+    fanout of 200 that is 199 copies saved out of 200);
+  - partner rows live flat, `n` values per row in one allocation per join key,
+    instead of a `Vec` per row inside a `Vec` per key;
+  - join keys are encoded into a reusable buffer when probing and stored inline
+    when short, so neither side allocates per row;
+  - a wide partner whose columns the query mostly ignores has only the read
+    positions written per combination.
+
+  On 200k-row joins: 1:1 on a primary key **214 ms → 132 ms**; a 1:N join emitting
+  40M rows **8.6 s → 0.98 s** (12-column rows) and 3.7 s → 0.77 s (3-column). The
+  width sensitivity is gone — 0.98 s vs 0.77 s where it used to be 8.6 s vs 3.7 s.
 - **Compiled regular expressions are cached**, so `WHERE col REGEXP '...'` compiles
   the pattern once instead of once per row. Compilation costs far more than
   matching, so this dominates such scans: a `COUNT(*)` with a `REGEXP` filter over

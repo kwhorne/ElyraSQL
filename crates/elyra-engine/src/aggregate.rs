@@ -213,11 +213,21 @@ impl AggPlan {
 
     /// Append the evaluated argument expressions to a row (if any).
     pub fn extend_row(&self, row: &[Value]) -> Result<Vec<Value>> {
-        let mut r = row.to_vec();
-        for e in &self.arg_exprs {
-            r.push(crate::predicate::eval_row(e, &self.input_schema, row)?);
-        }
+        let mut r = Vec::new();
+        self.extend_row_into(row, &mut r)?;
         Ok(r)
+    }
+
+    /// [`extend_row`](Self::extend_row) into a caller-owned buffer, so a scan or
+    /// join can reuse one allocation across every row it feeds.
+    pub fn extend_row_into(&self, row: &[Value], out: &mut Vec<Value>) -> Result<()> {
+        out.clear();
+        out.reserve(row.len() + self.arg_exprs.len());
+        out.extend_from_slice(row);
+        for e in &self.arg_exprs {
+            out.push(crate::predicate::eval_row(e, &self.input_schema, row)?);
+        }
+        Ok(())
     }
 
     /// Finalise an aggregator into output rows in projection order.
