@@ -22,6 +22,35 @@ All notable changes to ElyraSQL are documented here. The format is based on
   join battery differentially against MySQL 8.4 while working on ESQL-39;
   present since joins on expressions were supported.
 
+### Added
+
+- **Non-equi joins stream instead of being refused (ESQL-39).** `ON a.id < b.id`,
+  a `BETWEEN` band join, or any `ON` with no equality to hash on had no key to
+  build a hash table from, so the chain declined and the whole product was
+  materialised — where it hit the fail-safe ceilings added in 1.4.13/1.5.0. The
+  ceilings had to *fill* before they could refuse: on 20,000 rows, a three-way
+  `ON a.id < b.id` under `COUNT(*)` grew the server to **2136 MB** and then
+  failed after 1.3 s.
+
+  Such a step is now the same unkeyed step a comma cross join uses, with the
+  `ON` condition applied per pair, streamed into the spilling sorter/aggregator.
+  The same query keeps the server at its **34 MB** idle footprint and answers —
+  or, when the work is genuinely astronomical, is interrupted by
+  `ELYRASQL_QUERY_TIMEOUT_MS` with the session still usable. Being honest about
+  the trade: memory is now bounded but the *time* is not, and the join row
+  ceilings no longer bound these shapes, so a timeout is the right control.
+
+  When an `ON` mixes an equality with other conditions (`ON a.k = b.k AND
+  a.x > b.x`), the equality is still hashed and the rest applied as a residual,
+  so that shape stays `O(n+m)` rather than becoming a nested loop. A residual is
+  an `ON` condition, not a `WHERE`: pairs it rejects are *unmatched*, so a LEFT
+  join still NULL-extends the left row.
+
+  Verified against MySQL 8.4 on 5000-row tables: 15 join shapes (non-equi,
+  band, `LEFT` with residual, equality-plus-residual, `GROUP BY` and
+  `ORDER BY ... LIMIT` over each) all identical, 0 divergences, plus the 203-case
+  differential battery, the 15-size threshold sweep and the robustness scenario.
+
 ### Performance
 
 - **Row paths no longer decode columns the query never reads (ESQL-49, covering

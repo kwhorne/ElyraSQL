@@ -2755,11 +2755,39 @@ async fn cross_join_streams_and_materialising_shapes_stay_bounded() {
         .unwrap();
     assert_eq!(rows, vec![(120, 1), (120, 5), (120, 9)]);
 
-    // A non-equi join is not a shape the chain can stream, so it materialises and the
-    // ceilings apply. This keeps the cap path covered now that cross joins do not
-    // exercise it.
+    // A non-equi join under an aggregate now streams too (ESQL-39), so it is
+    // answered rather than refused -- exactly like the comma cross join above,
+    // which it is a filtered form of.
+    let got: Option<i64> = c
+        .query_first("SELECT COUNT(*) FROM jb a JOIN jb b ON a.v < b.v")
+        .await
+        .unwrap();
+    // v cycles 1,2,3,0 over ids 1..120, so each value has 30 rows.
+    let by_v = 30i64;
+    let expect = by_v * by_v * (3 + 2 + 1); // 0<1,2,3; 1<2,3; 2<3
+    assert_eq!(got, Some(expect));
+
+    // An equality plus an extra condition keeps the hash key and applies the rest
+    // as a residual: same answer as the equality alone would give, filtered.
+    let got: Option<i64> = c
+        .query_first("SELECT COUNT(*) FROM jb a JOIN jb b ON a.id = b.id AND a.v > 1")
+        .await
+        .unwrap();
+    assert_eq!(got, Some(60));
+
+    // A LEFT join's residual is an ON condition, not a filter: rows it rejects
+    // are unmatched, so the left row survives with NULLs.
+    let rows: Vec<(i64, Option<i64>)> = c
+        .query("SELECT a.id, b.id FROM jb a LEFT JOIN jb b ON a.id = b.id AND a.v > 1 ORDER BY a.id LIMIT 4")
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![(1, None), (2, Some(2)), (3, Some(3)), (4, None)]);
+
+    // Shapes that still materialise keep the ceilings: a plain (non-aggregated,
+    // unordered) non-equi join has no streaming consumer, so the cap path stays
+    // covered.
     let err = c
-        .query_drop("SELECT COUNT(*) FROM jb a JOIN jb b ON a.v < b.v JOIN jb c ON a.v < c.v JOIN jb d ON a.v < d.v JOIN jb e ON a.v < e.v")
+        .query_drop("SELECT a.id, b.id FROM jb a JOIN jb b ON a.v < b.v JOIN jb c ON a.v < c.v JOIN jb d ON a.v < d.v JOIN jb e ON a.v < e.v")
         .await;
     if let Err(e) = err {
         let msg = e.to_string();

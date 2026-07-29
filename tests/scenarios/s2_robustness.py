@@ -272,15 +272,18 @@ def recovers_from_resource_exhaustion() -> None:
     rows = ",".join(f"({i},{i % 7})" for i in range(1, 3001))
     cur.execute(f"INSERT INTO big VALUES {rows}")
 
-    # Repeatedly trigger the join ceilings. A *cross* join no longer qualifies: those
-    # stream now, so they complete instead of being refused (and would run for a very
-    # long time at this size). A non-equi join is a shape the streaming chain declines,
-    # so it materialises and the ceilings apply -- which is what this checks.
+    # Repeatedly trigger the join ceilings. Which shapes still reach them has
+    # narrowed twice, and the query has to follow: cross joins stream (ESQL-39),
+    # and so do non-equi joins under an aggregate or ORDER BY, so both now
+    # complete (or run very long) instead of being refused. What still
+    # materialises is a plain projection with no aggregate and no ORDER BY --
+    # there is no streaming consumer to feed, the whole product is built, and the
+    # ceilings apply. That is what this checks.
     refused = 0
     for _ in range(5):
         try:
             cur.execute(
-                "SELECT COUNT(*) FROM big a JOIN big b ON a.v < b.v "
+                "SELECT a.id, b.id FROM big a JOIN big b ON a.v < b.v "
                 "JOIN big c ON a.v < c.v JOIN big d ON a.v < d.v"
             )
             cur.fetchall()

@@ -170,13 +170,25 @@ judge fit before deploying.
   is normalised to an explicit `JOIN` chain (using the WHERE equi-predicates as
   `ON`), so it gets the same cost-based reordering and streaming as explicit
   joins when every table is connected by an equi-predicate.
-- **Remaining materialising joins**: `FULL` joins, non-equi joins, derived-table
-  joins, and `RIGHT` joins that are part of a multi-table chain (rather than a
-  single two-table `RIGHT JOIN`) still build the full join result before
-  `ORDER BY`/`GROUP BY` (correct, but not memory-bounded on very large such
-  joins). `FULL` needs unmatched-build-side tracking; non-equi joins have no hash
-  key to stream on; a derived table is materialised first. These shapes are rare
-  and the materialising path is correct. Streaming left-deep chains of **more than
+- **Non-equi joins stream, but cost `O(n x m)`**: `ON a.id < b.id`, a `BETWEEN`
+  band join, or any `ON` with no equality to hash on now pairs every row and
+  applies the condition per pair, streamed into the spilling sorter/aggregator.
+  Memory is flat (a 20,000-row three-way `ON a.id < b.id` keeps the server at its
+  34 MB idle footprint), but the work is quadratic or worse and the join row
+  ceilings no longer bound it -- bound the *time* instead with
+  `ELYRASQL_QUERY_TIMEOUT_MS`, which interrupts such a join promptly and leaves
+  the session usable. When the `ON` mixes an equality with other conditions
+  (`ON a.k = b.k AND a.x > b.x`) the equality is still hashed and the rest is
+  applied as a residual, so that shape stays `O(n+m)`. There is no index-driven
+  inequality (band) join yet, which is where MySQL wins these outright.
+- **Remaining materialising joins**: `FULL` joins, derived-table joins, `RIGHT`
+  joins that are part of a multi-table chain (rather than a single two-table
+  `RIGHT JOIN`), and any join whose output is neither aggregated nor ordered
+  (a plain projection has no streaming consumer to feed) still build the full
+  join result (correct, but not memory-bounded on very large such joins; the
+  `ELYRASQL_JOIN_MAX_ROWS`/`_BYTES` ceilings apply there). `FULL` needs
+  unmatched-build-side tracking; a derived table is materialised first. These
+  shapes are rare and the materialising path is correct. Streaming left-deep chains of **more than
   two** tables (and complex join expressions) is tracked in ESQL-29; today they
   take the materialising `join_select` path.
 - **`WHERE col IN (SELECT ...)` and `DISTINCT` collection are in-memory** (unlike

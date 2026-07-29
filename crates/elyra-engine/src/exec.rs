@@ -4577,14 +4577,16 @@ enum Partner {
     /// Equi-join: partner rows in a hash table keyed by the collated join key,
     /// probed with `probe_key` evaluated over the left schema.
     Keyed(Box<KeyedPartner>),
-    /// Cross join (a comma-separated table with no join condition): every left row
-    /// pairs with every partner row.
+    /// Every left row is paired with every partner row: a comma cross join (no
+    /// condition at all) or a join whose `ON` has no equality to hash on, in
+    /// which case [`JoinChainStep::cond`] filters the pairs.
     ///
-    /// This is what lets `FROM a, b, c WHERE ...` stream. The partners are
-    /// materialised -- as the keyed steps already do -- but the *product* never is,
-    /// and the product is what explodes: 4000 rows three ways is 1.3 billion
-    /// combinations, which previously grew the process to 97 GB before the OS killed
-    /// it. Streaming it into the spilling sorter/aggregator keeps memory flat.
+    /// This is what lets `FROM a, b, c WHERE ...` and `ON a.id < b.id` stream.
+    /// The partners are materialised -- as the keyed steps already do -- but the
+    /// *product* never is, and the product is what explodes: 4000 rows three ways
+    /// is 1.3 billion combinations, which previously grew the process to 97 GB
+    /// before the OS killed it. Streaming it into the spilling
+    /// sorter/aggregator keeps memory flat.
     All(Vec<Vec<Value>>),
 }
 
@@ -4603,6 +4605,15 @@ struct JoinChainStep {
     /// Number of partner columns (for LEFT-join NULL extension).
     plen: usize,
     left_outer: bool,
+    /// The part of the `ON` condition that is not the hash key: everything, for a
+    /// non-equi join; the surviving conjuncts, when one equality was hashed on;
+    /// `None` for a plain equi or cross join. Evaluated over the combined
+    /// left ++ partner row, whose schema comes with it.
+    ///
+    /// It is an `ON` condition, not a `WHERE`: a pair it rejects is *unmatched*,
+    /// so a LEFT join still NULL-extends the left row. Applying it as a filter
+    /// instead would silently drop those rows.
+    cond: Option<(Expr, Schema)>,
 }
 
 /// Rewrite a two-table `A RIGHT JOIN B ON c` into the equivalent
@@ -4665,9 +4676,12 @@ struct PendingStep {
     def: TableDef,
     pcols: Vec<ColumnDef>,
     left_schema: Schema,
-    /// `None` for a comma cross join; otherwise (probe key, partner key,
-    /// collation, LEFT?).
-    keys: Option<(Expr, Expr, elyra_core::Collation, bool)>,
+    /// `None` when there is no equality to hash on (a comma cross join, or an
+    /// `ON` like `a.id < b.id`); otherwise (probe key, partner key, collation).
+    keys: Option<(Expr, Expr, elyra_core::Collation)>,
+    /// Residual `ON` condition over the left ++ partner row, with its schema.
+    cond: Option<(Expr, Schema)>,
+    left_outer: bool,
 }
 
 /// Build a left-deep streaming hash join for a `TableWithJoins` (a driving table
@@ -4707,20 +4721,74 @@ async fn build_join_chain(
         if !matches!(kind, JoinKind::Inner | JoinKind::Left) {
             return Ok(None);
         }
-        let Some(on) = on else { return Ok(None) };
+        // No `ON` is only unconditional for an explicit CROSS JOIN (or `JOIN`
+        // with no constraint). USING and NATURAL also arrive here without an
+        // `ON` expression but are *equi* joins, so they must keep declining --
+        // treating them as cross joins would return a cartesian product.
+        if on.is_none()
+            && !matches!(
+                join.join_operator,
+                JoinOperator::CrossJoin | JoinOperator::Inner(JoinConstraint::None)
+            )
+        {
+            return Ok(None);
+        }
         let (pdef, pcols) = resolve_table(db, &join.relation).await?;
         let left_schema = Schema::new(left_cols.clone());
         let pschema = Schema::new(pcols.clone());
-        let Some((lkey, rkey)) = equi_keys(&on, &left_schema, &pschema) else {
-            return Ok(None);
+        let mut through_cols = left_cols.clone();
+        through_cols.extend(pcols.clone());
+        let through = Schema::new(through_cols);
+
+        // Prefer an equality to hash on. If the whole `ON` is not one, look for
+        // an equality *conjunct* and keep the rest as a residual: `ON a.k = b.k
+        // AND a.x > b.x` then still costs O(n+m) instead of O(n*m). With no
+        // equality anywhere the step pairs every row and the `ON` filters --
+        // O(n*m), which is what a non-equi join inherently is, but streamed, so
+        // it answers instead of being refused by the materialising row cap.
+        let (keys, cond) = match &on {
+            None => (None, None),
+            Some(on) => match equi_keys(on, &left_schema, &pschema) {
+                Some((lkey, rkey)) => {
+                    let coll = join_key_collation(&lkey, &left_schema, &rkey, &pschema);
+                    (Some((lkey, rkey, coll)), None)
+                }
+                None => {
+                    let mut parts = Vec::new();
+                    split_and(on, &mut parts);
+                    let hashable = parts
+                        .iter()
+                        .position(|p| equi_keys(p, &left_schema, &pschema).is_some());
+                    match hashable {
+                        Some(i) => {
+                            let (lkey, rkey) = equi_keys(&parts[i], &left_schema, &pschema)
+                                .expect("position() just matched");
+                            let coll = join_key_collation(&lkey, &left_schema, &rkey, &pschema);
+                            parts.remove(i);
+                            let residual = parts.into_iter().reduce(|a, b| Expr::BinaryOp {
+                                left: Box::new(a),
+                                op: sqlparser::ast::BinaryOperator::And,
+                                right: Box::new(b),
+                            });
+                            (
+                                Some((lkey, rkey, coll)),
+                                residual.map(|e| (e, through.clone())),
+                            )
+                        }
+                        None => (None, Some((on.clone(), through.clone()))),
+                    }
+                }
+            },
         };
-        let coll = join_key_collation(&lkey, &left_schema, &rkey, &pschema);
+
         left_cols.extend(pcols.clone());
         pending.push(PendingStep {
             def: pdef,
             pcols,
             left_schema,
-            keys: Some((lkey, rkey, coll, kind == JoinKind::Left)),
+            keys,
+            cond,
+            left_outer: kind == JoinKind::Left,
         });
     }
 
@@ -4742,6 +4810,9 @@ async fn build_join_chain(
             pcols,
             left_schema,
             keys: None,
+            cond: None,
+            // A cross join has no unmatched case to preserve.
+            left_outer: false,
         });
     }
 
@@ -4760,11 +4831,22 @@ async fn build_join_chain(
     if let Some(m) = mask.as_mut() {
         let mut give_up = false;
         for p in &pending {
-            let Some((lkey, _, _, _)) = &p.keys else {
-                continue;
-            };
+            // The probe key (over the accumulated left row) and any residual ON
+            // condition (over left ++ partner) both read columns the projection
+            // may never mention. `left_schema` and the residual's schema are
+            // prefixes of the combined schema, so their indices are combined
+            // indices and can be marked directly.
             let mut refs = Vec::new();
-            if !collect_col_refs(lkey, &p.left_schema, &mut refs) {
+            let ok = p
+                .keys
+                .as_ref()
+                .map(|(lkey, _, _)| collect_col_refs(lkey, &p.left_schema, &mut refs))
+                .unwrap_or(true)
+                && p.cond
+                    .as_ref()
+                    .map(|(c, sch)| collect_col_refs(c, sch, &mut refs))
+                    .unwrap_or(true);
+            if !ok {
                 give_up = true;
                 break;
             }
@@ -4792,7 +4874,7 @@ async fn build_join_chain(
         // or the hash table would be keyed on NULL.
         let pmask = mask.as_ref().and_then(|m| {
             let mut sub = m[off..off + plen].to_vec();
-            if let Some((_, rkey, _, _)) = &p.keys {
+            if let Some((_, rkey, _)) = &p.keys {
                 let mut refs = Vec::new();
                 if !collect_col_refs(rkey, &pschema, &mut refs) {
                     return None; // key we can't attribute -> decode all of it
@@ -4810,7 +4892,7 @@ async fn build_join_chain(
         let mut decoded: Vec<Value> = Vec::with_capacity(plen);
 
         match p.keys {
-            Some((lkey, rkey, coll, left_outer)) => {
+            Some((lkey, rkey, coll)) => {
                 // Materialise the partner into a hash table keyed by its join key.
                 let mut table: std::collections::HashMap<Vec<u8>, Vec<Vec<Value>>> =
                     std::collections::HashMap::new();
@@ -4847,7 +4929,8 @@ async fn build_join_chain(
                     })),
                     left_schema: p.left_schema,
                     plen,
-                    left_outer,
+                    left_outer: p.left_outer,
+                    cond: p.cond,
                 });
             }
             None => {
@@ -4883,8 +4966,8 @@ async fn build_join_chain(
                     partner: Partner::All(rows),
                     left_schema: p.left_schema,
                     plen,
-                    // A cross join has no unmatched case to preserve.
-                    left_outer: false,
+                    left_outer: p.left_outer,
+                    cond: p.cond,
                 });
             }
         }
@@ -4996,10 +5079,15 @@ fn stream_join_chain(
     if let Some(rows) = matches {
         for m in rows {
             check.tick()?;
-            matched = true;
             let mut c = Vec::with_capacity(left.len() + m.len());
             c.extend_from_slice(left);
             c.extend_from_slice(m);
+            if let Some((cond, sch)) = &step.cond {
+                if !predicate::matches(cond, sch, &c)? {
+                    continue; // fails the ON condition: not a match
+                }
+            }
+            matched = true;
             stream_join_chain(&c, rest, check, emit)?;
         }
     }
