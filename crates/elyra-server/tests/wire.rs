@@ -1243,6 +1243,13 @@ async fn non_strict_sql_mode_coerces_invalid_integer_text() {
         .unwrap();
     assert_eq!(values, [(0, 0), (123, 456)]);
 
+    let count: i64 = c
+        .query_first("SELECT COUNT(*) FROM mode_values WHERE value = 'Channel1'")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(count, 1);
+
     c.query_drop("SET SESSION sql_mode='STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION'")
         .await
         .unwrap();
