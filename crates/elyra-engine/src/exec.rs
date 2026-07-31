@@ -6268,7 +6268,7 @@ fn projection_correlated_any(projection: &[sqlparser::ast::SelectItem], quals: &
 /// subqueries. Outer references in correlated subqueries become literals; the
 /// subquery's own columns are left untouched.
 fn bind_row(expr: &Expr, schema: &Schema, row: &[Value]) -> Expr {
-    map_expr(expr, &|e| {
+    bind_outer_references(expr, &[], &|e| {
         if let Expr::CompoundIdentifier(parts) = e {
             if parts.len() >= 2 {
                 let qual = format!(
@@ -11976,7 +11976,7 @@ async fn correlated_select(
 /// literals from `row`, including inside subqueries. Bare names remain bound
 /// to the innermost query scope.
 fn bind_outer(expr: &Expr, outer: &str, schema: &Schema, row: &[Value]) -> Expr {
-    map_expr(expr, &|e| match e {
+    bind_outer_references(expr, &[], &|e| match e {
         Expr::CompoundIdentifier(parts) if parts.len() >= 2 => {
             let tbl = &parts[parts.len() - 2].value;
             let col = &parts[parts.len() - 1].value;
@@ -11991,6 +11991,57 @@ fn bind_outer(expr: &Expr, outer: &str, schema: &Schema, row: &[Value]) -> Expr 
             }
         }
         _ => None,
+    })
+}
+
+/// Bind qualified references while respecting relation names introduced by
+/// nested query scopes. A local relation shadows an outer relation with the
+/// same qualifier.
+fn bind_outer_references(
+    expr: &Expr,
+    shadowed: &[String],
+    bind: &dyn Fn(&Expr) -> Option<Expr>,
+) -> Expr {
+    map_expr(expr, &|candidate| match candidate {
+        Expr::Subquery(query) => Some(Expr::Subquery(Box::new(bind_outer_query(
+            query, shadowed, bind,
+        )))),
+        Expr::InSubquery {
+            expr,
+            subquery,
+            negated,
+        } => Some(Expr::InSubquery {
+            expr: Box::new(bind_outer_references(expr, shadowed, bind)),
+            subquery: Box::new(bind_outer_query(subquery, shadowed, bind)),
+            negated: *negated,
+        }),
+        Expr::Exists { subquery, negated } => Some(Expr::Exists {
+            subquery: Box::new(bind_outer_query(subquery, shadowed, bind)),
+            negated: *negated,
+        }),
+        Expr::CompoundIdentifier(parts)
+            if parts.len() >= 2
+                && shadowed.iter().any(|qualifier| {
+                    qualifier.eq_ignore_ascii_case(&parts[parts.len() - 2].value)
+                }) =>
+        {
+            Some(candidate.clone())
+        }
+        _ => bind(candidate),
+    })
+}
+
+fn bind_outer_query(
+    query: &SqlQuery,
+    inherited_shadowing: &[String],
+    bind: &dyn Fn(&Expr) -> Option<Expr>,
+) -> SqlQuery {
+    let mut shadowed = inherited_shadowing.to_vec();
+    if let SetExpr::Select(select) = query.body.as_ref() {
+        shadowed.extend(join_qualifiers(&select.from));
+    }
+    rewrite_query(query, &|expr| {
+        Some(bind_outer_references(expr, &shadowed, bind))
     })
 }
 

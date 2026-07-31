@@ -1049,6 +1049,37 @@ async fn nested_correlation_resolves_missing_inner_columns_from_outer_scope() {
 }
 
 #[tokio::test]
+async fn correlated_join_preserves_shadowed_inner_qualifiers() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop("CREATE TABLE entries (id INT PRIMARY KEY, category_id INT)")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE links (id INT PRIMARY KEY, entry_id INT)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO entries VALUES (10, 7), (20, 7), (30, 8)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO links VALUES (1, 10), (2, 20), (3, 30)")
+        .await
+        .unwrap();
+
+    let rows: Vec<i64> = c
+        .query(
+            "SELECT links.id FROM links \
+             LEFT JOIN entries ON entries.id = links.entry_id \
+             WHERE EXISTS (SELECT * FROM entries \
+             WHERE links.entry_id = entries.id AND category_id = 7) \
+             ORDER BY links.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows, [1, 2]);
+}
+
+#[tokio::test]
 async fn correlated_null_equality_does_not_enter_index_key_encoding() {
     let srv = TestServer::start().await;
     let mut c = srv.conn().await;
