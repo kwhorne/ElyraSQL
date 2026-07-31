@@ -14027,6 +14027,7 @@ fn agg_needed_mask(schema: &Schema, filter: Option<&Expr>, plan: &AggPlan) -> Op
     // arg_exprs, so they must be added explicitly or the scan would decode
     // them as NULL and silently produce wrong aggregates.
     refs.extend(plan.agg_input_cols());
+    refs.extend(plan.sample_input_cols());
     let mut mask = vec![false; schema.columns.len()];
     for i in refs {
         if i < mask.len() {

@@ -3274,6 +3274,40 @@ async fn group_by_expression() {
     assert!(p95[0].1 > 0.0);
 }
 
+#[tokio::test]
+async fn grouped_wildcard_projects_a_representative_row() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop(
+        "CREATE TABLE events (id INT PRIMARY KEY, category VARCHAR(8), amount INT, ended_at DATETIME)",
+    )
+    .await
+    .unwrap();
+    c.query_drop(
+        "INSERT INTO events VALUES
+         (1, 'a', 10, NULL), (2, 'a', 20, NULL), (3, 'b', 30, NULL)",
+    )
+    .await
+    .unwrap();
+
+    let rows: Vec<(i64, String, i64, Option<String>)> = c
+        .query(
+            "SELECT * FROM events
+             WHERE ended_at IS NULL
+             GROUP BY category
+             ORDER BY category",
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(rows.len(), 2);
+    assert!(
+        matches!(&rows[0], (1, category, 10, None) if category == "a")
+            || matches!(&rows[0], (2, category, 20, None) if category == "a")
+    );
+    assert!(matches!(&rows[1], (3, category, 30, None) if category == "b"));
+}
+
 // Indexed ORDER BY ... LIMIT (ESQL-20): reverse primary-key scan and secondary-
 // index ordered scan return correct top-N without a full sort. Correctness is
 // checked against a locally computed expectation.

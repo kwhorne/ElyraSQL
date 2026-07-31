@@ -141,6 +141,13 @@ impl AggPlan {
             return None;
         }
         let gc = self.group_cols[0];
+        if self.plan.iter().any(|column| match column {
+            OutCol::Column(index) => *index != gc,
+            OutCol::Computed(_) => true,
+            OutCol::Agg(_) => false,
+        }) {
+            return None;
+        }
         match schema.columns.get(gc).map(|c| &c.ty) {
             Some(ColumnType::Int) | Some(ColumnType::Float) => {}
             _ => return None,
@@ -208,6 +215,19 @@ impl AggPlan {
             // values in scan order.
             .flat_map(|a| a.arg_col.into_iter().chain(a.order.iter().map(|&(c, _)| c)))
             .filter(|&c| c < base)
+            .collect()
+    }
+
+    /// Base-table columns copied from a representative row into the grouped
+    /// projection. Scans must decode these even when they are not group keys or
+    /// aggregate arguments.
+    pub fn sample_input_cols(&self) -> Vec<usize> {
+        self.plan
+            .iter()
+            .filter_map(|column| match column {
+                OutCol::Column(index) => Some(*index),
+                OutCol::Agg(_) | OutCol::Computed(_) => None,
+            })
             .collect()
     }
 
@@ -499,6 +519,49 @@ pub fn build_plan(
     let ci = elyra_core::Collation::Ci;
 
     for item in projection {
+        match item {
+            SelectItem::Wildcard(_) => {
+                for (idx, column) in schema.columns.iter().enumerate() {
+                    out_cols.push(ColumnDef {
+                        name: output_column_name(&column.name),
+                        ty: column.ty.clone(),
+                        nullable: column.nullable,
+                        collation: column.collation,
+                    });
+                    plan.push(OutCol::Column(idx));
+                }
+                continue;
+            }
+            SelectItem::QualifiedWildcard(object, _) => {
+                let qualifier = object
+                    .0
+                    .last()
+                    .map(|identifier| identifier.value.as_str())
+                    .unwrap_or_default();
+                let before = plan.len();
+                for (idx, column) in schema.columns.iter().enumerate() {
+                    let Some((column_qualifier, name)) = column.name.split_once('.') else {
+                        continue;
+                    };
+                    if column_qualifier.eq_ignore_ascii_case(qualifier) {
+                        out_cols.push(ColumnDef {
+                            name: name.to_owned(),
+                            ty: column.ty.clone(),
+                            nullable: column.nullable,
+                            collation: column.collation,
+                        });
+                        plan.push(OutCol::Column(idx));
+                    }
+                }
+                if plan.len() == before {
+                    return Err(Error::Unsupported(format!(
+                        "qualified wildcard {object}.* matched no relation"
+                    )));
+                }
+                continue;
+            }
+            SelectItem::UnnamedExpr(_) | SelectItem::ExprWithAlias { .. } => {}
+        }
         let (expr, alias) = item_expr_and_alias(item)?;
 
         // 1) A bare aggregate: SUM(x), COUNT(*), ...
