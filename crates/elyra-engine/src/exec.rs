@@ -24,8 +24,8 @@ use elyra_olap::GroupAggregator;
 
 use crate::catalog::{
     self, autoinc_key, catalog_key, data_key, data_prefix, index_table_prefix,
-    indexnull_table_prefix, rowid_key, wcount_key, ColMeta, ForeignKey, IndexDef, RefAction,
-    TableDef,
+    indexnull_table_prefix, partmeta_key, rowid_key, stats_key, wcount_key, ColMeta, ForeignKey,
+    IndexDef, RefAction, TableDef,
 };
 use crate::eval::eval_expr;
 use crate::keyenc;
@@ -40,6 +40,13 @@ fn table_ident(name: &ObjectName) -> Result<String> {
         .last()
         .map(|i| i.value.clone())
         .ok_or_else(|| Error::Catalog("empty table name".into()))
+}
+
+fn map_collation(name: &ObjectName) -> elyra_core::Collation {
+    name.0
+        .last()
+        .map(|identifier| elyra_core::Collation::from_name(&identifier.value))
+        .unwrap_or_default()
 }
 
 /// Escape regex metacharacters so a literal string can be embedded in a pattern
@@ -246,7 +253,7 @@ pub async fn create_table(
         let collation = col
             .collation
             .as_ref()
-            .map(|c| elyra_core::Collation::from_name(&c.to_string()))
+            .map(map_collation)
             .unwrap_or_default();
         for opt in &col.options {
             match &opt.option {
@@ -2054,6 +2061,15 @@ fn options_to_meta(options: &[ColumnOption]) -> (bool, ColMeta) {
     (nullable, meta)
 }
 
+fn option_collation(option: &ColumnOption) -> Option<elyra_core::Collation> {
+    match option {
+        // sqlparser 0.53's CHANGE/MODIFY path retains CHARACTER SET but not
+        // COLLATE. The frontend rewrites the latter to this AST shape.
+        ColumnOption::CharacterSet(name) => Some(map_collation(name)),
+        _ => None,
+    }
+}
+
 /// `MODIFY COLUMN` / `CHANGE COLUMN`: retype, rename, and reset options.
 async fn alter_change_column(
     db: &Session,
@@ -2073,9 +2089,20 @@ async fn alter_change_column(
 
     let new_ty = map_type(data_type)?;
     let old_ty = def.schema.columns[i].ty.clone();
+    let old_collation = def.schema.columns[i].collation;
+    let new_collation = options
+        .iter()
+        .rev()
+        .find_map(option_collation)
+        .unwrap_or(old_collation);
     if def.pk_cols.contains(&i) && new_ty != old_ty {
         return Err(Error::Unsupported(
             "cannot change the type of a primary key column".into(),
+        ));
+    }
+    if def.pk_cols.contains(&i) && new_collation != old_collation {
+        return Err(Error::Unsupported(
+            "cannot change the collation of a primary key column".into(),
         ));
     }
     if let Some(nn) = new_name {
@@ -2088,7 +2115,71 @@ async fn alter_change_column(
     if new_ty != old_ty {
         recoerce_column(db, def, i).await?;
     }
+    if new_collation != old_collation {
+        def.schema.columns[i].collation = new_collation;
+        let schema_collations = def
+            .schema
+            .columns
+            .iter()
+            .map(|column| column.collation)
+            .collect::<Vec<_>>();
+        for index in &mut def.indexes {
+            if index.cols.contains(&i) {
+                index.col_collations = index
+                    .cols
+                    .iter()
+                    .map(|&column| schema_collations[column])
+                    .collect();
+            }
+        }
+        rebuild_indexes_for_column(db, def, i).await?;
+    }
     Ok(())
+}
+
+async fn rebuild_indexes_for_column(db: &Session, def: &TableDef, column: usize) -> Result<()> {
+    let indexes = def
+        .indexes
+        .iter()
+        .filter(|index| index.cols.contains(&column))
+        .cloned()
+        .collect::<Vec<_>>();
+    if indexes.is_empty() {
+        return Ok(());
+    }
+
+    let mut deletes = Vec::new();
+    for index in &indexes {
+        for prefix in [
+            index::index_scan_prefix(&def.name, &index.name),
+            index::indexnull_scan_prefix(&def.name, &index.name),
+        ] {
+            let mut cursor = None;
+            loop {
+                let batch = db.scan_batch(prefix.clone(), cursor.clone(), 4096).await?;
+                if batch.is_empty() {
+                    break;
+                }
+                let is_last = batch.len() < 4096;
+                cursor = batch.last().map(|(key, _)| key.clone());
+                deletes.extend(batch.into_iter().map(|(key, _)| key));
+                if is_last {
+                    break;
+                }
+            }
+        }
+    }
+
+    let indexed_def = TableDef {
+        indexes,
+        ..def.clone()
+    };
+    let rows = collect_matches(db, def, None, None).await?;
+    let mut puts = vec![(catalog_key(&def.name), def.encode()?)];
+    for (key, row) in rows {
+        puts.extend(index::entries_for_row(&indexed_def, &row, &key)?);
+    }
+    db.commit_write(puts, deletes).await
 }
 
 /// `ALTER COLUMN ... SET/DROP DEFAULT | SET/DROP NOT NULL | SET DATA TYPE`.
@@ -2166,58 +2257,119 @@ async fn alter_add_column(
     col: &sqlparser::ast::ColumnDef,
 ) -> Result<()> {
     let ty = map_type(&col.data_type)?;
-    let mut nullable = true;
-    let mut default = Value::Null;
-    for opt in &col.options {
-        match &opt.option {
-            ColumnOption::NotNull => nullable = false,
-            ColumnOption::Default(e) => default = coerce(eval_expr(e)?, &ty, &col.name.value)?,
-            _ => {}
-        }
+    let options = col
+        .options
+        .iter()
+        .map(|option| option.option.clone())
+        .collect::<Vec<_>>();
+    let (nullable, meta) = options_to_meta(&options);
+    let is_primary = options.iter().any(|option| {
+        matches!(
+            option,
+            ColumnOption::Unique {
+                is_primary: true,
+                ..
+            }
+        )
+    });
+    if is_primary && def.has_pk() {
+        return Err(Error::Query("multiple primary keys are not allowed".into()));
     }
-    if !nullable && default.is_null() {
+    if meta.auto_increment && !is_primary {
+        return Err(Error::Unsupported(
+            "ADD COLUMN AUTO_INCREMENT currently requires PRIMARY KEY".into(),
+        ));
+    }
+    let default = options
+        .iter()
+        .find_map(|option| match option {
+            ColumnOption::Default(expression) => Some(expression),
+            _ => None,
+        })
+        .map(|expression| coerce(eval_expr(expression)?, &ty, &col.name.value))
+        .transpose()?
+        .unwrap_or(Value::Null);
+    if !nullable && default.is_null() && !meta.auto_increment {
         return Err(Error::Query(format!(
             "ADD COLUMN '{}' is NOT NULL and needs a DEFAULT",
             col.name.value
         )));
     }
 
-    // Append the default to every existing row.
-    let prefix = data_prefix(&def.name);
-    let mut cursor: Option<Vec<u8>> = None;
-    let mut puts = Vec::new();
-    loop {
-        let chunk = db.scan_batch(prefix.clone(), cursor.clone(), 4096).await?;
-        if chunk.is_empty() {
-            break;
-        }
-        let last = chunk.len() < 4096;
-        cursor = chunk.last().map(|(k, _)| k.clone());
-        for (k, v) in chunk {
-            let mut row: Vec<Value> = rowdec::decode_row(&v)?;
-            row.push(default.clone());
-            puts.push((
-                k,
-                bincode::serialize(&row).map_err(|e| Error::Storage(e.to_string()))?,
-            ));
-        }
-        if last {
-            break;
-        }
-    }
+    let old_def = def.clone();
+    let rows = collect_matches(db, def, None, None).await?;
+    ensure_col_meta(def);
+    let new_column = def.schema.columns.len();
     def.schema.columns.push(ColumnDef {
         name: col.name.value.clone(),
-        ty,
+        ty: ty.clone(),
         nullable,
         collation: col
             .collation
             .as_ref()
-            .map(|c| elyra_core::Collation::from_name(&c.to_string()))
+            .map(map_collation)
+            .or_else(|| {
+                col.options
+                    .iter()
+                    .rev()
+                    .find_map(|option| option_collation(&option.option))
+            })
             .unwrap_or_default(),
     });
-    if !puts.is_empty() {
-        db.commit_write(puts, vec![]).await?;
+    def.col_meta.push(meta.clone());
+    if is_primary {
+        def.pk_cols = vec![new_column];
     }
+
+    let mut puts = vec![(catalog_key(&def.name), def.encode()?)];
+    let mut deletes = Vec::new();
+    let mut auto_increment = 0i64;
+    for (old_key, mut row) in rows {
+        if is_primary {
+            deletes.extend(index::entry_keys_for_row(&old_def, &row, &old_key)?);
+        }
+        let value = if meta.auto_increment {
+            auto_increment += 1;
+            coerce(Value::Int(auto_increment), &ty, &col.name.value)?
+        } else {
+            default.clone()
+        };
+        row.push(value);
+        let new_key = if is_primary {
+            let primary_values = def
+                .pk_cols
+                .iter()
+                .map(|&position| row[position].clone())
+                .collect::<Vec<_>>();
+            data_key(
+                &def.name,
+                &keyenc::encode_key_coll(&primary_values, &def.pk_collations())?,
+            )
+        } else {
+            old_key.clone()
+        };
+        if new_key != old_key {
+            deletes.push(old_key);
+        }
+        puts.push((
+            new_key.clone(),
+            bincode::serialize(&row).map_err(|error| Error::Storage(error.to_string()))?,
+        ));
+        if is_primary {
+            puts.extend(index::entries_for_row(def, &row, &new_key)?);
+        }
+    }
+    if is_primary {
+        deletes.push(rowid_key(&def.name));
+    }
+    if meta.auto_increment {
+        puts.push((
+            autoinc_key(&def.name),
+            auto_increment.to_le_bytes().to_vec(),
+        ));
+    }
+    puts.push(bump_wcount(db, &def.name).await?);
+    db.commit_write(puts, deletes).await?;
     Ok(())
 }
 
@@ -2284,12 +2436,23 @@ async fn alter_drop_column(db: &Session, def: &mut TableDef, name: &str) -> Resu
     Ok(())
 }
 
+pub async fn rename_table(db: &Session, old: &str, new: &str) -> Result<QueryResult> {
+    let mut def = catalog::load(db, old).await?;
+    alter_rename_table(db, &mut def, new).await?;
+    Ok(QueryResult::Affected(0))
+}
+
 async fn alter_rename_table(db: &Session, def: &mut TableDef, new: &str) -> Result<()> {
     if catalog::exists(db, new).await? {
         return Err(Error::Catalog(format!("table already exists: {new}")));
     }
     let old = def.name.clone();
     def.name = new.to_string();
+    for foreign_key in &mut def.foreign_keys {
+        if foreign_key.ref_table.eq_ignore_ascii_case(&old) {
+            foreign_key.ref_table = new.to_string();
+        }
+    }
 
     let mut puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     let mut deletes: Vec<Vec<u8>> = Vec::new();
@@ -2345,16 +2508,40 @@ async fn alter_rename_table(db: &Session, def: &mut TableDef, new: &str) -> Resu
         }
     }
 
-    // Move catalog + meta counters.
+    // Move catalog + table-scoped metadata.
     deletes.push(catalog_key(&old));
     puts.push((catalog_key(new), def.encode()?));
-    if let Some(rc) = db.get(rowid_key(&old)).await? {
-        deletes.push(rowid_key(&old));
-        puts.push((rowid_key(new), rc));
+    // MySQL carries referencing foreign keys across a table rename. Update
+    // every child catalog in the same write so later DML never probes the old
+    // table name.
+    for table in catalog::list_tables(db).await? {
+        if table.eq_ignore_ascii_case(&old) {
+            continue;
+        }
+        let mut referencing = catalog::load(db, &table).await?;
+        let mut changed = false;
+        for foreign_key in &mut referencing.foreign_keys {
+            if foreign_key.ref_table.eq_ignore_ascii_case(&old) {
+                foreign_key.ref_table = new.to_string();
+                changed = true;
+            }
+        }
+        if changed {
+            puts.push((catalog_key(&table), referencing.encode()?));
+        }
     }
-    if let Some(wc) = db.get(wcount_key(&old)).await? {
-        deletes.push(wcount_key(&old));
-        puts.push((wcount_key(new), wc));
+    for key in [
+        rowid_key as fn(&str) -> Vec<u8>,
+        autoinc_key,
+        wcount_key,
+        stats_key,
+        partmeta_key,
+    ] {
+        let old_key = key(&old);
+        if let Some(value) = db.get(old_key.clone()).await? {
+            deletes.push(old_key);
+            puts.push((key(new), value));
+        }
     }
     db.commit_write(puts, deletes).await?;
     Ok(())
@@ -2506,6 +2693,62 @@ pub async fn create_index(db: &Session, ci: CreateIndex) -> Result<QueryResult> 
         }
     }
     db.commit_write(puts, vec![]).await?;
+    Ok(QueryResult::Affected(0))
+}
+
+/// Rename a secondary index and rebuild its persisted keys under the new name.
+pub async fn rename_index(
+    db: &Session,
+    table: &str,
+    old_name: &str,
+    new_name: &str,
+) -> Result<QueryResult> {
+    let mut def = catalog::load(db, table).await?;
+    if def
+        .indexes
+        .iter()
+        .any(|index| index.name.eq_ignore_ascii_case(new_name))
+    {
+        return Err(Error::Catalog(format!("index already exists: {new_name}")));
+    }
+    let position = def
+        .indexes
+        .iter()
+        .position(|index| index.name.eq_ignore_ascii_case(old_name))
+        .ok_or_else(|| Error::Catalog(format!("unknown index: {old_name}")))?;
+    def.indexes[position].name = new_name.to_string();
+    let renamed = def.indexes[position].clone();
+
+    let mut deletes = Vec::new();
+    for prefix in [
+        index::index_scan_prefix(table, old_name),
+        index::indexnull_scan_prefix(table, old_name),
+    ] {
+        let mut cursor = None;
+        loop {
+            let batch = db.scan_batch(prefix.clone(), cursor.clone(), 4096).await?;
+            if batch.is_empty() {
+                break;
+            }
+            let is_last = batch.len() < 4096;
+            cursor = batch.last().map(|(key, _)| key.clone());
+            deletes.extend(batch.into_iter().map(|(key, _)| key));
+            if is_last {
+                break;
+            }
+        }
+    }
+
+    let indexed_def = TableDef {
+        indexes: vec![renamed],
+        ..def.clone()
+    };
+    let rows = collect_matches(db, &def, None, None).await?;
+    let mut puts = vec![(catalog_key(table), def.encode()?)];
+    for (key, row) in rows {
+        puts.extend(index::entries_for_row(&indexed_def, &row, &key)?);
+    }
+    db.commit_write(puts, deletes).await?;
     Ok(QueryResult::Affected(0))
 }
 
@@ -3340,18 +3583,22 @@ async fn check_fk_batch(
     batch: &[(Vec<u8>, Vec<Value>)],
 ) -> Result<()> {
     for fk in &def.foreign_keys {
-        let parent = catalog::load(db, &fk.ref_table).await?;
-        let mut probes = Vec::new();
+        let mut referenced_values = Vec::new();
         for (_, row) in batch {
             let vals: Vec<Value> = fk.columns.iter().map(|&i| row[i].clone()).collect();
             if vals.iter().any(|v| v.is_null()) {
                 continue; // a NULL in the referencing tuple is allowed
             }
-            probes.push(fk_probe_key(&parent, &fk.ref_columns, &vals)?);
+            referenced_values.push(vals);
         }
-        if probes.is_empty() {
+        if referenced_values.is_empty() {
             continue;
         }
+        let parent = catalog::load(db, &fk.ref_table).await?;
+        let probes = referenced_values
+            .iter()
+            .map(|values| fk_probe_key(&parent, &fk.ref_columns, values))
+            .collect::<Result<Vec<_>>>()?;
         for found in db.multi_get(probes).await? {
             if found.is_none() {
                 return Err(Error::ForeignKey(format!(

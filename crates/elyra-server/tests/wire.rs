@@ -286,6 +286,196 @@ async fn create_database_fails_instead_of_succeeding_as_a_noop() {
 }
 
 #[tokio::test]
+async fn alter_change_and_modify_accept_collation() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop(
+        "CREATE TABLE collate_changes (
+            id INT PRIMARY KEY,
+            a TEXT,
+            INDEX idx_a (a)
+        )",
+    )
+    .await
+    .unwrap();
+    c.query_drop("INSERT INTO collate_changes VALUES (1, 'Alpha')")
+        .await
+        .unwrap();
+
+    c.query_drop(
+        "ALTER TABLE collate_changes
+         CHANGE a a2 TEXT COLLATE 'utf8mb4_bin'",
+    )
+    .await
+    .unwrap();
+    let binary_matches: i64 = c
+        .query_first("SELECT COUNT(*) FROM collate_changes WHERE a2 = 'alpha'")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(binary_matches, 0);
+
+    c.query_drop(
+        "ALTER TABLE collate_changes
+         MODIFY a2 TEXT COLLATE utf8mb4_0900_ai_ci",
+    )
+    .await
+    .unwrap();
+    let insensitive_matches: i64 = c
+        .query_first("SELECT COUNT(*) FROM collate_changes WHERE a2 = 'alpha'")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(insensitive_matches, 1);
+}
+
+#[tokio::test]
+async fn standalone_rename_table_preserves_rows_indexes_and_auto_increment() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop(
+        "CREATE TABLE rename_source (
+            id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+            a INT,
+            INDEX idx_a (a)
+        )",
+    )
+    .await
+    .unwrap();
+    c.query_drop("INSERT INTO rename_source (a) VALUES (10)")
+        .await
+        .unwrap();
+    c.query_drop(
+        "CREATE TABLE rename_child (
+            id INT PRIMARY KEY,
+            source_id INT,
+            CONSTRAINT fk_rename_source
+                FOREIGN KEY (source_id) REFERENCES rename_source(id)
+        )",
+    )
+    .await
+    .unwrap();
+    c.query_drop("INSERT INTO rename_child VALUES (1, 1)")
+        .await
+        .unwrap();
+
+    c.query_drop("RENAME TABLE rename_source TO rename_target")
+        .await
+        .unwrap();
+    c.query_drop("UPDATE rename_child SET source_id = 1 WHERE id = 1")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO rename_target (a) VALUES (20)")
+        .await
+        .unwrap();
+    let rows: Vec<(i64, i64)> = c
+        .query("SELECT id, a FROM rename_target ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![(1, 10), (2, 20)]);
+
+    let indexes: Vec<String> = c
+        .query("SHOW INDEX FROM rename_target")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row: mysql_async::Row| row.get("Key_name").unwrap())
+        .collect();
+    assert!(indexes.iter().any(|name| name == "idx_a"));
+    assert!(c.query_drop("SELECT * FROM rename_source").await.is_err());
+}
+
+#[tokio::test]
+async fn alter_table_rename_index_rekeys_existing_entries() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop(
+        "CREATE TABLE rename_index_table (
+            id INT PRIMARY KEY,
+            a INT,
+            INDEX idx_old (a)
+        )",
+    )
+    .await
+    .unwrap();
+    c.query_drop("INSERT INTO rename_index_table VALUES (1, 10), (2, 20)")
+        .await
+        .unwrap();
+
+    c.query_drop("ALTER TABLE rename_index_table RENAME INDEX idx_old TO idx_new")
+        .await
+        .unwrap();
+    let indexes: Vec<String> = c
+        .query("SHOW INDEX FROM rename_index_table")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row: mysql_async::Row| row.get("Key_name").unwrap())
+        .collect();
+    assert!(!indexes.iter().any(|name| name == "idx_old"));
+    assert!(indexes.iter().any(|name| name == "idx_new"));
+
+    let id: i64 = c
+        .query_first("SELECT id FROM rename_index_table WHERE a = 20")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(id, 2);
+}
+
+#[tokio::test]
+async fn add_auto_increment_primary_key_backfills_existing_rows() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop(
+        "CREATE TABLE add_auto_primary (
+            a INT NOT NULL,
+            label VARCHAR(10),
+            INDEX idx_a (a)
+        )",
+    )
+    .await
+    .unwrap();
+    c.query_drop("INSERT INTO add_auto_primary VALUES (30, 'c'), (10, 'a'), (20, 'b')")
+        .await
+        .unwrap();
+
+    c.query_drop(
+        "ALTER TABLE add_auto_primary
+         ADD id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY",
+    )
+    .await
+    .unwrap();
+    let rows: Vec<(u64, i64, String)> = c
+        .query("SELECT id, a, label FROM add_auto_primary ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            (1, 30, "c".into()),
+            (2, 10, "a".into()),
+            (3, 20, "b".into())
+        ]
+    );
+
+    c.query_drop("INSERT INTO add_auto_primary (a, label) VALUES (40, 'd')")
+        .await
+        .unwrap();
+    assert_eq!(c.last_insert_id(), Some(4));
+    let indexed_id: u64 = c
+        .query_first("SELECT id FROM add_auto_primary WHERE a = 20")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(indexed_id, 3);
+}
+
+#[tokio::test]
 async fn transactions_commit_and_rollback() {
     let srv = TestServer::start().await;
     let mut c = srv.conn().await;
@@ -3382,6 +3572,42 @@ async fn group_concat_honours_its_order_by() {
         .await
         .unwrap();
     assert_eq!(got.map(|s| s.split(',').count()), Some(12));
+}
+
+// Laravel's MySQL schema builder prepares this information_schema query when it
+// inspects a table's indexes. The GROUP BY path used to declare `NOT non_unique`
+// as text while returning an integer, which made the binary protocol terminate
+// the connection instead of sending the row.
+#[tokio::test]
+async fn prepared_index_introspection_keeps_not_result_numeric() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop(
+        "CREATE TABLE event_group (id BIGINT PRIMARY KEY, slug VARCHAR(32), INDEX ix_slug (slug))",
+    )
+    .await
+    .unwrap();
+
+    let mut rows: Vec<(String, String, String, i64)> = c
+        .exec(
+            "SELECT index_name AS `name`, \
+                    GROUP_CONCAT(column_name ORDER BY seq_in_index) AS `columns`, \
+                    index_type AS `type`, NOT non_unique AS `unique` \
+             FROM information_schema.statistics \
+             WHERE table_schema = schema() AND table_name = 'event_group' \
+             GROUP BY index_name, index_type, non_unique",
+            (),
+        )
+        .await
+        .unwrap();
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            ("PRIMARY".into(), "id".into(), "BTREE".into(), 1),
+            ("ix_slug".into(), "slug".into(), "BTREE".into(), 0),
+        ]
+    );
 }
 
 // A secondary-index range must not be used when it matches most of the table: the

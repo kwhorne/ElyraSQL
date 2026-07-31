@@ -861,15 +861,25 @@ impl Engine {
             return Ok(vec![exec::show_processlist()?]);
         }
 
+        // sqlparser 0.53 does not recognize standalone RENAME TABLE, and parses
+        // ALTER TABLE ... RENAME INDEX as a malformed column rename. Handle
+        // those narrow MySQL forms before the generic frontend.
+        if let Some(rename) = parse_mysql_rename(trimmed) {
+            require_privilege(privilege, PrivilegedAction::Rename)?;
+            let result = match rename {
+                MysqlRename::Table { old, new } => exec::rename_table(sess, &old, &new).await?,
+                MysqlRename::Index { table, old, new } => {
+                    exec::rename_index(sess, &table, &old, &new).await?
+                }
+            };
+            return Ok(vec![result]);
+        }
+
         // sqlparser 0.53 does not recognize MySQL's DROP INDEX / DROP FOREIGN
         // KEY forms. Parse these narrow DDL statements before the generic
         // frontend so Laravel's schema builder can remove indexes and keys.
         if let Some(drop) = parse_mysql_drop(trimmed) {
-            if privilege < Privilege::Admin {
-                return Err(Error::Query(
-                    "access denied: ALTER TABLE requires ADMIN privilege".into(),
-                ));
-            }
+            require_privilege(privilege, PrivilegedAction::AlterTable)?;
             let result = match drop.kind {
                 MysqlDropKind::Index => exec::drop_index(sess, &drop.table, &drop.name).await?,
                 MysqlDropKind::ForeignKey => {
@@ -882,11 +892,7 @@ impl Engine {
         // BACKUP [DATABASE] TO '<path>' — hot, consistent copy of the whole
         // database to a new file. Not standard SQL, so handled here.
         if head.starts_with("backup") {
-            if privilege < Privilege::Admin {
-                return Err(Error::Query(
-                    "access denied: BACKUP requires ADMIN privilege".into(),
-                ));
-            }
+            require_privilege(privilege, PrivilegedAction::Backup)?;
             let toks: Vec<&str> = trimmed.split_whitespace().collect();
             let path = toks
                 .iter()
@@ -904,11 +910,7 @@ impl Engine {
 
         // CREATE FULLTEXT INDEX (not reliably parsed by the frontend).
         if head.starts_with("create fulltext index") {
-            if privilege < Privilege::Admin {
-                return Err(Error::Query(
-                    "access denied: CREATE FULLTEXT INDEX requires ADMIN privilege".into(),
-                ));
-            }
+            require_privilege(privilege, PrivilegedAction::CreateFulltextIndex)?;
             let toks: Vec<&str> = trimmed.split_whitespace().collect();
             let name = toks
                 .iter()
@@ -970,11 +972,7 @@ impl Engine {
                 None
             };
             if let Some((kw, drop_meta)) = op {
-                if privilege < Privilege::Write {
-                    return Err(Error::Query(
-                        "access denied: ALTER TABLE requires WRITE privilege".into(),
-                    ));
-                }
+                require_privilege(privilege, PrivilegedAction::AlterPartition)?;
                 let toks: Vec<&str> = trimmed.split_whitespace().collect();
                 let table = toks
                     .get(2)
@@ -1012,22 +1010,14 @@ impl Engine {
             || head.starts_with("refresh materialized")
             || head.starts_with("drop materialized")
         {
-            if privilege < Privilege::Write {
-                return Err(Error::Query(
-                    "access denied: materialized views require WRITE privilege".into(),
-                ));
-            }
+            require_privilege(privilege, PrivilegedAction::MaterializedViews)?;
             return self.materialized_view(trimmed, privilege, user, sess).await;
         }
 
         // LOAD DATA INFILE '<server-side path>' INTO TABLE t ... — reads a file on
         // the server and bulk-inserts it (requires ADMIN, like MySQL's FILE priv).
         if head.starts_with("load data") {
-            if privilege < Privilege::Admin {
-                return Err(Error::Query(
-                    "access denied: LOAD DATA INFILE requires ADMIN privilege".into(),
-                ));
-            }
+            require_privilege(privilege, PrivilegedAction::LoadDataInfile)?;
             let spec = exec::parse_load_data(trimmed)?;
             let content = tokio::fs::read_to_string(&spec.path).await.map_err(|e| {
                 Error::Query(format!("LOAD DATA: cannot read '{}': {e}", spec.path))
@@ -1051,6 +1041,7 @@ impl Engine {
         // Pessimistic table locking (LOCK TABLES / UNLOCK TABLES) — not parsed by
         // the SQL frontend.
         if head.starts_with("lock tables") || head.starts_with("lock table ") {
+            require_privilege(privilege, PrivilegedAction::LockTables)?;
             let rest = {
                 let lower = trimmed.to_ascii_lowercase();
                 let pos = lower
@@ -1084,11 +1075,7 @@ impl Engine {
 
         // Triggers (MySQL CREATE/DROP TRIGGER, not parsed by the frontend).
         if head.starts_with("create trigger") || head.starts_with("create or replace trigger") {
-            if privilege < Privilege::Admin {
-                return Err(Error::Query(
-                    "access denied: CREATE TRIGGER requires ADMIN privilege".into(),
-                ));
-            }
+            require_privilege(privilege, PrivilegedAction::CreateTrigger)?;
             let t = parse_create_trigger(trimmed)?;
             sess.commit_write(
                 vec![
@@ -1105,11 +1092,7 @@ impl Engine {
             return Ok(vec![QueryResult::empty_ok()]);
         }
         if head.starts_with("drop trigger") {
-            if privilege < Privilege::Admin {
-                return Err(Error::Query(
-                    "access denied: DROP TRIGGER requires ADMIN privilege".into(),
-                ));
-            }
+            require_privilege(privilege, PrivilegedAction::DropTrigger)?;
             let toks: Vec<&str> = trimmed.split_whitespace().collect();
             let name = toks
                 .iter()
@@ -1143,11 +1126,7 @@ impl Engine {
             return Ok(vec![exec::show_binary_logs(sess).await?]);
         }
         if head.starts_with("purge binary") || head.starts_with("purge master") {
-            if privilege < Privilege::Admin {
-                return Err(Error::Query(
-                    "access denied: PURGE BINARY LOGS requires ADMIN privilege".into(),
-                ));
-            }
+            require_privilege(privilege, PrivilegedAction::PurgeBinaryLogs)?;
             let toks: Vec<&str> = trimmed.split_whitespace().collect();
             let to = toks
                 .iter()
@@ -1161,11 +1140,7 @@ impl Engine {
         // Stored procedures (CREATE/DROP PROCEDURE, CALL): the MySQL BEGIN..END
         // body is not parsed by the SQL frontend, so handle it here.
         if head.starts_with("create procedure") || head.starts_with("create or replace procedure") {
-            if privilege < Privilege::Admin {
-                return Err(Error::Query(
-                    "access denied: CREATE PROCEDURE requires ADMIN privilege".into(),
-                ));
-            }
+            require_privilege(privilege, PrivilegedAction::CreateProcedure)?;
             let (name, def) = parse_create_procedure(trimmed)?;
             let enc = bincode::serialize(&def).map_err(|e| Error::Storage(e.to_string()))?;
             sess.commit_write(vec![(catalog::proc_key(&name), enc)], vec![])
@@ -1173,11 +1148,7 @@ impl Engine {
             return Ok(vec![QueryResult::empty_ok()]);
         }
         if head.starts_with("drop procedure") {
-            if privilege < Privilege::Admin {
-                return Err(Error::Query(
-                    "access denied: DROP PROCEDURE requires ADMIN privilege".into(),
-                ));
-            }
+            require_privilege(privilege, PrivilegedAction::DropProcedure)?;
             let toks: Vec<&str> = trimmed.split_whitespace().collect();
             let name = toks
                 .iter()
@@ -1288,6 +1259,12 @@ impl Engine {
         if let Some(stripped) = strip_create_table_options(&subst_sql) {
             subst_sql = stripped;
         }
+        // CHANGE/MODIFY parse column options manually in sqlparser 0.53 and
+        // omit COLLATE. Rewrite only top-level ALTER TABLE collation clauses to
+        // the equivalent CHARACTER SET option, which that parser path retains.
+        if let Some(rewritten) = rewrite_alter_column_collations(&subst_sql) {
+            subst_sql = rewritten;
+        }
         let mut update_modifiers = None;
         if let Some(parsed) = parse_update_modifiers(&subst_sql)? {
             subst_sql = parsed.base_sql.clone();
@@ -1354,11 +1331,7 @@ impl Engine {
             let effective = self
                 .effective_privilege(privilege, user, &stmt, sess)
                 .await?;
-            if effective < need {
-                return Err(Error::Query(format!(
-                    "access denied: statement requires {need:?} privilege"
-                )));
-            }
+            require_privilege(effective, PrivilegedAction::Statement(need))?;
             // Fine-grained write enforcement: within the write tier, require the
             // *specific* privilege (INSERT/UPDATE/DELETE) on each target table,
             // not merely "some write". Skipped for Admin/open-auth connections
@@ -1985,6 +1958,77 @@ fn parse_create_procedure(sql: &str) -> Result<(String, proc::ProcDef)> {
     Ok((name, proc::ProcDef { params, body }))
 }
 
+#[derive(Clone, Copy)]
+enum PrivilegedAction {
+    Rename,
+    AlterTable,
+    AlterPartition,
+    Backup,
+    CreateFulltextIndex,
+    MaterializedViews,
+    LoadDataInfile,
+    LockTables,
+    CreateTrigger,
+    DropTrigger,
+    PurgeBinaryLogs,
+    CreateProcedure,
+    DropProcedure,
+    Statement(Privilege),
+}
+
+impl PrivilegedAction {
+    fn required(self) -> Privilege {
+        match self {
+            Self::AlterPartition | Self::MaterializedViews | Self::LockTables => Privilege::Write,
+            Self::Statement(required) => required,
+            Self::Rename
+            | Self::AlterTable
+            | Self::Backup
+            | Self::CreateFulltextIndex
+            | Self::LoadDataInfile
+            | Self::CreateTrigger
+            | Self::DropTrigger
+            | Self::PurgeBinaryLogs
+            | Self::CreateProcedure
+            | Self::DropProcedure => Privilege::Admin,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Rename => "RENAME",
+            Self::AlterTable | Self::AlterPartition => "ALTER TABLE",
+            Self::Backup => "BACKUP",
+            Self::CreateFulltextIndex => "CREATE FULLTEXT INDEX",
+            Self::MaterializedViews => "materialized views",
+            Self::LoadDataInfile => "LOAD DATA INFILE",
+            Self::LockTables => "LOCK TABLES",
+            Self::CreateTrigger => "CREATE TRIGGER",
+            Self::DropTrigger => "DROP TRIGGER",
+            Self::PurgeBinaryLogs => "PURGE BINARY LOGS",
+            Self::CreateProcedure => "CREATE PROCEDURE",
+            Self::DropProcedure => "DROP PROCEDURE",
+            Self::Statement(_) => "statement",
+        }
+    }
+}
+
+fn require_privilege(granted: Privilege, action: PrivilegedAction) -> Result<()> {
+    let required = action.required();
+    if granted >= required {
+        return Ok(());
+    }
+    let required = match required {
+        Privilege::Read => "READ",
+        Privilege::Write => "WRITE",
+        Privilege::Admin => "ADMIN",
+    };
+    Err(Error::Query(format!(
+        "access denied: {} requires {required} privilege",
+        action.label()
+    )))
+}
+
 fn required_privilege(stmt: &Statement) -> Privilege {
     match stmt {
         Statement::Query(_) | Statement::SetVariable { .. } | Statement::Use { .. } => {
@@ -2239,6 +2283,84 @@ fn is_deepening_token(tok: &Token) -> bool {
     }
 }
 
+fn mysql_ddl_tokens(sql: &str) -> Option<Vec<Token>> {
+    let dialect = MySqlDialect {};
+    Some(
+        Tokenizer::new(&dialect, sql)
+            .tokenize()
+            .ok()?
+            .into_iter()
+            .filter(|token| !matches!(token, Token::Whitespace(_) | Token::SemiColon))
+            .collect(),
+    )
+}
+
+fn mysql_word(tokens: &[Token], position: usize) -> Option<&str> {
+    match tokens.get(position) {
+        Some(Token::Word(word)) => Some(word.value.as_str()),
+        _ => None,
+    }
+}
+
+fn mysql_keyword(tokens: &[Token], position: usize, expected: &str) -> bool {
+    mysql_word(tokens, position).is_some_and(|actual| actual.eq_ignore_ascii_case(expected))
+}
+
+fn mysql_table_name(tokens: &[Token], start: usize, end: usize) -> Option<String> {
+    match tokens.get(start..end)? {
+        [Token::Word(table)] => Some(table.value.clone()),
+        [Token::Word(_schema), Token::Period, Token::Word(table)] => Some(table.value.clone()),
+        _ => None,
+    }
+}
+
+enum MysqlRename {
+    Table {
+        old: String,
+        new: String,
+    },
+    Index {
+        table: String,
+        old: String,
+        new: String,
+    },
+}
+
+/// Parse MySQL rename forms absent from sqlparser 0.53. The single-pair
+/// `RENAME TABLE` form is what Laravel emits; quoted and schema-qualified table
+/// names are accepted.
+fn parse_mysql_rename(sql: &str) -> Option<MysqlRename> {
+    let tokens = mysql_ddl_tokens(sql)?;
+
+    if mysql_keyword(&tokens, 0, "rename") && mysql_keyword(&tokens, 1, "table") {
+        let to_position = (2..tokens.len()).find(|&i| mysql_keyword(&tokens, i, "to"))?;
+        return Some(MysqlRename::Table {
+            old: mysql_table_name(&tokens, 2, to_position)?,
+            new: mysql_table_name(&tokens, to_position + 1, tokens.len())?,
+        });
+    }
+
+    if tokens.len() >= 7 && mysql_keyword(&tokens, 0, "alter") && mysql_keyword(&tokens, 1, "table")
+    {
+        let rename_position = tokens.iter().position(
+            |token| matches!(token, Token::Word(word) if word.value.eq_ignore_ascii_case("rename")),
+        )?;
+        if rename_position + 5 == tokens.len()
+            && (mysql_keyword(&tokens, rename_position + 1, "index")
+                || mysql_keyword(&tokens, rename_position + 1, "key"))
+            && mysql_keyword(&tokens, rename_position + 3, "to")
+        {
+            return Some(MysqlRename::Index {
+                table: mysql_table_name(&tokens, 2, rename_position)?,
+                old: mysql_word(&tokens, rename_position + 2)?.to_string(),
+                new: mysql_word(&tokens, rename_position + 4)?.to_string(),
+            });
+        }
+    }
+
+    None
+}
+
 #[derive(Clone, Copy)]
 enum MysqlDropKind {
     Index,
@@ -2255,64 +2377,93 @@ struct MysqlDrop {
 /// `ALTER TABLE t DROP INDEX i`, `ALTER TABLE t DROP FOREIGN KEY fk`, and
 /// `DROP INDEX i ON t`. Quoted and schema-qualified table names are accepted.
 fn parse_mysql_drop(sql: &str) -> Option<MysqlDrop> {
-    let dialect = MySqlDialect {};
-    let tokens: Vec<Token> = Tokenizer::new(&dialect, sql)
-        .tokenize()
-        .ok()?
-        .into_iter()
-        .filter(|token| !matches!(token, Token::Whitespace(_) | Token::SemiColon))
-        .collect();
+    let tokens = mysql_ddl_tokens(sql)?;
 
-    let word = |position: usize| match tokens.get(position) {
-        Some(Token::Word(word)) => Some(word.value.as_str()),
-        _ => None,
-    };
-    let keyword = |position: usize, expected: &str| {
-        word(position).is_some_and(|actual| actual.eq_ignore_ascii_case(expected))
-    };
-    let table_name = |start: usize, end: usize| -> Option<String> {
-        match &tokens[start..end] {
-            [Token::Word(table)] => Some(table.value.clone()),
-            [Token::Word(_schema), Token::Period, Token::Word(table)] => Some(table.value.clone()),
-            _ => None,
-        }
-    };
-
-    if tokens.len() >= 6 && keyword(0, "alter") && keyword(1, "table") {
+    if tokens.len() >= 6 && mysql_keyword(&tokens, 0, "alter") && mysql_keyword(&tokens, 1, "table")
+    {
         let drop_position = tokens.iter().position(
             |token| matches!(token, Token::Word(word) if word.value.eq_ignore_ascii_case("drop")),
         )?;
-        let table = table_name(2, drop_position)?;
+        let table = mysql_table_name(&tokens, 2, drop_position)?;
         if drop_position + 3 == tokens.len()
-            && (keyword(drop_position + 1, "index") || keyword(drop_position + 1, "key"))
+            && (mysql_keyword(&tokens, drop_position + 1, "index")
+                || mysql_keyword(&tokens, drop_position + 1, "key"))
         {
             return Some(MysqlDrop {
                 table,
-                name: word(drop_position + 2)?.to_string(),
+                name: mysql_word(&tokens, drop_position + 2)?.to_string(),
                 kind: MysqlDropKind::Index,
             });
         }
         if drop_position + 4 == tokens.len()
-            && keyword(drop_position + 1, "foreign")
-            && keyword(drop_position + 2, "key")
+            && mysql_keyword(&tokens, drop_position + 1, "foreign")
+            && mysql_keyword(&tokens, drop_position + 2, "key")
         {
             return Some(MysqlDrop {
                 table,
-                name: word(drop_position + 3)?.to_string(),
+                name: mysql_word(&tokens, drop_position + 3)?.to_string(),
                 kind: MysqlDropKind::ForeignKey,
             });
         }
     }
 
-    if tokens.len() >= 5 && keyword(0, "drop") && keyword(1, "index") && keyword(3, "on") {
+    if tokens.len() >= 5
+        && mysql_keyword(&tokens, 0, "drop")
+        && mysql_keyword(&tokens, 1, "index")
+        && mysql_keyword(&tokens, 3, "on")
+    {
         return Some(MysqlDrop {
-            table: table_name(4, tokens.len())?,
-            name: word(2)?.to_string(),
+            table: mysql_table_name(&tokens, 4, tokens.len())?,
+            name: mysql_word(&tokens, 2)?.to_string(),
             kind: MysqlDropKind::Index,
         });
     }
 
     None
+}
+
+/// Make ALTER TABLE CHANGE/MODIFY collation clauses visible to sqlparser 0.53.
+/// Its column-option parser retains `CHARACTER SET <name>` but, unlike the
+/// CREATE/ADD column path, does not consume `COLLATE <name>`. The executor maps
+/// both spellings onto ElyraSQL's stored text collation.
+fn rewrite_alter_column_collations(sql: &str) -> Option<String> {
+    let statement = sql.trim_start();
+    if !keyword_at(statement.as_bytes(), 0, b"alter") {
+        return None;
+    }
+    let table_position = find_top_level_keyword(statement, b"table")?;
+    if !statement[..table_position]
+        .trim()
+        .eq_ignore_ascii_case("alter")
+    {
+        return None;
+    }
+    if find_top_level_keyword(statement, b"change").is_none()
+        && find_top_level_keyword(statement, b"modify").is_none()
+    {
+        return None;
+    }
+
+    let mut positions = Vec::new();
+    let mut search_from = 0;
+    while let Some(relative) = find_top_level_keyword(&sql[search_from..], b"collate") {
+        let position = search_from + relative;
+        positions.push(position);
+        search_from = position + b"collate".len();
+    }
+    if positions.is_empty() {
+        return None;
+    }
+
+    let mut rewritten = String::with_capacity(sql.len() + positions.len() * 6);
+    let mut copied_through = 0;
+    for position in positions {
+        rewritten.push_str(&sql[copied_through..position]);
+        rewritten.push_str("CHARACTER SET");
+        copied_through = position + b"collate".len();
+    }
+    rewritten.push_str(&sql[copied_through..]);
+    Some(rewritten)
 }
 
 /// Extract MySQL's single-table `UPDATE ... ORDER BY ... [LIMIT ...]` tail.
@@ -3326,10 +3477,77 @@ mod comma_update_tests {
 }
 
 #[cfg(test)]
+mod mysql_ddl_compat_tests {
+    use super::{
+        parse_mysql_rename, require_privilege, rewrite_alter_column_collations, MysqlRename,
+        PrivilegedAction,
+    };
+    use elyra_core::Privilege;
+
+    #[test]
+    fn rewrites_only_alter_change_and_modify_collations() {
+        assert_eq!(
+            rewrite_alter_column_collations(
+                "ALTER TABLE t CHANGE a b TEXT COLLATE 'utf8mb4_0900_ai_ci'"
+            )
+            .as_deref(),
+            Some("ALTER TABLE t CHANGE a b TEXT CHARACTER SET 'utf8mb4_0900_ai_ci'")
+        );
+        assert_eq!(
+            rewrite_alter_column_collations(
+                "ALTER TABLE t MODIFY a TEXT COLLATE utf8mb4_bin, \
+                 CHANGE b c TEXT COLLATE utf8mb4_0900_ai_ci"
+            )
+            .as_deref(),
+            Some(
+                "ALTER TABLE t MODIFY a TEXT CHARACTER SET utf8mb4_bin, \
+                 CHANGE b c TEXT CHARACTER SET utf8mb4_0900_ai_ci"
+            )
+        );
+        assert!(
+            rewrite_alter_column_collations("CREATE TABLE t (a TEXT COLLATE utf8mb4_bin)")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn parses_laravel_rename_forms() {
+        match parse_mysql_rename("RENAME TABLE `old_table` TO `new_table`") {
+            Some(MysqlRename::Table { old, new }) => {
+                assert_eq!(old, "old_table");
+                assert_eq!(new, "new_table");
+            }
+            _ => panic!("expected a table rename"),
+        }
+        match parse_mysql_rename("ALTER TABLE db.t RENAME INDEX `old_i` TO `new_i`") {
+            Some(MysqlRename::Index { table, old, new }) => {
+                assert_eq!(table, "t");
+                assert_eq!(old, "old_i");
+                assert_eq!(new, "new_i");
+            }
+            _ => panic!("expected an index rename"),
+        }
+    }
+
+    #[test]
+    fn shared_privilege_gate_enforces_the_required_tier() {
+        assert!(require_privilege(Privilege::Admin, PrivilegedAction::AlterTable).is_ok());
+        assert!(require_privilege(Privilege::Write, PrivilegedAction::AlterTable).is_err());
+        assert!(require_privilege(Privilege::Read, PrivilegedAction::LockTables).is_err());
+        assert!(require_privilege(
+            Privilege::Write,
+            PrivilegedAction::Statement(Privilege::Write)
+        )
+        .is_ok());
+    }
+}
+
+#[cfg(test)]
 mod fuzz_props {
     use super::{
-        parse_update_modifiers, rewrite_comma_update, rewrite_insert_set, split_top_level,
-        strip_create_table_options, strip_dml_limit,
+        parse_mysql_rename, parse_update_modifiers, rewrite_alter_column_collations,
+        rewrite_comma_update, rewrite_insert_set, split_top_level, strip_create_table_options,
+        strip_dml_limit,
     };
     use proptest::prelude::*;
 
@@ -3347,6 +3565,8 @@ mod fuzz_props {
             let _ = strip_create_table_options(&s);
             let _ = strip_dml_limit(&s);
             let _ = parse_update_modifiers(&s);
+            let _ = parse_mysql_rename(&s);
+            let _ = rewrite_alter_column_collations(&s);
             let _ = split_top_level(&s, ',');
             let _ = split_top_level(&s, '=');
         }
@@ -3360,6 +3580,9 @@ mod fuzz_props {
             let _ = rewrite_insert_set(&format!("INSERT IGNORE INTO `t` SET {a}"));
             let _ = rewrite_comma_update(&format!("UPDATE {a} SET x = 1 WHERE y = 2"));
             let _ = strip_create_table_options(&format!("CREATE TABLE t (id INT) {a}"));
+            let _ = rewrite_alter_column_collations(&format!(
+                "ALTER TABLE t CHANGE a b TEXT {a}"
+            ));
         }
 
         /// split_top_level round-trips: joining the parts with the separator

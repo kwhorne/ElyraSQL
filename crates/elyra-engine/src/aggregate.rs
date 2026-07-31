@@ -747,7 +747,21 @@ fn infer_computed_type(expr: &Expr) -> ColumnType {
                 _ => ColumnType::Text,
             }
         }
-        Expr::UnaryOp { expr: e, .. } | Expr::Nested(e) => infer_computed_type(e),
+        Expr::UnaryOp { op, expr: e } => {
+            use sqlparser::ast::UnaryOperator::*;
+            match op {
+                // MySQL exposes logical negation as an integer result. This is
+                // especially important for native prepared statements, whose
+                // binary rows must agree with the declared result metadata.
+                Not | BangNot => ColumnType::Int,
+                PGBitwiseNot => ColumnType::UInt,
+                PGSquareRoot | PGCubeRoot => ColumnType::Float,
+                Plus | Minus | PGPostfixFactorial | PGPrefixFactorial | PGAbs => {
+                    infer_computed_type(e)
+                }
+            }
+        }
+        Expr::Nested(e) => infer_computed_type(e),
         Expr::Function(f) => {
             let n = f
                 .name
