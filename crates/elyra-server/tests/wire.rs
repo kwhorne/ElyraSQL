@@ -195,6 +195,51 @@ async fn mysql_index_and_foreign_key_drop_forms() {
 }
 
 #[tokio::test]
+async fn dropping_a_column_preserves_foreign_key_positions() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop("CREATE TABLE parents (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop(
+        "CREATE TABLE children (
+            id INT PRIMARY KEY,
+            obsolete INT,
+            parent_id INT,
+            payload INT,
+            CONSTRAINT fk_parent FOREIGN KEY (parent_id) REFERENCES parents(id)
+        )",
+    )
+    .await
+    .unwrap();
+    c.query_drop("INSERT INTO parents VALUES (7)")
+        .await
+        .unwrap();
+
+    c.query_drop("ALTER TABLE children DROP COLUMN obsolete")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO children VALUES (1, 7, 999)")
+        .await
+        .unwrap();
+    assert!(c
+        .query_drop("INSERT INTO children VALUES (2, 999, 7)")
+        .await
+        .is_err());
+
+    let column: String = c
+        .query_first(
+            "SELECT column_name FROM information_schema.key_column_usage \
+             WHERE table_name = 'children' AND constraint_name = 'fk_parent'",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(column, "parent_id");
+}
+
+#[tokio::test]
 async fn update_order_by_limit_changes_only_the_ordered_rows() {
     let srv = TestServer::start().await;
     let mut c = srv.conn().await;
@@ -496,6 +541,46 @@ async fn transactions_commit_and_rollback() {
 
     let ids: Vec<i64> = c.query("SELECT id FROM t ORDER BY id").await.unwrap();
     assert_eq!(ids, vec![1]);
+}
+
+#[tokio::test]
+async fn transactional_update_keeps_unchanged_index_entries_visible() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop(
+        "CREATE TABLE records (
+            id INT PRIMARY KEY,
+            lookup_key INT,
+            note VARCHAR(20),
+            INDEX lookup_key_idx (lookup_key)
+        )",
+    )
+    .await
+    .unwrap();
+
+    c.query_drop("BEGIN").await.unwrap();
+    c.query_drop("INSERT INTO records VALUES (1, 7, 'before')")
+        .await
+        .unwrap();
+    c.query_drop("UPDATE records SET note = 'after' WHERE id = 1")
+        .await
+        .unwrap();
+
+    let note: String = c
+        .query_first("SELECT note FROM records WHERE lookup_key = 7")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(note, "after");
+
+    c.query_drop("COMMIT").await.unwrap();
+    let note: String = c
+        .query_first("SELECT note FROM records WHERE lookup_key = 7")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(note, "after");
 }
 
 #[tokio::test]
@@ -1670,6 +1755,39 @@ async fn data_types() {
     assert!(doc.contains("\"a\""), "json was {doc}");
 }
 
+// MySQL accepts datetime-shaped bound strings for DATE columns and stores only
+// the date component, including both midnight and non-midnight values.
+#[tokio::test]
+async fn date_columns_accept_datetime_shaped_prepared_values() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop("CREATE TABLE bound_dates (id INT PRIMARY KEY, d DATE NOT NULL)")
+        .await
+        .unwrap();
+    c.exec_drop(
+        "INSERT INTO bound_dates VALUES (?, ?), (?, ?)",
+        (1, "2026-08-02 00:00:00", 2, "2026-08-03 23:59:59"),
+    )
+    .await
+    .unwrap();
+
+    let rows: Vec<(i64, String)> = c
+        .query("SELECT id, d FROM bound_dates ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![(1, "2026-08-02".into()), (2, "2026-08-03".into())]
+    );
+    assert!(c
+        .exec_drop(
+            "INSERT INTO bound_dates VALUES (?, ?)",
+            (3, "2026-02-30 00:00:00"),
+        )
+        .await
+        .is_err());
+}
+
 #[tokio::test]
 async fn introspection() {
     let srv = TestServer::start().await;
@@ -1688,6 +1806,148 @@ async fn introspection() {
         .unwrap()
         .unwrap();
     assert_eq!(n, 2);
+}
+
+// Keep the standard table-introspection columns present and binary-protocol
+// compatible even when only best-effort size metadata is available.
+#[tokio::test]
+async fn table_introspection_columns_are_available() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop("CREATE TABLE introspected_table (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+
+    let rows: Vec<(String, String, i64, String, String, String)> = c
+        .exec(
+            "SELECT table_name AS `name`, table_schema AS `schema`, \
+                    (data_length + index_length) AS `size`, \
+                    table_comment AS `comment`, engine AS `engine`, \
+                    table_collation AS `collation` \
+             FROM information_schema.tables \
+             WHERE table_type IN ('BASE TABLE', 'SYSTEM VERSIONED') \
+               AND table_schema IN ('elyra') \
+             ORDER BY table_schema, table_name",
+            (),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![(
+            "introspected_table".into(),
+            "elyra".into(),
+            0,
+            String::new(),
+            "ElyraSQL".into(),
+            "utf8mb4_0900_ai_ci".into(),
+        )]
+    );
+}
+
+// Foreign-key introspection joins these two virtual relations and aggregates
+// composite-key columns in ordinal order. The join must stay on the virtual
+// relation path rather than loading either view as a stored table.
+#[tokio::test]
+async fn foreign_key_introspection_reports_actions() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop(
+        "CREATE TABLE introspected_parent (
+            id INT,
+            tenant_id INT,
+            PRIMARY KEY (id, tenant_id)
+        )",
+    )
+    .await
+    .unwrap();
+    c.query_drop(
+        "CREATE TABLE introspected_child (
+            id INT PRIMARY KEY,
+            parent_id INT,
+            parent_tenant_id INT,
+            CONSTRAINT fk_introspected_parent
+                FOREIGN KEY (parent_id, parent_tenant_id)
+                REFERENCES introspected_parent (id, tenant_id)
+                ON UPDATE CASCADE ON DELETE SET NULL
+        )",
+    )
+    .await
+    .unwrap();
+
+    let rows: Vec<(String, String, String, String, String, String, String)> = c
+        .exec(
+            "SELECT kc.constraint_name AS `name`, \
+                    GROUP_CONCAT(kc.column_name ORDER BY kc.ordinal_position) AS `columns`, \
+                    kc.referenced_table_schema AS `foreign_schema`, \
+                    kc.referenced_table_name AS `foreign_table`, \
+                    GROUP_CONCAT(kc.referenced_column_name ORDER BY kc.ordinal_position) \
+                        AS `foreign_columns`, \
+                    rc.update_rule AS `on_update`, rc.delete_rule AS `on_delete` \
+             FROM information_schema.key_column_usage kc \
+             JOIN information_schema.referential_constraints rc \
+               ON kc.constraint_schema = rc.constraint_schema \
+              AND kc.constraint_name = rc.constraint_name \
+             WHERE kc.table_schema = 'elyra' \
+               AND kc.table_name = 'introspected_child' \
+               AND kc.referenced_table_name IS NOT NULL \
+             GROUP BY kc.constraint_name, kc.referenced_table_schema, \
+                      kc.referenced_table_name, rc.update_rule, rc.delete_rule",
+            (),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![(
+            "fk_introspected_parent".into(),
+            "parent_id,parent_tenant_id".into(),
+            "elyra".into(),
+            "introspected_parent".into(),
+            "id,tenant_id".into(),
+            "CASCADE".into(),
+            "SET NULL".into(),
+        )]
+    );
+
+    c.query_drop("CREATE TABLE default_action_parent (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop(
+        "CREATE TABLE default_action_child (
+            id INT PRIMARY KEY,
+            parent_id INT,
+            CONSTRAINT fk_default_action
+                FOREIGN KEY (parent_id) REFERENCES default_action_parent (id)
+        )",
+    )
+    .await
+    .unwrap();
+    let actions: (String, String) = c
+        .query_first(
+            "SELECT update_rule, delete_rule \
+             FROM information_schema.referential_constraints \
+             WHERE constraint_name = 'fk_default_action'",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(actions, ("NO ACTION".into(), "NO ACTION".into()));
+
+    let error = c
+        .query_drop(
+            "SELECT 1 FROM information_schema.key_column_usage kc \
+             JOIN information_schema.missing_constraints mc \
+               ON kc.constraint_name = mc.constraint_name LIMIT 1",
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("missing_constraints"), "{error}");
+    assert!(
+        !error.contains("no such table: key_column_usage"),
+        "{error}"
+    );
 }
 
 #[tokio::test]
@@ -3574,16 +3834,15 @@ async fn group_concat_honours_its_order_by() {
     assert_eq!(got.map(|s| s.split(',').count()), Some(12));
 }
 
-// Laravel's MySQL schema builder prepares this information_schema query when it
-// inspects a table's indexes. The GROUP BY path used to declare `NOT non_unique`
-// as text while returning an integer, which made the binary protocol terminate
-// the connection instead of sending the row.
+// Index introspection commonly prepares this information_schema query. The
+// GROUP BY path used to declare `NOT non_unique` as text while returning an
+// integer, which terminated the binary-protocol connection.
 #[tokio::test]
 async fn prepared_index_introspection_keeps_not_result_numeric() {
     let srv = TestServer::start().await;
     let mut c = srv.conn().await;
     c.query_drop(
-        "CREATE TABLE event_group (id BIGINT PRIMARY KEY, slug VARCHAR(32), INDEX ix_slug (slug))",
+        "CREATE TABLE indexed_items (id BIGINT PRIMARY KEY, slug VARCHAR(32), INDEX ix_slug (slug))",
     )
     .await
     .unwrap();
@@ -3594,7 +3853,7 @@ async fn prepared_index_introspection_keeps_not_result_numeric() {
                     GROUP_CONCAT(column_name ORDER BY seq_in_index) AS `columns`, \
                     index_type AS `type`, NOT non_unique AS `unique` \
              FROM information_schema.statistics \
-             WHERE table_schema = schema() AND table_name = 'event_group' \
+             WHERE table_schema = schema() AND table_name = 'indexed_items' \
              GROUP BY index_name, index_type, non_unique",
             (),
         )
@@ -3743,9 +4002,8 @@ async fn in_list_lookups_return_correct_rows() {
     }
 
     // Literals of a different type than the column must be coerced before they are
-    // encoded as index keys. PDO binds integers as quoted strings, so this is the
-    // ordinary shape from Laravel's whereIn - and without coercion the lookup found
-    // nothing while a scan found the rows.
+    // encoded as index keys. Clients can bind integers as quoted strings; without
+    // coercion the lookup found nothing while an equivalent scan found the rows.
     for (sql, want) in [
         ("SELECT COUNT(*) FROM il WHERE id IN ('1','2')", 2i64),
         ("SELECT COUNT(*) FROM il WHERE id IN ('1',2)", 2),

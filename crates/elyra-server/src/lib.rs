@@ -709,8 +709,8 @@ async fn write_outcomes<W: AsyncWrite + Send + Unpin>(
     results: QueryResultWriter<'_, W>,
     in_trans: bool,
 ) -> Result<(), std::io::Error> {
-    // Report an open transaction in the OK status flags so drivers (PDO/mysqlnd)
-    // track PDO::inTransaction() correctly.
+    // Report an open transaction in the OK status flags so clients can track
+    // transaction state correctly.
     let status_flags = if in_trans {
         StatusFlags::SERVER_STATUS_IN_TRANS
     } else {

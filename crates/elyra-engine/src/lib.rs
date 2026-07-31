@@ -877,7 +877,7 @@ impl Engine {
 
         // sqlparser 0.53 does not recognize MySQL's DROP INDEX / DROP FOREIGN
         // KEY forms. Parse these narrow DDL statements before the generic
-        // frontend so Laravel's schema builder can remove indexes and keys.
+        // frontend so schema tools can remove indexes and keys.
         if let Some(drop) = parse_mysql_drop(trimmed) {
             require_privilege(privilege, PrivilegedAction::AlterTable)?;
             let result = match drop.kind {
@@ -1254,8 +1254,8 @@ impl Engine {
         // Strip trailing MySQL table options (ENGINE=, DEFAULT CHARSET/CHARACTER
         // SET, COLLATE, AUTO_INCREMENT, ROW_FORMAT, COMMENT, ...) from CREATE
         // TABLE, which the parser does not accept in all their spellings. They
-        // are no-ops here (single storage engine, utf8mb4). This makes Laravel,
-        // mysqldump and ORM-emitted DDL parse.
+        // are no-ops here (single storage engine, utf8mb4). This makes schema
+        // dumps and ORM-emitted DDL parse.
         if let Some(stripped) = strip_create_table_options(&subst_sql) {
             subst_sql = stripped;
         }
@@ -1272,7 +1272,7 @@ impl Engine {
         }
         // Strip a trailing `LIMIT n` from UPDATE/DELETE (not parsed; MySQL's
         // UPDATE/DELETE ... LIMIT without ORDER BY is non-deterministic anyway,
-        // and drivers like Laravel use it only for a unique-key single row).
+        // and clients normally use it only for a unique-key single row).
         if update_modifiers.is_none() {
             if let Some(stripped) = strip_dml_limit(&subst_sql) {
                 subst_sql = stripped;
@@ -2326,9 +2326,8 @@ enum MysqlRename {
     },
 }
 
-/// Parse MySQL rename forms absent from sqlparser 0.53. The single-pair
-/// `RENAME TABLE` form is what Laravel emits; quoted and schema-qualified table
-/// names are accepted.
+/// Parse MySQL rename forms absent from sqlparser 0.53. The commonly emitted
+/// single-pair `RENAME TABLE` form accepts quoted and schema-qualified names.
 fn parse_mysql_rename(sql: &str) -> Option<MysqlRename> {
     let tokens = mysql_ddl_tokens(sql)?;
 
@@ -3511,7 +3510,7 @@ mod mysql_ddl_compat_tests {
     }
 
     #[test]
-    fn parses_laravel_rename_forms() {
+    fn parses_mysql_rename_forms() {
         match parse_mysql_rename("RENAME TABLE `old_table` TO `new_table`") {
             Some(MysqlRename::Table { old, new }) => {
                 assert_eq!(old, "old_table");

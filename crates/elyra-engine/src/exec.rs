@@ -1023,6 +1023,14 @@ fn information_schema_view(tf: &TableFactor) -> Option<String> {
     None
 }
 
+/// Whether a table factor names a persisted ElyraSQL table rather than one of
+/// the virtual information_schema/mysql relations. Streaming join plans need a
+/// real [`TableDef`]; virtual relations must use the materialising path, which
+/// obtains their schema and rows from [`information_schema`].
+fn stored_table_factor(tf: &TableFactor) -> bool {
+    matches!(tf, TableFactor::Table { .. }) && information_schema_view(tf).is_none()
+}
+
 /// The `Key` letter (PRI/UNI/MUL/empty) for column `i` of a table.
 fn column_key(def: &TableDef, i: usize) -> &'static str {
     if def.pk_cols.contains(&i) {
@@ -1043,6 +1051,15 @@ fn column_extra(meta: &ColMeta) -> &'static str {
         "STORED GENERATED"
     } else {
         ""
+    }
+}
+
+fn ref_action_name(action: RefAction) -> &'static str {
+    match action {
+        RefAction::NoAction => "NO ACTION",
+        RefAction::Restrict => "RESTRICT",
+        RefAction::Cascade => "CASCADE",
+        RefAction::SetNull => "SET NULL",
     }
 }
 
@@ -1069,6 +1086,10 @@ async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec
                 text("TABLE_TYPE"),
                 text("ENGINE"),
                 int("TABLE_ROWS"),
+                int("DATA_LENGTH"),
+                int("INDEX_LENGTH"),
+                text("TABLE_COMMENT"),
+                text("TABLE_COLLATION"),
             ]);
             let mut rows = Vec::with_capacity(names.len());
             for n in names {
@@ -1082,6 +1103,14 @@ async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec
                     Value::Text("BASE TABLE".into()),
                     Value::Text("ElyraSQL".into()),
                     table_rows,
+                    // ElyraSQL does not currently maintain MySQL's physical
+                    // per-table byte estimates or table comments. Expose the
+                    // columns with stable best-effort values so schema tools
+                    // can consume the standard information_schema shape.
+                    Value::Int(0),
+                    Value::Int(0),
+                    Value::Text(String::new()),
+                    Value::Text("utf8mb4_0900_ai_ci".into()),
                 ]);
             }
             Ok((schema, rows))
@@ -1250,6 +1279,27 @@ async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec
                         ]);
                     }
                 }
+            }
+            Ok((schema, rows))
+        }
+        "referential_constraints" => {
+            let schema = Schema::new(vec![
+                text("CONSTRAINT_SCHEMA"),
+                text("CONSTRAINT_NAME"),
+                text("UPDATE_RULE"),
+                text("DELETE_RULE"),
+            ]);
+            let mut rows = Vec::new();
+            for table_name in names {
+                let def = catalog::load(db, &table_name).await?;
+                rows.extend(def.foreign_keys.iter().map(|foreign_key| {
+                    vec![
+                        Value::Text("elyra".into()),
+                        Value::Text(foreign_key.name.clone()),
+                        Value::Text(ref_action_name(foreign_key.on_update).into()),
+                        Value::Text(ref_action_name(foreign_key.on_delete).into()),
+                    ]
+                }));
             }
             Ok((schema, rows))
         }
@@ -1894,8 +1944,8 @@ pub async fn alter_table(
             // via the CREATE INDEX path, then refresh the working definition.
             AlterTableOperation::AddConstraint(tc) => {
                 use sqlparser::ast::TableConstraint as TC;
-                // Foreign key: index the referencing columns (with backfill) then
-                // register the constraint. Common via Laravel's constrained().
+                // Foreign key: index the referencing columns (with backfill),
+                // then register the constraint.
                 if let TC::ForeignKey {
                     name: fname,
                     columns: cols,
@@ -2429,6 +2479,9 @@ async fn alter_drop_column(db: &Session, def: &mut TableDef, name: &str) -> Resu
     def.pk_cols.iter_mut().for_each(shift);
     for i in &mut def.indexes {
         i.cols.iter_mut().for_each(shift);
+    }
+    for foreign_key in &mut def.foreign_keys {
+        foreign_key.columns.iter_mut().for_each(shift);
     }
     if !puts.is_empty() {
         db.commit_write(puts, vec![]).await?;
@@ -4866,8 +4919,8 @@ async fn streaming_nlj_select(
     }
     let twj = &select.from[0];
     if twj.joins.len() != 1
-        || !matches!(twj.relation, TableFactor::Table { .. })
-        || !matches!(twj.joins[0].relation, TableFactor::Table { .. })
+        || !stored_table_factor(&twj.relation)
+        || !stored_table_factor(&twj.joins[0].relation)
     {
         return Ok(None);
     }
@@ -5195,9 +5248,7 @@ async fn build_join_chain(
 ) -> Result<Option<JoinChain>> {
     // Something must be joined: either explicit JOINs on the first entry, or further
     // comma-separated tables.
-    if !matches!(twj.relation, TableFactor::Table { .. })
-        || (twj.joins.is_empty() && from.len() < 2)
-    {
+    if !stored_table_factor(&twj.relation) || (twj.joins.is_empty() && from.len() < 2) {
         return Ok(None);
     }
     let (_ddef, dcols) = resolve_table(db, &twj.relation).await?;
@@ -5207,7 +5258,7 @@ async fn build_join_chain(
 
     // --- Resolve pass: catalog only, no rows read. ---
     for join in &twj.joins {
-        if !matches!(join.relation, TableFactor::Table { .. }) {
+        if !stored_table_factor(&join.relation) {
             return Ok(None);
         }
         let (kind, on) = join_kind(&join.join_operator)?;
@@ -5290,7 +5341,7 @@ async fn build_join_chain(
     // unkeyed step -- the partners are materialised (bounded by their table size, as
     // the keyed steps already are) while the product, which is what explodes, is not.
     for extra in &from[1..] {
-        if !matches!(extra.relation, TableFactor::Table { .. }) || !extra.joins.is_empty() {
+        if !stored_table_factor(&extra.relation) || !extra.joins.is_empty() {
             // A derived table, or a comma entry that itself carries JOINs: leave the
             // whole query to the materialising path rather than half-handle it.
             return Ok(None);
@@ -6784,7 +6835,7 @@ async fn build_from(
     let ordered: Vec<&TableWithJoins> = if from.len() > 1
         && from
             .iter()
-            .all(|t| t.joins.is_empty() && matches!(t.relation, TableFactor::Table { .. }))
+            .all(|t| t.joins.is_empty() && stored_table_factor(&t.relation))
     {
         let mut idx: Vec<(&TableWithJoins, u64)> = Vec::with_capacity(from.len());
         for t in from {
@@ -6841,7 +6892,7 @@ async fn build_from(
 
             // Index nested-loop join only applies to a plain (indexed) table
             // partner, not a derived table.
-            let nlj = if let TableFactor::Table { .. } = &join.relation {
+            let nlj = if stored_table_factor(&join.relation) {
                 let (pdef, pcols) = resolve_table(db, &join.relation).await?;
                 let partner_schema = Schema::new(pcols.clone());
                 on.as_ref()
@@ -8102,10 +8153,9 @@ fn in_list_lookup(def: &TableDef, filter: Option<&Expr>) -> Result<Option<(usize
         //  - a column reference or expression would have to be evaluated per row,
         //    which is the thing being avoided;
         //  - a literal of a different type must be coerced before it is encoded as
-        //    a key, or the lookup silently finds nothing. PDO sends bound integers
-        //    as quoted strings, so `id IN ('1','2')` on an INT primary key is the
-        //    normal shape from Laravel, not an edge case -- without coercion it
-        //    returned zero rows while a scan returned two.
+        //    a key, or the lookup silently finds nothing. Clients can send bound
+        //    integers as quoted strings, so `id IN ('1','2')` on an INT primary
+        //    key must agree with the equivalent scan.
         let coldef = &def.schema.columns[col];
         let mut vals = Vec::with_capacity(list.len());
         let mut usable = true;
@@ -14267,6 +14317,13 @@ fn coerce(v: Value, ty: &ColumnType, col: &str) -> Result<Value> {
         (ColumnType::Bytes, Value::Bytes(b)) => Value::Bytes(b),
         (ColumnType::Date, Value::Date(d)) => Value::Date(d),
         (ColumnType::Date, Value::Text(s)) => elyra_core::datetime::parse_date(&s)
+            .or_else(|| {
+                // MySQL accepts a valid datetime-shaped string for a DATE
+                // column and stores its date component. Client libraries can
+                // bind date values in this form.
+                elyra_core::datetime::parse_datetime(&s)
+                    .map(|micros| micros.div_euclid(86_400_000_000) as i32)
+            })
             .map(Value::Date)
             .ok_or_else(|| Error::Type(format!("invalid DATE literal: {s}")))?,
         (ColumnType::DateTime, Value::DateTime(t)) => Value::DateTime(t),

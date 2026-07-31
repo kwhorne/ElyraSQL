@@ -669,6 +669,28 @@ impl Session {
             if let Some(tx) = guard.as_mut() {
                 let budget = txn_max_bytes();
                 let logging = !tx.savepoints.is_empty();
+                // Match the storage-layer write order: deletes first, then
+                // puts. An unchanged index entry can occur in both collections
+                // during UPDATE, and the replacement must remain visible.
+                for k in deletes {
+                    let klen = k.len();
+                    if logging {
+                        tx.undo.push(UndoEntry {
+                            prev_put: tx.puts.get(&k).cloned(),
+                            prev_deleted: tx.deletes.contains(&k),
+                            key: k.clone(),
+                        });
+                    }
+                    if let Some(old) = tx.puts.remove(&k) {
+                        tx.mem -= klen + old.len();
+                    }
+                    if tx.deletes.insert(k) {
+                        tx.mem += klen;
+                    }
+                    if tx.mem > budget {
+                        return Err(txn_overflow(budget));
+                    }
+                }
                 for (k, v) in puts {
                     if logging {
                         tx.undo.push(UndoEntry {
@@ -685,25 +707,6 @@ impl Session {
                     }
                     tx.mem += k.len() + v.len();
                     tx.puts.insert(k, v);
-                    if tx.mem > budget {
-                        return Err(txn_overflow(budget));
-                    }
-                }
-                for k in deletes {
-                    let klen = k.len();
-                    if logging {
-                        tx.undo.push(UndoEntry {
-                            prev_put: tx.puts.get(&k).cloned(),
-                            prev_deleted: tx.deletes.contains(&k),
-                            key: k.clone(),
-                        });
-                    }
-                    if let Some(old) = tx.puts.remove(&k) {
-                        tx.mem -= klen + old.len();
-                    }
-                    if tx.deletes.insert(k) {
-                        tx.mem += klen;
-                    }
                     if tx.mem > budget {
                         return Err(txn_overflow(budget));
                     }
