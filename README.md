@@ -177,7 +177,7 @@ mysql -h 127.0.0.1 -P 3307 -u root -p
 SELECT 1;
 SELECT 1 + 1 AS two;
 SELECT 'hei fra ElyraSQL' AS msg;
-SELECT VERSION();   -- 8.0.0-ElyraSQL-1.6.0
+SELECT VERSION();   -- 8.0.12-ElyraSQL-1.6.0
 ```
 
 ## Configuration

@@ -29,6 +29,7 @@ async fn literals_and_arithmetic() {
 
     let ver: String = c.query_first("SELECT VERSION()").await.unwrap().unwrap();
     assert!(ver.contains("ElyraSQL"), "version was {ver}");
+    assert!(ver.starts_with("8.0.12-"), "version was {ver}");
 
     drop(c);
 }
