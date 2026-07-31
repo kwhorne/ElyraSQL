@@ -195,6 +195,70 @@ async fn mysql_index_and_foreign_key_drop_forms() {
 }
 
 #[tokio::test]
+async fn update_order_by_limit_changes_only_the_ordered_rows() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop(
+        "CREATE TABLE users (
+            id INT PRIMARY KEY,
+            first_name VARCHAR(20),
+            active INT
+        )",
+    )
+    .await
+    .unwrap();
+    c.query_drop(
+        "INSERT INTO users VALUES
+            (1, 'Zoe', 0),
+            (2, 'Ada', 0),
+            (3, 'Ada', 0),
+            (4, 'Mia', 0)",
+    )
+    .await
+    .unwrap();
+
+    c.query_drop(
+        "UPDATE users SET active = 1
+         ORDER BY first_name ASC, users.id ASC LIMIT 1",
+    )
+    .await
+    .unwrap();
+    assert_eq!(c.affected_rows(), 1);
+
+    let active: Vec<i64> = c
+        .query("SELECT id FROM users WHERE active = 1 ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(active, vec![2]);
+
+    c.query_drop(
+        "UPDATE users SET active = 2
+         ORDER BY first_name DESC, id DESC LIMIT 2",
+    )
+    .await
+    .unwrap();
+    let updated: Vec<i64> = c
+        .query("SELECT id FROM users WHERE active = 2 ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(updated, vec![1, 4]);
+
+    c.query_drop(
+        "UPDATE users SET first_name = 'ORDER BY is data', active = 3
+         WHERE active = 0
+         ORDER BY first_name ASC, id ASC LIMIT 1",
+    )
+    .await
+    .unwrap();
+    let filtered: Vec<i64> = c
+        .query("SELECT id FROM users WHERE active = 3")
+        .await
+        .unwrap();
+    assert_eq!(filtered, vec![3]);
+}
+
+#[tokio::test]
 async fn transactions_commit_and_rollback() {
     let srv = TestServer::start().await;
     let mut c = srv.conn().await;

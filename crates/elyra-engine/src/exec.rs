@@ -8,8 +8,8 @@ use elyra_core::{ColumnDef, ColumnType, Error, Result, Schema, Value};
 use sqlparser::ast::{
     AlterColumnOperation, AlterTableOperation, Assignment, AssignmentTarget, ColumnOption,
     CreateIndex, CreateTable, DataType, Delete, FromTable, Insert, JoinConstraint, JoinOperator,
-    ObjectName, Query as SqlQuery, Select, SetExpr, Statement, TableConstraint, TableFactor,
-    TableWithJoins,
+    ObjectName, OrderByExpr, Query as SqlQuery, Select, SetExpr, Statement, TableConstraint,
+    TableFactor, TableWithJoins,
 };
 
 use crate::aggregate;
@@ -8787,8 +8787,15 @@ pub async fn update(
     table: &TableWithJoins,
     assignments: &[Assignment],
     selection: Option<&Expr>,
+    order_by: &[OrderByExpr],
+    limit: Option<&Expr>,
 ) -> Result<QueryResult> {
     if !table.joins.is_empty() {
+        if !order_by.is_empty() || limit.is_some() {
+            return Err(Error::Unsupported(
+                "ORDER BY / LIMIT is supported only for single-table UPDATE".into(),
+            ));
+        }
         return multi_update(db, vindex, table, assignments, selection).await;
     }
     let name = table_of(table)?;
@@ -8819,7 +8826,17 @@ pub async fn update(
         sets.push((idx, &a.value));
     }
 
-    let matches = mutation_matches(db, vindex, &def, &qualifier, selection, None).await?;
+    let mut matches = mutation_matches(db, vindex, &def, &qualifier, selection, None).await?;
+    if !order_by.is_empty() {
+        let order = order_by
+            .iter()
+            .map(|expr| (expr.expr.clone(), expr.asc.unwrap_or(true)))
+            .collect::<Vec<_>>();
+        sort_mutation_matches(&mut matches, &def.schema, &order, &db.cancel_token())?;
+    }
+    if let Some(limit) = limit {
+        matches.truncate(eval_usize(limit)?);
+    }
     let affected = matches.len() as u64;
 
     // Stored generated columns are recomputed after each update.
@@ -13670,6 +13687,34 @@ fn sort_full_rows(
     let colls = order_key_collations(order, schema);
     sort_keyed_coll(&mut keyed, order, &colls);
     reorder(rows, &keyed);
+    Ok(())
+}
+
+fn sort_mutation_matches(
+    rows: &mut [(Vec<u8>, Vec<Value>)],
+    schema: &Schema,
+    order: &[(Expr, bool)],
+    cancel: &std::sync::Arc<elyra_core::cancel::QueryCancel>,
+) -> Result<()> {
+    let mut check = elyra_core::cancel::CancelCheck::new(cancel.clone());
+    let mut keyed = Vec::with_capacity(rows.len());
+    for (position, (_, row)) in rows.iter().enumerate() {
+        check.tick()?;
+        let keys = order
+            .iter()
+            .map(|(expr, _)| predicate::eval_row(expr, schema, row))
+            .collect::<Result<Vec<_>>>()?;
+        keyed.push((keys, position));
+    }
+    let collations = order_key_collations(order, schema);
+    sort_keyed_coll(&mut keyed, order, &collations);
+    let reordered = keyed
+        .iter()
+        .map(|(_, position)| rows[*position].clone())
+        .collect::<Vec<_>>();
+    for (slot, row) in rows.iter_mut().zip(reordered) {
+        *slot = row;
+    }
     Ok(())
 }
 

@@ -43,6 +43,12 @@ use sqlparser::tokenizer::{Token, Tokenizer};
 
 pub use stream::RowStream;
 
+struct UpdateModifiers {
+    base_sql: String,
+    order_by: Vec<sqlparser::ast::OrderByExpr>,
+    limit: Option<sqlparser::ast::Expr>,
+}
+
 /// Outcome of a single SQL statement.
 #[allow(clippy::large_enum_variant)]
 pub enum QueryResult {
@@ -1282,11 +1288,18 @@ impl Engine {
         if let Some(stripped) = strip_create_table_options(&subst_sql) {
             subst_sql = stripped;
         }
+        let mut update_modifiers = None;
+        if let Some(parsed) = parse_update_modifiers(&subst_sql)? {
+            subst_sql = parsed.base_sql.clone();
+            update_modifiers = Some(parsed);
+        }
         // Strip a trailing `LIMIT n` from UPDATE/DELETE (not parsed; MySQL's
         // UPDATE/DELETE ... LIMIT without ORDER BY is non-deterministic anyway,
         // and drivers like Laravel use it only for a unique-key single row).
-        if let Some(stripped) = strip_dml_limit(&subst_sql) {
-            subst_sql = stripped;
+        if update_modifiers.is_none() {
+            if let Some(stripped) = strip_dml_limit(&subst_sql) {
+                subst_sql = stripped;
+            }
         }
         // Rewrite MySQL's `INSERT ... SET col = val, ...` shorthand into the
         // standard `INSERT ... (cols) VALUES (...)` the parser accepts.
@@ -1393,7 +1406,9 @@ impl Engine {
                     }
                 }
             }
-            let r = self.execute_stmt(stmt, sess).await?;
+            let r = self
+                .execute_stmt(stmt, sess, update_modifiers.as_ref())
+                .await?;
             // Track ROW_COUNT(): rows changed by DML, or -1 after a result set
             // (matches MySQL).
             match &r {
@@ -1452,7 +1467,12 @@ impl Engine {
         Ok(eff)
     }
 
-    async fn execute_stmt(&self, stmt: Statement, sess: &Session) -> Result<QueryResult> {
+    async fn execute_stmt(
+        &self,
+        stmt: Statement,
+        sess: &Session,
+        update_modifiers: Option<&UpdateModifiers>,
+    ) -> Result<QueryResult> {
         match stmt {
             Statement::Query(q) => {
                 if query_has_from(&q) {
@@ -1492,8 +1512,20 @@ impl Engine {
                 selection,
                 ..
             } => {
-                let r = exec::update(sess, &self.vindex, &table, &assignments, selection.as_ref())
-                    .await?;
+                let order_by = update_modifiers
+                    .map(|modifiers| modifiers.order_by.as_slice())
+                    .unwrap_or_default();
+                let limit = update_modifiers.and_then(|modifiers| modifiers.limit.as_ref());
+                let r = exec::update(
+                    sess,
+                    &self.vindex,
+                    &table,
+                    &assignments,
+                    selection.as_ref(),
+                    order_by,
+                    limit,
+                )
+                .await?;
                 self.fire_triggers(sess).await?;
                 Ok(r)
             }
@@ -2278,6 +2310,153 @@ fn parse_mysql_drop(sql: &str) -> Option<MysqlDrop> {
     None
 }
 
+/// Extract MySQL's single-table `UPDATE ... ORDER BY ... [LIMIT ...]` tail.
+/// The UPDATE itself remains on sqlparser 0.53; the tail is parsed by wrapping
+/// it in a SELECT, whose ORDER BY / LIMIT AST is already supported.
+fn parse_update_modifiers(sql: &str) -> Result<Option<UpdateModifiers>> {
+    let trimmed = sql.trim().trim_end_matches(';').trim_end();
+    if !keyword_at(trimmed.as_bytes(), 0, b"update") {
+        return Ok(None);
+    }
+    let Some((order_start, order_expr_start)) = find_top_level_order_by(trimmed) else {
+        return Ok(None);
+    };
+
+    let tail = &trimmed[order_expr_start..];
+    let limit_start = find_top_level_keyword(tail, b"limit");
+    let order_sql = match limit_start {
+        Some(position) => tail[..position].trim(),
+        None => tail.trim(),
+    };
+    if order_sql.is_empty() {
+        return Ok(None);
+    }
+    let limit_sql = limit_start.map(|position| tail[position..].trim());
+    let wrapper = match limit_sql {
+        Some(limit) => {
+            format!("SELECT * FROM __elyra_update_order ORDER BY {order_sql} {limit}")
+        }
+        None => format!("SELECT * FROM __elyra_update_order ORDER BY {order_sql}"),
+    };
+    let mut statements = Parser::parse_sql(&MySqlDialect {}, &wrapper)
+        .map_err(|error| Error::Parse(error.to_string()))?;
+    let Statement::Query(mut query) = statements
+        .pop()
+        .filter(|_| statements.is_empty())
+        .ok_or_else(|| Error::Parse("invalid UPDATE ORDER BY clause".into()))?
+    else {
+        return Err(Error::Parse("invalid UPDATE ORDER BY clause".into()));
+    };
+    let order_by = query
+        .order_by
+        .take()
+        .map(|order| order.exprs)
+        .unwrap_or_default();
+    if query.offset.is_some() {
+        return Err(Error::Parse(
+            "UPDATE LIMIT does not support an offset".into(),
+        ));
+    }
+
+    Ok(Some(UpdateModifiers {
+        base_sql: trimmed[..order_start].trim_end().to_string(),
+        order_by,
+        limit: query.limit.take(),
+    }))
+}
+
+fn find_top_level_order_by(sql: &str) -> Option<(usize, usize)> {
+    let bytes = sql.as_bytes();
+    let mut search_from = 0;
+    while let Some(order_start) = find_top_level_keyword(&sql[search_from..], b"order") {
+        let order_start = search_from + order_start;
+        let mut by_start = order_start + b"order".len();
+        while bytes.get(by_start).is_some_and(u8::is_ascii_whitespace) {
+            by_start += 1;
+        }
+        if keyword_at(bytes, by_start, b"by") {
+            return Some((order_start, by_start + b"by".len()));
+        }
+        search_from = order_start + b"order".len();
+    }
+    None
+}
+
+/// Byte offset of an ASCII keyword outside quotes and parentheses.
+fn find_top_level_keyword(sql: &str, keyword: &[u8]) -> Option<usize> {
+    let bytes = sql.as_bytes();
+    let mut quote = None;
+    let mut depth = 0usize;
+    let mut position = 0usize;
+    while position < bytes.len() {
+        let byte = bytes[position];
+        if let Some(delimiter) = quote {
+            if byte == b'\\' {
+                position = position.saturating_add(2);
+                continue;
+            }
+            if byte == delimiter {
+                if bytes.get(position + 1) == Some(&delimiter) {
+                    position += 2;
+                    continue;
+                }
+                quote = None;
+            }
+        } else {
+            match byte {
+                b'\'' | b'"' | b'`' => quote = Some(byte),
+                b'#' => {
+                    position += 1;
+                    while position < bytes.len() && bytes[position] != b'\n' {
+                        position += 1;
+                    }
+                    continue;
+                }
+                b'-' if bytes.get(position + 1) == Some(&b'-') => {
+                    position += 2;
+                    while position < bytes.len() && bytes[position] != b'\n' {
+                        position += 1;
+                    }
+                    continue;
+                }
+                b'/' if bytes.get(position + 1) == Some(&b'*') => {
+                    position += 2;
+                    while position + 1 < bytes.len()
+                        && (bytes[position] != b'*' || bytes[position + 1] != b'/')
+                    {
+                        position += 1;
+                    }
+                    position = (position + 2).min(bytes.len());
+                    continue;
+                }
+                b'(' => depth += 1,
+                b')' => depth = depth.saturating_sub(1),
+                _ if depth == 0 && keyword_at(bytes, position, keyword) => return Some(position),
+                _ => {}
+            }
+        }
+        position += 1;
+    }
+    None
+}
+
+fn keyword_at(sql: &[u8], position: usize, keyword: &[u8]) -> bool {
+    let Some(candidate) = sql.get(position..position.saturating_add(keyword.len())) else {
+        return false;
+    };
+    if !candidate.eq_ignore_ascii_case(keyword) {
+        return false;
+    }
+    let is_identifier = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$';
+    !position
+        .checked_sub(1)
+        .and_then(|previous| sql.get(previous))
+        .is_some_and(|byte| is_identifier(*byte))
+        && !sql
+            .get(position + keyword.len())
+            .is_some_and(|byte| is_identifier(*byte))
+}
+
 /// Remove trailing table options from a `CREATE TABLE (...) <options>` statement
 /// that the SQL parser cannot accept in every MySQL spelling (`ENGINE=`,
 /// `DEFAULT CHARSET`/`CHARACTER SET`, `COLLATE '...'`, `AUTO_INCREMENT=`,
@@ -2643,6 +2822,7 @@ pub fn fuzz_preprocess_parse(sql: &str) {
     if let Some(x) = strip_create_table_options(&s) {
         s = x;
     }
+    let _ = parse_update_modifiers(&s);
     if let Some(x) = strip_dml_limit(&s) {
         s = x;
     }
@@ -3143,8 +3323,8 @@ mod comma_update_tests {
 #[cfg(test)]
 mod fuzz_props {
     use super::{
-        rewrite_comma_update, rewrite_insert_set, split_top_level, strip_create_table_options,
-        strip_dml_limit,
+        parse_update_modifiers, rewrite_comma_update, rewrite_insert_set, split_top_level,
+        strip_create_table_options, strip_dml_limit,
     };
     use proptest::prelude::*;
 
@@ -3161,6 +3341,7 @@ mod fuzz_props {
             let _ = rewrite_comma_update(&s);
             let _ = strip_create_table_options(&s);
             let _ = strip_dml_limit(&s);
+            let _ = parse_update_modifiers(&s);
             let _ = split_top_level(&s, ',');
             let _ = split_top_level(&s, '=');
         }
