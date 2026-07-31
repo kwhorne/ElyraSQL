@@ -1999,6 +1999,46 @@ async fn insert_set_shorthand() {
     assert_eq!(rows, vec![(1, "a,b".into(), 105), (2, "x".into(), 9)]);
 }
 
+#[tokio::test]
+async fn scalar_subqueries_in_insert_value_rows() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop("CREATE TABLE properties (id INT PRIMARY KEY, `key` VARCHAR(16))")
+        .await
+        .unwrap();
+    c.query_drop(
+        "CREATE TABLE entity_values (id INT PRIMARY KEY, property_id INT, value VARCHAR(16))",
+    )
+    .await
+    .unwrap();
+    c.query_drop("INSERT INTO properties VALUES (10, 'first'), (20, 'second')")
+        .await
+        .unwrap();
+
+    c.query_drop(
+        "INSERT INTO entity_values (id, property_id, value) VALUES
+         (1, (SELECT id FROM properties WHERE `key` = 'first'), 'a'),
+         (2, (SELECT id FROM properties WHERE `key` = 'second'), 'b')
+         ON DUPLICATE KEY UPDATE value = VALUES(value)",
+    )
+    .await
+    .unwrap();
+    c.query_drop(
+        "INSERT INTO entity_values (id, property_id, value) VALUES
+         (1, (SELECT id FROM properties WHERE `key` = 'first'), 'updated')
+         ON DUPLICATE KEY UPDATE value = VALUES(value)",
+    )
+    .await
+    .unwrap();
+
+    let rows: Vec<(i64, i64, String)> = c
+        .query("SELECT id, property_id, value FROM entity_values ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![(1, 10, "updated".into()), (2, 20, "b".into())]);
+}
+
 /// SELECT DISTINCT deduplicates (was previously a no-op), applies LIMIT after
 /// dedup, and is collation-aware. [ESQL-8 / ESQL-4]
 #[tokio::test]

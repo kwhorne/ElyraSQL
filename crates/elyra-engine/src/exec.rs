@@ -2902,7 +2902,16 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
         Some(expr_rows) => {
             let mut out = Vec::with_capacity(expr_rows.len());
             for exprs in expr_rows {
-                out.push(exprs.iter().map(eval_expr).collect::<Result<Vec<_>>>()?);
+                let mut row = Vec::with_capacity(exprs.len());
+                for expr in exprs {
+                    if expr_has_subquery(expr) {
+                        let resolved = resolve_subqueries(db, vindex, expr.clone()).await?;
+                        row.push(eval_expr(&resolved)?);
+                    } else {
+                        row.push(eval_expr(expr)?);
+                    }
+                }
+                out.push(row);
             }
             out
         }
