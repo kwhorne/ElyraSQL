@@ -4716,6 +4716,22 @@ async fn prepared_index_introspection_keeps_not_result_numeric() {
             ("ix_slug".into(), "slug".into(), "BTREE".into(), 0),
         ]
     );
+
+    let rows: Vec<(i64, String, String, Option<i64>, String)> = c
+        .query(
+            "SELECT NON_UNIQUE, INDEX_NAME, COLUMN_NAME, SUB_PART, INDEX_TYPE
+             FROM information_schema.STATISTICS
+             WHERE TABLE_SCHEMA = 'elyra'
+               AND TABLE_NAME = 'indexed_items'
+               AND INDEX_NAME = 'ix_slug'
+             ORDER BY SEQ_IN_INDEX",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![(1, "ix_slug".into(), "slug".into(), None, "BTREE".into())]
+    );
 }
 
 // A secondary-index range must not be used when it matches most of the table: the

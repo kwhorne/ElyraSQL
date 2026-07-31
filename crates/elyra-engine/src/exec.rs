@@ -1198,6 +1198,7 @@ async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec
                 text("COLUMN_NAME"),
                 text("COLLATION"),
                 int("CARDINALITY"),
+                int("SUB_PART"),
                 text("NULLABLE"),
                 text("INDEX_TYPE"),
             ]);
@@ -1215,6 +1216,7 @@ async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec
                             Value::Int(seq as i64 + 1),
                             Value::Text(c.name.clone()),
                             Value::Text("A".into()),
+                            Value::Null,
                             Value::Null,
                             Value::Text(if c.nullable { "YES" } else { "" }.into()),
                             Value::Text(itype.to_string()),
