@@ -46,7 +46,12 @@ pub use stream::RowStream;
 struct UpdateModifiers {
     base_sql: String,
     order_by: Vec<sqlparser::ast::OrderByExpr>,
-    limit: Option<sqlparser::ast::Expr>,
+    limit: Option<usize>,
+}
+
+struct DmlLimit {
+    base_sql: String,
+    limit: usize,
 }
 
 /// Outcome of a single SQL statement.
@@ -1270,12 +1275,13 @@ impl Engine {
             subst_sql = parsed.base_sql.clone();
             update_modifiers = Some(parsed);
         }
-        // Strip a trailing `LIMIT n` from UPDATE/DELETE (not parsed; MySQL's
-        // UPDATE/DELETE ... LIMIT without ORDER BY is non-deterministic anyway,
-        // and clients normally use it only for a unique-key single row).
+        let mut dml_limit = None;
+        // sqlparser does not accept a trailing LIMIT on every MySQL UPDATE and
+        // DELETE shape. Parse it separately and pass the row bound to execution.
         if update_modifiers.is_none() {
-            if let Some(stripped) = strip_dml_limit(&subst_sql) {
-                subst_sql = stripped;
+            if let Some(parsed) = parse_dml_limit(&subst_sql) {
+                subst_sql = parsed.base_sql;
+                dml_limit = Some(parsed.limit);
             }
         }
         // Rewrite MySQL's `INSERT ... SET col = val, ...` shorthand into the
@@ -1386,7 +1392,7 @@ impl Engine {
                 }
             }
             let r = self
-                .execute_stmt(stmt, sess, update_modifiers.as_ref())
+                .execute_stmt(stmt, sess, update_modifiers.as_ref(), dml_limit)
                 .await?;
             // Track ROW_COUNT(): rows changed by DML, or -1 after a result set
             // (matches MySQL).
@@ -1451,6 +1457,7 @@ impl Engine {
         stmt: Statement,
         sess: &Session,
         update_modifiers: Option<&UpdateModifiers>,
+        dml_limit: Option<usize>,
     ) -> Result<QueryResult> {
         match stmt {
             Statement::Query(q) => {
@@ -1494,7 +1501,9 @@ impl Engine {
                 let order_by = update_modifiers
                     .map(|modifiers| modifiers.order_by.as_slice())
                     .unwrap_or_default();
-                let limit = update_modifiers.and_then(|modifiers| modifiers.limit.as_ref());
+                let limit = update_modifiers
+                    .and_then(|modifiers| modifiers.limit)
+                    .or(dml_limit);
                 let r = exec::update(
                     sess,
                     &self.vindex,
@@ -1509,7 +1518,7 @@ impl Engine {
                 Ok(r)
             }
             Statement::Delete(del) => {
-                let r = exec::delete(sess, &self.vindex, &del).await?;
+                let r = exec::delete(sess, &self.vindex, &del, dml_limit).await?;
                 self.fire_triggers(sess).await?;
                 Ok(r)
             }
@@ -2569,7 +2578,11 @@ fn parse_update_modifiers(sql: &str) -> Result<Option<UpdateModifiers>> {
     Ok(Some(UpdateModifiers {
         base_sql: trimmed[..order_start].trim_end().to_string(),
         order_by,
-        limit: query.limit.take(),
+        limit: query
+            .limit
+            .take()
+            .map(|limit| exec::eval_usize(&limit))
+            .transpose()?,
     }))
 }
 
@@ -2741,10 +2754,9 @@ fn strip_create_table_options(sql: &str) -> Option<String> {
     Some(sql[..=close].to_string())
 }
 
-/// Remove a trailing `LIMIT <n>` from an `UPDATE`/`DELETE` statement, which the
-/// parser does not accept. Row-limited UPDATE/DELETE is not enforced (the whole
-/// matching set is affected); the WHERE clause is respected as written.
-fn strip_dml_limit(sql: &str) -> Option<String> {
+/// Extract a trailing `LIMIT <n>` from an `UPDATE`/`DELETE` statement when the
+/// parser does not accept that MySQL form.
+fn parse_dml_limit(sql: &str) -> Option<DmlLimit> {
     let head = sql.trim_start();
     let up = head.get(..7).unwrap_or(head).to_ascii_uppercase();
     if !(up.starts_with("UPDATE ") || up.starts_with("DELETE ")) {
@@ -2767,7 +2779,10 @@ fn strip_dml_limit(sql: &str) -> Option<String> {
     let bb = before_num.as_bytes();
     if bb.len() >= 5 && bb[bb.len() - 5..].eq_ignore_ascii_case(b"limit") {
         let kept = before_num[..before_num.len() - 5].trim_end();
-        return Some(kept.to_string());
+        return Some(DmlLimit {
+            base_sql: kept.to_string(),
+            limit: trimmed[i..].parse().ok()?,
+        });
     }
     None
 }
@@ -3031,8 +3046,8 @@ pub fn fuzz_preprocess_parse(sql: &str) {
         s = x;
     }
     let _ = parse_update_modifiers(&s);
-    if let Some(x) = strip_dml_limit(&s) {
-        s = x;
+    if let Some(x) = parse_dml_limit(&s) {
+        s = x.base_sql;
     }
     if let Some(x) = rewrite_insert_set(&s) {
         s = x;
@@ -3597,9 +3612,9 @@ mod mysql_ddl_compat_tests {
 #[cfg(test)]
 mod fuzz_props {
     use super::{
-        parse_mysql_rename, parse_update_modifiers, rewrite_alter_column_collations,
-        rewrite_comma_update, rewrite_insert_set, split_top_level, strip_create_table_options,
-        strip_dml_limit,
+        parse_dml_limit, parse_mysql_rename, parse_update_modifiers,
+        rewrite_alter_column_collations, rewrite_comma_update, rewrite_insert_set, split_top_level,
+        strip_create_table_options,
     };
     use proptest::prelude::*;
 
@@ -3615,7 +3630,7 @@ mod fuzz_props {
             let _ = rewrite_insert_set(&s);
             let _ = rewrite_comma_update(&s);
             let _ = strip_create_table_options(&s);
-            let _ = strip_dml_limit(&s);
+            let _ = parse_dml_limit(&s);
             let _ = parse_update_modifiers(&s);
             let _ = parse_mysql_rename(&s);
             let _ = rewrite_alter_column_collations(&s);
@@ -3664,8 +3679,8 @@ mod fuzz_props {
 }
 
 #[cfg(test)]
-mod strip_dml_limit_utf8 {
-    use super::strip_dml_limit;
+mod parse_dml_limit_utf8 {
+    use super::parse_dml_limit;
     #[test]
     fn multibyte_before_limit_does_not_panic() {
         // 'é' is 2 bytes; various offsets before a trailing number must not panic.
@@ -3675,12 +3690,13 @@ mod strip_dml_limit_utf8 {
             "UPDATE é limité 3",
             "UPDATE tμλ 12",
         ] {
-            let _ = strip_dml_limit(s);
+            let _ = parse_dml_limit(s);
         }
-        // sanity: a real LIMIT is still stripped
+        // Sanity: a real LIMIT retains both the base statement and row bound.
         assert_eq!(
-            strip_dml_limit("UPDATE t SET x=1 LIMIT 5").unwrap(),
-            "UPDATE t SET x=1"
+            parse_dml_limit("UPDATE t SET x=1 LIMIT 5")
+                .map(|parsed| (parsed.base_sql, parsed.limit)),
+            Some(("UPDATE t SET x=1".into(), 5))
         );
     }
 }

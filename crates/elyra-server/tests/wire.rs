@@ -443,6 +443,61 @@ async fn update_order_by_limit_changes_only_the_ordered_rows() {
 }
 
 #[tokio::test]
+async fn update_and_delete_limit_bound_the_matching_rows() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop(
+        "CREATE TABLE limited_mutations (
+            id INT PRIMARY KEY,
+            bucket INT,
+            active INT
+        )",
+    )
+    .await
+    .unwrap();
+    c.query_drop(
+        "INSERT INTO limited_mutations VALUES
+            (1, 7, 0),
+            (2, 7, 0),
+            (3, 7, 0)",
+    )
+    .await
+    .unwrap();
+
+    c.query_drop("UPDATE limited_mutations SET active = 1 WHERE bucket = 7 LIMIT 0")
+        .await
+        .unwrap();
+    assert_eq!(c.affected_rows(), 0);
+    c.query_drop("DELETE FROM limited_mutations WHERE bucket = 7 LIMIT 0")
+        .await
+        .unwrap();
+    assert_eq!(c.affected_rows(), 0);
+
+    c.query_drop("UPDATE limited_mutations SET active = 1 WHERE bucket = 7 LIMIT 1")
+        .await
+        .unwrap();
+    assert_eq!(c.affected_rows(), 1);
+    let updated: i64 = c
+        .query_first("SELECT COUNT(*) FROM limited_mutations WHERE active = 1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(updated, 1);
+
+    c.query_drop("DELETE FROM limited_mutations WHERE bucket = 7 LIMIT 1")
+        .await
+        .unwrap();
+    assert_eq!(c.affected_rows(), 1);
+    let remaining: i64 = c
+        .query_first("SELECT COUNT(*) FROM limited_mutations")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(remaining, 2);
+}
+
+#[tokio::test]
 async fn create_database_fails_instead_of_succeeding_as_a_noop() {
     let srv = TestServer::start().await;
     let mut c = srv.conn().await;

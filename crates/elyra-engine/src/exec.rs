@@ -8983,6 +8983,9 @@ async fn collect_matches_inner(
     bail_on_wide_range: bool,
 ) -> Result<Option<Vec<(Vec<u8>, Vec<Value>)>>> {
     let mut out = Vec::new();
+    if limit == Some(0) {
+        return Ok(Some(out));
+    }
 
     let recheck = |row: &[Value]| -> Result<bool> {
         match filter {
@@ -9266,7 +9269,7 @@ pub async fn update(
     assignments: &[Assignment],
     selection: Option<&Expr>,
     order_by: &[OrderByExpr],
-    limit: Option<&Expr>,
+    limit: Option<usize>,
 ) -> Result<QueryResult> {
     if !table.joins.is_empty() {
         if !order_by.is_empty() || limit.is_some() {
@@ -9313,7 +9316,7 @@ pub async fn update(
         sort_mutation_matches(&mut matches, &def.schema, &order, &db.cancel_token())?;
     }
     if let Some(limit) = limit {
-        matches.truncate(eval_usize(limit)?);
+        matches.truncate(limit);
     }
     let affected = matches.len() as u64;
 
@@ -9435,7 +9438,12 @@ pub async fn update(
     Ok(QueryResult::Affected(affected))
 }
 
-pub async fn delete(db: &Session, vindex: &VectorRegistry, del: &Delete) -> Result<QueryResult> {
+pub async fn delete(
+    db: &Session,
+    vindex: &VectorRegistry,
+    del: &Delete,
+    limit_override: Option<usize>,
+) -> Result<QueryResult> {
     let relations = match &del.from {
         FromTable::WithFromKeyword(v) | FromTable::WithoutKeyword(v) => v,
     };
@@ -9447,10 +9455,12 @@ pub async fn delete(db: &Session, vindex: &VectorRegistry, del: &Delete) -> Resu
     let def = catalog::load(db, &name).await?;
     let qualifier = factor_qualifier(&relations[0].relation).unwrap_or_else(|| name.clone());
 
-    let limit = match &del.limit {
-        Some(e) => Some(eval_usize(e)?),
-        None => None,
-    };
+    let limit = del
+        .limit
+        .as_ref()
+        .map(eval_usize)
+        .transpose()?
+        .or(limit_override);
 
     let matches =
         mutation_matches(db, vindex, &def, &qualifier, del.selection.as_ref(), limit).await?;
@@ -10005,7 +10015,7 @@ fn ident_name(e: &Expr) -> Option<&str> {
     }
 }
 
-fn eval_usize(e: &Expr) -> Result<usize> {
+pub(crate) fn eval_usize(e: &Expr) -> Result<usize> {
     match eval_expr(e)? {
         Value::Int(i) if i >= 0 => Ok(i as usize),
         other => Err(Error::Query(format!(
