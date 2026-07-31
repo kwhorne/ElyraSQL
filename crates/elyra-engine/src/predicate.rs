@@ -1852,14 +1852,10 @@ fn cast_value(v: Value, ty: &sqlparser::ast::DataType) -> Result<Value> {
                 _ => 0,
             };
             return Ok(match &v {
-                Value::Decimal(u, s) => {
-                    let rescaled = if *s <= scale {
-                        u * 10i128.pow((scale - *s) as u32)
-                    } else {
-                        u / 10i128.pow((*s - scale) as u32)
-                    };
-                    Value::Decimal(rescaled, scale)
-                }
+                Value::Decimal(u, s) => match elyra_core::value::rescale_decimal(*u, *s, scale) {
+                    Some(rescaled) => Value::Decimal(rescaled, scale),
+                    None => Value::Null,
+                },
                 Value::Int(i) => Value::Decimal(*i as i128 * 10i128.pow(scale as u32), scale),
                 other => match other
                     .to_wire_string()

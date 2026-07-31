@@ -14689,11 +14689,8 @@ fn coerce_with_mode(v: Value, ty: &ColumnType, col: &str, strict: bool) -> Resul
         }
         (ColumnType::Decimal(_, sc), Value::Decimal(u, s)) => {
             // Rescale to the column's declared scale.
-            let v = if s <= *sc {
-                u * 10i128.pow((*sc - s) as u32)
-            } else {
-                u / 10i128.pow((s - *sc) as u32)
-            };
+            let v = elyra_core::value::rescale_decimal(u, s, *sc)
+                .ok_or_else(|| Error::Type(format!("DECIMAL value is out of range for {col}")))?;
             Value::Decimal(v, *sc)
         }
         (ColumnType::Time, Value::Time(t)) => Value::Time(t),

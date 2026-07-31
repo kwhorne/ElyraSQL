@@ -2926,6 +2926,24 @@ async fn mysql_semantics_matches() {
     assert_eq!(s, "2024-02-29");
 }
 
+#[tokio::test]
+async fn decimal_scale_reduction_rounds_half_away_from_zero() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop("CREATE TABLE decimal_values (id INT PRIMARY KEY, amount DECIMAL(8,2))")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO decimal_values VALUES (1, 8.876543211), (2, -8.876543211)")
+        .await
+        .unwrap();
+
+    let rows: Vec<(i64, String)> = c
+        .query("SELECT id, amount FROM decimal_values ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![(1, "8.88".into()), (2, "-8.88".into())]);
+}
+
 // Regression for the second differential batch (ESQL-15): DIV integer division,
 // IN-list three-valued logic, and the added BIT_COUNT/TO_DAYS/INSERT/CONV.
 #[tokio::test]

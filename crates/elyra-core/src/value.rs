@@ -584,6 +584,10 @@ pub fn parse_decimal(s: &str, target_scale: u8) -> Option<(i128, u8)> {
         return None;
     }
     let ts = target_scale as usize;
+    let round_up = frac_part
+        .as_bytes()
+        .get(ts)
+        .is_some_and(|digit| *digit >= b'5');
     let frac = if frac_part.len() >= ts {
         frac_part[..ts].to_string()
     } else {
@@ -591,10 +595,53 @@ pub fn parse_decimal(s: &str, target_scale: u8) -> Option<(i128, u8)> {
     };
     let combined = format!("{}{}", int_part, frac);
     let mut v: i128 = combined.parse().ok()?;
+    if round_up {
+        v = v.checked_add(1)?;
+    }
     if neg {
         v = -v;
     }
     Some((v, target_scale))
+}
+
+/// Change a decimal's scale, rounding half away from zero when digits are
+/// discarded. Returns `None` if increasing the scale would overflow `i128`.
+pub fn rescale_decimal(units: i128, from_scale: u8, to_scale: u8) -> Option<i128> {
+    if from_scale <= to_scale {
+        let factor = 10i128.checked_pow((to_scale - from_scale) as u32)?;
+        return units.checked_mul(factor);
+    }
+
+    let divisor = 10i128.checked_pow((from_scale - to_scale) as u32)?;
+    let quotient = units / divisor;
+    let remainder = units % divisor;
+    if remainder.unsigned_abs() >= (divisor / 2) as u128 {
+        quotient.checked_add(if units.is_negative() { -1 } else { 1 })
+    } else {
+        Some(quotient)
+    }
+}
+
+#[cfg(test)]
+mod decimal_tests {
+    use super::{parse_decimal, rescale_decimal};
+
+    #[test]
+    fn parsing_rounds_half_away_from_zero() {
+        assert_eq!(parse_decimal("8.876543211", 2), Some((888, 2)));
+        assert_eq!(parse_decimal("-8.876543211", 2), Some((-888, 2)));
+        assert_eq!(parse_decimal("1.234", 2), Some((123, 2)));
+        assert_eq!(parse_decimal("1.235", 2), Some((124, 2)));
+    }
+
+    #[test]
+    fn rescaling_rounds_when_digits_are_discarded() {
+        assert_eq!(rescale_decimal(8_876_543_211, 9, 2), Some(888));
+        assert_eq!(rescale_decimal(-8_876_543_211, 9, 2), Some(-888));
+        assert_eq!(rescale_decimal(1234, 3, 2), Some(123));
+        assert_eq!(rescale_decimal(1235, 3, 2), Some(124));
+        assert_eq!(rescale_decimal(123, 2, 4), Some(12_300));
+    }
 }
 
 #[cfg(test)]
