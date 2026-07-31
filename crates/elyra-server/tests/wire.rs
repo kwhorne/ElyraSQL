@@ -2077,6 +2077,76 @@ async fn scalar_subqueries_in_insert_value_rows() {
     assert_eq!(rows, vec![(1, 10, "updated".into()), (2, 20, "b".into())]);
 }
 
+#[tokio::test]
+async fn duplicate_key_update_honors_unique_secondary_indexes() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop(
+        "CREATE TABLE keyed_values (
+            id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            `key` VARCHAR(16) UNIQUE,
+            label VARCHAR(16)
+        )",
+    )
+    .await
+    .unwrap();
+    c.query_drop("INSERT INTO keyed_values (`key`, label) VALUES ('a', 'old-a'), ('b', 'old-b')")
+        .await
+        .unwrap();
+    c.query_drop(
+        "INSERT INTO keyed_values (`key`, label) VALUES ('a', 'new-a'), ('b', 'new-b')
+         ON DUPLICATE KEY UPDATE label = VALUES(label)",
+    )
+    .await
+    .unwrap();
+    c.query_drop(
+        "INSERT INTO keyed_values (`key`, label) VALUES ('c', 'first'), ('c', 'second')
+         ON DUPLICATE KEY UPDATE label = VALUES(label)",
+    )
+    .await
+    .unwrap();
+
+    let rows: Vec<(i64, String, String)> = c
+        .query("SELECT id, `key`, label FROM keyed_values ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            (1, "a".into(), "new-a".into()),
+            (2, "b".into(), "new-b".into()),
+            (5, "c".into(), "second".into()),
+        ]
+    );
+
+    c.query_drop("CREATE TABLE unique_only (`key` VARCHAR(16) UNIQUE, label VARCHAR(16))")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO unique_only VALUES ('a', 'old')")
+        .await
+        .unwrap();
+    c.query_drop(
+        "INSERT INTO unique_only VALUES ('a', 'new')
+         ON DUPLICATE KEY UPDATE label = VALUES(label)",
+    )
+    .await
+    .unwrap();
+    let rows: Vec<(String, String)> = c.query("SELECT * FROM unique_only").await.unwrap();
+    assert_eq!(rows, vec![("a".into(), "new".into())]);
+
+    c.query_drop("INSERT INTO keyed_values (`key`, label) VALUES ('d', 'old-d')")
+        .await
+        .unwrap();
+    let err = c
+        .query_drop(
+            "INSERT INTO keyed_values (id, `key`, label) VALUES (1, 'd', 'conflict')
+             ON DUPLICATE KEY UPDATE label = VALUES(label)",
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("more than one unique row"));
+}
+
 /// SELECT DISTINCT deduplicates (was previously a no-op), applies LIMIT after
 /// dedup, and is collation-aware. [ESQL-8 / ESQL-4]
 #[tokio::test]

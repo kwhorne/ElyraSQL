@@ -3135,6 +3135,10 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
         built.push((key, row));
     }
 
+    if on_dup && index::has_unique(&def) {
+        remap_unique_upsert_conflicts(db, &def, &mut built).await?;
+    }
+
     // Fast path: a plain INSERT (no IGNORE/REPLACE/ON DUPLICATE) into a PK
     // table outside a transaction detects duplicates inside the write
     // transaction itself (redb returns the previous value), avoiding any
@@ -3187,7 +3191,8 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
 
     // One batched existence read for the whole statement (PK tables) instead of
     // a read per row — the bulk-insert hot path.
-    let existing: Vec<Option<Vec<u8>>> = if has_pk {
+    let clustered_conflicts = has_pk || (on_dup && index::has_unique(&def));
+    let existing: Vec<Option<Vec<u8>>> = if clustered_conflicts {
         let keys: Vec<Vec<u8>> = built.iter().map(|(k, _)| k.clone()).collect();
         db.multi_get(keys).await?
     } else {
@@ -3196,7 +3201,7 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
 
     // Pass 2: apply INSERT / upsert semantics using the batched existence info.
     for (i, (key, row)) in built.into_iter().enumerate() {
-        if !has_pk {
+        if !clustered_conflicts {
             batch.push((key, row));
             affected += 1;
             continue;
@@ -3289,6 +3294,61 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
                 .unwrap_or(0)
         },
     })
+}
+
+/// Point rows that collide with a unique secondary index at the owning
+/// clustered row. The normal duplicate-update pass can then merge them exactly
+/// like primary-key conflicts. The ownership map also covers collisions among
+/// rows in the same statement.
+async fn remap_unique_upsert_conflicts(
+    db: &Session,
+    def: &TableDef,
+    rows: &mut [(Vec<u8>, Vec<Value>)],
+) -> Result<()> {
+    let probes = rows
+        .iter()
+        .map(|(_, row)| index::unique_probe_keys(def, row))
+        .collect::<Result<Vec<_>>>()?;
+    let flat = probes.iter().flatten().cloned().collect::<Vec<Vec<u8>>>();
+    let stored = db.multi_get(flat.clone()).await?;
+    let mut owners = std::collections::HashMap::<Vec<u8>, Vec<u8>>::new();
+    for (probe, owner) in flat.into_iter().zip(stored) {
+        if let Some(owner) = owner {
+            owners.insert(probe, owner);
+        }
+    }
+
+    let clustered = if def.has_pk() {
+        db.multi_get(rows.iter().map(|(key, _)| key.clone()).collect())
+            .await?
+    } else {
+        vec![None; rows.len()]
+    };
+
+    for (((key, _), row_probes), stored_row) in rows.iter_mut().zip(probes).zip(clustered) {
+        let mut conflict = stored_row.map(|_| key.clone());
+        for probe in &row_probes {
+            let Some(owner) = owners.get(probe) else {
+                continue;
+            };
+            match &conflict {
+                Some(existing) if existing != owner => {
+                    return Err(Error::Duplicate(
+                        "upsert conflicts with more than one unique row".into(),
+                    ));
+                }
+                None => conflict = Some(owner.clone()),
+                Some(_) => {}
+            }
+        }
+        if let Some(owner) = conflict {
+            *key = owner;
+        }
+        for probe in row_probes {
+            owners.entry(probe).or_insert_with(|| key.clone());
+        }
+    }
+    Ok(())
 }
 
 /// Replace `VALUES(col)` references (MySQL ON DUPLICATE KEY UPDATE) with the
