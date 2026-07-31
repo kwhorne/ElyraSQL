@@ -837,6 +837,36 @@ async fn native_prepared_statements() {
     assert_eq!(rows, vec![(2, "pear".into(), 8), (3, "plum".into(), 13)]);
 }
 
+#[tokio::test]
+async fn prepared_aggregate_rows_match_declared_result_types() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop("CREATE TABLE measurements (id INT PRIMARY KEY, amount DOUBLE)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO measurements VALUES (1, 500.0), (2, 100.0)")
+        .await
+        .unwrap();
+
+    let row: (String, i64) = c
+        .exec_first(
+            "SELECT
+                COALESCE(
+                    MAX(CASE WHEN id = 1 THEN amount END) -
+                    MIN(CASE WHEN id = 2 THEN amount END),
+                    0
+                ) AS difference,
+                ABS(SUM(CASE WHEN id = ? THEN 1 ELSE 0 END)) AS matches
+             FROM measurements",
+            (1,),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row, ("400".into(), 1));
+}
+
 /// Qualified wildcard `alias.*` in the projection expands to that table's
 /// columns. [ESQL-9]
 #[tokio::test]
