@@ -1216,6 +1216,44 @@ async fn non_strict_sql_mode_coerces_invalid_integer_text() {
         .is_err());
 }
 
+#[tokio::test]
+async fn non_strict_sql_mode_coerces_invalid_temporal_text() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop("CREATE TABLE temporal_values (id INT PRIMARY KEY, d DATE, dt DATETIME, tm TIME)")
+        .await
+        .unwrap();
+    c.query_drop("SET SESSION sql_mode='NO_ENGINE_SUBSTITUTION'")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO temporal_values VALUES (1, '', '', '')")
+        .await
+        .unwrap();
+
+    let row: (String, String, String) = c
+        .query_first("SELECT d, dt, tm FROM temporal_values WHERE id = 1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row,
+        (
+            "0000-00-00".into(),
+            "0000-00-00 00:00:00".into(),
+            "00:00:00".into(),
+        )
+    );
+
+    c.query_drop("SET SESSION sql_mode='STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION'")
+        .await
+        .unwrap();
+    assert!(c
+        .query_drop("INSERT INTO temporal_values VALUES (2, '', '', '')")
+        .await
+        .is_err());
+}
+
 /// Join followed by GROUP BY over an indexed partner -- exercises the streaming
 /// index nested-loop aggregation path (bounded memory) and must produce exactly
 /// the same result as the materialising join.

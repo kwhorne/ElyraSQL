@@ -14657,20 +14657,25 @@ fn coerce_with_mode(v: Value, ty: &ColumnType, col: &str, strict: bool) -> Resul
         (ColumnType::Bytes, Value::Text(s)) => Value::Bytes(s.into_bytes()),
         (ColumnType::Bytes, Value::Bytes(b)) => Value::Bytes(b),
         (ColumnType::Date, Value::Date(d)) => Value::Date(d),
-        (ColumnType::Date, Value::Text(s)) => elyra_core::datetime::parse_date(&s)
-            .or_else(|| {
+        (ColumnType::Date, Value::Text(s)) => {
+            match elyra_core::datetime::parse_date(&s).or_else(|| {
                 // MySQL accepts a valid datetime-shaped string for a DATE
                 // column and stores its date component. Client libraries can
                 // bind date values in this form.
                 elyra_core::datetime::parse_datetime(&s)
                     .map(|micros| micros.div_euclid(86_400_000_000) as i32)
-            })
-            .map(Value::Date)
-            .ok_or_else(|| Error::Type(format!("invalid DATE literal: {s}")))?,
+            }) {
+                Some(date) => Value::Date(date),
+                None if !strict => Value::Text("0000-00-00".into()),
+                None => return Err(Error::Type(format!("invalid DATE literal: {s}"))),
+            }
+        }
         (ColumnType::DateTime, Value::DateTime(t)) => Value::DateTime(t),
-        (ColumnType::DateTime, Value::Text(s)) => elyra_core::datetime::parse_datetime(&s)
-            .map(Value::DateTime)
-            .ok_or_else(|| Error::Type(format!("invalid DATETIME literal: {s}")))?,
+        (ColumnType::DateTime, Value::Text(s)) => match elyra_core::datetime::parse_datetime(&s) {
+            Some(datetime) => Value::DateTime(datetime),
+            None if !strict => Value::Text("0000-00-00 00:00:00".into()),
+            None => return Err(Error::Type(format!("invalid DATETIME literal: {s}"))),
+        },
         (ColumnType::Decimal(_, sc), Value::Text(s)) => elyra_core::value::parse_decimal(&s, *sc)
             .map(|(u, s)| Value::Decimal(u, s))
             .ok_or_else(|| Error::Type(format!("invalid DECIMAL literal: {s}")))?,
@@ -14692,9 +14697,11 @@ fn coerce_with_mode(v: Value, ty: &ColumnType, col: &str, strict: bool) -> Resul
             Value::Decimal(v, *sc)
         }
         (ColumnType::Time, Value::Time(t)) => Value::Time(t),
-        (ColumnType::Time, Value::Text(s)) => elyra_core::datetime::parse_time(&s)
-            .map(Value::Time)
-            .ok_or_else(|| Error::Type(format!("invalid TIME literal: {s}")))?,
+        (ColumnType::Time, Value::Text(s)) => match elyra_core::datetime::parse_time(&s) {
+            Some(time) => Value::Time(time),
+            None if !strict => Value::Text("00:00:00".into()),
+            None => return Err(Error::Type(format!("invalid TIME literal: {s}"))),
+        },
         (ColumnType::Json, Value::Json(s)) => Value::Json(s),
         (ColumnType::Json, Value::Text(s)) => {
             if elyra_core::value::is_valid_json(&s) {
