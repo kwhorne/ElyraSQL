@@ -1620,18 +1620,23 @@ impl Engine {
                 exec::show_columns(sess, &name).await
             }
             Statement::SetVariable { .. } | Statement::Use { .. } => Ok(QueryResult::empty_ok()),
-            // ElyraSQL is a single logical schema (one file); CREATE/DROP
-            // DATABASE|SCHEMA are accepted as no-ops so tools and migrations that
-            // issue them proceed.
+            // ElyraSQL is a single logical schema backed by one file. Reporting
+            // success here would make callers believe an isolated database was
+            // created when every connection still shares `elyra`.
             Statement::CreateDatabase { .. } | Statement::CreateSchema { .. } => {
-                Ok(QueryResult::empty_ok())
+                Err(Error::Unsupported(
+                    "CREATE DATABASE is not supported; ElyraSQL uses the single `elyra` database"
+                        .into(),
+                ))
             }
             Statement::Explain { statement, .. } => exec::explain(sess, &statement).await,
             Statement::Drop {
                 object_type:
                     sqlparser::ast::ObjectType::Database | sqlparser::ast::ObjectType::Schema,
                 ..
-            } => Ok(QueryResult::empty_ok()),
+            } => Err(Error::Unsupported(
+                "DROP DATABASE is not supported; ElyraSQL uses the single `elyra` database".into(),
+            )),
             // Session/introspection queries GUI tools and ORMs fire on connect.
             Statement::ShowVariables { filter, .. } => exec::show_variables(filter.as_ref()),
             Statement::ShowStatus { filter, .. } => exec::show_status(filter.as_ref()),

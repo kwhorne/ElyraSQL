@@ -259,6 +259,33 @@ async fn update_order_by_limit_changes_only_the_ordered_rows() {
 }
 
 #[tokio::test]
+async fn create_database_fails_instead_of_succeeding_as_a_noop() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    let error = c
+        .query_drop("CREATE DATABASE unsupported_database")
+        .await
+        .unwrap_err();
+    match error {
+        mysql_async::Error::Server(error) => {
+            assert_eq!(error.code, 1235);
+            assert!(error.message.contains("single `elyra` database"));
+        }
+        other => panic!("expected a server error, got {other:?}"),
+    }
+
+    let databases: Vec<String> = c.query("SHOW DATABASES").await.unwrap();
+    assert_eq!(databases, vec!["information_schema", "elyra"]);
+
+    let error = c.query_drop("DROP DATABASE elyra").await.unwrap_err();
+    assert!(
+        matches!(error, mysql_async::Error::Server(error) if error.code == 1235),
+        "DROP DATABASE must fail loudly too"
+    );
+}
+
+#[tokio::test]
 async fn transactions_commit_and_rollback() {
     let srv = TestServer::start().await;
     let mut c = srv.conn().await;
