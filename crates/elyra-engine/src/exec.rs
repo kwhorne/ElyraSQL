@@ -6194,9 +6194,11 @@ async fn join_correlated_select(
     offset: usize,
     limit: Option<usize>,
 ) -> Result<QueryResult> {
-    if !group_by.is_empty() || aggregate::projection_has_aggregate(&select.projection) {
+    let aggregating =
+        !group_by.is_empty() || aggregate::projection_has_aggregate(&select.projection);
+    if aggregating && projection_has_subquery(&select.projection) {
         return Err(Error::Unsupported(
-            "correlated subqueries combined with aggregation over joins are not supported".into(),
+            "correlated subqueries in aggregate join projections are not supported".into(),
         ));
     }
 
@@ -6213,6 +6215,19 @@ async fn join_correlated_select(
             }
         }
         kept.push(row);
+    }
+
+    if aggregating {
+        let (out_schema, out_rows) = aggregate::run(&schema, &select.projection, &group_by, kept)?;
+        let mut out_rows = apply_having(
+            select.having.as_ref(),
+            &select.projection,
+            &out_schema,
+            out_rows,
+        )?;
+        order_output_rows(&mut out_rows, &out_schema, &order_exprs)?;
+        apply_offset_limit(&mut out_rows, offset, limit);
+        return Ok(QueryResult::Rows(RowStream::literal(out_schema, out_rows)));
     }
 
     let resolved_order = resolve_order_aliases(&order_exprs, &select.projection, &schema);

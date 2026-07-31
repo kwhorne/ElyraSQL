@@ -978,6 +978,66 @@ async fn prepared_correlated_projection_preserves_unsigned_metadata() {
 }
 
 #[tokio::test]
+async fn correlated_filter_can_feed_join_aggregation() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop(
+        "CREATE TABLE aggregate_parents (
+            id INT PRIMARY KEY,
+            scope_id INT,
+            deleted_at DATETIME NULL
+        )",
+    )
+    .await
+    .unwrap();
+    c.query_drop(
+        "CREATE TABLE aggregate_records (
+            id INT PRIMARY KEY,
+            parent_id INT,
+            item_id INT,
+            deleted_at DATETIME NULL
+        )",
+    )
+    .await
+    .unwrap();
+    c.query_drop("CREATE TABLE aggregate_items (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO aggregate_parents VALUES (1, 7, NULL), (2, 8, NULL)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO aggregate_items VALUES (10), (20)")
+        .await
+        .unwrap();
+    c.query_drop(
+        "INSERT INTO aggregate_records VALUES
+         (100, 1, 10, NULL), (101, 1, 20, NULL), (102, 2, 10, NULL)",
+    )
+    .await
+    .unwrap();
+
+    let count: Option<i64> = c
+        .exec_first(
+            "SELECT COUNT(*) AS aggregate_count
+             FROM aggregate_records
+             INNER JOIN aggregate_items
+                 ON aggregate_items.id = aggregate_records.item_id
+             WHERE EXISTS (
+                 SELECT * FROM aggregate_parents
+                 WHERE aggregate_records.parent_id = aggregate_parents.id
+                   AND scope_id = ?
+                   AND aggregate_parents.deleted_at IS NULL
+             )
+             AND aggregate_records.deleted_at IS NULL",
+            (7,),
+        )
+        .await
+        .unwrap();
+    assert_eq!(count, Some(2));
+}
+
+#[tokio::test]
 async fn joined_correlated_projection_expands_qualified_wildcard() {
     let srv = TestServer::start().await;
     let mut c = srv.conn().await;
