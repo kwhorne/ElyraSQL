@@ -14842,7 +14842,7 @@ fn coerce_with_mode(v: Value, ty: &ColumnType, col: &str, strict: bool) -> Resul
         }
         (ColumnType::UInt, Value::Bool(b)) => Value::UInt(b as u64),
         (ColumnType::UInt, Value::Float(f))
-            if f.is_finite() && f >= 0.0 && f < 18_446_744_073_709_551_616.0 =>
+            if f.is_finite() && (0.0..18_446_744_073_709_551_616.0).contains(&f) =>
         {
             Value::UInt(f as u64)
         }
@@ -14855,7 +14855,7 @@ fn coerce_with_mode(v: Value, ty: &ColumnType, col: &str, strict: bool) -> Resul
             if let Ok(value) = text.parse::<u64>() {
                 Value::UInt(value)
             } else if let Ok(value) = text.parse::<f64>() {
-                if value.is_finite() && value >= 0.0 && value < 18_446_744_073_709_551_616.0 {
+                if value.is_finite() && (0.0..18_446_744_073_709_551_616.0).contains(&value) {
                     Value::UInt(value as u64)
                 } else if !strict {
                     Value::UInt(if value.is_sign_negative() {
