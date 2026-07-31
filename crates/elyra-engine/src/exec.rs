@@ -2581,6 +2581,14 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
     } else {
         0
     };
+    let stored_auto_id = |row: &[Value]| {
+        let value = row.get(auto_col?)?;
+        match value {
+            Value::Int(id) => u64::try_from(*id).ok(),
+            Value::UInt(id) => Some(*id),
+            _ => None,
+        }
+    };
 
     let mut deletes: Vec<Vec<u8>> = Vec::new();
     let mut affected: u64 = 0;
@@ -2603,8 +2611,11 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
     // Pass 1: build every row (coerce, defaults, AUTO_INCREMENT, generated,
     // NOT NULL) and its clustered key — no per-row storage reads.
     let mut built: Vec<(Vec<u8>, Vec<Value>)> = Vec::with_capacity(rows.len());
-    // First auto-generated id of this statement -> LAST_INSERT_ID() / OK packet.
-    let mut first_id: i64 = 0;
+    // LAST_INSERT_ID() retains the first generated value. The wire OK packet
+    // follows mysql_insert_id(): it prefers that generated value, but when no
+    // value was generated it reports the last explicit nonzero value stored in
+    // the AUTO_INCREMENT column.
+    let mut first_generated_id: i64 = 0;
     let checks = parse_checks(&def)?;
     let trigs = catalog::load_triggers(db, &name).await?;
     let before_ins: Vec<catalog::TriggerDef> = trigs
@@ -2650,18 +2661,20 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
                     // Coerce to the column type so a UInt (BIGINT UNSIGNED) PK
                     // stores/looks up with the same key encoding as the value.
                     row[ai] = coerce(Value::Int(autoinc), &col.ty, &col.name)?;
-                    if first_id == 0 {
-                        first_id = autoinc;
+                    if first_generated_id == 0 {
+                        first_generated_id = autoinc;
                     }
                 } else {
-                    let n = match &row[ai] {
-                        Value::Int(n) => Some(*n),
-                        Value::UInt(u) => Some(*u as i64),
+                    let explicit_id = match &row[ai] {
+                        Value::Int(n) => u64::try_from(*n).ok(),
+                        Value::UInt(u) => Some(*u),
                         _ => None,
                     };
-                    if let Some(n) = n {
-                        if n > autoinc {
-                            autoinc = n;
+                    if let Some(explicit_id) = explicit_id {
+                        if let Ok(n) = i64::try_from(explicit_id) {
+                            if n > autoinc {
+                                autoinc = n;
+                            }
                         }
                     }
                 }
@@ -2737,8 +2750,19 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
                 queue_after(db, &after_ins, &def.schema, Some(row), None)?;
             }
         }
-        db.set_last_insert_id(first_id);
-        return Ok(QueryResult::Affected(affected));
+        db.set_last_insert_id(first_generated_id);
+        return Ok(QueryResult::Insert {
+            affected_rows: affected,
+            last_insert_id: if first_generated_id != 0 {
+                first_generated_id as u64
+            } else {
+                built
+                    .iter()
+                    .rev()
+                    .find_map(|(_, row)| stored_auto_id(row))
+                    .unwrap_or(0)
+            },
+        });
     }
 
     // One batched existence read for the whole statement (PK tables) instead of
@@ -2827,13 +2851,24 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
     puts.push(bump_wcount(db, &name).await?);
 
     db.commit_write(puts, deletes).await?;
-    db.set_last_insert_id(first_id);
+    db.set_last_insert_id(first_generated_id);
     if !after_ins.is_empty() {
         for (_, row) in &batch {
             queue_after(db, &after_ins, &def.schema, Some(row), None)?;
         }
     }
-    Ok(QueryResult::Affected(affected))
+    Ok(QueryResult::Insert {
+        affected_rows: affected,
+        last_insert_id: if first_generated_id != 0 {
+            first_generated_id as u64
+        } else {
+            batch
+                .iter()
+                .rev()
+                .find_map(|(_, row)| stored_auto_id(row))
+                .unwrap_or(0)
+        },
+    })
 }
 
 /// Replace `VALUES(col)` references (MySQL ON DUPLICATE KEY UPDATE) with the
@@ -11182,7 +11217,7 @@ async fn run_subquery_capped(
             }
             Ok(rows)
         }
-        QueryResult::Affected(_) => Ok(Vec::new()),
+        QueryResult::Affected(_) | QueryResult::Insert { .. } => Ok(Vec::new()),
     }
 }
 
@@ -11303,7 +11338,9 @@ async fn run_subquery_schema(
             }
             Ok((schema, rows))
         }
-        QueryResult::Affected(_) => Ok((Schema::new(Vec::new()), Vec::new())),
+        QueryResult::Affected(_) | QueryResult::Insert { .. } => {
+            Ok((Schema::new(Vec::new()), Vec::new()))
+        }
     }
 }
 

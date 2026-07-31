@@ -89,6 +89,57 @@ async fn ddl_dml_roundtrip() {
 }
 
 #[tokio::test]
+async fn explicit_auto_increment_value_is_returned_in_ok_packet() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop(
+        "CREATE TABLE ai_explicit (
+            id BIGINT NOT NULL AUTO_INCREMENT,
+            a VARCHAR(10),
+            PRIMARY KEY (id)
+        )",
+    )
+    .await
+    .unwrap();
+
+    c.query_drop("INSERT INTO ai_explicit (id, a) VALUES (1697842, 'explicit')")
+        .await
+        .unwrap();
+    assert_eq!(c.last_insert_id(), Some(1_697_842));
+
+    // An explicit value affects the OK packet, but not SQL LAST_INSERT_ID().
+    let session_id: u64 = c
+        .query_first("SELECT LAST_INSERT_ID()")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(session_id, 0);
+
+    c.query_drop("INSERT INTO ai_explicit (a) VALUES ('auto')")
+        .await
+        .unwrap();
+    assert_eq!(c.last_insert_id(), Some(1_697_843));
+
+    // The binary prepared-statement path uses the same statement-local value.
+    c.exec_drop(
+        "INSERT INTO ai_explicit (id, a) VALUES (?, ?)",
+        (1_800_000_u64, "prepared"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(c.last_insert_id(), Some(1_800_000));
+
+    c.query_drop(
+        "INSERT IGNORE INTO ai_explicit (id, a)
+         VALUES (1800000, 'ignored')",
+    )
+    .await
+    .unwrap();
+    assert_eq!(c.last_insert_id(), None);
+}
+
+#[tokio::test]
 async fn transactions_commit_and_rollback() {
     let srv = TestServer::start().await;
     let mut c = srv.conn().await;

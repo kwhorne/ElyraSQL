@@ -50,6 +50,11 @@ pub enum QueryResult {
     Rows(RowStream),
     /// A statement that changed state; carries affected row count.
     Affected(u64),
+    /// An INSERT result, including the statement-local ID for the OK packet.
+    Insert {
+        affected_rows: u64,
+        last_insert_id: u64,
+    },
 }
 
 impl QueryResult {
@@ -1007,8 +1012,12 @@ impl Engine {
             let mut total = 0u64;
             for stmt in stmts {
                 for r in Box::pin(self.execute_as(&stmt, privilege, user, sess)).await? {
-                    if let QueryResult::Affected(n) = r {
-                        total += n;
+                    match r {
+                        QueryResult::Affected(n)
+                        | QueryResult::Insert {
+                            affected_rows: n, ..
+                        } => total += n,
+                        QueryResult::Rows(_) => {}
                     }
                 }
             }
@@ -1371,6 +1380,9 @@ impl Engine {
             // (matches MySQL).
             match &r {
                 QueryResult::Affected(n) => sess.set_row_count(*n as i64),
+                QueryResult::Insert { affected_rows, .. } => {
+                    sess.set_row_count(*affected_rows as i64)
+                }
                 QueryResult::Rows(_) => sess.set_row_count(-1),
             }
             out.push(r);

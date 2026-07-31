@@ -619,15 +619,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for ElyraShim {
             a.record(self.conn_id, &user, &sql, res.is_ok());
         }
         match res {
-            Ok(outcomes) => {
-                write_outcomes(
-                    outcomes,
-                    results,
-                    self.session.last_insert_id() as u64,
-                    self.session.in_txn(),
-                )
-                .await
-            }
+            Ok(outcomes) => write_outcomes(outcomes, results, self.session.in_txn()).await,
             Err(e) => {
                 results
                     .error(elyra_kind(&e), e.to_string().as_bytes())
@@ -673,15 +665,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for ElyraShim {
             a.record(self.conn_id, &user, query, res.is_ok());
         }
         match res {
-            Ok(outcomes) => {
-                write_outcomes(
-                    outcomes,
-                    results,
-                    self.session.last_insert_id() as u64,
-                    self.session.in_txn(),
-                )
-                .await
-            }
+            Ok(outcomes) => write_outcomes(outcomes, results, self.session.in_txn()).await,
             Err(e) => {
                 results
                     .error(elyra_kind(&e), e.to_string().as_bytes())
@@ -723,7 +707,6 @@ const STREAM_BATCH: usize = 1024;
 async fn write_outcomes<W: AsyncWrite + Send + Unpin>(
     mut outcomes: Vec<QueryResult>,
     results: QueryResultWriter<'_, W>,
-    last_insert_id: u64,
     in_trans: bool,
 ) -> Result<(), std::io::Error> {
     // Report an open transaction in the OK status flags so drivers (PDO/mysqlnd)
@@ -778,6 +761,18 @@ async fn write_outcomes<W: AsyncWrite + Send + Unpin>(
             results
                 .completed(OkResponse {
                     affected_rows: n,
+                    status_flags,
+                    ..Default::default()
+                })
+                .await
+        }
+        Some(QueryResult::Insert {
+            affected_rows,
+            last_insert_id,
+        }) => {
+            results
+                .completed(OkResponse {
+                    affected_rows,
                     last_insert_id,
                     status_flags,
                     ..Default::default()
