@@ -1011,6 +1011,41 @@ async fn joined_correlated_projection_expands_qualified_wildcard() {
     assert_eq!(rows, [(1, "one".into(), 2, 1)]);
 }
 
+#[tokio::test]
+async fn non_strict_sql_mode_coerces_invalid_integer_text() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop("CREATE TABLE mode_values (id INT PRIMARY KEY, value INT)")
+        .await
+        .unwrap();
+    c.query_drop(
+        "SET NAMES 'utf8mb4' COLLATE 'utf8mb4_unicode_ci', \
+         SESSION sql_mode='NO_ENGINE_SUBSTITUTION'",
+    )
+    .await
+    .unwrap();
+    c.query_drop("INSERT INTO mode_values VALUES (1, '{\"name\":\"row\"}')")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO mode_values VALUES (2, '123tail')")
+        .await
+        .unwrap();
+    let values: Vec<i64> = c
+        .query("SELECT value FROM mode_values ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(values, [0, 123]);
+
+    c.query_drop("SET SESSION sql_mode='STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION'")
+        .await
+        .unwrap();
+    assert!(c
+        .query_drop("INSERT INTO mode_values VALUES (3, 'invalid')")
+        .await
+        .is_err());
+}
+
 /// Join followed by GROUP BY over an indexed partner -- exercises the streaming
 /// index nested-loop aggregation path (bounded memory) and must produce exactly
 /// the same result as the materialising join.

@@ -1232,7 +1232,7 @@ impl Engine {
             return Ok(vec![users::execute(sql, sess, privilege).await?]);
         }
 
-        if let Some(r) = self.intercept_session(sql) {
+        if let Some(r) = self.intercept_session(sql, sess) {
             return Ok(vec![r]); // session/introspection: read-level
         }
 
@@ -1660,15 +1660,23 @@ impl Engine {
     }
 
     /// Handle the well-known session/introspection queries MySQL drivers send.
-    fn intercept_session(&self, sql: &str) -> Option<QueryResult> {
+    fn intercept_session(&self, sql: &str, sess: &Session) -> Option<QueryResult> {
         let t = sql.trim().trim_end_matches(';').trim();
+        let is_set = t
+            .get(..4)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("set "));
+        if is_set {
+            let lower = t.to_ascii_lowercase();
+            if let Some((_, mode)) = lower.rsplit_once("sql_mode") {
+                let strict =
+                    mode.contains("strict_trans_tables") || mode.contains("strict_all_tables");
+                sess.set_strict_sql_mode(strict);
+            }
+        }
         // Every intercepted query is short; skip large statements cheaply
         // (a long `SET ...` is still swallowed).
         if t.len() > 48 {
-            return t
-                .get(..4)
-                .filter(|h| h.eq_ignore_ascii_case("set "))
-                .map(|_| QueryResult::empty_ok());
+            return is_set.then(QueryResult::empty_ok);
         }
         let lower = t.to_ascii_lowercase();
 
@@ -1690,7 +1698,7 @@ impl Engine {
                 ColumnType::Text,
                 Value::Text("elyra".into()),
             )),
-            _ if lower.starts_with("set ") => Some(QueryResult::empty_ok()),
+            _ if is_set => Some(QueryResult::empty_ok()),
             _ => None,
         }
     }

@@ -72,6 +72,7 @@ pub struct Session {
     db: Db,
     txn: Mutex<Option<TxnState>>,
     isolation: Mutex<Isolation>,
+    strict_sql_mode: std::sync::atomic::AtomicBool,
     /// Nested `CALL` depth (guards against runaway procedure recursion).
     call_depth: std::sync::atomic::AtomicUsize,
     /// Ready-to-run trigger-body SQL queued by the last DML, fired by the engine.
@@ -131,6 +132,7 @@ impl Session {
             db,
             txn: Mutex::new(None),
             isolation: Mutex::new(Isolation::Snapshot),
+            strict_sql_mode: std::sync::atomic::AtomicBool::new(true),
             call_depth: std::sync::atomic::AtomicUsize::new(0),
             pending_triggers: Mutex::new(Vec::new()),
             user_vars: Mutex::new(std::collections::HashMap::new()),
@@ -174,6 +176,18 @@ impl Session {
     /// Clear the deadline once the statement is done.
     pub fn disarm_cancel(&self) {
         self.cancel.disarm();
+    }
+
+    /// Whether invalid values fail instead of using MySQL's warning-producing
+    /// fallback conversions.
+    pub fn strict_sql_mode(&self) -> bool {
+        self.strict_sql_mode
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn set_strict_sql_mode(&self, strict: bool) {
+        self.strict_sql_mode
+            .store(strict, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Value returned by `LAST_INSERT_ID()`.

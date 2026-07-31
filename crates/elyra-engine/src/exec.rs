@@ -2989,7 +2989,7 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
             let bound = bind_values(expr, insert, &def.schema);
             let v = predicate::eval_row(&bound, &def.schema, &merged)?;
             let col = &def.schema.columns[*idx];
-            merged[*idx] = coerce(v, &col.ty, &col.name)?;
+            merged[*idx] = coerce_for_session(db, v, &col.ty, &col.name)?;
         }
         Ok(merged)
     };
@@ -3026,7 +3026,7 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
         let mut row = vec![Value::Null; def.schema.columns.len()];
         for (slot, v) in target.iter().zip(vals) {
             let col = &def.schema.columns[*slot];
-            row[*slot] = coerce(v, &col.ty, &col.name)?;
+            row[*slot] = coerce_for_session(db, v, &col.ty, &col.name)?;
         }
 
         if has_meta {
@@ -9229,12 +9229,12 @@ pub async fn update(
             // Assignment RHS may reference existing column values.
             let v = predicate::eval_row(expr, &def.schema, &old_row)?;
             let col = &def.schema.columns[*idx];
-            new_row[*idx] = coerce(v, &col.ty, &col.name)?;
+            new_row[*idx] = coerce_for_session(db, v, &col.ty, &col.name)?;
         }
         for (i, ge) in &generated {
             let v = predicate::eval_row(ge, &def.schema, &new_row)?;
             let col = &def.schema.columns[*i];
-            new_row[*i] = coerce(v, &col.ty, &col.name)?;
+            new_row[*i] = coerce_for_session(db, v, &col.ty, &col.name)?;
         }
         for t in &before_upd {
             apply_before_trigger(t, &def.schema, &mut new_row, Some(&old_row))?;
@@ -9745,7 +9745,7 @@ async fn multi_update(
                 if &s.qual == qual {
                     let v = predicate::eval_row(s.expr, &schema, &joined)?;
                     let col = &info.def.schema.columns[s.col];
-                    new_base[s.col] = coerce(v, &col.ty, &col.name)?;
+                    new_base[s.col] = coerce_for_session(db, v, &col.ty, &col.name)?;
                 }
             }
             for (i, col) in info.def.schema.columns.iter().enumerate() {
@@ -14447,6 +14447,14 @@ fn source_rows(source: &SqlQuery) -> Result<Option<&[Vec<sqlparser::ast::Expr>]>
 
 /// Coerce a literal value to a column's declared type.
 fn coerce(v: Value, ty: &ColumnType, col: &str) -> Result<Value> {
+    coerce_with_mode(v, ty, col, true)
+}
+
+fn coerce_for_session(db: &Session, v: Value, ty: &ColumnType, col: &str) -> Result<Value> {
+    coerce_with_mode(v, ty, col, db.strict_sql_mode())
+}
+
+fn coerce_with_mode(v: Value, ty: &ColumnType, col: &str, strict: bool) -> Result<Value> {
     if v.is_null() {
         return Ok(Value::Null);
     }
@@ -14523,12 +14531,17 @@ fn coerce(v: Value, ty: &ColumnType, col: &str) -> Result<Value> {
         (ColumnType::Float, Value::UInt(u)) => Value::Float(u as f64),
         // Lenient (MySQL-style) conversions.
         (ColumnType::Int, Value::Float(f)) => Value::Int(f as i64),
-        (ColumnType::Int, Value::Text(s)) => s
-            .trim()
-            .parse::<i64>()
-            .or_else(|_| s.trim().parse::<f64>().map(|f| f as i64))
-            .map(Value::Int)
-            .map_err(|_| Error::Type(format!("invalid INTEGER value: {s}")))?,
+        (ColumnType::Int, Value::Text(s)) => {
+            match s
+                .trim()
+                .parse::<i64>()
+                .or_else(|_| s.trim().parse::<f64>().map(|f| f as i64))
+            {
+                Ok(value) => Value::Int(value),
+                Err(_) if !strict => Value::Int(mysql_integer_prefix(&s)),
+                Err(_) => return Err(Error::Type(format!("invalid INTEGER value: {s}"))),
+            }
+        }
         (ColumnType::Float, Value::Text(s)) => s
             .trim()
             .parse::<f64>()
@@ -14544,6 +14557,45 @@ fn coerce(v: Value, ty: &ColumnType, col: &str) -> Result<Value> {
             )))
         }
     })
+}
+
+fn mysql_integer_prefix(value: &str) -> i64 {
+    let value = value.trim_start();
+    let bytes = value.as_bytes();
+    let mut end = usize::from(matches!(bytes.first(), Some(b'+') | Some(b'-')));
+    let mut digits = 0usize;
+    while bytes.get(end).is_some_and(u8::is_ascii_digit) {
+        end += 1;
+        digits += 1;
+    }
+    if bytes.get(end) == Some(&b'.') {
+        end += 1;
+        while bytes.get(end).is_some_and(u8::is_ascii_digit) {
+            end += 1;
+            digits += 1;
+        }
+    }
+    if digits == 0 {
+        return 0;
+    }
+    if matches!(bytes.get(end), Some(b'e') | Some(b'E')) {
+        let exponent_start = end;
+        end += 1;
+        if matches!(bytes.get(end), Some(b'+') | Some(b'-')) {
+            end += 1;
+        }
+        let exponent_digits = end;
+        while bytes.get(end).is_some_and(u8::is_ascii_digit) {
+            end += 1;
+        }
+        if end == exponent_digits {
+            end = exponent_start;
+        }
+    }
+    value[..end]
+        .parse::<f64>()
+        .map(|number| number as i64)
+        .unwrap_or(0)
 }
 
 fn parse_vector(s: &str, dim: u32) -> Result<Vec<f32>> {
