@@ -14866,7 +14866,7 @@ fn coerce_with_mode(v: Value, ty: &ColumnType, col: &str, strict: bool) -> Resul
         (ColumnType::UInt, Value::Float(f))
             if f.is_finite() && (0.0..18_446_744_073_709_551_616.0).contains(&f) =>
         {
-            Value::UInt(f as u64)
+            Value::UInt(f.round() as u64)
         }
         (ColumnType::UInt, Value::Float(_)) if !strict => Value::UInt(0),
         (ColumnType::UInt, Value::Float(f)) => {
@@ -14878,7 +14878,7 @@ fn coerce_with_mode(v: Value, ty: &ColumnType, col: &str, strict: bool) -> Resul
                 Value::UInt(value)
             } else if let Ok(value) = text.parse::<f64>() {
                 if value.is_finite() && (0.0..18_446_744_073_709_551_616.0).contains(&value) {
-                    Value::UInt(value as u64)
+                    Value::UInt(value.round() as u64)
                 } else if !strict {
                     Value::UInt(if value.is_sign_negative() {
                         0
@@ -14897,12 +14897,12 @@ fn coerce_with_mode(v: Value, ty: &ColumnType, col: &str, strict: bool) -> Resul
         (ColumnType::Int, Value::UInt(u)) => Value::Int(u as i64),
         (ColumnType::Float, Value::UInt(u)) => Value::Float(u as f64),
         // Lenient (MySQL-style) conversions.
-        (ColumnType::Int, Value::Float(f)) => Value::Int(f as i64),
+        (ColumnType::Int, Value::Float(f)) => Value::Int(f.round() as i64),
         (ColumnType::Int, Value::Text(s)) => {
             match s
                 .trim()
                 .parse::<i64>()
-                .or_else(|_| s.trim().parse::<f64>().map(|f| f as i64))
+                .or_else(|_| s.trim().parse::<f64>().map(|f| f.round() as i64))
             {
                 Ok(value) => Value::Int(value),
                 Err(_) if !strict => Value::Int(mysql_integer_prefix(&s)),
@@ -14961,7 +14961,7 @@ fn mysql_integer_prefix(value: &str) -> i64 {
     }
     value[..end]
         .parse::<f64>()
-        .map(|number| number as i64)
+        .map(|number| number.round() as i64)
         .unwrap_or(0)
 }
 

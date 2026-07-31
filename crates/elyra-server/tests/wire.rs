@@ -1234,14 +1234,23 @@ async fn non_strict_sql_mode_coerces_invalid_integer_text() {
     c.query_drop("INSERT INTO mode_values VALUES (1, '{\"name\":\"row\"}', '')")
         .await
         .unwrap();
-    c.query_drop("INSERT INTO mode_values VALUES (2, '123tail', '456tail')")
+    c.query_drop("INSERT INTO mode_values VALUES (2, '123.5tail', '456.5tail')")
+        .await
+        .unwrap();
+    c.exec_drop(
+        "INSERT INTO mode_values VALUES (?, ?, ?)",
+        (3, "112.5", "137.5"),
+    )
+    .await
+    .unwrap();
+    c.query_drop("INSERT INTO mode_values VALUES (4, -112.5, -112.5)")
         .await
         .unwrap();
     let values: Vec<(i64, u64)> = c
         .query("SELECT value, unsigned_value FROM mode_values ORDER BY id")
         .await
         .unwrap();
-    assert_eq!(values, [(0, 0), (123, 456)]);
+    assert_eq!(values, [(0, 0), (124, 457), (113, 138), (-113, 0)]);
 
     let count: i64 = c
         .query_first("SELECT COUNT(*) FROM mode_values WHERE value = 'Channel1'")
@@ -1254,11 +1263,11 @@ async fn non_strict_sql_mode_coerces_invalid_integer_text() {
         .await
         .unwrap();
     assert!(c
-        .query_drop("INSERT INTO mode_values VALUES (3, 'invalid', 'invalid')")
+        .query_drop("INSERT INTO mode_values VALUES (5, 'invalid', 'invalid')")
         .await
         .is_err());
     assert!(c
-        .query_drop("INSERT INTO mode_values VALUES (4, 1, '')")
+        .query_drop("INSERT INTO mode_values VALUES (6, 1, '')")
         .await
         .is_err());
 }
