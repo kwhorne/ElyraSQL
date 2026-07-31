@@ -466,7 +466,7 @@ pub async fn create_table(
 pub async fn show_tables(db: &Session) -> Result<QueryResult> {
     let names = catalog::list_tables(db).await?;
     let schema = Schema::new(vec![ColumnDef {
-        name: "Tables_in_elyra".into(),
+        name: format!("Tables_in_{}", db.database()),
         ty: ColumnType::Text,
         nullable: false,
         collation: elyra_core::Collation::Ci,
@@ -717,10 +717,10 @@ pub fn show_collation(filter: Option<&sqlparser::ast::ShowStatementFilter>) -> R
 }
 
 /// `SHOW DATABASES` / `SHOW SCHEMAS`.
-pub fn show_databases() -> Result<QueryResult> {
+pub fn show_databases(db: &Session) -> Result<QueryResult> {
     let rows = vec![
         vec![Value::Text("information_schema".into())],
-        vec![Value::Text("elyra".into())],
+        vec![Value::Text(db.database())],
     ];
     Ok(QueryResult::Rows(RowStream::literal(
         text_schema(&["Database"]),
@@ -731,12 +731,12 @@ pub fn show_databases() -> Result<QueryResult> {
 /// `SHOW [FULL] PROCESSLIST` — a single representative row (the engine does not
 /// track a live connection table); handled in-engine so it works over both the
 /// text and prepared-statement paths.
-pub fn show_processlist() -> Result<QueryResult> {
+pub fn show_processlist(db: &Session) -> Result<QueryResult> {
     let row = vec![
         Value::Text("1".into()),
         Value::Text("root".into()),
         Value::Text("localhost".into()),
-        Value::Text("elyra".into()),
+        Value::Text(db.database()),
         Value::Text("Query".into()),
         Value::Text("0".into()),
         Value::Text(String::new()),
@@ -1078,6 +1078,7 @@ async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec
         collation: elyra_core::Collation::Ci,
     };
     let names = catalog::list_tables(db).await?;
+    let database = db.database();
     match view {
         "tables" => {
             let schema = Schema::new(vec![
@@ -1098,7 +1099,7 @@ async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec
                     None => Value::Null,
                 };
                 rows.push(vec![
-                    Value::Text("elyra".into()),
+                    Value::Text(database.clone()),
                     Value::Text(n),
                     Value::Text("BASE TABLE".into()),
                     Value::Text("ElyraSQL".into()),
@@ -1150,7 +1151,7 @@ async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec
                         Value::Null
                     };
                     rows.push(vec![
-                        Value::Text("elyra".into()),
+                        Value::Text(database.clone()),
                         Value::Text(tname.clone()),
                         Value::Text(c.name.clone()),
                         Value::Int(i as i64 + 1),
@@ -1195,7 +1196,7 @@ async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec
                     |non_unique: i64, iname: &str, seq: usize, ci: usize, itype: &str| {
                         let c = &def.schema.columns[ci];
                         rows.push(vec![
-                            Value::Text("elyra".into()),
+                            Value::Text(database.clone()),
                             Value::Text(tname.clone()),
                             Value::Int(non_unique),
                             Value::Text(iname.to_string()),
@@ -1240,9 +1241,9 @@ async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec
                 // PRIMARY KEY and UNIQUE constraints: no referenced table.
                 let mut push_key = |cname: &str, seq: usize, ci: usize| {
                     rows.push(vec![
-                        Value::Text("elyra".into()),
+                        Value::Text(database.clone()),
                         Value::Text(cname.to_string()),
-                        Value::Text("elyra".into()),
+                        Value::Text(database.clone()),
                         Value::Text(tname.clone()),
                         Value::Text(def.schema.columns[ci].name.clone()),
                         Value::Int(seq as i64 + 1),
@@ -1266,14 +1267,14 @@ async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec
                     for (seq, (&ci, rc)) in fk.columns.iter().zip(fk.ref_columns.iter()).enumerate()
                     {
                         rows.push(vec![
-                            Value::Text("elyra".into()),
+                            Value::Text(database.clone()),
                             Value::Text(fk.name.clone()),
-                            Value::Text("elyra".into()),
+                            Value::Text(database.clone()),
                             Value::Text(tname.clone()),
                             Value::Text(def.schema.columns[ci].name.clone()),
                             Value::Int(seq as i64 + 1),
                             Value::Int(seq as i64 + 1),
-                            Value::Text("elyra".into()),
+                            Value::Text(database.clone()),
                             Value::Text(fk.ref_table.clone()),
                             Value::Text(rc.clone()),
                         ]);
@@ -1294,7 +1295,7 @@ async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec
                 let def = catalog::load(db, &table_name).await?;
                 rows.extend(def.foreign_keys.iter().map(|foreign_key| {
                     vec![
-                        Value::Text("elyra".into()),
+                        Value::Text(database.clone()),
                         Value::Text(foreign_key.name.clone()),
                         Value::Text(ref_action_name(foreign_key.on_update).into()),
                         Value::Text(ref_action_name(foreign_key.on_delete).into()),
@@ -1538,11 +1539,11 @@ async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec
                     };
                     rows.push(vec![
                         Value::Text("def".into()),
-                        Value::Text("elyra".into()),
+                        Value::Text(database.clone()),
                         Value::Text(t.name),
                         Value::Text(event.into()),
                         Value::Text("def".into()),
-                        Value::Text("elyra".into()),
+                        Value::Text(database.clone()),
                         Value::Text(t.table),
                         Value::Text("1".into()),
                         Value::Null,
@@ -1603,7 +1604,7 @@ async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec
                     rows.push(vec![
                         Value::Text(name.clone()),
                         Value::Text("def".into()),
-                        Value::Text("elyra".into()),
+                        Value::Text(database.clone()),
                         Value::Text(name),
                         Value::Text("PROCEDURE".into()),
                         Value::Text(String::new()),
@@ -1654,7 +1655,7 @@ async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec
                     let def = String::from_utf8_lossy(v).to_string();
                     rows.push(vec![
                         Value::Text("def".into()),
-                        Value::Text("elyra".into()),
+                        Value::Text(database.clone()),
                         Value::Text(name),
                         Value::Text(def),
                         Value::Text("NONE".into()),
@@ -1716,12 +1717,12 @@ async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec
                 text("DEFAULT_COLLATION_NAME"),
                 text("SQL_PATH"),
             ]);
-            let rows = ["information_schema", "elyra"]
+            let rows = ["information_schema".to_string(), database]
                 .into_iter()
-                .map(|s| {
+                .map(|schema_name| {
                     vec![
                         Value::Text("def".into()),
-                        Value::Text(s.into()),
+                        Value::Text(schema_name),
                         Value::Text("utf8mb4".into()),
                         Value::Text("utf8mb4_0900_ai_ci".into()),
                         Value::Null,

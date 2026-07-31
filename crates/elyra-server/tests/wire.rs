@@ -2327,6 +2327,51 @@ async fn table_introspection_columns_are_available() {
     );
 }
 
+#[tokio::test]
+async fn selected_database_names_catalog_rows_for_the_session() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn_to_database("application_test").await;
+    c.query_drop("CREATE TABLE migrations (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+
+    let database: String = c.query_first("SELECT DATABASE()").await.unwrap().unwrap();
+    assert_eq!(database, "application_test");
+
+    let exists: i64 = c
+        .query_first(
+            "SELECT EXISTS (
+                SELECT 1 FROM information_schema.tables
+                WHERE table_schema = 'application_test'
+                  AND table_name = 'migrations'
+                  AND table_type = 'BASE TABLE'
+            )",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(exists, 1);
+
+    let exists: i64 = c
+        .query_first(
+            "SELECT EXISTS (
+                SELECT 1 FROM information_schema.tables
+                WHERE table_schema = DATABASE()
+                  AND table_name = 'migrations'
+            )",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(exists, 1);
+
+    c.query_drop("USE switched_test").await.unwrap();
+    let database: String = c.query_first("SELECT DATABASE()").await.unwrap().unwrap();
+    assert_eq!(database, "switched_test");
+    let schemas: Vec<String> = c.query("SHOW DATABASES").await.unwrap();
+    assert_eq!(schemas, vec!["information_schema", "switched_test"]);
+}
+
 // Foreign-key introspection joins these two virtual relations and aggregates
 // composite-key columns in ordinal order. The join must stay on the virtual
 // relation path rather than loading either view as a stored table.

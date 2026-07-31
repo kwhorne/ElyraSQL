@@ -1,5 +1,5 @@
 //! Statement pre-pass that resolves the session-state niladic functions
-//! `LAST_INSERT_ID()`, `ROW_COUNT()` and `FOUND_ROWS()` to literals.
+//! `LAST_INSERT_ID()`, `ROW_COUNT()`, `FOUND_ROWS()` and `DATABASE()` to literals.
 //!
 //! These depend on per-connection state (the last auto-generated id and the
 //! rows changed by the previous statement), which the stateless row evaluator
@@ -10,10 +10,11 @@
 use sqlparser::ast::{Expr, Query, SetExpr, Statement, Value as SqlValue};
 
 /// Rewrite session-state functions in `stmt` to literal values.
-pub fn rewrite(stmt: &mut Statement, last_insert_id: i64, row_count: i64) {
+pub fn rewrite(stmt: &mut Statement, last_insert_id: i64, row_count: i64, database: &str) {
     let ctx = Ctx {
         last_insert_id,
         row_count,
+        database,
     };
     match stmt {
         Statement::Query(q) => ctx.query(q),
@@ -38,12 +39,13 @@ pub fn rewrite(stmt: &mut Statement, last_insert_id: i64, row_count: i64) {
     }
 }
 
-struct Ctx {
+struct Ctx<'a> {
     last_insert_id: i64,
     row_count: i64,
+    database: &'a str,
 }
 
-impl Ctx {
+impl Ctx<'_> {
     /// The literal value for a session function, or `None` if `e` is not one.
     fn literal_for(&self, e: &Expr) -> Option<Expr> {
         let Expr::Function(f) = e else { return None };
@@ -58,13 +60,18 @@ impl Ctx {
             return None;
         }
         let name = f.name.0.last()?.value.to_ascii_lowercase();
-        let v = match name.as_str() {
-            "last_insert_id" => self.last_insert_id,
-            "row_count" => self.row_count,
-            "found_rows" => self.row_count.max(0),
+        let value = match name.as_str() {
+            "last_insert_id" => {
+                Expr::Value(SqlValue::Number(self.last_insert_id.to_string(), false))
+            }
+            "row_count" => Expr::Value(SqlValue::Number(self.row_count.to_string(), false)),
+            "found_rows" => Expr::Value(SqlValue::Number(self.row_count.max(0).to_string(), false)),
+            "database" | "schema" => {
+                Expr::Value(SqlValue::SingleQuotedString(self.database.to_string()))
+            }
             _ => return None,
         };
-        Some(Expr::Value(SqlValue::Number(v.to_string(), false)))
+        Some(value)
     }
 
     fn expr(&self, e: &mut Expr) {
@@ -99,6 +106,14 @@ impl Ctx {
                 for x in list {
                     self.expr(x);
                 }
+            }
+            Expr::Subquery(query)
+            | Expr::Exists {
+                subquery: query, ..
+            } => self.query(query),
+            Expr::InSubquery { expr, subquery, .. } => {
+                self.expr(expr);
+                self.query(subquery);
             }
             Expr::Case {
                 operand,

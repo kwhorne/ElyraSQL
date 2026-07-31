@@ -858,7 +858,7 @@ impl Engine {
         // SHOW [FULL] PROCESSLIST — handled in-engine so it works over the
         // prepared-statement path too (SHOW FULL PROCESSLIST also fails to parse).
         if head.starts_with("show processlist") || head.starts_with("show full processlist") {
-            return Ok(vec![exec::show_processlist()?]);
+            return Ok(vec![exec::show_processlist(sess)?]);
         }
 
         // sqlparser 0.53 does not recognize standalone RENAME TABLE, and parses
@@ -1324,9 +1324,15 @@ impl Engine {
             // literal) before anything inspects the statement.
             let mut stmt = stmt;
             aiembed::resolve_stmt(&mut stmt).await?;
-            // Resolve LAST_INSERT_ID()/ROW_COUNT()/FOUND_ROWS() from session
-            // state before execution (stateless evaluator can't see it).
-            sessfn::rewrite(&mut stmt, sess.last_insert_id(), sess.row_count());
+            // Resolve session-backed functions before execution because the
+            // stateless evaluator cannot read connection state.
+            let database = sess.database();
+            sessfn::rewrite(
+                &mut stmt,
+                sess.last_insert_id(),
+                sess.row_count(),
+                &database,
+            );
             let need = required_privilege(&stmt);
             let effective = self
                 .effective_privilege(privilege, user, &stmt, sess)
@@ -1616,7 +1622,24 @@ impl Engine {
                     .ok_or_else(|| Error::Catalog("empty table name".into()))?;
                 exec::show_columns(sess, &name).await
             }
-            Statement::SetVariable { .. } | Statement::Use { .. } => Ok(QueryResult::empty_ok()),
+            Statement::SetVariable { .. } => Ok(QueryResult::empty_ok()),
+            Statement::Use(use_expr) => {
+                use sqlparser::ast::Use;
+                let database = match use_expr {
+                    Use::Database(name) | Use::Schema(name) | Use::Object(name) => {
+                        object_name_last(&name)
+                            .ok_or_else(|| Error::Catalog("empty database name".into()))?
+                    }
+                    Use::Default => "elyra".into(),
+                    other => {
+                        return Err(Error::Unsupported(format!(
+                            "USE target is not supported: {other}"
+                        )))
+                    }
+                };
+                sess.set_database(&database);
+                Ok(QueryResult::empty_ok())
+            }
             // ElyraSQL is a single logical schema backed by one file. Reporting
             // success here would make callers believe an isolated database was
             // created when every connection still shares `elyra`.
@@ -1638,7 +1661,7 @@ impl Engine {
             Statement::ShowVariables { filter, .. } => exec::show_variables(filter.as_ref()),
             Statement::ShowStatus { filter, .. } => exec::show_status(filter.as_ref()),
             Statement::ShowCollation { filter } => exec::show_collation(filter.as_ref()),
-            Statement::ShowDatabases { .. } => exec::show_databases(),
+            Statement::ShowDatabases { .. } => exec::show_databases(sess),
             Statement::ShowVariable { variable } => {
                 let kw = variable
                     .iter()
@@ -1696,7 +1719,7 @@ impl Engine {
             "select database()" | "select schema()" => Some(QueryResult::scalar(
                 "database()",
                 ColumnType::Text,
-                Value::Text("elyra".into()),
+                Value::Text(sess.database()),
             )),
             _ if is_set => Some(QueryResult::empty_ok()),
             _ => None,
@@ -2063,9 +2086,7 @@ fn require_privilege(granted: Privilege, action: PrivilegedAction) -> Result<()>
 
 fn required_privilege(stmt: &Statement) -> Privilege {
     match stmt {
-        Statement::Query(_) | Statement::SetVariable { .. } | Statement::Use { .. } => {
-            Privilege::Read
-        }
+        Statement::Query(_) | Statement::SetVariable { .. } | Statement::Use(_) => Privilege::Read,
         Statement::Insert(_) | Statement::Update { .. } | Statement::Delete(_) => Privilege::Write,
         Statement::StartTransaction { .. }
         | Statement::Commit { .. }

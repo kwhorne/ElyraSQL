@@ -634,10 +634,10 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for ElyraShim {
 
     async fn on_init<'a>(
         &'a mut self,
-        _schema: &'a str,
+        schema: &'a str,
         writer: InitWriter<'a, W>,
     ) -> Result<(), Self::Error> {
-        // USE <db>: single-catalog for now, always accept.
+        self.session.set_database(schema);
         writer.ok().await
     }
 

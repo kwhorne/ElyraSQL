@@ -72,6 +72,7 @@ pub struct Session {
     db: Db,
     txn: Mutex<Option<TxnState>>,
     isolation: Mutex<Isolation>,
+    database: Mutex<String>,
     strict_sql_mode: std::sync::atomic::AtomicBool,
     /// Nested `CALL` depth (guards against runaway procedure recursion).
     call_depth: std::sync::atomic::AtomicUsize,
@@ -132,6 +133,7 @@ impl Session {
             db,
             txn: Mutex::new(None),
             isolation: Mutex::new(Isolation::Snapshot),
+            database: Mutex::new("elyra".into()),
             strict_sql_mode: std::sync::atomic::AtomicBool::new(true),
             call_depth: std::sync::atomic::AtomicUsize::new(0),
             pending_triggers: Mutex::new(Vec::new()),
@@ -142,6 +144,14 @@ impl Session {
             row_count: std::sync::atomic::AtomicI64::new(-1),
             cancel: Arc::new(elyra_core::cancel::QueryCancel::new()),
         }
+    }
+
+    pub fn database(&self) -> String {
+        self.database.lock().unwrap().clone()
+    }
+
+    pub fn set_database(&self, database: &str) {
+        *self.database.lock().unwrap() = database.to_string();
     }
 
     /// Cancellation token for the statement running on this session. Cloned into
