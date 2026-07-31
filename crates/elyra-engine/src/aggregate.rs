@@ -340,6 +340,12 @@ fn ident_of(expr: &Expr) -> Option<String> {
     }
 }
 
+fn output_column_name(name: &str) -> String {
+    name.rsplit_once('.')
+        .map_or(name, |(_, column)| column)
+        .to_owned()
+}
+
 fn resolve_group_alias<'a>(
     expr: &'a Expr,
     schema: &Schema,
@@ -513,7 +519,7 @@ pub fn build_plan(
         if !contains_aggregate(expr) {
             if let Some(idx) = ident_of(expr).and_then(|n| col_index(schema, &n).ok()) {
                 out_cols.push(ColumnDef {
-                    name: alias.unwrap_or_else(|| schema.columns[idx].name.clone()),
+                    name: alias.unwrap_or_else(|| output_column_name(&schema.columns[idx].name)),
                     ty: schema.columns[idx].ty.clone(),
                     nullable: schema.columns[idx].nullable,
                     collation: ci,

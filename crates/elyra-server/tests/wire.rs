@@ -1041,27 +1041,29 @@ async fn correlated_filter_can_feed_join_aggregation() {
         .unwrap();
     assert_eq!(count, Some(2));
 
-    let grouped: Vec<(i64, String, i64)> = c
-        .exec(
-            "SELECT aggregate_records.item_id,
-                    aggregate_items.name AS item_name,
-                    COUNT(*) AS record_count
-             FROM aggregate_records
-             INNER JOIN aggregate_items
-                 ON aggregate_items.id = aggregate_records.item_id
-             WHERE EXISTS (
-                 SELECT * FROM aggregate_parents
-                 WHERE aggregate_records.parent_id = aggregate_parents.id
-                   AND scope_id = ?
-                   AND aggregate_parents.deleted_at IS NULL
-             )
-             AND aggregate_records.deleted_at IS NULL
-             GROUP BY aggregate_records.item_id, aggregate_items.name
-             ORDER BY aggregate_items.name",
-            (7,),
-        )
-        .await
-        .unwrap();
+    let grouped_sql = "SELECT aggregate_records.item_id,
+                aggregate_items.name AS item_name,
+                COUNT(*) AS record_count
+         FROM aggregate_records
+         INNER JOIN aggregate_items
+             ON aggregate_items.id = aggregate_records.item_id
+         WHERE EXISTS (
+             SELECT * FROM aggregate_parents
+             WHERE aggregate_records.parent_id = aggregate_parents.id
+               AND scope_id = ?
+               AND aggregate_parents.deleted_at IS NULL
+         )
+         AND aggregate_records.deleted_at IS NULL
+         GROUP BY aggregate_records.item_id, aggregate_items.name
+         ORDER BY aggregate_items.name";
+    let mut result = c.exec_iter(grouped_sql, (7,)).await.unwrap();
+    let columns = result.columns().unwrap();
+    let names = columns
+        .iter()
+        .map(|column| column.name_str().into_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["item_id", "item_name", "record_count"]);
+    let grouped: Vec<(i64, String, i64)> = result.collect().await.unwrap();
     assert_eq!(grouped, [(20, "Apple".into(), 1), (10, "Zebra".into(), 1)]);
 }
 
