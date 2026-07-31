@@ -2198,27 +2198,11 @@ async fn rebuild_indexes_for_column(db: &Session, def: &TableDef, column: usize)
         return Ok(());
     }
 
-    let mut deletes = Vec::new();
-    for index in &indexes {
-        for prefix in [
-            index::index_scan_prefix(&def.name, &index.name),
-            index::indexnull_scan_prefix(&def.name, &index.name),
-        ] {
-            let mut cursor = None;
-            loop {
-                let batch = db.scan_batch(prefix.clone(), cursor.clone(), 4096).await?;
-                if batch.is_empty() {
-                    break;
-                }
-                let is_last = batch.len() < 4096;
-                cursor = batch.last().map(|(key, _)| key.clone());
-                deletes.extend(batch.into_iter().map(|(key, _)| key));
-                if is_last {
-                    break;
-                }
-            }
-        }
-    }
+    let index_names = indexes
+        .iter()
+        .map(|index| index.name.as_str())
+        .collect::<Vec<_>>();
+    let deletes = collect_index_entry_keys(db, &def.name, &index_names).await?;
 
     let indexed_def = TableDef {
         indexes,
@@ -2435,11 +2419,28 @@ async fn alter_drop_column(db: &Session, def: &mut TableDef, name: &str) -> Resu
             "cannot drop a primary key column".into(),
         ));
     }
-    if def.indexes.iter().any(|i| i.cols.contains(&idx)) {
-        return Err(Error::Unsupported(
-            "cannot drop an indexed column; drop the index first".into(),
-        ));
+    if let Some(foreign_key) = def
+        .foreign_keys
+        .iter()
+        .find(|foreign_key| foreign_key.columns.contains(&idx))
+    {
+        return Err(Error::Unsupported(format!(
+            "cannot drop column `{name}`: needed in foreign key constraint `{}`",
+            foreign_key.name
+        )));
     }
+
+    let dropped_indexes = def
+        .indexes
+        .iter()
+        .filter(|index| index.cols.contains(&idx))
+        .cloned()
+        .collect::<Vec<_>>();
+    let dropped_index_names = dropped_indexes
+        .iter()
+        .map(|index| index.name.as_str())
+        .collect::<Vec<_>>();
+    let deletes = collect_index_entry_keys(db, &def.name, &dropped_index_names).await?;
     if idx < def.col_meta.len() {
         def.col_meta.remove(idx);
     }
@@ -2470,6 +2471,7 @@ async fn alter_drop_column(db: &Session, def: &mut TableDef, name: &str) -> Resu
         }
     }
     def.schema.columns.remove(idx);
+    def.indexes.retain(|index| !index.cols.contains(&idx));
     // Shift key/index column positions above the removed one.
     let shift = |c: &mut usize| {
         if *c > idx {
@@ -2483,9 +2485,8 @@ async fn alter_drop_column(db: &Session, def: &mut TableDef, name: &str) -> Resu
     for foreign_key in &mut def.foreign_keys {
         foreign_key.columns.iter_mut().for_each(shift);
     }
-    if !puts.is_empty() {
-        db.commit_write(puts, vec![]).await?;
-    }
+    puts.push(bump_wcount(db, &def.name).await?);
+    db.commit_write(puts, deletes).await?;
     Ok(())
 }
 
@@ -2772,25 +2773,7 @@ pub async fn rename_index(
     def.indexes[position].name = new_name.to_string();
     let renamed = def.indexes[position].clone();
 
-    let mut deletes = Vec::new();
-    for prefix in [
-        index::index_scan_prefix(table, old_name),
-        index::indexnull_scan_prefix(table, old_name),
-    ] {
-        let mut cursor = None;
-        loop {
-            let batch = db.scan_batch(prefix.clone(), cursor.clone(), 4096).await?;
-            if batch.is_empty() {
-                break;
-            }
-            let is_last = batch.len() < 4096;
-            cursor = batch.last().map(|(key, _)| key.clone());
-            deletes.extend(batch.into_iter().map(|(key, _)| key));
-            if is_last {
-                break;
-            }
-        }
-    }
+    let deletes = collect_index_entry_keys(db, table, &[old_name]).await?;
 
     let indexed_def = TableDef {
         indexes: vec![renamed],
@@ -2815,29 +2798,40 @@ pub async fn drop_index(db: &Session, table: &str, name: &str) -> Result<QueryRe
         .ok_or_else(|| Error::Catalog(format!("unknown index: {name}")))?;
     let removed = def.indexes.remove(position);
 
-    let mut deletes = Vec::new();
-    for prefix in [
-        index::index_scan_prefix(table, &removed.name),
-        index::indexnull_scan_prefix(table, &removed.name),
-    ] {
-        let mut cursor = None;
-        loop {
-            let batch = db.scan_batch(prefix.clone(), cursor.clone(), 4096).await?;
-            if batch.is_empty() {
-                break;
-            }
-            let is_last = batch.len() < 4096;
-            cursor = batch.last().map(|(key, _)| key.clone());
-            deletes.extend(batch.into_iter().map(|(key, _)| key));
-            if is_last {
-                break;
-            }
-        }
-    }
+    let deletes = collect_index_entry_keys(db, table, &[removed.name.as_str()]).await?;
 
     db.commit_write(vec![(catalog_key(table), def.encode()?)], deletes)
         .await?;
     Ok(QueryResult::Affected(0))
+}
+
+async fn collect_index_entry_keys(
+    db: &Session,
+    table: &str,
+    index_names: &[&str],
+) -> Result<Vec<Vec<u8>>> {
+    let mut keys = Vec::new();
+    for index_name in index_names {
+        for prefix in [
+            index::index_scan_prefix(table, index_name),
+            index::indexnull_scan_prefix(table, index_name),
+        ] {
+            let mut cursor = None;
+            loop {
+                let batch = db.scan_batch(prefix.clone(), cursor.clone(), 4096).await?;
+                if batch.is_empty() {
+                    break;
+                }
+                let is_last = batch.len() < 4096;
+                cursor = batch.last().map(|(key, _)| key.clone());
+                keys.extend(batch.into_iter().map(|(key, _)| key));
+                if is_last {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(keys)
 }
 
 /// Remove a named foreign-key constraint without removing its supporting index.

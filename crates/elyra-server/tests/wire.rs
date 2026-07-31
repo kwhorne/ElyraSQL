@@ -299,6 +299,53 @@ async fn dropping_a_column_preserves_foreign_key_positions() {
 }
 
 #[tokio::test]
+async fn dropping_an_indexed_column_removes_dependent_indexes() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop(
+        "CREATE TABLE indexed_columns (
+            id INT PRIMARY KEY,
+            obsolete VARCHAR(20),
+            retained INT,
+            INDEX idx_obsolete (obsolete),
+            UNIQUE INDEX uniq_obsolete_retained (obsolete, retained),
+            INDEX idx_retained (retained)
+        )",
+    )
+    .await
+    .unwrap();
+    c.query_drop(
+        "INSERT INTO indexed_columns VALUES
+            (1, 'first', 10),
+            (2, 'second', 20)",
+    )
+    .await
+    .unwrap();
+
+    c.query_drop("ALTER TABLE indexed_columns DROP COLUMN obsolete")
+        .await
+        .unwrap();
+
+    let indexes: Vec<String> = c
+        .query("SHOW INDEX FROM indexed_columns")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row: mysql_async::Row| row.get("Key_name").unwrap())
+        .collect();
+    assert!(!indexes.iter().any(|name| name == "idx_obsolete"));
+    assert!(!indexes.iter().any(|name| name == "uniq_obsolete_retained"));
+    assert!(indexes.iter().any(|name| name == "idx_retained"));
+
+    let rows: Vec<(i64, i64)> = c
+        .query("SELECT id, retained FROM indexed_columns ORDER BY retained")
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![(1, 10), (2, 20)]);
+}
+
+#[tokio::test]
 async fn update_order_by_limit_changes_only_the_ordered_rows() {
     let srv = TestServer::start().await;
     let mut c = srv.conn().await;
