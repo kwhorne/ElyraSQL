@@ -6225,7 +6225,9 @@ async fn join_correlated_select(
             &out_schema,
             out_rows,
         )?;
-        order_output_rows(&mut out_rows, &out_schema, &order_exprs)?;
+        let output_order =
+            resolve_output_order_expressions(&order_exprs, &select.projection, &out_schema);
+        order_output_rows(&mut out_rows, &out_schema, &output_order)?;
         apply_offset_limit(&mut out_rows, offset, limit);
         return Ok(QueryResult::Rows(RowStream::literal(out_schema, out_rows)));
     }
@@ -9951,6 +9953,34 @@ fn resolve_order_aliases(
                 }
             }
             (e.clone(), *asc)
+        })
+        .collect()
+}
+
+fn resolve_output_order_expressions(
+    order: &[(Expr, bool)],
+    projection: &[sqlparser::ast::SelectItem],
+    output_schema: &Schema,
+) -> Vec<(Expr, bool)> {
+    use sqlparser::ast::{Ident, SelectItem};
+
+    order
+        .iter()
+        .map(|(order_expr, ascending)| {
+            let output_name = projection.iter().enumerate().find_map(|(index, item)| {
+                let projected_expr = match item {
+                    SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => expr,
+                    _ => return None,
+                };
+                (projected_expr == order_expr)
+                    .then(|| output_schema.columns.get(index))
+                    .flatten()
+                    .map(|column| column.name.clone())
+            });
+            match output_name {
+                Some(name) => (Expr::Identifier(Ident::new(name)), *ascending),
+                None => (order_expr.clone(), *ascending),
+            }
         })
         .collect()
 }

@@ -1001,13 +1001,18 @@ async fn correlated_filter_can_feed_join_aggregation() {
     )
     .await
     .unwrap();
-    c.query_drop("CREATE TABLE aggregate_items (id INT PRIMARY KEY)")
-        .await
-        .unwrap();
+    c.query_drop(
+        "CREATE TABLE aggregate_items (
+            id INT PRIMARY KEY,
+            name VARCHAR(16)
+        )",
+    )
+    .await
+    .unwrap();
     c.query_drop("INSERT INTO aggregate_parents VALUES (1, 7, NULL), (2, 8, NULL)")
         .await
         .unwrap();
-    c.query_drop("INSERT INTO aggregate_items VALUES (10), (20)")
+    c.query_drop("INSERT INTO aggregate_items VALUES (10, 'Zebra'), (20, 'Apple')")
         .await
         .unwrap();
     c.query_drop(
@@ -1035,6 +1040,29 @@ async fn correlated_filter_can_feed_join_aggregation() {
         .await
         .unwrap();
     assert_eq!(count, Some(2));
+
+    let grouped: Vec<(i64, String, i64)> = c
+        .exec(
+            "SELECT aggregate_records.item_id,
+                    aggregate_items.name AS item_name,
+                    COUNT(*) AS record_count
+             FROM aggregate_records
+             INNER JOIN aggregate_items
+                 ON aggregate_items.id = aggregate_records.item_id
+             WHERE EXISTS (
+                 SELECT * FROM aggregate_parents
+                 WHERE aggregate_records.parent_id = aggregate_parents.id
+                   AND scope_id = ?
+                   AND aggregate_parents.deleted_at IS NULL
+             )
+             AND aggregate_records.deleted_at IS NULL
+             GROUP BY aggregate_records.item_id, aggregate_items.name
+             ORDER BY aggregate_items.name",
+            (7,),
+        )
+        .await
+        .unwrap();
+    assert_eq!(grouped, [(20, "Apple".into(), 1), (10, "Zebra".into(), 1)]);
 }
 
 #[tokio::test]
