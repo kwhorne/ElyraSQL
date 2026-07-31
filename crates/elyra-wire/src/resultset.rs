@@ -98,7 +98,14 @@ impl<'a, W: AsyncWrite + Unpin + 'a> StatementMetaWriter<'a, W> {
 
 enum Finalizer {
     Ok(OkResponse),
-    Eof,
+    Eof(StatusFlags),
+}
+
+fn add_status_flags(finalizer: &mut Finalizer, status_flags: StatusFlags) {
+    match finalizer {
+        Finalizer::Ok(response) => response.status_flags |= status_flags,
+        Finalizer::Eof(response_flags) => *response_flags |= status_flags,
+    }
 }
 
 /// Convenience type for providing query results to clients.
@@ -145,10 +152,14 @@ impl<'a, W: AsyncWrite + Unpin> QueryResultWriter<'a, W> {
         }
         match self.last_end.take() {
             None => Ok(()),
-            Some(Finalizer::Ok(ok_packet)) => {
+            Some(Finalizer::Ok(mut ok_packet)) => {
+                ok_packet.status_flags |= status;
                 writers::write_ok_packet(self.writer, self.client_capabilities, ok_packet).await
             }
-            Some(Finalizer::Eof) => writers::write_eof_packet(self.writer, status).await,
+            Some(Finalizer::Eof(mut response_flags)) => {
+                response_flags |= status;
+                writers::write_eof_packet(self.writer, response_flags).await
+            }
         }
     }
 
@@ -398,7 +409,7 @@ impl<'a, W: AsyncWrite + Unpin + 'a> RowWriter<'a, W> {
                 self.result.as_mut().unwrap().last_end = Some(Finalizer::Ok(resp));
             } else {
                 // we wrote out at least one row
-                self.result.as_mut().unwrap().last_end = Some(Finalizer::Eof);
+                self.result.as_mut().unwrap().last_end = Some(Finalizer::Eof(StatusFlags::empty()));
             }
         }
 
@@ -408,6 +419,16 @@ impl<'a, W: AsyncWrite + Unpin + 'a> RowWriter<'a, W> {
     /// Indicate to the client that no more rows are coming.
     pub async fn finish(self) -> io::Result<()> {
         self.finish_with_info("").await
+    }
+
+    /// Finish the result set with connection status flags on its terminating
+    /// EOF/OK packet.
+    pub async fn finish_with_status(mut self, status_flags: StatusFlags) -> io::Result<()> {
+        self.finish_inner("", true).await?;
+        if let Some(finalizer) = self.result.as_mut().unwrap().last_end.as_mut() {
+            add_status_flags(finalizer, status_flags);
+        }
+        self.result.take().unwrap().no_more_results().await
     }
 
     /// End this resultset response, and indicate to the client that no more rows are coming.
@@ -443,5 +464,30 @@ impl<'a, W: AsyncWrite + Unpin + 'a> RowWriter<'a, W> {
         self.finish_inner("", false).await?;
 
         self.result.take().unwrap().error(kind, msg).await
+    }
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::*;
+
+    #[test]
+    fn result_finalizers_preserve_connection_status() {
+        let status = StatusFlags::SERVER_STATUS_IN_TRANS;
+
+        let mut eof = Finalizer::Eof(StatusFlags::empty());
+        add_status_flags(&mut eof, status);
+        assert!(matches!(
+            eof,
+            Finalizer::Eof(flags) if flags.contains(StatusFlags::SERVER_STATUS_IN_TRANS)
+        ));
+
+        let mut ok = Finalizer::Ok(OkResponse::default());
+        add_status_flags(&mut ok, status);
+        assert!(matches!(
+            ok,
+            Finalizer::Ok(response)
+                if response.status_flags.contains(StatusFlags::SERVER_STATUS_IN_TRANS)
+        ));
     }
 }

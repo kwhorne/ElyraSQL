@@ -647,7 +647,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for ElyraShim {
         results: QueryResultWriter<'a, W>,
     ) -> Result<(), Self::Error> {
         if let Some((cols, rows)) = self.observ_result(query) {
-            return write_string_rows(results, &cols, rows).await;
+            return write_string_rows(results, &cols, rows, self.session.in_txn()).await;
         }
         let privilege = self.privilege();
         let user = self.user();
@@ -680,6 +680,7 @@ async fn write_string_rows<W: AsyncWrite + Send + Unpin>(
     results: QueryResultWriter<'_, W>,
     col_names: &[&str],
     rows: Vec<Vec<String>>,
+    in_trans: bool,
 ) -> Result<(), std::io::Error> {
     let cols: Vec<Column> = col_names
         .iter()
@@ -697,12 +698,20 @@ async fn write_string_rows<W: AsyncWrite + Send + Unpin>(
         }
         rw.end_row().await?;
     }
-    rw.finish().await
+    rw.finish_with_status(transaction_status(in_trans)).await
 }
 
 /// Rows pulled from storage per batch while streaming a result set. Bounds
 /// per-connection memory regardless of table size.
 const STREAM_BATCH: usize = 1024;
+
+fn transaction_status(in_trans: bool) -> StatusFlags {
+    if in_trans {
+        StatusFlags::SERVER_STATUS_IN_TRANS
+    } else {
+        StatusFlags::empty()
+    }
+}
 
 async fn write_outcomes<W: AsyncWrite + Send + Unpin>(
     mut outcomes: Vec<QueryResult>,
@@ -711,11 +720,7 @@ async fn write_outcomes<W: AsyncWrite + Send + Unpin>(
 ) -> Result<(), std::io::Error> {
     // Report an open transaction in the OK status flags so clients can track
     // transaction state correctly.
-    let status_flags = if in_trans {
-        StatusFlags::SERVER_STATUS_IN_TRANS
-    } else {
-        StatusFlags::empty()
-    };
+    let status_flags = transaction_status(in_trans);
     // The text protocol returns a single result per query in this build.
     match outcomes.drain(..).next() {
         Some(QueryResult::Rows(mut stream)) => {
@@ -755,7 +760,7 @@ async fn write_outcomes<W: AsyncWrite + Send + Unpin>(
                     rw.end_row().await?;
                 }
             }
-            rw.finish().await
+            rw.finish_with_status(status_flags).await
         }
         Some(QueryResult::Affected(n)) => {
             results
