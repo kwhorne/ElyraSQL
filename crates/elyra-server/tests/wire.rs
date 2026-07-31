@@ -346,6 +346,38 @@ async fn dropping_an_indexed_column_removes_dependent_indexes() {
 }
 
 #[tokio::test]
+async fn adding_not_null_columns_backfills_mysql_implicit_values() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop("CREATE TABLE alter_defaults (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO alter_defaults VALUES (1)")
+        .await
+        .unwrap();
+
+    c.query_drop("ALTER TABLE alter_defaults ADD label VARCHAR(20) NOT NULL")
+        .await
+        .unwrap();
+    c.query_drop("ALTER TABLE alter_defaults ADD attempts INT NOT NULL")
+        .await
+        .unwrap();
+
+    let row: (String, i64) = c
+        .query_first("SELECT label, attempts FROM alter_defaults WHERE id = 1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row, (String::new(), 0));
+
+    assert!(c
+        .query_drop("INSERT INTO alter_defaults (id) VALUES (2)")
+        .await
+        .is_err());
+}
+
+#[tokio::test]
 async fn update_order_by_limit_changes_only_the_ordered_rows() {
     let srv = TestServer::start().await;
     let mut c = srv.conn().await;

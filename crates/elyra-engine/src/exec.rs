@@ -2314,16 +2314,15 @@ async fn alter_add_column(
             "ADD COLUMN AUTO_INCREMENT currently requires PRIMARY KEY".into(),
         ));
     }
-    let default = options
+    let explicit_default = options
         .iter()
         .find_map(|option| match option {
             ColumnOption::Default(expression) => Some(expression),
             _ => None,
         })
         .map(|expression| coerce(eval_expr(expression)?, &ty, &col.name.value))
-        .transpose()?
-        .unwrap_or(Value::Null);
-    if !nullable && default.is_null() && !meta.auto_increment {
+        .transpose()?;
+    if !nullable && explicit_default.as_ref().is_some_and(Value::is_null) && !meta.auto_increment {
         return Err(Error::Query(format!(
             "ADD COLUMN '{}' is NOT NULL and needs a DEFAULT",
             col.name.value
@@ -2332,6 +2331,16 @@ async fn alter_add_column(
 
     let old_def = def.clone();
     let rows = collect_matches(db, def, None, None).await?;
+    let default = match explicit_default {
+        Some(default) => default,
+        None if nullable || meta.auto_increment || rows.is_empty() => Value::Null,
+        None => mysql_implicit_alter_value(&ty).ok_or_else(|| {
+            Error::Query(format!(
+                "ADD COLUMN '{}' cannot backfill existing rows without a DEFAULT",
+                col.name.value
+            ))
+        })?,
+    };
     ensure_col_meta(def);
     let new_column = def.schema.columns.len();
     def.schema.columns.push(ColumnDef {
@@ -2405,6 +2414,20 @@ async fn alter_add_column(
     puts.push(bump_wcount(db, &def.name).await?);
     db.commit_write(puts, deletes).await?;
     Ok(())
+}
+
+fn mysql_implicit_alter_value(ty: &ColumnType) -> Option<Value> {
+    match ty {
+        ColumnType::Bool => Some(Value::Bool(false)),
+        ColumnType::Int => Some(Value::Int(0)),
+        ColumnType::UInt => Some(Value::UInt(0)),
+        ColumnType::Float => Some(Value::Float(0.0)),
+        ColumnType::Text => Some(Value::Text(String::new())),
+        ColumnType::Bytes => Some(Value::Bytes(Vec::new())),
+        ColumnType::Decimal(_, scale) => Some(Value::Decimal(0, *scale)),
+        ColumnType::Time => Some(Value::Time(0)),
+        ColumnType::Vector(_) | ColumnType::Date | ColumnType::DateTime | ColumnType::Json => None,
+    }
 }
 
 async fn alter_drop_column(db: &Session, def: &mut TableDef, name: &str) -> Result<()> {
