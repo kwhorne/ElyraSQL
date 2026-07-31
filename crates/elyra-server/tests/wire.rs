@@ -195,6 +195,65 @@ async fn mysql_index_and_foreign_key_drop_forms() {
 }
 
 #[tokio::test]
+async fn multi_object_drop_processes_every_name() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    for name in ["drop_first", "drop_second", "drop_third"] {
+        c.query_drop(format!("CREATE TABLE {name} (id INT PRIMARY KEY)"))
+            .await
+            .unwrap();
+    }
+    c.query_drop("DROP TABLE drop_first, drop_second, drop_third")
+        .await
+        .unwrap();
+    let remaining: i64 = c
+        .query_first(
+            "SELECT COUNT(*) FROM information_schema.tables \
+             WHERE table_name IN ('drop_first', 'drop_second', 'drop_third')",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(remaining, 0);
+
+    c.query_drop("CREATE TABLE preserved_first (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE preserved_second (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    assert!(c
+        .query_drop("DROP TABLE preserved_first, missing_table, preserved_second")
+        .await
+        .is_err());
+    c.query_drop("INSERT INTO preserved_first VALUES (1)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO preserved_second VALUES (1)")
+        .await
+        .unwrap();
+    c.query_drop("DROP TABLE IF EXISTS preserved_first, missing_table, preserved_second")
+        .await
+        .unwrap();
+
+    c.query_drop("CREATE TABLE view_source (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop("CREATE VIEW first_view AS SELECT id FROM view_source")
+        .await
+        .unwrap();
+    c.query_drop("CREATE VIEW second_view AS SELECT id FROM view_source")
+        .await
+        .unwrap();
+    c.query_drop("DROP VIEW first_view, second_view")
+        .await
+        .unwrap();
+    assert!(c.query_drop("SELECT * FROM first_view").await.is_err());
+    assert!(c.query_drop("SELECT * FROM second_view").await.is_err());
+}
+
+#[tokio::test]
 async fn dropping_a_column_preserves_foreign_key_positions() {
     let srv = TestServer::start().await;
     let mut c = srv.conn().await;
@@ -718,6 +777,30 @@ async fn qualified_wildcard() {
         .await
         .unwrap();
 
+    let result = c
+        .query_iter("SELECT qa.* FROM qa JOIN qb ON qb.a_id = qa.id ORDER BY qa.id")
+        .await
+        .unwrap();
+    let names: Vec<String> = result
+        .columns_ref()
+        .iter()
+        .map(|column| column.name_str().into_owned())
+        .collect();
+    assert_eq!(names, ["id", "name"]);
+    result.drop_result().await.unwrap();
+
+    let result = c
+        .query_iter("SELECT * FROM qa JOIN qb ON qb.a_id = qa.id ORDER BY qa.id")
+        .await
+        .unwrap();
+    let names: Vec<String> = result
+        .columns_ref()
+        .iter()
+        .map(|column| column.name_str().into_owned())
+        .collect();
+    assert_eq!(names, ["id", "name", "id", "a_id", "label"]);
+    result.drop_result().await.unwrap();
+
     // a.* -> only qa's two columns
     let rows: Vec<(i64, String)> = c
         .query("SELECT qa.* FROM qa JOIN qb ON qb.a_id = qa.id ORDER BY qa.id")
@@ -731,6 +814,201 @@ async fn qualified_wildcard() {
         .await
         .unwrap();
     assert_eq!(rows, vec![(1, 1, "post".into())]);
+}
+
+#[tokio::test]
+async fn correlated_exists_preserves_inner_bare_columns() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop("CREATE TABLE lists (id INT PRIMARY KEY, owner_id INT)")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE levels (id INT PRIMARY KEY, list_id INT)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO lists VALUES (10, 1), (20, 2)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO levels VALUES (20, 10), (30, 20)")
+        .await
+        .unwrap();
+
+    let rows: Vec<i64> = c
+        .query(
+            "SELECT id FROM lists WHERE owner_id = 1 AND EXISTS (\
+             SELECT * FROM levels WHERE lists.id = levels.list_id AND id = 20)",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows, [10]);
+}
+
+#[tokio::test]
+async fn nested_correlation_resolves_missing_inner_columns_from_outer_scope() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop("CREATE TABLE contacts (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop(
+        "CREATE TABLE items (\
+         id INT PRIMARY KEY, contact_id INT, kind VARCHAR(8), target_id INT)",
+    )
+    .await
+    .unwrap();
+    c.query_drop("CREATE TABLE targets (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO contacts VALUES (1), (2)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO items VALUES (10, 1, 'match', 100), (20, 2, 'other', 200)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO targets VALUES (100), (200)")
+        .await
+        .unwrap();
+
+    let rows: Vec<i64> = c
+        .query(
+            "SELECT id FROM contacts WHERE EXISTS (\
+             SELECT * FROM items WHERE contacts.id = items.contact_id AND EXISTS (\
+             SELECT * FROM targets WHERE items.target_id = targets.id \
+             AND kind = 'match' AND target_id = 100))",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows, [1]);
+}
+
+#[tokio::test]
+async fn correlated_null_equality_does_not_enter_index_key_encoding() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop("CREATE TABLE parents (id INT PRIMARY KEY, child_id INT)")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE children (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO parents VALUES (1, NULL), (2, 20)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO children VALUES (20)")
+        .await
+        .unwrap();
+
+    let rows: Vec<i64> = c
+        .query(
+            "SELECT id FROM parents WHERE EXISTS (\
+             SELECT * FROM children WHERE parents.child_id = children.id)",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows, [2]);
+}
+
+#[tokio::test]
+async fn correlated_scalar_subquery_alias_can_order_rows() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop("CREATE TABLE records (id INT PRIMARY KEY, active INT)")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE record_logs (id INT PRIMARY KEY, record_id INT)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO records VALUES (1, 1), (2, 1), (3, 0)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO record_logs VALUES (10, 1), (11, 1), (12, 2)")
+        .await
+        .unwrap();
+
+    let rows: Vec<(i64, i64)> = c
+        .query(
+            "SELECT records.id, (SELECT COUNT(*) FROM record_logs \
+             WHERE record_logs.record_id = records.id) AS log_count \
+             FROM records WHERE active = 1 ORDER BY log_count, records.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows, [(2, 1), (1, 2)]);
+}
+
+#[tokio::test]
+async fn prepared_correlated_projection_preserves_unsigned_metadata() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop("CREATE TABLE count_parents (id BIGINT UNSIGNED PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop(
+        "CREATE TABLE count_children (
+            id BIGINT UNSIGNED PRIMARY KEY,
+            parent_id BIGINT UNSIGNED,
+            deleted_at DATETIME NULL
+        )",
+    )
+    .await
+    .unwrap();
+    c.query_drop("INSERT INTO count_parents VALUES (396208)")
+        .await
+        .unwrap();
+
+    let row: Option<(u64, i64)> = c
+        .exec_first(
+            "SELECT id,
+                    (SELECT COUNT(*)
+                     FROM count_children
+                     WHERE count_parents.id = count_children.parent_id
+                       AND count_children.deleted_at IS NULL) AS child_count
+             FROM count_parents
+             WHERE count_parents.id IN (?)",
+            (396208_u64,),
+        )
+        .await
+        .unwrap();
+    assert_eq!(row, Some((396208, 0)));
+}
+
+#[tokio::test]
+async fn joined_correlated_projection_expands_qualified_wildcard() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop("CREATE TABLE parents (id INT PRIMARY KEY, label VARCHAR(8))")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE links (parent_id INT)")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE children (id INT PRIMARY KEY, parent_id INT)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO parents VALUES (1, 'one')")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO links VALUES (1)").await.unwrap();
+    c.query_drop("INSERT INTO children VALUES (10, 1), (11, 1)")
+        .await
+        .unwrap();
+
+    let rows: Vec<(i64, String, i64, i64)> = c
+        .query(
+            "SELECT parents.*, (SELECT COUNT(*) FROM children \
+             WHERE children.parent_id = parents.id) AS child_count, \
+             links.parent_id AS pivot_id FROM parents \
+             INNER JOIN links ON parents.id = links.parent_id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows, [(1, "one".into(), 2, 1)]);
 }
 
 /// Join followed by GROUP BY over an indexed partner -- exercises the streaming
@@ -2712,6 +2990,21 @@ async fn group_by_expression() {
         vec![
             ("2026-07-17 10:00:00".into(), 60, 6),
             ("2026-07-17 10:01:00".into(), 60, 6),
+        ]
+    );
+
+    let rows: Vec<(String, i64)> = c
+        .query(
+            "SELECT DATE_FORMAT(ts, '%Y-%m-%d %H:%i:00') AS bucket, COUNT(*) \
+             FROM logs GROUP BY bucket ORDER BY bucket",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            ("2026-07-17 10:00:00".into(), 60),
+            ("2026-07-17 10:01:00".into(), 60),
         ]
     );
 

@@ -340,6 +340,37 @@ fn ident_of(expr: &Expr) -> Option<String> {
     }
 }
 
+fn resolve_group_alias<'a>(
+    expr: &'a Expr,
+    schema: &Schema,
+    projection: &'a [SelectItem],
+) -> &'a Expr {
+    let Expr::Identifier(id) = expr else {
+        return expr;
+    };
+    let source_column_exists = schema.columns.iter().any(|column| {
+        column.name.eq_ignore_ascii_case(&id.value)
+            || column
+                .name
+                .split_once('.')
+                .is_some_and(|(_, name)| name.eq_ignore_ascii_case(&id.value))
+    });
+    if source_column_exists {
+        return expr;
+    }
+    projection
+        .iter()
+        .find_map(|item| match item {
+            SelectItem::ExprWithAlias { expr, alias }
+                if alias.value.eq_ignore_ascii_case(&id.value) =>
+            {
+                Some(expr)
+            }
+            _ => None,
+        })
+        .unwrap_or(expr)
+}
+
 /// Extract a GROUP_CONCAT `SEPARATOR '...'` clause, if present.
 /// The optional top-N cap in `FACET(col, n)` (its second argument, a positive
 /// integer literal). `None` = return every facet value.
@@ -449,6 +480,7 @@ pub fn build_plan(
     // group's sample row (all rows in a group share the value).
     let mut group_cols = Vec::new();
     for g in group_by {
+        let g = resolve_group_alias(g, schema, projection);
         match ident_of(g).and_then(|n| col_index(schema, &n).ok()) {
             Some(idx) => group_cols.push(idx),
             None => {

@@ -1513,12 +1513,24 @@ impl Engine {
                 if_exists,
                 ..
             } => {
-                let name = names
-                    .first()
-                    .and_then(|n| n.0.last())
-                    .map(|i| i.value.clone())
-                    .ok_or_else(|| Error::Catalog("empty table name".into()))?;
-                exec::drop_table(sess, &name, if_exists).await
+                let table_names = names
+                    .iter()
+                    .map(|name| {
+                        object_name_last(name)
+                            .ok_or_else(|| Error::Catalog("empty table name".into()))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                if !if_exists {
+                    for name in &table_names {
+                        if !catalog::exists(sess, name).await? {
+                            return Err(Error::Catalog(format!("no such table: {name}")));
+                        }
+                    }
+                }
+                for name in table_names {
+                    exec::drop_table(sess, &name, true).await?;
+                }
+                Ok(QueryResult::Affected(0))
             }
             Statement::Drop {
                 object_type: sqlparser::ast::ObjectType::View,
@@ -1526,12 +1538,24 @@ impl Engine {
                 if_exists,
                 ..
             } => {
-                let name = names
-                    .first()
-                    .and_then(|n| n.0.last())
-                    .map(|i| i.value.clone())
-                    .ok_or_else(|| Error::Catalog("empty view name".into()))?;
-                exec::drop_view(sess, &name, if_exists).await
+                let view_names = names
+                    .iter()
+                    .map(|name| {
+                        object_name_last(name)
+                            .ok_or_else(|| Error::Catalog("empty view name".into()))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                if !if_exists {
+                    for name in &view_names {
+                        if catalog::load_view(sess, name).await?.is_none() {
+                            return Err(Error::Catalog(format!("no such view: {name}")));
+                        }
+                    }
+                }
+                for name in view_names {
+                    exec::drop_view(sess, &name, true).await?;
+                }
+                Ok(QueryResult::Affected(0))
             }
             Statement::StartTransaction { .. } => {
                 sess.begin()?;

@@ -6207,7 +6207,7 @@ async fn join_correlated_select(
     for row in rows {
         if let Some(f) = &raw_filter {
             let bound = bind_row(f, &schema, &row);
-            let resolved = resolve_subqueries(db, vindex, bound).await?;
+            let resolved = resolve_subqueries_with_outer(db, vindex, bound, &schema, &row).await?;
             if !predicate::matches(&resolved, &schema, &row)? {
                 continue;
             }
@@ -6217,7 +6217,15 @@ async fn join_correlated_select(
 
     let resolved_order = resolve_order_aliases(&order_exprs, &select.projection, &schema);
     if !resolved_order.is_empty() {
-        sort_full_rows(&mut kept, &schema, &resolved_order, &db.cancel_token())?;
+        sort_rows_with_subqueries(
+            db,
+            vindex,
+            &mut kept,
+            &schema,
+            &resolved_order,
+            |expr, row| bind_row(expr, &schema, row),
+        )
+        .await?;
     }
     apply_offset_limit(&mut kept, offset, limit);
 
@@ -6227,48 +6235,94 @@ async fn join_correlated_select(
         return Ok(QueryResult::Rows(RowStream::literal(osch, out)));
     }
 
-    // Per-row projection with correlated SELECT-list subqueries.
+    // Build a projection plan once so wildcard expansion does not repeat for
+    // every joined row.
     use sqlparser::ast::SelectItem;
+    enum Projection<'a> {
+        Column(usize),
+        Expr(&'a Expr),
+    }
+
+    let mut projection = Vec::new();
+    let mut outcols = Vec::new();
+    let mut inferred = Vec::new();
+    for item in &select.projection {
+        match item {
+            SelectItem::Wildcard(_) => {
+                for (index, column) in schema.columns.iter().enumerate() {
+                    projection.push(Projection::Column(index));
+                    let mut column = column.clone();
+                    column.name = output_column_name(&column.name).to_owned();
+                    outcols.push(column);
+                }
+            }
+            SelectItem::QualifiedWildcard(object, _) => {
+                let qualifier = object
+                    .0
+                    .last()
+                    .map(|identifier| identifier.value.as_str())
+                    .unwrap_or_default();
+                let before = projection.len();
+                for (index, column) in schema.columns.iter().enumerate() {
+                    if let Some((column_qualifier, name)) = column.name.split_once('.') {
+                        if column_qualifier.eq_ignore_ascii_case(qualifier) {
+                            projection.push(Projection::Column(index));
+                            let mut column = column.clone();
+                            column.name = name.to_owned();
+                            outcols.push(column);
+                        }
+                    }
+                }
+                if projection.len() == before {
+                    return Err(Error::Unsupported(format!(
+                        "qualified wildcard {object}.* matched no relation"
+                    )));
+                }
+            }
+            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                let name = match item {
+                    SelectItem::ExprWithAlias { alias, .. } => alias.value.clone(),
+                    SelectItem::UnnamedExpr(expr) => ident_name(expr)
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| expr.to_string()),
+                    _ => unreachable!(),
+                };
+                inferred.push(projection.len());
+                projection.push(Projection::Expr(expr));
+                outcols.push(ColumnDef {
+                    name,
+                    ty: ColumnType::Text,
+                    nullable: true,
+                    collation: elyra_core::Collation::Ci,
+                });
+            }
+        }
+    }
+
     let mut out_rows: Vec<Vec<Value>> = Vec::with_capacity(kept.len());
     for row in &kept {
-        let mut vals = Vec::with_capacity(select.projection.len());
-        for item in &select.projection {
-            let expr = match item {
-                SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => e,
-                other => {
-                    return Err(Error::Unsupported(format!(
-                        "projection item not supported with correlated subquery: {other}"
-                    )))
+        let mut vals = Vec::with_capacity(projection.len());
+        for item in &projection {
+            match item {
+                Projection::Column(index) => vals.push(row[*index].clone()),
+                Projection::Expr(expr) => {
+                    let bound = bind_row(expr, &schema, row);
+                    let resolved =
+                        resolve_subqueries_with_outer(db, vindex, bound, &schema, row).await?;
+                    vals.push(predicate::eval_row(&resolved, &schema, row)?);
                 }
-            };
-            let bound = bind_row(expr, &schema, row);
-            let resolved = resolve_subqueries(db, vindex, bound).await?;
-            vals.push(predicate::eval_row(&resolved, &schema, row)?);
+            }
         }
         out_rows.push(vals);
     }
 
-    let mut outcols = Vec::with_capacity(select.projection.len());
-    for (ci, item) in select.projection.iter().enumerate() {
-        let name = match item {
-            SelectItem::ExprWithAlias { alias, .. } => alias.value.clone(),
-            SelectItem::UnnamedExpr(e) => ident_name(e)
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| e.to_string()),
-            _ => format!("col{ci}"),
-        };
-        let ty = out_rows
+    for index in inferred {
+        outcols[index].ty = out_rows
             .iter()
-            .map(|r| &r[ci])
+            .map(|row| &row[index])
             .find(|v| !v.is_null())
             .map(infer_val)
             .unwrap_or(ColumnType::Text);
-        outcols.push(ColumnDef {
-            name,
-            ty,
-            nullable: true,
-            collation: elyra_core::Collation::Ci,
-        });
     }
     Ok(QueryResult::Rows(RowStream::literal(
         Schema::new(outcols),
@@ -8089,8 +8143,8 @@ fn eq_col_literal(def: &TableDef, filter: Option<&Expr>) -> Result<Option<(usize
     // the stored entries (e.g. a DATE column vs a '2024-01-01' text literal).
     let col = &def.schema.columns[idx];
     match coerce(eval_expr(lit_expr)?, &col.ty, &col.name) {
-        Ok(v) => Ok(Some((idx, v))),
-        Err(_) => Ok(None),
+        Ok(v) if !v.is_null() => Ok(Some((idx, v))),
+        Ok(_) | Err(_) => Ok(None),
     }
 }
 
@@ -9061,7 +9115,8 @@ async fn mutation_matches(
         let mut out = Vec::new();
         for (key, row) in all {
             let bound = bind_outer(f, qualifier, &def.schema, &row);
-            let resolved = resolve_subqueries(db, vindex, bound).await?;
+            let resolved =
+                resolve_subqueries_with_outer(db, vindex, bound, &def.schema, &row).await?;
             if predicate::matches(&resolved, &def.schema, &row)? {
                 out.push((key, row));
                 if let Some(l) = limit {
@@ -9915,7 +9970,7 @@ fn project_exprs(
         match item {
             SelectItem::Wildcard(_) => {
                 for (i, c) in schema.columns.iter().enumerate() {
-                    names.push(c.name.clone());
+                    names.push(output_column_name(&c.name).to_owned());
                     projs.push(Proj::Col(i));
                 }
             }
@@ -9925,9 +9980,9 @@ fn project_exprs(
                 let qual = obj.0.last().map(|i| i.value.clone()).unwrap_or_default();
                 let mut matched = false;
                 for (i, c) in schema.columns.iter().enumerate() {
-                    if let Some((q, _)) = c.name.split_once('.') {
+                    if let Some((q, name)) = c.name.split_once('.') {
                         if q.eq_ignore_ascii_case(&qual) {
-                            names.push(c.name.clone());
+                            names.push(name.to_owned());
                             projs.push(Proj::Col(i));
                             matched = true;
                         }
@@ -10004,6 +10059,10 @@ fn project_exprs(
     Ok((Schema::new(cols), out_rows))
 }
 
+fn output_column_name(name: &str) -> &str {
+    name.split_once('.').map_or(name, |(_, column)| column)
+}
+
 /// The (qualified) name of a plain column reference, if `e` is one.
 fn col_ref_name(e: &Expr) -> Option<String> {
     match e {
@@ -10023,6 +10082,7 @@ fn infer_val(v: &Value) -> ColumnType {
     match v {
         Value::Bool(_) => ColumnType::Bool,
         Value::Int(_) => ColumnType::Int,
+        Value::UInt(_) => ColumnType::UInt,
         Value::Float(_) => ColumnType::Float,
         Value::Bytes(_) => ColumnType::Bytes,
         Value::Vector(x) => ColumnType::Vector(x.len() as u32),
@@ -11466,7 +11526,7 @@ async fn correlated_select(
 
     for row in all {
         let bound = bind_outer(corr_filter, outer, &def.schema, &row);
-        let resolved = resolve_subqueries(db, vindex, bound).await?;
+        let resolved = resolve_subqueries_with_outer(db, vindex, bound, &def.schema, &row).await?;
         if predicate::matches(&resolved, &def.schema, &row)? {
             matched.push(row);
         }
@@ -11482,7 +11542,15 @@ async fn correlated_select(
 
     let resolved = resolve_order_aliases(order_exprs, &select.projection, &def.schema);
     if !resolved.is_empty() {
-        sort_full_rows(&mut matched, &def.schema, &resolved, &db.cancel_token())?;
+        sort_rows_with_subqueries(
+            db,
+            vindex,
+            &mut matched,
+            &def.schema,
+            &resolved,
+            |expr, row| bind_outer(expr, outer, &def.schema, row),
+        )
+        .await?;
     }
     apply_offset_limit(&mut matched, offset, limit);
 
@@ -11509,7 +11577,8 @@ async fn correlated_select(
                 }
             };
             let bound = bind_outer(expr, outer, &def.schema, row);
-            let resolved = resolve_subqueries(db, vindex, bound).await?;
+            let resolved =
+                resolve_subqueries_with_outer(db, vindex, bound, &def.schema, row).await?;
             vals.push(predicate::eval_row(&resolved, &def.schema, row)?);
         }
         out_rows.push(vals);
@@ -11559,8 +11628,9 @@ async fn correlated_select(
     )))
 }
 
-/// Rewrite outer column references (`outer.col`, or a bare outer column) in
-/// `expr` to literals from `row`, including inside subqueries.
+/// Rewrite qualified outer column references (`outer.col`) in `expr` to
+/// literals from `row`, including inside subqueries. Bare names remain bound
+/// to the innermost query scope.
 fn bind_outer(expr: &Expr, outer: &str, schema: &Schema, row: &[Value]) -> Expr {
     map_expr(expr, &|e| match e {
         Expr::CompoundIdentifier(parts) if parts.len() >= 2 => {
@@ -11576,13 +11646,88 @@ fn bind_outer(expr: &Expr, outer: &str, schema: &Schema, row: &[Value]) -> Expr 
                 None
             }
         }
-        Expr::Identifier(id) => schema
-            .columns
-            .iter()
-            .position(|c| c.name.eq_ignore_ascii_case(&id.value))
-            .map(|i| value_to_expr(&row[i])),
         _ => None,
     })
+}
+
+/// Resolve subqueries after qualified correlation has been bound. If an inner
+/// scope does not own a bare column, retry that name against the immediate
+/// outer row. A name that resolves in the inner scope never reaches this path,
+/// preserving the usual nearest-scope precedence.
+async fn resolve_subqueries_with_outer(
+    db: &Session,
+    vindex: &VectorRegistry,
+    expr: Expr,
+    outer_schema: &Schema,
+    outer_row: &[Value],
+) -> Result<Expr> {
+    let mut bound = expr;
+    let mut rebound = Vec::new();
+    loop {
+        match resolve_subqueries(db, vindex, bound.clone()).await {
+            Ok(resolved) => return Ok(resolved),
+            Err(error) => {
+                let Some(column) = bare_unknown_column(&error).map(str::to_owned) else {
+                    return Err(error);
+                };
+                if rebound
+                    .iter()
+                    .any(|name: &String| name.eq_ignore_ascii_case(&column))
+                {
+                    return Err(error);
+                }
+                let index = match predicate::resolve_index(&column, outer_schema) {
+                    Ok(index) => index,
+                    Err(Error::Catalog(_)) => return Err(error),
+                    Err(error) => return Err(error),
+                };
+                let value = value_to_expr(&outer_row[index]);
+                bound = map_expr(&bound, &|candidate| match candidate {
+                    Expr::Identifier(identifier)
+                        if identifier.value.eq_ignore_ascii_case(&column) =>
+                    {
+                        Some(value.clone())
+                    }
+                    _ => None,
+                });
+                rebound.push(column);
+            }
+        }
+    }
+}
+
+fn bare_unknown_column(error: &Error) -> Option<&str> {
+    let Error::Catalog(message) = error else {
+        return None;
+    };
+    let column = message.strip_prefix("unknown column: ")?;
+    (!column.contains('.')).then_some(column)
+}
+
+async fn sort_rows_with_subqueries(
+    db: &Session,
+    vindex: &VectorRegistry,
+    rows: &mut [Vec<Value>],
+    schema: &Schema,
+    order: &[(Expr, bool)],
+    bind: impl Fn(&Expr, &[Value]) -> Expr,
+) -> Result<()> {
+    let mut check = db.cancel_check();
+    let mut keyed = Vec::with_capacity(rows.len());
+    for (position, row) in rows.iter().enumerate() {
+        check.tick()?;
+        let mut keys = Vec::with_capacity(order.len());
+        for (expr, _) in order {
+            let bound = bind(expr, row);
+            let resolved = resolve_subqueries_with_outer(db, vindex, bound, schema, row).await?;
+            keys.push(predicate::eval_row(&resolved, schema, row)?);
+        }
+        keyed.push((keys, position));
+    }
+    let collations = order_key_collations(order, schema);
+    sort_keyed_coll(&mut keyed, order, &collations);
+    reorder(rows, &keyed);
+    Ok(())
 }
 
 /// Materialise a subquery's rows by executing it through the query engine.
