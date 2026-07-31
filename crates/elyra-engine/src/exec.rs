@@ -10514,6 +10514,8 @@ async fn window_select(
     // is needed: the item either *is* a window expression, whose value is already
     // computed per row, or contains none at all.
     enum Out<'a> {
+        /// A source column expanded from `*` or `relation.*`.
+        Column(usize),
         /// The item is exactly window expression `k`: take the precomputed value.
         Window(usize),
         /// The item contains no window function: evaluate it against the row.
@@ -10522,34 +10524,93 @@ async fn window_select(
         /// substitute and evaluate, as before.
         Mixed(&'a Expr),
     }
-    let mut plan: Vec<Out> = Vec::with_capacity(select.projection.len());
+    struct PlannedOut<'a> {
+        name: String,
+        source_column: Option<usize>,
+        evaluator: Out<'a>,
+    }
+    let mut plan: Vec<PlannedOut<'_>> = Vec::with_capacity(select.projection.len());
     for item in &select.projection {
+        match item {
+            SelectItem::Wildcard(_) => {
+                plan.extend(
+                    schema
+                        .columns
+                        .iter()
+                        .enumerate()
+                        .map(|(index, column)| PlannedOut {
+                            name: output_column_name(&column.name).to_owned(),
+                            source_column: Some(index),
+                            evaluator: Out::Column(index),
+                        }),
+                );
+                continue;
+            }
+            SelectItem::QualifiedWildcard(object, _) => {
+                let qualifier = object
+                    .0
+                    .last()
+                    .map(|identifier| identifier.value.as_str())
+                    .unwrap_or_default();
+                let relation_matches = select.from.len() == 1
+                    && select.from[0].joins.is_empty()
+                    && factor_qualifier(&select.from[0].relation)
+                        .is_some_and(|relation| relation.eq_ignore_ascii_case(qualifier));
+                if !relation_matches {
+                    return Err(Error::Unsupported(format!(
+                        "qualified wildcard {object}.* matched no relation"
+                    )));
+                }
+                plan.extend(
+                    schema
+                        .columns
+                        .iter()
+                        .enumerate()
+                        .map(|(index, column)| PlannedOut {
+                            name: output_column_name(&column.name).to_owned(),
+                            source_column: Some(index),
+                            evaluator: Out::Column(index),
+                        }),
+                );
+                continue;
+            }
+            SelectItem::UnnamedExpr(_) | SelectItem::ExprWithAlias { .. } => {}
+        }
         let expr = match item {
             SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => e,
-            other => {
-                return Err(Error::Unsupported(format!(
-                    "projection item not supported with window functions: {other}"
-                )))
-            }
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => unreachable!(),
         };
-        if let Some(k) = win_values.iter().position(|(we, _)| we == expr) {
-            plan.push(Out::Window(k));
+        let evaluator = if let Some(k) = win_values.iter().position(|(we, _)| we == expr) {
+            Out::Window(k)
         } else {
             let mut nested = Vec::new();
             collect_window_exprs(expr, &mut nested);
-            plan.push(if nested.is_empty() {
+            if nested.is_empty() {
                 Out::Plain(expr)
             } else {
                 Out::Mixed(expr)
-            });
-        }
+            }
+        };
+        let name = match item {
+            SelectItem::ExprWithAlias { alias, .. } => alias.value.clone(),
+            SelectItem::UnnamedExpr(expr) => ident_name(expr)
+                .map(str::to_owned)
+                .unwrap_or_else(|| expr.to_string()),
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => unreachable!(),
+        };
+        plan.push(PlannedOut {
+            name,
+            source_column: None,
+            evaluator,
+        });
     }
 
     let mut out_rows: Vec<Vec<Value>> = Vec::with_capacity(rows.len());
     for (i, row) in rows.iter().enumerate() {
         let mut vals = Vec::with_capacity(plan.len());
-        for out in &plan {
-            vals.push(match out {
+        for planned in &plan {
+            vals.push(match &planned.evaluator {
+                Out::Column(index) => row[*index].clone(),
                 Out::Window(k) => win_values[*k].1[i].clone(),
                 Out::Plain(e) => predicate::eval_row(e, schema, row)?,
                 Out::Mixed(e) => {
@@ -10567,26 +10628,24 @@ async fn window_select(
     }
 
     // Output schema (names + inferred types).
-    let mut cols = Vec::with_capacity(select.projection.len());
-    for (ci, item) in select.projection.iter().enumerate() {
-        let name = match item {
-            SelectItem::ExprWithAlias { alias, .. } => alias.value.clone(),
-            SelectItem::UnnamedExpr(e) => ident_name(e)
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| e.to_string()),
-            _ => format!("col{ci}"),
-        };
-        let ty = out_rows
-            .iter()
-            .map(|r| &r[ci])
-            .find(|v| !v.is_null())
-            .map(infer_val)
-            .unwrap_or(ColumnType::Text);
+    let mut cols = Vec::with_capacity(plan.len());
+    for (column_index, planned) in plan.iter().enumerate() {
+        let source = planned
+            .source_column
+            .and_then(|index| schema.columns.get(index));
+        let ty = source.map(|column| column.ty.clone()).unwrap_or_else(|| {
+            out_rows
+                .iter()
+                .map(|row| &row[column_index])
+                .find(|value| !value.is_null())
+                .map(infer_val)
+                .unwrap_or(ColumnType::Text)
+        });
         cols.push(ColumnDef {
-            name,
+            name: planned.name.clone(),
             ty,
-            nullable: true,
-            collation: elyra_core::Collation::Ci,
+            nullable: source.is_none_or(|column| column.nullable),
+            collation: source.map_or(elyra_core::Collation::Ci, |column| column.collation),
         });
     }
     let out_schema = Schema::new(cols);

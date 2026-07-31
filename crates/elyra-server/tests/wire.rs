@@ -4744,6 +4744,20 @@ async fn window_functions_are_exact() {
         .unwrap();
     assert_eq!(rows, vec![(1, 2, 1), (2, 4, 2), (3, 6, 3), (4, 8, 4)]);
 
+    // Wildcards expand alongside a window expression, including when the
+    // window query is wrapped to filter on its generated row number.
+    let rows: Vec<(i64, i64, i64, i64)> = c
+        .query(
+            "SELECT * FROM (
+                 SELECT *, ROW_NUMBER() OVER (PARTITION BY g ORDER BY id DESC) AS row_num
+                 FROM w WHERE id <= 6
+             ) AS limited
+             WHERE row_num <= 1 ORDER BY g",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![(6, 0, 6, 1), (4, 1, 4, 1), (5, 2, 5, 1)]);
+
     // RANK/DENSE_RANK over ties: tie-insensitive, so exact regardless of order.
     let rows: Vec<(i64, i64, i64)> = c
         .query("SELECT amt, RANK() OVER (ORDER BY amt), DENSE_RANK() OVER (ORDER BY amt) FROM w ORDER BY amt, id LIMIT 7")
