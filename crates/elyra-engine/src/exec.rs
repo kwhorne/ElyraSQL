@@ -9938,6 +9938,66 @@ fn order_ordinal(e: &Expr) -> Option<usize> {
     }
 }
 
+fn projected_order_expr(
+    name: &str,
+    projection: &[sqlparser::ast::SelectItem],
+    schema: &Schema,
+) -> Option<Expr> {
+    use sqlparser::ast::{Ident, SelectItem};
+
+    let source_expr = |column: &str| {
+        let parts = column.split('.').map(Ident::new).collect::<Vec<_>>();
+        match parts.as_slice() {
+            [identifier] => Expr::Identifier(identifier.clone()),
+            _ => Expr::CompoundIdentifier(parts),
+        }
+    };
+    let mut matches = Vec::new();
+    for item in projection {
+        match item {
+            SelectItem::Wildcard(_) => {
+                matches.extend(
+                    schema
+                        .columns
+                        .iter()
+                        .filter(|column| {
+                            output_column_name(&column.name).eq_ignore_ascii_case(name)
+                        })
+                        .map(|column| source_expr(&column.name)),
+                );
+            }
+            SelectItem::QualifiedWildcard(object, _) => {
+                let qualifier = object
+                    .0
+                    .last()
+                    .map(|identifier| identifier.value.as_str())
+                    .unwrap_or_default();
+                matches.extend(schema.columns.iter().filter_map(|column| {
+                    let (column_qualifier, column_name) = column.name.split_once('.')?;
+                    (column_qualifier.eq_ignore_ascii_case(qualifier)
+                        && column_name.eq_ignore_ascii_case(name))
+                    .then(|| source_expr(&column.name))
+                }));
+            }
+            SelectItem::UnnamedExpr(expr) => {
+                if ident_name(expr).is_some_and(|output| output.eq_ignore_ascii_case(name)) {
+                    matches.push(expr.clone());
+                }
+            }
+            SelectItem::ExprWithAlias { expr, alias } => {
+                if alias.value.eq_ignore_ascii_case(name) {
+                    matches.push(expr.clone());
+                }
+            }
+        }
+    }
+    if matches.len() == 1 {
+        matches.pop()
+    } else {
+        None
+    }
+}
+
 fn resolve_order_aliases(
     order: &[(Expr, bool)],
     projection: &[sqlparser::ast::SelectItem],
@@ -9961,12 +10021,8 @@ fn resolve_order_aliases(
                     .iter()
                     .any(|c| c.name.eq_ignore_ascii_case(name));
                 if !is_column {
-                    for item in projection {
-                        if let SelectItem::ExprWithAlias { expr, alias } = item {
-                            if alias.value.eq_ignore_ascii_case(name) {
-                                return (expr.clone(), *asc);
-                            }
-                        }
+                    if let Some(expr) = projected_order_expr(name, projection, schema) {
+                        return (expr, *asc);
                     }
                 }
             }

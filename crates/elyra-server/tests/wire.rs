@@ -1443,6 +1443,28 @@ async fn join_order_by_streaming() {
         .await
         .unwrap();
     assert_eq!(rows, vec![(3, Some("C".into())), (6, Some("C".into()))]);
+
+    // MySQL resolves an unqualified ORDER BY name against the projected output
+    // before the joined input. The qualified wildcard exposes only the driving
+    // table's `id`, so the partner's `id` does not make this ambiguous.
+    let rows: Vec<(i64, i64, i64, String)> = c
+        .query(
+            "SELECT f.*, d.cat AS through_key
+             FROM so_facts f JOIN so_dim d ON f.dim_id = d.id
+             ORDER BY id DESC LIMIT 2",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![(6, 3, 30, "C".into()), (5, 2, 90, "B".into())]);
+
+    let error = c
+        .query_drop(
+            "SELECT * FROM so_facts f JOIN so_dim d ON f.dim_id = d.id
+             ORDER BY id LIMIT 1",
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("ambiguous column: id"));
 }
 
 /// ESQL-50: the streaming join builds each combined row in a reusable buffer,
