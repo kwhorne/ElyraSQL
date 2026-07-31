@@ -345,6 +345,47 @@ pub async fn create_table(
                     indexes_nulls: single,
                 });
             }
+            TableConstraint::Index {
+                name: index_name,
+                columns: cols,
+                ..
+            } => {
+                let mut idxs = Vec::new();
+                for ident in cols {
+                    let i = columns
+                        .iter()
+                        .position(|column| column.name.eq_ignore_ascii_case(&ident.value))
+                        .ok_or_else(|| {
+                            Error::Catalog(format!("unknown index column: {}", ident.value))
+                        })?;
+                    idxs.push(i);
+                }
+                let name = index_name
+                    .as_ref()
+                    .map(|name| name.value.clone())
+                    .unwrap_or_else(|| {
+                        format!(
+                            "{name}_{}_idx",
+                            idxs.iter()
+                                .map(|&i| columns[i].name.clone())
+                                .collect::<Vec<_>>()
+                                .join("_")
+                        )
+                    });
+                let col_collations = idxs
+                    .iter()
+                    .map(|&i| columns[i].collation)
+                    .collect::<Vec<_>>();
+                indexes.push(IndexDef {
+                    name,
+                    indexes_nulls: idxs.len() == 1,
+                    cols: idxs,
+                    unique: false,
+                    vector: false,
+                    fulltext: false,
+                    col_collations,
+                });
+            }
             TableConstraint::Check { expr, .. } => checks.push(expr.to_string()),
             TableConstraint::ForeignKey {
                 name: fname,
@@ -2465,6 +2506,55 @@ pub async fn create_index(db: &Session, ci: CreateIndex) -> Result<QueryResult> 
         }
     }
     db.commit_write(puts, vec![]).await?;
+    Ok(QueryResult::Affected(0))
+}
+
+/// Remove a secondary index definition and all of its persisted entries.
+pub async fn drop_index(db: &Session, table: &str, name: &str) -> Result<QueryResult> {
+    let mut def = catalog::load(db, table).await?;
+    let position = def
+        .indexes
+        .iter()
+        .position(|index| index.name.eq_ignore_ascii_case(name))
+        .ok_or_else(|| Error::Catalog(format!("unknown index: {name}")))?;
+    let removed = def.indexes.remove(position);
+
+    let mut deletes = Vec::new();
+    for prefix in [
+        index::index_scan_prefix(table, &removed.name),
+        index::indexnull_scan_prefix(table, &removed.name),
+    ] {
+        let mut cursor = None;
+        loop {
+            let batch = db.scan_batch(prefix.clone(), cursor.clone(), 4096).await?;
+            if batch.is_empty() {
+                break;
+            }
+            let is_last = batch.len() < 4096;
+            cursor = batch.last().map(|(key, _)| key.clone());
+            deletes.extend(batch.into_iter().map(|(key, _)| key));
+            if is_last {
+                break;
+            }
+        }
+    }
+
+    db.commit_write(vec![(catalog_key(table), def.encode()?)], deletes)
+        .await?;
+    Ok(QueryResult::Affected(0))
+}
+
+/// Remove a named foreign-key constraint without removing its supporting index.
+pub async fn drop_foreign_key(db: &Session, table: &str, name: &str) -> Result<QueryResult> {
+    let mut def = catalog::load(db, table).await?;
+    let position = def
+        .foreign_keys
+        .iter()
+        .position(|foreign_key| foreign_key.name.eq_ignore_ascii_case(name))
+        .ok_or_else(|| Error::Catalog(format!("unknown foreign key: {name}")))?;
+    def.foreign_keys.remove(position);
+    db.commit_write(vec![(catalog_key(table), def.encode()?)], Vec::new())
+        .await?;
     Ok(QueryResult::Affected(0))
 }
 

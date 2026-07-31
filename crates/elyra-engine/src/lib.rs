@@ -855,6 +855,24 @@ impl Engine {
             return Ok(vec![exec::show_processlist()?]);
         }
 
+        // sqlparser 0.53 does not recognize MySQL's DROP INDEX / DROP FOREIGN
+        // KEY forms. Parse these narrow DDL statements before the generic
+        // frontend so Laravel's schema builder can remove indexes and keys.
+        if let Some(drop) = parse_mysql_drop(trimmed) {
+            if privilege < Privilege::Admin {
+                return Err(Error::Query(
+                    "access denied: ALTER TABLE requires ADMIN privilege".into(),
+                ));
+            }
+            let result = match drop.kind {
+                MysqlDropKind::Index => exec::drop_index(sess, &drop.table, &drop.name).await?,
+                MysqlDropKind::ForeignKey => {
+                    exec::drop_foreign_key(sess, &drop.table, &drop.name).await?
+                }
+            };
+            return Ok(vec![result]);
+        }
+
         // BACKUP [DATABASE] TO '<path>' — hot, consistent copy of the whole
         // database to a new file. Not standard SQL, so handled here.
         if head.starts_with("backup") {
@@ -2182,6 +2200,82 @@ fn is_deepening_token(tok: &Token) -> bool {
         Word(w) => is_operator_keyword(w.keyword),
         _ => false,
     }
+}
+
+#[derive(Clone, Copy)]
+enum MysqlDropKind {
+    Index,
+    ForeignKey,
+}
+
+struct MysqlDrop {
+    table: String,
+    name: String,
+    kind: MysqlDropKind,
+}
+
+/// Parse the MySQL-only index/key removal forms rejected by sqlparser 0.53:
+/// `ALTER TABLE t DROP INDEX i`, `ALTER TABLE t DROP FOREIGN KEY fk`, and
+/// `DROP INDEX i ON t`. Quoted and schema-qualified table names are accepted.
+fn parse_mysql_drop(sql: &str) -> Option<MysqlDrop> {
+    let dialect = MySqlDialect {};
+    let tokens: Vec<Token> = Tokenizer::new(&dialect, sql)
+        .tokenize()
+        .ok()?
+        .into_iter()
+        .filter(|token| !matches!(token, Token::Whitespace(_) | Token::SemiColon))
+        .collect();
+
+    let word = |position: usize| match tokens.get(position) {
+        Some(Token::Word(word)) => Some(word.value.as_str()),
+        _ => None,
+    };
+    let keyword = |position: usize, expected: &str| {
+        word(position).is_some_and(|actual| actual.eq_ignore_ascii_case(expected))
+    };
+    let table_name = |start: usize, end: usize| -> Option<String> {
+        match &tokens[start..end] {
+            [Token::Word(table)] => Some(table.value.clone()),
+            [Token::Word(_schema), Token::Period, Token::Word(table)] => Some(table.value.clone()),
+            _ => None,
+        }
+    };
+
+    if tokens.len() >= 6 && keyword(0, "alter") && keyword(1, "table") {
+        let drop_position = tokens.iter().position(
+            |token| matches!(token, Token::Word(word) if word.value.eq_ignore_ascii_case("drop")),
+        )?;
+        let table = table_name(2, drop_position)?;
+        if drop_position + 3 == tokens.len()
+            && (keyword(drop_position + 1, "index") || keyword(drop_position + 1, "key"))
+        {
+            return Some(MysqlDrop {
+                table,
+                name: word(drop_position + 2)?.to_string(),
+                kind: MysqlDropKind::Index,
+            });
+        }
+        if drop_position + 4 == tokens.len()
+            && keyword(drop_position + 1, "foreign")
+            && keyword(drop_position + 2, "key")
+        {
+            return Some(MysqlDrop {
+                table,
+                name: word(drop_position + 3)?.to_string(),
+                kind: MysqlDropKind::ForeignKey,
+            });
+        }
+    }
+
+    if tokens.len() >= 5 && keyword(0, "drop") && keyword(1, "index") && keyword(3, "on") {
+        return Some(MysqlDrop {
+            table: table_name(4, tokens.len())?,
+            name: word(2)?.to_string(),
+            kind: MysqlDropKind::Index,
+        });
+    }
+
+    None
 }
 
 /// Remove trailing table options from a `CREATE TABLE (...) <options>` statement

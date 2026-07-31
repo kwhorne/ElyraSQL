@@ -140,6 +140,61 @@ async fn explicit_auto_increment_value_is_returned_in_ok_packet() {
 }
 
 #[tokio::test]
+async fn mysql_index_and_foreign_key_drop_forms() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop("CREATE TABLE parents (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop(
+        "CREATE TABLE children (
+            id INT PRIMARY KEY,
+            parent_id INT,
+            name VARCHAR(20),
+            INDEX idx_name (name),
+            CONSTRAINT fk_parent FOREIGN KEY (parent_id) REFERENCES parents(id)
+        )",
+    )
+    .await
+    .unwrap();
+
+    c.query_drop("ALTER TABLE children DROP INDEX IDX_NAME")
+        .await
+        .unwrap();
+    let indexes: Vec<String> = c
+        .query("SHOW INDEX FROM children")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row: mysql_async::Row| row.get("Key_name").unwrap())
+        .collect();
+    assert!(!indexes.iter().any(|name| name == "idx_name"));
+
+    c.query_drop("CREATE UNIQUE INDEX uniq_name ON children (name)")
+        .await
+        .unwrap();
+    c.query_drop("DROP INDEX uniq_name ON children")
+        .await
+        .unwrap();
+    let indexes: Vec<String> = c
+        .query("SHOW INDEX FROM children")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row: mysql_async::Row| row.get("Key_name").unwrap())
+        .collect();
+    assert!(!indexes.iter().any(|name| name == "uniq_name"));
+
+    c.query_drop("ALTER TABLE children DROP FOREIGN KEY fk_parent")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO children VALUES (1, 999, 'orphan')")
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn transactions_commit_and_rollback() {
     let srv = TestServer::start().await;
     let mut c = srv.conn().await;
