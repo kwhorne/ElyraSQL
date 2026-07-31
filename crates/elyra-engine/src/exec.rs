@@ -1763,9 +1763,16 @@ async fn run_virtual_select(
     }
 
     if !group_by.is_empty() || aggregate::projection_has_aggregate(&select.projection) {
-        let (osch, orows) = aggregate::run(&schema, &select.projection, group_by, rows)?;
-        let mut orows = apply_having(select.having.as_ref(), &select.projection, &osch, orows)?;
+        let (projection, hidden) = aggregate_projection_with_hidden(
+            &select.projection,
+            select.having.as_ref(),
+            order_exprs,
+            &schema,
+        );
+        let (mut osch, orows) = aggregate::run(&schema, &projection, group_by, rows)?;
+        let mut orows = apply_having(select.having.as_ref(), &projection, &osch, orows)?;
         order_output_rows(&mut orows, &osch, order_exprs)?;
+        truncate_hidden_columns(&mut osch, &mut orows, hidden);
         apply_offset_limit(&mut orows, offset, limit);
         return Ok(QueryResult::Rows(RowStream::literal(osch, orows)));
     }
@@ -4229,22 +4236,15 @@ pub async fn select(
 
     // Aggregation / grouping path: parallel streaming aggregation (OLAP).
     if !group_by.is_empty() || aggregate::projection_has_aggregate(&select.projection) {
-        // HAVING may reference aggregates not in the SELECT list (e.g.
-        // `... GROUP BY x HAVING COUNT(*) > 1`). Compute them as hidden output
-        // columns, then drop them before returning.
-        let hidden = having_hidden_items(&select.projection, select.having.as_ref());
-        let aug_proj: Vec<sqlparser::ast::SelectItem>;
-        let proj: &[sqlparser::ast::SelectItem] = if hidden.is_empty() {
-            &select.projection
-        } else {
-            aug_proj = select
-                .projection
-                .iter()
-                .cloned()
-                .chain(hidden.iter().cloned())
-                .collect();
-            &aug_proj
-        };
+        // HAVING and ORDER BY may read grouped values that are not returned.
+        // Compute them as hidden output columns, then drop them before returning.
+        let (projection, hidden) = aggregate_projection_with_hidden(
+            &select.projection,
+            select.having.as_ref(),
+            &order_exprs,
+            &def.schema,
+        );
+        let proj = projection.as_slice();
         let plan = aggregate::build_plan(&def.schema, proj, &group_by)?;
         // If statistics predict more distinct groups than fit in memory, go
         // straight to the spilling partitioned aggregation instead of running the
@@ -4324,15 +4324,8 @@ pub async fn select(
         };
         let (mut schema, mut out_rows) = (schema, out_rows);
         out_rows = apply_having(select.having.as_ref(), proj, &schema, out_rows)?;
-        // Drop hidden HAVING-only aggregate columns from the result.
-        if !hidden.is_empty() {
-            let keep = schema.columns.len().saturating_sub(hidden.len());
-            schema.columns.truncate(keep);
-            for r in &mut out_rows {
-                r.truncate(keep);
-            }
-        }
         order_output_rows(&mut out_rows, &schema, &order_exprs)?;
+        truncate_hidden_columns(&mut schema, &mut out_rows, hidden);
         apply_offset_limit(&mut out_rows, offset, limit);
         return Ok(QueryResult::Rows(RowStream::literal(schema, out_rows)));
     }
@@ -4899,10 +4892,17 @@ async fn join_select(
     // Aggregation / grouping.
     if !group_by.is_empty() || aggregate::projection_has_aggregate(&select.projection) {
         // Aggregating and ordering materialised rows is pure CPU work.
+        let (projection, hidden) = aggregate_projection_with_hidden(
+            &select.projection,
+            select.having.as_ref(),
+            &order_exprs,
+            &schema,
+        );
         let (osch, orows) = cpu_bound(|| -> Result<(Schema, Vec<Vec<Value>>)> {
-            let (osch, orows) = aggregate::run(&schema, &select.projection, &group_by, rows)?;
-            let mut orows = apply_having(select.having.as_ref(), &select.projection, &osch, orows)?;
+            let (mut osch, orows) = aggregate::run(&schema, &projection, &group_by, rows)?;
+            let mut orows = apply_having(select.having.as_ref(), &projection, &osch, orows)?;
             order_output_rows(&mut orows, &osch, &order_exprs)?;
+            truncate_hidden_columns(&mut osch, &mut orows, hidden);
             apply_offset_limit(&mut orows, offset, limit);
             Ok((osch, orows))
         })?;
@@ -10259,6 +10259,71 @@ fn having_hidden_items(
         out.push(SelectItem::ExprWithAlias { expr: a, alias });
     }
     out
+}
+
+/// Add projection columns needed only to evaluate HAVING or ORDER BY after
+/// grouping. MySQL permits ORDER BY to reference a representative source value
+/// that is not returned when full-group enforcement is disabled.
+fn aggregate_projection_with_hidden(
+    projection: &[sqlparser::ast::SelectItem],
+    having: Option<&Expr>,
+    order: &[(Expr, bool)],
+    source_schema: &Schema,
+) -> (Vec<sqlparser::ast::SelectItem>, usize) {
+    use sqlparser::ast::SelectItem;
+
+    let mut augmented = projection.to_vec();
+    augmented.extend(having_hidden_items(projection, having));
+    let resolved_order = resolve_order_aliases(order, projection, source_schema);
+
+    for ((original, _), (resolved, _)) in order.iter().zip(resolved_order) {
+        if order_ordinal(original).is_some()
+            || projection_exposes_order_expr(&augmented, original, &resolved)
+        {
+            continue;
+        }
+        augmented.push(SelectItem::UnnamedExpr(resolved));
+    }
+
+    let hidden = augmented.len().saturating_sub(projection.len());
+    (augmented, hidden)
+}
+
+fn projection_exposes_order_expr(
+    projection: &[sqlparser::ast::SelectItem],
+    original: &Expr,
+    resolved: &Expr,
+) -> bool {
+    use sqlparser::ast::SelectItem;
+
+    let original_name = ident_name(original);
+    projection.iter().any(|item| match item {
+        SelectItem::Wildcard(_) => ident_name(resolved).is_some(),
+        SelectItem::QualifiedWildcard(_, _) => false,
+        SelectItem::UnnamedExpr(expr) => {
+            expr == original
+                || expr == resolved
+                || original_name.is_some_and(|name| {
+                    ident_name(expr).is_some_and(|output| output.eq_ignore_ascii_case(name))
+                })
+        }
+        SelectItem::ExprWithAlias { expr, alias } => {
+            expr == original
+                || expr == resolved
+                || original_name.is_some_and(|name| alias.value.eq_ignore_ascii_case(name))
+        }
+    })
+}
+
+fn truncate_hidden_columns(schema: &mut Schema, rows: &mut [Vec<Value>], hidden: usize) {
+    if hidden == 0 {
+        return;
+    }
+    let visible = schema.columns.len().saturating_sub(hidden);
+    schema.columns.truncate(visible);
+    for row in rows {
+        row.truncate(visible);
+    }
 }
 
 /// Collect aggregate-function sub-expressions (not recursing into their args).

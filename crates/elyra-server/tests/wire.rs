@@ -3361,6 +3361,17 @@ async fn group_by_expression() {
         ]
     );
 
+    // With full-group enforcement disabled, MySQL permits ordering groups by a
+    // representative source value that is not part of the returned projection.
+    let rows: Vec<(String, i64)> = c
+        .query(
+            "SELECT DATE_FORMAT(ts, '%Y-%m-%d') AS day, COUNT(*)
+             FROM logs GROUP BY day ORDER BY ts DESC",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![("2026-07-17".into(), 120)]);
+
     let rows: Vec<(String, i64)> = c
         .query(
             "SELECT DATE_FORMAT(ts, '%Y-%m-%d %H:%i:00') AS bucket, COUNT(*) \
