@@ -1091,12 +1091,22 @@ async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec
                 int("INDEX_LENGTH"),
                 text("TABLE_COMMENT"),
                 text("TABLE_COLLATION"),
+                int("AUTO_INCREMENT"),
+                text("CREATE_OPTIONS"),
             ]);
             let mut rows = Vec::with_capacity(names.len());
             for n in names {
+                let def = catalog::load(db, &n).await?;
                 let table_rows = match catalog::load_stats(db, &n).await? {
                     Some(s) => Value::Int(s.rows as i64),
                     None => Value::Null,
+                };
+                let auto_increment = if (0..def.schema.columns.len())
+                    .any(|column_index| def.meta(column_index).auto_increment)
+                {
+                    Value::Int(read_autoinc(db, &n).await?.saturating_add(1))
+                } else {
+                    Value::Null
                 };
                 rows.push(vec![
                     Value::Text(database.clone()),
@@ -1112,6 +1122,8 @@ async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec
                     Value::Int(0),
                     Value::Text(String::new()),
                     Value::Text("utf8mb4_0900_ai_ci".into()),
+                    auto_increment,
+                    Value::Text(String::new()),
                 ]);
             }
             Ok((schema, rows))
@@ -1728,6 +1740,14 @@ async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec
                         Value::Null,
                     ]
                 })
+                .collect();
+            Ok((schema, rows))
+        }
+        "collation_character_set_applicability" => {
+            let schema = Schema::new(vec![text("COLLATION_NAME"), text("CHARACTER_SET_NAME")]);
+            let rows = ["utf8mb4_0900_ai_ci", "utf8mb4_unicode_ci", "utf8mb4_bin"]
+                .into_iter()
+                .map(|collation| vec![Value::Text(collation.into()), Value::Text("utf8mb4".into())])
                 .collect();
             Ok((schema, rows))
         }

@@ -2543,6 +2543,32 @@ async fn table_introspection_columns_are_available() {
             "utf8mb4_0900_ai_ci".into(),
         )]
     );
+
+    let rows: Vec<(String, String, Option<i64>, String, String, String)> = c
+        .exec(
+            "SELECT t.TABLE_NAME, t.ENGINE, t.AUTO_INCREMENT,
+                    t.TABLE_COMMENT, t.CREATE_OPTIONS, ccsa.CHARACTER_SET_NAME
+             FROM information_schema.TABLES t
+             INNER JOIN information_schema.COLLATION_CHARACTER_SET_APPLICABILITY ccsa
+                ON ccsa.COLLATION_NAME = t.TABLE_COLLATION
+             WHERE t.TABLE_SCHEMA = 'elyra'
+               AND t.TABLE_NAME = 'introspected_table'
+               AND t.TABLE_TYPE = 'BASE TABLE'",
+            (),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![(
+            "introspected_table".into(),
+            "ElyraSQL".into(),
+            None,
+            String::new(),
+            String::new(),
+            "utf8mb4".into(),
+        )]
+    );
 }
 
 #[tokio::test]
