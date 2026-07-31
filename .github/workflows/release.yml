@@ -5,7 +5,11 @@ on:
     tags: ["v*"]
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -14,25 +18,48 @@ jobs:
   build:
     name: build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-musl
+            platform: linux
             arch: x86_64
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
+            platform: linux
+            arch: aarch64
+          - os: macos-15
+            target: aarch64-apple-darwin
+            platform: macos
             arch: aarch64
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Validate release version
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          MANIFEST_VERSION=$(awk -F '"' '/^version = "/ { print $2; exit }' Cargo.toml)
+          test "$VERSION" = "$MANIFEST_VERSION" || {
+            echo "tag version $VERSION does not match Cargo.toml $MANIFEST_VERSION" >&2
+            exit 1
+          }
+          grep -q "^## \[$VERSION\]" CHANGELOG.md || {
+            echo "CHANGELOG.md has no section for $VERSION" >&2
+            exit 1
+          }
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.97.0
         with:
           targets: ${{ matrix.target }}
 
       - name: Install musl tools
+        if: matrix.platform == 'linux'
         # ports.ubuntu.com (the arm64 mirror) has intermittent connectivity from
         # the arm64 runners, so retry the update+install a few times before giving
         # up rather than failing the whole release on a transient network blip.
@@ -47,34 +74,60 @@ jobs:
           echo "musl-tools install failed after retries" >&2
           exit 1
 
-      - name: Build static binary
+      - name: Build Linux static binary
+        if: matrix.platform == 'linux'
+        run: cargo build --release --locked --target ${{ matrix.target }} -p elyra-cli
+
+      - name: Build macOS binary
+        if: matrix.platform == 'macos'
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
         run: cargo build --release --locked --target ${{ matrix.target }} -p elyra-cli
 
       - name: Package
         run: |
           VERSION=${GITHUB_REF_NAME#v}
-          NAME=elyrasql-${VERSION}-linux-${{ matrix.arch }}
+          NAME=elyrasql-${VERSION}-${{ matrix.platform }}-${{ matrix.arch }}
+          BIN=target/${{ matrix.target }}/release/elyrasql
           mkdir -p "dist/$NAME"
-          cp target/${{ matrix.target }}/release/elyrasql "dist/$NAME/"
+          cp "$BIN" "dist/$NAME/"
           cp README.md LICENSE "dist/$NAME/"
-          cp packaging/elyrasql.service "dist/$NAME/"
+          if [ "${{ matrix.platform }}" = "linux" ]; then
+            cp packaging/elyrasql.service "dist/$NAME/"
+          else
+            test "$(lipo -archs "$BIN")" = "arm64"
+            test "$(vtool -show-build "$BIN" | awk '/minos/ { print $2; exit }')" = "11.0"
+            codesign --verify --strict "$BIN"
+          fi
           tar -C dist -czf "$NAME.tar.gz" "$NAME"
-          sha256sum "$NAME.tar.gz" > "$NAME.tar.gz.sha256"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$NAME.tar.gz" > "$NAME.tar.gz.sha256"
+          else
+            shasum -a 256 "$NAME.tar.gz" > "$NAME.tar.gz.sha256"
+          fi
+          mkdir verify
+          tar -C verify -xzf "$NAME.tar.gz"
+          "verify/$NAME/elyrasql" version
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ matrix.arch }}
+          name: release-${{ matrix.platform }}-${{ matrix.arch }}
           path: |
             elyrasql-*.tar.gz
             elyrasql-*.tar.gz.sha256
+          if-no-files-found: error
 
   release:
     name: publish release
     needs: build
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - uses: actions/download-artifact@v8
         with:

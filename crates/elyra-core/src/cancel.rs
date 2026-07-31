@@ -135,7 +135,7 @@ impl CancelCheck {
     #[inline]
     pub fn tick(&mut self) -> Result<(), Error> {
         self.tick = self.tick.wrapping_add(1);
-        if self.tick % CHECK_INTERVAL == 0 {
+        if self.tick.is_multiple_of(CHECK_INTERVAL) {
             return self.token.check();
         }
         Ok(())

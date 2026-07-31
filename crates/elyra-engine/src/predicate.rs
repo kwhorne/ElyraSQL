@@ -750,7 +750,7 @@ fn eval_json_fn(name: &str, vals: &[Value]) -> Result<Value> {
             Json::Arr(vals.iter().map(Json::from_value).collect()).to_json_string(),
         )),
         "json_object" => {
-            if vals.len() % 2 != 0 {
+            if !vals.len().is_multiple_of(2) {
                 return Err(Error::Query("JSON_OBJECT expects key/value pairs".into()));
             }
             let mut pairs = Vec::with_capacity(vals.len() / 2);
@@ -820,7 +820,7 @@ fn eval_json_fn(name: &str, vals: &[Value]) -> Result<Value> {
             let Some(mut doc) = get_doc(&vals[0])? else {
                 return Ok(Value::Null);
             };
-            if vals[1..].len() % 2 != 0 {
+            if !vals[1..].len().is_multiple_of(2) {
                 return Err(Error::Query(format!(
                     "{} expects (doc, path, val, ...)",
                     name.to_ascii_uppercase()
@@ -869,6 +869,25 @@ fn niladic_fn(name: &str) -> Option<Value> {
 /// `@@global.var`) to a value. Common variables that clients and ORMs probe on
 /// connect are given sensible values; unknown ones return NULL (lenient, so an
 /// unfamiliar `@@variable` never fails a session-setup query).
+#[cfg(target_os = "linux")]
+pub(crate) fn compile_os() -> &'static str {
+    "Linux"
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn compile_os() -> &'static str {
+    "macOS"
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn compile_os() -> &'static str {
+    std::env::consts::OS
+}
+
+pub(crate) fn compile_machine() -> &'static str {
+    std::env::consts::ARCH
+}
+
 pub fn system_var(raw: &str) -> Value {
     let n = raw
         .trim_start_matches("@@")
@@ -880,8 +899,8 @@ pub fn system_var(raw: &str) -> Value {
     match n.as_str() {
         "version" => text(elyra_core::SERVER_VERSION),
         "version_comment" => text("ElyraSQL"),
-        "version_compile_os" => text("Linux"),
-        "version_compile_machine" => text("x86_64"),
+        "version_compile_os" => text(compile_os()),
+        "version_compile_machine" => text(compile_machine()),
         "protocol_version" => Value::Int(10),
         "autocommit" => Value::Int(1),
         "sql_mode" => text("STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION"),
@@ -3057,5 +3076,22 @@ mod resolve_tests {
         assert!(!eq_dotted("aa.k", &parts("a.k")));
         assert!(!eq_dotted("a.k", &parts("a.k.x")));
         assert!(eq_dotted("k", &parts("k")));
+    }
+
+    #[test]
+    fn system_variables_report_the_build_target() {
+        assert_eq!(
+            system_var("@@version_compile_machine"),
+            Value::Text(std::env::consts::ARCH.into())
+        );
+        assert_eq!(
+            system_var("@@version_compile_os"),
+            Value::Text(compile_os().into())
+        );
+
+        #[cfg(target_os = "macos")]
+        assert_eq!(compile_os(), "macOS");
+        #[cfg(target_os = "linux")]
+        assert_eq!(compile_os(), "Linux");
     }
 }

@@ -1,6 +1,7 @@
 # Installation
 
-ElyraSQL targets **Ubuntu 24.04+** for production but runs anywhere Rust does.
+ElyraSQL release builds target **Ubuntu 24.04+** and **Apple Silicon macOS
+11+**. Intel Macs are not supported.
 
 !!! warning "Upgrading to 1.5.0 or later"
 
@@ -27,25 +28,45 @@ ElyraSQL targets **Ubuntu 24.04+** for production but runs anywhere Rust does.
     runaway joins, set [`ELYRASQL_QUERY_TIMEOUT_MS`](configuration.md) instead; it
     interrupts one promptly and leaves the session usable.
 
-## Static binaries
+## Release binaries
 
 Each [release](https://github.com/kwhorne/ElyraSQL/releases) ships fully static
-`musl` binaries for `x86_64` and `aarch64` — no libc or other runtime
-dependency.
+Linux `musl` binaries for `x86_64` and `aarch64`. Releases after v1.6.0 also
+ship a native Apple Silicon macOS binary. The macOS build links only
+Apple-provided system libraries and supports macOS 11 or later.
 
 ```bash
-VER=1.6.0
+# Linux
+VER=X.Y.Z
 ARCH=x86_64   # or aarch64
 curl -L -o elyrasql.tar.gz \
-  https://github.com/kwhorne/ElyraSQL/releases/download/v${VER}/elyrasql-${VER}-linux-${ARCH}.tar.gz
+  "https://github.com/kwhorne/ElyraSQL/releases/download/v${VER}/elyrasql-${VER}-linux-${ARCH}.tar.gz"
 tar xzf elyrasql.tar.gz
 cd elyrasql-${VER}-linux-${ARCH}
 ./elyrasql version
 ```
 
-Each archive contains the `elyrasql` binary, `README`, `LICENSE`, and a sample
-`elyrasql.service` systemd unit. Verify integrity with the published
-`.sha256` file.
+```bash
+# Apple Silicon, macOS 11+
+VER=X.Y.Z
+curl -L -o elyrasql.tar.gz \
+  "https://github.com/kwhorne/ElyraSQL/releases/download/v${VER}/elyrasql-${VER}-macos-aarch64.tar.gz"
+tar xzf elyrasql.tar.gz
+cd elyrasql-${VER}-macos-aarch64
+./elyrasql version
+```
+
+Every archive contains `elyrasql`, `README`, and `LICENSE`; Linux archives also
+contain a sample `elyrasql.service` systemd unit. Verify integrity with the
+published `.sha256` file (`sha256sum -c` on Linux or `shasum -a 256 -c` on
+macOS).
+
+!!! note "macOS code signing"
+
+    The macOS binary currently has the ad-hoc signature produced by the Apple
+    linker, not a Developer ID signature or Apple notarization. Environments
+    that require Gatekeeper publisher verification should build from source
+    until signed and notarized release credentials are configured.
 
 ## Docker
 
@@ -62,13 +83,24 @@ The image is ~15 MB, runs as a non-root user, stores data in the
 
 ## Build from source
 
-Requires Rust 1.82+.
+Requires Rust 1.88+ and the platform toolchain. On macOS, install Xcode Command
+Line Tools first (`xcode-select --install`).
 
 ```bash
 git clone https://github.com/kwhorne/ElyraSQL.git
 cd ElyraSQL
 cargo build --release
 ./target/release/elyrasql serve
+```
+
+For an explicit Apple Silicon build with the same deployment floor as the
+release:
+
+```bash
+rustup target add aarch64-apple-darwin
+MACOSX_DEPLOYMENT_TARGET=11.0 \
+  cargo build --release --locked --target aarch64-apple-darwin -p elyra-cli
+./target/aarch64-apple-darwin/release/elyrasql version
 ```
 
 To build a static binary yourself:

@@ -544,8 +544,11 @@ fn system_variables() -> Vec<(&'static str, String)> {
         ("tx_isolation", "REPEATABLE-READ".into()),
         ("version", elyra_core::SERVER_VERSION.into()),
         ("version_comment", "ElyraSQL \u{2014} MIT licensed".into()),
-        ("version_compile_machine", std::env::consts::ARCH.into()),
-        ("version_compile_os", "Linux".into()),
+        (
+            "version_compile_machine",
+            predicate::compile_machine().into(),
+        ),
+        ("version_compile_os", predicate::compile_os().into()),
         ("wait_timeout", "28800".into()),
     ]
 }
@@ -588,6 +591,26 @@ pub fn show_variables(filter: Option<&sqlparser::ast::ShowStatementFilter>) -> R
         text_schema(&["Variable_name", "Value"]),
         rows,
     )))
+}
+
+#[cfg(test)]
+mod system_variable_tests {
+    use super::system_variables;
+    use crate::predicate;
+    use std::collections::HashMap;
+
+    #[test]
+    fn show_variables_reports_the_build_target() {
+        let variables: HashMap<_, _> = system_variables().into_iter().collect();
+        assert_eq!(
+            variables.get("version_compile_machine").map(String::as_str),
+            Some(predicate::compile_machine())
+        );
+        assert_eq!(
+            variables.get("version_compile_os").map(String::as_str),
+            Some(predicate::compile_os())
+        );
+    }
 }
 
 /// `SHOW [GLOBAL|SESSION] STATUS [LIKE ...]` — minimal counters.
@@ -5162,7 +5185,7 @@ impl Pacer {
     #[inline]
     async fn tick(&mut self) {
         self.tick = self.tick.wrapping_add(1);
-        if self.tick % Self::INTERVAL == 0 {
+        if self.tick.is_multiple_of(Self::INTERVAL) {
             tokio::task::yield_now().await;
         }
     }

@@ -87,8 +87,8 @@ fn temp_path() -> PathBuf {
 /// Delete leftover spill/aggregation temp files from ElyraSQL processes that are
 /// no longer running (e.g. killed with SIGKILL, which skips `Drop` cleanup).
 /// Only removes files whose embedded PID is *confirmed* dead, so concurrently
-/// running instances are never disturbed; a no-op where liveness can't be
-/// determined (non-Linux) or the temp dir can't be read.
+/// running instances are never disturbed; a no-op where process liveness can't
+/// be determined or the temp dir can't be read.
 pub fn cleanup_stale_tempfiles() {
     let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
         return;
@@ -116,15 +116,31 @@ fn tempfile_pid(name: &str) -> Option<u32> {
     digits.parse().ok()
 }
 
-/// True only when we can *confirm* the process is gone (via Linux `/proc`).
-/// When liveness can't be determined, returns `false` so a possibly-live file
-/// is never deleted.
+/// True only when POSIX `kill(pid, 0)` confirms that the process is gone.
+/// `EPERM` means the process exists under another user; every other unexpected
+/// error is treated as possibly alive so cleanup cannot delete a live owner's
+/// files.
+#[cfg(unix)]
 fn pid_is_dead(pid: u32) -> bool {
-    let proc_root = std::path::Path::new("/proc");
-    if !proc_root.exists() {
-        return false; // not Linux (e.g. dev on macOS) -> don't risk it
+    use rustix::io::Errno;
+    use rustix::process::{test_kill_process, Pid};
+
+    let Ok(raw_pid) = i32::try_from(pid) else {
+        return false;
+    };
+    let Some(pid) = Pid::from_raw(raw_pid) else {
+        return false;
+    };
+    match test_kill_process(pid) {
+        Err(Errno::SRCH) => true,
+        Ok(()) | Err(Errno::PERM) => false,
+        Err(_) => false,
     }
-    !proc_root.join(pid.to_string()).exists()
+}
+
+#[cfg(not(unix))]
+fn pid_is_dead(_pid: u32) -> bool {
+    false
 }
 
 /// A spilled, sorted run on disk, read back one length-prefixed frame at a time.
@@ -484,8 +500,9 @@ mod cleanup_tests {
         );
         let _ = std::fs::remove_file(&path);
 
-        // On Linux we can confirm a clearly-dead PID's file is reclaimed.
-        if std::path::Path::new("/proc").exists() {
+        // Unix provides kill(pid, 0), so a clearly-dead PID is reclaimed.
+        #[cfg(unix)]
+        {
             let dead = std::env::temp_dir().join("elyrasql-sort-2147480000-1.tmp");
             std::fs::write(&dead, b"x").unwrap();
             assert!(pid_is_dead(2_147_480_000));

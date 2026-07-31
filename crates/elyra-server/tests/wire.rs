@@ -2259,7 +2259,7 @@ async fn nullable_indexed_order_by_limit() {
     let mut seed: u64 = 0x51ED;
     for id in 1..=3000i64 {
         seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-        let is_null = (seed >> 3) % 8 == 0;
+        let is_null = (seed >> 3).is_multiple_of(8);
         let rev = if is_null {
             None
         } else {
@@ -2337,7 +2337,7 @@ async fn compound_order_by_pk_tiebreaker() {
     let mut seed: u64 = 0xC0FFEE;
     for id in 1..=3000i64 {
         seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-        let rev = if (seed >> 7) % 16 == 0 {
+        let rev = if (seed >> 7).is_multiple_of(16) {
             None
         } else {
             Some(((seed >> 20) % 20) as i64)
@@ -2394,7 +2394,7 @@ async fn null_indexed_order_walk() {
     let mut seed: u64 = 0x24;
     for id in 1..=2500i64 {
         seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-        let rev = if (seed >> 5) % 8 == 0 {
+        let rev = if (seed >> 5).is_multiple_of(8) {
             None
         } else {
             Some(((seed >> 20) % 30) as i64)
