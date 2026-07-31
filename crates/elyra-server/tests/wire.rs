@@ -1216,32 +1216,42 @@ async fn non_strict_sql_mode_coerces_invalid_integer_text() {
     let srv = TestServer::start().await;
     let mut c = srv.conn().await;
 
-    c.query_drop("CREATE TABLE mode_values (id INT PRIMARY KEY, value INT)")
-        .await
-        .unwrap();
+    c.query_drop(
+        "CREATE TABLE mode_values (
+            id INT PRIMARY KEY,
+            value INT,
+            unsigned_value BIGINT UNSIGNED
+        )",
+    )
+    .await
+    .unwrap();
     c.query_drop(
         "SET NAMES 'utf8mb4' COLLATE 'utf8mb4_unicode_ci', \
          SESSION sql_mode='NO_ENGINE_SUBSTITUTION'",
     )
     .await
     .unwrap();
-    c.query_drop("INSERT INTO mode_values VALUES (1, '{\"name\":\"row\"}')")
+    c.query_drop("INSERT INTO mode_values VALUES (1, '{\"name\":\"row\"}', '')")
         .await
         .unwrap();
-    c.query_drop("INSERT INTO mode_values VALUES (2, '123tail')")
+    c.query_drop("INSERT INTO mode_values VALUES (2, '123tail', '456tail')")
         .await
         .unwrap();
-    let values: Vec<i64> = c
-        .query("SELECT value FROM mode_values ORDER BY id")
+    let values: Vec<(i64, u64)> = c
+        .query("SELECT value, unsigned_value FROM mode_values ORDER BY id")
         .await
         .unwrap();
-    assert_eq!(values, [0, 123]);
+    assert_eq!(values, [(0, 0), (123, 456)]);
 
     c.query_drop("SET SESSION sql_mode='STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION'")
         .await
         .unwrap();
     assert!(c
-        .query_drop("INSERT INTO mode_values VALUES (3, 'invalid')")
+        .query_drop("INSERT INTO mode_values VALUES (3, 'invalid', 'invalid')")
+        .await
+        .is_err());
+    assert!(c
+        .query_drop("INSERT INTO mode_values VALUES (4, 1, '')")
         .await
         .is_err());
 }

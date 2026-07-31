@@ -14835,15 +14835,43 @@ fn coerce_with_mode(v: Value, ty: &ColumnType, col: &str, strict: bool) -> Resul
         (ColumnType::Vector(dim), Value::Text(s)) => Value::Vector(parse_vector(&s, *dim)?),
         // BIGINT UNSIGNED.
         (ColumnType::UInt, Value::UInt(u)) => Value::UInt(u),
-        (ColumnType::UInt, Value::Int(i)) => Value::UInt(i as u64),
+        (ColumnType::UInt, Value::Int(i)) if i >= 0 => Value::UInt(i as u64),
+        (ColumnType::UInt, Value::Int(_)) if !strict => Value::UInt(0),
+        (ColumnType::UInt, Value::Int(i)) => {
+            return Err(Error::Type(format!("invalid UNSIGNED value: {i}")))
+        }
         (ColumnType::UInt, Value::Bool(b)) => Value::UInt(b as u64),
-        (ColumnType::UInt, Value::Float(f)) => Value::UInt(f as u64),
-        (ColumnType::UInt, Value::Text(s)) => s
-            .trim()
-            .parse::<u64>()
-            .or_else(|_| s.trim().parse::<f64>().map(|f| f as u64))
-            .map(Value::UInt)
-            .map_err(|_| Error::Type(format!("invalid UNSIGNED value: {s}")))?,
+        (ColumnType::UInt, Value::Float(f))
+            if f.is_finite() && f >= 0.0 && f < 18_446_744_073_709_551_616.0 =>
+        {
+            Value::UInt(f as u64)
+        }
+        (ColumnType::UInt, Value::Float(_)) if !strict => Value::UInt(0),
+        (ColumnType::UInt, Value::Float(f)) => {
+            return Err(Error::Type(format!("invalid UNSIGNED value: {f}")))
+        }
+        (ColumnType::UInt, Value::Text(s)) => {
+            let text = s.trim();
+            if let Ok(value) = text.parse::<u64>() {
+                Value::UInt(value)
+            } else if let Ok(value) = text.parse::<f64>() {
+                if value.is_finite() && value >= 0.0 && value < 18_446_744_073_709_551_616.0 {
+                    Value::UInt(value as u64)
+                } else if !strict {
+                    Value::UInt(if value.is_sign_negative() {
+                        0
+                    } else {
+                        u64::MAX
+                    })
+                } else {
+                    return Err(Error::Type(format!("invalid UNSIGNED value: {s}")));
+                }
+            } else if !strict {
+                Value::UInt(mysql_integer_prefix(&s).max(0) as u64)
+            } else {
+                return Err(Error::Type(format!("invalid UNSIGNED value: {s}")));
+            }
+        }
         (ColumnType::Int, Value::UInt(u)) => Value::Int(u as i64),
         (ColumnType::Float, Value::UInt(u)) => Value::Float(u as f64),
         // Lenient (MySQL-style) conversions.
