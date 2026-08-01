@@ -6,6 +6,31 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **Native Apple Silicon support is release-gated.** CI now builds and runs the
+  full workspace test suite on an arm64 macOS runner using the minimum supported
+  Rust toolchain. Tagged releases add an `elyrasql-<version>-macos-aarch64`
+  archive and checksum alongside the existing Linux artifacts. The macOS build
+  targets macOS 11.0, verifies the Mach-O architecture/minimum OS/signature, and
+  is executed again after archive extraction.
+
+### Changed
+
+- **The documented minimum Rust version is now 1.88.** The locked dependency
+  graph already required 1.88 (notably `time` through the wire-protocol stack),
+  so the previous 1.82 claim could not reproduce a locked build. The macOS CI
+  lane now tests the corrected minimum directly.
+
+### Fixed
+
+- **Build metadata now reports the real target.** `@@version_compile_os`,
+  `@@version_compile_machine`, and their `SHOW VARIABLES` equivalents no longer
+  claim that Apple Silicon builds are Linux/x86_64.
+- **Crash-leaked sort and aggregation files are reclaimed on macOS.** Unix
+  process liveness now uses a non-signalling `kill(pid, 0)` check instead of the
+  Linux-only `/proc` filesystem, while treating ambiguous results as live.
+
 ## [1.6.0] - 2026-07-29
 
 A performance release built on one finding: **two slow-join reports were the same

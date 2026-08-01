@@ -76,8 +76,8 @@ workload — served over the protocol your stack already knows.
   in one query, and `ai_embed('text')` generates embeddings in SQL via an
   OpenAI-compatible endpoint: the RAG stack in one file, no external search
   engine.
-- **MIT licensed**, targets **Ubuntu 24.04+** for production, develops
-  anywhere Rust runs.
+- **MIT licensed**, release-tested on **Ubuntu 24.04+** and **Apple Silicon
+  macOS 11+**.
 
 ## SQL support
 
@@ -210,13 +210,28 @@ bound them with `ELYRASQL_QUERY_TIMEOUT_MS`.
 
 ## Install
 
-Static Linux binaries (x86_64 and aarch64) are attached to each
-[GitHub Release](https://github.com/kwhorne/ElyraSQL/releases):
+Linux static binaries (`x86_64` and `aarch64`) are attached to each
+[GitHub Release](https://github.com/kwhorne/ElyraSQL/releases). Releases after
+v1.6.0 also include a native Apple Silicon macOS binary; Intel Macs are not
+supported.
 
 ```bash
+# Linux x86_64 (use ARCH=aarch64 on ARM Linux)
+VER=X.Y.Z
+ARCH=x86_64
 curl -L -o elyrasql.tar.gz \
-  https://github.com/kwhorne/ElyraSQL/releases/download/v1.6.0/elyrasql-1.6.0-linux-x86_64.tar.gz
-tar xzf elyrasql.tar.gz && ./elyrasql-1.6.0-linux-x86_64/elyrasql serve
+  "https://github.com/kwhorne/ElyraSQL/releases/download/v${VER}/elyrasql-${VER}-linux-${ARCH}.tar.gz"
+tar xzf elyrasql.tar.gz
+./elyrasql-${VER}-linux-${ARCH}/elyrasql serve
+```
+
+```bash
+# Apple Silicon, macOS 11+
+VER=X.Y.Z
+curl -L -o elyrasql.tar.gz \
+  "https://github.com/kwhorne/ElyraSQL/releases/download/v${VER}/elyrasql-${VER}-macos-aarch64.tar.gz"
+tar xzf elyrasql.tar.gz
+./elyrasql-${VER}-macos-aarch64/elyrasql serve
 ```
 
 ## Docker

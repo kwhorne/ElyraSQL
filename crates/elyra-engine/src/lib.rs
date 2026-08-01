@@ -190,7 +190,7 @@ impl Engine {
                             Act::Bubble(o) => return Ok(o),
                         }
                         n += 1;
-                        if n % 1024 == 0 {
+                        if n.is_multiple_of(1024) {
                             tokio::task::yield_now().await;
                         }
                         if n >= MAX_LOOP {
@@ -209,7 +209,7 @@ impl Engine {
                             Act::Bubble(o) => return Ok(o),
                         }
                         n += 1;
-                        if n % 1024 == 0 {
+                        if n.is_multiple_of(1024) {
                             tokio::task::yield_now().await;
                         }
                         if n >= MAX_LOOP {
@@ -231,7 +231,7 @@ impl Engine {
                             break;
                         }
                         n += 1;
-                        if n % 1024 == 0 {
+                        if n.is_multiple_of(1024) {
                             tokio::task::yield_now().await;
                         }
                         if n >= MAX_LOOP {

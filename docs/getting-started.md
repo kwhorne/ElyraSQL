@@ -12,7 +12,7 @@ in a couple of minutes.
       ghcr.io/kwhorne/elyrasql:latest
     ```
 
-=== "Static binary"
+=== "Release binary"
 
     Download the release for your architecture from the
     [releases page](https://github.com/kwhorne/ElyraSQL/releases), then:

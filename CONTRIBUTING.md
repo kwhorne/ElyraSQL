@@ -35,7 +35,7 @@ ElyraSQL is a Cargo workspace. See
 
 ## Development setup
 
-Requires Rust 1.82+.
+Requires Rust 1.88+.
 
 ```bash
 git clone https://github.com/kwhorne/ElyraSQL.git

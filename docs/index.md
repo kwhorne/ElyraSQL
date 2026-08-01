@@ -34,7 +34,8 @@ vector search and parallel analytical (OLAP) aggregation — all under one brand
   B-tree indexes, range scans, and HNSW vector indexes.
 - **Transactions** — `BEGIN` / `COMMIT` / `ROLLBACK` with **snapshot isolation**.
 - **Security** — `mysql_native_password` auth, TLS, and read/write/admin roles.
-- **Operations** — single static binary, systemd unit, and a ~15 MB Docker image.
+- **Operations** — static Linux and native Apple Silicon macOS binaries, a
+  systemd unit, and a ~15 MB Docker image.
 
 ## Quick taste
 
