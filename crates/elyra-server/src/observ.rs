@@ -203,7 +203,11 @@ fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else {
-        format!("{}…", &s[..max])
+        let mut end = max;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}…", &s[..end])
     }
 }
 
@@ -346,5 +350,26 @@ impl AuditLog {
         if let Ok(mut f) = self.file.lock() {
             let _ = writeln!(f, "{ts}\t{conn_id}\t{user}\t{status}\t{flat}");
         }
+    }
+}
+
+#[cfg(test)]
+mod truncate_tests {
+    use super::truncate;
+
+    #[test]
+    fn preserves_text_that_fits() {
+        assert_eq!(truncate("plain", 5), "plain");
+    }
+
+    #[test]
+    fn truncates_at_a_utf8_boundary() {
+        assert_eq!(truncate("abc🚀def", 5), "abc…");
+        assert_eq!(truncate("abc🚀def", 7), "abc🚀…");
+    }
+
+    #[test]
+    fn supports_a_zero_byte_limit() {
+        assert_eq!(truncate("text", 0), "…");
     }
 }
