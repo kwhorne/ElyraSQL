@@ -2565,52 +2565,70 @@ fn resolve(name: &str, schema: &Schema, row: &[Value]) -> Result<Value> {
     Ok(row.get(idx).cloned().unwrap_or(Value::Null))
 }
 
-/// True if `col` equals `parts` joined by `.`, case-insensitively, without
-/// building that joined string.
-fn eq_dotted(col: &str, parts: &[sqlparser::ast::Ident]) -> bool {
-    let mut rest = col;
-    for (i, p) in parts.iter().enumerate() {
-        if i > 0 {
-            match rest.strip_prefix('.') {
-                Some(r) => rest = r,
-                None => return false,
-            }
-        }
-        if rest.len() < p.value.len() {
-            return false;
-        }
-        let (head, tail) = rest.split_at(p.value.len());
-        if !head.eq_ignore_ascii_case(&p.value) {
-            return false;
-        }
-        rest = tail;
+fn qualifier_matches_parts(qualifier: &[String], reference: &[sqlparser::ast::Ident]) -> bool {
+    reference.len() <= qualifier.len()
+        && qualifier[qualifier.len() - reference.len()..]
+            .iter()
+            .zip(reference)
+            .all(|(stored, requested)| stored.eq_ignore_ascii_case(&requested.value))
+}
+
+fn column_name(column: &elyra_core::ColumnDef) -> &str {
+    if column.qualifier.is_empty() {
+        return &column.name;
     }
-    rest.is_empty()
+    let qualifier_len = column.qualifier.iter().map(String::len).sum::<usize>()
+        + column.qualifier.len().saturating_sub(1);
+    column.name.get(qualifier_len + 1..).unwrap_or(&column.name)
 }
 
 /// [`resolve_index`] for an already-split qualified reference (`t.col` arrives
-/// as parts). Same two-stage rule, but it does not allocate: evaluating a
+/// as parts). Same exact/qualified-suffix/bare rule, but it does not allocate: evaluating a
 /// qualified column per row used to build a `String` for the joined name and
 /// resolve it again for every row, which showed up in profiles of joins and
 /// filters alike.
 pub fn resolve_index_parts(parts: &[sqlparser::ast::Ident], schema: &Schema) -> Result<usize> {
-    if let Some(i) = schema
-        .columns
-        .iter()
-        .position(|c| eq_dotted(&c.name, parts))
-    {
-        return Ok(i);
-    }
     let Some(last) = parts.last() else {
         return Err(Error::Catalog("unknown column".into()));
     };
-    fn bare(n: &str) -> &str {
-        n.rsplit('.').next().unwrap_or(n)
+    if parts.len() >= 2 {
+        let has_qualified_columns = schema
+            .columns
+            .iter()
+            .any(|column| !column.qualifier.is_empty());
+        let hits = schema
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_, column)| {
+                if has_qualified_columns {
+                    !column.qualifier.is_empty()
+                        && column_name(column).eq_ignore_ascii_case(&last.value)
+                        && qualifier_matches_parts(&column.qualifier, &parts[..parts.len() - 1])
+                } else {
+                    column.name.eq_ignore_ascii_case(&last.value)
+                }
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        match hits.as_slice() {
+            [index] => return Ok(*index),
+            [] if has_qualified_columns => {
+                return Err(Error::Catalog(format!("unknown column: {}", dotted(parts))))
+            }
+            [] => {}
+            _ => return Err(Error::Query(format!("ambiguous column: {}", dotted(parts)))),
+        }
     }
     let mut hit = None;
     let mut n = 0usize;
     for (i, c) in schema.columns.iter().enumerate() {
-        if bare(&c.name).eq_ignore_ascii_case(&last.value) {
+        let name = if c.qualifier.is_empty() {
+            c.name.as_str()
+        } else {
+            column_name(c)
+        };
+        if name.eq_ignore_ascii_case(&last.value) {
             n += 1;
             hit = Some(i);
         }
@@ -2633,14 +2651,45 @@ fn dotted(parts: &[sqlparser::ast::Ident]) -> String {
 
 /// Resolve a column reference to an index. Handles both single-table (bare
 /// names) and joined (qualified "table.col") schemas: exact match first, then
-/// a unique bare-suffix match (so `col` resolves against `t.col`).
+/// a unique qualified suffix (`t.col` against `db.t.col`), then a unique bare
+/// suffix (`col` against `t.col`).
 pub fn resolve_index(name: &str, schema: &Schema) -> Result<usize> {
-    if let Some(i) = schema
+    let exact_names = schema
         .columns
         .iter()
-        .position(|c| c.name.eq_ignore_ascii_case(name))
-    {
-        return Ok(i);
+        .enumerate()
+        .filter(|(_, column)| column_name(column).eq_ignore_ascii_case(name))
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    match exact_names.as_slice() {
+        [index] => return Ok(*index),
+        [] => {}
+        _ => return Err(Error::Query(format!("ambiguous column: {name}"))),
+    }
+    if name.contains('.') {
+        let reference = name.split('.').collect::<Vec<_>>();
+        let (requested_qualifier, requested_column) =
+            reference.split_at(reference.len().saturating_sub(1));
+        let hits = schema
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_, column)| {
+                !column.qualifier.is_empty()
+                    && column_name(column).eq_ignore_ascii_case(requested_column[0])
+                    && requested_qualifier.len() <= column.qualifier.len()
+                    && column.qualifier[column.qualifier.len() - requested_qualifier.len()..]
+                        .iter()
+                        .zip(requested_qualifier)
+                        .all(|(stored, requested)| stored.eq_ignore_ascii_case(requested))
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        match hits.as_slice() {
+            [index] => return Ok(*index),
+            [] => {}
+            _ => return Err(Error::Query(format!("ambiguous column: {name}"))),
+        }
     }
     // Match on the bare (unqualified) name on both sides, so a qualified
     // reference like `t.col` resolves against a single-table (bare) schema and
@@ -2651,7 +2700,14 @@ pub fn resolve_index(name: &str, schema: &Schema) -> Result<usize> {
         .columns
         .iter()
         .enumerate()
-        .filter(|(_, c)| bare(&c.name).eq_ignore_ascii_case(&target))
+        .filter(|(_, c)| {
+            let candidate = if c.qualifier.is_empty() {
+                c.name.clone()
+            } else {
+                column_name(c).to_owned()
+            };
+            candidate.eq_ignore_ascii_case(&target)
+        })
         .map(|(i, _)| i)
         .collect();
     match hits.len() {
@@ -2924,12 +2980,13 @@ fn cmp(l: &Value, r: &Value, coll: Collation) -> Result<Option<std::cmp::Orderin
 
 /// Collation of a bare/qualified column reference, if it is one.
 fn expr_collation(e: &Expr, schema: &Schema) -> Option<Collation> {
-    let name = match e {
-        Expr::Identifier(id) => id.value.as_str(),
-        Expr::CompoundIdentifier(parts) => parts.last()?.value.as_str(),
+    let index = match e {
+        Expr::Identifier(id) => resolve_index_parts(std::slice::from_ref(id), schema),
+        Expr::CompoundIdentifier(parts) => resolve_index_parts(parts, schema),
+        Expr::Nested(inner) => return expr_collation(inner, schema),
         _ => return None,
     };
-    schema.column(name).map(|c| c.collation)
+    index.ok().map(|index| schema.columns[index].collation)
 }
 
 /// The comparison collation for two operands: case-sensitive if either is a
@@ -3055,23 +3112,38 @@ mod resolve_tests {
         )
     }
 
+    fn qualified_schema(names: &[&str]) -> Schema {
+        Schema::new(
+            names
+                .iter()
+                .map(|name| {
+                    let mut parts = name.split('.').collect::<Vec<_>>();
+                    parts.pop();
+                    ColumnDef::new(*name, ColumnType::Int, true)
+                        .with_qualifier(parts.into_iter().map(str::to_owned).collect())
+                })
+                .collect(),
+        )
+    }
+
     /// The allocation-free parts resolver must agree with the string resolver on
     /// every shape: exact qualified match, bare-suffix match, ambiguity and
     /// absence. A disagreement would read the wrong column, silently.
     #[test]
     fn parts_resolver_agrees_with_string_resolver() {
         let cases: Vec<(Schema, &str)> = vec![
-            (schema(&["a.k", "a.v", "b.k", "b.v"]), "b.v"),
-            (schema(&["a.k", "a.v", "b.k", "b.v"]), "B.V"),
-            (schema(&["a.k", "a.v", "b.k", "b.v"]), "v"),
-            (schema(&["a.k", "a.v", "b.k", "b.v"]), "c.v"),
-            (schema(&["a.k", "a.v"]), "a.v"),
-            (schema(&["a.k", "a.v"]), "v"),
+            (qualified_schema(&["a.k", "a.v", "b.k", "b.v"]), "b.v"),
+            (qualified_schema(&["a.k", "a.v", "b.k", "b.v"]), "B.V"),
+            (qualified_schema(&["a.k", "a.v", "b.k", "b.v"]), "v"),
+            (qualified_schema(&["a.k", "a.v", "b.k", "b.v"]), "c.v"),
+            (qualified_schema(&["a.k", "a.v"]), "a.v"),
+            (qualified_schema(&["a.k", "a.v"]), "v"),
             (schema(&["k", "v"]), "t.v"),
             (schema(&["k", "v"]), "v"),
             (schema(&["k", "v"]), "nope"),
-            (schema(&["db.t.v", "db.t.k"]), "db.t.v"),
-            (schema(&["db.t.v", "db.t.k"]), "t.v"),
+            (qualified_schema(&["db.t.v", "db.t.k"]), "db.t.v"),
+            (qualified_schema(&["db.t.v", "db.t.k"]), "t.v"),
+            (qualified_schema(&["db1.t.v", "db2.t.v"]), "t.v"),
         ];
         for (sch, name) in cases {
             let p = parts(name);
@@ -3093,14 +3165,31 @@ mod resolve_tests {
     }
 
     #[test]
-    fn eq_dotted_is_exact() {
-        assert!(eq_dotted("a.k", &parts("a.k")));
-        assert!(eq_dotted("A.K", &parts("a.k")));
-        assert!(!eq_dotted("a.k", &parts("a")));
-        assert!(!eq_dotted("a.kk", &parts("a.k")));
-        assert!(!eq_dotted("aa.k", &parts("a.k")));
-        assert!(!eq_dotted("a.k", &parts("a.k.x")));
-        assert!(eq_dotted("k", &parts("k")));
+    fn qualified_suffix_resolution_is_unique() {
+        let sch = qualified_schema(&["db.t.id", "db.other.id"]);
+        assert_eq!(resolve_index("t.id", &sch).unwrap(), 0);
+        assert_eq!(resolve_index_parts(&parts("t.id"), &sch).unwrap(), 0);
+
+        let dotted_identifier = Schema::new(vec![
+            ColumnDef::new("elyra.dot.name.id", ColumnType::Int, true)
+                .with_qualifier(vec!["elyra".into(), "dot.name".into()]),
+            ColumnDef::new("elyra.dot_partner.id", ColumnType::Int, true)
+                .with_qualifier(vec!["elyra".into(), "dot_partner".into()]),
+        ]);
+        assert_eq!(
+            resolve_index_parts(&[ident("dot.name"), ident("id")], &dotted_identifier).unwrap(),
+            0
+        );
+
+        let ambiguous = qualified_schema(&["db1.t.id", "db2.t.id"]);
+        assert!(matches!(
+            resolve_index("t.id", &ambiguous),
+            Err(Error::Query(message)) if message.contains("ambiguous")
+        ));
+        assert!(matches!(
+            resolve_index_parts(&parts("t.id"), &ambiguous),
+            Err(Error::Query(message)) if message.contains("ambiguous")
+        ));
     }
 
     #[test]
