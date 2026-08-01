@@ -2000,6 +2000,62 @@ async fn multi_key_using_preserves_sql_coercion_and_collation_semantics() {
 }
 
 #[tokio::test]
+async fn coercive_composite_using_and_natural_joins_keep_binary_collation() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop(
+        "CREATE TABLE coercive_coll_l (
+             id INT,
+             label VARCHAR(8) COLLATE utf8mb4_general_ci,
+             lval VARCHAR(8)
+         )",
+    )
+    .await
+    .unwrap();
+    c.query_drop(
+        "CREATE TABLE coercive_coll_r (
+             id VARCHAR(8),
+             label VARCHAR(8) COLLATE utf8mb4_bin,
+             rval VARCHAR(8)
+         )",
+    )
+    .await
+    .unwrap();
+    c.query_drop("INSERT INTO coercive_coll_l VALUES (5,'x','lower'),(6,'X','exact')")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO coercive_coll_r VALUES ('5','X','wrong'),('6','X','right')")
+        .await
+        .unwrap();
+
+    let using_rows: Vec<(i64, String, String, String)> = c
+        .query(
+            "SELECT l.id, l.label, l.lval, r.rval
+             FROM coercive_coll_l AS l
+             JOIN coercive_coll_r AS r USING(id, label)
+             ORDER BY l.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        using_rows,
+        [(6, "X".into(), "exact".into(), "right".into())]
+    );
+
+    let natural_rows: Vec<(i64, String, String, String)> = c
+        .query(
+            "SELECT l.id, l.label, l.lval, r.rval
+             FROM coercive_coll_l AS l
+             NATURAL JOIN coercive_coll_r AS r
+             ORDER BY l.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(natural_rows, using_rows);
+}
+
+#[tokio::test]
 async fn correlated_exists_preserves_inner_bare_columns() {
     let srv = TestServer::start().await;
     let mut c = srv.conn().await;
