@@ -1751,6 +1751,73 @@ async fn natural_join_uses_all_common_columns_and_mysql_star_order() {
 }
 
 #[tokio::test]
+async fn using_and_natural_joins_preserve_quoted_identifier_boundaries() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop("CREATE TABLE `join.left` (`join.key` INT PRIMARY KEY, left_value VARCHAR(8))")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE `join.right` (`join.key` INT PRIMARY KEY, right_value VARCHAR(8))")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE `join.third` (`join.key` INT PRIMARY KEY, third_value VARCHAR(8))")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO `join.left` VALUES (1,'L1'),(2,'L2')")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO `join.right` VALUES (1,'R1'),(3,'R3')")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO `join.third` VALUES (1,'T1'),(4,'T4')")
+        .await
+        .unwrap();
+
+    let sql = "SELECT *
+               FROM `join.left` AS `left.alias`
+               JOIN `join.right` AS `right.alias` USING (`join.key`)
+               JOIN `join.third` AS `third.alias` USING (`join.key`)";
+    let mut result = c.query_iter(sql).await.unwrap();
+    let columns = result.columns_ref();
+    let names = columns
+        .iter()
+        .map(|column| column.name_str().into_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        ["join.key", "left_value", "right_value", "third_value"]
+    );
+    let tables = columns
+        .iter()
+        .map(|column| column.table_str().into_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(tables, ["", "left.alias", "right.alias", "third.alias"]);
+    let rows: Vec<(i64, String, String, String)> = result.collect().await.unwrap();
+    assert_eq!(rows, [(1, "L1".into(), "R1".into(), "T1".into())]);
+
+    let qualified: Vec<(i64, i64)> = c
+        .query(
+            "SELECT `left.alias`.`join.key`, `right.alias`.`join.key`
+             FROM `join.left` AS `left.alias`
+             JOIN `join.right` AS `right.alias` USING (`join.key`)",
+        )
+        .await
+        .unwrap();
+    assert_eq!(qualified, [(1, 1)]);
+
+    let natural: Vec<(i64, String, String)> = c
+        .query(
+            "SELECT *
+             FROM `join.left` AS `left.alias`
+             NATURAL JOIN `join.right` AS `right.alias`",
+        )
+        .await
+        .unwrap();
+    assert_eq!(natural, [(1, "L1".into(), "R1".into())]);
+}
+
+#[tokio::test]
 async fn using_join_visibility_survives_later_on_and_cross_joins() {
     let srv = TestServer::start().await;
     let mut c = srv.conn().await;

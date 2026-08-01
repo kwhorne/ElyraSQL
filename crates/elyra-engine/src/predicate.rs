@@ -3079,29 +3079,20 @@ mod resolve_tests {
         )
     }
 
-    /// The allocation-free parts resolver must agree with the string resolver on
-    /// every shape: exact qualified match, bare-suffix match, ambiguity and
-    /// absence. A disagreement would read the wrong column, silently.
+    /// A one-part AST reference and a bare identifier string share the same
+    /// resolution path. Qualified references deliberately use only the parts
+    /// resolver so dots inside quoted identifiers remain data.
     #[test]
-    fn parts_resolver_agrees_with_string_resolver() {
+    fn bare_identifier_resolvers_agree() {
         let cases: Vec<(Schema, &str)> = vec![
-            (qualified_schema(&["a.k", "a.v", "b.k", "b.v"]), "b.v"),
-            (qualified_schema(&["a.k", "a.v", "b.k", "b.v"]), "B.V"),
             (qualified_schema(&["a.k", "a.v", "b.k", "b.v"]), "v"),
-            (qualified_schema(&["a.k", "a.v", "b.k", "b.v"]), "c.v"),
-            (qualified_schema(&["a.k", "a.v"]), "a.v"),
             (qualified_schema(&["a.k", "a.v"]), "v"),
-            (schema(&["k", "v"]), "t.v"),
             (schema(&["k", "v"]), "v"),
             (schema(&["k", "v"]), "nope"),
-            (qualified_schema(&["db.t.v", "db.t.k"]), "db.t.v"),
-            (qualified_schema(&["db.t.v", "db.t.k"]), "t.v"),
-            (qualified_schema(&["db1.t.v", "db2.t.v"]), "t.v"),
         ];
         for (sch, name) in cases {
-            let p = parts(name);
             let by_str = resolve_index(name, &sch);
-            let by_parts = resolve_index_parts(&p, &sch);
+            let by_parts = resolve_index_parts(&[ident(name)], &sch);
             match (&by_str, &by_parts) {
                 (Ok(a), Ok(b)) => assert_eq!(a, b, "{name} in {:?}", cols(&sch)),
                 (Err(_), Err(_)) => {}
@@ -3120,7 +3111,6 @@ mod resolve_tests {
     #[test]
     fn qualified_suffix_resolution_is_unique() {
         let sch = qualified_schema(&["db.t.id", "db.other.id"]);
-        assert_eq!(resolve_index("t.id", &sch).unwrap(), 0);
         assert_eq!(resolve_index_parts(&parts("t.id"), &sch).unwrap(), 0);
 
         let dotted_identifier = Schema::new(vec![
@@ -3136,13 +3126,22 @@ mod resolve_tests {
 
         let ambiguous = qualified_schema(&["db1.t.id", "db2.t.id"]);
         assert!(matches!(
-            resolve_index("t.id", &ambiguous),
-            Err(Error::Query(message)) if message.contains("ambiguous")
-        ));
-        assert!(matches!(
             resolve_index_parts(&parts("t.id"), &ambiguous),
             Err(Error::Query(message)) if message.contains("ambiguous")
         ));
+    }
+
+    #[test]
+    fn quoted_dots_are_not_qualifier_separators() {
+        let schema = Schema::new(vec![
+            ColumnDef::new("t.a.b", ColumnType::Int, true).with_qualifier(vec!["t".into()])
+        ]);
+        assert_eq!(resolve_index("a.b", &schema).unwrap(), 0);
+        assert_eq!(
+            resolve_index_parts(&[ident("t"), ident("a.b")], &schema).unwrap(),
+            0
+        );
+        assert!(resolve_index_parts(&parts("t.a.b"), &schema).is_err());
     }
 
     #[test]

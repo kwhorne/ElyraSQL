@@ -8534,10 +8534,6 @@ struct UsingKey {
     right: usize,
 }
 
-fn logical_column_name(name: &str) -> &str {
-    name.rsplit_once('.').map_or(name, |(_, column)| column)
-}
-
 /// Columns exposed by an unqualified `*`, excluding only the operand indexes a
 /// USING/NATURAL join marked as qualified-access-only.
 pub(crate) fn unqualified_wildcard_indices(schema: &Schema) -> Vec<usize> {
@@ -8547,9 +8543,7 @@ pub(crate) fn unqualified_wildcard_indices(schema: &Schema) -> Vec<usize> {
 fn find_logical_column(schema: &Schema, name: &str, side: &str) -> Result<usize> {
     let matches: Vec<usize> = unqualified_wildcard_indices(schema)
         .into_iter()
-        .filter(|&index| {
-            logical_column_name(&schema.columns[index].name).eq_ignore_ascii_case(name)
-        })
+        .filter(|&index| column_name(&schema.columns[index]).eq_ignore_ascii_case(name))
         .collect();
     match matches.as_slice() {
         [index] => Ok(*index),
@@ -8612,7 +8606,7 @@ fn resolve_using_keys(
     let first = if right_first { right } else { left };
     let mut names = Vec::new();
     for index in unqualified_wildcard_indices(first) {
-        let name = logical_column_name(&first.columns[index].name);
+        let name = column_name(&first.columns[index]);
         if names
             .iter()
             .any(|seen: &String| seen.eq_ignore_ascii_case(name))
@@ -8625,8 +8619,7 @@ fn resolve_using_keys(
                 unqualified_wildcard_indices(other_schema)
                     .into_iter()
                     .any(|other| {
-                        logical_column_name(&other_schema.columns[other].name)
-                            .eq_ignore_ascii_case(name)
+                        column_name(&other_schema.columns[other]).eq_ignore_ascii_case(name)
                     })
             },
             |using| using.iter().any(|column| column.eq_ignore_ascii_case(name)),
@@ -8649,11 +8642,14 @@ fn resolve_using_keys(
         .map(Some)
 }
 
-fn column_expr(name: &str) -> Expr {
-    let parts = name
-        .split('.')
+fn column_def_expr(column: &ColumnDef) -> Expr {
+    let mut parts = column
+        .qualifier
+        .iter()
+        .cloned()
         .map(sqlparser::ast::Ident::new)
         .collect::<Vec<_>>();
+    parts.push(sqlparser::ast::Ident::new(column_name(column)));
     match parts.as_slice() {
         [identifier] => Expr::Identifier(identifier.clone()),
         _ => Expr::CompoundIdentifier(parts),
@@ -8664,8 +8660,8 @@ fn using_key_pairs(keys: &[UsingKey], left: &Schema, right: &Schema) -> Vec<(Exp
     keys.iter()
         .map(|key| {
             (
-                column_expr(&left.columns[key.left].name),
-                column_expr(&right.columns[key.right].name),
+                column_def_expr(&left.columns[key.left]),
+                column_def_expr(&right.columns[key.right]),
             )
         })
         .collect()
@@ -8690,6 +8686,7 @@ fn coalesce_using_join(
             };
             let mut column = source.clone();
             column.name = key.name.clone();
+            column.qualifier.clear();
             column
         })
         .collect::<Vec<_>>();
@@ -8702,7 +8699,7 @@ fn coalesce_using_join(
                 (left_len + key.right, &right.columns[key.right]),
             ]
         })
-        .filter_map(|(index, column)| (!column.name.contains('.')).then_some(index))
+        .filter_map(|(index, column)| column.qualifier.is_empty().then_some(index))
         .collect();
     let physical_order = if kind == JoinKind::Right {
         (left_len..physical_schema.columns.len())
@@ -11136,8 +11133,7 @@ async fn multi_delete(
     relations: &[TableWithJoins],
 ) -> Result<QueryResult> {
     let source_relations = del.using.as_deref().unwrap_or(relations);
-    let (cols, rows) = build_from(db, vindex, source_relations, &[]).await?;
-    let schema = Schema::new(cols);
+    let (schema, rows) = build_from(db, vindex, source_relations, &[]).await?;
     let filter = match &del.selection {
         Some(f) => Some(resolve_subqueries(db, vindex, f.clone()).await?),
         None => None,
@@ -16994,17 +16990,17 @@ mod composite_join_tests {
     use elyra_core::{ColumnDef, ColumnType, Schema, Value};
     use sqlparser::ast::{BinaryOperator, Expr};
 
-    use super::{column_expr, combine, JoinCondition, JoinKind, NESTED_JOIN_COMPARISONS};
+    use super::{column_def_expr, combine, JoinCondition, JoinKind, NESTED_JOIN_COMPARISONS};
 
     #[test]
     fn multi_key_equality_avoids_quadratic_fallback() {
         let left_columns = [
-            ColumnDef::new("l.id", ColumnType::Int, false),
-            ColumnDef::new("l.code", ColumnType::Int, false),
+            ColumnDef::new("l.id", ColumnType::Int, false).with_qualifier(vec!["l".into()]),
+            ColumnDef::new("l.code", ColumnType::Int, false).with_qualifier(vec!["l".into()]),
         ];
         let right_columns = [
-            ColumnDef::new("r.id", ColumnType::Int, false),
-            ColumnDef::new("r.code", ColumnType::Int, false),
+            ColumnDef::new("r.id", ColumnType::Int, false).with_qualifier(vec!["r".into()]),
+            ColumnDef::new("r.code", ColumnType::Int, false).with_qualifier(vec!["r".into()]),
         ];
         let left_schema = Schema::new(left_columns.into());
         let right_schema = Schema::new(right_columns.into());
@@ -17012,15 +17008,15 @@ mod composite_join_tests {
             .map(|value| vec![Value::Int(value / 4), Value::Int(value % 4)])
             .collect::<Vec<_>>();
         let right_rows = left_rows.clone();
-        let equality = |left: &str, right: &str| Expr::BinaryOp {
-            left: Box::new(column_expr(left)),
+        let equality = |left: usize, right: usize| Expr::BinaryOp {
+            left: Box::new(column_def_expr(&left_schema.columns[left])),
             op: BinaryOperator::Eq,
-            right: Box::new(column_expr(right)),
+            right: Box::new(column_def_expr(&right_schema.columns[right])),
         };
         let predicate = Expr::BinaryOp {
-            left: Box::new(equality("l.id", "r.id")),
+            left: Box::new(equality(0, 0)),
             op: BinaryOperator::And,
-            right: Box::new(equality("l.code", "r.code")),
+            right: Box::new(equality(1, 1)),
         };
 
         NESTED_JOIN_COMPARISONS.with(|comparisons| comparisons.set(0));
