@@ -11963,7 +11963,53 @@ fn query_refs_qualifier(q: &SqlQuery, qualifier: &[String]) -> bool {
     found.get()
 }
 
-type InlineCteMap = std::collections::HashMap<String, SqlQuery>;
+// sqlparser's generated visitors, query execution, and AST drop path recurse
+// through every derived query. Keep enough headroom for the rest of the
+// statement on a Tokio worker's comparatively small stack.
+const MAX_CTE_EXPANSION_DEPTH: usize = 2;
+// A shallow CTE can still expand exponentially when it references a previous
+// definition more than once. Bound the generated tree as well as its depth.
+const MAX_CTE_EXPANSION_NODES: usize = 256;
+
+#[derive(Clone)]
+struct InlineCte {
+    query: std::rc::Rc<SqlQuery>,
+    cost: CteExpansionCost,
+}
+
+type InlineCteMap = std::collections::HashMap<String, InlineCte>;
+
+#[derive(Clone, Copy, Default)]
+struct CteExpansionCost {
+    depth: usize,
+    nodes: usize,
+}
+
+impl CteExpansionCost {
+    fn include(&mut self, nested: Self) -> Result<()> {
+        let depth = nested.depth.saturating_add(1);
+        if depth > MAX_CTE_EXPANSION_DEPTH {
+            return Err(Error::Parse(format!(
+                "CTE expansion limit exceeded (depth limit {MAX_CTE_EXPANSION_DEPTH}); simplify the query"
+            )));
+        }
+
+        let nodes = self
+            .nodes
+            .checked_add(nested.nodes)
+            .and_then(|nodes| nodes.checked_add(1))
+            .filter(|nodes| *nodes <= MAX_CTE_EXPANSION_NODES)
+            .ok_or_else(|| {
+                Error::Parse(format!(
+                    "CTE expansion limit exceeded (node limit {MAX_CTE_EXPANSION_NODES}); simplify the query"
+                ))
+            })?;
+
+        self.depth = self.depth.max(depth);
+        self.nodes = nodes;
+        Ok(())
+    }
+}
 
 /// Expand every non-recursive `WITH` visible from `query`, inlining CTEs as
 /// derived tables at every relation reference in the query tree. A scope stack
@@ -11971,23 +12017,31 @@ type InlineCteMap = std::collections::HashMap<String, SqlQuery>;
 /// definitions visible at its declaration point.
 fn expand_ctes(query: &SqlQuery) -> Result<SqlQuery> {
     let mut expanded = query.clone();
-    expand_ctes_with_scope(&mut expanded, InlineCteMap::new());
+    expand_ctes_with_scope(&mut expanded, InlineCteMap::new())?;
     Ok(expanded)
 }
 
-fn expand_ctes_with_scope(query: &mut SqlQuery, parent_scope: InlineCteMap) {
+fn expand_ctes_with_scope(
+    query: &mut SqlQuery,
+    parent_scope: InlineCteMap,
+) -> Result<CteExpansionCost> {
     let mut expander = InlineCteExpander {
         scopes: vec![parent_scope],
+        cost: CteExpansionCost::default(),
     };
-    let _ = query.visit(&mut expander);
+    match query.visit(&mut expander) {
+        ControlFlow::Continue(()) => Ok(expander.cost),
+        ControlFlow::Break(error) => Err(error),
+    }
 }
 
 struct InlineCteExpander {
     scopes: Vec<InlineCteMap>,
+    cost: CteExpansionCost,
 }
 
 impl VisitorMut for InlineCteExpander {
-    type Break = std::convert::Infallible;
+    type Break = Error;
 
     fn pre_visit_query(&mut self, query: &mut SqlQuery) -> ControlFlow<Self::Break> {
         let mut scope = self.scopes.last().cloned().unwrap_or_default();
@@ -12003,8 +12057,17 @@ impl VisitorMut for InlineCteExpander {
             } else {
                 for cte in with.cte_tables {
                     let mut body = *cte.query;
-                    expand_ctes_with_scope(&mut body, scope.clone());
-                    scope.insert(cte.alias.name.value.to_ascii_lowercase(), body);
+                    let cost = match expand_ctes_with_scope(&mut body, scope.clone()) {
+                        Ok(cost) => cost,
+                        Err(error) => return ControlFlow::Break(error),
+                    };
+                    scope.insert(
+                        cte.alias.name.value.to_ascii_lowercase(),
+                        InlineCte {
+                            query: std::rc::Rc::new(body),
+                            cost,
+                        },
+                    );
                 }
             }
         }
@@ -12038,13 +12101,16 @@ impl VisitorMut for InlineCteExpander {
         else {
             return ControlFlow::Continue(());
         };
+        if let Err(error) = self.cost.include(body.cost) {
+            return ControlFlow::Break(error);
+        }
         let alias = alias.clone().unwrap_or_else(|| sqlparser::ast::TableAlias {
             name: sqlparser::ast::Ident::new(cte_name.clone()),
             columns: Vec::new(),
         });
         *table_factor = TableFactor::Derived {
             lateral: false,
-            subquery: Box::new(body.clone()),
+            subquery: Box::new(body.query.as_ref().clone()),
             alias: Some(alias),
         };
         ControlFlow::Continue(())
@@ -16746,8 +16812,10 @@ fn parse_vector(s: &str, dim: u32) -> Result<Vec<f32>> {
 #[cfg(test)]
 mod cte_rewrite_tests {
     use crate::{Engine, QueryResult, Session};
-    use elyra_core::{Privilege, Value};
+    use elyra_core::{Error, Privilege, Value};
     use elyra_storage::Db;
+
+    const EXPANSION_LIMIT_CHILD: &str = "ELYRASQL_CTE_EXPANSION_LIMIT_CHILD";
 
     fn engine_and_session() -> (Engine, Session) {
         let engine = Engine::new(Db::in_memory().unwrap());
@@ -16934,6 +17002,117 @@ mod cte_rewrite_tests {
                 vec![Value::Int(2)],
                 vec![Value::Int(3)]
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_sibling_cte_aliases_still_execute() {
+        let (engine, session) = engine_and_session();
+        let definitions = (0..=1)
+            .map(|index| {
+                if index == 0 {
+                    "c0 AS (SELECT 7 AS n)".to_owned()
+                } else {
+                    format!("c{index} AS (SELECT n FROM c{})", index - 1)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        assert_eq!(
+            rows(
+                &engine,
+                &session,
+                &format!("WITH {definitions} SELECT n FROM c1"),
+            )
+            .await,
+            vec![vec![Value::Int(7)]]
+        );
+    }
+
+    #[tokio::test]
+    async fn excessive_cte_expansion_width_returns_a_complexity_error() {
+        let (engine, session) = engine_and_session();
+        let relations = (0..=super::MAX_CTE_EXPANSION_NODES)
+            .map(|index| {
+                if index == 0 {
+                    "c AS c0".to_owned()
+                } else {
+                    format!("CROSS JOIN c AS c{index}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let result = engine
+            .execute(
+                &format!("WITH c AS (SELECT 1 AS n) SELECT c0.n FROM {relations}"),
+                Privilege::Admin,
+                &session,
+            )
+            .await;
+
+        let Err(Error::Parse(message)) = result else {
+            panic!("excessive CTE expansion unexpectedly succeeded");
+        };
+        assert!(message.contains("CTE expansion limit exceeded (node limit"));
+    }
+
+    #[test]
+    fn excessive_cte_expansion_returns_an_error_without_aborting() {
+        if std::env::var_os(EXPANSION_LIMIT_CHILD).is_some() {
+            let definitions = (0..=100)
+                .map(|index| {
+                    if index == 0 {
+                        "c0 AS (SELECT n FROM seq)".to_owned()
+                    } else {
+                        format!("c{index} AS (SELECT n FROM c{})", index - 1)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "WITH RECURSIVE seq(n) AS (\
+                     SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 3\
+                 ) SELECT nested.n FROM (\
+                     WITH {definitions} SELECT n FROM c100\
+                 ) AS nested"
+            );
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .unwrap();
+            let result = runtime.block_on(async {
+                let (engine, session) = engine_and_session();
+                engine.execute(&sql, Privilege::Admin, &session).await
+            });
+            let message = match result {
+                Err(Error::Parse(message)) => message,
+                Err(error) => panic!("expected a SQL complexity error, got {error}"),
+                Ok(_) => panic!("excessive CTE expansion unexpectedly succeeded"),
+            };
+            assert!(
+                message.contains("CTE expansion limit exceeded (depth limit"),
+                "unexpected error: {message}"
+            );
+            return;
+        }
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "exec::cte_rewrite_tests::excessive_cte_expansion_returns_an_error_without_aborting",
+                "--nocapture",
+            ])
+            .env(EXPANSION_LIMIT_CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child process failed with status {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 }
