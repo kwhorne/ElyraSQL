@@ -9,7 +9,7 @@ use sqlparser::ast::{
     AlterColumnOperation, AlterTableOperation, Assignment, AssignmentTarget, ColumnOption,
     CreateIndex, CreateTable, DataType, Delete, FromTable, Ident, Insert, JoinConstraint,
     JoinOperator, ObjectName, OrderByExpr, Query as SqlQuery, Select, SetExpr, Statement,
-    TableConstraint, TableFactor, TableWithJoins, Visit, Visitor,
+    TableConstraint, TableFactor, TableWithJoins, Visit, VisitMut, Visitor, VisitorMut,
 };
 use std::ops::ControlFlow;
 
@@ -11963,62 +11963,92 @@ fn query_refs_qualifier(q: &SqlQuery, qualifier: &[String]) -> bool {
     found.get()
 }
 
-/// Expand a query's `WITH` clause by inlining each CTE as a derived table
-/// wherever it is referenced in a top-level `FROM`. CTEs may reference earlier
-/// CTEs in the same `WITH`. `WITH RECURSIVE` is not supported.
+type InlineCteMap = std::collections::HashMap<String, SqlQuery>;
+
+/// Expand every non-recursive `WITH` visible from `query`, inlining CTEs as
+/// derived tables at every relation reference in the query tree. A scope stack
+/// keeps nested `WITH` names lexical, and each CTE body is expanded only against
+/// definitions visible at its declaration point.
 fn expand_ctes(query: &SqlQuery) -> Result<SqlQuery> {
-    use std::collections::HashMap;
-    let Some(with) = &query.with else {
-        return Ok(query.clone());
+    let mut expanded = query.clone();
+    expand_ctes_with_scope(&mut expanded, InlineCteMap::new());
+    Ok(expanded)
+}
+
+fn expand_ctes_with_scope(query: &mut SqlQuery, parent_scope: InlineCteMap) {
+    let mut expander = InlineCteExpander {
+        scopes: vec![parent_scope],
     };
-
-    let mut map: HashMap<String, SqlQuery> = HashMap::new();
-    for cte in &with.cte_tables {
-        // Expand this CTE's body against the CTEs defined before it.
-        let body = replace_from_ctes((*cte.query).clone(), &map);
-        map.insert(cte.alias.name.value.to_ascii_lowercase(), body);
-    }
-
-    let mut q = query.clone();
-    q.with = None;
-    Ok(replace_from_ctes(q, &map))
+    let _ = query.visit(&mut expander);
 }
 
-fn replace_from_ctes(
-    mut query: SqlQuery,
-    map: &std::collections::HashMap<String, SqlQuery>,
-) -> SqlQuery {
-    if let SetExpr::Select(select) = query.body.as_mut() {
-        for twj in &mut select.from {
-            twj.relation = replace_cte_relation(&twj.relation, map);
-            for join in &mut twj.joins {
-                join.relation = replace_cte_relation(&join.relation, map);
-            }
-        }
-    }
-    query
+struct InlineCteExpander {
+    scopes: Vec<InlineCteMap>,
 }
 
-fn replace_cte_relation(
-    tf: &TableFactor,
-    map: &std::collections::HashMap<String, SqlQuery>,
-) -> TableFactor {
-    if let TableFactor::Table { name, alias, .. } = tf {
-        if let Some(tname) = name.0.last() {
-            if let Some(body) = map.get(&tname.value.to_ascii_lowercase()) {
-                let al = alias.clone().unwrap_or_else(|| sqlparser::ast::TableAlias {
-                    name: sqlparser::ast::Ident::new(tname.value.clone()),
-                    columns: Vec::new(),
-                });
-                return TableFactor::Derived {
-                    lateral: false,
-                    subquery: Box::new(body.clone()),
-                    alias: Some(al),
-                };
+impl VisitorMut for InlineCteExpander {
+    type Break = std::convert::Infallible;
+
+    fn pre_visit_query(&mut self, query: &mut SqlQuery) -> ControlFlow<Self::Break> {
+        let mut scope = self.scopes.last().cloned().unwrap_or_default();
+        if let Some(with) = query.with.take() {
+            if with.recursive {
+                // A nested recursive WITH is materialised when that query is
+                // executed. Its names shadow outer inline CTEs in every local
+                // body, while differently named outer CTEs remain visible.
+                for cte in &with.cte_tables {
+                    scope.remove(&cte.alias.name.value.to_ascii_lowercase());
+                }
+                query.with = Some(with);
+            } else {
+                for cte in with.cte_tables {
+                    let mut body = *cte.query;
+                    expand_ctes_with_scope(&mut body, scope.clone());
+                    scope.insert(cte.alias.name.value.to_ascii_lowercase(), body);
+                }
             }
         }
+        self.scopes.push(scope);
+        ControlFlow::Continue(())
     }
-    tf.clone()
+
+    fn post_visit_query(&mut self, _query: &mut SqlQuery) -> ControlFlow<Self::Break> {
+        self.scopes.pop();
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_table_factor(
+        &mut self,
+        table_factor: &mut TableFactor,
+    ) -> ControlFlow<Self::Break> {
+        let TableFactor::Table {
+            name, alias, args, ..
+        } = table_factor
+        else {
+            return ControlFlow::Continue(());
+        };
+        if args.is_some() || name.0.len() != 1 {
+            return ControlFlow::Continue(());
+        }
+        let cte_name = &name.0[0].value;
+        let Some(body) = self
+            .scopes
+            .last()
+            .and_then(|scope| scope.get(&cte_name.to_ascii_lowercase()))
+        else {
+            return ControlFlow::Continue(());
+        };
+        let alias = alias.clone().unwrap_or_else(|| sqlparser::ast::TableAlias {
+            name: sqlparser::ast::Ident::new(cte_name.clone()),
+            columns: Vec::new(),
+        });
+        *table_factor = TableFactor::Derived {
+            lateral: false,
+            subquery: Box::new(body.clone()),
+            alias: Some(alias),
+        };
+        ControlFlow::Continue(())
+    }
 }
 
 /// True if any projection item contains a window function (`f(...) OVER (...)`).
@@ -13111,65 +13141,121 @@ fn rewrite_table_refs(
     mut query: SqlQuery,
     map: &std::collections::HashMap<String, String>,
 ) -> SqlQuery {
-    fn fix(tf: &mut TableFactor, map: &std::collections::HashMap<String, String>) {
-        if let TableFactor::Table { name, alias, .. } = tf {
-            if let Some(last) = name.0.last() {
-                if let Some(temp) = map.get(&last.value.to_ascii_lowercase()) {
-                    let orig = last.value.clone();
-                    *name = ObjectName(vec![sqlparser::ast::Ident::new(temp.clone())]);
-                    if alias.is_none() {
-                        *alias = Some(sqlparser::ast::TableAlias {
-                            name: sqlparser::ast::Ident::new(orig),
-                            columns: Vec::new(),
-                        });
-                    }
-                }
-            }
-        }
-    }
-    fn walk(body: &mut SetExpr, map: &std::collections::HashMap<String, String>) {
-        match body {
-            SetExpr::Select(s) => {
-                for twj in &mut s.from {
-                    fix(&mut twj.relation, map);
-                    for j in &mut twj.joins {
-                        fix(&mut j.relation, map);
-                    }
-                }
-            }
-            SetExpr::SetOperation { left, right, .. } => {
-                walk(left, map);
-                walk(right, map);
-            }
-            SetExpr::Query(q) => walk(&mut q.body, map),
-            _ => {}
-        }
-    }
-    walk(&mut query.body, map);
+    let mut rewriter = TempTableRewriter {
+        scopes: vec![map.clone()],
+    };
+    let _ = VisitMut::visit(&mut query, &mut rewriter);
     query
 }
 
 fn query_refs_table(query: &SqlQuery, name: &str) -> bool {
-    setexpr_refs_table(&query.body, name)
+    refs_table(query, name)
 }
 
 fn setexpr_refs_table(body: &SetExpr, name: &str) -> bool {
-    match body {
-        SetExpr::Select(s) => s.from.iter().any(|twj| {
-            factor_refs(&twj.relation, name)
-                || twj.joins.iter().any(|j| factor_refs(&j.relation, name))
-        }),
-        SetExpr::SetOperation { left, right, .. } => {
-            setexpr_refs_table(left, name) || setexpr_refs_table(right, name)
+    refs_table(body, name)
+}
+
+struct TempTableRewriter {
+    scopes: Vec<std::collections::HashMap<String, String>>,
+}
+
+impl VisitorMut for TempTableRewriter {
+    type Break = std::convert::Infallible;
+
+    fn pre_visit_query(&mut self, query: &mut SqlQuery) -> ControlFlow<Self::Break> {
+        let mut scope = self.scopes.last().cloned().unwrap_or_default();
+        if let Some(with) = &query.with {
+            for cte in &with.cte_tables {
+                scope.remove(&cte.alias.name.value.to_ascii_lowercase());
+            }
         }
-        SetExpr::Query(q) => setexpr_refs_table(&q.body, name),
-        _ => false,
+        self.scopes.push(scope);
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_query(&mut self, _query: &mut SqlQuery) -> ControlFlow<Self::Break> {
+        self.scopes.pop();
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_table_factor(
+        &mut self,
+        table_factor: &mut TableFactor,
+    ) -> ControlFlow<Self::Break> {
+        let TableFactor::Table {
+            name, alias, args, ..
+        } = table_factor
+        else {
+            return ControlFlow::Continue(());
+        };
+        if args.is_some() || name.0.len() != 1 {
+            return ControlFlow::Continue(());
+        }
+        let original = name.0[0].value.clone();
+        let Some(temp) = self
+            .scopes
+            .last()
+            .and_then(|scope| scope.get(&original.to_ascii_lowercase()))
+        else {
+            return ControlFlow::Continue(());
+        };
+        *name = ObjectName(vec![sqlparser::ast::Ident::new(temp.clone())]);
+        if alias.is_none() {
+            *alias = Some(sqlparser::ast::TableAlias {
+                name: sqlparser::ast::Ident::new(original),
+                columns: Vec::new(),
+            });
+        }
+        ControlFlow::Continue(())
     }
 }
 
-fn factor_refs(tf: &TableFactor, name: &str) -> bool {
-    matches!(tf, TableFactor::Table { name: n, .. }
-        if n.0.last().is_some_and(|i| i.value.eq_ignore_ascii_case(name)))
+fn refs_table<T: Visit>(node: &T, name: &str) -> bool {
+    let mut finder = TableRefFinder {
+        name,
+        shadowed: vec![false],
+    };
+    matches!(node.visit(&mut finder), ControlFlow::Break(()))
+}
+
+struct TableRefFinder<'a> {
+    name: &'a str,
+    shadowed: Vec<bool>,
+}
+
+impl Visitor for TableRefFinder<'_> {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, query: &SqlQuery) -> ControlFlow<Self::Break> {
+        let shadowed = self.shadowed.last().copied().unwrap_or(false)
+            || query.with.as_ref().is_some_and(|with| {
+                with.cte_tables
+                    .iter()
+                    .any(|cte| cte.alias.name.value.eq_ignore_ascii_case(self.name))
+            });
+        self.shadowed.push(shadowed);
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_query(&mut self, _query: &SqlQuery) -> ControlFlow<Self::Break> {
+        self.shadowed.pop();
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_table_factor(&mut self, table_factor: &TableFactor) -> ControlFlow<Self::Break> {
+        if self.shadowed.last().copied().unwrap_or(false) {
+            return ControlFlow::Continue(());
+        }
+        match table_factor {
+            TableFactor::Table {
+                name, args: None, ..
+            } if name.0.len() == 1 && name.0[0].value.eq_ignore_ascii_case(self.name) => {
+                ControlFlow::Break(())
+            }
+            _ => ControlFlow::Continue(()),
+        }
+    }
 }
 
 fn apply_col_aliases(mut schema: Schema, alias_cols: &[String]) -> Schema {
@@ -16655,6 +16741,201 @@ fn parse_vector(s: &str, dim: u32) -> Result<Vec<f32>> {
         )));
     }
     Ok(vals)
+}
+
+#[cfg(test)]
+mod cte_rewrite_tests {
+    use crate::{Engine, QueryResult, Session};
+    use elyra_core::{Privilege, Value};
+    use elyra_storage::Db;
+
+    fn engine_and_session() -> (Engine, Session) {
+        let engine = Engine::new(Db::in_memory().unwrap());
+        let session = engine.session();
+        (engine, session)
+    }
+
+    async fn rows(engine: &Engine, session: &Session, sql: &str) -> Vec<Vec<Value>> {
+        let mut outcomes = engine
+            .execute(sql, Privilege::Admin, session)
+            .await
+            .unwrap();
+        assert_eq!(outcomes.len(), 1, "expected one outcome for `{sql}`");
+        let QueryResult::Rows(mut stream) = outcomes.remove(0) else {
+            panic!("expected rows for `{sql}`");
+        };
+        let mut result = Vec::new();
+        loop {
+            let batch = stream.next_batch(128).await.unwrap();
+            if batch.is_empty() {
+                return result;
+            }
+            result.extend(batch);
+        }
+    }
+
+    #[tokio::test]
+    async fn nonrecursive_ctes_expand_in_derived_and_scalar_subqueries() {
+        let (engine, session) = engine_and_session();
+
+        assert_eq!(
+            rows(
+                &engine,
+                &session,
+                "WITH c AS (SELECT 7 AS n) \
+                 SELECT derived.n FROM (SELECT n FROM c) AS derived",
+            )
+            .await,
+            vec![vec![Value::Int(7)]]
+        );
+        assert_eq!(
+            rows(
+                &engine,
+                &session,
+                "WITH c AS (SELECT 8 AS n) SELECT (SELECT n FROM c) AS n",
+            )
+            .await,
+            vec![vec![Value::Int(8)]]
+        );
+    }
+
+    #[tokio::test]
+    async fn nonrecursive_ctes_expand_in_all_supported_set_operands() {
+        let (engine, session) = engine_and_session();
+
+        for (sql, expected) in [
+            (
+                "WITH c AS (SELECT 2 AS n) \
+                 SELECT n FROM c UNION ALL SELECT 3 AS n ORDER BY n",
+                vec![vec![Value::Int(2)], vec![Value::Int(3)]],
+            ),
+            (
+                "WITH c AS (SELECT 2 AS n) SELECT n FROM c INTERSECT SELECT 2 AS n",
+                vec![vec![Value::Int(2)]],
+            ),
+            (
+                "WITH c AS (SELECT 2 AS n) SELECT n FROM c EXCEPT SELECT 3 AS n",
+                vec![vec![Value::Int(2)]],
+            ),
+        ] {
+            assert_eq!(rows(&engine, &session, sql).await, expected, "{sql}");
+        }
+    }
+
+    #[tokio::test]
+    async fn nested_with_shadows_outer_ctes_without_hiding_other_outer_names() {
+        let (engine, session) = engine_and_session();
+
+        let shadowed = "WITH c AS (SELECT 1 AS n) SELECT shadowed_value.n \
+                        FROM (WITH c AS (SELECT 2 AS n) SELECT n FROM c) AS shadowed_value";
+        assert_eq!(
+            rows(&engine, &session, shadowed).await,
+            vec![vec![Value::Int(2)]]
+        );
+        assert_eq!(
+            rows(
+                &engine,
+                &session,
+                "WITH outer_value AS (SELECT 9 AS n) SELECT nested.n \
+                 FROM (WITH local_value AS (SELECT 2 AS n) \
+                       SELECT n FROM outer_value) AS nested",
+            )
+            .await,
+            vec![vec![Value::Int(9)]]
+        );
+    }
+
+    #[tokio::test]
+    async fn cte_rewrite_does_not_capture_qualified_physical_tables() {
+        let (engine, session) = engine_and_session();
+        engine
+            .execute("CREATE TABLE c (n INT)", Privilege::Admin, &session)
+            .await
+            .unwrap();
+        engine
+            .execute("INSERT INTO c VALUES (42)", Privilege::Admin, &session)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            rows(
+                &engine,
+                &session,
+                "WITH c AS (SELECT 1 AS n) SELECT n FROM elyra.c",
+            )
+            .await,
+            vec![vec![Value::Int(42)]]
+        );
+    }
+
+    #[tokio::test]
+    async fn recursive_ctes_rewrite_outer_derived_and_scalar_references() {
+        let (engine, session) = engine_and_session();
+        let cte = "WITH RECURSIVE seq(n) AS (\
+                       SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 3\
+                   )";
+
+        assert_eq!(
+            rows(
+                &engine,
+                &session,
+                &format!("{cte} SELECT derived.n FROM (SELECT n FROM seq) AS derived ORDER BY n"),
+            )
+            .await,
+            vec![
+                vec![Value::Int(1)],
+                vec![Value::Int(2)],
+                vec![Value::Int(3)]
+            ]
+        );
+        assert_eq!(
+            rows(
+                &engine,
+                &session,
+                &format!("{cte} SELECT (SELECT MAX(n) FROM seq) AS max_n"),
+            )
+            .await,
+            vec![vec![Value::Int(3)]]
+        );
+    }
+
+    #[tokio::test]
+    async fn recursive_self_references_work_through_derived_and_scalar_subqueries() {
+        let (engine, session) = engine_and_session();
+
+        assert_eq!(
+            rows(
+                &engine,
+                &session,
+                "WITH RECURSIVE seq(n) AS (\
+                     SELECT 1 UNION ALL \
+                     SELECT prior.n + 1 FROM (SELECT n FROM seq) AS prior WHERE prior.n < 3\
+                 ) SELECT n FROM seq ORDER BY n",
+            )
+            .await,
+            vec![
+                vec![Value::Int(1)],
+                vec![Value::Int(2)],
+                vec![Value::Int(3)]
+            ]
+        );
+        assert_eq!(
+            rows(
+                &engine,
+                &session,
+                "WITH RECURSIVE seq(n) AS (\
+                     SELECT 1 UNION ALL \
+                     SELECT (SELECT n + 1 FROM seq) WHERE (SELECT n FROM seq) < 3\
+                 ) SELECT n FROM seq ORDER BY n",
+            )
+            .await,
+            vec![
+                vec![Value::Int(1)],
+                vec![Value::Int(2)],
+                vec![Value::Int(3)]
+            ]
+        );
+    }
 }
 
 #[cfg(test)]
