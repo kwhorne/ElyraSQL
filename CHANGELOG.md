@@ -6,6 +6,41 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **`CREATE TABLE ... AS SELECT` over an aggregate was truncated at the first
+  parenthesis.** The preprocessor that strips MySQL table options (`ENGINE=`,
+  `DEFAULT CHARSET`, ...) located the column list by looking for the first `(`
+  in the statement. In a CTAS that paren usually belongs to the *query* —
+  `COUNT(*)`, a derived table, any function call — so the statement was cut at
+  that paren's partner: `CREATE TABLE t AS SELECT g, COUNT(*) AS c FROM u GROUP
+  BY g` became `CREATE TABLE t AS SELECT g, COUNT(*)`, which then failed with
+  `unknown column: g`. The stripper now declines any statement that is a CTAS or
+  `LIKE` before it looks for a column list. **Materialized views run through
+  CTAS**, so `CREATE MATERIALIZED VIEW v AS SELECT ... GROUP BY ...` — the main
+  reason to want one — works for the first time (ESQL-54).
+- **`SHOW CREATE TABLE` now echoes `CHECK` and `FOREIGN KEY` constraints.** They
+  were enforced but invisible, so a schema dumped through `SHOW CREATE TABLE`
+  silently lost them and schema-diff tools saw a table that did not match the
+  one they had. Referential actions are included (`ON DELETE CASCADE`), MySQL's
+  implicit `NO ACTION` is not, and the emitted DDL is accepted back with the
+  constraints still live.
+- **Catalog errors report the MySQL code clients branch on.** Everything the
+  catalog refused answered 1146 (`ER_NO_SUCH_TABLE`), so an unknown column
+  looked like a missing table to an ORM. Unknown columns are now 1054
+  (`ER_BAD_FIELD_ERROR`, SQLSTATE 42S22), a duplicate index name 1061, an
+  unknown index 1176, and "already exists" 1050; anything unrecognised keeps
+  1146.
+- **The soak/chaos suite can no longer hang a CI job (ESQL-53).** A connect
+  attempt had no timeout of its own, so a server that accepted the socket from
+  the listen backlog while mid-restart and never wrote the handshake blocked the
+  chaos loop indefinitely — observed once as a job that sat silent for 45
+  minutes before being cancelled by hand. Connects are now bounded and treated
+  as "not ready" (the caller already retries until its deadline), worker joins
+  time out with the worker's index rather than blocking, and the workflow has a
+  45-minute cap so a hang is reported within the hour instead of burning a
+  runner until the six-hour default.
+
 ## [1.7.0] - 2026-08-01
 
 A compatibility release, and one that arrived from outside: both halves came in
@@ -131,7 +166,7 @@ succeeding.
 
 - Result metadata still reports an **empty `table` field** where MySQL reports
   the source table, so a client cannot disambiguate duplicate column names
-  except by position.
+  except by position (ESQL-55).
 
 ## [1.6.0] - 2026-07-29
 

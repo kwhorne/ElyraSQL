@@ -129,10 +129,6 @@ gaps:
   `LAST_INSERT_ID()`/`ROW_COUNT()`, `@@`system variables, and `CONVERT()`. The
   MySQL shorthands `INSERT ... SET`, the `<<`/`>>`/`~` bitwise operators and
   `LOAD DATA LOCAL INFILE` all work.
-- A **materialized view over an aggregate** (`CREATE MATERIALIZED VIEW v AS
-  SELECT g, COUNT(*) ... GROUP BY g`) is rejected with `unknown column`; the
-  non-materialized form of the same view works. Tracked in
-  [ESQL-54](https://wirelabs.youtrack.cloud/issue/ESQL-54).
 - Vector search and `VEC_DISTANCE(...)` are ElyraSQL extensions (they mirror
   MySQL 9's vector direction but are not identical).
 - **One database.** `CREATE DATABASE`/`SCHEMA` is refused unless written with
@@ -143,7 +139,8 @@ gaps:
   each column definition; ElyraSQL leaves it empty. Column *names* match MySQL
   (a `SELECT *` over a join returns bare, possibly duplicated names), so a client
   that disambiguates duplicates via metadata cannot, and must use positional
-  access or explicit aliases.
+  access or explicit aliases. Tracked in
+  [ESQL-55](https://wirelabs.youtrack.cloud/issue/ESQL-55).
 - **Isolation levels:** `SET TRANSACTION ISOLATION LEVEL ...` is accepted for all
   four standard levels, but only two engines exist — `SERIALIZABLE` (opt-in) and
   **snapshot** isolation, which backs everything else. Snapshot is *at least as

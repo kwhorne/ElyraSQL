@@ -52,7 +52,7 @@ impl Error {
     pub fn mysql_code(&self) -> u16 {
         match self {
             Error::Parse(_) => 1064,
-            Error::Catalog(_) => 1146,     // ER_NO_SUCH_TABLE-ish bucket
+            Error::Catalog(m) => catalog_code(m),
             Error::Type(_) => 1366,        // ER_TRUNCATED_WRONG_VALUE
             Error::OutOfRange(_) => 1690,  // ER_DATA_OUT_OF_RANGE
             Error::Unsupported(_) => 1235, // ER_NOT_SUPPORTED_YET
@@ -67,9 +67,67 @@ impl Error {
     pub fn sqlstate(&self) -> &'static [u8; 5] {
         match self {
             Error::Parse(_) => b"42000",
-            Error::Catalog(_) => b"42S02",
+            Error::Catalog(m) => match catalog_code(m) {
+                1054 => b"42S22", // ER_BAD_FIELD_ERROR
+                1050 => b"42S01", // ER_TABLE_EXISTS_ERROR
+                1061 | 1176 => b"42000",
+                _ => b"42S02", // ER_NO_SUCH_TABLE
+            },
             Error::OutOfRange(_) => b"22003",
             _ => b"HY000",
         }
+    }
+}
+
+/// `Catalog` covers everything the catalog can refuse, but clients branch on the
+/// specific code: an ORM reports "no such table" and "unknown column" very
+/// differently, and a migration tool may treat "already exists" as success.
+/// MySQL has distinct codes for each, so answering 1146 for all of them
+/// mislabels most. The variant carries no structure, so the message prefix is
+/// the only discriminator available; anything unrecognised keeps the old bucket.
+fn catalog_code(message: &str) -> u16 {
+    let m = message.trim_start();
+    if m.starts_with("unknown column")
+        || m.starts_with("unknown primary key column")
+        || m.starts_with("unknown unique column")
+        || m.starts_with("unknown index column")
+        || m.starts_with("unknown foreign key column")
+    {
+        return 1054; // ER_BAD_FIELD_ERROR
+    }
+    if m.starts_with("index already exists") {
+        return 1061; // ER_DUP_KEYNAME
+    }
+    if m.starts_with("unknown index") || m.starts_with("no such index") {
+        return 1176; // ER_KEY_DOES_NOT_EXIST
+    }
+    if m.contains("already exists") {
+        return 1050; // ER_TABLE_EXISTS_ERROR
+    }
+    1146 // ER_NO_SUCH_TABLE
+}
+
+#[cfg(test)]
+mod catalog_code_tests {
+    use super::Error;
+
+    #[test]
+    fn catalog_errors_map_to_the_code_clients_branch_on() {
+        let code = |m: &str| Error::Catalog(m.into()).mysql_code();
+        assert_eq!(code("unknown column: g"), 1054);
+        assert_eq!(code("unknown index column: g"), 1054);
+        assert_eq!(code("no such table: t"), 1146);
+        assert_eq!(code("no such materialized view: v"), 1146);
+        assert_eq!(code("index already exists: ix"), 1061);
+        assert_eq!(code("table already exists: t"), 1050);
+        assert_eq!(code("unknown index: ix"), 1176);
+        assert_eq!(
+            Error::Catalog("unknown column: g".into()).sqlstate(),
+            b"42S22"
+        );
+        assert_eq!(
+            Error::Catalog("no such table: t".into()).sqlstate(),
+            b"42S02"
+        );
     }
 }

@@ -883,6 +883,17 @@ pub async fn show_columns(db: &Session, table: &str) -> Result<QueryResult> {
     Ok(QueryResult::Rows(RowStream::literal(schema, rows)))
 }
 
+/// The `ON DELETE`/`ON UPDATE` clause to echo for a referential action, or
+/// `None` for the default that MySQL leaves implicit.
+fn ref_action_sql(action: catalog::RefAction) -> Option<&'static str> {
+    match action {
+        catalog::RefAction::NoAction => None,
+        catalog::RefAction::Restrict => Some("RESTRICT"),
+        catalog::RefAction::Cascade => Some("CASCADE"),
+        catalog::RefAction::SetNull => Some("SET NULL"),
+    }
+}
+
 /// SHOW CREATE TABLE: reconstruct the DDL from the catalog definition.
 pub async fn show_create_table(db: &Session, name: &str) -> Result<QueryResult> {
     let def = catalog::load(db, name).await?;
@@ -928,6 +939,39 @@ pub async fn show_create_table(db: &Session, name: &str) -> Result<QueryResult> 
             .collect::<Vec<_>>()
             .join(", ");
         lines.push(format!("  {kind} `{}` ({cols})", idx.name));
+    }
+    // CHECK and FOREIGN KEY constraints are enforced but used to be invisible
+    // here, so a dump taken through SHOW CREATE TABLE silently dropped them and
+    // schema-diff tools saw a table that did not match the one they had.
+    for chk in &def.checks {
+        lines.push(format!("  CHECK ({chk})"));
+    }
+    for fk in &def.foreign_keys {
+        let cols = fk
+            .columns
+            .iter()
+            .map(|&i| format!("`{}`", def.schema.columns[i].name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let ref_cols = fk
+            .ref_columns
+            .iter()
+            .map(|c| format!("`{c}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut line = format!(
+            "  CONSTRAINT `{}` FOREIGN KEY ({cols}) REFERENCES `{}` ({ref_cols})",
+            fk.name, fk.ref_table
+        );
+        // MySQL omits the default NO ACTION, so only referential actions that
+        // were actually asked for are echoed back.
+        if let Some(action) = ref_action_sql(fk.on_delete) {
+            line.push_str(&format!(" ON DELETE {action}"));
+        }
+        if let Some(action) = ref_action_sql(fk.on_update) {
+            line.push_str(&format!(" ON UPDATE {action}"));
+        }
+        lines.push(line);
     }
     let ddl = format!("CREATE TABLE `{name}` (\n{}\n)", lines.join(",\n"));
     let schema = Schema::new(vec![

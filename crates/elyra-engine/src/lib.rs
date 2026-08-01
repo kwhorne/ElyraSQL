@@ -2864,6 +2864,20 @@ fn strip_create_table_options(sql: &str) -> Option<String> {
         }
         i += 1;
     };
+    // The first paren only *starts a column list* when nothing before it turned the
+    // statement into `CREATE TABLE ... AS <query>` or `... LIKE t`. In a CTAS the
+    // first paren usually belongs to the query instead -- `COUNT(*)`, a derived
+    // table, a function call -- and treating it as the column list truncated the
+    // statement at that paren's partner, silently dropping the rest of the query
+    // (`... AS SELECT g, COUNT(*) AS c FROM u GROUP BY g` became
+    // `... AS SELECT g, COUNT(*)`, which then failed on an unresolvable column).
+    let before_paren = &sql[..open];
+    if [b"AS".as_slice(), b"SELECT".as_slice(), b"LIKE".as_slice()]
+        .iter()
+        .any(|kw| (0..before_paren.len()).any(|p| keyword_at(before_paren.as_bytes(), p, kw)))
+    {
+        return None;
+    }
     // Match the closing paren of the column list.
     let mut depth = 0i32;
     let mut j = open;
@@ -3698,10 +3712,40 @@ mod comma_update_tests {
 #[cfg(test)]
 mod mysql_ddl_compat_tests {
     use super::{
-        parse_mysql_rename, require_privilege, rewrite_alter_column_collations, MysqlRename,
-        PrivilegedAction,
+        parse_mysql_rename, require_privilege, rewrite_alter_column_collations,
+        strip_create_table_options, MysqlRename, PrivilegedAction,
     };
     use elyra_core::Privilege;
+
+    #[test]
+    fn table_option_stripping_never_touches_a_ctas() {
+        // The first paren of a CTAS belongs to the query, not to a column list.
+        for sql in [
+            "CREATE TABLE c AS SELECT g, COUNT(*) AS c FROM u GROUP BY g",
+            "CREATE TABLE c AS SELECT COUNT(*) FROM u",
+            "CREATE TABLE c AS SELECT * FROM (SELECT 1) x",
+            "CREATE TABLE c AS SELECT CONCAT(a, b) FROM u ORDER BY 1",
+            "CREATE TABLE c LIKE other",
+        ] {
+            assert_eq!(strip_create_table_options(sql), None, "{sql}");
+        }
+    }
+
+    #[test]
+    fn table_option_stripping_still_trims_real_options() {
+        assert_eq!(
+            strip_create_table_options(
+                "CREATE TABLE t (id INT) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+            )
+            .as_deref(),
+            Some("CREATE TABLE t (id INT)")
+        );
+        assert_eq!(
+            strip_create_table_options("CREATE TABLE `as_of` (id INT) ROW_FORMAT=DYNAMIC")
+                .as_deref(),
+            Some("CREATE TABLE `as_of` (id INT)")
+        );
+    }
 
     #[test]
     fn rewrites_only_alter_change_and_modify_collations() {
