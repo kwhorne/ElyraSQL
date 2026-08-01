@@ -20,6 +20,7 @@ tables:
     rows: { kind: fixed, count: 100000 }
     schema:
       name: tenants
+      primary_key: [id]
       columns:
         - { name: id, type: bigint, nullable: false, primary_key: true }
         - { name: slug, type: "varchar(80)", nullable: false, unique: true }
@@ -43,6 +44,7 @@ tables:
     rows: { kind: fixed, count: 100000 }
     schema:
       name: users
+      primary_key: [id]
       columns:
         - { name: id, type: bigint, nullable: false, primary_key: true }
         - { name: email, type: "varchar(255)", nullable: false, unique: true }
@@ -66,6 +68,9 @@ tables:
         - { name: user_id, type: bigint, nullable: false, primary_key: true }
         - { name: role, type: "varchar(20)", nullable: false }
         - { name: joined_at, type: datetime, nullable: false }
+      relationships:
+        - { name: membership_tenant, columns: [tenant_id], referenced_table: tenants, referenced_columns: [id] }
+        - { name: membership_user, columns: [user_id], referenced_table: users, referenced_columns: [id] }
     relationships:
       - name: membership_tenant
         columns: [tenant_id]
@@ -86,6 +91,7 @@ tables:
     rows: { kind: fixed, count: 1000000 }
     schema:
       name: projects
+      primary_key: [id]
       columns:
         - { name: id, type: bigint, nullable: false, primary_key: true }
         - { name: tenant_id, type: bigint, nullable: false }
@@ -95,6 +101,9 @@ tables:
         - { name: metadata, type: json, nullable: true }
         - { name: created_at, type: datetime, nullable: false }
         - { name: updated_at, type: datetime, nullable: false }
+      relationships:
+        - { name: project_tenant, columns: [tenant_id], referenced_table: tenants, referenced_columns: [id] }
+        - { name: project_owner, columns: [owner_id], referenced_table: users, referenced_columns: [id] }
     relationships:
       - name: project_tenant
         columns: [tenant_id]
@@ -120,6 +129,7 @@ tables:
     rows: { kind: fixed, count: 1000000 }
     schema:
       name: tasks
+      primary_key: [id]
       columns:
         - { name: id, type: bigint, nullable: false, primary_key: true }
         - { name: project_id, type: bigint, nullable: false }
@@ -131,6 +141,10 @@ tables:
         - { name: payload, type: json, nullable: true }
         - { name: created_at, type: datetime, nullable: false }
         - { name: updated_at, type: datetime, nullable: false }
+      relationships:
+        - { name: task_project, columns: [project_id], referenced_table: projects, referenced_columns: [id] }
+        - { name: task_assignee, columns: [assignee_id], referenced_table: users, referenced_columns: [id] }
+        - { name: task_parent, columns: [parent_id], referenced_table: tasks, referenced_columns: [id] }
     relationships:
       - name: task_project
         columns: [project_id]
@@ -172,6 +186,9 @@ tables:
         - { name: task_id, type: bigint, nullable: false, primary_key: true }
         - { name: user_id, type: bigint, nullable: false, primary_key: true }
         - { name: notifications, type: boolean, nullable: false }
+      relationships:
+        - { name: watcher_task, columns: [task_id], referenced_table: tasks, referenced_columns: [id] }
+        - { name: watcher_user, columns: [user_id], referenced_table: users, referenced_columns: [id] }
     relationships:
       - name: watcher_task
         columns: [task_id]
@@ -191,6 +208,7 @@ tables:
     rows: { kind: fixed, count: 1000000 }
     schema:
       name: audit_events
+      primary_key: [id]
       columns:
         - { name: id, type: bigint, nullable: false, primary_key: true }
         - { name: tenant_id, type: bigint, nullable: false }
@@ -200,6 +218,9 @@ tables:
         - { name: event_name, type: "varchar(80)", nullable: false }
         - { name: context, type: json, nullable: false }
         - { name: created_at, type: datetime, nullable: false }
+      relationships:
+        - { name: event_tenant, columns: [tenant_id], referenced_table: tenants, referenced_columns: [id] }
+        - { name: event_actor, columns: [actor_id], referenced_table: users, referenced_columns: [id] }
     relationships:
       - name: event_tenant
         columns: [tenant_id]

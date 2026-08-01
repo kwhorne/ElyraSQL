@@ -1,4 +1,4 @@
-# Stress fixture 5 of 6 — CMS / blog / auth kitchen sink.
+# CMS / blog / auth kitchen-sink stress fixture.
 #
 # Stress axis: MAXIMUM FEATURE DENSITY + CROSS-DIALECT EDGE CASES.
 # Broad content-management schema fixture (structure only).
@@ -8,11 +8,9 @@
 # collation / bytes / big decimal / unicode) into a small number of rows so a
 # regression in any single feature surfaces here.
 #
-# Output targets SQLite to round out the dialect matrix (fixtures 1-4 cover
-# postgres / mysql / mssql). Row counts are intentionally small — this fixture
-# is a coverage FLOOR, not a volume test.
-#
-# PROVISIONAL: non-3A planner argument shapes follow the documented planner style.
+# Output targets SQLite. Row counts are intentionally small — this fixture is a
+# coverage floor, not a volume test. Planner argument shapes follow the
+# documented style.
 
 version: 1
 kind: model

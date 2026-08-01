@@ -25,9 +25,10 @@ cargo test --workspace
 ```
 
 If you have [`just`](https://github.com/casey/just), `just check` runs these
-workspace gates plus the isolated SQL dump testbench checks. Run `just` to see
-the grouped build, run, test, stress, and Docker recipes. `just` is optional;
-the commands above remain supported directly.
+workspace gates. `just check-all` also checks the documentation and isolated SQL
+dump testbench. Run `just` to see the grouped build, run, test, stress, and
+Docker recipes. `just` is optional; the commands above remain supported
+directly.
 
 ## Test suites
 
@@ -60,7 +61,7 @@ compatibility job):
   it in CI against a `mysql:8.4` service container; run it locally against any
   MySQL with `--ref-port`. Intentional/tracked differences are allowlisted in the
   harness with a rationale.
-- **[SQL dump correctness stress test](../testbench/sql-dump/README.md)** —
+- **[SQL dump correctness stress test](https://github.com/kwhorne/ElyraSQL/blob/main/testbench/sql-dump/README.md)** —
   manually generates deterministic schemas and data, imports them into MySQL
   8.4 and an ephemeral ElyraSQL server, and compares metadata and typed
   contents. It is an isolated local investigation tool, not a CI gate,

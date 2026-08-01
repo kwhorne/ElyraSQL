@@ -1,28 +1,28 @@
 # SQL dump correctness stress test
 
-This is a developer-only, local stress tool for ElyraSQL. It generates a
-deterministic MySQL dump from a YAML model, imports every statement through the
-MySQL wire protocol into both MySQL 8.4 and an ephemeral in-process ElyraSQL
-server, then compares schema metadata, row counts, and typed table contents.
+This is a developer-only, local correctness and investigation tool for
+ElyraSQL. It generates a deterministic MySQL dump from a YAML model, imports
+each statement into both MySQL and an ephemeral in-process ElyraSQL server, and
+compares their schema metadata and typed contents.
 
-It is not part of CI, a user-facing ElyraSQL feature, or a controlled performance
-benchmark. Use it when changing SQL parsing, execution, type coercion, schema
-metadata, or MySQL compatibility and you want broader coverage than a focused
-regression test provides.
+It is not a user-facing feature, a CI gate, or a controlled performance
+benchmark. Use it for broad coverage while changing SQL parsing, execution,
+type coercion, schema metadata, or MySQL compatibility. When it finds a product
+bug, add a focused workspace regression test as well.
 
 ## Prerequisites
 
 - Rust 1.88 or newer.
-- Docker with the Compose plugin and a running Docker daemon.
-- `just` is optional; every recipe below has a raw command equivalent.
-- ShellCheck is needed only for `just stress-check` and `just check`.
+- Docker with the Compose plugin and a running daemon.
+- `just` is optional; raw equivalents are documented below.
+- ShellCheck is needed for `just stress-check` or `just check-all`.
 
-The testbench is intentionally a separate Cargo workspace. Root-level
-`cargo test --workspace` does not build or run it.
+The testbench is a separate Cargo workspace. Root `cargo test --workspace` does
+not build it.
 
 ## Quick start
 
-From the repository root, run the default schema comparison:
+From the repository root:
 
 ```bash
 just stress
@@ -34,117 +34,163 @@ Without `just`:
 ./testbench/sql-dump/scripts/run.sh
 ```
 
-The runner starts a fresh MySQL 8.4 container, waits for it to become healthy,
-runs ElyraSQL in-process on an ephemeral port with a temporary database, and
-removes the MySQL container, network, and temporary volume when it exits. Each
-invocation uses a unique Compose project, so concurrent runs remain isolated.
+The runner starts the pinned MySQL 8.4 patch image, waits for it to become
+healthy, runs ElyraSQL in-process with a temporary database, and removes the
+container, network, and disk-backed database volume on exit. Each invocation
+uses a unique Compose project.
 
-The default model is `fixtures/models/car_dealership.yaml`. Schema-only mode
-still makes SQL Splitter plan rows before rendering, so the default cap of three
-rows avoids needless generation while retaining all 26 tables and 217 columns.
+The runner changes into `testbench/sql-dump/` before invoking the harness.
+Relative values passed to `--model` and `--artifacts` are therefore resolved
+from that directory. The default model is `fixtures/car_dealership.yaml`.
 
-## Common stress profiles
+The command prints the path to its `report.json`. By default, artifacts go into
+a unique `artifacts/runs/<timestamp>-<pid>/` directory.
 
-Compare another bundled schema:
+## Useful profiles
+
+Compare a bundled schema:
 
 ```bash
-just stress-schema fixtures/models/odoo_erp.yaml 3
+just stress-schema fixtures/odoo_erp.yaml 3
 ```
 
-Generate data and compare every row using typed, order-independent digests:
+Generate rows and compare all tables:
 
 ```bash
 just stress-data
 ```
 
-The equivalent raw command is:
+Equivalent raw command:
 
 ```bash
 ./testbench/sql-dump/scripts/run.sh \
-  --model fixtures/local/02_relational_graph.yaml \
+  --model fixtures/02_relational_graph.yaml \
   --mode schema-and-data \
   --max-rows 1000 \
-  --batch-size 127
+  --batch-size 1
 ```
 
-Add warmed diagnostic timings for `COUNT(*)`, an ordered 100-row page, and a
-point lookup on each table:
+Collect diagnostic query timings as well:
 
 ```bash
 just stress-profile
 ```
 
-These timings alternate query order and verify both systems returned the same
-rows. `elyra_speedup` is `mysql_time / elyra_time`, so values above `1.0` mean
-ElyraSQL was faster in that run. The results are troubleshooting signals, not
-stable benchmark numbers.
-
-Pass arbitrary harness options through the general recipe:
+The general recipe forwards arbitrary harness options without flattening shell
+arguments:
 
 ```bash
 just stress \
-  --model fixtures/local/01_scalar_matrix.yaml \
+  --model fixtures/01_scalar_matrix.yaml \
   --mode schema-and-data \
   --max-rows 100000 \
+  --timeout-seconds 300 \
   --artifacts artifacts/scalar-100k
 ```
 
-Run `just stress --help` for every option.
+Run `just stress --help` for the complete CLI.
 
-## Models and scale
+Harness arguments override a model's generation seed, output dialect, output
+mode, and batch size. This makes the selected command, rather than incidental
+fixture defaults, the run contract.
 
-- `fixtures/local/01_scalar_matrix.yaml` targets exact decimals, signed and
-  unsigned integers, floating point, text and binary values, JSON, booleans,
-  temporal values, nullability, defaults, Unicode, and escaping.
-- `fixtures/local/02_relational_graph.yaml` targets foreign keys, composite
-  keys, junctions, self-referential hierarchies, unique values, JSON, temporal
-  planners, and multiple relationship shapes.
-- `fixtures/local/03_commerce_graph.yaml` combines money, orders, line items,
-  inventory, payments, binary payloads, JSON, enums, and relationships.
-- `fixtures/models/` contains additional broad models, including the
-  315-table Odoo-shaped ERP schema.
+## What is compared
 
-`--max-rows` is a cap per table, not for the entire run. The three local models
-have been exercised at 100,000 generated rows per table: 100,000 scalar rows,
-700,000 relational rows, and 600,000 commerce rows. The car-dealership model has
-been exercised at 1,000 rows per table. Large runs collect each table's rows for
-typed comparison, so use a dedicated artifact directory and allow substantial
-time and memory.
+Before either import, SQL Splitter compiles the selected model, renders directly
+to `generated.sql`, and validates that dump. MySQL always executes each
+statement first, so invalid generated SQL is reported as an oracle preflight
+failure rather than an ElyraSQL divergence.
 
-## Artifacts and failures
+After import, the harness compares:
 
-The artifact directory defaults to `testbench/sql-dump/artifacts/latest/` and is
-ignored by Git. Each run replaces its own `generated.sql`, `report.json`, and
-`failure.sql` files so stale failures cannot be mistaken for current ones.
+- table names and column order;
+- normalized column types, signedness, nullability, defaults, generated and
+  auto-increment attributes, character sets, and collation behavior;
+- semantic primary, unique, and secondary indexes without relying on generated
+  index names;
+- foreign-key columns, referenced columns, and actions, treating MySQL's
+  equivalent `RESTRICT` and `NO ACTION` spellings alike;
+- row counts and order-independent typed row digests that preserve duplicate
+multiplicity.
 
-- `generated.sql` is the exact dump sent to both databases.
-- `report.json` records arguments, model and dump hashes, generator diagnostics,
-  validation results, engine versions, import timings, optional query profiles,
-  and the final comparison outcome.
-- `failure.sql` is written when MySQL or ElyraSQL rejects an import statement.
+Automatically created non-unique indexes whose columns exactly match a foreign
+key are omitted from the index snapshot because MySQL and ElyraSQL materialize
+and name those implementation indexes differently. Other declared secondary
+indexes remain part of the comparison.
 
-MySQL always executes a statement first. A MySQL rejection is an oracle
-preflight failure rather than an ElyraSQL divergence. If MySQL accepts the
-statement and ElyraSQL rejects it, the report and `failure.sql` identify the
-first divergent statement. Metadata, row-count, data, and profiling failures
-include a specific diagnostic in `report.json` and make the command exit
-non-zero. Generation validation errors point to the retained `generated.sql`.
+Table rows are streamed while hashing. The harness retains fixed-size row
+fingerprints for multiset comparison and formats only selected rows when
+reporting a mismatch; it does not retain or format two complete tables at once.
+Memory still grows by roughly one 32-byte fingerprint per row, plus collection
+overhead.
 
-## Known model preflight results
+Optional profiling warms each query, alternates database order, and verifies
+order-sensitive results. Ordered-page and point-lookup samples are emitted only
+when a table has a complete, non-null unique key with no prefix columns.
+`elyra_speedup` is `mysql_time / elyra_time`; treat it only as a local
+troubleshooting signal.
 
-- `cms_kitchensink.yaml` fails generation verification because `media.md5` is
-  `CHAR(32)` while its file-metadata planner produces a 64-character SHA-256
-  value by default.
-- `everything.yaml --max-rows 3` violates planner minimum child counts and
-  tenant cardinality before generation.
-- `odoo_erp.yaml` passes schema validation and imports all 315 tables and 3,569
-  columns into both databases. Its data mode currently produces 177 generation
-  verification failures at seed 42 with a cap of three rows.
+## Fixtures and scale
 
-Treat those as known model/generator constraints. Use deterministic local model
-changes when a failing data mode needs to become a correctness gate.
+All checked-in YAML configurations live directly in `fixtures/`:
 
-## Testbench quality checks
+- `01_scalar_matrix.yaml` covers numeric, text, binary, JSON, boolean, temporal,
+  null/default, Unicode, and escaping behavior.
+- `02_relational_graph.yaml` covers primary and composite keys, foreign keys,
+  junctions, self-references, uniqueness, JSON, and temporal planners.
+- `03_commerce_graph.yaml` covers money, orders, line items, inventory,
+  payments, binary payloads, enums, and relationships.
+- `banking_ledger.yaml`, `car_dealership.yaml`, `cms_kitchensink.yaml`,
+  `everything.yaml`, and `odoo_erp.yaml` provide broader schema shapes.
+
+These are static local stress configurations. They have no synchronization or
+refresh workflow.
+
+`--max-rows` is a cap per table, not for the whole run. Start with the smallest
+profile that exercises the relevant path. Large profiles can require substantial
+CPU, disk space, fingerprint memory, and time even though dump generation and
+row reads are streamed.
+
+Some broad fixtures intentionally remain useful only for selected modes:
+
+- `cms_kitchensink.yaml` currently fails data generation because `media.md5` is
+  `CHAR(32)` while its file-metadata planner emits a 64-character SHA-256 value.
+- `everything.yaml --max-rows 3` violates planner minimum child and tenant
+  cardinalities before generation.
+- `odoo_erp.yaml` is primarily useful as a large schema profile; its data mode
+  exposes known generation-verification failures at small row caps.
+
+The relational presets use one-row inserts because ElyraSQL currently checks a
+self-referencing foreign key row-by-row within a multi-row statement. Raising
+`--batch-size` deliberately exposes that compatibility divergence.
+
+## Artifacts and outcomes
+
+Every successfully initialized run writes `report.json`, including setup,
+generation, connection, timeout, import, and comparison failures.
+
+- `generated.sql` is the exact streamed and hashed dump sent to both databases.
+- `report.json` records normalized arguments, source revision and dirty state,
+  executable, model, and dump hashes, host OS/architecture, validation, MySQL
+  image and session environment, engine versions, timings, and a structured
+  outcome.
+- `failure.sql` contains the first import statement that is rejected, times out,
+  or fails operationally.
+
+SQL rejection, timeout, and infrastructure failure are distinct outcomes.
+Metadata, row-count, data, and profiling divergences exit non-zero with a
+diagnostic in `report.json`.
+
+Passing `--artifacts <directory>` makes the location stable. A `.run.lock`
+prevents two active runs from sharing and corrupting that directory. If a
+process is killed without cleanup, remove a stale lock only after confirming no
+run still owns it.
+
+`--timeout-seconds` applies to each statement or query. A streamed table scan
+uses one deadline for the complete scan rather than resetting the timeout for
+each row.
+
+## Testbench checks
 
 ```bash
 just stress-check
@@ -160,3 +206,7 @@ cargo test --manifest-path testbench/sql-dump/Cargo.toml --locked
 shellcheck testbench/sql-dump/scripts/run.sh
 docker compose --file testbench/sql-dump/compose.yaml config --quiet
 ```
+
+`just check` runs the normal workspace gates. `just check-all` adds the isolated
+testbench and strict documentation build without running a live differential
+profile.

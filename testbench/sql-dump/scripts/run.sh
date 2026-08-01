@@ -21,14 +21,21 @@ if ! docker info >/dev/null 2>&1; then
 fi
 
 cleanup() {
-    "${compose[@]}" down --volumes --remove-orphans >/dev/null 2>&1 || true
+    if ! "${compose[@]}" down --volumes --remove-orphans >/dev/null 2>&1; then
+        echo "warning: MySQL cleanup failed; run: docker compose --project-name ${project} --file ${bench_dir}/compose.yaml down --volumes --remove-orphans" >&2
+    fi
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 "${compose[@]}" up --detach --wait
 binding="$("${compose[@]}" port mysql 3306)"
 port="${binding##*:}"
+container_id="$("${compose[@]}" ps --quiet mysql)"
+image_id="$(docker inspect --format '{{.Image}}' "${container_id}")"
 
 cd "${bench_dir}"
 ELYRA_STRESS_MYSQL_URL="mysql://root:stress-secret@127.0.0.1:${port}/stress" \
+    ELYRA_STRESS_MYSQL_IMAGE="${image_id}" \
     cargo run --locked --release -- "$@"

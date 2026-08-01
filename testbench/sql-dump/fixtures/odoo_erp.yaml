@@ -1,17 +1,12 @@
-# Stress fixture 7 of 7 — Odoo-style ERP with all apps installed (LARGEST SCHEMA).
+# Large ERP stress fixture with all apps installed.
 #
-# Stress axis: ENORMOUS TABLE COUNT + VERY DENSE FK GRAPH.
-# A hand-authored model of a full Odoo deployment (315 tables) with every
+# Stress axis: ENORMOUS TABLE AND COLUMN COUNT.
+# A model of a full ERP deployment (315 tables) with every
 # major application enabled: Contacts, Sales, CRM, Purchase, Accounting, Inventory,
 # Manufacturing, HR (employees/leaves/attendance/expenses/recruitment), Project &
 # Timesheets, Point of Sale, Website/eCommerce, Payments, Subscriptions, Fleet,
 # Helpdesk, Marketing (mass mailing + automation), Events, Calendar, Documents,
 # Sign, Surveys, Repair, Quality, Maintenance, Loyalty, Discuss/mail, and Lunch.
-#
-# Odoo is open source (LGPL-3), so this schema is modeled from its documented
-# conventions and is safe to publish. It is the shape that
-#     sql-splitter generate odoo_dump.sql --emit-config odoo_erp.yaml
-# would produce from a real Odoo PostgreSQL dump.
 #
 # Why it stresses the generator hard:
 #   - Every business row carries Odoo's standard audit FKs (create_uid, write_uid
@@ -31,11 +26,9 @@
 #   - geo.coordinate_pair on res_partner (partner_latitude/partner_longitude).
 #   - file.metadata on ir_attachment and documents.document.
 #
-# `defaults.inference: schema` owns the descriptive columns (names, emails, money,
-# dates, json, flags, state selections) via schema/name heuristics that need NO
-# source data, so this stays a complete hand-authored model without a generator
-# for all ~2,000 columns. Explicit generators are given only for primary keys and
-# foreign keys.
+# `defaults.inference: schema` handles descriptive columns such as names, email,
+# money, dates, JSON, flags, and state selections. Explicit generators are used
+# for primary and foreign-key columns.
 #
 # Planner argument payloads follow the documented configuration shapes for all
 # planner kinds used below.

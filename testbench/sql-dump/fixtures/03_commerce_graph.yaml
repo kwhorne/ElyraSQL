@@ -20,6 +20,7 @@ tables:
     rows: { kind: fixed, count: 100000 }
     schema:
       name: customers
+      primary_key: [id]
       columns:
         - { name: id, type: bigint, nullable: false, primary_key: true }
         - { name: email, type: "varchar(255)", nullable: false, unique: true }
@@ -41,6 +42,7 @@ tables:
     rows: { kind: fixed, count: 100000 }
     schema:
       name: products
+      primary_key: [id]
       columns:
         - { name: id, type: bigint, nullable: false, primary_key: true }
         - { name: sku, type: "varchar(40)", nullable: false, unique: true }
@@ -66,6 +68,7 @@ tables:
     rows: { kind: fixed, count: 1000000 }
     schema:
       name: orders
+      primary_key: [id]
       columns:
         - { name: id, type: bigint, nullable: false, primary_key: true }
         - { name: customer_id, type: bigint, nullable: false }
@@ -79,6 +82,8 @@ tables:
         - { name: notes, type: text, nullable: true }
         - { name: placed_at, type: datetime, nullable: false }
         - { name: updated_at, type: datetime, nullable: false }
+      relationships:
+        - { name: order_customer, columns: [customer_id], referenced_table: customers, referenced_columns: [id] }
     relationships:
       - name: order_customer
         columns: [customer_id]
@@ -111,6 +116,7 @@ tables:
     rows: { kind: fixed, count: 1000000 }
     schema:
       name: order_items
+      primary_key: [id]
       columns:
         - { name: id, type: bigint, nullable: false, primary_key: true }
         - { name: order_id, type: bigint, nullable: false }
@@ -120,6 +126,9 @@ tables:
         - { name: unit_price, type: "decimal(30,10)", nullable: false }
         - { name: line_total, type: "decimal(30,10)", nullable: false }
         - { name: metadata, type: json, nullable: true }
+      relationships:
+        - { name: item_order, columns: [order_id], referenced_table: orders, referenced_columns: [id] }
+        - { name: item_product, columns: [product_id], referenced_table: products, referenced_columns: [id] }
     relationships:
       - name: item_order
         columns: [order_id]
@@ -144,6 +153,7 @@ tables:
     rows: { kind: fixed, count: 1000000 }
     schema:
       name: payments
+      primary_key: [id]
       columns:
         - { name: id, type: bigint, nullable: false, primary_key: true }
         - { name: order_id, type: bigint, nullable: false }
@@ -153,6 +163,9 @@ tables:
         - { name: state, type: "enum('pending','authorized','captured','refunded','failed')", nullable: false }
         - { name: response, type: json, nullable: true }
         - { name: processed_at, type: datetime, nullable: false }
+      relationships:
+        - { name: payment_order, columns: [order_id], referenced_table: orders, referenced_columns: [id] }
+        - { name: payment_parent, columns: [parent_id], referenced_table: payments, referenced_columns: [id] }
     relationships:
       - name: payment_order
         columns: [order_id]
@@ -184,6 +197,7 @@ tables:
     rows: { kind: fixed, count: 1000000 }
     schema:
       name: inventory_movements
+      primary_key: [id]
       columns:
         - { name: id, type: bigint, nullable: false, primary_key: true }
         - { name: product_id, type: bigint, nullable: false }
@@ -192,6 +206,9 @@ tables:
         - { name: balance, type: bigint, nullable: false }
         - { name: reason, type: "varchar(100)", nullable: false }
         - { name: created_at, type: timestamp, nullable: false }
+      relationships:
+        - { name: movement_product, columns: [product_id], referenced_table: products, referenced_columns: [id] }
+        - { name: movement_item, columns: [order_item_id], referenced_table: order_items, referenced_columns: [id] }
     relationships:
       - name: movement_product
         columns: [product_id]

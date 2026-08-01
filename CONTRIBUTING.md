@@ -61,7 +61,8 @@ replacing the underlying Cargo commands:
 
 ```bash
 just             # list grouped recipes
-just check       # formatting, Clippy, workspace tests, and testbench checks
+just check       # formatting, Clippy, and workspace tests
+just check-all   # also check docs and the isolated testbench
 just run         # build and run the native release binary
 just docker-run  # build and run the local Docker image
 ```
@@ -78,7 +79,7 @@ a local correctness and investigation tool rather than a product feature or a
 stable benchmark.
 
 Run the default schema comparison with `just stress`, a generated-data run with
-`just stress-data`, or the complete standalone checks with `just stress-check`.
+`just stress-data`, or its standalone checks with `just stress-check`.
 See [the testbench guide](testbench/sql-dump/README.md) for prerequisites,
 profiles, artifacts, and raw commands that do not require `just`.
 

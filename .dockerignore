@@ -9,3 +9,4 @@ site
 *.edb-lock
 dist
 bench
+testbench/sql-dump

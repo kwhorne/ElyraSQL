@@ -1,4 +1,4 @@
-# Stress fixture 6 of 6 — THE EVERYTHING FIXTURE (capstone / ultimate stress test).
+# Broad all-features stress fixture.
 #
 # A single self-contained `kind: model` that exercises the supported surface
 # in one file: a broad generator/modifier catalog, every row-count rule and

@@ -1,7 +1,6 @@
-# Stress fixture 4 of 6 — Banking / transaction ledger.
+# Banking / transaction ledger stress fixture.
 #
 # Stress axis: DECIMAL PRECISION EDGE CASES + TEMPORAL CORRELATION + FK CYCLES.
-# Anchored on the kassalapp bank_* tables (structure only).
 #
 # Exercises:
 #   - Multiple currency scales in one model (0, 2, 3 decimal places) and a wide
@@ -16,7 +15,7 @@
 #   - credential.secret               (webhook signing keys)
 #
 # Output targets MSSQL to exercise N'' string prefixing and identity mapping.
-# PROVISIONAL: any non-3A planner argument shape follows the documented style.
+# Planner argument shapes follow the documented style.
 
 version: 1
 kind: model

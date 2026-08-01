@@ -1,9 +1,8 @@
-# Stress fixture — Car dealership listing site with CMS, blog, and test-drive telemetry.
+# Car dealership listing stress fixture with CMS, blog, and test-drive telemetry.
 #
 # Stress axis: TEMPORAL CAUSALITY CHAINS + GEO TELEMETRY + CMS/BLOG TREES.
-# Fully invented, generic domain (no real/proprietary schema). A used-and-new car
-# dealership that runs an online listing site, a small CMS, and a blog, and tracks
-# test drives with a GPS logger.
+# A used-and-new car dealership runs an online listing site, a small CMS, and a
+# blog, and tracks test drives with a GPS logger.
 #
 # The interesting narrative this fixture models:
 #   a customer submits a test_drive_request for a listing  (requested_at)

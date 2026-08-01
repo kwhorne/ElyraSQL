@@ -20,6 +20,7 @@ tables:
     rows: { kind: fixed, count: 100000 }
     schema:
       name: scalar_matrix
+      primary_key: [id]
       columns:
         - { name: id, type: bigint, nullable: false, primary_key: true }
         - { name: signed_tiny, type: tinyint, nullable: false }
