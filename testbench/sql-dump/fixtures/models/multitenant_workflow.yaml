@@ -1,0 +1,594 @@
+# Stress fixture 1 of 6 — Multi-tenant workflow / project-management platform.
+#
+# Stress axis: STRUCTURAL PLANNERS + TENANCY + IMPORTS.
+# Anchored on the taskflow / unlimit / showflow SaaS shapes (structure only; no
+# source values are reproduced here).
+#
+# Exercises:
+#   - relation.tenant_family        (tasks: same-tenant folder foreign key)
+#   - relation.junction_pair        (memberships, task_assignees composite junction)
+#   - relation.polymorphic_pair     (comments / attachments / activity_log)
+#   - hierarchy.tree                (self-referential folders + nested tasks)
+#   - workflow.progress_counters    (import_jobs)
+#   - temporal.lifecycle / soft_delete / timestamps
+#   - file.metadata                 (attachments)
+#   - composite primary keys (tenant_id, id)
+#   - per-table `seed: null` randomization inside a seeded model
+#   - imports: (root-wins override merge across two partial documents)
+#
+# Planner argument payloads (tenant_family, junction_pair, polymorphic_pair,
+# hierarchy.tree, temporal.*) follow the documented planner style and exercise
+# their supported interactions in a single model.
+
+version: 1
+kind: model
+
+source:
+  dialect: mysql
+  fingerprint: sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+  fingerprint_policy: warn
+
+output:
+  dialect: postgres
+  mode: schema_and_data
+  inserts: auto
+  batch_size: 1000
+
+seed: 918273
+
+defaults:
+  inference: disabled
+
+imports:
+  - imports/core.yaml
+  - imports/workflow.yaml
+
+tables:
+
+  tenants:
+    rows: { kind: fixed, count: 50 }
+    schema:
+      name: tenants
+      columns:
+        - { name: id, type: bigint, nullable: false, primary_key: true }
+        - { name: name, type: varchar(120), nullable: false }
+        - { name: slug, type: varchar(140), nullable: false, unique: true }
+        - { name: plan, type: varchar(20), nullable: false }
+        - { name: settings, type: json, nullable: true }
+        - { name: created_at, type: datetime, nullable: false }
+        - { name: updated_at, type: datetime, nullable: false }
+    columns:
+      id:
+        generator: { kind: sequence, start: 1 }
+      name:
+        generator: { kind: company.name }
+      slug:
+        generator: { kind: text.slug }
+        modifiers:
+          - { kind: unique, max_attempts: 32, on_exhaustion: error }
+      plan:
+        generator:
+          kind: weighted_choice
+          choices:
+            - { value: free, weight: 0.55 }
+            - { value: team, weight: 0.30 }
+            - { value: business, weight: 0.12 }
+            - { value: enterprise, weight: 0.03 }
+      settings:
+        generator: { kind: json_value }
+        modifiers:
+          - { kind: null_rate, rate: 0.20 }
+    planners:
+      - kind: temporal.timestamps
+        columns:
+          created_at: created_at
+          updated_at: updated_at
+        created: { min: 2021-01-01T00:00:00Z, max: 2026-01-01T00:00:00Z }
+
+  users:
+    rows: { kind: fixed, count: 4000 }
+    schema:
+      name: users
+      columns:
+        - { name: id, type: bigint, nullable: false, primary_key: true }
+        - { name: email, type: varchar(255), nullable: false, unique: true }
+        - { name: full_name, type: varchar(160), nullable: false }
+        - { name: password_hash, type: varchar(255), nullable: false }
+        - { name: avatar_path, type: varchar(255), nullable: true }
+        - { name: locale, type: varchar(12), nullable: false }
+        - { name: last_seen_at, type: datetime, nullable: true }
+        - { name: created_at, type: datetime, nullable: false }
+        - { name: updated_at, type: datetime, nullable: false }
+    columns:
+      id:
+        generator: { kind: sequence, start: 1 }
+      email:
+        generator: { kind: internet.email }
+        modifiers:
+          - { kind: unique, max_attempts: 64, on_exhaustion: error }
+      full_name:
+        generator: { kind: person.full_name }
+      password_hash:
+        # Credential generator: syntactically valid but unmistakably synthetic.
+        generator: { kind: credential.password_hash }
+      avatar_path:
+        generator: { kind: file.name }
+        modifiers:
+          - { kind: null_rate, rate: 0.60 }
+      locale:
+        generator:
+          kind: weighted_choice
+          choices:
+            - { value: en, weight: 0.7 }
+            - { value: nb, weight: 0.2 }
+            - { value: de, weight: 0.1 }
+    planners:
+      - kind: temporal.timestamps
+        columns:
+          created_at: created_at
+          updated_at: updated_at
+        created: { min: 2021-01-01T00:00:00Z, max: 2026-01-01T00:00:00Z }
+
+  memberships:
+    # Junction: user <-> tenant many-to-many, with a role column.
+    rows:
+      kind: relation.children
+      parent: tenants
+      count: 8000
+      distribution: { kind: histogram, mean: 160, min: 1, max: 900 }
+    schema:
+      name: memberships
+      columns:
+        - { name: id, type: bigint, nullable: false, primary_key: true }
+        - { name: tenant_id, type: bigint, nullable: false }
+        - { name: user_id, type: bigint, nullable: false }
+        - { name: role, type: varchar(20), nullable: false }
+        - { name: invited_at, type: datetime, nullable: false }
+    relationships:
+      - name: membership_tenant
+        columns: [tenant_id]
+        references: { table: tenants, columns: [id] }
+      - name: membership_user
+        columns: [user_id]
+        references: { table: users, columns: [id] }
+    columns:
+      id:
+        generator: { kind: sequence, start: 1 }
+      role:
+        generator:
+          kind: weighted_choice
+          choices:
+            - { value: owner, weight: 0.05 }
+            - { value: admin, weight: 0.15 }
+            - { value: member, weight: 0.65 }
+            - { value: guest, weight: 0.15 }
+      invited_at:
+        generator: { kind: datetime }
+    planners:
+      # Guarantee a distinct (tenant, user) pair per membership row. Uniqueness
+      # is intrinsic to the planner (a pair-index permutation), so no `unique`
+      # flag is needed.
+      - kind: relation.junction_pair
+        left_relationship: membership_tenant
+        right_relationship: membership_user
+        columns:
+          left: tenant_id
+          right: user_id
+
+  folders:
+    # Self-referential tree scoped to a tenant.
+    rows:
+      kind: relation.children
+      parent: tenants
+      count: 3000
+      distribution: { kind: histogram, mean: 60, min: 0, max: 400 }
+    schema:
+      name: folders
+      columns:
+        - { name: id, type: bigint, nullable: false, primary_key: true }
+        - { name: tenant_id, type: bigint, nullable: false }
+        - { name: parent_id, type: bigint, nullable: true }
+        - { name: name, type: varchar(120), nullable: false }
+        - { name: depth, type: integer, nullable: false }
+    relationships:
+      - name: folder_tenant
+        columns: [tenant_id]
+        references: { table: tenants, columns: [id] }
+      - name: folder_parent
+        columns: [parent_id]
+        references: { table: folders, columns: [id] }
+    columns:
+      id:
+        generator: { kind: sequence, start: 1 }
+      tenant_id:
+        generator: { kind: relation.foreign_key, relationship: folder_tenant }
+      name:
+        generator: { kind: text.word }
+      # hierarchy.tree owns parent_id but produces no depth output, so the
+      # declared depth column gets its own bounded integer generator.
+      depth:
+        generator: { kind: integer, min: 0, max: 6 }
+    planners:
+      # Self-referential folder tree: null-parent roots plus bounded-depth,
+      # bounded-branching descendants that reference an earlier folder.
+      - kind: hierarchy.tree
+        relationship: folder_parent
+        columns:
+          parent: parent_id
+        root_ratio: 0.15
+        max_depth: 6
+        max_branching: 12
+
+  tasks:
+    seed: null   # intentionally randomized even though the model is seeded
+    rows:
+      kind: relation.children
+      parent: folders
+      count: 40000
+      distribution: { kind: poisson, mean: 13, min: 0, max: 250 }
+    schema:
+      name: tasks
+      columns:
+        - { name: id, type: bigint, nullable: false, primary_key: true }
+        - { name: tenant_id, type: bigint, nullable: false }
+        - { name: folder_id, type: bigint, nullable: false }
+        - { name: parent_id, type: bigint, nullable: true }
+        - { name: title, type: varchar(200), nullable: false }
+        - { name: status, type: varchar(20), nullable: false }
+        - { name: priority, type: smallint, nullable: false }
+        - { name: created_at, type: datetime, nullable: false }
+        - { name: updated_at, type: datetime, nullable: false }
+        - { name: completed_at, type: datetime, nullable: true }
+        - { name: deleted_at, type: datetime, nullable: true }
+    relationships:
+      - name: task_tenant
+        columns: [tenant_id]
+        references: { table: tenants, columns: [id] }
+      - name: task_folder
+        columns: [folder_id]
+        references: { table: folders, columns: [id] }
+      - name: task_parent
+        columns: [parent_id]
+        references: { table: tasks, columns: [id] }
+    columns:
+      id:
+        generator: { kind: sequence, start: 1 }
+      title:
+        generator: { kind: text.sentence }
+      priority:
+        generator: { kind: integer, min: 0, max: 3 }
+    planners:
+      # Draw a same-tenant folder: partition the folder rows into 50 tenant
+      # blocks (ids 1..50, matching the 50 `tenants`) and pick this task's
+      # folder from its own tenant's block. Owns both tenant_id and folder_id.
+      - kind: relation.tenant_family
+        relationship: task_folder
+        columns:
+          tenant: tenant_id
+          parent: folder_id
+        num_tenants: 50
+        tenant_start: 1
+      # Self-referential subtask tree.
+      - kind: hierarchy.tree
+        relationship: task_parent
+        columns:
+          parent: parent_id
+        root_ratio: 0.7
+        max_depth: 4
+        max_branching: 6
+      # created_at <= updated_at, both within the platform lifetime.
+      - kind: temporal.timestamps
+        columns:
+          created_at: created_at
+          updated_at: updated_at
+        created: { min: 2021-06-01T00:00:00Z, max: 2026-01-01T00:00:00Z }
+      # A linear status chain; completed_at is set exactly for the terminal
+      # states (done, cancelled) and null before them.
+      - kind: temporal.lifecycle
+        columns:
+          status: status
+          done: completed_at
+        states: [open, in_progress, blocked, done, cancelled]
+        start: { min: 2021-06-01T00:00:00Z, max: 2026-01-01T00:00:00Z }
+      - kind: temporal.soft_delete
+        columns:
+          deleted_at: deleted_at
+        deletion_probability: 0.08
+        deleted_range: { min: 2021-06-01T00:00:00Z, max: 2026-01-01T00:00:00Z }
+
+  task_assignees:
+    # Composite-key junction: (task_id, user_id) is the primary key.
+    rows:
+      kind: relation.children
+      parent: tasks
+      count: 60000
+      distribution: { kind: histogram, mean: 1.5, min: 0, max: 8 }
+    schema:
+      name: task_assignees
+      columns:
+        - { name: task_id, type: bigint, nullable: false, primary_key: true }
+        - { name: user_id, type: bigint, nullable: false, primary_key: true }
+        - { name: assigned_at, type: datetime, nullable: false }
+    relationships:
+      - name: assignee_task
+        columns: [task_id]
+        references: { table: tasks, columns: [id] }
+      - name: assignee_user
+        columns: [user_id]
+        references: { table: users, columns: [id] }
+    columns:
+      assigned_at:
+        generator: { kind: datetime }
+    planners:
+      - kind: relation.junction_pair
+        left_relationship: assignee_task
+        right_relationship: assignee_user
+        columns:
+          left: task_id
+          right: user_id
+
+  comments:
+    # Polymorphic: attaches to tasks OR folders via (commentable_type, commentable_id).
+    rows: { kind: fixed, count: 90000 }
+    schema:
+      name: comments
+      columns:
+        - { name: id, type: bigint, nullable: false, primary_key: true }
+        - { name: tenant_id, type: bigint, nullable: false }
+        - { name: author_id, type: bigint, nullable: false }
+        - { name: commentable_type, type: varchar(40), nullable: false }
+        - { name: commentable_id, type: bigint, nullable: false }
+        - { name: body, type: text, nullable: false }
+        - { name: created_at, type: datetime, nullable: false }
+    relationships:
+      - name: comment_tenant
+        columns: [tenant_id]
+        references: { table: tenants, columns: [id] }
+      - name: comment_author
+        columns: [author_id]
+        references: { table: users, columns: [id] }
+    columns:
+      id:
+        generator: { kind: sequence, start: 1 }
+      tenant_id:
+        generator: { kind: relation.foreign_key, relationship: comment_tenant }
+      author_id:
+        generator: { kind: relation.foreign_key, relationship: comment_author }
+      body:
+        generator: { kind: text.paragraph }
+      created_at:
+        generator: { kind: datetime }
+    planners:
+      - kind: relation.polymorphic_pair
+        columns:
+          type: commentable_type
+          id: commentable_id
+        targets:
+          - { table: tasks, type: task, weight: 0.85 }
+          - { table: folders, type: folder, weight: 0.15 }
+
+  attachments:
+    # Polymorphic + file metadata.
+    rows: { kind: fixed, count: 30000 }
+    schema:
+      name: attachments
+      columns:
+        - { name: id, type: bigint, nullable: false, primary_key: true }
+        - { name: attachable_type, type: varchar(40), nullable: false }
+        - { name: attachable_id, type: bigint, nullable: false }
+        - { name: file_name, type: varchar(255), nullable: false }
+        - { name: extension, type: varchar(12), nullable: false }
+        - { name: mime_type, type: varchar(120), nullable: false }
+        - { name: size_bytes, type: bigint, nullable: false }
+        - { name: checksum, type: char(64), nullable: false }
+        - { name: created_at, type: datetime, nullable: false }
+    columns:
+      id:
+        generator: { kind: sequence, start: 1 }
+      created_at:
+        generator: { kind: datetime }
+    planners:
+      - kind: relation.polymorphic_pair
+        columns:
+          type: attachable_type
+          id: attachable_id
+        targets:
+          - { table: tasks, type: task, weight: 0.6 }
+          - { table: comments, type: comment, weight: 0.4 }
+      - kind: file.metadata
+        columns:
+          name: file_name
+          extension: extension
+          mime_type: mime_type
+          size: size_bytes
+          hash: checksum
+        size: { min: 512, max: 52428800 }
+        extensions: [pdf, png, jpg, docx, xlsx, csv, zip]
+
+  personal_access_tokens:
+    rows: { kind: fixed, count: 6000 }
+    schema:
+      name: personal_access_tokens
+      columns:
+        - { name: id, type: bigint, nullable: false, primary_key: true }
+        - { name: user_id, type: bigint, nullable: false }
+        - { name: name, type: varchar(120), nullable: false }
+        - { name: token, type: char(64), nullable: false, unique: true }
+        - { name: abilities, type: json, nullable: true }
+        - { name: last_used_at, type: datetime, nullable: true }
+        - { name: expires_at, type: datetime, nullable: true }
+        - { name: created_at, type: datetime, nullable: false }
+    relationships:
+      - name: pat_user
+        columns: [user_id]
+        references: { table: users, columns: [id] }
+    columns:
+      id:
+        generator: { kind: sequence, start: 1 }
+      user_id:
+        generator: { kind: relation.foreign_key, relationship: pat_user }
+      name:
+        generator: { kind: text.word }
+      token:
+        generator: { kind: credential.token, length: 64, alphabet: alphanumeric }
+        modifiers:
+          - { kind: unique, max_attempts: 16, on_exhaustion: error }
+      abilities:
+        generator: { kind: json_value }
+        modifiers:
+          - { kind: null_rate, rate: 0.30 }
+      last_used_at:
+        generator: { kind: datetime }
+        modifiers:
+          - { kind: null_rate, rate: 0.40 }
+      expires_at:
+        generator: { kind: datetime }
+        modifiers:
+          - { kind: null_rate, rate: 0.30 }
+      created_at:
+        generator: { kind: datetime }
+
+  import_jobs:
+    # workflow.progress_counters owns the counter/status/timestamp columns.
+    rows: { kind: fixed, count: 12000 }
+    schema:
+      name: import_jobs
+      columns:
+        - { name: id, type: bigint, nullable: false, primary_key: true }
+        - { name: tenant_id, type: bigint, nullable: false }
+        - { name: source, type: varchar(60), nullable: false }
+        - { name: total_rows, type: integer, nullable: false }
+        - { name: processed_rows, type: integer, nullable: false }
+        - { name: imported_rows, type: integer, nullable: false }
+        - { name: failed_rows, type: integer, nullable: false }
+        - { name: pending_rows, type: integer, nullable: false }
+        - { name: status, type: varchar(20), nullable: false }
+        - { name: started_at, type: datetime, nullable: false }
+        - { name: completed_at, type: datetime, nullable: true }
+    relationships:
+      - name: import_job_tenant
+        columns: [tenant_id]
+        references: { table: tenants, columns: [id] }
+    columns:
+      id:
+        generator: { kind: sequence, start: 1 }
+      tenant_id:
+        generator: { kind: relation.foreign_key, relationship: import_job_tenant }
+      source:
+        generator:
+          kind: weighted_choice
+          choices:
+            - { value: csv, weight: 0.6 }
+            - { value: api, weight: 0.3 }
+            - { value: webhook, weight: 0.1 }
+      # progress_counters owns the counters/status/completed_at; started_at is
+      # an independent timestamp.
+      started_at:
+        generator: { kind: datetime }
+    planners:
+      - kind: workflow.progress_counters
+        columns:
+          total: total_rows
+          processed: processed_rows
+          succeeded: imported_rows
+          failed: failed_rows
+          pending: pending_rows
+          status: status
+          completed_at: completed_at
+        progress:
+          kind: mixture
+          complete_weight: 0.7
+          active_weight: 0.25
+          not_started_weight: 0.05
+        partition: exact
+        completed_statuses: [completed, failed]
+        active_statuses: [queued, running]
+
+  webhooks:
+    rows: { kind: fixed, count: 800 }
+    schema:
+      name: webhooks
+      columns:
+        - { name: id, type: bigint, nullable: false, primary_key: true }
+        - { name: tenant_id, type: bigint, nullable: false }
+        - { name: url, type: varchar(255), nullable: false }
+        - { name: signing_secret, type: varchar(80), nullable: false }
+        - { name: events, type: json, nullable: false }
+        - { name: is_active, type: boolean, nullable: false }
+        - { name: created_at, type: datetime, nullable: false }
+    relationships:
+      - name: webhook_tenant
+        columns: [tenant_id]
+        references: { table: tenants, columns: [id] }
+    columns:
+      id:
+        generator: { kind: sequence, start: 1 }
+      tenant_id:
+        generator: { kind: relation.foreign_key, relationship: webhook_tenant }
+      url:
+        generator: { kind: internet.url }
+      signing_secret:
+        generator: { kind: credential.secret }
+      events:
+        generator: { kind: json_value }
+      is_active:
+        generator: { kind: boolean, probability: 0.85 }
+      created_at:
+        generator: { kind: datetime }
+
+  activity_log:
+    # Polymorphic audit trail across everything.
+    rows: { kind: fixed, count: 250000 }
+    schema:
+      name: activity_log
+      columns:
+        - { name: id, type: bigint, nullable: false, primary_key: true }
+        - { name: tenant_id, type: bigint, nullable: false }
+        - { name: causer_id, type: bigint, nullable: true }
+        - { name: subject_type, type: varchar(40), nullable: false }
+        - { name: subject_id, type: bigint, nullable: false }
+        - { name: event, type: varchar(40), nullable: false }
+        - { name: properties, type: json, nullable: true }
+        - { name: ip_address, type: varchar(45), nullable: true }
+        - { name: created_at, type: datetime, nullable: false }
+    relationships:
+      - name: activity_tenant
+        columns: [tenant_id]
+        references: { table: tenants, columns: [id] }
+      - name: activity_causer
+        columns: [causer_id]
+        references: { table: users, columns: [id] }
+    columns:
+      id:
+        generator: { kind: sequence, start: 1 }
+      tenant_id:
+        generator: { kind: relation.foreign_key, relationship: activity_tenant }
+      causer_id:
+        generator: { kind: relation.foreign_key, relationship: activity_causer }
+      event:
+        generator:
+          kind: weighted_choice
+          choices:
+            - { value: created, weight: 0.4 }
+            - { value: updated, weight: 0.4 }
+            - { value: deleted, weight: 0.1 }
+            - { value: restored, weight: 0.1 }
+      properties:
+        generator: { kind: json_value }
+        modifiers:
+          - { kind: null_rate, rate: 0.25 }
+      ip_address:
+        generator: { kind: internet.ipv4 }
+        modifiers:
+          - { kind: null_rate, rate: 0.15 }
+      created_at:
+        generator: { kind: datetime }
+    planners:
+      - kind: relation.polymorphic_pair
+        columns:
+          type: subject_type
+          id: subject_id
+        targets:
+          - { table: tasks, type: task, weight: 0.6 }
+          - { table: folders, type: folder, weight: 0.2 }
+          - { table: comments, type: comment, weight: 0.2 }

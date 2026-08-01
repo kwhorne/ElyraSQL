@@ -1,0 +1,347 @@
+# Stress fixture 4 of 6 — Banking / transaction ledger.
+#
+# Stress axis: DECIMAL PRECISION EDGE CASES + TEMPORAL CORRELATION + FK CYCLES.
+# Anchored on the kassalapp bank_* tables (structure only).
+#
+# Exercises:
+#   - Multiple currency scales in one model (0, 2, 3 decimal places) and a wide
+#     decimal(20,4) balance column
+#   - FK CYCLE -> DEFERRED CONSTRAINTS: transfers reference two accounts, and
+#     accounts reference a "primary_transaction" back into transactions
+#   - temporal.interval               (statement periods)
+#   - monotonic                       (running balance / ledger sequence)
+#   - observed_sample                 (category names -> source-literal risk marker)
+#   - pattern                         (IBAN-like account numbers)
+#   - clamp / round modifiers on money
+#   - credential.secret               (webhook signing keys)
+#
+# Output targets MSSQL to exercise N'' string prefixing and identity mapping.
+# PROVISIONAL: any non-3A planner argument shape follows the documented style.
+
+version: 1
+kind: model
+
+source:
+  dialect: postgres
+  fingerprint_policy: warn
+
+output:
+  dialect: mssql
+  mode: schema_and_data
+  batch_size: 1000
+
+seed: 5150420
+
+defaults:
+  inference: disabled
+
+tables:
+
+  currencies:
+    rows: { kind: fixed, count: 6 }
+    schema:
+      name: currencies
+      columns:
+        - { name: code, type: char(3), nullable: false, primary_key: true }
+        - { name: name, type: varchar(40), nullable: false }
+        - { name: minor_scale, type: smallint, nullable: false }
+    columns:
+      code:
+        # unique so the 6-row PK holds all distinct codes (plain `choice` random
+        # draws could repeat a code and violate the primary key).
+        generator: { kind: choice, values: [NOK, EUR, USD, JPY, BHD, GBP] }
+        modifiers: [{ kind: unique, max_attempts: 64, on_exhaustion: error }]
+      name: { generator: { kind: text.word } }
+      # NOK/EUR/USD/GBP = 2, JPY = 0, BHD = 3 -> exercises 0/2/3 scale handling.
+      minor_scale:
+        generator:
+          kind: weighted_choice
+          choices:
+            - { value: 2, weight: 0.66 }
+            - { value: 0, weight: 0.17 }
+            - { value: 3, weight: 0.17 }
+
+  banks:
+    rows: { kind: fixed, count: 40 }
+    schema:
+      name: banks
+      columns:
+        - { name: id, type: bigint, nullable: false, primary_key: true }
+        - { name: name, type: varchar(120), nullable: false }
+        - { name: bic, type: varchar(11), nullable: false, unique: true }
+        - { name: country, type: char(2), nullable: false }
+    columns:
+      id: { generator: { kind: sequence, start: 1 } }
+      name: { generator: { kind: company.name } }
+      bic:
+        # mask: `?`=upper letter, literal `NO`, `*`=alphanumeric (was regex `[A-Z]{4}NO[A-Z0-9]{2}`).
+        generator: { kind: pattern, mask: "????NO**" }
+        modifiers: [{ kind: unique, max_attempts: 16, on_exhaustion: error }]
+      country: { generator: { kind: constant, value: NO } }
+
+  accounts:
+    rows: { kind: fixed, count: 120000 }
+    schema:
+      name: accounts
+      columns:
+        - { name: id, type: bigint, nullable: false, primary_key: true }
+        - { name: bank_id, type: bigint, nullable: false }
+        - { name: owner_email, type: varchar(255), nullable: false }
+        - { name: iban, type: varchar(34), nullable: false, unique: true }
+        - { name: currency_code, type: char(3), nullable: false }
+        - { name: balance, type: "decimal(20,4)", nullable: false }
+        - { name: kind, type: varchar(16), nullable: false }
+        # Deferred self/forward reference: newest transaction on the account.
+        - { name: primary_transaction_id, type: bigint, nullable: true }
+        - { name: opened_at, type: datetime, nullable: false }
+        - { name: closed_at, type: datetime, nullable: true }
+    relationships:
+      - name: account_bank
+        columns: [bank_id]
+        references: { table: banks, columns: [id] }
+      # NOTE: an FK on currency_code -> currencies.code is NOT supported: FK
+      # value selection can only materialize integer/sequence/uuid parent keys,
+      # not a char(3) natural key. Substituted a `choice` over the same code set
+      # below (values stay valid against currencies; no rendered FK constraint).
+      # Forward FK into transactions -> creates a cycle -> deferred constraint.
+      - name: account_primary_txn
+        columns: [primary_transaction_id]
+        references: { table: transactions, columns: [id] }
+    columns:
+      id: { generator: { kind: sequence, start: 1 } }
+      bank_id: { generator: { kind: relation.foreign_key, relationship: account_bank } }
+      owner_email: { generator: { kind: internet.email } }
+      iban:
+        # mask: literal `NO`, `#`=digit x13 (was regex `NO[0-9]{2}[0-9]{11}`).
+        generator: { kind: pattern, mask: "NO#############" }
+        modifiers: [{ kind: unique, max_attempts: 32, on_exhaustion: error }]
+      currency_code: { generator: { kind: choice, values: [NOK, EUR, USD, JPY, BHD, GBP] } }
+      balance:
+        generator: { kind: normal, mean: 25000.0, std: 40000.0, min: -50000.0, max: 5000000.0, scale: 4 }
+        modifiers:
+          - { kind: clamp, min: -50000.0, max: 5000000.0 }
+          - { kind: round, scale: 4 }
+      kind:
+        generator:
+          kind: weighted_choice
+          choices:
+            - { value: checking, weight: 0.55 }
+            - { value: savings, weight: 0.35 }
+            - { value: credit, weight: 0.10 }
+      # Account open date (soft_delete planner owns closed_at below).
+      opened_at: { generator: { kind: datetime } }
+      primary_transaction_id:
+        # Nullable forward FK; resolved after transactions exist (deferred).
+        # Column NULLability lives on the schema entry; the generator drops values via null_rate.
+        generator: { kind: relation.foreign_key, relationship: account_primary_txn, null_rate: 0.15 }
+    planners:
+      - kind: temporal.soft_delete
+        columns: { deleted_at: closed_at }
+        deletion_probability: 0.09
+        deleted_range: { min: 2020-01-01T00:00:00Z, max: 2026-01-01T00:00:00Z }
+
+  transactions:
+    rows:
+      kind: relation.children
+      parent: accounts
+      count: 3000000
+      distribution: { kind: poisson, mean: 25, min: 0, max: 4000 }
+    schema:
+      name: transactions
+      columns:
+        - { name: id, type: bigint, nullable: false, primary_key: true }
+        - { name: account_id, type: bigint, nullable: false }
+        - { name: category_id, type: bigint, nullable: true }
+        - { name: amount_minor, type: bigint, nullable: false }
+        - { name: currency_code, type: char(3), nullable: false }
+        - { name: running_balance, type: "decimal(20,4)", nullable: false }
+        - { name: direction, type: varchar(6), nullable: false }
+        - { name: description, type: varchar(200), nullable: true }
+        - { name: booked_at, type: datetime, nullable: false }
+        - { name: sequence_no, type: bigint, nullable: false }
+    relationships:
+      - name: txn_account
+        columns: [account_id]
+        references: { table: accounts, columns: [id] }
+      - name: txn_category
+        columns: [category_id]
+        references: { table: transaction_categories, columns: [id] }
+    columns:
+      id: { generator: { kind: sequence, start: 1 } }
+      account_id: { generator: { kind: relation.foreign_key, relationship: txn_account } }
+      category_id:
+        # Column NULLability is a schema property; null_rate drops FK values.
+        generator: { kind: relation.foreign_key, relationship: txn_category, null_rate: 0.35 }
+      amount_minor:
+        # Money as integer minor units (no float arithmetic anywhere).
+        generator: { kind: integer, min: -50000000, max: 50000000 }
+      currency_code: { generator: { kind: constant, value: NOK } }
+      running_balance:
+        generator: { kind: normal, mean: 25000.0, std: 40000.0, min: -100000.0, max: 5000000.0, scale: 4 }
+      direction:
+        generator:
+          kind: weighted_choice
+          choices:
+            - { value: debit, weight: 0.55 }
+            - { value: credit, weight: 0.45 }
+      description:
+        generator: { kind: text.sentence }
+        modifiers: [{ kind: null_rate, rate: 0.2 }]
+      booked_at: { generator: { kind: datetime } }
+      sequence_no: { generator: { kind: monotonic, start: 1, step: 1 } }
+
+  transaction_categories:
+    # observed_sample deliberately used -> triggers source-literal risk marker.
+    rows: { kind: fixed, count: 80 }
+    schema:
+      name: transaction_categories
+      columns:
+        - { name: id, type: bigint, nullable: false, primary_key: true }
+        - { name: parent_id, type: bigint, nullable: true }
+        - { name: name, type: varchar(80), nullable: false }
+        # NOTE: a `depth` output column is NOT supported by hierarchy.tree
+        # (the planner emits `parent` only), so the depth column + depth_column
+        # arg were dropped. max_depth still bounds the tree internally.
+    relationships:
+      - name: category_parent
+        columns: [parent_id]
+        references: { table: transaction_categories, columns: [id] }
+    columns:
+      id: { generator: { kind: sequence, start: 1 } }
+      name:
+        generator:
+          kind: observed_sample
+          values: [Groceries, Rent, Salary, Utilities, Transport, Dining, Insurance, Subscriptions]
+    planners:
+      - kind: hierarchy.tree
+        relationship: category_parent
+        columns: { parent: parent_id }
+        root_ratio: 0.2
+        max_depth: 3
+        # max_branching takes a single integer cap (was an unsupported
+        # `branching` distribution `{uniform, min: 0, max: 8}`).
+        max_branching: 8
+
+  category_mappings:
+    # Junction: many merchant strings mapped to a category.
+    rows: { kind: fixed, count: 20000 }
+    schema:
+      name: category_mappings
+      columns:
+        - { name: id, type: bigint, nullable: false, primary_key: true }
+        - { name: category_id, type: bigint, nullable: false }
+        - { name: merchant_pattern, type: varchar(120), nullable: false }
+    relationships:
+      - name: mapping_category
+        columns: [category_id]
+        references: { table: transaction_categories, columns: [id] }
+    columns:
+      id: { generator: { kind: sequence, start: 1 } }
+      category_id: { generator: { kind: relation.foreign_key, relationship: mapping_category } }
+      merchant_pattern: { generator: { kind: company.name } }
+
+  statements:
+    # temporal.interval: monthly statement windows (all closed, no open period).
+    rows:
+      kind: relation.children
+      parent: accounts
+      count: 400000
+      distribution: { kind: histogram, mean: 12, min: 0, max: 60 }
+    schema:
+      name: statements
+      columns:
+        - { name: id, type: bigint, nullable: false, primary_key: true }
+        - { name: account_id, type: bigint, nullable: false }
+        - { name: period_start, type: datetime, nullable: false }
+        - { name: period_end, type: datetime, nullable: false }
+        - { name: period_days, type: integer, nullable: false }
+        - { name: opening_balance, type: "decimal(20,4)", nullable: false }
+        - { name: closing_balance, type: "decimal(20,4)", nullable: false }
+    relationships:
+      - name: statement_account
+        columns: [account_id]
+        references: { table: accounts, columns: [id] }
+    columns:
+      id: { generator: { kind: sequence, start: 1 } }
+      account_id: { generator: { kind: relation.foreign_key, relationship: statement_account } }
+      opening_balance:
+        generator: { kind: normal, mean: 25000.0, std: 40000.0, min: -100000.0, max: 5000000.0, scale: 4 }
+      closing_balance:
+        generator: { kind: normal, mean: 25000.0, std: 40000.0, min: -100000.0, max: 5000000.0, scale: 4 }
+    planners:
+      - kind: temporal.interval
+        columns:
+          start: period_start
+          end: period_end
+          duration: period_days
+        # `range` (was `monotonic`) so the min/max both apply and statement
+        # windows spread across the documented 2020-2026 window.
+        start:
+          kind: range
+          min: 2020-01-01T00:00:00Z
+          max: 2026-01-01T00:00:00Z
+        # `uniform` (was `fixed`) so min/max 28-31 days apply; `fixed` only
+        # reads a single `value` and would have collapsed to 0-day periods.
+        duration:
+          kind: uniform
+          unit: days
+          min: 28
+          max: 31
+        open_probability: 0.0
+        end_inclusive: false
+        timezone: utc
+
+  transfers:
+    # FK CYCLE stress: two FKs into accounts (from/to) in one row.
+    rows: { kind: fixed, count: 500000 }
+    schema:
+      name: transfers
+      columns:
+        - { name: id, type: bigint, nullable: false, primary_key: true }
+        - { name: from_account_id, type: bigint, nullable: false }
+        - { name: to_account_id, type: bigint, nullable: false }
+        - { name: amount_minor, type: bigint, nullable: false }
+        - { name: fee_minor, type: bigint, nullable: false }
+        - { name: reference, type: varchar(24), nullable: false, unique: true }
+        - { name: executed_at, type: datetime, nullable: false }
+    relationships:
+      - name: transfer_from
+        columns: [from_account_id]
+        references: { table: accounts, columns: [id] }
+      - name: transfer_to
+        columns: [to_account_id]
+        references: { table: accounts, columns: [id] }
+    columns:
+      id: { generator: { kind: sequence, start: 1 } }
+      from_account_id: { generator: { kind: relation.foreign_key, relationship: transfer_from } }
+      to_account_id: { generator: { kind: relation.foreign_key, relationship: transfer_to } }
+      amount_minor: { generator: { kind: integer, min: 100, max: 100000000 } }
+      fee_minor: { generator: { kind: integer, min: 0, max: 5000 } }
+      reference:
+        # mask: literal `TRF`, `#`=digit x10 (was regex `TRF[0-9]{10}`).
+        generator: { kind: pattern, mask: "TRF##########" }
+        modifiers: [{ kind: unique, max_attempts: 32, on_exhaustion: error }]
+      executed_at: { generator: { kind: datetime } }
+
+  webhooks:
+    rows: { kind: fixed, count: 300 }
+    schema:
+      name: webhooks
+      columns:
+        - { name: id, type: bigint, nullable: false, primary_key: true }
+        - { name: bank_id, type: bigint, nullable: false }
+        - { name: url, type: varchar(255), nullable: false }
+        - { name: signing_key, type: varchar(96), nullable: false }
+        - { name: api_key, type: varchar(64), nullable: false }
+        - { name: is_active, type: boolean, nullable: false }
+    relationships:
+      - name: webhook_bank
+        columns: [bank_id]
+        references: { table: banks, columns: [id] }
+    columns:
+      id: { generator: { kind: sequence, start: 1 } }
+      bank_id: { generator: { kind: relation.foreign_key, relationship: webhook_bank } }
+      url: { generator: { kind: internet.url } }
+      signing_key: { generator: { kind: credential.secret } }
+      api_key: { generator: { kind: credential.api_key } }
+      is_active: { generator: { kind: boolean, probability: 0.9 } }

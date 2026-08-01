@@ -1,0 +1,856 @@
+# Stress fixture 6 of 6 — THE EVERYTHING FIXTURE (capstone / ultimate stress test).
+#
+# A single self-contained `kind: model` that exercises the supported surface
+# in one file: a broad generator/modifier catalog, every row-count rule and
+# child distribution kind, composite primary keys, an FK cycle resolved via
+# deferred constraints, per-table seed overrides, and all twelve planners:
+#
+#   commerce.order_family, workflow.progress_counters, temporal.interval,
+#   temporal.timestamps, temporal.soft_delete, temporal.lifecycle,
+#   relation.polymorphic_pair, relation.junction_pair, relation.tenant_family,
+#   hierarchy.tree, geo.coordinate_pair, file.metadata
+#
+# Fictional "OmniPlatform": a multi-tenant SaaS that combines commerce, project
+# workflow, payments, and content. Output targets MSSQL (hardest dialect: N''
+# prefixing, IDENTITY, GO batching via --mssql-go at the CLI).
+#
+# Planner argument payloads follow the documented configuration shapes. This
+# fixture exercises all twelve planners together with the other model features.
+
+version: 1
+kind: model
+
+source:
+  dialect: postgres
+  fingerprint: sha256:feedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedface
+  fingerprint_policy: warn
+
+output:
+  dialect: mssql
+  mode: schema_and_data
+  inserts: auto
+  batch_size: 1000
+
+seed: 424242
+
+defaults:
+  inference: disabled
+
+tables:
+
+  # ---- Tenancy root + geo -------------------------------------------------
+  tenants:
+    rows: { kind: fixed, count: 40 }
+    schema:
+      name: tenants
+      columns:
+        - { name: id, type: bigint, nullable: false, primary_key: true }
+        - { name: name, type: varchar(120), nullable: false }
+        - { name: slug, type: varchar(140), nullable: false, unique: true }
+        - { name: plan, type: varchar(16), nullable: false }
+        - { name: hq_latitude, type: "decimal(9,6)", nullable: false }
+        - { name: hq_longitude, type: "decimal(9,6)", nullable: false }
+        - { name: settings, type: json, nullable: true }
+        - { name: created_at, type: datetime, nullable: false }
+        - { name: updated_at, type: datetime, nullable: false }
+    columns:
+      id: { generator: { kind: sequence, start: 1 } }
+      name: { generator: { kind: company.name } }
+      slug:
+        generator: { kind: text.slug }
+        modifiers: [{ kind: suffix, value: "-inc" }, { kind: unique, max_attempts: 32, on_exhaustion: error }]
+      plan:
+        generator:
+          kind: weighted_choice
+          choices:
+            - { value: free, weight: 0.4 }
+            - { value: pro, weight: 0.4 }
+            - { value: enterprise, weight: 0.2 }
+      settings:
+        generator: { kind: json_value }
+        modifiers: [{ kind: null_rate, rate: 0.2 }]
+    planners:
+      - kind: geo.coordinate_pair
+        columns: { latitude: hq_latitude, longitude: hq_longitude }
+        bounds: { min_lat: -55.0, max_lat: 71.0, min_lon: -168.0, max_lon: 178.0 }
+        precision: 6
+      - kind: temporal.timestamps
+        columns: { created_at: created_at, updated_at: updated_at }
+        created: { kind: range, min: 2019-01-01T00:00:00Z, max: 2026-01-01T00:00:00Z }
+        update_delay: { kind: uniform, unit: days, min: 0, max: 365 }
+
+  # ---- Users: broad semantic / credential / identifier catalog ------------
+  users:
+    rows: { kind: fixed, count: 6000 }
+    schema:
+      name: users
+      columns:
+        - { name: id, type: bigint, nullable: false, primary_key: true }
+        - { name: uuid, type: char(36), nullable: false, unique: true }
+        - { name: ulid, type: char(26), nullable: false, unique: true }
+        - { name: nanoid, type: varchar(21), nullable: false, unique: true }
+        - { name: first_name, type: varchar(80), nullable: false }
+        - { name: last_name, type: varchar(80), nullable: false }
+        - { name: full_name, type: varchar(160), nullable: false }
+        - { name: username, type: varchar(40), nullable: false, unique: true }
+        - { name: email, type: varchar(255), nullable: false, unique: true }
+        - { name: password_hash, type: varchar(255), nullable: false }
+        - { name: api_key, type: varchar(64), nullable: true }
+        - { name: phone, type: varchar(32), nullable: true }
+        - { name: address_line1, type: varchar(200), nullable: true }
+        - { name: address_line2, type: varchar(200), nullable: true }
+        - { name: city, type: varchar(120), nullable: true }
+        - { name: region, type: varchar(120), nullable: true }
+        - { name: postcode, type: varchar(12), nullable: true }
+        - { name: country, type: varchar(2), nullable: true }
+        - { name: user_agent, type: varchar(255), nullable: true }
+        - { name: locale, type: varchar(8), nullable: false }
+        - { name: karma, type: "decimal(18,6)", nullable: false }
+        - { name: signature, type: blob, nullable: true }
+        - { name: created_at, type: datetime, nullable: false }
+        - { name: updated_at, type: datetime, nullable: false }
+        - { name: deleted_at, type: datetime, nullable: true }
+    columns:
+      id: { generator: { kind: sequence, start: 1 } }
+      uuid: { generator: { kind: uuid } }
+      ulid: { generator: { kind: identifier.ulid } }
+      nanoid: { generator: { kind: identifier.nanoid } }
+      first_name: { generator: { kind: person.first_name } }
+      last_name: { generator: { kind: person.last_name } }
+      full_name:
+        generator:
+          kind: template
+          parts:
+            - { field: first_name }
+            - " "
+            - { field: last_name }
+      username:
+        generator: { kind: person.username }
+        modifiers: [{ kind: case, mode: lower }, { kind: unique, max_attempts: 64, on_exhaustion: widen }]
+      email:
+        generator: { kind: internet.email }
+        modifiers: [{ kind: unique, max_attempts: 64, on_exhaustion: error }]
+      password_hash: { generator: { kind: credential.password_hash } }
+      api_key:
+        generator: { kind: credential.api_key }
+        modifiers: [{ kind: prefix, value: "ak_" }, { kind: null_rate, rate: 0.5 }]
+      phone:
+        generator: { kind: phone.number }
+        modifiers: [{ kind: null_rate, rate: 0.3 }]
+      address_line1:
+        generator: { kind: address.line1 }
+        modifiers: [{ kind: null_rate, rate: 0.2 }]
+      address_line2:
+        generator: { kind: address.line2 }
+        modifiers: [{ kind: null_rate, rate: 0.8 }]
+      city:
+        generator: { kind: address.city }
+        modifiers: [{ kind: null_rate, rate: 0.2 }]
+      region:
+        generator: { kind: address.region }
+        modifiers: [{ kind: null_rate, rate: 0.3 }]
+      postcode:
+        generator: { kind: address.postcode }
+        modifiers: [{ kind: null_rate, rate: 0.2 }]
+      country:
+        generator: { kind: address.country }
+        modifiers: [{ kind: truncate, max_length: 2 }, { kind: case, mode: upper }, { kind: null_rate, rate: 0.1 }]
+      user_agent:
+        generator: { kind: internet.user_agent }
+        modifiers: [{ kind: null_rate, rate: 0.3 }]
+      locale:
+        generator:
+          kind: weighted_choice
+          choices:
+            - { value: en, weight: 0.6 }
+            - { value: nb, weight: 0.15 }
+            - { value: de, weight: 0.15 }
+            - { value: ja, weight: 0.1 }
+      karma:
+        generator: { kind: normal, mean: 500, std: 350, min: 0, max: 100000, scale: 6 }
+        modifiers: [{ kind: clamp, min: 0, max: 100000 }, { kind: round, scale: 6 }]
+      signature:
+        generator: { kind: bytes, min_length: 32, max_length: 256 }
+        modifiers: [{ kind: null_rate, rate: 0.85 }]
+    planners:
+      - kind: temporal.timestamps
+        columns: { created_at: created_at, updated_at: updated_at }
+        created: { kind: range, min: 2019-01-01T00:00:00Z, max: 2026-01-01T00:00:00Z }
+        update_delay: { kind: uniform, unit: hours, min: 0, max: 8760 }
+      - kind: temporal.soft_delete
+        columns: { deleted_at: deleted_at }
+        deletion_probability: 0.07
+        deleted_range: { kind: range, min: 2020-01-01T00:00:00Z, max: 2026-01-01T00:00:00Z }
+
+  # ---- Junction with composite PK ----------------------------------------
+  memberships:
+    rows:
+      kind: relation.children
+      parent: tenants
+      count: 12000
+      distribution: { kind: histogram, mean: 300, min: 1, max: 2000 }
+    schema:
+      name: memberships
+      columns:
+        - { name: tenant_id, type: bigint, nullable: false, primary_key: true }
+        - { name: user_id, type: bigint, nullable: false, primary_key: true }
+        - { name: role, type: varchar(20), nullable: false }
+        - { name: joined_at, type: datetime, nullable: false }
+    relationships:
+      - name: membership_tenant
+        columns: [tenant_id]
+        references: { table: tenants, columns: [id] }
+      - name: membership_user
+        columns: [user_id]
+        references: { table: users, columns: [id] }
+    columns:
+      role:
+        generator:
+          kind: weighted_choice
+          choices:
+            - { value: owner, weight: 0.05 }
+            - { value: admin, weight: 0.15 }
+            - { value: member, weight: 0.8 }
+      joined_at: { generator: { kind: datetime } }
+    planners:
+      - kind: relation.junction_pair
+        columns: { left: tenant_id, right: user_id }
+        left_relationship: membership_tenant
+        right_relationship: membership_user
+
+  # ---- Hierarchy tree ----------------------------------------------------
+  categories:
+    rows:
+      kind: relation.children
+      parent: tenants
+      count: 2000
+      distribution: { kind: uniform, mean: 30, min: 5, max: 100 }
+    schema:
+      name: categories
+      columns:
+        - { name: id, type: bigint, nullable: false, primary_key: true }
+        - { name: tenant_id, type: bigint, nullable: false }
+        - { name: parent_id, type: bigint, nullable: true }
+        - { name: name, type: varchar(120), nullable: false }
+        - { name: depth, type: integer, nullable: false }
+    relationships:
+      - name: category_tenant
+        columns: [tenant_id]
+        references: { table: tenants, columns: [id] }
+      - name: category_parent
+        columns: [parent_id]
+        references: { table: categories, columns: [id] }
+    columns:
+      id: { generator: { kind: sequence, start: 1 } }
+      tenant_id: { generator: { kind: relation.foreign_key, relationship: category_tenant } }
+      name: { generator: { kind: text.word } }
+      # `hierarchy.tree` has no depth output; a plain generator fills the column.
+      depth: { generator: { kind: integer, min: 0, max: 5 } }
+    planners:
+      - kind: hierarchy.tree
+        columns: { parent: parent_id }
+        relationship: category_parent
+        root_ratio: 0.15
+        max_depth: 5
+        max_branching: 6
+
+  # ---- Products: mask + file metadata + statistical money ----------------
+  products:
+    rows:
+      kind: relation.children
+      parent: tenants
+      count: 120000
+      distribution: { kind: poisson, mean: 3000, min: 0, max: 40000 }
+    schema:
+      name: products
+      columns:
+        - { name: id, type: bigint, nullable: false, primary_key: true }
+        - { name: tenant_id, type: bigint, nullable: false }
+        - { name: category_id, type: bigint, nullable: true }
+        - { name: name, type: varchar(200), nullable: false }
+        - { name: sku, type: varchar(32), nullable: false }
+        - { name: currency, type: char(3), nullable: false }
+        - { name: unit_price, type: "decimal(12,2)", nullable: false }
+        - { name: cost, type: "decimal(12,4)", nullable: false }
+        - { name: weight_g, type: integer, nullable: true }
+        - { name: image_name, type: varchar(255), nullable: true }
+        - { name: image_ext, type: varchar(8), nullable: true }
+        - { name: image_mime, type: varchar(80), nullable: true }
+        - { name: image_size, type: bigint, nullable: true }
+        - { name: image_hash, type: char(64), nullable: true }
+        - { name: created_at, type: datetime, nullable: false }
+        - { name: updated_at, type: datetime, nullable: false }
+    relationships:
+      - name: product_tenant
+        columns: [tenant_id]
+        references: { table: tenants, columns: [id] }
+      - name: product_category
+        columns: [category_id]
+        references: { table: categories, columns: [id] }
+    columns:
+      id: { generator: { kind: sequence, start: 1 } }
+      tenant_id: { generator: { kind: relation.foreign_key, relationship: product_tenant } }
+      category_id:
+        generator: { kind: relation.foreign_key, relationship: product_category, null_rate: 0.15 }
+      name: { generator: { kind: commerce.product_name } }
+      sku: { generator: { kind: pattern, mask: "SKU-????????" } }
+      currency:
+        generator:
+          kind: weighted_choice
+          choices:
+            - { value: USD, weight: 0.5 }
+            - { value: EUR, weight: 0.3 }
+            - { value: NOK, weight: 0.2 }
+      unit_price:
+        generator: { kind: lognormal, mu: 4.0, sigma: 1.2, min: 0.99, max: 9999.0, scale: 2 }
+        modifiers: [{ kind: clamp, min: 0.99, max: 9999.0 }]
+      cost:
+        generator: { kind: lognormal, mu: 3.5, sigma: 1.2, min: 0.10, max: 8000.0, scale: 4 }
+      weight_g:
+        generator: { kind: lognormal, mu: 5.0, sigma: 1.5, min: 1, max: 50000 }
+        modifiers: [{ kind: null_rate, rate: 0.2 }]
+    planners:
+      - kind: file.metadata
+        columns:
+          name: image_name
+          extension: image_ext
+          mime_type: image_mime
+          size: image_size
+          hash: image_hash
+        size: { min: 4096, max: 8388608 }
+        extensions: [jpg, png, webp]
+        hash_kind: sha256
+      - kind: temporal.timestamps
+        columns: { created_at: created_at, updated_at: updated_at }
+        created: { kind: range, min: 2020-01-01T00:00:00Z, max: 2026-01-01T00:00:00Z }
+        update_delay: { kind: uniform, unit: days, min: 0, max: 365 }
+
+  # ---- Commerce order family (exact minor-unit money) + tenant family -----
+  orders:
+    rows:
+      kind: relation.children
+      parent: tenants
+      count: 400000
+      distribution: { kind: observed, mean: 10000, min: 0, max: 80000 }
+    schema:
+      name: orders
+      columns:
+        - { name: id, type: bigint, nullable: false, primary_key: true }
+        - { name: tenant_id, type: bigint, nullable: false }
+        - { name: buyer_id, type: bigint, nullable: false }
+        - { name: reference, type: varchar(24), nullable: false, unique: true }
+        - { name: currency, type: char(3), nullable: false }
+        - { name: subtotal, type: "decimal(14,2)", nullable: false }
+        - { name: discount_total, type: "decimal(14,2)", nullable: false }
+        - { name: tax_total, type: "decimal(14,2)", nullable: false }
+        - { name: shipping_total, type: "decimal(14,2)", nullable: false }
+        - { name: grand_total, type: "decimal(14,2)", nullable: false }
+        - { name: status, type: varchar(16), nullable: false }
+        - { name: placed_at, type: datetime, nullable: false }
+        - { name: updated_at, type: datetime, nullable: false }
+    relationships:
+      - name: order_tenant
+        columns: [tenant_id]
+        references: { table: tenants, columns: [id] }
+      - name: order_buyer
+        columns: [buyer_id]
+        references: { table: users, columns: [id] }
+    columns:
+      id: { generator: { kind: sequence, start: 1 } }
+      reference:
+        generator: { kind: pattern, mask: "ORD-####-######" }
+        modifiers: [{ kind: unique, max_attempts: 32, on_exhaustion: error }]
+      currency: { generator: { kind: constant, value: USD } }
+      status:
+        generator:
+          kind: weighted_choice
+          choices:
+            - { value: pending, weight: 0.1 }
+            - { value: paid, weight: 0.5 }
+            - { value: shipped, weight: 0.25 }
+            - { value: refunded, weight: 0.05 }
+            - { value: cancelled, weight: 0.1 }
+      placed_at: { generator: { kind: datetime } }
+      updated_at: { generator: { kind: after, source: placed_at, min_seconds: 0, max_seconds: 2592000 } }
+      # tenant_id/buyer_id owned by tenant_family; the money columns by order_family.
+    planners:
+      - kind: relation.tenant_family
+        columns: { tenant: tenant_id, parent: buyer_id }
+        relationship: order_buyer
+        num_tenants: 40
+        tenant_start: 1
+      - kind: commerce.order_family
+        children: order_items
+        relationship: order_item_order
+        columns:
+          subtotal: subtotal
+          discount: discount_total
+          tax: tax_total
+          shipping: shipping_total
+          total: grand_total
+        child_columns:
+          quantity: quantity
+          unit_price: unit_price
+          discount: discount_amount
+          tax: tax_amount
+          line_total: line_total
+        currency_scale: 2
+        rounding: bankers
+        tax:
+          kind: weighted_choice
+          rates: [0.0, 0.08, 0.20, 0.25]
+          weights: [0.1, 0.3, 0.3, 0.3]
+
+  order_items:
+    rows:
+      kind: relation.children
+      parent: orders
+      count: 1600000
+      # `fixed` (integer mean): commerce.order_family owns this child's line
+      # count and draws it per order from this distribution. A deterministic
+      # count keeps the family-produced total exactly equal to the resolved
+      # `orders * mean`, which the row_count verifier checks; a mean-respecting
+      # kind (poisson/histogram) would make the total drift off that estimate.
+      distribution: { kind: fixed, mean: 4, min: 4, max: 4 }
+    schema:
+      name: order_items
+      columns:
+        - { name: id, type: bigint, nullable: false, primary_key: true }
+        - { name: order_id, type: bigint, nullable: false }
+        - { name: product_id, type: bigint, nullable: true }
+        - { name: description, type: varchar(200), nullable: false }
+        - { name: quantity, type: integer, nullable: false }
+        - { name: unit_price, type: "decimal(14,2)", nullable: false }
+        - { name: discount_amount, type: "decimal(14,2)", nullable: false }
+        - { name: tax_amount, type: "decimal(14,2)", nullable: false }
+        - { name: line_total, type: "decimal(14,2)", nullable: false }
+    relationships:
+      - name: order_item_order
+        columns: [order_id]
+        references: { table: orders, columns: [id] }
+      - name: order_item_product
+        columns: [product_id]
+        references: { table: products, columns: [id] }
+    columns:
+      id: { generator: { kind: sequence, start: 1 } }
+      order_id: { generator: { kind: relation.foreign_key, relationship: order_item_order } }
+      product_id:
+        generator: { kind: relation.foreign_key, relationship: order_item_product, null_rate: 0.03 }
+      description: { generator: { kind: commerce.product_name } }
+      # quantity/prices/discount/tax/line_total owned by order_family.
+
+  # ---- Workflow progress counters ----------------------------------------
+  import_jobs:
+    seed: null   # randomize this table even though the model is seeded
+    rows:
+      kind: relation.children
+      parent: tenants
+      count: 20000
+      distribution: { kind: poisson, mean: 500, min: 0, max: 8000 }
+    schema:
+      name: import_jobs
+      columns:
+        - { name: id, type: bigint, nullable: false, primary_key: true }
+        - { name: tenant_id, type: bigint, nullable: false }
+        - { name: kind, type: varchar(40), nullable: false }
+        - { name: total, type: integer, nullable: false }
+        - { name: processed, type: integer, nullable: false }
+        - { name: succeeded, type: integer, nullable: false }
+        - { name: failed, type: integer, nullable: false }
+        - { name: pending, type: integer, nullable: false }
+        - { name: status, type: varchar(16), nullable: false }
+        - { name: completed_at, type: datetime, nullable: true }
+    relationships:
+      - name: import_job_tenant
+        columns: [tenant_id]
+        references: { table: tenants, columns: [id] }
+    columns:
+      id: { generator: { kind: sequence, start: 1 } }
+      tenant_id: { generator: { kind: relation.foreign_key, relationship: import_job_tenant } }
+      kind: { generator: { kind: choice, values: [products, customers, orders, inventory] } }
+    planners:
+      - kind: workflow.progress_counters
+        columns:
+          total: total
+          processed: processed
+          succeeded: succeeded
+          failed: failed
+          pending: pending
+          status: status
+          completed_at: completed_at
+        total: { kind: uniform, min: 10, max: 5000 }
+        progress:
+          kind: mixture
+          complete_weight: 0.6
+          active_weight: 0.3
+          not_started_weight: 0.1
+        partition: exact
+        completed_statuses: [completed, failed]
+        active_statuses: [queued, running]
+
+  # ---- Temporal interval (bookings with open/running rows) ---------------
+  sessions:
+    rows:
+      kind: relation.children
+      parent: users
+      count: 800000
+      distribution: { kind: poisson, mean: 130, min: 0, max: 6000 }
+    schema:
+      name: sessions
+      columns:
+        - { name: id, type: bigint, nullable: false, primary_key: true }
+        - { name: user_id, type: bigint, nullable: false }
+        - { name: started_at, type: datetime, nullable: false }
+        - { name: ended_at, type: datetime, nullable: true }
+        - { name: duration_seconds, type: integer, nullable: true }
+        - { name: is_active, type: boolean, nullable: false }
+        - { name: ip_address, type: varchar(45), nullable: false }
+    relationships:
+      - name: session_user
+        columns: [user_id]
+        references: { table: users, columns: [id] }
+    columns:
+      id: { generator: { kind: sequence, start: 1 } }
+      user_id: { generator: { kind: relation.foreign_key, relationship: session_user } }
+      ip_address: { generator: { kind: internet.ipv4 } }
+    planners:
+      - kind: temporal.interval
+        columns:
+          start: started_at
+          end: ended_at
+          duration: duration_seconds
+          open: is_active
+        start:
+          kind: observed_range
+          min: 2024-01-01T00:00:00Z
+          max: 2026-01-01T00:00:00Z
+        duration:
+          kind: histogram
+          unit: seconds
+          min: 5
+          max: 86400
+        open_probability: 0.05
+        # Half-open [start, end): `end = start + duration` renders exactly at the
+        # column's second precision. `end_inclusive: true` would subtract 1ns,
+        # which second-precision datetime rendering drops, breaking the verified
+        # end = start + duration equation.
+        end_inclusive: false
+        timezone: preserve
+
+  # ---- Tasks: tree + timestamps + lifecycle + soft delete ----------------
+  tasks:
+    rows:
+      kind: relation.children
+      parent: tenants
+      count: 300000
+      distribution: { kind: poisson, mean: 7500, min: 0, max: 60000 }
+    schema:
+      name: tasks
+      columns:
+        - { name: id, type: bigint, nullable: false, primary_key: true }
+        - { name: tenant_id, type: bigint, nullable: false }
+        - { name: parent_id, type: bigint, nullable: true }
+        - { name: assignee_id, type: bigint, nullable: true }
+        - { name: title, type: varchar(200), nullable: false }
+        - { name: status, type: varchar(16), nullable: false }
+        - { name: depth, type: integer, nullable: false }
+        - { name: created_at, type: datetime, nullable: false }
+        - { name: updated_at, type: datetime, nullable: false }
+        - { name: closed_at, type: datetime, nullable: true }
+        - { name: deleted_at, type: datetime, nullable: true }
+    relationships:
+      - name: task_tenant
+        columns: [tenant_id]
+        references: { table: tenants, columns: [id] }
+      - name: task_parent
+        columns: [parent_id]
+        references: { table: tasks, columns: [id] }
+      - name: task_assignee
+        columns: [assignee_id]
+        references: { table: users, columns: [id] }
+    columns:
+      id: { generator: { kind: sequence, start: 1 } }
+      tenant_id: { generator: { kind: relation.foreign_key, relationship: task_tenant } }
+      assignee_id:
+        generator: { kind: relation.foreign_key, relationship: task_assignee, null_rate: 0.3 }
+      title: { generator: { kind: text.sentence } }
+      # `hierarchy.tree` has no depth output; a plain generator fills the column.
+      depth: { generator: { kind: integer, min: 0, max: 5 } }
+      updated_at: { generator: { kind: datetime } }
+    planners:
+      - kind: hierarchy.tree
+        columns: { parent: parent_id }
+        relationship: task_parent
+        root_ratio: 0.6
+        max_depth: 5
+        max_branching: 8
+      - kind: temporal.lifecycle
+        columns:
+          status: status
+          created: created_at
+          closed: closed_at
+        states: [created, in_progress, closed]
+        weights: [0.2, 0.5, 0.3]
+        start: { kind: range, min: 2021-01-01T00:00:00Z, max: 2026-01-01T00:00:00Z }
+        step: { kind: uniform, unit: days, min: 1, max: 30 }
+      - kind: temporal.soft_delete
+        columns: { deleted_at: deleted_at }
+        deletion_probability: 0.1
+        deleted_range: { kind: range, min: 2021-01-01T00:00:00Z, max: 2026-01-01T00:00:00Z }
+
+  # ---- Polymorphic comments ----------------------------------------------
+  comments:
+    rows: { kind: fixed, count: 500000 }
+    schema:
+      name: comments
+      columns:
+        - { name: id, type: bigint, nullable: false, primary_key: true }
+        - { name: author_id, type: bigint, nullable: false }
+        - { name: commentable_type, type: varchar(24), nullable: false }
+        - { name: commentable_id, type: bigint, nullable: false }
+        - { name: body, type: text, nullable: false }
+        - { name: created_at, type: datetime, nullable: false }
+    relationships:
+      - name: comment_author
+        columns: [author_id]
+        references: { table: users, columns: [id] }
+    columns:
+      id: { generator: { kind: sequence, start: 1 } }
+      author_id: { generator: { kind: relation.foreign_key, relationship: comment_author } }
+      body: { generator: { kind: text.paragraph } }
+      created_at: { generator: { kind: datetime } }
+    planners:
+      - kind: relation.polymorphic_pair
+        columns: { type: commentable_type, id: commentable_id }
+        targets:
+          - { table: tasks, type: task, weight: 0.5 }
+          - { table: orders, type: order, weight: 0.3 }
+          - { table: products, type: product, weight: 0.2 }
+
+  # ---- Tags + polymorphic junction ---------------------------------------
+  tags:
+    rows: { kind: fixed, count: 500 }
+    schema:
+      name: tags
+      columns:
+        - { name: id, type: bigint, nullable: false, primary_key: true }
+        - { name: name, type: varchar(60), nullable: false, unique: true }
+    columns:
+      id: { generator: { kind: sequence, start: 1 } }
+      name:
+        generator: { kind: text.word }
+        modifiers: [{ kind: format, template: "{value}-tag" }, { kind: unique, max_attempts: 32, on_exhaustion: widen }]
+
+  taggables:
+    rows: { kind: fixed, count: 400000 }
+    schema:
+      name: taggables
+      columns:
+        - { name: id, type: bigint, nullable: false, primary_key: true }
+        - { name: tag_id, type: bigint, nullable: false }
+        - { name: taggable_type, type: varchar(24), nullable: false }
+        - { name: taggable_id, type: bigint, nullable: false }
+    relationships:
+      - name: taggable_tag
+        columns: [tag_id]
+        references: { table: tags, columns: [id] }
+    columns:
+      id: { generator: { kind: sequence, start: 1 } }
+      tag_id: { generator: { kind: relation.foreign_key, relationship: taggable_tag } }
+    planners:
+      - kind: relation.polymorphic_pair
+        columns: { type: taggable_type, id: taggable_id }
+        targets:
+          - { table: products, type: product, weight: 0.5 }
+          - { table: tasks, type: task, weight: 0.5 }
+
+  # ---- Attachments: file metadata + polymorphic --------------------------
+  attachments:
+    rows: { kind: fixed, count: 200000 }
+    schema:
+      name: attachments
+      columns:
+        - { name: id, type: bigint, nullable: false, primary_key: true }
+        - { name: attachable_type, type: varchar(24), nullable: false }
+        - { name: attachable_id, type: bigint, nullable: false }
+        - { name: file_name, type: varchar(255), nullable: false }
+        - { name: extension, type: varchar(8), nullable: false }
+        - { name: mime_type, type: varchar(80), nullable: false }
+        - { name: size_bytes, type: bigint, nullable: false }
+        - { name: sha256, type: char(64), nullable: false }
+        - { name: uploaded_at, type: datetime, nullable: false }
+    columns:
+      id: { generator: { kind: sequence, start: 1 } }
+      uploaded_at: { generator: { kind: datetime } }
+    planners:
+      - kind: relation.polymorphic_pair
+        columns: { type: attachable_type, id: attachable_id }
+        targets:
+          - { table: tasks, type: task, weight: 0.4 }
+          - { table: comments, type: comment, weight: 0.3 }
+          - { table: orders, type: order, weight: 0.3 }
+      - kind: file.metadata
+        columns:
+          name: file_name
+          extension: extension
+          mime_type: mime_type
+          size: size_bytes
+          hash: sha256
+        size: { min: 1024, max: 52428800 }
+        extensions: [pdf, png, jpg, docx, xlsx, csv, zip, mp4]
+        hash_kind: sha256
+
+  # ---- Payments: decimal scales + monotonic + FK cycle -------------------
+  accounts:
+    rows:
+      kind: relation.children
+      parent: tenants
+      count: 8000
+      distribution: { kind: histogram, mean: 200, min: 1, max: 1500 }
+    schema:
+      name: accounts
+      columns:
+        - { name: id, type: bigint, nullable: false, primary_key: true }
+        - { name: tenant_id, type: bigint, nullable: false }
+        - { name: iban, type: varchar(34), nullable: false, unique: true }
+        - { name: currency, type: char(3), nullable: false }
+        - { name: minor_scale, type: smallint, nullable: false }
+        - { name: balance, type: "decimal(20,4)", nullable: false }
+        # Forward FK into transactions -> FK cycle -> deferred constraint.
+        - { name: last_transaction_id, type: bigint, nullable: true }
+        - { name: opened_at, type: datetime, nullable: false }
+    relationships:
+      - name: account_tenant
+        columns: [tenant_id]
+        references: { table: tenants, columns: [id] }
+      - name: account_last_txn
+        columns: [last_transaction_id]
+        references: { table: payments, columns: [id] }
+    columns:
+      id: { generator: { kind: sequence, start: 1 } }
+      tenant_id: { generator: { kind: relation.foreign_key, relationship: account_tenant } }
+      iban:
+        generator: { kind: pattern, mask: "NO#############" }
+        modifiers: [{ kind: unique, max_attempts: 32, on_exhaustion: error }]
+      currency:
+        generator:
+          kind: weighted_choice
+          choices:
+            - { value: USD, weight: 0.5 }
+            - { value: JPY, weight: 0.2 }
+            - { value: BHD, weight: 0.3 }
+      minor_scale:
+        generator:
+          kind: weighted_choice
+          choices:
+            - { value: 2, weight: 0.5 }
+            - { value: 0, weight: 0.2 }
+            - { value: 3, weight: 0.3 }
+      balance:
+        generator: { kind: normal, mean: 50000, std: 80000, min: -100000, max: 10000000, scale: 4 }
+        modifiers: [{ kind: clamp, min: -100000, max: 10000000 }, { kind: round, scale: 4 }]
+      last_transaction_id:
+        generator: { kind: relation.foreign_key, relationship: account_last_txn, null_rate: 0.2 }
+      opened_at: { generator: { kind: datetime } }
+
+  payments:
+    rows:
+      kind: relation.children
+      parent: accounts
+      count: 2000000
+      distribution: { kind: poisson, mean: 250, min: 0, max: 20000 }
+    schema:
+      name: payments
+      columns:
+        - { name: id, type: bigint, nullable: false, primary_key: true }
+        - { name: account_id, type: bigint, nullable: false }
+        - { name: order_id, type: bigint, nullable: true }
+        - { name: amount_minor, type: bigint, nullable: false }
+        - { name: running_balance, type: "decimal(20,4)", nullable: false }
+        - { name: method, type: varchar(16), nullable: false }
+        # No `unique: true`: the reference is built by a `template` that embeds
+        # the id sequence, so it is unique by construction but not one of the
+        # generators the compiler recognizes as inherently unique (sequence,
+        # uuid, monotonic, ulid, and high-entropy nanoid/token/hash). Marking it
+        # unique would auto-attach a tracking modifier that exceeds its 1M
+        # max_tracked budget at 2M rows, so it is left unconstrained here.
+        - { name: reference, type: varchar(32), nullable: false }
+        - { name: sequence_no, type: bigint, nullable: false }
+        - { name: paid_at, type: datetime, nullable: false }
+    relationships:
+      - name: payment_account
+        columns: [account_id]
+        references: { table: accounts, columns: [id] }
+      - name: payment_order
+        columns: [order_id]
+        references: { table: orders, columns: [id] }
+    columns:
+      id: { generator: { kind: sequence, start: 1 } }
+      account_id: { generator: { kind: relation.foreign_key, relationship: payment_account } }
+      order_id:
+        generator: { kind: relation.foreign_key, relationship: payment_order, null_rate: 0.4 }
+      amount_minor: { generator: { kind: integer, min: -100000000, max: 100000000 } }
+      running_balance:
+        generator: { kind: normal, mean: 50000, std: 80000, min: -200000, max: 10000000, scale: 4 }
+      method:
+        generator:
+          kind: weighted_choice
+          choices:
+            - { value: card, weight: 0.6 }
+            - { value: transfer, weight: 0.25 }
+            - { value: wallet, weight: 0.15 }
+      reference:
+        # 2M rows exceeds the `unique` modifier's 1M max_tracked budget, so this
+        # large unique column is made inherently unique off the id sequence
+        # (the documented pattern) rather than deduplicated after the fact.
+        generator:
+          kind: template
+          parts:
+            - "PAY-"
+            - { field: id }
+      sequence_no: { generator: { kind: monotonic, start: 1, step: 1 } }
+      paid_at: { generator: { kind: datetime } }
+
+  # ---- Audit log: polymorphic + observed_sample risk marker --------------
+  activity_log:
+    rows: { kind: fixed, count: 1500000 }
+    schema:
+      name: activity_log
+      columns:
+        - { name: id, type: bigint, nullable: false, primary_key: true }
+        - { name: tenant_id, type: bigint, nullable: false }
+        - { name: causer_id, type: bigint, nullable: true }
+        - { name: subject_type, type: varchar(24), nullable: false }
+        - { name: subject_id, type: bigint, nullable: false }
+        - { name: event, type: varchar(40), nullable: false }
+        - { name: properties, type: json, nullable: true }
+        - { name: created_at, type: datetime, nullable: false }
+    relationships:
+      - name: activity_tenant
+        columns: [tenant_id]
+        references: { table: tenants, columns: [id] }
+      - name: activity_causer
+        columns: [causer_id]
+        references: { table: users, columns: [id] }
+    columns:
+      id: { generator: { kind: sequence, start: 1 } }
+      tenant_id: { generator: { kind: relation.foreign_key, relationship: activity_tenant } }
+      causer_id:
+        generator: { kind: relation.foreign_key, relationship: activity_causer, null_rate: 0.2 }
+      event:
+        # observed_sample deliberately used -> source-literal risk marker.
+        generator:
+          kind: observed_sample
+          values: [created, updated, deleted, restored, published, archived, exported, imported]
+      properties:
+        generator: { kind: json_value }
+        modifiers: [{ kind: null_rate, rate: 0.3 }]
+      created_at: { generator: { kind: datetime } }
+    planners:
+      - kind: relation.polymorphic_pair
+        columns: { type: subject_type, id: subject_id }
+        targets:
+          - { table: tasks, type: task, weight: 0.3 }
+          - { table: orders, type: order, weight: 0.3 }
+          - { table: products, type: product, weight: 0.2 }
+          - { table: payments, type: payment, weight: 0.2 }

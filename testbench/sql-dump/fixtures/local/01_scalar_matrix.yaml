@@ -1,0 +1,78 @@
+version: 1
+kind: model
+
+source:
+  dialect: mysql
+  fingerprint_policy: ignore
+
+output:
+  dialect: mysql
+  mode: schema_and_data
+  batch_size: 17
+
+seed: 42001
+
+defaults:
+  inference: disabled
+
+tables:
+  scalar_matrix:
+    rows: { kind: fixed, count: 100000 }
+    schema:
+      name: scalar_matrix
+      columns:
+        - { name: id, type: bigint, nullable: false, primary_key: true }
+        - { name: signed_tiny, type: tinyint, nullable: false }
+        - { name: unsigned_tiny, type: "tinyint unsigned", nullable: false }
+        - { name: signed_small, type: smallint, nullable: false }
+        - { name: signed_integer, type: integer, nullable: false }
+        - { name: signed_big, type: bigint, nullable: false }
+        - { name: exact_value, type: "decimal(30,10)", nullable: false }
+        - { name: approximate_value, type: double, nullable: false }
+        - { name: fixed_code, type: "char(8)", nullable: false }
+        - { name: short_text, type: "varchar(255)", nullable: false }
+        - { name: long_text, type: text, nullable: false }
+        - { name: binary_value, type: "varbinary(32)", nullable: false }
+        - { name: blob_value, type: blob, nullable: true }
+        - { name: json_value, type: json, nullable: false }
+        - { name: active, type: boolean, nullable: false }
+        - { name: event_date, type: date, nullable: false }
+        - { name: event_at, type: datetime, nullable: false }
+        - { name: recorded_at, type: timestamp, nullable: false }
+        - { name: optional_text, type: "varchar(80)", nullable: true }
+        - { name: defaulted_text, type: "varchar(20)", nullable: false, default_sql: "'pending'" }
+    columns:
+      id: { generator: { kind: sequence, start: 1 } }
+      signed_tiny: { generator: { kind: integer, min: -128, max: 127 } }
+      unsigned_tiny: { generator: { kind: integer, min: 0, max: 255 } }
+      signed_small: { generator: { kind: integer, min: -32768, max: 32767 } }
+      signed_integer: { generator: { kind: integer, min: -2000000000, max: 2000000000 } }
+      signed_big: { generator: { kind: integer, min: -9000000000000000, max: 9000000000000000 } }
+      exact_value: { generator: { kind: decimal, min: -999999999.9999999999, max: 999999999.9999999999, scale: 10 } }
+      approximate_value: { generator: { kind: decimal, min: -1000000, max: 1000000, scale: 6 } }
+      fixed_code: { generator: { kind: pattern, mask: "??##**##" } }
+      short_text:
+        generator:
+          kind: choice
+          values:
+            - "plain text"
+            - "quote ' inside"
+            - 'double " quote'
+            - "backslash \\ inside"
+            - "person@example.com"
+            - "@leading and trailing@"
+            - "unicode æøå 🚀"
+      long_text: { generator: { kind: text.paragraph } }
+      binary_value: { generator: { kind: bytes, min_length: 0, max_length: 32 } }
+      blob_value:
+        generator: { kind: bytes, min_length: 0, max_length: 256 }
+        modifiers: [{ kind: null_rate, rate: 0.25 }]
+      json_value: { generator: { kind: json_value } }
+      active: { generator: { kind: boolean, probability: 0.5 } }
+      event_date: { generator: { kind: date } }
+      event_at: { generator: { kind: datetime } }
+      recorded_at: { generator: { kind: datetime } }
+      optional_text:
+        generator: { kind: string, min_length: 0, max_length: 80 }
+        modifiers: [{ kind: null_rate, rate: 0.35 }]
+      defaulted_text: { generator: { kind: database_default } }

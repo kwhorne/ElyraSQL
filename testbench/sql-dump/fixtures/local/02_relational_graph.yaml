@@ -1,0 +1,222 @@
+version: 1
+kind: model
+
+source:
+  dialect: mysql
+  fingerprint_policy: ignore
+
+output:
+  dialect: mysql
+  mode: schema_and_data
+  batch_size: 17
+
+seed: 42002
+
+defaults:
+  inference: disabled
+
+tables:
+  tenants:
+    rows: { kind: fixed, count: 100000 }
+    schema:
+      name: tenants
+      columns:
+        - { name: id, type: bigint, nullable: false, primary_key: true }
+        - { name: slug, type: "varchar(80)", nullable: false, unique: true }
+        - { name: settings, type: json, nullable: true }
+        - { name: created_at, type: datetime, nullable: false }
+        - { name: updated_at, type: datetime, nullable: false }
+    columns:
+      id: { generator: { kind: sequence, start: 1 } }
+      slug:
+        generator: { kind: identifier.nanoid }
+        modifiers: [{ kind: unique, max_attempts: 32, on_exhaustion: error }]
+      settings:
+        generator: { kind: json_value }
+        modifiers: [{ kind: null_rate, rate: 0.2 }]
+    planners:
+      - kind: temporal.timestamps
+        columns: { created_at: created_at, updated_at: updated_at }
+        created: { min: 2020-01-01T00:00:00Z, max: 2026-01-01T00:00:00Z }
+
+  users:
+    rows: { kind: fixed, count: 100000 }
+    schema:
+      name: users
+      columns:
+        - { name: id, type: bigint, nullable: false, primary_key: true }
+        - { name: email, type: "varchar(255)", nullable: false, unique: true }
+        - { name: display_name, type: "varchar(160)", nullable: false }
+        - { name: created_at, type: datetime, nullable: false }
+    columns:
+      id: { generator: { kind: sequence, start: 1 } }
+      email:
+        generator: { kind: internet.email }
+        modifiers: [{ kind: unique, max_attempts: 64, on_exhaustion: error }]
+      display_name: { generator: { kind: person.full_name } }
+      created_at: { generator: { kind: datetime } }
+
+  memberships:
+    rows: { kind: fixed, count: 1000000 }
+    schema:
+      name: memberships
+      primary_key: [tenant_id, user_id]
+      columns:
+        - { name: tenant_id, type: bigint, nullable: false, primary_key: true }
+        - { name: user_id, type: bigint, nullable: false, primary_key: true }
+        - { name: role, type: "varchar(20)", nullable: false }
+        - { name: joined_at, type: datetime, nullable: false }
+    relationships:
+      - name: membership_tenant
+        columns: [tenant_id]
+        references: { table: tenants, columns: [id] }
+      - name: membership_user
+        columns: [user_id]
+        references: { table: users, columns: [id] }
+    columns:
+      role: { generator: { kind: choice, values: [owner, admin, member, viewer] } }
+      joined_at: { generator: { kind: datetime } }
+    planners:
+      - kind: relation.junction_pair
+        left_relationship: membership_tenant
+        right_relationship: membership_user
+        columns: { left: tenant_id, right: user_id }
+
+  projects:
+    rows: { kind: fixed, count: 1000000 }
+    schema:
+      name: projects
+      columns:
+        - { name: id, type: bigint, nullable: false, primary_key: true }
+        - { name: tenant_id, type: bigint, nullable: false }
+        - { name: owner_id, type: bigint, nullable: false }
+        - { name: name, type: "varchar(180)", nullable: false }
+        - { name: budget, type: "decimal(20,4)", nullable: false }
+        - { name: metadata, type: json, nullable: true }
+        - { name: created_at, type: datetime, nullable: false }
+        - { name: updated_at, type: datetime, nullable: false }
+    relationships:
+      - name: project_tenant
+        columns: [tenant_id]
+        references: { table: tenants, columns: [id] }
+      - name: project_owner
+        columns: [owner_id]
+        references: { table: users, columns: [id] }
+    columns:
+      id: { generator: { kind: sequence, start: 1 } }
+      tenant_id: { generator: { kind: relation.foreign_key, relationship: project_tenant } }
+      owner_id: { generator: { kind: relation.foreign_key, relationship: project_owner } }
+      name: { generator: { kind: text.sentence } }
+      budget: { generator: { kind: decimal, min: -1000000, max: 1000000000, scale: 4 } }
+      metadata:
+        generator: { kind: json_value }
+        modifiers: [{ kind: null_rate, rate: 0.3 }]
+    planners:
+      - kind: temporal.timestamps
+        columns: { created_at: created_at, updated_at: updated_at }
+        created: { min: 2020-01-01T00:00:00Z, max: 2026-01-01T00:00:00Z }
+
+  tasks:
+    rows: { kind: fixed, count: 1000000 }
+    schema:
+      name: tasks
+      columns:
+        - { name: id, type: bigint, nullable: false, primary_key: true }
+        - { name: project_id, type: bigint, nullable: false }
+        - { name: assignee_id, type: bigint, nullable: true }
+        - { name: parent_id, type: bigint, nullable: true }
+        - { name: title, type: "varchar(240)", nullable: false }
+        - { name: status, type: "enum('open','active','done','blocked')", nullable: false }
+        - { name: priority, type: tinyint, nullable: false }
+        - { name: payload, type: json, nullable: true }
+        - { name: created_at, type: datetime, nullable: false }
+        - { name: updated_at, type: datetime, nullable: false }
+    relationships:
+      - name: task_project
+        columns: [project_id]
+        references: { table: projects, columns: [id] }
+      - name: task_assignee
+        columns: [assignee_id]
+        references: { table: users, columns: [id] }
+      - name: task_parent
+        columns: [parent_id]
+        references: { table: tasks, columns: [id] }
+    columns:
+      id: { generator: { kind: sequence, start: 1 } }
+      project_id: { generator: { kind: relation.foreign_key, relationship: task_project } }
+      assignee_id:
+        generator: { kind: relation.foreign_key, relationship: task_assignee, null_rate: 0.2 }
+      title: { generator: { kind: text.sentence } }
+      status: { generator: { kind: choice, values: [open, active, done, blocked] } }
+      priority: { generator: { kind: integer, min: 0, max: 9 } }
+      payload:
+        generator: { kind: json_value }
+        modifiers: [{ kind: null_rate, rate: 0.25 }]
+    planners:
+      - kind: hierarchy.tree
+        relationship: task_parent
+        columns: { parent: parent_id }
+        root_ratio: 0.15
+        max_depth: 8
+        max_branching: 16
+      - kind: temporal.timestamps
+        columns: { created_at: created_at, updated_at: updated_at }
+        created: { min: 2020-01-01T00:00:00Z, max: 2026-01-01T00:00:00Z }
+
+  task_watchers:
+    rows: { kind: fixed, count: 1000000 }
+    schema:
+      name: task_watchers
+      primary_key: [task_id, user_id]
+      columns:
+        - { name: task_id, type: bigint, nullable: false, primary_key: true }
+        - { name: user_id, type: bigint, nullable: false, primary_key: true }
+        - { name: notifications, type: boolean, nullable: false }
+    relationships:
+      - name: watcher_task
+        columns: [task_id]
+        references: { table: tasks, columns: [id] }
+      - name: watcher_user
+        columns: [user_id]
+        references: { table: users, columns: [id] }
+    columns:
+      notifications: { generator: { kind: boolean, probability: 0.75 } }
+    planners:
+      - kind: relation.junction_pair
+        left_relationship: watcher_task
+        right_relationship: watcher_user
+        columns: { left: task_id, right: user_id }
+
+  audit_events:
+    rows: { kind: fixed, count: 1000000 }
+    schema:
+      name: audit_events
+      columns:
+        - { name: id, type: bigint, nullable: false, primary_key: true }
+        - { name: tenant_id, type: bigint, nullable: false }
+        - { name: actor_id, type: bigint, nullable: true }
+        - { name: subject_type, type: "varchar(40)", nullable: false }
+        - { name: subject_id, type: bigint, nullable: false }
+        - { name: event_name, type: "varchar(80)", nullable: false }
+        - { name: context, type: json, nullable: false }
+        - { name: created_at, type: datetime, nullable: false }
+    relationships:
+      - name: event_tenant
+        columns: [tenant_id]
+        references: { table: tenants, columns: [id] }
+      - name: event_actor
+        columns: [actor_id]
+        references: { table: users, columns: [id] }
+    columns:
+      id: { generator: { kind: sequence, start: 1 } }
+      tenant_id: { generator: { kind: relation.foreign_key, relationship: event_tenant } }
+      actor_id:
+        generator: { kind: relation.foreign_key, relationship: event_actor, null_rate: 0.1 }
+      subject_type: { generator: { kind: choice, values: [project, task, membership] } }
+      subject_id: { generator: { kind: integer, min: 1, max: 1000000 } }
+      event_name:
+        generator:
+          kind: choice
+          values: [created, updated, deleted, "notified@example.com", "owner's change"]
+      context: { generator: { kind: json_value } }
+      created_at: { generator: { kind: datetime } }

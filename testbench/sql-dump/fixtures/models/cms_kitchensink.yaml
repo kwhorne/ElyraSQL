@@ -1,0 +1,390 @@
+# Stress fixture 5 of 6 — CMS / blog / auth kitchen sink.
+#
+# Stress axis: MAXIMUM FEATURE DENSITY + CROSS-DIALECT EDGE CASES.
+# Broad content-management schema fixture (structure only).
+#
+# Deliberately packs at least one of every generator family, every modifier,
+# and the schema-evidence edge cases (generated / identity / database_default /
+# collation / bytes / big decimal / unicode) into a small number of rows so a
+# regression in any single feature surfaces here.
+#
+# Output targets SQLite to round out the dialect matrix (fixtures 1-4 cover
+# postgres / mysql / mssql). Row counts are intentionally small — this fixture
+# is a coverage FLOOR, not a volume test.
+#
+# PROVISIONAL: non-3A planner argument shapes follow the documented planner style.
+
+version: 1
+kind: model
+
+source:
+  dialect: mysql
+  fingerprint_policy: ignore
+
+output:
+  dialect: sqlite
+  mode: schema_and_data
+  batch_size: 250
+
+seed: 20260716
+
+defaults:
+  inference: disabled
+
+tables:
+
+  users:
+    rows: { kind: fixed, count: 500 }
+    schema:
+      name: users
+      columns:
+        # identity column (owned by the database, omitted from INSERT)
+        - { name: id, type: bigint, nullable: false, primary_key: true, identity: true }
+        - { name: uuid, type: char(36), nullable: false, unique: true }
+        - { name: ulid, type: char(26), nullable: false, unique: true }
+        - { name: nanoid, type: varchar(21), nullable: false, unique: true }
+        - { name: email, type: varchar(255), nullable: false, unique: true }
+        - { name: username, type: varchar(40), nullable: false, unique: true }
+        - { name: display_name, type: varchar(120), nullable: false }
+        - { name: title, type: varchar(40), nullable: true }
+        - { name: password_hash, type: varchar(255), nullable: false }
+        - { name: api_token, type: char(64), nullable: true }
+        - { name: bio, type: text, nullable: true, collation: utf8mb4_unicode_ci }
+        - { name: company, type: varchar(120), nullable: true }
+        - { name: job_title, type: varchar(120), nullable: true }
+        - { name: phone, type: varchar(32), nullable: true }
+        - { name: country_code, type: varchar(6), nullable: true }
+        - { name: website, type: varchar(255), nullable: true }
+        - { name: ipv4, type: varchar(15), nullable: true }
+        - { name: ipv6, type: varchar(45), nullable: true }
+        - { name: mac, type: varchar(17), nullable: true }
+        - { name: user_agent, type: varchar(255), nullable: true }
+        - { name: avatar, type: blob, nullable: true }
+        - { name: reputation, type: "decimal(30,10)", nullable: false }
+        - { name: role, type: varchar(16), nullable: false }
+        - { name: is_verified, type: boolean, nullable: false }
+        - { name: created_at, type: datetime, nullable: false }
+        - { name: updated_at, type: datetime, nullable: false }
+        - { name: deleted_at, type: datetime, nullable: true }
+    columns:
+      uuid: { generator: { kind: uuid } }
+      ulid: { generator: { kind: identifier.ulid } }
+      nanoid: { generator: { kind: identifier.nanoid } }
+      email:
+        generator: { kind: internet.email }
+        modifiers: [{ kind: unique, max_attempts: 64, on_exhaustion: error }]
+      username:
+        generator: { kind: person.username }
+        modifiers:
+          - { kind: case, mode: lower }
+          - { kind: unique, max_attempts: 64, on_exhaustion: widen }
+      display_name: { generator: { kind: person.full_name } }
+      title:
+        generator: { kind: person.title }
+        modifiers: [{ kind: null_rate, rate: 0.5 }]
+      password_hash: { generator: { kind: credential.password_hash } }
+      api_token:
+        generator: { kind: credential.token, length: 64, alphabet: alphanumeric }
+        modifiers: [{ kind: null_rate, rate: 0.4 }]
+      bio:
+        # Unicode-heavy prose to stress escaping across dialects.
+        generator: { kind: text.paragraph }
+        modifiers: [{ kind: null_rate, rate: 0.3 }]
+      company:
+        generator: { kind: company.name }
+        modifiers: [{ kind: null_rate, rate: 0.4 }]
+      job_title:
+        generator: { kind: company.job_title }
+        modifiers: [{ kind: null_rate, rate: 0.4 }]
+      phone:
+        generator: { kind: phone.number }
+        modifiers: [{ kind: null_rate, rate: 0.3 }]
+      country_code:
+        generator: { kind: phone.country_code }
+        modifiers: [{ kind: null_rate, rate: 0.3 }]
+      website:
+        generator: { kind: internet.url }
+        modifiers: [{ kind: null_rate, rate: 0.5 }]
+      ipv4:
+        generator: { kind: internet.ipv4 }
+        modifiers: [{ kind: null_rate, rate: 0.4 }]
+      ipv6:
+        generator: { kind: internet.ipv6 }
+        modifiers: [{ kind: null_rate, rate: 0.6 }]
+      mac:
+        generator: { kind: network.mac }
+        modifiers: [{ kind: null_rate, rate: 0.6 }]
+      user_agent:
+        generator: { kind: internet.user_agent }
+        modifiers: [{ kind: null_rate, rate: 0.4 }]
+      avatar:
+        generator: { kind: bytes, min_length: 64, max_length: 512 }
+        modifiers: [{ kind: null_rate, rate: 0.7 }]
+      reputation:
+        # Very wide decimal to stress big-number rendering.
+        generator: { kind: decimal, min: 0, max: 100000, scale: 10 }
+      role:
+        generator:
+          kind: weighted_choice
+          choices:
+            - { value: reader, weight: 0.7 }
+            - { value: author, weight: 0.2 }
+            - { value: editor, weight: 0.08 }
+            - { value: admin, weight: 0.02 }
+      is_verified: { generator: { kind: boolean, probability: 0.6 } }
+    planners:
+      - kind: temporal.timestamps
+        columns:
+          created_at: created_at
+          updated_at: updated_at
+        created: { min: 2015-01-01T00:00:00Z, max: 2026-01-01T00:00:00Z }
+      - kind: temporal.soft_delete
+        columns: { deleted_at: deleted_at }
+        deletion_probability: 0.1
+        deleted_range: { min: 2015-01-01T00:00:00Z, max: 2026-01-01T00:00:00Z }
+
+  categories:
+    rows: { kind: fixed, count: 40 }
+    schema:
+      name: categories
+      columns:
+        - { name: id, type: bigint, nullable: false, primary_key: true, identity: true }
+        - { name: parent_id, type: bigint, nullable: true }
+        - { name: name, type: varchar(80), nullable: false }
+        - { name: slug, type: varchar(100), nullable: false, unique: true }
+        - { name: depth, type: integer, nullable: false }
+    relationships:
+      - name: category_parent
+        columns: [parent_id]
+        references: { table: categories, columns: [id] }
+    columns:
+      name: { generator: { kind: text.word } }
+      slug:
+        generator: { kind: text.slug }
+        modifiers: [{ kind: unique, max_attempts: 16, on_exhaustion: error }]
+      # The tree planner does not emit a depth; give the column its own generator.
+      depth: { generator: { kind: integer, min: 0, max: 3 } }
+    planners:
+      - kind: hierarchy.tree
+        relationship: category_parent
+        columns: { parent: parent_id }
+        root_ratio: 0.3
+        max_depth: 3
+        max_branching: 6
+
+  posts:
+    rows: { kind: fixed, count: 3000 }
+    schema:
+      name: posts
+      columns:
+        # Sequence PK (not identity): relation.polymorphic_pair targets require a
+        # dense integer key recipe, which the compiler derives from a `sequence`
+        # generator or a bare integer PK — an `identity` column is omitted.
+        - { name: id, type: bigint, nullable: false, primary_key: true }
+        - { name: author_id, type: bigint, nullable: false }
+        - { name: category_id, type: bigint, nullable: true }
+        - { name: title, type: varchar(200), nullable: false }
+        # generated column derived from title (database-generated, omitted).
+        - { name: slug, type: varchar(220), nullable: false, generated: true }
+        - { name: excerpt, type: varchar(400), nullable: true }
+        - { name: body, type: text, nullable: false, collation: utf8mb4_unicode_ci }
+        - { name: word_count, type: integer, nullable: false }
+        - { name: rating, type: "decimal(4,2)", nullable: true }
+        # database default (omitted from INSERT, rendered as default token).
+        - { name: view_count, type: bigint, nullable: false, default_sql: "0" }
+        - { name: status, type: varchar(12), nullable: false, default_sql: "'draft'" }
+        - { name: metadata, type: json, nullable: true }
+        - { name: published_at, type: datetime, nullable: true }
+        - { name: created_at, type: datetime, nullable: false }
+        - { name: updated_at, type: datetime, nullable: false }
+    relationships:
+      - name: post_author
+        columns: [author_id]
+        references: { table: users, columns: [id] }
+      - name: post_category
+        columns: [category_id]
+        references: { table: categories, columns: [id] }
+    columns:
+      id: { generator: { kind: sequence, start: 1 } }
+      author_id: { generator: { kind: relation.foreign_key, relationship: post_author } }
+      category_id:
+        generator: { kind: relation.foreign_key, relationship: post_category, null_rate: 0.2 }
+      title: { generator: { kind: text.sentence } }
+      slug: { generator: { kind: database_default } }        # produced by the database
+      excerpt:
+        generator: { kind: text.sentence }
+        modifiers:
+          - { kind: truncate, max_length: 400 }
+          - { kind: null_rate, rate: 0.2 }
+      body: { generator: { kind: text.paragraph } }
+      word_count: { generator: { kind: integer, min: 50, max: 5000 } }
+      rating:
+        generator: { kind: decimal, min: 0, max: 5, scale: 2 }
+        modifiers:
+          - { kind: clamp, min: 0, max: 5 }
+          - { kind: null_rate, rate: 0.3 }
+      view_count: { generator: { kind: database_default } }
+      status: { generator: { kind: database_default } }
+      metadata:
+        generator: { kind: json_value }
+        modifiers: [{ kind: null_rate, rate: 0.4 }]
+      published_at:
+        generator: { kind: datetime }
+        modifiers: [{ kind: null_rate, rate: 0.3 }]
+    planners:
+      - kind: temporal.timestamps
+        columns:
+          created_at: created_at
+          updated_at: updated_at
+        created: { min: 2016-01-01T00:00:00Z, max: 2026-01-01T00:00:00Z }
+
+  comments:
+    # Self-referential threaded comment tree.
+    rows: { kind: fixed, count: 20000 }
+    schema:
+      name: comments
+      columns:
+        # Sequence PK (not identity) so relation.polymorphic_pair can target it.
+        - { name: id, type: bigint, nullable: false, primary_key: true }
+        - { name: post_id, type: bigint, nullable: false }
+        - { name: parent_id, type: bigint, nullable: true }
+        - { name: author_id, type: bigint, nullable: true }
+        - { name: guest_name, type: varchar(120), nullable: true }
+        - { name: guest_email, type: varchar(255), nullable: true }
+        - { name: body, type: text, nullable: false }
+        - { name: depth, type: integer, nullable: false }
+        - { name: created_at, type: datetime, nullable: false }
+    relationships:
+      - name: comment_post
+        columns: [post_id]
+        references: { table: posts, columns: [id] }
+      - name: comment_parent
+        columns: [parent_id]
+        references: { table: comments, columns: [id] }
+      - name: comment_author
+        columns: [author_id]
+        references: { table: users, columns: [id] }
+    columns:
+      id: { generator: { kind: sequence, start: 1 } }
+      post_id: { generator: { kind: relation.foreign_key, relationship: comment_post } }
+      author_id:
+        generator: { kind: relation.foreign_key, relationship: comment_author, null_rate: 0.4 }
+      guest_name:
+        generator: { kind: person.full_name }
+        modifiers: [{ kind: null_rate, rate: 0.6 }]
+      guest_email:
+        generator: { kind: internet.email }
+        modifiers: [{ kind: null_rate, rate: 0.6 }]
+      body: { generator: { kind: text.paragraph } }
+      created_at: { generator: { kind: datetime } }
+      # The tree planner does not emit a depth; give the column its own generator.
+      depth: { generator: { kind: integer, min: 0, max: 8 } }
+    planners:
+      - kind: hierarchy.tree
+        relationship: comment_parent
+        columns: { parent: parent_id }
+        root_ratio: 0.6
+        max_depth: 8
+        max_branching: 20
+
+  tags:
+    rows: { kind: fixed, count: 200 }
+    schema:
+      name: tags
+      columns:
+        - { name: id, type: bigint, nullable: false, primary_key: true, identity: true }
+        - { name: name, type: varchar(60), nullable: false, unique: true }
+        - { name: slug, type: varchar(80), nullable: false, unique: true }
+    columns:
+      name:
+        generator: { kind: text.word }
+        modifiers: [{ kind: unique, max_attempts: 32, on_exhaustion: widen }]
+      slug:
+        generator: { kind: text.slug }
+        modifiers: [{ kind: unique, max_attempts: 32, on_exhaustion: error }]
+
+  taggables:
+    # Polymorphic + junction: a tag attached to a post OR a comment.
+    rows: { kind: fixed, count: 25000 }
+    schema:
+      name: taggables
+      columns:
+        - { name: id, type: bigint, nullable: false, primary_key: true, identity: true }
+        - { name: tag_id, type: bigint, nullable: false }
+        - { name: taggable_type, type: varchar(24), nullable: false }
+        - { name: taggable_id, type: bigint, nullable: false }
+    relationships:
+      - name: taggable_tag
+        columns: [tag_id]
+        references: { table: tags, columns: [id] }
+    columns:
+      tag_id: { generator: { kind: relation.foreign_key, relationship: taggable_tag } }
+    planners:
+      - kind: relation.polymorphic_pair
+        columns: { type: taggable_type, id: taggable_id }
+        targets:
+          - { table: posts, type: post, weight: 0.75 }
+          - { table: comments, type: comment, weight: 0.25 }
+
+  media:
+    rows: { kind: fixed, count: 8000 }
+    schema:
+      name: media
+      columns:
+        - { name: id, type: bigint, nullable: false, primary_key: true, identity: true }
+        - { name: post_id, type: bigint, nullable: false }
+        - { name: file_name, type: varchar(255), nullable: false }
+        - { name: extension, type: varchar(8), nullable: false }
+        - { name: mime_type, type: varchar(80), nullable: false }
+        - { name: size_bytes, type: bigint, nullable: false }
+        - { name: md5, type: char(32), nullable: false }
+        - { name: port, type: integer, nullable: true }
+    relationships:
+      - name: media_post
+        columns: [post_id]
+        references: { table: posts, columns: [id] }
+    columns:
+      post_id: { generator: { kind: relation.foreign_key, relationship: media_post } }
+      port:
+        generator: { kind: network.port }
+        modifiers: [{ kind: null_rate, rate: 0.8 }]
+    planners:
+      - kind: file.metadata
+        columns:
+          name: file_name
+          extension: extension
+          mime_type: mime_type
+          size: size_bytes
+          hash: md5
+        size: { kind: lognormal, min: 1024, max: 10485760 }
+        extensions: [png, jpg, gif, svg, mp4, pdf]
+
+  revisions:
+    rows:
+      kind: relation.children
+      parent: posts
+      count: 15000
+      distribution: { kind: poisson, mean: 5, min: 0, max: 100 }
+    schema:
+      name: revisions
+      columns:
+        - { name: id, type: bigint, nullable: false, primary_key: true, identity: true }
+        - { name: post_id, type: bigint, nullable: false }
+        - { name: revision_no, type: integer, nullable: false }
+        - { name: diff, type: text, nullable: false }
+        - { name: editor_id, type: bigint, nullable: true }
+        - { name: created_at, type: datetime, nullable: false }
+    relationships:
+      - name: revision_post
+        columns: [post_id]
+        references: { table: posts, columns: [id] }
+      - name: revision_editor
+        columns: [editor_id]
+        references: { table: users, columns: [id] }
+    columns:
+      post_id: { generator: { kind: relation.foreign_key, relationship: revision_post } }
+      revision_no: { generator: { kind: sequence, start: 1 } }
+      diff: { generator: { kind: text.paragraph } }
+      editor_id:
+        generator: { kind: relation.foreign_key, relationship: revision_editor, null_rate: 0.2 }
+      created_at: { generator: { kind: datetime } }
