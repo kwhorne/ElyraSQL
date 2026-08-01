@@ -135,12 +135,6 @@ gaps:
   `IF NOT EXISTS`; see the note under *Laravel / Eloquent* above. `USE <name>`
   is accepted and changes what the catalog reports, but does not give a separate
   namespace.
-- **Result metadata omits the source table.** MySQL fills the `table` field of
-  each column definition; ElyraSQL leaves it empty. Column *names* match MySQL
-  (a `SELECT *` over a join returns bare, possibly duplicated names), so a client
-  that disambiguates duplicates via metadata cannot, and must use positional
-  access or explicit aliases. Tracked in
-  [ESQL-55](https://wirelabs.youtrack.cloud/issue/ESQL-55).
 - **Isolation levels:** `SET TRANSACTION ISOLATION LEVEL ...` is accepted for all
   four standard levels, but only two engines exist — `SERIALIZABLE` (opt-in) and
   **snapshot** isolation, which backs everything else. Snapshot is *at least as

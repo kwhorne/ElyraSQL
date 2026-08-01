@@ -567,6 +567,67 @@ async fn create_database_fails_instead_of_succeeding_as_a_noop() {
     );
 }
 
+/// Result metadata must name the source table. Without it a client cannot tell
+/// the two `id` columns of a join apart: not by name (they collide, exactly as
+/// in MySQL) and not by metadata. Every expectation below was read off MySQL 8.4
+/// on the same schema.
+#[tokio::test]
+async fn result_metadata_reports_the_source_table() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop("CREATE TABLE meta_a (id INT PRIMARY KEY, name VARCHAR(16))")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE meta_b (id INT PRIMARY KEY, a_id INT, label VARCHAR(16))")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO meta_a VALUES (1,'Ada')")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO meta_b VALUES (1,1,'post')")
+        .await
+        .unwrap();
+
+    // (sql, expected "table.column" per result column)
+    for (sql, expected) in [
+        (
+            "SELECT * FROM meta_a JOIN meta_b ON meta_b.a_id = meta_a.id",
+            vec![
+                "meta_a.id",
+                "meta_a.name",
+                "meta_b.id",
+                "meta_b.a_id",
+                "meta_b.label",
+            ],
+        ),
+        (
+            "SELECT meta_a.name, meta_b.label FROM meta_a JOIN meta_b ON meta_b.a_id = meta_a.id",
+            vec!["meta_a.name", "meta_b.label"],
+        ),
+        ("SELECT * FROM meta_a", vec!["meta_a.id", "meta_a.name"]),
+        // The alias, not the table name -- as MySQL reports it.
+        ("SELECT x.id FROM meta_a x", vec!["x.id"]),
+        ("SELECT x.* FROM meta_a x", vec!["x.id", "x.name"]),
+        // A computed column has no source table in MySQL either.
+        (
+            "SELECT id + 1 AS next, name FROM meta_a",
+            vec![".next", "meta_a.name"],
+        ),
+        ("SELECT COUNT(*) AS c FROM meta_a", vec![".c"]),
+    ] {
+        let result = c.query_iter(sql).await.unwrap();
+        let got: Vec<String> = result
+            .columns()
+            .expect("result set has columns")
+            .iter()
+            .map(|col| format!("{}.{}", col.table_str(), col.name_str()))
+            .collect();
+        result.drop_result().await.unwrap();
+        assert_eq!(got, expected, "{sql}");
+    }
+}
+
 /// `CREATE TABLE ... AS SELECT` over an aggregate used to fail with an
 /// unresolvable column: the option-stripper treated the first `(` in the
 /// statement as the start of a column list, so `COUNT(*)` truncated the query
