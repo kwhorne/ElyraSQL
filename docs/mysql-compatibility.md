@@ -12,7 +12,7 @@ drivers connect without modification.
 - **Authentication** — `mysql_native_password` by **default** (widest driver
   compatibility), with `caching_sha2_password` available opt-in (see below).
 - **TLS** — clients may negotiate SSL.
-- **Handshake** — reports a MySQL-looking version, e.g. `8.0.12-ElyraSQL-1.6.0`,
+- **Handshake** — reports a MySQL-looking version, e.g. `8.0.12-ElyraSQL-1.7.0`,
   and answers the session/introspection queries clients send on connect
   (`SELECT @@version_comment`, `SELECT VERSION()`, `SET ...`,
   `SHOW VARIABLES/STATUS/COLLATION/DATABASES/TABLE STATUS`, and the
@@ -43,6 +43,23 @@ With that setting a full Eloquent workload -- `Schema::create` (including
 `lastInsertId`, `hasMany`/`belongsTo`, eager loading, `withCount`, query-builder
 joins/aggregates/`groupBy`+`having`, `updateOrInsert`, transactions and
 cascading deletes -- runs cleanly.
+
+Since 1.7.0 this is exercised against real applications rather than only
+synthetic tests: the migration and test suites of four commercial Laravel
+codebases run against ElyraSQL, the largest with 469 migration files. The
+compatibility fixes that came out of that work are covered by 103 end-to-end
+tests through the wire protocol, which run on every pull request alongside a
+query battery compared differentially against MySQL 8.4.
+
+!!! note "`php artisan migrate` and `CREATE DATABASE`"
+
+    ElyraSQL has one logical database, `elyra`. `CREATE DATABASE IF NOT EXISTS`
+    (which is what Laravel's `MigrateCommand` issues when the configured database
+    is missing) succeeds as a no-op, as does `DROP DATABASE IF EXISTS` for a
+    database that does not exist here. An **unconditional** `CREATE DATABASE`
+    fails, because that caller is asking for an isolated database it would not
+    get — before 1.7.0 it silently "succeeded" and every connection kept sharing
+    `elyra`.
 
 ## Verified clients
 
@@ -108,6 +125,15 @@ gaps:
   are not parsed (parser limitations); `&`, `|`, `^` bitwise operators work.
 - Vector search and `VEC_DISTANCE(...)` are ElyraSQL extensions (they mirror
   MySQL 9's vector direction but are not identical).
+- **One database.** `CREATE DATABASE`/`SCHEMA` is refused unless written with
+  `IF NOT EXISTS`; see the note under *Laravel / Eloquent* above. `USE <name>`
+  is accepted and changes what the catalog reports, but does not give a separate
+  namespace.
+- **Result metadata omits the source table.** MySQL fills the `table` field of
+  each column definition; ElyraSQL leaves it empty. Column *names* match MySQL
+  (a `SELECT *` over a join returns bare, possibly duplicated names), so a client
+  that disambiguates duplicates via metadata cannot, and must use positional
+  access or explicit aliases.
 - **Isolation levels:** `SET TRANSACTION ISOLATION LEVEL ...` is accepted for all
   four standard levels, but only two engines exist — `SERIALIZABLE` (opt-in) and
   **snapshot** isolation, which backs everything else. Snapshot is *at least as

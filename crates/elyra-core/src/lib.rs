@@ -62,4 +62,4 @@ pub const PRODUCT_NAME: &str = "ElyraSQL";
 /// affect client-side SQL generation. MySQL 8.0.11 introduced window functions;
 /// the next patch keeps the branded suffix from being treated as a prerelease
 /// older than 8.0.11 by semantic-version comparators.
-pub const SERVER_VERSION: &str = "8.0.12-ElyraSQL-1.6.0";
+pub const SERVER_VERSION: &str = "8.0.12-ElyraSQL-1.7.0";

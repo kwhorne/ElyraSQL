@@ -43,7 +43,7 @@ workload — served over the protocol your stack already knows.
 **[→ Get started in 60 seconds](#quick-start)** &nbsp;·&nbsp;
 **[→ Full documentation](https://elyracode.com/docs/sql-server)**
 
-> **Stable release: v1.6.0.** A broad, MySQL-compatible SQL engine: full
+> **Stable release: v1.7.0.** A broad, MySQL-compatible SQL engine: full
 > DDL/DML, all join types (INNER/LEFT/RIGHT/FULL/CROSS, streamed for large
 > analytical joins — including non-equi and cross joins, which never buffer the
 > product), subqueries (correlated too), CTEs (incl. `WITH RECURSIVE`),
@@ -55,7 +55,9 @@ workload — served over the protocol your stack already knows.
 > parallel OLAP aggregation. Native `mysql_native_password` /
 > `caching_sha2_password` auth, TLS, replication and Raft failover. Correctness
 > is guarded by wire, property, fuzz, crash-recovery and concurrent soak/chaos
-> tests. See the [changelog](CHANGELOG.md).
+> tests, and by a query battery run differentially against MySQL 8.4 on every
+> pull request. Laravel migrations and Eloquent run unmodified. See the
+> [changelog](CHANGELOG.md).
 
 ## Why ElyraSQL
 
@@ -177,7 +179,7 @@ mysql -h 127.0.0.1 -P 3307 -u root -p
 SELECT 1;
 SELECT 1 + 1 AS two;
 SELECT 'hei fra ElyraSQL' AS msg;
-SELECT VERSION();   -- 8.0.12-ElyraSQL-1.6.0
+SELECT VERSION();   -- 8.0.12-ElyraSQL-1.7.0
 ```
 
 ## Configuration
@@ -210,10 +212,10 @@ bound them with `ELYRASQL_QUERY_TIMEOUT_MS`.
 
 ## Install
 
-Linux static binaries (`x86_64` and `aarch64`) are attached to each
-[GitHub Release](https://github.com/kwhorne/ElyraSQL/releases). Releases after
-v1.6.0 also include a native Apple Silicon macOS binary; Intel Macs are not
-supported.
+Linux static binaries (`x86_64` and `aarch64`) and a native Apple Silicon macOS
+binary are attached to each
+[GitHub Release](https://github.com/kwhorne/ElyraSQL/releases). Intel Macs are
+not supported.
 
 ```bash
 # Linux x86_64 (use ARCH=aarch64 on ARM Linux)
@@ -239,7 +241,7 @@ tar xzf elyrasql.tar.gz
 Multi-arch image (amd64 + arm64) on GHCR:
 
 ```bash
-docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.6.0
+docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.7.0
 # with auth + a persistent volume:
 docker run -p 3307:3307 -v elyra:/var/lib/elyrasql \
   -e ELYRASQL_USER=root -e ELYRASQL_PASSWORD=secret \

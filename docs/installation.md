@@ -17,6 +17,18 @@ ElyraSQL release builds target **Ubuntu 24.04+** and **Apple Silicon macOS
     done, so an interrupted upgrade simply resumes on the next start. **Take a backup
     first, and note that downgrading to 1.4.x afterwards is not supported.**
 
+!!! info "Upgrading to 1.7.0"
+
+    No on-disk format change and no migration: a 1.5.x or 1.6.x database opens
+    unchanged, and a database written by 1.7.0 still opens in either. Two behaviour
+    changes worth knowing before you upgrade. **`CREATE DATABASE` now refuses**
+    instead of quietly succeeding, because this server has one logical schema and
+    reporting success made callers believe otherwise; the conditional forms
+    (`CREATE DATABASE IF NOT EXISTS`, `DROP DATABASE IF EXISTS`) are still no-ops, so
+    Laravel migrations and container entrypoints are unaffected. And the **advertised
+    MySQL version is now 8.0.12** rather than 8.0.0, which lets version-gated clients
+    generate window-function SQL they previously suppressed.
+
 !!! info "Upgrading to 1.6.0"
 
     No on-disk format change and no migration: a 1.5.x database opens unchanged, and a
@@ -31,9 +43,9 @@ ElyraSQL release builds target **Ubuntu 24.04+** and **Apple Silicon macOS
 ## Release binaries
 
 Each [release](https://github.com/kwhorne/ElyraSQL/releases) ships fully static
-Linux `musl` binaries for `x86_64` and `aarch64`. Releases after v1.6.0 also
-ship a native Apple Silicon macOS binary. The macOS build links only
-Apple-provided system libraries and supports macOS 11 or later.
+Linux `musl` binaries for `x86_64` and `aarch64`, and — from v1.7.0 — a native
+Apple Silicon macOS binary. The macOS build links only Apple-provided system
+libraries and supports macOS 11 or later.
 
 ```bash
 # Linux
@@ -73,8 +85,8 @@ macOS).
 Multi-arch image (`amd64` + `arm64`) on the GitHub Container Registry:
 
 ```bash
-docker pull ghcr.io/kwhorne/elyrasql:1.6.0   # or :latest
-docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.6.0
+docker pull ghcr.io/kwhorne/elyrasql:1.7.0   # or :latest
+docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.7.0
 ```
 
 The image is ~15 MB, runs as a non-root user, stores data in the
