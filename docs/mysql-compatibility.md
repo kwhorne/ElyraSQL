@@ -108,21 +108,31 @@ connection is accepted. Databases whose indexed text is pure ASCII are unaffecte
 ElyraSQL implements a focused, growing subset of MySQL SQL. Notable current
 gaps:
 
-- Subqueries (`WHERE` + SELECT-list, correlated + uncorrelated), derived
-  tables, CTEs (`WITH`), `HAVING`, and window functions are supported;
-  `WITH RECURSIVE`, explicit window frames, and correlated subqueries with
-  joins are not.
-- Views, row-level triggers, and stored procedures are supported;
-  user-defined functions and scheduled events are not.
+- Subqueries (`WHERE` + SELECT-list, correlated + uncorrelated, **including over
+  joins**), derived tables, CTEs including **`WITH RECURSIVE`**, `HAVING`,
+  window functions with **explicit `ROWS` frames** and named windows,
+  `GROUP BY ... WITH ROLLUP` and set operations are supported. Not yet:
+  `RANGE`/`GROUPS` **numeric value-offset** frames (only the `UNBOUNDED`/`CURRENT
+  ROW` forms of `RANGE`).
+- Views, **materialized views**, row-level triggers, and stored procedures
+  (parameters, local and session variables, `IF`/`WHILE`/`LOOP`/`REPEAT`,
+  cursors, condition handlers) are supported; user-defined functions and
+  scheduled events are not.
 - `ALTER TABLE` supports add/drop/rename/`MODIFY`/`CHANGE` column, rename table,
-  and `ADD INDEX`/`KEY`/`UNIQUE` (with backfill); `ADD PRIMARY KEY`/`FOREIGN KEY`
-  on an existing table must instead be declared in `CREATE TABLE`.
+  `ADD INDEX`/`KEY`/`UNIQUE` (with backfill) and **`ADD FOREIGN KEY`** (enforced,
+  though `SHOW CREATE TABLE` does not yet echo the constraint back);
+  `ADD PRIMARY KEY` on an existing table must instead be declared in
+  `CREATE TABLE`.
 - A broad scalar function library (string, math, date/time, JSON, `MD5`/`SHA1`/
   `SHA2`, `HEX`/`UNHEX`, `FORMAT`, `FIND_IN_SET`, `FROM_UNIXTIME`, ...),
   statistical and bitwise aggregates (`STDDEV*`, `VAR*`, `BIT_OR`/`AND`/`XOR`),
-  `LAST_INSERT_ID()`/`ROW_COUNT()`, `@@`system variables, and `CONVERT()`.
-  `INSERT ... SET`, the `<<`/`>>`/`~` bitwise operators, and `LOAD DATA LOCAL`
-  are not parsed (parser limitations); `&`, `|`, `^` bitwise operators work.
+  `LAST_INSERT_ID()`/`ROW_COUNT()`, `@@`system variables, and `CONVERT()`. The
+  MySQL shorthands `INSERT ... SET`, the `<<`/`>>`/`~` bitwise operators and
+  `LOAD DATA LOCAL INFILE` all work.
+- A **materialized view over an aggregate** (`CREATE MATERIALIZED VIEW v AS
+  SELECT g, COUNT(*) ... GROUP BY g`) is rejected with `unknown column`; the
+  non-materialized form of the same view works. Tracked in
+  [ESQL-54](https://wirelabs.youtrack.cloud/issue/ESQL-54).
 - Vector search and `VEC_DISTANCE(...)` are ElyraSQL extensions (they mirror
   MySQL 9's vector direction but are not identical).
 - **One database.** `CREATE DATABASE`/`SCHEMA` is refused unless written with
