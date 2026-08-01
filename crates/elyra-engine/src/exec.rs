@@ -4062,6 +4062,7 @@ async fn select_inner(
     // take a fixpoint-materialisation path via temporary relations.
     if let Some(w) = &query.with {
         if w.recursive {
+            guard_cte_ast_complexity(query)?;
             return Box::pin(execute_recursive_cte(db, vindex, query)).await;
         }
         let expanded = expand_ctes(query)?;
@@ -5200,21 +5201,50 @@ async fn join_select(
         split_and(f, &mut conjuncts);
     }
 
-    let (schema, mut rows) = build_from(db, vindex, &select.from, &conjuncts).await?;
+    let (schema, rows) = build_from(db, vindex, &select.from, &conjuncts).await?;
+    let cancel = db.cancel_token();
+    cpu_bound(move || {
+        finish_materialized_select(
+            select,
+            filter.as_ref(),
+            schema,
+            rows,
+            &group_by,
+            &order_exprs,
+            offset,
+            limit,
+            &cancel,
+        )
+    })
+}
 
+/// Apply the relational work shared by materialised joins and flattened derived
+/// chains. Callers run this through [`cpu_bound`] so row loops do not monopolise
+/// an async worker.
+#[allow(clippy::too_many_arguments)]
+fn finish_materialized_select(
+    select: &Select,
+    filter: Option<&Expr>,
+    schema: Schema,
+    mut rows: Vec<Vec<Value>>,
+    group_by: &[Expr],
+    order_exprs: &[(Expr, bool)],
+    offset: usize,
+    limit: Option<usize>,
+    cancel: &std::sync::Arc<elyra_core::cancel::QueryCancel>,
+) -> Result<QueryResult> {
     // WHERE over the joined rows.
-    if let Some(f) = &filter {
-        let mut check = db.cancel_check();
-        rows = cpu_bound(|| -> Result<Vec<Vec<Value>>> {
-            let mut kept = Vec::with_capacity(rows.len());
-            for row in rows.into_iter() {
-                check.tick()?;
-                if predicate::matches(f, &schema, &row)? {
-                    kept.push(row);
-                }
+    let mut check = elyra_core::cancel::CancelCheck::new(cancel.clone());
+    check.tick_now()?;
+    if let Some(filter) = filter {
+        let mut kept = Vec::with_capacity(rows.len());
+        for row in rows {
+            check.tick()?;
+            if predicate::matches(filter, &schema, &row)? {
+                kept.push(row);
             }
-            Ok(kept)
-        })?;
+        }
+        rows = kept;
     }
 
     // Aggregation / grouping.
@@ -5223,30 +5253,24 @@ async fn join_select(
         let (projection, hidden) = aggregate_projection_with_hidden(
             &select.projection,
             select.having.as_ref(),
-            &order_exprs,
+            order_exprs,
             &schema,
         );
-        let (osch, orows) = cpu_bound(|| -> Result<(Schema, Vec<Vec<Value>>)> {
-            let (mut osch, orows) = aggregate::run(&schema, &projection, &group_by, rows)?;
-            let mut orows = apply_having(select.having.as_ref(), &projection, &osch, orows)?;
-            order_output_rows(&mut orows, &osch, &order_exprs)?;
-            truncate_hidden_columns(&mut osch, &mut orows, hidden);
-            apply_offset_limit(&mut orows, offset, limit);
-            Ok((osch, orows))
-        })?;
+        let (mut osch, orows) = aggregate::run(&schema, &projection, group_by, rows)?;
+        let mut orows = apply_having(select.having.as_ref(), &projection, &osch, orows)?;
+        order_output_rows(&mut orows, &osch, order_exprs)?;
+        truncate_hidden_columns(&mut osch, &mut orows, hidden);
+        apply_offset_limit(&mut orows, offset, limit);
         return Ok(QueryResult::Rows(RowStream::literal(osch, orows)));
     }
 
     // ORDER BY + projection.
-    let resolved = resolve_order_aliases(&order_exprs, &select.projection, &schema);
-    let cancel = db.cancel_token();
-    let (osch, out) = cpu_bound(|| -> Result<(Schema, Vec<Vec<Value>>)> {
-        if !resolved.is_empty() {
-            sort_full_rows(&mut rows, &schema, &resolved, &cancel)?;
-        }
-        apply_offset_limit(&mut rows, offset, limit);
-        project_exprs(&select.projection, &schema, &rows, None)
-    })?;
+    let resolved = resolve_order_aliases(order_exprs, &select.projection, &schema);
+    if !resolved.is_empty() {
+        sort_full_rows(&mut rows, &schema, &resolved, cancel)?;
+    }
+    apply_offset_limit(&mut rows, offset, limit);
+    let (osch, out) = project_exprs(&select.projection, &schema, &rows, None)?;
     Ok(QueryResult::Rows(RowStream::literal(osch, out)))
 }
 
@@ -11963,6 +11987,71 @@ const MAX_CTE_EXPANSION_DEPTH: usize = 16;
 // A shallow CTE can still expand exponentially when it references a previous
 // definition more than once. Bound the generated tree as well as its depth.
 const MAX_CTE_EXPANSION_NODES: usize = 256;
+// Definitions that are never referenced do not contribute to the expanded
+// tree, but still consume parser, visitor, and scope-management work. Bound the
+// source AST independently, leaving enough room for the supported dependency
+// depth and the 101-layer fail-safe regression to reach the expansion guard.
+const MAX_CTE_AST_NODES: usize = 4096;
+
+struct CteScope<T>(std::rc::Rc<CteScopeNode<T>>);
+
+impl<T> Clone for CteScope<T> {
+    fn clone(&self) -> Self {
+        Self(std::rc::Rc::clone(&self.0))
+    }
+}
+
+enum CteScopeNode<T> {
+    Root,
+    Binding {
+        name: String,
+        value: Option<T>,
+        parent: CteScope<T>,
+    },
+}
+
+impl<T> Default for CteScope<T> {
+    fn default() -> Self {
+        Self(std::rc::Rc::new(CteScopeNode::Root))
+    }
+}
+
+impl<T> CteScope<T> {
+    fn bind(&self, name: String, value: T) -> Self {
+        Self(std::rc::Rc::new(CteScopeNode::Binding {
+            name,
+            value: Some(value),
+            parent: self.clone(),
+        }))
+    }
+
+    fn shadow(&self, name: String) -> Self {
+        Self(std::rc::Rc::new(CteScopeNode::Binding {
+            name,
+            value: None,
+            parent: self.clone(),
+        }))
+    }
+
+    fn get(&self, wanted: &str) -> Option<&T> {
+        let mut node = self.0.as_ref();
+        loop {
+            match node {
+                CteScopeNode::Root => return None,
+                CteScopeNode::Binding {
+                    name,
+                    value,
+                    parent,
+                } => {
+                    if name.eq_ignore_ascii_case(wanted) {
+                        return value.as_ref();
+                    }
+                    node = parent.0.as_ref();
+                }
+            }
+        }
+    }
+}
 
 #[derive(Clone)]
 struct InlineCte {
@@ -11970,7 +12059,47 @@ struct InlineCte {
     cost: CteExpansionCost,
 }
 
-type InlineCteMap = std::collections::HashMap<String, InlineCte>;
+type InlineCteScope = CteScope<InlineCte>;
+
+#[derive(Default)]
+struct CteAstBudget {
+    nodes: usize,
+}
+
+impl CteAstBudget {
+    fn charge(&mut self, nodes: usize) -> ControlFlow<Error> {
+        self.nodes = match self.nodes.checked_add(nodes) {
+            Some(total) if total <= MAX_CTE_AST_NODES => total,
+            _ => {
+                return ControlFlow::Break(Error::Parse(format!(
+                    "CTE expansion limit exceeded (AST node limit {MAX_CTE_AST_NODES}); simplify the query"
+                )))
+            }
+        };
+        ControlFlow::Continue(())
+    }
+}
+
+struct CteAstCounter {
+    budget: CteAstBudget,
+}
+
+impl Visitor for CteAstCounter {
+    type Break = Error;
+
+    fn pre_visit_query(&mut self, query: &SqlQuery) -> ControlFlow<Self::Break> {
+        self.budget
+            .charge(1 + query.with.as_ref().map_or(0, |with| with.cte_tables.len()))
+    }
+
+    fn pre_visit_table_factor(&mut self, _table_factor: &TableFactor) -> ControlFlow<Self::Break> {
+        self.budget.charge(1)
+    }
+
+    fn pre_visit_expr(&mut self, _expr: &Expr) -> ControlFlow<Self::Break> {
+        self.budget.charge(1)
+    }
+}
 
 #[derive(Clone, Copy, Default)]
 struct CteExpansionCost {
@@ -12009,14 +12138,25 @@ impl CteExpansionCost {
 /// keeps nested `WITH` names lexical, and each CTE body is expanded only against
 /// definitions visible at its declaration point.
 fn expand_ctes(query: &SqlQuery) -> Result<SqlQuery> {
+    guard_cte_ast_complexity(query)?;
     let mut expanded = query.clone();
-    expand_ctes_with_scope(&mut expanded, InlineCteMap::new())?;
+    expand_ctes_with_scope(&mut expanded, InlineCteScope::default())?;
     Ok(expanded)
+}
+
+fn guard_cte_ast_complexity(query: &SqlQuery) -> Result<()> {
+    let mut counter = CteAstCounter {
+        budget: CteAstBudget::default(),
+    };
+    if let ControlFlow::Break(error) = query.visit(&mut counter) {
+        return Err(error);
+    }
+    Ok(())
 }
 
 fn expand_ctes_with_scope(
     query: &mut SqlQuery,
-    parent_scope: InlineCteMap,
+    parent_scope: InlineCteScope,
 ) -> Result<CteExpansionCost> {
     let mut expander = InlineCteExpander {
         scopes: vec![parent_scope],
@@ -12029,7 +12169,7 @@ fn expand_ctes_with_scope(
 }
 
 struct InlineCteExpander {
-    scopes: Vec<InlineCteMap>,
+    scopes: Vec<InlineCteScope>,
     cost: CteExpansionCost,
 }
 
@@ -12044,7 +12184,7 @@ impl VisitorMut for InlineCteExpander {
                 // executed. Its names shadow outer inline CTEs in every local
                 // body, while differently named outer CTEs remain visible.
                 for cte in &with.cte_tables {
-                    scope.remove(&cte.alias.name.value.to_ascii_lowercase());
+                    scope = scope.shadow(cte.alias.name.value.clone());
                 }
                 query.with = Some(with);
             } else {
@@ -12054,8 +12194,8 @@ impl VisitorMut for InlineCteExpander {
                         Ok(cost) => cost,
                         Err(error) => return ControlFlow::Break(error),
                     };
-                    scope.insert(
-                        cte.alias.name.value.to_ascii_lowercase(),
+                    scope = scope.bind(
+                        cte.alias.name.value,
                         InlineCte {
                             query: std::rc::Rc::new(body),
                             cost,
@@ -12087,11 +12227,7 @@ impl VisitorMut for InlineCteExpander {
             return ControlFlow::Continue(());
         }
         let cte_name = &name.0[0].value;
-        let Some(body) = self
-            .scopes
-            .last()
-            .and_then(|scope| scope.get(&cte_name.to_ascii_lowercase()))
-        else {
+        let Some(body) = self.scopes.last().and_then(|scope| scope.get(cte_name)) else {
             return ControlFlow::Continue(());
         };
         if let Err(error) = self.cost.include(body.cost) {
@@ -13200,8 +13336,12 @@ fn rewrite_table_refs(
     mut query: SqlQuery,
     map: &std::collections::HashMap<String, String>,
 ) -> SqlQuery {
+    let scope = map.iter().fold(CteScope::default(), |scope, (name, temp)| {
+        scope.bind(name.clone(), temp.clone())
+    });
     let mut rewriter = TempTableRewriter {
-        scopes: vec![map.clone()],
+        scopes: vec![scope],
+        saved_with: Vec::new(),
     };
     let _ = VisitMut::visit(&mut query, &mut rewriter);
     query
@@ -13216,7 +13356,8 @@ fn setexpr_refs_table(body: &SetExpr, name: &str) -> bool {
 }
 
 struct TempTableRewriter {
-    scopes: Vec<std::collections::HashMap<String, String>>,
+    scopes: Vec<CteScope<String>>,
+    saved_with: Vec<Option<sqlparser::ast::With>>,
 }
 
 impl VisitorMut for TempTableRewriter {
@@ -13224,17 +13365,32 @@ impl VisitorMut for TempTableRewriter {
 
     fn pre_visit_query(&mut self, query: &mut SqlQuery) -> ControlFlow<Self::Break> {
         let mut scope = self.scopes.last().cloned().unwrap_or_default();
-        if let Some(with) = &query.with {
-            for cte in &with.cte_tables {
-                scope.remove(&cte.alias.name.value.to_ascii_lowercase());
+        let mut saved_with = query.with.take();
+        if let Some(with) = &mut saved_with {
+            if with.recursive {
+                for cte in &with.cte_tables {
+                    scope = scope.shadow(cte.alias.name.value.clone());
+                }
+            }
+            for cte in &mut with.cte_tables {
+                let mut nested = Self {
+                    scopes: vec![scope.clone()],
+                    saved_with: Vec::new(),
+                };
+                let _ = VisitMut::visit(cte.query.as_mut(), &mut nested);
+                if !with.recursive {
+                    scope = scope.shadow(cte.alias.name.value.clone());
+                }
             }
         }
+        self.saved_with.push(saved_with);
         self.scopes.push(scope);
         ControlFlow::Continue(())
     }
 
-    fn post_visit_query(&mut self, _query: &mut SqlQuery) -> ControlFlow<Self::Break> {
+    fn post_visit_query(&mut self, query: &mut SqlQuery) -> ControlFlow<Self::Break> {
         self.scopes.pop();
+        query.with = self.saved_with.pop().flatten();
         ControlFlow::Continue(())
     }
 
@@ -13252,11 +13408,7 @@ impl VisitorMut for TempTableRewriter {
             return ControlFlow::Continue(());
         }
         let original = name.0[0].value.clone();
-        let Some(temp) = self
-            .scopes
-            .last()
-            .and_then(|scope| scope.get(&original.to_ascii_lowercase()))
-        else {
+        let Some(temp) = self.scopes.last().and_then(|scope| scope.get(&original)) else {
             return ControlFlow::Continue(());
         };
         *name = ObjectName(vec![sqlparser::ast::Ident::new(temp.clone())]);
@@ -13270,39 +13422,72 @@ impl VisitorMut for TempTableRewriter {
     }
 }
 
-fn refs_table<T: Visit>(node: &T, name: &str) -> bool {
+fn refs_table<T: VisitMut + Clone>(node: &T, name: &str) -> bool {
+    let mut node = node.clone();
     let mut finder = TableRefFinder {
         name,
         shadowed: vec![false],
+        saved_with: Vec::new(),
     };
-    matches!(node.visit(&mut finder), ControlFlow::Break(()))
+    matches!(
+        VisitMut::visit(&mut node, &mut finder),
+        ControlFlow::Break(())
+    )
 }
 
 struct TableRefFinder<'a> {
     name: &'a str,
     shadowed: Vec<bool>,
+    saved_with: Vec<Option<sqlparser::ast::With>>,
 }
 
-impl Visitor for TableRefFinder<'_> {
+impl VisitorMut for TableRefFinder<'_> {
     type Break = ();
 
-    fn pre_visit_query(&mut self, query: &SqlQuery) -> ControlFlow<Self::Break> {
-        let shadowed = self.shadowed.last().copied().unwrap_or(false)
-            || query.with.as_ref().is_some_and(|with| {
-                with.cte_tables
+    fn pre_visit_query(&mut self, query: &mut SqlQuery) -> ControlFlow<Self::Break> {
+        let mut shadowed = self.shadowed.last().copied().unwrap_or(false);
+        let mut saved_with = query.with.take();
+        if let Some(with) = &mut saved_with {
+            if with.recursive
+                && with
+                    .cte_tables
                     .iter()
                     .any(|cte| cte.alias.name.value.eq_ignore_ascii_case(self.name))
-            });
+            {
+                shadowed = true;
+            }
+            for cte in &mut with.cte_tables {
+                let mut nested = Self {
+                    name: self.name,
+                    shadowed: vec![shadowed],
+                    saved_with: Vec::new(),
+                };
+                if matches!(
+                    VisitMut::visit(cte.query.as_mut(), &mut nested),
+                    ControlFlow::Break(())
+                ) {
+                    return ControlFlow::Break(());
+                }
+                if !with.recursive && cte.alias.name.value.eq_ignore_ascii_case(self.name) {
+                    shadowed = true;
+                }
+            }
+        }
+        self.saved_with.push(saved_with);
         self.shadowed.push(shadowed);
         ControlFlow::Continue(())
     }
 
-    fn post_visit_query(&mut self, _query: &SqlQuery) -> ControlFlow<Self::Break> {
+    fn post_visit_query(&mut self, query: &mut SqlQuery) -> ControlFlow<Self::Break> {
         self.shadowed.pop();
+        query.with = self.saved_with.pop().flatten();
         ControlFlow::Continue(())
     }
 
-    fn pre_visit_table_factor(&mut self, table_factor: &TableFactor) -> ControlFlow<Self::Break> {
+    fn pre_visit_table_factor(
+        &mut self,
+        table_factor: &mut TableFactor,
+    ) -> ControlFlow<Self::Break> {
         if self.shadowed.last().copied().unwrap_or(false) {
             return ControlFlow::Continue(());
         }
@@ -14083,18 +14268,20 @@ async fn run_derived_query_chain(
             Some(limit) => Some(eval_usize(limit)?),
             None => None,
         };
-        let result = run_virtual_select(
-            db,
-            vindex,
-            layer.select,
-            input_schema,
-            rows,
-            layer.group_by,
-            &order_exprs,
-            offset,
-            limit,
-        )
-        .await?;
+        let cancel = db.cancel_token();
+        let result = cpu_bound(move || {
+            finish_materialized_select(
+                layer.select,
+                layer.select.selection.as_ref(),
+                input_schema,
+                rows,
+                layer.group_by,
+                &order_exprs,
+                offset,
+                limit,
+                &cancel,
+            )
+        })?;
         (schema, rows) = materialize_query_result(result).await?;
     }
     Ok(Some((schema, rows)))
@@ -17143,6 +17330,43 @@ mod cte_rewrite_tests {
     }
 
     #[tokio::test]
+    async fn nested_ctes_shadow_an_outer_recursive_name_at_the_declaration_point() {
+        let (engine, session) = engine_and_session();
+
+        assert_eq!(
+            rows(
+                &engine,
+                &session,
+                "WITH RECURSIVE seq(n) AS (\
+                     SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 2\
+                 ) SELECT nested.n FROM (\
+                     WITH seq AS (SELECT n + 10 AS n FROM seq) \
+                     SELECT n FROM seq\
+                 ) AS nested ORDER BY nested.n",
+            )
+            .await,
+            vec![vec![Value::Int(11)], vec![Value::Int(12)]]
+        );
+    }
+
+    #[test]
+    fn recursive_reference_finder_observes_declaration_point_scope() {
+        let query =
+            super::parse_query("WITH seq AS (SELECT n + 10 AS n FROM seq) SELECT n FROM seq")
+                .unwrap();
+        assert!(super::query_refs_table(&query, "seq"));
+
+        let shadowed = super::parse_query(
+            "WITH seed AS (SELECT 1 AS n), \
+                  seq AS (SELECT n FROM seed), \
+                  later AS (SELECT n FROM seq) \
+             SELECT n FROM later",
+        )
+        .unwrap();
+        assert!(!super::query_refs_table(&shadowed, "seq"));
+    }
+
+    #[tokio::test]
     async fn ordinary_cte_dependency_chain_still_executes() {
         let (engine, session) = engine_and_session();
         let definitions = (0..super::MAX_CTE_EXPANSION_DEPTH)
@@ -17275,6 +17499,59 @@ mod cte_rewrite_tests {
             panic!("over-limit CTE dependency chain unexpectedly succeeded");
         };
         assert!(message.contains("CTE expansion limit exceeded (depth limit"));
+    }
+
+    #[tokio::test]
+    async fn many_unused_cte_definitions_are_rejected_as_too_complex() {
+        let (engine, session) = engine_and_session();
+        let definitions = (0..5_000)
+            .map(|index| format!("unused_{index} AS (SELECT {index} AS n)"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let result = engine
+            .execute(
+                &format!("WITH {definitions} SELECT 1"),
+                Privilege::Admin,
+                &session,
+            )
+            .await;
+
+        let Err(Error::Parse(message)) = result else {
+            panic!("excessive unused CTE definitions unexpectedly succeeded");
+        };
+        assert!(message.contains("CTE expansion limit exceeded (AST node limit"));
+    }
+
+    #[tokio::test]
+    async fn cancelled_iterative_cte_chain_stops_between_layers() {
+        let (engine, session) = engine_and_session();
+        let definitions = (0..super::MAX_CTE_EXPANSION_DEPTH)
+            .map(|index| {
+                if index == 0 {
+                    "c0 AS (SELECT 1 AS n)".to_owned()
+                } else {
+                    format!("c{index} AS (SELECT n + 1 AS n FROM c{})", index - 1)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        session.cancel_token().cancel();
+        let result = engine
+            .execute(
+                &format!(
+                    "WITH {definitions} SELECT n FROM c{}",
+                    super::MAX_CTE_EXPANSION_DEPTH - 1
+                ),
+                Privilege::Admin,
+                &session,
+            )
+            .await;
+
+        let Err(error) = result else {
+            panic!("a cancelled iterative CTE chain must stop");
+        };
+        assert!(error.to_string().contains("cancelled"));
+        session.disarm_cancel();
     }
 
     #[tokio::test]
