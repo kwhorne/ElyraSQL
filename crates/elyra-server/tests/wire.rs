@@ -2056,6 +2056,156 @@ async fn coercive_composite_using_and_natural_joins_keep_binary_collation() {
 }
 
 #[tokio::test]
+async fn chained_using_and_natural_fallbacks_resolve_keys_per_side() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop("CREATE TABLE chain_int_a (id INT, aval VARCHAR(8))")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE chain_int_b (id INT, bval VARCHAR(8))")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE chain_text_c (id VARCHAR(8), cval VARCHAR(8))")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO chain_int_a VALUES (5,'A5'),(6,'A6')")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO chain_int_b VALUES (5,'B5'),(6,'B6')")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO chain_text_c VALUES ('5','C5'),('7','C7')")
+        .await
+        .unwrap();
+
+    let using_rows: Vec<(i64, String, String, String)> = c
+        .query(
+            "SELECT id, a.aval, b.bval, c.cval
+             FROM chain_int_a AS a
+             JOIN chain_int_b AS b USING(id)
+             JOIN chain_text_c AS c USING(id)",
+        )
+        .await
+        .unwrap();
+    assert_eq!(using_rows, [(5, "A5".into(), "B5".into(), "C5".into())]);
+
+    let natural_rows: Vec<(i64, String, String, String)> = c
+        .query(
+            "SELECT id, a.aval, b.bval, c.cval
+             FROM chain_int_a AS a
+             NATURAL JOIN chain_int_b AS b
+             NATURAL JOIN chain_text_c AS c",
+        )
+        .await
+        .unwrap();
+    assert_eq!(natural_rows, using_rows);
+
+    c.query_drop("CREATE TABLE chain_float_a (id DOUBLE, aval VARCHAR(8))")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE chain_float_b (id DOUBLE, bval VARCHAR(8))")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE chain_float_c (id DOUBLE, cval VARCHAR(8))")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO chain_float_a VALUES (1.5,'A1'),(2.5,'A2')")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO chain_float_b VALUES (1.5,'B1'),(2.5,'B2')")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO chain_float_c VALUES (1.5,'C1'),(3.5,'C3')")
+        .await
+        .unwrap();
+
+    let using_float_rows: Vec<(f64, String, String, String)> = c
+        .query(
+            "SELECT id, a.aval, b.bval, c.cval
+             FROM chain_float_a AS a
+             JOIN chain_float_b AS b USING(id)
+             JOIN chain_float_c AS c USING(id)",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        using_float_rows,
+        [(1.5, "A1".into(), "B1".into(), "C1".into())]
+    );
+
+    let natural_float_rows: Vec<(f64, String, String, String)> = c
+        .query(
+            "SELECT id, a.aval, b.bval, c.cval
+             FROM chain_float_a AS a
+             NATURAL JOIN chain_float_b AS b
+             NATURAL JOIN chain_float_c AS c",
+        )
+        .await
+        .unwrap();
+    assert_eq!(natural_float_rows, using_float_rows);
+}
+
+#[tokio::test]
+async fn nested_derived_joins_preserve_binary_collation() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop(
+        "CREATE TABLE nested_coll_source (
+             label VARCHAR(8) COLLATE utf8mb4_bin,
+             lval VARCHAR(8)
+         )",
+    )
+    .await
+    .unwrap();
+    c.query_drop(
+        "CREATE TABLE nested_coll_partner (
+             label VARCHAR(8) COLLATE utf8mb4_general_ci,
+             rval VARCHAR(8)
+         )",
+    )
+    .await
+    .unwrap();
+    c.query_drop("INSERT INTO nested_coll_source VALUES ('x','wrong'),('X','exact')")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO nested_coll_partner VALUES ('X','right')")
+        .await
+        .unwrap();
+
+    let using_rows: Vec<(String, String, String)> = c
+        .query(
+            "SELECT d.label, d.lval, p.rval
+             FROM (
+                 SELECT inner_d.label, inner_d.lval
+                 FROM (
+                     SELECT label, lval FROM nested_coll_source
+                 ) AS inner_d
+             ) AS d
+             JOIN nested_coll_partner AS p USING(label)",
+        )
+        .await
+        .unwrap();
+    assert_eq!(using_rows, [("X".into(), "exact".into(), "right".into())]);
+
+    let natural_rows: Vec<(String, String, String)> = c
+        .query(
+            "SELECT d.label, d.lval, p.rval
+             FROM (
+                 SELECT inner_d.label, inner_d.lval
+                 FROM (
+                     SELECT label, lval FROM nested_coll_source
+                 ) AS inner_d
+             ) AS d
+             NATURAL JOIN nested_coll_partner AS p",
+        )
+        .await
+        .unwrap();
+    assert_eq!(natural_rows, using_rows);
+}
+
+#[tokio::test]
 async fn correlated_exists_preserves_inner_bare_columns() {
     let srv = TestServer::start().await;
     let mut c = srv.conn().await;

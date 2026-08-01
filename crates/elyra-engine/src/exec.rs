@@ -7147,7 +7147,7 @@ async fn load_relation(
                 name: format!("{alias}.{}", c.name),
                 ty: c.ty.clone(),
                 nullable: c.nullable,
-                collation: elyra_core::Collation::Ci,
+                collation: c.collation,
                 qualifier: qualifier_parts.clone(),
             })
             .collect();
@@ -7795,10 +7795,13 @@ async fn build_from(
             jr = apply_pushdown(jr, &jc, conjuncts)?;
             let partner_schema = Schema::new(jc);
             let using_keys = resolve_using_keys(&join.join_operator, &cur_schema, &partner_schema)?;
-            let resolved_on = using_keys
+            let resolved_keys = using_keys
                 .as_ref()
-                .and_then(|keys| using_predicate(keys, &cur_schema, &partner_schema))
-                .or(on);
+                .map(|keys| using_key_pairs(keys, &cur_schema, &partner_schema));
+            let condition = resolved_keys
+                .as_deref()
+                .map(JoinCondition::ResolvedKeys)
+                .or_else(|| on.as_ref().map(JoinCondition::On));
             let cancel = db.cancel_token();
             let (cols, rows) = cpu_bound(|| {
                 combine(
@@ -7807,7 +7810,7 @@ async fn build_from(
                     &partner_schema,
                     &jr,
                     kind,
-                    resolved_on.as_ref(),
+                    condition,
                     &cancel,
                 )
             })?;
@@ -8335,7 +8338,7 @@ async fn build_inner_join_reordered(
                 &right_schema,
                 &rrows,
                 JoinKind::Inner,
-                Some(&pred),
+                Some(JoinCondition::On(&pred)),
                 &cancel,
             )
         })?;
@@ -8657,18 +8660,15 @@ fn column_expr(name: &str) -> Expr {
     }
 }
 
-fn using_predicate(keys: &[UsingKey], left: &Schema, right: &Schema) -> Option<Expr> {
+fn using_key_pairs(keys: &[UsingKey], left: &Schema, right: &Schema) -> Vec<(Expr, Expr)> {
     keys.iter()
-        .map(|key| Expr::BinaryOp {
-            left: Box::new(column_expr(&left.columns[key.left].name)),
-            op: sqlparser::ast::BinaryOperator::Eq,
-            right: Box::new(column_expr(&right.columns[key.right].name)),
+        .map(|key| {
+            (
+                column_expr(&left.columns[key.left].name),
+                column_expr(&right.columns[key.right].name),
+            )
         })
-        .reduce(|left, right| Expr::BinaryOp {
-            left: Box::new(left),
-            op: sqlparser::ast::BinaryOperator::And,
-            right: Box::new(right),
-        })
+        .collect()
 }
 
 fn coalesce_using_join(
@@ -8774,8 +8774,15 @@ fn join_kind(op: &JoinOperator) -> Result<(JoinKind, Option<Expr>)> {
     })
 }
 
-/// Combine two materialised relations under a join kind. Equi-`ON` INNER/LEFT
-/// use a hash join; everything else (RIGHT/FULL, non-equi) is nested-loop.
+#[derive(Clone, Copy)]
+enum JoinCondition<'a> {
+    On(&'a Expr),
+    ResolvedKeys(&'a [(Expr, Expr)]),
+}
+
+/// Combine two materialised relations under a join kind. Compatible equi-`ON`
+/// and resolved USING/NATURAL keys use a hash join; other conditions use the
+/// general nested-loop evaluator.
 #[allow(clippy::too_many_arguments)]
 fn combine(
     lschema: &Schema,
@@ -8783,7 +8790,7 @@ fn combine(
     rschema: &Schema,
     rrows: &[Vec<Value>],
     kind: JoinKind,
-    on: Option<&Expr>,
+    condition: Option<JoinCondition<'_>>,
     cancel: &std::sync::Arc<elyra_core::cancel::QueryCancel>,
 ) -> Result<(Schema, Vec<Vec<Value>>)> {
     let mut cols = lschema.columns.clone();
@@ -8805,35 +8812,42 @@ fn combine(
     // INNER equi-joins whose inputs are already sorted on the join key (e.g.
     // clustered primary-key scans), use a streaming merge join instead — no hash
     // table, and the output stays ordered.
+    let inferred_keys = match condition {
+        Some(JoinCondition::On(expression)) => equi_key_pairs(expression, lschema, rschema),
+        Some(JoinCondition::ResolvedKeys(_)) | None => None,
+    };
+    let key_pairs = match condition {
+        Some(JoinCondition::On(_)) => inferred_keys.as_deref(),
+        Some(JoinCondition::ResolvedKeys(keys)) => Some(keys),
+        None => None,
+    };
     if matches!(kind, JoinKind::Inner | JoinKind::Left | JoinKind::Right) {
-        if let Some(e) = on {
-            if let Some(keys) = equi_key_pairs(e, lschema, rschema)
-                .filter(|keys| hash_key_pairs_compatible(keys, lschema, rschema))
-            {
-                const MERGE_MIN: usize = 2048;
-                if let [(lkey, rkey)] = keys.as_slice() {
-                    // The merge join compares keys under the default collation,
-                    // so skip it for a `_bin` join key (fall through to the
-                    // collation-aware hash join below).
-                    let bin_key = join_key_collation(lkey, lschema, rkey, rschema).is_bin();
-                    if !bin_key
-                        && kind == JoinKind::Inner
-                        && lrows.len() >= MERGE_MIN
-                        && rrows.len() >= MERGE_MIN
-                    {
-                        if let (Some(lk), Some(rk)) = (
-                            sorted_keyed(lrows, lschema, lkey)?,
-                            sorted_keyed(rrows, rschema, rkey)?,
-                        ) {
-                            if let Some(out) = merge_join_inner(lk, rk) {
-                                return Ok((schema, out));
-                            }
+        if let Some(keys) = key_pairs
+            .filter(|keys| !keys.is_empty() && hash_key_pairs_compatible(keys, lschema, rschema))
+        {
+            const MERGE_MIN: usize = 2048;
+            if let [(lkey, rkey)] = keys {
+                // The merge join compares keys under the default collation,
+                // so skip it for a `_bin` join key (fall through to the
+                // collation-aware hash join below).
+                let bin_key = join_key_collation(lkey, lschema, rkey, rschema).is_bin();
+                if !bin_key
+                    && kind == JoinKind::Inner
+                    && lrows.len() >= MERGE_MIN
+                    && rrows.len() >= MERGE_MIN
+                {
+                    if let (Some(lk), Some(rk)) = (
+                        sorted_keyed(lrows, lschema, lkey)?,
+                        sorted_keyed(rrows, rschema, rkey)?,
+                    ) {
+                        if let Some(out) = merge_join_inner(lk, rk) {
+                            return Ok((schema, out));
                         }
                     }
                 }
-                let rows = hash_join(lrows, rrows, lschema, rschema, &keys, kind, cancel)?;
-                return Ok((schema, rows));
             }
+            let rows = hash_join(lrows, rrows, lschema, rschema, keys, kind, cancel)?;
+            return Ok((schema, rows));
         }
     }
 
@@ -8858,8 +8872,13 @@ fn combine(
             let mut combined = l.clone();
             combined.extend_from_slice(r);
             budget.sample(&combined);
-            let keep = match on {
-                Some(e) => predicate::matches(e, &schema, &combined)?,
+            let keep = match condition {
+                Some(JoinCondition::On(expression)) => {
+                    predicate::matches(expression, &schema, &combined)?
+                }
+                Some(JoinCondition::ResolvedKeys(keys)) => {
+                    resolved_key_pairs_match(l, lschema, r, rschema, keys)?
+                }
                 None => true,
             };
             if keep {
@@ -8886,6 +8905,27 @@ fn combine(
         }
     }
     Ok((schema, out))
+}
+
+fn resolved_key_pairs_match(
+    left_row: &[Value],
+    left_schema: &Schema,
+    right_row: &[Value],
+    right_schema: &Schema,
+    keys: &[(Expr, Expr)],
+) -> Result<bool> {
+    for (left, right) in keys {
+        let left_value = predicate::eval_row(left, left_schema, left_row)?;
+        let right_value = predicate::eval_row(right, right_schema, right_row)?;
+        let collation = join_key_collation(left, left_schema, right, right_schema);
+        if !left_value
+            .compare_coll(&right_value, collation)
+            .is_some_and(std::cmp::Ordering::is_eq)
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -16954,7 +16994,7 @@ mod composite_join_tests {
     use elyra_core::{ColumnDef, ColumnType, Schema, Value};
     use sqlparser::ast::{BinaryOperator, Expr};
 
-    use super::{column_expr, combine, JoinKind, NESTED_JOIN_COMPARISONS};
+    use super::{column_expr, combine, JoinCondition, JoinKind, NESTED_JOIN_COMPARISONS};
 
     #[test]
     fn multi_key_equality_avoids_quadratic_fallback() {
@@ -16990,7 +17030,7 @@ mod composite_join_tests {
             &right_schema,
             &right_rows,
             JoinKind::Inner,
-            Some(&predicate),
+            Some(JoinCondition::On(&predicate)),
             &Arc::new(QueryCancel::new()),
         )
         .unwrap();
