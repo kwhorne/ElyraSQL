@@ -6,16 +6,92 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-08-01
+
+A compatibility release, and one that arrived from outside: both halves came in
+as pull requests from [@HelgeSverre](https://github.com/HelgeSverre), who ran the
+migration and test suites of **four commercial Laravel codebases** against
+isolated ElyraSQL instances, reduced every failure to a generic MySQL
+reproduction, and checked the ambiguous ones against MySQL 8.4 rather than
+guessing. The largest of those suites had 469 migration files; two complete
+application suites passed 278 tests / 764 assertions and 169 tests / 762
+assertions against ElyraSQL.
+
+The theme is that **almost none of these were engine bugs**. They were places
+where ElyraSQL answered a question correctly but *differently* — a column label,
+a coercion under a session SQL mode, a version string, a metadata field — and
+every one of those differences becomes a driver-specific workaround in somebody's
+application. There are 103 new end-to-end tests through the MySQL wire protocol
+covering them.
+
+Two genuine wrong-results bugs were found on the way, and both had been present
+for some time. Neither came from a report: one fell out of running a join battery
+differentially against MySQL, the other out of the threshold sweep finally being
+able to run.
+
+Also in this release: **native Apple Silicon binaries**, built and tested on an
+arm64 macOS runner in CI and attached to every tagged release from this one on.
+
+No on-disk format change and no migration — a 1.5.x or 1.6.x database opens
+unchanged, and a 1.7.0 database still opens in either. It is a minor rather than
+a patch bump because the advertised MySQL version changes what version-gated
+clients generate, and because `CREATE DATABASE` now refuses instead of quietly
+succeeding.
+
+### Fixed — wrong results
+
+- **A fractional literal was rounded into an integer index range, shifting the
+  result by a row.** `k > 1024.5` on an `INT` primary key means `k >= 1025`, but
+  the bound was coerced the way an `INSERT` value is coerced — rounded to the
+  nearest representable value — and the strict `>` was then applied to the
+  *rounded* bound, dropping row 1025. Four lookup paths reused `coerce()`, which
+  prepares a value for **storage**, to prepare a literal for **comparison**;
+  those are different jobs. A bound now keeps its meaning by flipping its
+  inclusivity when coercion moved the value, which is exact rather than
+  approximate: coercion rounds to the nearest representable value, so nothing
+  lies strictly between the literal and its coerced form. `=`, `IN` and
+  `BETWEEN` have nowhere to record a flipped inclusivity, so an inexact literal
+  declines the index and lets the scan's filter answer — closing `k = 1024.5`,
+  which returned a row it should not have. Only the index paths were affected
+  (`k+0 > 1024.5` was always right), and both directions were wrong: `<` matched
+  one row too few before this release, `=` since the point lookup was written.
+  Found by the threshold sweep at n=2048, where `AVG(k)` lands on `.5` and
+  `WHERE k > (SELECT AVG(k) FROM a)` counted one short.
+- **A join `ON` condition spanning both tables was hashed as an equi key**
+  (carried from 1.6.0; see that entry). Verified again here by the join battery
+  that now runs on every pull request.
+
 ### Added
 
+- **Laravel migrations run unmodified.** MySQL index and foreign-key drop forms,
+  ordered and limited `UPDATE`, column backfills for added columns, removal of
+  indexes with dependent columns, rename/introspection metadata, collation
+  metadata, index prefixes, and catalog results that honour the selected
+  database.
 - **Native Apple Silicon support is release-gated.** CI now builds and runs the
   full workspace test suite on an arm64 macOS runner using the minimum supported
   Rust toolchain. Tagged releases add an `elyrasql-<version>-macos-aarch64`
   archive and checksum alongside the existing Linux artifacts. The macOS build
   targets macOS 11.0, verifies the Mach-O architecture/minimum OS/signature, and
   is executed again after archive extraction.
+- **103 end-to-end tests through the MySQL wire protocol**, plus unit and
+  property regressions, covering every compatibility path changed here.
 
 ### Changed
+
+- **`CREATE DATABASE` refuses instead of silently succeeding.** ElyraSQL is a
+  single logical schema in one file, so reporting success made callers believe
+  they had an isolated database when every connection still shares `elyra`. The
+  *conditional* forms are honest no-ops and still succeed — `CREATE DATABASE IF
+  NOT EXISTS` means "make sure this exists", which is what Laravel's
+  `MigrateCommand`, container entrypoints and our own benches ask for — as does
+  `DROP DATABASE IF EXISTS` for a database that does not exist here. An
+  unconditional `CREATE DATABASE other`, or dropping the live database, now
+  fails loudly.
+- **`SELECT *` over a join returns MySQL's column labels.** The bare column name
+  is returned and the qualifier belongs in the result metadata; ElyraSQL was
+  inventing labels like `np_a.id`. Clients that key rows by name now see the
+  same collisions MySQL produces, which is what their code expects.
 
 - **The MySQL compatibility version advertised to clients is now 8.0.12.** The
   previous 8.0.0 prefix made Laravel and other clients suppress window-function
@@ -28,12 +104,34 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ### Fixed
 
+- **MySQL coercion is aligned across session SQL modes** — unsigned values,
+  integer and decimal rounding, invalid temporal input in non-strict mode,
+  numeric string prefixes in comparisons (`'123tail'` compares as `123`, a
+  string with no numeric prefix as `0`), and exact-decimal overflow.
+- **Correct wire results** for explicit auto-increment IDs, transaction status
+  in the result-set flags, prepared and dynamic result types encoded from the
+  declared column type, and MySQL-compatible column metadata.
+- **Query fixes:** correlated subqueries (including over joins), aggregated
+  correlated join filters, grouped join ordering and projections, representative
+  rows for grouped wildcards, scalar subqueries in `INSERT ... VALUES`, wildcard
+  expansion in window projections, ordering by hidden source values, unordered
+  DML limits, upserts on unique secondary-key conflicts, and inner-relation
+  shadowing.
+- **SQL dumps ingest byte-for-byte.** Exact decimal and hexadecimal literals are
+  preserved, substitutions no longer reach inside quoted text, and observed SQL
+  is truncated only on UTF-8 boundaries.
 - **Build metadata now reports the real target.** `@@version_compile_os`,
   `@@version_compile_machine`, and their `SHOW VARIABLES` equivalents no longer
   claim that Apple Silicon builds are Linux/x86_64.
 - **Crash-leaked sort and aggregation files are reclaimed on macOS.** Unix
   process liveness now uses a non-signalling `kill(pid, 0)` check instead of the
   Linux-only `/proc` filesystem, while treating ambiguous results as live.
+
+### Known gaps
+
+- Result metadata still reports an **empty `table` field** where MySQL reports
+  the source table, so a client cannot disambiguate duplicate column names
+  except by position.
 
 ## [1.6.0] - 2026-07-29
 
