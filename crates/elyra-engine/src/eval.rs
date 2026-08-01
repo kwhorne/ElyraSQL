@@ -139,7 +139,7 @@ fn number_literal(number: &str) -> Result<Value> {
 }
 
 fn decode_hex_literal(hex: &str) -> Result<Vec<u8>> {
-    if hex.len() % 2 != 0 {
+    if !hex.len().is_multiple_of(2) {
         return Err(Error::Type(format!(
             "hex literal must contain an even number of digits: X'{hex}'"
         )));

@@ -112,16 +112,20 @@ class Differ:
         self.e = connect(ELYRA)
         self.m = connect(MYSQL)
         self.ec, self.mc = self.e.cursor(), self.m.cursor()
-        # Fresh, identically named schema on both sides.
-        for cur, drop in ((self.ec, True), (self.mc, True)):
-            if drop:
-                try:
-                    cur.execute(f"DROP DATABASE IF EXISTS {db}")
-                except Exception:
-                    pass
-        for cur in (self.ec, self.mc):
-            cur.execute(f"CREATE DATABASE {db}")
-            cur.execute(f"USE {db}")
+        # MySQL gets a genuinely fresh database. ElyraSQL is a single logical
+        # schema in one file, so it cannot hand out an isolated database and now
+        # says so instead of pretending: only the conditional form is a no-op
+        # there. Scenarios do not rely on database-level isolation anyway --
+        # every battery drops its own tables first -- so the names still line up
+        # on both sides.
+        try:
+            self.mc.execute(f"DROP DATABASE IF EXISTS {db}")
+        except Exception:
+            pass
+        self.mc.execute(f"CREATE DATABASE {db}")
+        self.mc.execute(f"USE {db}")
+        self.ec.execute(f"CREATE DATABASE IF NOT EXISTS {db}")
+        self.ec.execute(f"USE {db}")
         self.passed = 0
         self.diverged: list[tuple[str, object, object]] = []
         self.errors: list[tuple[str, object, object]] = []

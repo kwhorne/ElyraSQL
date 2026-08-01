@@ -1655,22 +1655,28 @@ impl Engine {
                 Ok(QueryResult::empty_ok())
             }
             // ElyraSQL is a single logical schema backed by one file. Reporting
-            // success here would make callers believe an isolated database was
-            // created when every connection still shares `elyra`.
-            Statement::CreateDatabase { .. } | Statement::CreateSchema { .. } => {
-                Err(Error::Unsupported(
-                    "CREATE DATABASE is not supported; ElyraSQL uses the single `elyra` database"
-                        .into(),
-                ))
+            // success for an unconditional `CREATE DATABASE other` would make the
+            // caller believe it got an isolated database when every connection
+            // still shares `elyra`, so that form is refused. The conditional forms
+            // are how tooling asks "make sure this exists" rather than "give me a
+            // fresh one" -- Laravel's MigrateCommand, container entrypoints and our
+            // own benches all issue `IF NOT EXISTS` -- so they succeed as no-ops,
+            // as does naming the database that already exists.
+            Statement::CreateDatabase { if_not_exists, .. } => {
+                create_database_result(if_not_exists)
             }
+            Statement::CreateSchema { if_not_exists, .. } => create_database_result(if_not_exists),
             Statement::Explain { statement, .. } => exec::explain(sess, &statement).await,
             Statement::Drop {
                 object_type:
                     sqlparser::ast::ObjectType::Database | sqlparser::ast::ObjectType::Schema,
+                if_exists,
+                names,
                 ..
-            } => Err(Error::Unsupported(
-                "DROP DATABASE is not supported; ElyraSQL uses the single `elyra` database".into(),
-            )),
+            } => {
+                let target = names.first().and_then(object_name_last);
+                drop_database_result(&sess.database(), if_exists, target.as_deref())
+            }
             // Session/introspection queries GUI tools and ORMs fire on connect.
             Statement::ShowVariables { filter, .. } => exec::show_variables(filter.as_ref()),
             Statement::ShowStatus { filter, .. } => exec::show_status(filter.as_ref()),
@@ -1755,6 +1761,61 @@ fn truthy(v: &Value) -> bool {
 
 fn object_name_last(name: &sqlparser::ast::ObjectName) -> Option<String> {
     name.0.last().map(|i| i.value.clone())
+}
+
+/// `CREATE DATABASE`/`SCHEMA` against a server that has exactly one database.
+///
+/// `IF NOT EXISTS` asks for the database to *be there*, which it already is, so
+/// it is an honest no-op — and it is the form tooling uses (Laravel's
+/// `MigrateCommand`, container entrypoints, our own benches). An unconditional
+/// `CREATE DATABASE` asks for a *new, empty* database, which this server cannot
+/// give, so refusing beats silently sharing `elyra`.
+fn create_database_result(if_not_exists: bool) -> Result<QueryResult> {
+    if if_not_exists {
+        return Ok(QueryResult::empty_ok());
+    }
+    Err(Error::Unsupported(
+        "CREATE DATABASE is not supported; ElyraSQL uses the single `elyra` database \
+         (use CREATE DATABASE IF NOT EXISTS to make this a no-op)"
+            .into(),
+    ))
+}
+
+/// `DROP DATABASE`/`SCHEMA` under the same single-database model.
+///
+/// `IF EXISTS` on a database that does not exist here is a no-op, which is what
+/// the caller asked for. Dropping the database the session is actually using is
+/// refused rather than silently ignored: the caller expects its data to be gone.
+fn drop_database_result(
+    current: &str,
+    if_exists: bool,
+    target: Option<&str>,
+) -> Result<QueryResult> {
+    let names_current = target.is_some_and(|t| t.eq_ignore_ascii_case(current));
+    if if_exists && !names_current {
+        return Ok(QueryResult::empty_ok());
+    }
+    Err(Error::Unsupported(
+        "DROP DATABASE is not supported; ElyraSQL uses the single `elyra` database".into(),
+    ))
+}
+
+#[cfg(test)]
+mod database_ddl_tests {
+    use super::{create_database_result, drop_database_result};
+
+    #[test]
+    fn conditional_create_is_a_no_op() {
+        assert!(create_database_result(true).is_ok());
+        assert!(create_database_result(false).is_err());
+    }
+
+    #[test]
+    fn conditional_drop_spares_everything_but_the_live_database() {
+        assert!(drop_database_result("elyra", true, Some("scratch")).is_ok());
+        assert!(drop_database_result("elyra", true, Some("ELYRA")).is_err());
+        assert!(drop_database_result("elyra", false, Some("scratch")).is_err());
+    }
 }
 
 /// Collect the column names referenced by an expression. Returns `false` if it

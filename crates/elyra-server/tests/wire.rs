@@ -568,6 +568,41 @@ async fn create_database_fails_instead_of_succeeding_as_a_noop() {
 }
 
 #[tokio::test]
+async fn conditional_database_ddl_is_a_no_op() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    // Laravel's MigrateCommand, container entrypoints and our own benches ask
+    // for the database to *exist*, not to be new; that is satisfiable here.
+    c.query_drop("CREATE DATABASE IF NOT EXISTS elyra")
+        .await
+        .unwrap();
+    c.query_drop("CREATE SCHEMA IF NOT EXISTS laravel")
+        .await
+        .unwrap();
+    c.query_drop("DROP DATABASE IF EXISTS never_created")
+        .await
+        .unwrap();
+
+    let databases: Vec<String> = c.query("SHOW DATABASES").await.unwrap();
+    assert_eq!(databases, vec!["information_schema", "elyra"]);
+
+    // ... but dropping the database the session is using is not a no-op.
+    let error = c
+        .query_drop("DROP DATABASE IF EXISTS elyra")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, mysql_async::Error::Server(error) if error.code == 1235),
+        "dropping the live database must fail even with IF EXISTS"
+    );
+
+    // The connection is still usable after each refusal.
+    let one: Option<i32> = c.query_first("SELECT 1").await.unwrap();
+    assert_eq!(one, Some(1));
+}
+
+#[tokio::test]
 async fn alter_change_and_modify_accept_collation() {
     let srv = TestServer::start().await;
     let mut c = srv.conn().await;
