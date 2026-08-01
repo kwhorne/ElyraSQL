@@ -35,6 +35,49 @@ async fn literals_and_arithmetic() {
 }
 
 #[tokio::test]
+async fn mysql_dump_literals_remain_exact() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop(
+        "CREATE TABLE literal_matrix (
+            id INT PRIMARY KEY,
+            amount DECIMAL(30,10) NOT NULL,
+            payload VARBINARY(16) NOT NULL,
+            email VARCHAR(255) NOT NULL
+        )",
+    )
+    .await
+    .unwrap();
+    c.query_drop(
+        "INSERT INTO literal_matrix VALUES
+         (1, -170812946.3720907892, X'00AF10', 'otilia@example.com')",
+    )
+    .await
+    .unwrap();
+
+    let row: (String, Vec<u8>, String) = c
+        .query_first("SELECT amount, payload, email FROM literal_matrix WHERE id = 1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.0, "-170812946.3720907892");
+    assert_eq!(row.1, vec![0x00, 0xaf, 0x10]);
+    assert_eq!(row.2, "otilia@example.com");
+
+    let odd_0x: Vec<u8> = c.query_first("SELECT 0xF").await.unwrap().unwrap();
+    assert_eq!(odd_0x, vec![0x0f]);
+    assert!(c.query_drop("SELECT X'F'").await.is_err());
+
+    assert!(c
+        .query_drop("SELECT 17014118346046923173168730371588410572.7 + 0.1")
+        .await
+        .is_err());
+    let still_connected: i64 = c.query_first("SELECT 1").await.unwrap().unwrap();
+    assert_eq!(still_connected, 1);
+}
+
+#[tokio::test]
 async fn ddl_dml_roundtrip() {
     let srv = TestServer::start().await;
     let mut c = srv.conn().await;
