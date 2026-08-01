@@ -6776,6 +6776,59 @@ fn range_bounds(def: &TableDef, filter: Option<&Expr>) -> Result<Option<RangeQue
 }
 
 /// `col OP literal` (or `literal OP col`) -> `(col, op-relative-to-col, value)`.
+/// Where a coerced literal landed relative to the literal the query actually
+/// wrote. `None` when the two are not numerically comparable, in which case the
+/// caller must treat the coercion as exact (text/date/enum coercions, which are
+/// value-preserving in a way this check cannot see).
+fn numeric_rounding(original: &Value, coerced: &Value) -> Option<std::cmp::Ordering> {
+    if !matches!(original, Value::Float(_) | Value::Decimal(..)) {
+        return None;
+    }
+    coerced.compare(original)
+}
+
+/// Whether coercing the literal to the column's type preserved its value, so an
+/// index seek on the coerced key answers the same question the query asked.
+fn coercion_is_exact(original: &Value, coerced: &Value) -> bool {
+    !matches!(
+        numeric_rounding(original, coerced),
+        Some(std::cmp::Ordering::Less | std::cmp::Ordering::Greater)
+    )
+}
+
+/// Move a range bound into the column's domain without changing which rows it
+/// selects.
+///
+/// A bound literal is *compared*, not stored, so it must not be rounded the way
+/// an INSERT value is: on an `INT` key, `k > 1024.5` means `k >= 1025`, and
+/// rounding the bound to 1025 while keeping the strict `>` silently drops row
+/// 1025. When coercion moved the value, the bound's inclusivity is flipped to
+/// compensate. That is exact rather than approximate: coercion rounds to the
+/// *nearest* value the column can hold, so no representable value lies strictly
+/// between the literal and its coerced form.
+fn adjust_bound_op(
+    op: &sqlparser::ast::BinaryOperator,
+    original: &Value,
+    coerced: &Value,
+) -> sqlparser::ast::BinaryOperator {
+    use sqlparser::ast::BinaryOperator::*;
+    use std::cmp::Ordering;
+    match numeric_rounding(original, coerced) {
+        // Rounded up: `col > lit` and `col >= lit` are both `col >= coerced`,
+        // while `col < lit` and `col <= lit` are both `col < coerced`.
+        Some(Ordering::Greater) => match op {
+            Gt | GtEq => GtEq,
+            _ => Lt,
+        },
+        // Rounded down: the mirror image.
+        Some(Ordering::Less) => match op {
+            Gt | GtEq => Gt,
+            _ => LtEq,
+        },
+        _ => op.clone(),
+    }
+}
+
 fn as_range(
     def: &TableDef,
     expr: &Expr,
@@ -6793,20 +6846,21 @@ fn as_range(
             .iter()
             .position(|c| c.name.eq_ignore_ascii_case(n))
     };
-    let coerce_col = |col: usize, v: Value| {
+    let coerce_col = |col: usize, v: &Value| {
         let c = &def.schema.columns[col];
-        coerce(v, &c.ty, &c.name).ok()
+        coerce(v.clone(), &c.ty, &c.name).ok()
     };
     if let Some(col) = ident_name(left).and_then(col_of) {
         if let Ok(v) = eval_expr(right) {
-            if let Some(cv) = coerce_col(col, v) {
-                return Ok(Some((col, op.clone(), cv)));
+            if let Some(cv) = coerce_col(col, &v) {
+                let op = adjust_bound_op(op, &v, &cv);
+                return Ok(Some((col, op, cv)));
             }
         }
     }
     if let Some(col) = ident_name(right).and_then(col_of) {
         if let Ok(v) = eval_expr(left) {
-            if let Some(cv) = coerce_col(col, v) {
+            if let Some(cv) = coerce_col(col, &v) {
                 let flipped = match op {
                     Gt => Lt,
                     GtEq => LtEq,
@@ -6814,7 +6868,8 @@ fn as_range(
                     LtEq => GtEq,
                     _ => unreachable!(),
                 };
-                return Ok(Some((col, flipped, cv)));
+                let op = adjust_bound_op(&flipped, &v, &cv);
+                return Ok(Some((col, op, cv)));
             }
         }
     }
@@ -6842,8 +6897,19 @@ fn as_between(def: &TableDef, expr: &Expr) -> Result<Option<(usize, Value, Value
     };
     let c = &def.schema.columns[col];
     match (eval_expr(low), eval_expr(high)) {
-        (Ok(lo), Ok(hi)) => match (coerce(lo, &c.ty, &c.name), coerce(hi, &c.ty, &c.name)) {
-            (Ok(lo), Ok(hi)) => Ok(Some((col, lo, hi))),
+        (Ok(lo), Ok(hi)) => match (
+            coerce(lo.clone(), &c.ty, &c.name),
+            coerce(hi.clone(), &c.ty, &c.name),
+        ) {
+            // BETWEEN's bounds are inclusive on both ends and there is nowhere to
+            // record a flipped inclusivity, so a bound that coercion moved falls
+            // back to a scan (which re-applies the filter exactly) rather than
+            // shifting the range by one row.
+            (Ok(lo_c), Ok(hi_c))
+                if coercion_is_exact(&lo, &lo_c) && coercion_is_exact(&hi, &hi_c) =>
+            {
+                Ok(Some((col, lo_c, hi_c)))
+            }
             _ => Ok(None),
         },
         _ => Ok(None),
@@ -8309,9 +8375,13 @@ fn eq_col_literal(def: &TableDef, filter: Option<&Expr>) -> Result<Option<(usize
     // Coerce the literal to the column's type so index/PK key encoding matches
     // the stored entries (e.g. a DATE column vs a '2024-01-01' text literal).
     let col = &def.schema.columns[idx];
-    match coerce(eval_expr(lit_expr)?, &col.ty, &col.name) {
-        Ok(v) if !v.is_null() => Ok(Some((idx, v))),
-        Ok(_) | Err(_) => Ok(None),
+    let original = eval_expr(lit_expr)?;
+    match coerce(original.clone(), &col.ty, &col.name) {
+        // A literal the column cannot hold exactly (`k = 1024.5` on an INT key)
+        // matches nothing; seeking the rounded key would match the wrong row, so
+        // the lookup is declined and the scan's filter answers it.
+        Ok(v) if !v.is_null() && coercion_is_exact(&original, &v) => Ok(Some((idx, v))),
+        _ => Ok(None),
     }
 }
 
@@ -8386,8 +8456,14 @@ fn in_list_lookup(def: &TableDef, filter: Option<&Expr>) -> Result<Option<(usize
                 // of a non-match, which the residual filter re-applies -- so it can
                 // be skipped for lookup purposes.
                 Some(v) if v.is_null() => {}
-                Some(v) => match coerce(v, &coldef.ty, &coldef.name) {
-                    Ok(c) => vals.push(c),
+                Some(v) => match coerce(v.clone(), &coldef.ty, &coldef.name) {
+                    // As for `=`: a rounded key would match a row the literal does
+                    // not, so an inexact member sends the whole list to a scan.
+                    Ok(c) if coercion_is_exact(&v, &c) => vals.push(c),
+                    Ok(_) => {
+                        usable = false;
+                        break;
+                    }
                     // Not representable in the column's type: fall back to a scan
                     // rather than guess at the comparison semantics.
                     Err(_) => {

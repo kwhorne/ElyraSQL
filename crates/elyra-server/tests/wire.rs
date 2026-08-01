@@ -567,6 +567,60 @@ async fn create_database_fails_instead_of_succeeding_as_a_noop() {
     );
 }
 
+/// A fractional literal compared against an integer key is a *comparison*, not a
+/// value to store, so it must not be rounded into the key's domain: `k > 1024.5`
+/// means `k >= 1025`, and `k = 1024.5` matches nothing. Every answer below was
+/// verified against MySQL 8.4 on the same data.
+#[tokio::test]
+async fn fractional_bounds_on_an_integer_key_match_mysql() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop("CREATE TABLE frac (k INT PRIMARY KEY, s INT)")
+        .await
+        .unwrap();
+    let rows: Vec<String> = (-8..=2048).map(|i| format!("({i},{i})")).collect();
+    for chunk in rows.chunks(500) {
+        c.query_drop(format!("INSERT INTO frac VALUES {}", chunk.join(",")))
+            .await
+            .unwrap();
+    }
+    c.query_drop("CREATE INDEX ix_frac_s ON frac (s)")
+        .await
+        .unwrap();
+
+    for (sql, expected) in [
+        // The bound sits between two keys: strictness must not shift by one row.
+        ("SELECT COUNT(*) FROM frac WHERE k > 1024.5", 1024),
+        ("SELECT COUNT(*) FROM frac WHERE k >= 1024.5", 1024),
+        ("SELECT COUNT(*) FROM frac WHERE k < 1024.5", 1033),
+        ("SELECT COUNT(*) FROM frac WHERE k <= 1024.5", 1033),
+        // Reversed operands, and a secondary index rather than the PK.
+        ("SELECT COUNT(*) FROM frac WHERE 1024.5 < k", 1024),
+        ("SELECT COUNT(*) FROM frac WHERE s > 1024.5", 1024),
+        // Negative bounds round away from zero, so the direction matters there too.
+        ("SELECT COUNT(*) FROM frac WHERE k > -3.5", 2052),
+        ("SELECT COUNT(*) FROM frac WHERE k < -3.5", 5),
+        // No integer equals a fractional literal -- via `=`, `IN` or `BETWEEN`.
+        ("SELECT COUNT(*) FROM frac WHERE k = 1024.5", 0),
+        ("SELECT COUNT(*) FROM frac WHERE s = 1024.5", 0),
+        ("SELECT COUNT(*) FROM frac WHERE k IN (1024.5, 7)", 1),
+        (
+            "SELECT COUNT(*) FROM frac WHERE k BETWEEN 1024.5 AND 2048.5",
+            1024,
+        ),
+        // Exact bounds keep their existing meaning.
+        ("SELECT COUNT(*) FROM frac WHERE k > 1024", 1024),
+        (
+            "SELECT COUNT(*) FROM frac WHERE k BETWEEN 1025 AND 2048",
+            1024,
+        ),
+    ] {
+        let got: Option<i64> = c.query_first(sql).await.unwrap();
+        assert_eq!(got, Some(expected), "{sql}");
+    }
+}
+
 #[tokio::test]
 async fn conditional_database_ddl_is_a_no_op() {
     let srv = TestServer::start().await;
