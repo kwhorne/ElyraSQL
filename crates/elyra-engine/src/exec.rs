@@ -9,7 +9,8 @@ use sqlparser::ast::{
     AlterColumnOperation, AlterTableOperation, Assignment, AssignmentTarget, ColumnOption,
     CreateIndex, CreateTable, DataType, Delete, FromTable, Ident, Insert, JoinConstraint,
     JoinOperator, ObjectName, OrderByExpr, Query as SqlQuery, Select, SetExpr, Statement,
-    TableConstraint, TableFactor, TableWithJoins, Visit, VisitMut, Visitor, VisitorMut,
+    TableAlias, TableAliasColumnDef, TableConstraint, TableFactor, TableWithJoins, Visit, VisitMut,
+    Visitor, VisitorMut, With,
 };
 use std::ops::ControlFlow;
 
@@ -4061,6 +4062,7 @@ async fn select_inner(
     // Expand CTEs (WITH ...) into derived tables, then execute. Recursive CTEs
     // take a fixpoint-materialisation path via temporary relations.
     if let Some(w) = &query.with {
+        validate_unique_cte_names(w)?;
         if w.recursive {
             guard_cte_ast_complexity(query)?;
             return Box::pin(execute_recursive_cte(db, vindex, query)).await;
@@ -7210,13 +7212,25 @@ async fn load_relation(
     }
 
     // Derived table: materialise the subquery and qualify its columns.
-    if let TableFactor::Derived { subquery, .. } = tf {
+    if let TableFactor::Derived {
+        subquery,
+        alias: Some(alias),
+        ..
+    } = tf
+    {
         let qualifier = factor_qualifier_object(db, tf).ok_or_else(|| {
             Error::Query("a derived table (FROM (SELECT ...)) needs an alias".into())
         })?;
         let (schema, rows) = run_subquery_schema(db, vindex, subquery).await?;
+        let schema = apply_col_aliases(schema, &alias_column_names(alias))?;
         let cols = qualify_columns(&schema, &qualifier);
         return Ok((cols, rows));
+    }
+
+    if matches!(tf, TableFactor::Derived { .. }) {
+        return Err(Error::Query(
+            "a derived table (FROM (SELECT ...)) needs an alias".into(),
+        ));
     }
 
     let (def, cols) = resolve_table(db, tf).await?;
@@ -12056,6 +12070,7 @@ impl<T> CteScope<T> {
 #[derive(Clone)]
 struct InlineCte {
     query: std::rc::Rc<SqlQuery>,
+    columns: Vec<TableAliasColumnDef>,
     cost: CteExpansionCost,
 }
 
@@ -12148,6 +12163,24 @@ impl CteExpansionCost {
     }
 }
 
+fn validate_unique_cte_names(with: &With) -> Result<()> {
+    for (index, cte) in with.cte_tables.iter().enumerate() {
+        if with.cte_tables[..index].iter().any(|prior| {
+            prior
+                .alias
+                .name
+                .value
+                .eq_ignore_ascii_case(&cte.alias.name.value)
+        }) {
+            return Err(Error::Query(format!(
+                "duplicate CTE name: {}",
+                cte.alias.name.value
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Expand every non-recursive `WITH` visible from `query`, inlining CTEs as
 /// derived tables at every relation reference in the query tree. A scope stack
 /// keeps nested `WITH` names lexical, and each CTE body is expanded only against
@@ -12194,6 +12227,11 @@ impl VisitorMut for InlineCteExpander {
     type Break = Error;
 
     fn pre_visit_query(&mut self, query: &mut SqlQuery) -> ControlFlow<Self::Break> {
+        if let Some(with) = &query.with {
+            if let Err(error) = validate_unique_cte_names(with) {
+                return ControlFlow::Break(error);
+            }
+        }
         let mut scope = self.scopes.last().cloned().unwrap_or_default();
         let mut saved_with = None;
         if let Some(mut with) = query.with.take() {
@@ -12223,6 +12261,7 @@ impl VisitorMut for InlineCteExpander {
                         cte.alias.name.value,
                         InlineCte {
                             query: std::rc::Rc::new(body),
+                            columns: cte.alias.columns,
                             cost,
                         },
                     );
@@ -12260,10 +12299,13 @@ impl VisitorMut for InlineCteExpander {
         if let Err(error) = self.cost.include(body.cost) {
             return ControlFlow::Break(error);
         }
-        let alias = alias.clone().unwrap_or_else(|| sqlparser::ast::TableAlias {
+        let mut alias = alias.clone().unwrap_or_else(|| TableAlias {
             name: sqlparser::ast::Ident::new(cte_name.clone()),
             columns: Vec::new(),
         });
+        if alias.columns.is_empty() {
+            alias.columns.clone_from(&body.columns);
+        }
         *table_factor = TableFactor::Derived {
             lateral: false,
             subquery: Box::new(body.query.as_ref().clone()),
@@ -13218,6 +13260,9 @@ async fn execute_recursive_cte(
         for cte in &with.cte_tables {
             let cname = cte.alias.name.value.clone();
             let temp = unique_temp_name(&cname);
+            // Register before any fallible materialisation so a partially
+            // created internal relation is always removed on the error path.
+            created.push(temp.clone());
             // Rewrite references to earlier CTEs in this body.
             let body = rewrite_table_refs((*cte.query).clone(), &temp_names);
             let alias_cols: Vec<String> = cte
@@ -13231,11 +13276,10 @@ async fn execute_recursive_cte(
                 materialize_recursive(db, vindex, &temp, &cname, &body, &alias_cols).await?;
             } else {
                 let (schema, rows) = run_subquery_schema(db, vindex, &body).await?;
-                let schema = apply_col_aliases(schema, &alias_cols);
+                let schema = apply_col_aliases(schema, &alias_cols)?;
                 create_temp_table(db, &temp, &schema).await?;
                 fill_table(db, &temp, &schema, &rows).await?;
             }
-            created.push(temp.clone());
             temp_names.insert(cname.to_ascii_lowercase(), temp);
         }
 
@@ -13269,7 +13313,7 @@ async fn materialize_recursive(
     let (distinct, anchor_q, rec_q) = split_recursive(body, cname)?;
 
     let (schema, anchor_rows) = run_subquery_schema(db, vindex, &anchor_q).await?;
-    let schema = apply_col_aliases(schema, alias_cols);
+    let schema = apply_col_aliases(schema, alias_cols)?;
     create_temp_table(db, temp, &schema).await?;
 
     let row_key = |r: &[Value]| -> Vec<u8> { Value::row_collation_key(r) };
@@ -13349,8 +13393,14 @@ fn split_recursive(body: &SqlQuery, cname: &str) -> Result<(bool, SqlQuery, SqlQ
     let left_rec = setexpr_refs_table(left, cname);
     let right_rec = setexpr_refs_table(right, cname);
     match (left_rec, right_rec) {
-        (false, true) => Ok((distinct, wrap(left), wrap(right))),
-        (true, false) => Ok((distinct, wrap(right), wrap(left))),
+        (false, true) => {
+            validate_recursive_table_reference(right, cname)?;
+            Ok((distinct, wrap(left), wrap(right)))
+        }
+        (true, false) => {
+            validate_recursive_table_reference(left, cname)?;
+            Ok((distinct, wrap(right), wrap(left)))
+        }
         _ => Err(Error::Unsupported(
             "recursive CTE must have exactly one self-referencing branch".into(),
         )),
@@ -13379,7 +13429,7 @@ fn query_refs_table(query: &SqlQuery, name: &str) -> bool {
 }
 
 fn setexpr_refs_table(body: &SetExpr, name: &str) -> bool {
-    refs_table(body, name)
+    refs_table_count(body, name) != 0
 }
 
 struct TempTableRewriter {
@@ -13448,26 +13498,30 @@ impl VisitorMut for TempTableRewriter {
 }
 
 fn refs_table<T: VisitMut + Clone>(node: &T, name: &str) -> bool {
+    refs_table_count(node, name) != 0
+}
+
+fn refs_table_count<T: VisitMut + Clone>(node: &T, name: &str) -> usize {
     let mut node = node.clone();
-    let mut finder = TableRefFinder {
+    let mut counter = TableRefCounter {
         name,
         shadowed: vec![false],
         saved_with: Vec::new(),
+        count: 0,
     };
-    matches!(
-        VisitMut::visit(&mut node, &mut finder),
-        ControlFlow::Break(())
-    )
+    let _ = VisitMut::visit(&mut node, &mut counter);
+    counter.count
 }
 
-struct TableRefFinder<'a> {
+struct TableRefCounter<'a> {
     name: &'a str,
     shadowed: Vec<bool>,
     saved_with: Vec<Option<sqlparser::ast::With>>,
+    count: usize,
 }
 
-impl VisitorMut for TableRefFinder<'_> {
-    type Break = ();
+impl VisitorMut for TableRefCounter<'_> {
+    type Break = std::convert::Infallible;
 
     fn pre_visit_query(&mut self, query: &mut SqlQuery) -> ControlFlow<Self::Break> {
         let mut shadowed = self.shadowed.last().copied().unwrap_or(false);
@@ -13481,13 +13535,10 @@ impl VisitorMut for TableRefFinder<'_> {
                     name: self.name,
                     shadowed: vec![shadowed],
                     saved_with: Vec::new(),
+                    count: 0,
                 };
-                if matches!(
-                    VisitMut::visit(cte.query.as_mut(), &mut nested),
-                    ControlFlow::Break(())
-                ) {
-                    return ControlFlow::Break(());
-                }
+                let _ = VisitMut::visit(cte.query.as_mut(), &mut nested);
+                self.count = self.count.saturating_add(nested.count);
                 if !with.recursive && cte.alias.name.value.eq_ignore_ascii_case(self.name) {
                     shadowed = true;
                 }
@@ -13515,20 +13566,91 @@ impl VisitorMut for TableRefFinder<'_> {
             TableFactor::Table {
                 name, args: None, ..
             } if name.0.len() == 1 && name.0[0].value.eq_ignore_ascii_case(self.name) => {
-                ControlFlow::Break(())
+                self.count = self.count.saturating_add(1);
+                ControlFlow::Continue(())
             }
             _ => ControlFlow::Continue(()),
         }
     }
 }
 
-fn apply_col_aliases(mut schema: Schema, alias_cols: &[String]) -> Schema {
-    if !alias_cols.is_empty() {
-        for (col, new) in schema.columns.iter_mut().zip(alias_cols.iter()) {
-            col.name = new.clone();
-        }
+fn validate_recursive_table_reference(body: &SetExpr, name: &str) -> Result<()> {
+    let total = refs_table_count(body, name);
+    if total != 1 {
+        return Err(Error::Unsupported(format!(
+            "recursive table '{name}' must be referenced exactly once"
+        )));
     }
-    schema
+    if direct_table_ref_count(body, name) != 1 {
+        return Err(Error::Unsupported(format!(
+            "recursive table '{name}' must not be referenced in a subquery"
+        )));
+    }
+    Ok(())
+}
+
+fn direct_table_ref_count(body: &SetExpr, name: &str) -> usize {
+    let SetExpr::Select(select) = body else {
+        return 0;
+    };
+    select
+        .from
+        .iter()
+        .map(|table| {
+            direct_factor_ref_count(&table.relation, name)
+                + table
+                    .joins
+                    .iter()
+                    .map(|join| direct_factor_ref_count(&join.relation, name))
+                    .sum::<usize>()
+        })
+        .sum()
+}
+
+fn direct_factor_ref_count(factor: &TableFactor, name: &str) -> usize {
+    match factor {
+        TableFactor::Table {
+            name: relation,
+            args: None,
+            ..
+        } if relation.0.len() == 1 && relation.0[0].value.eq_ignore_ascii_case(name) => 1,
+        TableFactor::NestedJoin {
+            table_with_joins, ..
+        } => {
+            direct_factor_ref_count(&table_with_joins.relation, name)
+                + table_with_joins
+                    .joins
+                    .iter()
+                    .map(|join| direct_factor_ref_count(&join.relation, name))
+                    .sum::<usize>()
+        }
+        _ => 0,
+    }
+}
+
+fn alias_column_names(alias: &TableAlias) -> Vec<String> {
+    alias
+        .columns
+        .iter()
+        .map(|column| column.name.value.clone())
+        .collect()
+}
+
+fn apply_col_aliases(mut schema: Schema, alias_cols: &[String]) -> Result<Schema> {
+    if alias_cols.is_empty() {
+        return Ok(schema);
+    }
+    if alias_cols.len() != schema.columns.len() {
+        return Err(Error::Query(format!(
+            "column alias count {} does not match query column count {}",
+            alias_cols.len(),
+            schema.columns.len()
+        )));
+    }
+    for (column, alias) in schema.columns.iter_mut().zip(alias_cols) {
+        column.name.clone_from(alias);
+    }
+    Ok(schema)
 }
 
 async fn create_temp_table(db: &Session, name: &str, schema: &Schema) -> Result<()> {
@@ -14172,7 +14294,7 @@ struct DerivedQueryLayer<'a> {
     query: &'a SqlQuery,
     select: &'a Select,
     subquery: &'a SqlQuery,
-    input_alias: &'a Ident,
+    input_alias: &'a TableAlias,
     group_by: &'a [Expr],
 }
 
@@ -14243,7 +14365,7 @@ fn derived_query_layer(query: &SqlQuery) -> Option<DerivedQueryLayer<'_>> {
         query,
         select,
         subquery,
-        input_alias: &alias.name,
+        input_alias: alias,
         group_by,
     })
 }
@@ -14270,8 +14392,10 @@ async fn run_derived_query_chain(
     let (mut schema, mut rows) =
         materialize_query_result(Box::pin(select(db, vindex, current)).await?).await?;
     for layer in layers.into_iter().rev() {
-        let input_qualifier = canonical_relation_qualifier(db, None, layer.input_alias);
-        let input_schema = Schema::new(qualify_columns(&schema, &input_qualifier));
+        let input_qualifier = canonical_relation_qualifier(db, None, &layer.input_alias.name);
+        let aliased_schema =
+            apply_col_aliases(schema.clone(), &alias_column_names(layer.input_alias))?;
+        let input_schema = Schema::new(qualify_columns(&aliased_schema, &input_qualifier));
         let order_exprs: Vec<(Expr, bool)> = match &layer.query.order_by {
             Some(order_by) => order_by
                 .exprs
@@ -17167,7 +17291,11 @@ mod cte_rewrite_tests {
         (engine, session)
     }
 
-    async fn rows(engine: &Engine, session: &Session, sql: &str) -> Vec<Vec<Value>> {
+    async fn schema_and_rows(
+        engine: &Engine,
+        session: &Session,
+        sql: &str,
+    ) -> (elyra_core::Schema, Vec<Vec<Value>>) {
         let mut outcomes = engine
             .execute(sql, Privilege::Admin, session)
             .await
@@ -17176,14 +17304,146 @@ mod cte_rewrite_tests {
         let QueryResult::Rows(mut stream) = outcomes.remove(0) else {
             panic!("expected rows for `{sql}`");
         };
+        let schema = stream.schema.clone();
         let mut result = Vec::new();
         loop {
             let batch = stream.next_batch(128).await.unwrap();
             if batch.is_empty() {
-                return result;
+                return (schema, result);
             }
             result.extend(batch);
         }
+    }
+
+    async fn rows(engine: &Engine, session: &Session, sql: &str) -> Vec<Vec<Value>> {
+        schema_and_rows(engine, session, sql).await.1
+    }
+
+    #[tokio::test]
+    async fn cte_column_aliases_survive_nested_scalar_derived_and_set_inlining() {
+        let (engine, session) = engine_and_session();
+
+        for sql in [
+            "WITH c(renamed) AS (SELECT 7 AS original), \
+                  nested AS (SELECT renamed FROM c) \
+             SELECT renamed FROM nested",
+            "WITH c(renamed) AS (SELECT 7 AS original) \
+             SELECT (SELECT renamed FROM c)",
+            "WITH c(renamed) AS (SELECT 7 AS original) \
+             SELECT derived.renamed FROM (SELECT renamed FROM c) AS derived",
+            "WITH c(renamed) AS (SELECT 7 AS original) \
+             SELECT renamed FROM c UNION ALL SELECT 8 ORDER BY renamed",
+        ] {
+            let expected = if sql.contains("UNION ALL") {
+                vec![vec![Value::Int(7)], vec![Value::Int(8)]]
+            } else {
+                vec![vec![Value::Int(7)]]
+            };
+            assert_eq!(rows(&engine, &session, sql).await, expected, "{sql}");
+        }
+    }
+
+    #[tokio::test]
+    async fn cte_column_aliases_drive_join_resolution_and_result_metadata() {
+        let (engine, session) = engine_and_session();
+        engine
+            .execute(
+                "CREATE TABLE cte_alias_right (join_key INT, right_payload INT)",
+                Privilege::Admin,
+                &session,
+            )
+            .await
+            .unwrap();
+        engine
+            .execute(
+                "INSERT INTO cte_alias_right VALUES (1, 11)",
+                Privilege::Admin,
+                &session,
+            )
+            .await
+            .unwrap();
+
+        let (schema, result) = schema_and_rows(
+            &engine,
+            &session,
+            "WITH c(join_key, left_payload) AS (SELECT 1 AS old_key, 7 AS old_payload) \
+             SELECT c.join_key, c.left_payload, r.right_payload \
+             FROM c JOIN cte_alias_right AS r USING (join_key)",
+        )
+        .await;
+        assert_eq!(
+            schema
+                .columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            ["join_key", "left_payload", "right_payload"]
+        );
+        assert_eq!(schema.tables, ["c", "c", "r"]);
+        assert_eq!(
+            result,
+            vec![vec![Value::Int(1), Value::Int(7), Value::Int(11)]]
+        );
+    }
+
+    #[tokio::test]
+    async fn nonrecursive_cte_column_alias_width_must_match_the_query() {
+        let (engine, session) = engine_and_session();
+
+        for sql in [
+            "WITH c(only_one) AS (SELECT 1, 2) SELECT * FROM c",
+            "WITH c(one, too_many) AS (SELECT 1) SELECT * FROM c",
+        ] {
+            let Err(error) = engine.execute(sql, Privilege::Admin, &session).await else {
+                panic!("mismatched CTE column aliases unexpectedly succeeded")
+            };
+            assert!(error.to_string().contains("column alias count"), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn recursive_cte_column_alias_width_must_match_the_query() {
+        let (engine, session) = engine_and_session();
+
+        for sql in [
+            "WITH RECURSIVE seq(only_one) AS (\
+                 SELECT 1, 2 UNION ALL SELECT only_one + 1, 2 FROM seq WHERE only_one < 2\
+             ) SELECT * FROM seq",
+            "WITH RECURSIVE seq(one, too_many) AS (\
+                 SELECT 1 UNION ALL SELECT one + 1 FROM seq WHERE one < 2\
+             ) SELECT * FROM seq",
+        ] {
+            let Err(error) = engine.execute(sql, Privilege::Admin, &session).await else {
+                panic!("mismatched recursive CTE aliases unexpectedly succeeded")
+            };
+            assert!(error.to_string().contains("column alias count"), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_cte_names_are_rejected_only_within_the_same_scope() {
+        let (engine, session) = engine_and_session();
+
+        for sql in [
+            "WITH c AS (SELECT 1), C AS (SELECT 2) SELECT * FROM c",
+            "WITH RECURSIVE c(n) AS (SELECT 1), C(n) AS (SELECT 2) SELECT * FROM c",
+        ] {
+            let Err(error) = engine.execute(sql, Privilege::Admin, &session).await else {
+                panic!("case-insensitive duplicate CTE unexpectedly succeeded")
+            };
+            assert!(error.to_string().contains("duplicate CTE name"), "{error}");
+        }
+
+        assert_eq!(
+            rows(
+                &engine,
+                &session,
+                "WITH c(n) AS (SELECT 1) \
+                 SELECT nested.n FROM (WITH C(n) AS (SELECT 2) SELECT n FROM C) AS nested",
+            )
+            .await,
+            vec![vec![Value::Int(2)]]
+        );
     }
 
     #[tokio::test]
@@ -17312,7 +17572,7 @@ mod cte_rewrite_tests {
     }
 
     #[tokio::test]
-    async fn recursive_self_references_work_through_derived_and_scalar_subqueries() {
+    async fn recursive_table_reference_must_be_direct_and_unique() {
         let (engine, session) = engine_and_session();
 
         assert_eq!(
@@ -17320,8 +17580,7 @@ mod cte_rewrite_tests {
                 &engine,
                 &session,
                 "WITH RECURSIVE seq(n) AS (\
-                     SELECT 1 UNION ALL \
-                     SELECT prior.n + 1 FROM (SELECT n FROM seq) AS prior WHERE prior.n < 3\
+                     SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 3\
                  ) SELECT n FROM seq ORDER BY n",
             )
             .await,
@@ -17331,22 +17590,28 @@ mod cte_rewrite_tests {
                 vec![Value::Int(3)]
             ]
         );
-        assert_eq!(
-            rows(
-                &engine,
-                &session,
-                "WITH RECURSIVE seq(n) AS (\
-                     SELECT 1 UNION ALL \
-                     SELECT (SELECT n + 1 FROM seq) WHERE (SELECT n FROM seq) < 3\
-                 ) SELECT n FROM seq ORDER BY n",
-            )
-            .await,
-            vec![
-                vec![Value::Int(1)],
-                vec![Value::Int(2)],
-                vec![Value::Int(3)]
-            ]
-        );
+        for sql in [
+            "WITH RECURSIVE seq(n) AS (\
+                 SELECT 1 UNION ALL \
+                 SELECT prior.n + 1 FROM (SELECT n FROM seq) AS prior WHERE prior.n < 3\
+             ) SELECT n FROM seq",
+            "WITH RECURSIVE seq(n) AS (\
+                 SELECT 1 UNION ALL SELECT (SELECT n + 1 FROM seq)\
+             ) SELECT n FROM seq",
+            "WITH RECURSIVE seq(n) AS (\
+                 SELECT 1 UNION ALL \
+                 SELECT left_seq.n + 1 FROM seq AS left_seq JOIN seq AS right_seq \
+                 ON left_seq.n = right_seq.n WHERE left_seq.n < 3\
+             ) SELECT n FROM seq",
+        ] {
+            let Err(error) = engine.execute(sql, Privilege::Admin, &session).await else {
+                panic!("invalid recursive table placement unexpectedly succeeded")
+            };
+            assert!(
+                error.to_string().contains("recursive table"),
+                "unexpected error for `{sql}`: {error}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -17464,6 +17729,46 @@ mod cte_rewrite_tests {
             .await;
 
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn failed_recursive_cte_materialization_cleans_up_internal_tables() {
+        let (engine, session) = engine_and_session();
+        let result = engine
+            .execute(
+                "WITH RECURSIVE cleanup_seq(n) AS (\
+                     SELECT 1 UNION ALL \
+                     SELECT missing_column FROM cleanup_seq WHERE n < 2\
+                 ) SELECT n FROM cleanup_seq",
+                Privilege::Admin,
+                &session,
+            )
+            .await;
+        assert!(result.is_err());
+
+        let internal_catalog_rows = session
+            .scan_batch(b"catalog::__cte_".to_vec(), None, 128)
+            .await
+            .unwrap();
+        assert!(
+            internal_catalog_rows.is_empty(),
+            "failed recursive CTE leaked internal catalog rows"
+        );
+        assert_eq!(
+            rows(
+                &engine,
+                &session,
+                "WITH RECURSIVE cleanup_seq(n) AS (\
+                     SELECT 1 UNION ALL SELECT n + 1 FROM cleanup_seq WHERE n < 2\
+                 ) SELECT n FROM cleanup_seq ORDER BY n",
+            )
+            .await,
+            vec![vec![Value::Int(1)], vec![Value::Int(2)]]
+        );
+        assert_eq!(
+            rows(&engine, &session, "SELECT 42").await,
+            vec![vec![Value::Int(42)]]
+        );
     }
 
     #[tokio::test]
