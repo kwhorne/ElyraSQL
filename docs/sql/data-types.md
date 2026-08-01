@@ -2,7 +2,8 @@
 
 | Type | Aliases accepted | Stored as | Notes |
 |------|------------------|-----------|-------|
-| `BIGINT` | `INT`, `INTEGER`, `SMALLINT`, `TINYINT` | 64-bit signed | |
+| `BIGINT` | `INT`, `INTEGER`, `SMALLINT`, `TINYINT`, `MEDIUMINT` | 64-bit signed | width is advisory, see below |
+| `BIGINT UNSIGNED` | the `UNSIGNED` form of any of the above | 64-bit unsigned | negatives are refused (1264 / `22003`) |
 | `DOUBLE` | `FLOAT`, `REAL` | 64-bit float | |
 | `BOOL` | `BOOLEAN` | boolean | rendered as `0`/`1` |
 | `TEXT` | `VARCHAR`, `CHAR`, `STRING` | UTF-8 string | |
@@ -13,6 +14,33 @@
 | `DECIMAL(p,s)` | `NUMERIC(p,s)` | exact fixed-point | scale preserved |
 | `JSON` | `JSONB` | validated text | structural validation on insert |
 | `VECTOR(n)` | | `n` × float32 | ANN search, see [Vector Search](vector-search.md) |
+
+## Integer widths and `UNSIGNED`
+
+Every integer width is stored as **64 bits**: `TINYINT`, `SMALLINT`, `MEDIUMINT`,
+`INT` and `BIGINT` are the same type here, and the declared width is *advisory*.
+A value that MySQL would reject as too wide for its column is accepted:
+
+```sql
+CREATE TABLE t (a TINYINT);
+INSERT INTO t VALUES (300);   -- ElyraSQL: stored. MySQL: 1264 Out of range
+```
+
+`UNSIGNED` is different: it is a **constraint**, not a width, and it is enforced
+on every integer type. A negative value is refused with MySQL's own error:
+
+```sql
+CREATE TABLE t (a INT UNSIGNED);
+INSERT INTO t VALUES (-1);    -- ERROR 1264 (22003): invalid UNSIGNED value: -1
+```
+
+!!! note "Tables created before 1.8.0"
+
+    Until 1.8.0 only `BIGINT UNSIGNED` was enforced; the narrower unsigned types
+    were stored as signed. A column created by an older version keeps the type it
+    was created with, so it goes on accepting negatives until the table is
+    recreated (or the column re-declared with `ALTER TABLE ... MODIFY`). Newly
+    created tables get the constraint.
 
 ## Literals and coercion
 

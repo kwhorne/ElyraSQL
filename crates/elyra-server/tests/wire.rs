@@ -567,6 +567,88 @@ async fn create_database_fails_instead_of_succeeding_as_a_noop() {
     );
 }
 
+/// `UNSIGNED` is a constraint, not a width. Every integer width is stored as 64
+/// bits here, but the signedness has to be enforced on all of them or the same
+/// schema is enforced inconsistently -- which is what happened while only
+/// `BIGINT UNSIGNED` mapped to the unsigned type.
+#[tokio::test]
+async fn unsigned_is_enforced_on_every_integer_width() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    for (i, ty) in [
+        "TINYINT UNSIGNED",
+        "SMALLINT UNSIGNED",
+        "MEDIUMINT UNSIGNED",
+        "INT UNSIGNED",
+        "INTEGER UNSIGNED",
+        "BIGINT UNSIGNED",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let table = format!("uns_{i}");
+        c.query_drop(format!("CREATE TABLE {table} (a {ty})"))
+            .await
+            .unwrap();
+
+        // MySQL answers 1264 / 22003 for a value the column cannot hold.
+        match c
+            .query_drop(format!("INSERT INTO {table} VALUES (-1)"))
+            .await
+            .unwrap_err()
+        {
+            mysql_async::Error::Server(e) => {
+                assert_eq!(e.code, 1264, "{ty}");
+                assert_eq!(e.state, "22003", "{ty}");
+            }
+            other => panic!("{ty} accepted -1 or failed oddly: {other:?}"),
+        }
+
+        // Non-negative values still store and read back unchanged.
+        c.query_drop(format!("INSERT INTO {table} VALUES (7)"))
+            .await
+            .unwrap();
+        let v: Option<u64> = c
+            .query_first(format!("SELECT a FROM {table}"))
+            .await
+            .unwrap();
+        assert_eq!(v, Some(7), "{ty}");
+
+        // ... and the column advertises itself as unsigned.
+        let ddl: Option<(String, String)> = c
+            .query_first(format!("SHOW CREATE TABLE {table}"))
+            .await
+            .unwrap();
+        assert!(ddl.unwrap().1.contains("UNSIGNED"), "{ty}");
+    }
+
+    // A signed column is unaffected.
+    c.query_drop("CREATE TABLE signed_col (a INT)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO signed_col VALUES (-1)")
+        .await
+        .unwrap();
+    let v: Option<i64> = c.query_first("SELECT a FROM signed_col").await.unwrap();
+    assert_eq!(v, Some(-1));
+
+    // AUTO_INCREMENT over an unsigned key is the shape Laravel generates for
+    // `$table->increments('id')`, so it has to keep working.
+    c.query_drop(
+        "CREATE TABLE uns_ai (id INT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, n INT UNSIGNED)",
+    )
+    .await
+    .unwrap();
+    c.query_drop("INSERT INTO uns_ai (n) VALUES (5),(7)")
+        .await
+        .unwrap();
+    let ids: Vec<u64> = c.query("SELECT id FROM uns_ai ORDER BY id").await.unwrap();
+    assert_eq!(ids, vec![1, 2]);
+    let sum: Option<u64> = c.query_first("SELECT SUM(n) FROM uns_ai").await.unwrap();
+    assert_eq!(sum, Some(12));
+}
+
 /// Result metadata must name the source table. Without it a client cannot tell
 /// the two `id` columns of a join apart: not by name (they collide, exactly as
 /// in MySQL) and not by metadata. Every expectation below was read off MySQL 8.4
