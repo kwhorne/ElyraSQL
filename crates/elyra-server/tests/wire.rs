@@ -1559,6 +1559,27 @@ async fn using_join_coalesces_keys_and_keeps_qualified_access() {
         ]
     );
 
+    let rows: Vec<i64> = c
+        .query(
+            "SELECT id + 0
+             FROM using_l AS l JOIN using_r AS r USING(id)
+             GROUP BY id
+             ORDER BY id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows, [1, 4]);
+    let rows: Vec<i64> = c
+        .query(
+            "SELECT id + COUNT(*)
+             FROM using_l AS l JOIN using_r AS r USING(id)
+             GROUP BY id
+             ORDER BY id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows, [2, 5]);
+
     assert!(c
         .query_drop("SELECT * FROM using_l JOIN using_r USING(missing)")
         .await
@@ -1879,6 +1900,103 @@ async fn using_join_visibility_survives_later_on_and_cross_joins() {
     assert_eq!(names, ["id", "aval", "bval", "id", "cval"]);
     let rows: Vec<(i64, String, String, i64, String)> = result.collect().await.unwrap();
     assert_eq!(rows, [(1, "A1".into(), "B1".into(), 1, "C1".into())]);
+}
+
+#[tokio::test]
+async fn multi_key_using_preserves_sql_coercion_and_collation_semantics() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop("CREATE TABLE typed_l (id INT, code INT, lval VARCHAR(8))")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE typed_r (id VARCHAR(8), code INT, rval VARCHAR(8))")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO typed_l VALUES (5,7,'L5'),(NULL,8,'LN')")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO typed_r VALUES ('5',7,'R5'),(NULL,8,'RN')")
+        .await
+        .unwrap();
+    let rows: Vec<(i64, String, String, String)> = c
+        .query(
+            "SELECT l.id, r.id, l.lval, r.rval
+             FROM typed_l AS l JOIN typed_r AS r USING(id, code)",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows, [(5, "5".into(), "L5".into(), "R5".into())]);
+
+    c.query_drop("CREATE TABLE decimal_l (bucket INT, amount DECIMAL(10,2))")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE decimal_r (bucket INT, amount INT)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO decimal_l VALUES (1,5.00),(2,NULL)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO decimal_r VALUES (1,5),(2,NULL)")
+        .await
+        .unwrap();
+    let count: Option<i64> = c
+        .query_first(
+            "SELECT COUNT(*)
+             FROM decimal_l AS l JOIN decimal_r AS r USING(bucket, amount)",
+        )
+        .await
+        .unwrap();
+    assert_eq!(count, Some(1));
+
+    c.query_drop("CREATE TABLE null_l (id INT, code INT)")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE null_r (id INT, code INT)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO null_l VALUES (NULL,1)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO null_r VALUES (NULL,1)")
+        .await
+        .unwrap();
+    let count: Option<i64> = c
+        .query_first("SELECT COUNT(*) FROM null_l JOIN null_r USING(id, code)")
+        .await
+        .unwrap();
+    assert_eq!(count, Some(0));
+
+    c.query_drop(
+        "CREATE TABLE coll_l (
+             grp INT,
+             label VARCHAR(8) COLLATE utf8mb4_general_ci
+         )",
+    )
+    .await
+    .unwrap();
+    c.query_drop(
+        "CREATE TABLE coll_r (
+             grp INT,
+             label VARCHAR(8) COLLATE utf8mb4_bin
+         )",
+    )
+    .await
+    .unwrap();
+    c.query_drop("INSERT INTO coll_l VALUES (1,'X'),(2,'x')")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO coll_r VALUES (1,'X'),(2,'X')")
+        .await
+        .unwrap();
+    let rows: Vec<(i64, String, String)> = c
+        .query(
+            "SELECT l.grp, l.label, r.label
+             FROM coll_l AS l JOIN coll_r AS r USING(grp, label)",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows, [(1, "X".into(), "X".into())]);
 }
 
 #[tokio::test]

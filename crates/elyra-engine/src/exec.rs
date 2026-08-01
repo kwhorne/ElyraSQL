@@ -8807,7 +8807,9 @@ fn combine(
     // table, and the output stays ordered.
     if matches!(kind, JoinKind::Inner | JoinKind::Left | JoinKind::Right) {
         if let Some(e) = on {
-            if let Some(keys) = equi_key_pairs(e, lschema, rschema) {
+            if let Some(keys) = equi_key_pairs(e, lschema, rschema)
+                .filter(|keys| hash_key_pairs_compatible(keys, lschema, rschema))
+            {
                 const MERGE_MIN: usize = 2048;
                 if let [(lkey, rkey)] = keys.as_slice() {
                     // The merge join compares keys under the default collation,
@@ -9170,6 +9172,43 @@ fn equi_key_pairs(on: &Expr, lschema: &Schema, rschema: &Schema) -> Option<Vec<(
         .iter()
         .map(|conjunct| equi_keys(conjunct, lschema, rschema))
         .collect()
+}
+
+/// Hash only direct-column pairs whose type-tagged keys preserve every equality
+/// that [`Value::compare`] can report. Other pairs retain the general nested
+/// evaluator, including SQL's numeric/text and decimal/integer coercions.
+fn hash_key_pairs_compatible(keys: &[(Expr, Expr)], left: &Schema, right: &Schema) -> bool {
+    keys.iter().all(|(left_key, right_key)| {
+        let Some(left_type) = expr_col_index(left_key, left)
+            .and_then(|index| left.columns.get(index))
+            .map(|column| &column.ty)
+        else {
+            return false;
+        };
+        let Some(right_type) = expr_col_index(right_key, right)
+            .and_then(|index| right.columns.get(index))
+            .map(|column| &column.ty)
+        else {
+            return false;
+        };
+        hash_key_types_compatible(left_type, right_type)
+    })
+}
+
+fn hash_key_types_compatible(left: &ColumnType, right: &ColumnType) -> bool {
+    use ColumnType::{Bool, Bytes, Date, DateTime, Decimal, Int, Json, Text, Time, UInt};
+
+    match (left, right) {
+        (Int | UInt, Int | UInt)
+        | (Bool, Bool)
+        | (Bytes, Bytes)
+        | (Date, Date)
+        | (DateTime, DateTime)
+        | (Time, Time)
+        | (Text | Json, Text | Json) => true,
+        (Decimal(_, left_scale), Decimal(_, right_scale)) => left_scale == right_scale,
+        _ => false,
+    }
 }
 
 /// Split an expression on top-level `AND` into conjuncts.

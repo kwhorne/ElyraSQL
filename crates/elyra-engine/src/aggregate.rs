@@ -631,9 +631,9 @@ pub fn build_plan(
 
     // Evaluation schema for Computed columns: input columns, then one
     // `__agg_i` column per aggregate.
-    let mut eval_cols = schema.columns.clone();
+    let mut eval_schema = schema.clone();
     for (i, t) in agg_types.iter().enumerate() {
-        eval_cols.push(ColumnDef {
+        eval_schema.columns.push(ColumnDef {
             name: format!("__agg_{i}"),
             ty: t.clone(),
             nullable: true,
@@ -669,7 +669,7 @@ pub fn build_plan(
         out_schema: Schema::with_tables(out_cols, out_tables),
         arg_exprs,
         input_schema: schema.clone(),
-        eval_schema: Schema::new(eval_cols),
+        eval_schema,
     })
 }
 
