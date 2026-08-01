@@ -12,7 +12,7 @@ drivers connect without modification.
 - **Authentication** — `mysql_native_password` by **default** (widest driver
   compatibility), with `caching_sha2_password` available opt-in (see below).
 - **TLS** — clients may negotiate SSL.
-- **Handshake** — reports a MySQL-looking version, e.g. `8.0.12-ElyraSQL-1.7.0`,
+- **Handshake** — reports a MySQL-looking version, e.g. `8.0.12-ElyraSQL-1.8.0`,
   and answers the session/introspection queries clients send on connect
   (`SELECT @@version_comment`, `SELECT VERSION()`, `SET ...`,
   `SHOW VARIABLES/STATUS/COLLATION/DATABASES/TABLE STATUS`, and the
@@ -119,10 +119,11 @@ gaps:
   cursors, condition handlers) are supported; user-defined functions and
   scheduled events are not.
 - `ALTER TABLE` supports add/drop/rename/`MODIFY`/`CHANGE` column, rename table,
-  `ADD INDEX`/`KEY`/`UNIQUE` (with backfill) and **`ADD FOREIGN KEY`** (enforced,
-  though `SHOW CREATE TABLE` does not yet echo the constraint back);
+  `ADD INDEX`/`KEY`/`UNIQUE` (with backfill) and **`ADD FOREIGN KEY`**;
   `ADD PRIMARY KEY` on an existing table must instead be declared in
-  `CREATE TABLE`.
+  `CREATE TABLE`. `SHOW CREATE TABLE` echoes `CHECK` and `FOREIGN KEY`
+  constraints (with their referential actions) since 1.8.0, so its output can be
+  replayed without losing them.
 - A broad scalar function library (string, math, date/time, JSON, `MD5`/`SHA1`/
   `SHA2`, `HEX`/`UNHEX`, `FORMAT`, `FIND_IN_SET`, `FROM_UNIXTIME`, ...),
   statistical and bitwise aggregates (`STDDEV*`, `VAR*`, `BIT_OR`/`AND`/`XOR`),
@@ -131,6 +132,11 @@ gaps:
   `LOAD DATA LOCAL INFILE` all work.
 - Vector search and `VEC_DISTANCE(...)` are ElyraSQL extensions (they mirror
   MySQL 9's vector direction but are not identical).
+- **Integer width is advisory.** `TINYINT`, `SMALLINT`, `MEDIUMINT`, `INT` and
+  `BIGINT` are all stored as 64 bits, so a value too wide for its declared
+  column (`300` into a `TINYINT`) is accepted where MySQL raises 1264.
+  `UNSIGNED` *is* enforced, on every width, since 1.8.0. See
+  [data types](sql/data-types.md#integer-widths-and-unsigned).
 - **One database.** `CREATE DATABASE`/`SCHEMA` is refused unless written with
   `IF NOT EXISTS`; see the note under *Laravel / Eloquent* above. `USE <name>`
   is accepted and changes what the catalog reports, but does not give a separate

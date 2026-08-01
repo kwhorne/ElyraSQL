@@ -6,8 +6,38 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
-### Fixed
+## [1.8.0] - 2026-08-01
 
+A correctness release, and an unusually direct demonstration of why differential
+testing is worth the trouble: **every bug below was found by asking MySQL what it
+does, rather than by a report**. Four came out of reviewing 1.7.0's own
+contributions, one from a contributed test harness on its first run, and one
+from re-reading a CI log that everybody had already given up on.
+
+Three of them were silent — a `CREATE TABLE ... AS SELECT` that lost half its
+query, a column constraint that was enforced on some columns and not others, and
+result metadata a client could not use — which is the kind that survives a test
+suite written by the people who wrote the engine.
+
+A minor rather than a patch bump: `INT UNSIGNED` columns now refuse negative
+values they previously accepted, and several error codes changed to the ones
+MySQL uses. Both are observable, even though both are corrections. There is no
+on-disk format change and no migration — 1.5.x, 1.6.x and 1.7.x databases open
+unchanged.
+
+### Fixed — silent wrong behaviour
+
+- **`CREATE TABLE ... AS SELECT` over an aggregate was truncated at the first
+  parenthesis.** The preprocessor that strips MySQL table options (`ENGINE=`,
+  `DEFAULT CHARSET`, ...) located the column list by looking for the first `(`
+  in the statement. In a CTAS that paren usually belongs to the *query* —
+  `COUNT(*)`, a derived table, any function call — so the statement was cut at
+  that paren's partner: `CREATE TABLE t AS SELECT g, COUNT(*) AS c FROM u GROUP
+  BY g` became `CREATE TABLE t AS SELECT g, COUNT(*)`, which then failed with
+  `unknown column: g`. The stripper now declines any statement that is a CTAS or
+  `LIKE` before it looks for a column list. **Materialized views run through
+  CTAS**, so `CREATE MATERIALIZED VIEW v AS SELECT ... GROUP BY ...` — the main
+  reason to want one — works for the first time (ESQL-54).
 - **`UNSIGNED` is enforced on every integer width (ESQL-56).** Only
   `BIGINT UNSIGNED` mapped to the unsigned type; `TINYINT`/`SMALLINT`/
   `MEDIUMINT`/`INT UNSIGNED` were stored as *signed*, so the same schema was
@@ -25,10 +55,14 @@ All notable changes to ElyraSQL are documented here. The format is based on
   migration and no on-disk change.
 
   Found by the differential SQL-dump harness in #26, on its first fixture.
-- **Out-of-range column values report MySQL's code.** Storing a value a column
-  cannot hold answered 1366 (`ER_TRUNCATED_WRONG_VALUE`, SQLSTATE `HY000`);
-  MySQL answers **1264** (`ER_WARN_DATA_OUT_OF_RANGE`, SQLSTATE `22003`), which
-  is what a client checking for an overflow looks for.
+- **`SHOW CREATE TABLE` now echoes `CHECK` and `FOREIGN KEY` constraints.** They
+  were enforced but invisible, so a schema dumped through `SHOW CREATE TABLE`
+  silently lost them and schema-diff tools saw a table that did not match the
+  one they had. Referential actions are included (`ON DELETE CASCADE`), MySQL's
+  implicit `NO ACTION` is not, and the emitted DDL is accepted back with the
+  constraints still live.
+
+### Fixed — client-visible metadata and errors
 
 - **Result metadata names the source table again (ESQL-55).** MySQL puts the
   bare column name in the name field and the relation in the `table` field, and
@@ -49,30 +83,19 @@ All notable changes to ElyraSQL are documented here. The format is based on
   bare column names, so there was no qualifier to match — while the same
   wildcard over a join worked. Naming the relation being read is now accepted;
   naming a relation that is not in the query still errors.
-
-- **`CREATE TABLE ... AS SELECT` over an aggregate was truncated at the first
-  parenthesis.** The preprocessor that strips MySQL table options (`ENGINE=`,
-  `DEFAULT CHARSET`, ...) located the column list by looking for the first `(`
-  in the statement. In a CTAS that paren usually belongs to the *query* —
-  `COUNT(*)`, a derived table, any function call — so the statement was cut at
-  that paren's partner: `CREATE TABLE t AS SELECT g, COUNT(*) AS c FROM u GROUP
-  BY g` became `CREATE TABLE t AS SELECT g, COUNT(*)`, which then failed with
-  `unknown column: g`. The stripper now declines any statement that is a CTAS or
-  `LIKE` before it looks for a column list. **Materialized views run through
-  CTAS**, so `CREATE MATERIALIZED VIEW v AS SELECT ... GROUP BY ...` — the main
-  reason to want one — works for the first time (ESQL-54).
-- **`SHOW CREATE TABLE` now echoes `CHECK` and `FOREIGN KEY` constraints.** They
-  were enforced but invisible, so a schema dumped through `SHOW CREATE TABLE`
-  silently lost them and schema-diff tools saw a table that did not match the
-  one they had. Referential actions are included (`ON DELETE CASCADE`), MySQL's
-  implicit `NO ACTION` is not, and the emitted DDL is accepted back with the
-  constraints still live.
+- **Out-of-range column values report MySQL's code.** Storing a value a column
+  cannot hold answered 1366 (`ER_TRUNCATED_WRONG_VALUE`, SQLSTATE `HY000`);
+  MySQL answers **1264** (`ER_WARN_DATA_OUT_OF_RANGE`, SQLSTATE `22003`), which
+  is what a client checking for an overflow looks for.
 - **Catalog errors report the MySQL code clients branch on.** Everything the
   catalog refused answered 1146 (`ER_NO_SUCH_TABLE`), so an unknown column
   looked like a missing table to an ORM. Unknown columns are now 1054
   (`ER_BAD_FIELD_ERROR`, SQLSTATE 42S22), a duplicate index name 1061, an
   unknown index 1176, and "already exists" 1050; anything unrecognised keeps
   1146.
+
+### Fixed — test infrastructure
+
 - **The soak/chaos suite can no longer hang a CI job (ESQL-53).** A connect
   attempt had no timeout of its own, so a server that accepted the socket from
   the listen backlog while mid-restart and never wrote the handshake blocked the
@@ -82,6 +105,15 @@ All notable changes to ElyraSQL are documented here. The format is based on
   time out with the worker's index rather than blocking, and the workflow has a
   45-minute cap so a hang is reported within the hour instead of burning a
   runner until the six-hour default.
+
+### Known gaps
+
+- **Integer width is advisory.** Every integer type is stored as 64 bits, so a
+  value too wide for its declared column (`300` into a `TINYINT`) is accepted
+  where MySQL raises 1264. The signedness *is* enforced, on every width, as of
+  this release. Persisting the declared width would change the catalog
+  encoding, so it is tracked separately in ESQL-56 with an approach that avoids
+  that; `docs/sql/data-types.md` documents the current behaviour.
 
 ## [1.7.0] - 2026-08-01
 
