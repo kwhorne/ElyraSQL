@@ -567,6 +567,122 @@ async fn create_database_fails_instead_of_succeeding_as_a_noop() {
     );
 }
 
+/// `CREATE TABLE ... AS SELECT` over an aggregate used to fail with an
+/// unresolvable column: the option-stripper treated the first `(` in the
+/// statement as the start of a column list, so `COUNT(*)` truncated the query
+/// there. Materialized views run through the same path, which is why an
+/// aggregate view was impossible to create.
+#[tokio::test]
+async fn ctas_and_materialized_views_accept_aggregates() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop("CREATE TABLE src (id INT PRIMARY KEY, g INT, v INT)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO src VALUES (1,1,10),(2,1,20),(3,2,30)")
+        .await
+        .unwrap();
+
+    c.query_drop("CREATE TABLE agg AS SELECT g, COUNT(*) AS c, SUM(v) AS s FROM src GROUP BY g")
+        .await
+        .unwrap();
+    let rows: Vec<(i64, i64, i64)> = c.query("SELECT g, c, s FROM agg ORDER BY g").await.unwrap();
+    assert_eq!(rows, vec![(1, 2, 30), (2, 1, 30)]);
+
+    // The same shape through a materialized view, plus a bare aggregate and a
+    // derived table -- all of which contain a paren before any column list.
+    c.query_drop("CREATE MATERIALIZED VIEW mv AS SELECT g, COUNT(*) AS c FROM src GROUP BY g")
+        .await
+        .unwrap();
+    let mv: Vec<(i64, i64)> = c.query("SELECT g, c FROM mv ORDER BY g").await.unwrap();
+    assert_eq!(mv, vec![(1, 2), (2, 1)]);
+
+    c.query_drop("CREATE TABLE total AS SELECT COUNT(*) AS n FROM src")
+        .await
+        .unwrap();
+    let total: Option<i64> = c.query_first("SELECT n FROM total").await.unwrap();
+    assert_eq!(total, Some(3));
+
+    c.query_drop(
+        "CREATE TABLE derived AS SELECT * FROM (SELECT g, SUM(v) AS s FROM src GROUP BY g) x",
+    )
+    .await
+    .unwrap();
+    let derived: Option<i64> = c.query_first("SELECT COUNT(*) FROM derived").await.unwrap();
+    assert_eq!(derived, Some(2));
+
+    // Real table options are still stripped rather than reaching the parser.
+    c.query_drop("CREATE TABLE opts (id INT) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4")
+        .await
+        .unwrap();
+}
+
+/// Constraints that are enforced must also be visible, or a dump taken through
+/// `SHOW CREATE TABLE` silently loses them.
+#[tokio::test]
+async fn show_create_table_echoes_checks_and_foreign_keys() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop("CREATE TABLE parent (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO parent VALUES (1)").await.unwrap();
+    c.query_drop("CREATE TABLE child (id INT PRIMARY KEY, pid INT, qty INT, CHECK (qty > 0))")
+        .await
+        .unwrap();
+    // Added by ALTER rather than declared, which is the form that was invisible.
+    c.query_drop("ALTER TABLE child ADD FOREIGN KEY (pid) REFERENCES parent(id) ON DELETE CASCADE")
+        .await
+        .unwrap();
+
+    let ddl: Option<(String, String)> = c.query_first("SHOW CREATE TABLE child").await.unwrap();
+    let ddl = ddl.expect("SHOW CREATE TABLE returned no row").1;
+    assert!(ddl.contains("CHECK (qty > 0)"), "{ddl}");
+    assert!(
+        ddl.contains("FOREIGN KEY (`pid`) REFERENCES `parent` (`id`)"),
+        "{ddl}"
+    );
+    assert!(ddl.contains("ON DELETE CASCADE"), "{ddl}");
+
+    // And the emitted DDL has to be accepted back, with the constraints live.
+    let copy = ddl.replace("`child`", "`child_copy`");
+    c.query_drop(copy).await.unwrap();
+    let orphan = c
+        .query_drop("INSERT INTO child_copy VALUES (1, 999, 1)")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(orphan, mysql_async::Error::Server(ref e) if e.code == 1452),
+        "the round-tripped foreign key must still be enforced: {orphan:?}"
+    );
+}
+
+/// Clients branch on the error code: an unknown column is not a missing table.
+#[tokio::test]
+async fn catalog_errors_use_the_specific_mysql_codes() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop("CREATE TABLE codes (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+
+    for (sql, code, state) in [
+        ("SELECT nope FROM codes", 1054u16, "42S22"),
+        ("SELECT * FROM missing_table", 1146, "42S02"),
+    ] {
+        match c.query_drop(sql).await.unwrap_err() {
+            mysql_async::Error::Server(e) => {
+                assert_eq!(e.code, code, "{sql}");
+                assert_eq!(e.state, state, "{sql}");
+            }
+            other => panic!("expected a server error for {sql}, got {other:?}"),
+        }
+    }
+}
+
 /// A fractional literal compared against an integer key is a *comparison*, not a
 /// value to store, so it must not be rounded into the key's domain: `k > 1024.5`
 /// means `k >= 1025`, and `k = 1024.5` matches nothing. Every answer below was

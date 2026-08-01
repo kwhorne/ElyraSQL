@@ -25,6 +25,12 @@ jobs:
   soak:
     name: soak + chaos
     runs-on: ubuntu-24.04
+    # A soak of N seconds plus build and cache should finish well inside this.
+    # The cap exists so that a hang is *reported* within the hour instead of
+    # burning a runner until the six-hour default: on 2026-07-29 a chaos
+    # iteration blocked forever in a connect that had no timeout of its own, and
+    # the job sat silent for 45 minutes before it was cancelled by hand.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
 

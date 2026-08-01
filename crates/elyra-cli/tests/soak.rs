@@ -107,19 +107,49 @@ fn opts(port: u16) -> mysql_async::Opts {
         .into()
 }
 
+/// A connect attempt must not be able to wait forever. A server that is
+/// mid-restart can *accept* the socket from the listen backlog and then never
+/// write the handshake, which leaves `Conn::new` waiting with no deadline of its
+/// own. That is the difference between a chaos test that reports a failure and
+/// one that hangs a CI job until the six-hour limit.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+async fn try_connect(port: u16) -> Option<mysql_async::Conn> {
+    match tokio::time::timeout(CONNECT_TIMEOUT, mysql_async::Conn::new(opts(port))).await {
+        Ok(Ok(c)) => Some(c),
+        // Connection refused (server down) and handshake stall are both just
+        // "not ready" to the caller, which retries until its deadline.
+        Ok(Err(_)) | Err(_) => None,
+    }
+}
+
 async fn conn(port: u16) -> mysql_async::Conn {
-    mysql_async::Conn::new(opts(port)).await.expect("connect")
+    try_connect(port)
+        .await
+        .expect("connect (server never completed a handshake)")
 }
 
 /// Reconnect with backoff until the deadline (the server may be mid-restart).
 async fn connect_retry(port: u16, deadline: Instant) -> Option<mysql_async::Conn> {
     while Instant::now() < deadline {
-        if let Ok(c) = mysql_async::Conn::new(opts(port)).await {
+        if let Some(c) = try_connect(port).await {
             return Some(c);
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     None
+}
+
+/// Join the workers, but never wait on them indefinitely: they are deadline-
+/// bounded, so one that has not finished shortly after the deadline is stuck,
+/// and saying so beats blocking the run.
+async fn join_workers(workers: Vec<tokio::task::JoinHandle<()>>) {
+    for (i, w) in workers.into_iter().enumerate() {
+        match tokio::time::timeout(Duration::from_secs(30), w).await {
+            Ok(_) => {}
+            Err(_) => panic!("worker {i} did not finish within 30s of the deadline"),
+        }
+    }
 }
 
 /// A server error means the server processed the statement (e.g. a write-write
@@ -336,9 +366,7 @@ async fn concurrent_transfers_preserve_invariant() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     stop.store(true, Ordering::Relaxed);
-    for w in workers {
-        let _ = w.await;
-    }
+    join_workers(workers).await;
 
     // Final settled check.
     let mut c = conn(port).await;
@@ -434,9 +462,7 @@ async fn crash_during_writes_preserves_invariant() {
     }
 
     stop.store(true, Ordering::Relaxed);
-    for w in workers {
-        let _ = w.await;
-    }
+    join_workers(workers).await;
 
     // Make sure the server is up for the final check.
     if child.try_wait().ok().flatten().is_some() {
