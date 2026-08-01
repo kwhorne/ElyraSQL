@@ -58,8 +58,17 @@ try {
     $r = $q("SELECT * FROM np_a WHERE id = ?", [1]);
     check("single-table SELECT *", count($r) === 1 && count($r[0]) === 2);
 
-    $r = $q("SELECT * FROM np_a JOIN np_b ON np_b.a_id = np_a.id WHERE np_a.id = ?", [1]);
-    check("join SELECT * (5 cols)", count($r) === 1 && count($r[0]) === 5);
+    // MySQL returns the *bare* column name and puts the qualifier in the result
+    // metadata, so this join's two `id` columns arrive under the same name and
+    // an associative fetch collapses them to 4 keys (verified against MySQL
+    // 8.4). Assert the wire column count, which is where the 5 actually is.
+    $s = $pdo->prepare("SELECT * FROM np_a JOIN np_b ON np_b.a_id = np_a.id WHERE np_a.id = ?");
+    $s->execute([1]);
+    $r = $s->fetchAll(PDO::FETCH_ASSOC);
+    check("join SELECT * (5 cols)", count($r) === 1 && $s->columnCount() === 5,
+        "columnCount=" . $s->columnCount());
+    check("join SELECT * bare column names", array_keys($r[0]) === ['id', 'name', 'a_id', 'label'],
+        implode(',', array_keys($r[0])));
 
     $r = $q("SELECT np_a.name, np_b.label FROM np_a JOIN np_b ON np_b.a_id = np_a.id", []);
     check("join explicit cols", count($r) === 2);

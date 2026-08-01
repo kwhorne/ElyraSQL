@@ -141,6 +141,13 @@ impl AggPlan {
             return None;
         }
         let gc = self.group_cols[0];
+        if self.plan.iter().any(|column| match column {
+            OutCol::Column(index) => *index != gc,
+            OutCol::Computed(_) => true,
+            OutCol::Agg(_) => false,
+        }) {
+            return None;
+        }
         match schema.columns.get(gc).map(|c| &c.ty) {
             Some(ColumnType::Int) | Some(ColumnType::Float) => {}
             _ => return None,
@@ -208,6 +215,19 @@ impl AggPlan {
             // values in scan order.
             .flat_map(|a| a.arg_col.into_iter().chain(a.order.iter().map(|&(c, _)| c)))
             .filter(|&c| c < base)
+            .collect()
+    }
+
+    /// Base-table columns copied from a representative row into the grouped
+    /// projection. Scans must decode these even when they are not group keys or
+    /// aggregate arguments.
+    pub fn sample_input_cols(&self) -> Vec<usize> {
+        self.plan
+            .iter()
+            .filter_map(|column| match column {
+                OutCol::Column(index) => Some(*index),
+                OutCol::Agg(_) | OutCol::Computed(_) => None,
+            })
             .collect()
     }
 
@@ -340,6 +360,43 @@ fn ident_of(expr: &Expr) -> Option<String> {
     }
 }
 
+fn output_column_name(name: &str) -> String {
+    name.rsplit_once('.')
+        .map_or(name, |(_, column)| column)
+        .to_owned()
+}
+
+fn resolve_group_alias<'a>(
+    expr: &'a Expr,
+    schema: &Schema,
+    projection: &'a [SelectItem],
+) -> &'a Expr {
+    let Expr::Identifier(id) = expr else {
+        return expr;
+    };
+    let source_column_exists = schema.columns.iter().any(|column| {
+        column.name.eq_ignore_ascii_case(&id.value)
+            || column
+                .name
+                .split_once('.')
+                .is_some_and(|(_, name)| name.eq_ignore_ascii_case(&id.value))
+    });
+    if source_column_exists {
+        return expr;
+    }
+    projection
+        .iter()
+        .find_map(|item| match item {
+            SelectItem::ExprWithAlias { expr, alias }
+                if alias.value.eq_ignore_ascii_case(&id.value) =>
+            {
+                Some(expr)
+            }
+            _ => None,
+        })
+        .unwrap_or(expr)
+}
+
 /// Extract a GROUP_CONCAT `SEPARATOR '...'` clause, if present.
 /// The optional top-N cap in `FACET(col, n)` (its second argument, a positive
 /// integer literal). `None` = return every facet value.
@@ -449,6 +506,7 @@ pub fn build_plan(
     // group's sample row (all rows in a group share the value).
     let mut group_cols = Vec::new();
     for g in group_by {
+        let g = resolve_group_alias(g, schema, projection);
         match ident_of(g).and_then(|n| col_index(schema, &n).ok()) {
             Some(idx) => group_cols.push(idx),
             None => {
@@ -461,6 +519,49 @@ pub fn build_plan(
     let ci = elyra_core::Collation::Ci;
 
     for item in projection {
+        match item {
+            SelectItem::Wildcard(_) => {
+                for (idx, column) in schema.columns.iter().enumerate() {
+                    out_cols.push(ColumnDef {
+                        name: output_column_name(&column.name),
+                        ty: column.ty.clone(),
+                        nullable: column.nullable,
+                        collation: column.collation,
+                    });
+                    plan.push(OutCol::Column(idx));
+                }
+                continue;
+            }
+            SelectItem::QualifiedWildcard(object, _) => {
+                let qualifier = object
+                    .0
+                    .last()
+                    .map(|identifier| identifier.value.as_str())
+                    .unwrap_or_default();
+                let before = plan.len();
+                for (idx, column) in schema.columns.iter().enumerate() {
+                    let Some((column_qualifier, name)) = column.name.split_once('.') else {
+                        continue;
+                    };
+                    if column_qualifier.eq_ignore_ascii_case(qualifier) {
+                        out_cols.push(ColumnDef {
+                            name: name.to_owned(),
+                            ty: column.ty.clone(),
+                            nullable: column.nullable,
+                            collation: column.collation,
+                        });
+                        plan.push(OutCol::Column(idx));
+                    }
+                }
+                if plan.len() == before {
+                    return Err(Error::Unsupported(format!(
+                        "qualified wildcard {object}.* matched no relation"
+                    )));
+                }
+                continue;
+            }
+            SelectItem::UnnamedExpr(_) | SelectItem::ExprWithAlias { .. } => {}
+        }
         let (expr, alias) = item_expr_and_alias(item)?;
 
         // 1) A bare aggregate: SUM(x), COUNT(*), ...
@@ -481,7 +582,7 @@ pub fn build_plan(
         if !contains_aggregate(expr) {
             if let Some(idx) = ident_of(expr).and_then(|n| col_index(schema, &n).ok()) {
                 out_cols.push(ColumnDef {
-                    name: alias.unwrap_or_else(|| schema.columns[idx].name.clone()),
+                    name: alias.unwrap_or_else(|| output_column_name(&schema.columns[idx].name)),
                     ty: schema.columns[idx].ty.clone(),
                     nullable: schema.columns[idx].nullable,
                     collation: ci,
@@ -747,7 +848,21 @@ fn infer_computed_type(expr: &Expr) -> ColumnType {
                 _ => ColumnType::Text,
             }
         }
-        Expr::UnaryOp { expr: e, .. } | Expr::Nested(e) => infer_computed_type(e),
+        Expr::UnaryOp { op, expr: e } => {
+            use sqlparser::ast::UnaryOperator::*;
+            match op {
+                // MySQL exposes logical negation as an integer result. This is
+                // especially important for native prepared statements, whose
+                // binary rows must agree with the declared result metadata.
+                Not | BangNot => ColumnType::Int,
+                PGBitwiseNot => ColumnType::UInt,
+                PGSquareRoot | PGCubeRoot => ColumnType::Float,
+                Plus | Minus | PGPostfixFactorial | PGPrefixFactorial | PGAbs => {
+                    infer_computed_type(e)
+                }
+            }
+        }
+        Expr::Nested(e) => infer_computed_type(e),
         Expr::Function(f) => {
             let n = f
                 .name

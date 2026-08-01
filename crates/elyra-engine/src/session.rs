@@ -72,6 +72,8 @@ pub struct Session {
     db: Db,
     txn: Mutex<Option<TxnState>>,
     isolation: Mutex<Isolation>,
+    database: Mutex<String>,
+    strict_sql_mode: std::sync::atomic::AtomicBool,
     /// Nested `CALL` depth (guards against runaway procedure recursion).
     call_depth: std::sync::atomic::AtomicUsize,
     /// Ready-to-run trigger-body SQL queued by the last DML, fired by the engine.
@@ -131,6 +133,8 @@ impl Session {
             db,
             txn: Mutex::new(None),
             isolation: Mutex::new(Isolation::Snapshot),
+            database: Mutex::new("elyra".into()),
+            strict_sql_mode: std::sync::atomic::AtomicBool::new(true),
             call_depth: std::sync::atomic::AtomicUsize::new(0),
             pending_triggers: Mutex::new(Vec::new()),
             user_vars: Mutex::new(std::collections::HashMap::new()),
@@ -140,6 +144,14 @@ impl Session {
             row_count: std::sync::atomic::AtomicI64::new(-1),
             cancel: Arc::new(elyra_core::cancel::QueryCancel::new()),
         }
+    }
+
+    pub fn database(&self) -> String {
+        self.database.lock().unwrap().clone()
+    }
+
+    pub fn set_database(&self, database: &str) {
+        *self.database.lock().unwrap() = database.to_string();
     }
 
     /// Cancellation token for the statement running on this session. Cloned into
@@ -174,6 +186,18 @@ impl Session {
     /// Clear the deadline once the statement is done.
     pub fn disarm_cancel(&self) {
         self.cancel.disarm();
+    }
+
+    /// Whether invalid values fail instead of using MySQL's warning-producing
+    /// fallback conversions.
+    pub fn strict_sql_mode(&self) -> bool {
+        self.strict_sql_mode
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn set_strict_sql_mode(&self, strict: bool) {
+        self.strict_sql_mode
+            .store(strict, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Value returned by `LAST_INSERT_ID()`.
@@ -669,6 +693,28 @@ impl Session {
             if let Some(tx) = guard.as_mut() {
                 let budget = txn_max_bytes();
                 let logging = !tx.savepoints.is_empty();
+                // Match the storage-layer write order: deletes first, then
+                // puts. An unchanged index entry can occur in both collections
+                // during UPDATE, and the replacement must remain visible.
+                for k in deletes {
+                    let klen = k.len();
+                    if logging {
+                        tx.undo.push(UndoEntry {
+                            prev_put: tx.puts.get(&k).cloned(),
+                            prev_deleted: tx.deletes.contains(&k),
+                            key: k.clone(),
+                        });
+                    }
+                    if let Some(old) = tx.puts.remove(&k) {
+                        tx.mem -= klen + old.len();
+                    }
+                    if tx.deletes.insert(k) {
+                        tx.mem += klen;
+                    }
+                    if tx.mem > budget {
+                        return Err(txn_overflow(budget));
+                    }
+                }
                 for (k, v) in puts {
                     if logging {
                         tx.undo.push(UndoEntry {
@@ -685,25 +731,6 @@ impl Session {
                     }
                     tx.mem += k.len() + v.len();
                     tx.puts.insert(k, v);
-                    if tx.mem > budget {
-                        return Err(txn_overflow(budget));
-                    }
-                }
-                for k in deletes {
-                    let klen = k.len();
-                    if logging {
-                        tx.undo.push(UndoEntry {
-                            prev_put: tx.puts.get(&k).cloned(),
-                            prev_deleted: tx.deletes.contains(&k),
-                            key: k.clone(),
-                        });
-                    }
-                    if let Some(old) = tx.puts.remove(&k) {
-                        tx.mem -= klen + old.len();
-                    }
-                    if tx.deletes.insert(k) {
-                        tx.mem += klen;
-                    }
                     if tx.mem > budget {
                         return Err(txn_overflow(budget));
                     }

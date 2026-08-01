@@ -8,8 +8,8 @@ use elyra_core::{ColumnDef, ColumnType, Error, Result, Schema, Value};
 use sqlparser::ast::{
     AlterColumnOperation, AlterTableOperation, Assignment, AssignmentTarget, ColumnOption,
     CreateIndex, CreateTable, DataType, Delete, FromTable, Insert, JoinConstraint, JoinOperator,
-    ObjectName, Query as SqlQuery, Select, SetExpr, Statement, TableConstraint, TableFactor,
-    TableWithJoins,
+    ObjectName, OrderByExpr, Query as SqlQuery, Select, SetExpr, Statement, TableConstraint,
+    TableFactor, TableWithJoins,
 };
 
 use crate::aggregate;
@@ -24,8 +24,8 @@ use elyra_olap::GroupAggregator;
 
 use crate::catalog::{
     self, autoinc_key, catalog_key, data_key, data_prefix, index_table_prefix,
-    indexnull_table_prefix, rowid_key, wcount_key, ColMeta, ForeignKey, IndexDef, RefAction,
-    TableDef,
+    indexnull_table_prefix, partmeta_key, rowid_key, stats_key, wcount_key, ColMeta, ForeignKey,
+    IndexDef, RefAction, TableDef,
 };
 use crate::eval::eval_expr;
 use crate::keyenc;
@@ -40,6 +40,13 @@ fn table_ident(name: &ObjectName) -> Result<String> {
         .last()
         .map(|i| i.value.clone())
         .ok_or_else(|| Error::Catalog("empty table name".into()))
+}
+
+fn map_collation(name: &ObjectName) -> elyra_core::Collation {
+    name.0
+        .last()
+        .map(|identifier| elyra_core::Collation::from_name(&identifier.value))
+        .unwrap_or_default()
 }
 
 /// Escape regex metacharacters so a literal string can be embedded in a pattern
@@ -246,7 +253,7 @@ pub async fn create_table(
         let collation = col
             .collation
             .as_ref()
-            .map(|c| elyra_core::Collation::from_name(&c.to_string()))
+            .map(map_collation)
             .unwrap_or_default();
         for opt in &col.options {
             match &opt.option {
@@ -345,6 +352,47 @@ pub async fn create_table(
                     indexes_nulls: single,
                 });
             }
+            TableConstraint::Index {
+                name: index_name,
+                columns: cols,
+                ..
+            } => {
+                let mut idxs = Vec::new();
+                for ident in cols {
+                    let i = columns
+                        .iter()
+                        .position(|column| column.name.eq_ignore_ascii_case(&ident.value))
+                        .ok_or_else(|| {
+                            Error::Catalog(format!("unknown index column: {}", ident.value))
+                        })?;
+                    idxs.push(i);
+                }
+                let name = index_name
+                    .as_ref()
+                    .map(|name| name.value.clone())
+                    .unwrap_or_else(|| {
+                        format!(
+                            "{name}_{}_idx",
+                            idxs.iter()
+                                .map(|&i| columns[i].name.clone())
+                                .collect::<Vec<_>>()
+                                .join("_")
+                        )
+                    });
+                let col_collations = idxs
+                    .iter()
+                    .map(|&i| columns[i].collation)
+                    .collect::<Vec<_>>();
+                indexes.push(IndexDef {
+                    name,
+                    indexes_nulls: idxs.len() == 1,
+                    cols: idxs,
+                    unique: false,
+                    vector: false,
+                    fulltext: false,
+                    col_collations,
+                });
+            }
             TableConstraint::Check { expr, .. } => checks.push(expr.to_string()),
             TableConstraint::ForeignKey {
                 name: fname,
@@ -418,7 +466,7 @@ pub async fn create_table(
 pub async fn show_tables(db: &Session) -> Result<QueryResult> {
     let names = catalog::list_tables(db).await?;
     let schema = Schema::new(vec![ColumnDef {
-        name: "Tables_in_elyra".into(),
+        name: format!("Tables_in_{}", db.database()),
         ty: ColumnType::Text,
         nullable: false,
         collation: elyra_core::Collation::Ci,
@@ -669,10 +717,10 @@ pub fn show_collation(filter: Option<&sqlparser::ast::ShowStatementFilter>) -> R
 }
 
 /// `SHOW DATABASES` / `SHOW SCHEMAS`.
-pub fn show_databases() -> Result<QueryResult> {
+pub fn show_databases(db: &Session) -> Result<QueryResult> {
     let rows = vec![
         vec![Value::Text("information_schema".into())],
-        vec![Value::Text("elyra".into())],
+        vec![Value::Text(db.database())],
     ];
     Ok(QueryResult::Rows(RowStream::literal(
         text_schema(&["Database"]),
@@ -683,12 +731,12 @@ pub fn show_databases() -> Result<QueryResult> {
 /// `SHOW [FULL] PROCESSLIST` — a single representative row (the engine does not
 /// track a live connection table); handled in-engine so it works over both the
 /// text and prepared-statement paths.
-pub fn show_processlist() -> Result<QueryResult> {
+pub fn show_processlist(db: &Session) -> Result<QueryResult> {
     let row = vec![
         Value::Text("1".into()),
         Value::Text("root".into()),
         Value::Text("localhost".into()),
-        Value::Text("elyra".into()),
+        Value::Text(db.database()),
         Value::Text("Query".into()),
         Value::Text("0".into()),
         Value::Text(String::new()),
@@ -975,6 +1023,14 @@ fn information_schema_view(tf: &TableFactor) -> Option<String> {
     None
 }
 
+/// Whether a table factor names a persisted ElyraSQL table rather than one of
+/// the virtual information_schema/mysql relations. Streaming join plans need a
+/// real [`TableDef`]; virtual relations must use the materialising path, which
+/// obtains their schema and rows from [`information_schema`].
+fn stored_table_factor(tf: &TableFactor) -> bool {
+    matches!(tf, TableFactor::Table { .. }) && information_schema_view(tf).is_none()
+}
+
 /// The `Key` letter (PRI/UNI/MUL/empty) for column `i` of a table.
 fn column_key(def: &TableDef, i: usize) -> &'static str {
     if def.pk_cols.contains(&i) {
@@ -998,6 +1054,15 @@ fn column_extra(meta: &ColMeta) -> &'static str {
     }
 }
 
+fn ref_action_name(action: RefAction) -> &'static str {
+    match action {
+        RefAction::NoAction => "NO ACTION",
+        RefAction::Restrict => "RESTRICT",
+        RefAction::Cascade => "CASCADE",
+        RefAction::SetNull => "SET NULL",
+    }
+}
+
 /// Build the rows of an `information_schema` view (`tables` or `columns`).
 async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec<Value>>)> {
     let text = |n: &str| ColumnDef {
@@ -1013,6 +1078,7 @@ async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec
         collation: elyra_core::Collation::Ci,
     };
     let names = catalog::list_tables(db).await?;
+    let database = db.database();
     match view {
         "tables" => {
             let schema = Schema::new(vec![
@@ -1021,19 +1087,43 @@ async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec
                 text("TABLE_TYPE"),
                 text("ENGINE"),
                 int("TABLE_ROWS"),
+                int("DATA_LENGTH"),
+                int("INDEX_LENGTH"),
+                text("TABLE_COMMENT"),
+                text("TABLE_COLLATION"),
+                int("AUTO_INCREMENT"),
+                text("CREATE_OPTIONS"),
             ]);
             let mut rows = Vec::with_capacity(names.len());
             for n in names {
+                let def = catalog::load(db, &n).await?;
                 let table_rows = match catalog::load_stats(db, &n).await? {
                     Some(s) => Value::Int(s.rows as i64),
                     None => Value::Null,
                 };
+                let auto_increment = if (0..def.schema.columns.len())
+                    .any(|column_index| def.meta(column_index).auto_increment)
+                {
+                    Value::Int(read_autoinc(db, &n).await?.saturating_add(1))
+                } else {
+                    Value::Null
+                };
                 rows.push(vec![
-                    Value::Text("elyra".into()),
+                    Value::Text(database.clone()),
                     Value::Text(n),
                     Value::Text("BASE TABLE".into()),
                     Value::Text("ElyraSQL".into()),
                     table_rows,
+                    // ElyraSQL does not currently maintain MySQL's physical
+                    // per-table byte estimates or table comments. Expose the
+                    // columns with stable best-effort values so schema tools
+                    // can consume the standard information_schema shape.
+                    Value::Int(0),
+                    Value::Int(0),
+                    Value::Text(String::new()),
+                    Value::Text("utf8mb4_0900_ai_ci".into()),
+                    auto_increment,
+                    Value::Text(String::new()),
                 ]);
             }
             Ok((schema, rows))
@@ -1073,7 +1163,7 @@ async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec
                         Value::Null
                     };
                     rows.push(vec![
-                        Value::Text("elyra".into()),
+                        Value::Text(database.clone()),
                         Value::Text(tname.clone()),
                         Value::Text(c.name.clone()),
                         Value::Int(i as i64 + 1),
@@ -1108,6 +1198,7 @@ async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec
                 text("COLUMN_NAME"),
                 text("COLLATION"),
                 int("CARDINALITY"),
+                int("SUB_PART"),
                 text("NULLABLE"),
                 text("INDEX_TYPE"),
             ]);
@@ -1118,13 +1209,14 @@ async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec
                     |non_unique: i64, iname: &str, seq: usize, ci: usize, itype: &str| {
                         let c = &def.schema.columns[ci];
                         rows.push(vec![
-                            Value::Text("elyra".into()),
+                            Value::Text(database.clone()),
                             Value::Text(tname.clone()),
                             Value::Int(non_unique),
                             Value::Text(iname.to_string()),
                             Value::Int(seq as i64 + 1),
                             Value::Text(c.name.clone()),
                             Value::Text("A".into()),
+                            Value::Null,
                             Value::Null,
                             Value::Text(if c.nullable { "YES" } else { "" }.into()),
                             Value::Text(itype.to_string()),
@@ -1163,9 +1255,9 @@ async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec
                 // PRIMARY KEY and UNIQUE constraints: no referenced table.
                 let mut push_key = |cname: &str, seq: usize, ci: usize| {
                     rows.push(vec![
-                        Value::Text("elyra".into()),
+                        Value::Text(database.clone()),
                         Value::Text(cname.to_string()),
-                        Value::Text("elyra".into()),
+                        Value::Text(database.clone()),
                         Value::Text(tname.clone()),
                         Value::Text(def.schema.columns[ci].name.clone()),
                         Value::Int(seq as i64 + 1),
@@ -1189,19 +1281,40 @@ async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec
                     for (seq, (&ci, rc)) in fk.columns.iter().zip(fk.ref_columns.iter()).enumerate()
                     {
                         rows.push(vec![
-                            Value::Text("elyra".into()),
+                            Value::Text(database.clone()),
                             Value::Text(fk.name.clone()),
-                            Value::Text("elyra".into()),
+                            Value::Text(database.clone()),
                             Value::Text(tname.clone()),
                             Value::Text(def.schema.columns[ci].name.clone()),
                             Value::Int(seq as i64 + 1),
                             Value::Int(seq as i64 + 1),
-                            Value::Text("elyra".into()),
+                            Value::Text(database.clone()),
                             Value::Text(fk.ref_table.clone()),
                             Value::Text(rc.clone()),
                         ]);
                     }
                 }
+            }
+            Ok((schema, rows))
+        }
+        "referential_constraints" => {
+            let schema = Schema::new(vec![
+                text("CONSTRAINT_SCHEMA"),
+                text("CONSTRAINT_NAME"),
+                text("UPDATE_RULE"),
+                text("DELETE_RULE"),
+            ]);
+            let mut rows = Vec::new();
+            for table_name in names {
+                let def = catalog::load(db, &table_name).await?;
+                rows.extend(def.foreign_keys.iter().map(|foreign_key| {
+                    vec![
+                        Value::Text(database.clone()),
+                        Value::Text(foreign_key.name.clone()),
+                        Value::Text(ref_action_name(foreign_key.on_update).into()),
+                        Value::Text(ref_action_name(foreign_key.on_delete).into()),
+                    ]
+                }));
             }
             Ok((schema, rows))
         }
@@ -1440,11 +1553,11 @@ async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec
                     };
                     rows.push(vec![
                         Value::Text("def".into()),
-                        Value::Text("elyra".into()),
+                        Value::Text(database.clone()),
                         Value::Text(t.name),
                         Value::Text(event.into()),
                         Value::Text("def".into()),
-                        Value::Text("elyra".into()),
+                        Value::Text(database.clone()),
                         Value::Text(t.table),
                         Value::Text("1".into()),
                         Value::Null,
@@ -1505,7 +1618,7 @@ async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec
                     rows.push(vec![
                         Value::Text(name.clone()),
                         Value::Text("def".into()),
-                        Value::Text("elyra".into()),
+                        Value::Text(database.clone()),
                         Value::Text(name),
                         Value::Text("PROCEDURE".into()),
                         Value::Text(String::new()),
@@ -1556,7 +1669,7 @@ async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec
                     let def = String::from_utf8_lossy(v).to_string();
                     rows.push(vec![
                         Value::Text("def".into()),
-                        Value::Text("elyra".into()),
+                        Value::Text(database.clone()),
                         Value::Text(name),
                         Value::Text(def),
                         Value::Text("NONE".into()),
@@ -1618,17 +1731,25 @@ async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec
                 text("DEFAULT_COLLATION_NAME"),
                 text("SQL_PATH"),
             ]);
-            let rows = ["information_schema", "elyra"]
+            let rows = ["information_schema".to_string(), database]
                 .into_iter()
-                .map(|s| {
+                .map(|schema_name| {
                     vec![
                         Value::Text("def".into()),
-                        Value::Text(s.into()),
+                        Value::Text(schema_name),
                         Value::Text("utf8mb4".into()),
                         Value::Text("utf8mb4_0900_ai_ci".into()),
                         Value::Null,
                     ]
                 })
+                .collect();
+            Ok((schema, rows))
+        }
+        "collation_character_set_applicability" => {
+            let schema = Schema::new(vec![text("COLLATION_NAME"), text("CHARACTER_SET_NAME")]);
+            let rows = ["utf8mb4_0900_ai_ci", "utf8mb4_unicode_ci", "utf8mb4_bin"]
+                .into_iter()
+                .map(|collation| vec![Value::Text(collation.into()), Value::Text("utf8mb4".into())])
                 .collect();
             Ok((schema, rows))
         }
@@ -1664,9 +1785,16 @@ async fn run_virtual_select(
     }
 
     if !group_by.is_empty() || aggregate::projection_has_aggregate(&select.projection) {
-        let (osch, orows) = aggregate::run(&schema, &select.projection, group_by, rows)?;
-        let mut orows = apply_having(select.having.as_ref(), &select.projection, &osch, orows)?;
+        let (projection, hidden) = aggregate_projection_with_hidden(
+            &select.projection,
+            select.having.as_ref(),
+            order_exprs,
+            &schema,
+        );
+        let (mut osch, orows) = aggregate::run(&schema, &projection, group_by, rows)?;
+        let mut orows = apply_having(select.having.as_ref(), &projection, &osch, orows)?;
         order_output_rows(&mut orows, &osch, order_exprs)?;
+        truncate_hidden_columns(&mut osch, &mut orows, hidden);
         apply_offset_limit(&mut orows, offset, limit);
         return Ok(QueryResult::Rows(RowStream::literal(osch, orows)));
     }
@@ -1846,8 +1974,8 @@ pub async fn alter_table(
             // via the CREATE INDEX path, then refresh the working definition.
             AlterTableOperation::AddConstraint(tc) => {
                 use sqlparser::ast::TableConstraint as TC;
-                // Foreign key: index the referencing columns (with backfill) then
-                // register the constraint. Common via Laravel's constrained().
+                // Foreign key: index the referencing columns (with backfill),
+                // then register the constraint.
                 if let TC::ForeignKey {
                     name: fname,
                     columns: cols,
@@ -2013,6 +2141,15 @@ fn options_to_meta(options: &[ColumnOption]) -> (bool, ColMeta) {
     (nullable, meta)
 }
 
+fn option_collation(option: &ColumnOption) -> Option<elyra_core::Collation> {
+    match option {
+        // sqlparser 0.53's CHANGE/MODIFY path retains CHARACTER SET but not
+        // COLLATE. The frontend rewrites the latter to this AST shape.
+        ColumnOption::CharacterSet(name) => Some(map_collation(name)),
+        _ => None,
+    }
+}
+
 /// `MODIFY COLUMN` / `CHANGE COLUMN`: retype, rename, and reset options.
 async fn alter_change_column(
     db: &Session,
@@ -2032,9 +2169,20 @@ async fn alter_change_column(
 
     let new_ty = map_type(data_type)?;
     let old_ty = def.schema.columns[i].ty.clone();
+    let old_collation = def.schema.columns[i].collation;
+    let new_collation = options
+        .iter()
+        .rev()
+        .find_map(option_collation)
+        .unwrap_or(old_collation);
     if def.pk_cols.contains(&i) && new_ty != old_ty {
         return Err(Error::Unsupported(
             "cannot change the type of a primary key column".into(),
+        ));
+    }
+    if def.pk_cols.contains(&i) && new_collation != old_collation {
+        return Err(Error::Unsupported(
+            "cannot change the collation of a primary key column".into(),
         ));
     }
     if let Some(nn) = new_name {
@@ -2047,7 +2195,55 @@ async fn alter_change_column(
     if new_ty != old_ty {
         recoerce_column(db, def, i).await?;
     }
+    if new_collation != old_collation {
+        def.schema.columns[i].collation = new_collation;
+        let schema_collations = def
+            .schema
+            .columns
+            .iter()
+            .map(|column| column.collation)
+            .collect::<Vec<_>>();
+        for index in &mut def.indexes {
+            if index.cols.contains(&i) {
+                index.col_collations = index
+                    .cols
+                    .iter()
+                    .map(|&column| schema_collations[column])
+                    .collect();
+            }
+        }
+        rebuild_indexes_for_column(db, def, i).await?;
+    }
     Ok(())
+}
+
+async fn rebuild_indexes_for_column(db: &Session, def: &TableDef, column: usize) -> Result<()> {
+    let indexes = def
+        .indexes
+        .iter()
+        .filter(|index| index.cols.contains(&column))
+        .cloned()
+        .collect::<Vec<_>>();
+    if indexes.is_empty() {
+        return Ok(());
+    }
+
+    let index_names = indexes
+        .iter()
+        .map(|index| index.name.as_str())
+        .collect::<Vec<_>>();
+    let deletes = collect_index_entry_keys(db, &def.name, &index_names).await?;
+
+    let indexed_def = TableDef {
+        indexes,
+        ..def.clone()
+    };
+    let rows = collect_matches(db, def, None, None).await?;
+    let mut puts = vec![(catalog_key(&def.name), def.encode()?)];
+    for (key, row) in rows {
+        puts.extend(index::entries_for_row(&indexed_def, &row, &key)?);
+    }
+    db.commit_write(puts, deletes).await
 }
 
 /// `ALTER COLUMN ... SET/DROP DEFAULT | SET/DROP NOT NULL | SET DATA TYPE`.
@@ -2125,59 +2321,143 @@ async fn alter_add_column(
     col: &sqlparser::ast::ColumnDef,
 ) -> Result<()> {
     let ty = map_type(&col.data_type)?;
-    let mut nullable = true;
-    let mut default = Value::Null;
-    for opt in &col.options {
-        match &opt.option {
-            ColumnOption::NotNull => nullable = false,
-            ColumnOption::Default(e) => default = coerce(eval_expr(e)?, &ty, &col.name.value)?,
-            _ => {}
-        }
+    let options = col
+        .options
+        .iter()
+        .map(|option| option.option.clone())
+        .collect::<Vec<_>>();
+    let (nullable, meta) = options_to_meta(&options);
+    let is_primary = options.iter().any(|option| {
+        matches!(
+            option,
+            ColumnOption::Unique {
+                is_primary: true,
+                ..
+            }
+        )
+    });
+    if is_primary && def.has_pk() {
+        return Err(Error::Query("multiple primary keys are not allowed".into()));
     }
-    if !nullable && default.is_null() {
+    if meta.auto_increment && !is_primary {
+        return Err(Error::Unsupported(
+            "ADD COLUMN AUTO_INCREMENT currently requires PRIMARY KEY".into(),
+        ));
+    }
+    let explicit_default = options
+        .iter()
+        .find_map(|option| match option {
+            ColumnOption::Default(expression) => Some(expression),
+            _ => None,
+        })
+        .map(|expression| coerce(eval_expr(expression)?, &ty, &col.name.value))
+        .transpose()?;
+    if !nullable && explicit_default.as_ref().is_some_and(Value::is_null) && !meta.auto_increment {
         return Err(Error::Query(format!(
             "ADD COLUMN '{}' is NOT NULL and needs a DEFAULT",
             col.name.value
         )));
     }
 
-    // Append the default to every existing row.
-    let prefix = data_prefix(&def.name);
-    let mut cursor: Option<Vec<u8>> = None;
-    let mut puts = Vec::new();
-    loop {
-        let chunk = db.scan_batch(prefix.clone(), cursor.clone(), 4096).await?;
-        if chunk.is_empty() {
-            break;
-        }
-        let last = chunk.len() < 4096;
-        cursor = chunk.last().map(|(k, _)| k.clone());
-        for (k, v) in chunk {
-            let mut row: Vec<Value> = rowdec::decode_row(&v)?;
-            row.push(default.clone());
-            puts.push((
-                k,
-                bincode::serialize(&row).map_err(|e| Error::Storage(e.to_string()))?,
-            ));
-        }
-        if last {
-            break;
-        }
-    }
+    let old_def = def.clone();
+    let rows = collect_matches(db, def, None, None).await?;
+    let default = match explicit_default {
+        Some(default) => default,
+        None if nullable || meta.auto_increment || rows.is_empty() => Value::Null,
+        None => mysql_implicit_alter_value(&ty).ok_or_else(|| {
+            Error::Query(format!(
+                "ADD COLUMN '{}' cannot backfill existing rows without a DEFAULT",
+                col.name.value
+            ))
+        })?,
+    };
+    ensure_col_meta(def);
+    let new_column = def.schema.columns.len();
     def.schema.columns.push(ColumnDef {
         name: col.name.value.clone(),
-        ty,
+        ty: ty.clone(),
         nullable,
         collation: col
             .collation
             .as_ref()
-            .map(|c| elyra_core::Collation::from_name(&c.to_string()))
+            .map(map_collation)
+            .or_else(|| {
+                col.options
+                    .iter()
+                    .rev()
+                    .find_map(|option| option_collation(&option.option))
+            })
             .unwrap_or_default(),
     });
-    if !puts.is_empty() {
-        db.commit_write(puts, vec![]).await?;
+    def.col_meta.push(meta.clone());
+    if is_primary {
+        def.pk_cols = vec![new_column];
     }
+
+    let mut puts = vec![(catalog_key(&def.name), def.encode()?)];
+    let mut deletes = Vec::new();
+    let mut auto_increment = 0i64;
+    for (old_key, mut row) in rows {
+        if is_primary {
+            deletes.extend(index::entry_keys_for_row(&old_def, &row, &old_key)?);
+        }
+        let value = if meta.auto_increment {
+            auto_increment += 1;
+            coerce(Value::Int(auto_increment), &ty, &col.name.value)?
+        } else {
+            default.clone()
+        };
+        row.push(value);
+        let new_key = if is_primary {
+            let primary_values = def
+                .pk_cols
+                .iter()
+                .map(|&position| row[position].clone())
+                .collect::<Vec<_>>();
+            data_key(
+                &def.name,
+                &keyenc::encode_key_coll(&primary_values, &def.pk_collations())?,
+            )
+        } else {
+            old_key.clone()
+        };
+        if new_key != old_key {
+            deletes.push(old_key);
+        }
+        puts.push((
+            new_key.clone(),
+            bincode::serialize(&row).map_err(|error| Error::Storage(error.to_string()))?,
+        ));
+        if is_primary {
+            puts.extend(index::entries_for_row(def, &row, &new_key)?);
+        }
+    }
+    if is_primary {
+        deletes.push(rowid_key(&def.name));
+    }
+    if meta.auto_increment {
+        puts.push((
+            autoinc_key(&def.name),
+            auto_increment.to_le_bytes().to_vec(),
+        ));
+    }
+    puts.push(bump_wcount(db, &def.name).await?);
+    db.commit_write(puts, deletes).await?;
     Ok(())
+}
+
+fn mysql_implicit_alter_value(ty: &ColumnType) -> Option<Value> {
+    match ty {
+        ColumnType::Bool => Some(Value::Bool(false)),
+        ColumnType::Int => Some(Value::Int(0)),
+        ColumnType::UInt => Some(Value::UInt(0)),
+        ColumnType::Float => Some(Value::Float(0.0)),
+        ColumnType::Text => Some(Value::Text(String::new())),
+        ColumnType::Bytes => Some(Value::Bytes(Vec::new())),
+        ColumnType::Decimal(_, scale) => Some(Value::Decimal(0, *scale)),
+        ColumnType::Time => Some(Value::Time(0)),
+        ColumnType::Vector(_) | ColumnType::Date | ColumnType::DateTime | ColumnType::Json => None,
+    }
 }
 
 async fn alter_drop_column(db: &Session, def: &mut TableDef, name: &str) -> Result<()> {
@@ -2192,11 +2472,28 @@ async fn alter_drop_column(db: &Session, def: &mut TableDef, name: &str) -> Resu
             "cannot drop a primary key column".into(),
         ));
     }
-    if def.indexes.iter().any(|i| i.cols.contains(&idx)) {
-        return Err(Error::Unsupported(
-            "cannot drop an indexed column; drop the index first".into(),
-        ));
+    if let Some(foreign_key) = def
+        .foreign_keys
+        .iter()
+        .find(|foreign_key| foreign_key.columns.contains(&idx))
+    {
+        return Err(Error::Unsupported(format!(
+            "cannot drop column `{name}`: needed in foreign key constraint `{}`",
+            foreign_key.name
+        )));
     }
+
+    let dropped_indexes = def
+        .indexes
+        .iter()
+        .filter(|index| index.cols.contains(&idx))
+        .cloned()
+        .collect::<Vec<_>>();
+    let dropped_index_names = dropped_indexes
+        .iter()
+        .map(|index| index.name.as_str())
+        .collect::<Vec<_>>();
+    let deletes = collect_index_entry_keys(db, &def.name, &dropped_index_names).await?;
     if idx < def.col_meta.len() {
         def.col_meta.remove(idx);
     }
@@ -2227,6 +2524,7 @@ async fn alter_drop_column(db: &Session, def: &mut TableDef, name: &str) -> Resu
         }
     }
     def.schema.columns.remove(idx);
+    def.indexes.retain(|index| !index.cols.contains(&idx));
     // Shift key/index column positions above the removed one.
     let shift = |c: &mut usize| {
         if *c > idx {
@@ -2237,10 +2535,18 @@ async fn alter_drop_column(db: &Session, def: &mut TableDef, name: &str) -> Resu
     for i in &mut def.indexes {
         i.cols.iter_mut().for_each(shift);
     }
-    if !puts.is_empty() {
-        db.commit_write(puts, vec![]).await?;
+    for foreign_key in &mut def.foreign_keys {
+        foreign_key.columns.iter_mut().for_each(shift);
     }
+    puts.push(bump_wcount(db, &def.name).await?);
+    db.commit_write(puts, deletes).await?;
     Ok(())
+}
+
+pub async fn rename_table(db: &Session, old: &str, new: &str) -> Result<QueryResult> {
+    let mut def = catalog::load(db, old).await?;
+    alter_rename_table(db, &mut def, new).await?;
+    Ok(QueryResult::Affected(0))
 }
 
 async fn alter_rename_table(db: &Session, def: &mut TableDef, new: &str) -> Result<()> {
@@ -2249,6 +2555,11 @@ async fn alter_rename_table(db: &Session, def: &mut TableDef, new: &str) -> Resu
     }
     let old = def.name.clone();
     def.name = new.to_string();
+    for foreign_key in &mut def.foreign_keys {
+        if foreign_key.ref_table.eq_ignore_ascii_case(&old) {
+            foreign_key.ref_table = new.to_string();
+        }
+    }
 
     let mut puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     let mut deletes: Vec<Vec<u8>> = Vec::new();
@@ -2304,16 +2615,40 @@ async fn alter_rename_table(db: &Session, def: &mut TableDef, new: &str) -> Resu
         }
     }
 
-    // Move catalog + meta counters.
+    // Move catalog + table-scoped metadata.
     deletes.push(catalog_key(&old));
     puts.push((catalog_key(new), def.encode()?));
-    if let Some(rc) = db.get(rowid_key(&old)).await? {
-        deletes.push(rowid_key(&old));
-        puts.push((rowid_key(new), rc));
+    // MySQL carries referencing foreign keys across a table rename. Update
+    // every child catalog in the same write so later DML never probes the old
+    // table name.
+    for table in catalog::list_tables(db).await? {
+        if table.eq_ignore_ascii_case(&old) {
+            continue;
+        }
+        let mut referencing = catalog::load(db, &table).await?;
+        let mut changed = false;
+        for foreign_key in &mut referencing.foreign_keys {
+            if foreign_key.ref_table.eq_ignore_ascii_case(&old) {
+                foreign_key.ref_table = new.to_string();
+                changed = true;
+            }
+        }
+        if changed {
+            puts.push((catalog_key(&table), referencing.encode()?));
+        }
     }
-    if let Some(wc) = db.get(wcount_key(&old)).await? {
-        deletes.push(wcount_key(&old));
-        puts.push((wcount_key(new), wc));
+    for key in [
+        rowid_key as fn(&str) -> Vec<u8>,
+        autoinc_key,
+        wcount_key,
+        stats_key,
+        partmeta_key,
+    ] {
+        let old_key = key(&old);
+        if let Some(value) = db.get(old_key.clone()).await? {
+            deletes.push(old_key);
+            puts.push((key(new), value));
+        }
     }
     db.commit_write(puts, deletes).await?;
     Ok(())
@@ -2468,6 +2803,104 @@ pub async fn create_index(db: &Session, ci: CreateIndex) -> Result<QueryResult> 
     Ok(QueryResult::Affected(0))
 }
 
+/// Rename a secondary index and rebuild its persisted keys under the new name.
+pub async fn rename_index(
+    db: &Session,
+    table: &str,
+    old_name: &str,
+    new_name: &str,
+) -> Result<QueryResult> {
+    let mut def = catalog::load(db, table).await?;
+    if def
+        .indexes
+        .iter()
+        .any(|index| index.name.eq_ignore_ascii_case(new_name))
+    {
+        return Err(Error::Catalog(format!("index already exists: {new_name}")));
+    }
+    let position = def
+        .indexes
+        .iter()
+        .position(|index| index.name.eq_ignore_ascii_case(old_name))
+        .ok_or_else(|| Error::Catalog(format!("unknown index: {old_name}")))?;
+    def.indexes[position].name = new_name.to_string();
+    let renamed = def.indexes[position].clone();
+
+    let deletes = collect_index_entry_keys(db, table, &[old_name]).await?;
+
+    let indexed_def = TableDef {
+        indexes: vec![renamed],
+        ..def.clone()
+    };
+    let rows = collect_matches(db, &def, None, None).await?;
+    let mut puts = vec![(catalog_key(table), def.encode()?)];
+    for (key, row) in rows {
+        puts.extend(index::entries_for_row(&indexed_def, &row, &key)?);
+    }
+    db.commit_write(puts, deletes).await?;
+    Ok(QueryResult::Affected(0))
+}
+
+/// Remove a secondary index definition and all of its persisted entries.
+pub async fn drop_index(db: &Session, table: &str, name: &str) -> Result<QueryResult> {
+    let mut def = catalog::load(db, table).await?;
+    let position = def
+        .indexes
+        .iter()
+        .position(|index| index.name.eq_ignore_ascii_case(name))
+        .ok_or_else(|| Error::Catalog(format!("unknown index: {name}")))?;
+    let removed = def.indexes.remove(position);
+
+    let deletes = collect_index_entry_keys(db, table, &[removed.name.as_str()]).await?;
+
+    db.commit_write(vec![(catalog_key(table), def.encode()?)], deletes)
+        .await?;
+    Ok(QueryResult::Affected(0))
+}
+
+async fn collect_index_entry_keys(
+    db: &Session,
+    table: &str,
+    index_names: &[&str],
+) -> Result<Vec<Vec<u8>>> {
+    let mut keys = Vec::new();
+    for index_name in index_names {
+        for prefix in [
+            index::index_scan_prefix(table, index_name),
+            index::indexnull_scan_prefix(table, index_name),
+        ] {
+            let mut cursor = None;
+            loop {
+                let batch = db.scan_batch(prefix.clone(), cursor.clone(), 4096).await?;
+                if batch.is_empty() {
+                    break;
+                }
+                let is_last = batch.len() < 4096;
+                cursor = batch.last().map(|(key, _)| key.clone());
+                keys.extend(batch.into_iter().map(|(key, _)| key));
+                if is_last {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(keys)
+}
+
+/// Remove a named foreign-key constraint without removing its supporting index.
+pub async fn drop_foreign_key(db: &Session, table: &str, name: &str) -> Result<QueryResult> {
+    let mut def = catalog::load(db, table).await?;
+    let position = def
+        .foreign_keys
+        .iter()
+        .position(|foreign_key| foreign_key.name.eq_ignore_ascii_case(name))
+        .ok_or_else(|| Error::Catalog(format!("unknown foreign key: {name}")))?;
+    def.foreign_keys.remove(position);
+    db.commit_write(vec![(catalog_key(table), def.encode()?)], Vec::new())
+        .await?;
+    Ok(QueryResult::Affected(0))
+}
+
 pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Result<QueryResult> {
     let name = table_ident(&ins.table_name)?;
     let def = catalog::load(db, &name).await?;
@@ -2498,7 +2931,16 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
         Some(expr_rows) => {
             let mut out = Vec::with_capacity(expr_rows.len());
             for exprs in expr_rows {
-                out.push(exprs.iter().map(eval_expr).collect::<Result<Vec<_>>>()?);
+                let mut row = Vec::with_capacity(exprs.len());
+                for expr in exprs {
+                    if expr_has_subquery(expr) {
+                        let resolved = resolve_subqueries(db, vindex, expr.clone()).await?;
+                        row.push(eval_expr(&resolved)?);
+                    } else {
+                        row.push(eval_expr(expr)?);
+                    }
+                }
+                out.push(row);
             }
             out
         }
@@ -2581,6 +3023,14 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
     } else {
         0
     };
+    let stored_auto_id = |row: &[Value]| {
+        let value = row.get(auto_col?)?;
+        match value {
+            Value::Int(id) => u64::try_from(*id).ok(),
+            Value::UInt(id) => Some(*id),
+            _ => None,
+        }
+    };
 
     let mut deletes: Vec<Vec<u8>> = Vec::new();
     let mut affected: u64 = 0;
@@ -2595,7 +3045,7 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
             let bound = bind_values(expr, insert, &def.schema);
             let v = predicate::eval_row(&bound, &def.schema, &merged)?;
             let col = &def.schema.columns[*idx];
-            merged[*idx] = coerce(v, &col.ty, &col.name)?;
+            merged[*idx] = coerce_for_session(db, v, &col.ty, &col.name)?;
         }
         Ok(merged)
     };
@@ -2603,8 +3053,11 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
     // Pass 1: build every row (coerce, defaults, AUTO_INCREMENT, generated,
     // NOT NULL) and its clustered key — no per-row storage reads.
     let mut built: Vec<(Vec<u8>, Vec<Value>)> = Vec::with_capacity(rows.len());
-    // First auto-generated id of this statement -> LAST_INSERT_ID() / OK packet.
-    let mut first_id: i64 = 0;
+    // LAST_INSERT_ID() retains the first generated value. The wire OK packet
+    // follows mysql_insert_id(): it prefers that generated value, but when no
+    // value was generated it reports the last explicit nonzero value stored in
+    // the AUTO_INCREMENT column.
+    let mut first_generated_id: i64 = 0;
     let checks = parse_checks(&def)?;
     let trigs = catalog::load_triggers(db, &name).await?;
     let before_ins: Vec<catalog::TriggerDef> = trigs
@@ -2629,7 +3082,7 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
         let mut row = vec![Value::Null; def.schema.columns.len()];
         for (slot, v) in target.iter().zip(vals) {
             let col = &def.schema.columns[*slot];
-            row[*slot] = coerce(v, &col.ty, &col.name)?;
+            row[*slot] = coerce_for_session(db, v, &col.ty, &col.name)?;
         }
 
         if has_meta {
@@ -2650,18 +3103,20 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
                     // Coerce to the column type so a UInt (BIGINT UNSIGNED) PK
                     // stores/looks up with the same key encoding as the value.
                     row[ai] = coerce(Value::Int(autoinc), &col.ty, &col.name)?;
-                    if first_id == 0 {
-                        first_id = autoinc;
+                    if first_generated_id == 0 {
+                        first_generated_id = autoinc;
                     }
                 } else {
-                    let n = match &row[ai] {
-                        Value::Int(n) => Some(*n),
-                        Value::UInt(u) => Some(*u as i64),
+                    let explicit_id = match &row[ai] {
+                        Value::Int(n) => u64::try_from(*n).ok(),
+                        Value::UInt(u) => Some(*u),
                         _ => None,
                     };
-                    if let Some(n) = n {
-                        if n > autoinc {
-                            autoinc = n;
+                    if let Some(explicit_id) = explicit_id {
+                        if let Ok(n) = i64::try_from(explicit_id) {
+                            if n > autoinc {
+                                autoinc = n;
+                            }
                         }
                     }
                 }
@@ -2702,6 +3157,10 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
         built.push((key, row));
     }
 
+    if on_dup && index::has_unique(&def) {
+        remap_unique_upsert_conflicts(db, &def, &mut built).await?;
+    }
+
     // Fast path: a plain INSERT (no IGNORE/REPLACE/ON DUPLICATE) into a PK
     // table outside a transaction detects duplicates inside the write
     // transaction itself (redb returns the previous value), avoiding any
@@ -2737,13 +3196,25 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
                 queue_after(db, &after_ins, &def.schema, Some(row), None)?;
             }
         }
-        db.set_last_insert_id(first_id);
-        return Ok(QueryResult::Affected(affected));
+        db.set_last_insert_id(first_generated_id);
+        return Ok(QueryResult::Insert {
+            affected_rows: affected,
+            last_insert_id: if first_generated_id != 0 {
+                first_generated_id as u64
+            } else {
+                built
+                    .iter()
+                    .rev()
+                    .find_map(|(_, row)| stored_auto_id(row))
+                    .unwrap_or(0)
+            },
+        });
     }
 
     // One batched existence read for the whole statement (PK tables) instead of
     // a read per row — the bulk-insert hot path.
-    let existing: Vec<Option<Vec<u8>>> = if has_pk {
+    let clustered_conflicts = has_pk || (on_dup && index::has_unique(&def));
+    let existing: Vec<Option<Vec<u8>>> = if clustered_conflicts {
         let keys: Vec<Vec<u8>> = built.iter().map(|(k, _)| k.clone()).collect();
         db.multi_get(keys).await?
     } else {
@@ -2752,7 +3223,7 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
 
     // Pass 2: apply INSERT / upsert semantics using the batched existence info.
     for (i, (key, row)) in built.into_iter().enumerate() {
-        if !has_pk {
+        if !clustered_conflicts {
             batch.push((key, row));
             affected += 1;
             continue;
@@ -2827,13 +3298,79 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
     puts.push(bump_wcount(db, &name).await?);
 
     db.commit_write(puts, deletes).await?;
-    db.set_last_insert_id(first_id);
+    db.set_last_insert_id(first_generated_id);
     if !after_ins.is_empty() {
         for (_, row) in &batch {
             queue_after(db, &after_ins, &def.schema, Some(row), None)?;
         }
     }
-    Ok(QueryResult::Affected(affected))
+    Ok(QueryResult::Insert {
+        affected_rows: affected,
+        last_insert_id: if first_generated_id != 0 {
+            first_generated_id as u64
+        } else {
+            batch
+                .iter()
+                .rev()
+                .find_map(|(_, row)| stored_auto_id(row))
+                .unwrap_or(0)
+        },
+    })
+}
+
+/// Point rows that collide with a unique secondary index at the owning
+/// clustered row. The normal duplicate-update pass can then merge them exactly
+/// like primary-key conflicts. The ownership map also covers collisions among
+/// rows in the same statement.
+async fn remap_unique_upsert_conflicts(
+    db: &Session,
+    def: &TableDef,
+    rows: &mut [(Vec<u8>, Vec<Value>)],
+) -> Result<()> {
+    let probes = rows
+        .iter()
+        .map(|(_, row)| index::unique_probe_keys(def, row))
+        .collect::<Result<Vec<_>>>()?;
+    let flat = probes.iter().flatten().cloned().collect::<Vec<Vec<u8>>>();
+    let stored = db.multi_get(flat.clone()).await?;
+    let mut owners = std::collections::HashMap::<Vec<u8>, Vec<u8>>::new();
+    for (probe, owner) in flat.into_iter().zip(stored) {
+        if let Some(owner) = owner {
+            owners.insert(probe, owner);
+        }
+    }
+
+    let clustered = if def.has_pk() {
+        db.multi_get(rows.iter().map(|(key, _)| key.clone()).collect())
+            .await?
+    } else {
+        vec![None; rows.len()]
+    };
+
+    for (((key, _), row_probes), stored_row) in rows.iter_mut().zip(probes).zip(clustered) {
+        let mut conflict = stored_row.map(|_| key.clone());
+        for probe in &row_probes {
+            let Some(owner) = owners.get(probe) else {
+                continue;
+            };
+            match &conflict {
+                Some(existing) if existing != owner => {
+                    return Err(Error::Duplicate(
+                        "upsert conflicts with more than one unique row".into(),
+                    ));
+                }
+                None => conflict = Some(owner.clone()),
+                Some(_) => {}
+            }
+        }
+        if let Some(owner) = conflict {
+            *key = owner;
+        }
+        for probe in row_probes {
+            owners.entry(probe).or_insert_with(|| key.clone());
+        }
+    }
+    Ok(())
 }
 
 /// Replace `VALUES(col)` references (MySQL ON DUPLICATE KEY UPDATE) with the
@@ -2889,22 +3426,8 @@ pub(crate) fn substitute_vars(sql: &str, env: &std::collections::HashMap<String,
     let mut i = 0;
     while i < cs.len() {
         let c = cs[i];
-        if c == '\'' {
-            out.push(c);
-            i += 1;
-            while i < cs.len() {
-                out.push(cs[i]);
-                if cs[i] == '\'' {
-                    if i + 1 < cs.len() && cs[i + 1] == '\'' {
-                        out.push(cs[i + 1]);
-                        i += 2;
-                        continue;
-                    }
-                    i += 1;
-                    break;
-                }
-                i += 1;
-            }
+        if matches!(c, '\'' | '"' | '`') {
+            i = copy_quoted_segment(&cs, i, &mut out);
             continue;
         }
         if c.is_ascii_alphabetic() || c == '_' {
@@ -2931,6 +3454,50 @@ pub(crate) fn substitute_vars(sql: &str, env: &std::collections::HashMap<String,
 
 /// Replace `@user` variable references with their SQL literals (unset = NULL),
 /// leaving `@@system` variables and string literals untouched.
+pub(crate) fn contains_uvar_reference(sql: &str) -> bool {
+    let bytes = sql.as_bytes();
+    let mut quote = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let byte = bytes[i];
+        if let Some(delimiter) = quote {
+            if byte == b'\\' && delimiter != b'`' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if byte == delimiter {
+                if bytes.get(i + 1) == Some(&delimiter) {
+                    i += 2;
+                    continue;
+                }
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+
+        if matches!(byte, b'\'' | b'"' | b'`') {
+            quote = Some(byte);
+            i += 1;
+            continue;
+        }
+        if byte == b'@' {
+            if bytes.get(i + 1) == Some(&b'@') {
+                i += 2;
+                continue;
+            }
+            if bytes
+                .get(i + 1)
+                .is_some_and(|next| next.is_ascii_alphanumeric() || *next == b'_')
+            {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
 pub(crate) fn substitute_uvars(
     sql: &str,
     vars: &std::collections::HashMap<String, Value>,
@@ -2940,22 +3507,8 @@ pub(crate) fn substitute_uvars(
     let mut i = 0;
     while i < cs.len() {
         let c = cs[i];
-        if c == '\'' {
-            out.push(c);
-            i += 1;
-            while i < cs.len() {
-                out.push(cs[i]);
-                if cs[i] == '\'' {
-                    if i + 1 < cs.len() && cs[i + 1] == '\'' {
-                        out.push(cs[i + 1]);
-                        i += 2;
-                        continue;
-                    }
-                    i += 1;
-                    break;
-                }
-                i += 1;
-            }
+        if matches!(c, '\'' | '"' | '`') {
+            i = copy_quoted_segment(&cs, i, &mut out);
             continue;
         }
         if c == '@' {
@@ -2982,6 +3535,31 @@ pub(crate) fn substitute_uvars(
         i += 1;
     }
     out
+}
+
+fn copy_quoted_segment(chars: &[char], start: usize, out: &mut String) -> usize {
+    let quote = chars[start];
+    out.push(quote);
+    let mut i = start + 1;
+    while i < chars.len() {
+        let current = chars[i];
+        out.push(current);
+        if current == '\\' && quote != '`' && i + 1 < chars.len() {
+            out.push(chars[i + 1]);
+            i += 2;
+            continue;
+        }
+        if current == quote {
+            if i + 1 < chars.len() && chars[i + 1] == quote {
+                out.push(chars[i + 1]);
+                i += 2;
+                continue;
+            }
+            return i + 1;
+        }
+        i += 1;
+    }
+    i
 }
 
 /// Render a value as a SQL literal (for splicing NEW/OLD into trigger bodies).
@@ -3215,18 +3793,22 @@ async fn check_fk_batch(
     batch: &[(Vec<u8>, Vec<Value>)],
 ) -> Result<()> {
     for fk in &def.foreign_keys {
-        let parent = catalog::load(db, &fk.ref_table).await?;
-        let mut probes = Vec::new();
+        let mut referenced_values = Vec::new();
         for (_, row) in batch {
             let vals: Vec<Value> = fk.columns.iter().map(|&i| row[i].clone()).collect();
             if vals.iter().any(|v| v.is_null()) {
                 continue; // a NULL in the referencing tuple is allowed
             }
-            probes.push(fk_probe_key(&parent, &fk.ref_columns, &vals)?);
+            referenced_values.push(vals);
         }
-        if probes.is_empty() {
+        if referenced_values.is_empty() {
             continue;
         }
+        let parent = catalog::load(db, &fk.ref_table).await?;
+        let probes = referenced_values
+            .iter()
+            .map(|values| fk_probe_key(&parent, &fk.ref_columns, values))
+            .collect::<Result<Vec<_>>>()?;
         for found in db.multi_get(probes).await? {
             if found.is_none() {
                 return Err(Error::ForeignKey(format!(
@@ -3777,22 +4359,15 @@ pub async fn select(
 
     // Aggregation / grouping path: parallel streaming aggregation (OLAP).
     if !group_by.is_empty() || aggregate::projection_has_aggregate(&select.projection) {
-        // HAVING may reference aggregates not in the SELECT list (e.g.
-        // `... GROUP BY x HAVING COUNT(*) > 1`). Compute them as hidden output
-        // columns, then drop them before returning.
-        let hidden = having_hidden_items(&select.projection, select.having.as_ref());
-        let aug_proj: Vec<sqlparser::ast::SelectItem>;
-        let proj: &[sqlparser::ast::SelectItem] = if hidden.is_empty() {
-            &select.projection
-        } else {
-            aug_proj = select
-                .projection
-                .iter()
-                .cloned()
-                .chain(hidden.iter().cloned())
-                .collect();
-            &aug_proj
-        };
+        // HAVING and ORDER BY may read grouped values that are not returned.
+        // Compute them as hidden output columns, then drop them before returning.
+        let (projection, hidden) = aggregate_projection_with_hidden(
+            &select.projection,
+            select.having.as_ref(),
+            &order_exprs,
+            &def.schema,
+        );
+        let proj = projection.as_slice();
         let plan = aggregate::build_plan(&def.schema, proj, &group_by)?;
         // If statistics predict more distinct groups than fit in memory, go
         // straight to the spilling partitioned aggregation instead of running the
@@ -3872,15 +4447,8 @@ pub async fn select(
         };
         let (mut schema, mut out_rows) = (schema, out_rows);
         out_rows = apply_having(select.having.as_ref(), proj, &schema, out_rows)?;
-        // Drop hidden HAVING-only aggregate columns from the result.
-        if !hidden.is_empty() {
-            let keep = schema.columns.len().saturating_sub(hidden.len());
-            schema.columns.truncate(keep);
-            for r in &mut out_rows {
-                r.truncate(keep);
-            }
-        }
         order_output_rows(&mut out_rows, &schema, &order_exprs)?;
+        truncate_hidden_columns(&mut schema, &mut out_rows, hidden);
         apply_offset_limit(&mut out_rows, offset, limit);
         return Ok(QueryResult::Rows(RowStream::literal(schema, out_rows)));
     }
@@ -4447,10 +5015,17 @@ async fn join_select(
     // Aggregation / grouping.
     if !group_by.is_empty() || aggregate::projection_has_aggregate(&select.projection) {
         // Aggregating and ordering materialised rows is pure CPU work.
+        let (projection, hidden) = aggregate_projection_with_hidden(
+            &select.projection,
+            select.having.as_ref(),
+            &order_exprs,
+            &schema,
+        );
         let (osch, orows) = cpu_bound(|| -> Result<(Schema, Vec<Vec<Value>>)> {
-            let (osch, orows) = aggregate::run(&schema, &select.projection, &group_by, rows)?;
-            let mut orows = apply_having(select.having.as_ref(), &select.projection, &osch, orows)?;
+            let (mut osch, orows) = aggregate::run(&schema, &projection, &group_by, rows)?;
+            let mut orows = apply_having(select.having.as_ref(), &projection, &osch, orows)?;
             order_output_rows(&mut orows, &osch, &order_exprs)?;
+            truncate_hidden_columns(&mut osch, &mut orows, hidden);
             apply_offset_limit(&mut orows, offset, limit);
             Ok((osch, orows))
         })?;
@@ -4494,8 +5069,8 @@ async fn streaming_nlj_select(
     }
     let twj = &select.from[0];
     if twj.joins.len() != 1
-        || !matches!(twj.relation, TableFactor::Table { .. })
-        || !matches!(twj.joins[0].relation, TableFactor::Table { .. })
+        || !stored_table_factor(&twj.relation)
+        || !stored_table_factor(&twj.joins[0].relation)
     {
         return Ok(None);
     }
@@ -4823,9 +5398,7 @@ async fn build_join_chain(
 ) -> Result<Option<JoinChain>> {
     // Something must be joined: either explicit JOINs on the first entry, or further
     // comma-separated tables.
-    if !matches!(twj.relation, TableFactor::Table { .. })
-        || (twj.joins.is_empty() && from.len() < 2)
-    {
+    if !stored_table_factor(&twj.relation) || (twj.joins.is_empty() && from.len() < 2) {
         return Ok(None);
     }
     let (_ddef, dcols) = resolve_table(db, &twj.relation).await?;
@@ -4835,7 +5408,7 @@ async fn build_join_chain(
 
     // --- Resolve pass: catalog only, no rows read. ---
     for join in &twj.joins {
-        if !matches!(join.relation, TableFactor::Table { .. }) {
+        if !stored_table_factor(&join.relation) {
             return Ok(None);
         }
         let (kind, on) = join_kind(&join.join_operator)?;
@@ -4918,7 +5491,7 @@ async fn build_join_chain(
     // unkeyed step -- the partners are materialised (bounded by their table size, as
     // the keyed steps already are) while the product, which is what explodes, is not.
     for extra in &from[1..] {
-        if !matches!(extra.relation, TableFactor::Table { .. }) || !extra.joins.is_empty() {
+        if !stored_table_factor(&extra.relation) || !extra.joins.is_empty() {
             // A derived table, or a comma entry that itself carries JOINs: leave the
             // whole query to the materialising path rather than half-handle it.
             return Ok(None);
@@ -5736,7 +6309,7 @@ fn projection_correlated_any(projection: &[sqlparser::ast::SelectItem], quals: &
 /// subqueries. Outer references in correlated subqueries become literals; the
 /// subquery's own columns are left untouched.
 fn bind_row(expr: &Expr, schema: &Schema, row: &[Value]) -> Expr {
-    map_expr(expr, &|e| {
+    bind_outer_references(expr, &[], &|e| {
         if let Expr::CompoundIdentifier(parts) = e {
             if parts.len() >= 2 {
                 let qual = format!(
@@ -5771,9 +6344,11 @@ async fn join_correlated_select(
     offset: usize,
     limit: Option<usize>,
 ) -> Result<QueryResult> {
-    if !group_by.is_empty() || aggregate::projection_has_aggregate(&select.projection) {
+    let aggregating =
+        !group_by.is_empty() || aggregate::projection_has_aggregate(&select.projection);
+    if aggregating && projection_has_subquery(&select.projection) {
         return Err(Error::Unsupported(
-            "correlated subqueries combined with aggregation over joins are not supported".into(),
+            "correlated subqueries in aggregate join projections are not supported".into(),
         ));
     }
 
@@ -5784,7 +6359,7 @@ async fn join_correlated_select(
     for row in rows {
         if let Some(f) = &raw_filter {
             let bound = bind_row(f, &schema, &row);
-            let resolved = resolve_subqueries(db, vindex, bound).await?;
+            let resolved = resolve_subqueries_with_outer(db, vindex, bound, &schema, &row).await?;
             if !predicate::matches(&resolved, &schema, &row)? {
                 continue;
             }
@@ -5792,9 +6367,32 @@ async fn join_correlated_select(
         kept.push(row);
     }
 
+    if aggregating {
+        let (out_schema, out_rows) = aggregate::run(&schema, &select.projection, &group_by, kept)?;
+        let mut out_rows = apply_having(
+            select.having.as_ref(),
+            &select.projection,
+            &out_schema,
+            out_rows,
+        )?;
+        let output_order =
+            resolve_output_order_expressions(&order_exprs, &select.projection, &out_schema);
+        order_output_rows(&mut out_rows, &out_schema, &output_order)?;
+        apply_offset_limit(&mut out_rows, offset, limit);
+        return Ok(QueryResult::Rows(RowStream::literal(out_schema, out_rows)));
+    }
+
     let resolved_order = resolve_order_aliases(&order_exprs, &select.projection, &schema);
     if !resolved_order.is_empty() {
-        sort_full_rows(&mut kept, &schema, &resolved_order, &db.cancel_token())?;
+        sort_rows_with_subqueries(
+            db,
+            vindex,
+            &mut kept,
+            &schema,
+            &resolved_order,
+            |expr, row| bind_row(expr, &schema, row),
+        )
+        .await?;
     }
     apply_offset_limit(&mut kept, offset, limit);
 
@@ -5804,48 +6402,94 @@ async fn join_correlated_select(
         return Ok(QueryResult::Rows(RowStream::literal(osch, out)));
     }
 
-    // Per-row projection with correlated SELECT-list subqueries.
+    // Build a projection plan once so wildcard expansion does not repeat for
+    // every joined row.
     use sqlparser::ast::SelectItem;
+    enum Projection<'a> {
+        Column(usize),
+        Expr(&'a Expr),
+    }
+
+    let mut projection = Vec::new();
+    let mut outcols = Vec::new();
+    let mut inferred = Vec::new();
+    for item in &select.projection {
+        match item {
+            SelectItem::Wildcard(_) => {
+                for (index, column) in schema.columns.iter().enumerate() {
+                    projection.push(Projection::Column(index));
+                    let mut column = column.clone();
+                    column.name = output_column_name(&column.name).to_owned();
+                    outcols.push(column);
+                }
+            }
+            SelectItem::QualifiedWildcard(object, _) => {
+                let qualifier = object
+                    .0
+                    .last()
+                    .map(|identifier| identifier.value.as_str())
+                    .unwrap_or_default();
+                let before = projection.len();
+                for (index, column) in schema.columns.iter().enumerate() {
+                    if let Some((column_qualifier, name)) = column.name.split_once('.') {
+                        if column_qualifier.eq_ignore_ascii_case(qualifier) {
+                            projection.push(Projection::Column(index));
+                            let mut column = column.clone();
+                            column.name = name.to_owned();
+                            outcols.push(column);
+                        }
+                    }
+                }
+                if projection.len() == before {
+                    return Err(Error::Unsupported(format!(
+                        "qualified wildcard {object}.* matched no relation"
+                    )));
+                }
+            }
+            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                let name = match item {
+                    SelectItem::ExprWithAlias { alias, .. } => alias.value.clone(),
+                    SelectItem::UnnamedExpr(expr) => ident_name(expr)
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| expr.to_string()),
+                    _ => unreachable!(),
+                };
+                inferred.push(projection.len());
+                projection.push(Projection::Expr(expr));
+                outcols.push(ColumnDef {
+                    name,
+                    ty: ColumnType::Text,
+                    nullable: true,
+                    collation: elyra_core::Collation::Ci,
+                });
+            }
+        }
+    }
+
     let mut out_rows: Vec<Vec<Value>> = Vec::with_capacity(kept.len());
     for row in &kept {
-        let mut vals = Vec::with_capacity(select.projection.len());
-        for item in &select.projection {
-            let expr = match item {
-                SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => e,
-                other => {
-                    return Err(Error::Unsupported(format!(
-                        "projection item not supported with correlated subquery: {other}"
-                    )))
+        let mut vals = Vec::with_capacity(projection.len());
+        for item in &projection {
+            match item {
+                Projection::Column(index) => vals.push(row[*index].clone()),
+                Projection::Expr(expr) => {
+                    let bound = bind_row(expr, &schema, row);
+                    let resolved =
+                        resolve_subqueries_with_outer(db, vindex, bound, &schema, row).await?;
+                    vals.push(predicate::eval_row(&resolved, &schema, row)?);
                 }
-            };
-            let bound = bind_row(expr, &schema, row);
-            let resolved = resolve_subqueries(db, vindex, bound).await?;
-            vals.push(predicate::eval_row(&resolved, &schema, row)?);
+            }
         }
         out_rows.push(vals);
     }
 
-    let mut outcols = Vec::with_capacity(select.projection.len());
-    for (ci, item) in select.projection.iter().enumerate() {
-        let name = match item {
-            SelectItem::ExprWithAlias { alias, .. } => alias.value.clone(),
-            SelectItem::UnnamedExpr(e) => ident_name(e)
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| e.to_string()),
-            _ => format!("col{ci}"),
-        };
-        let ty = out_rows
+    for index in inferred {
+        outcols[index].ty = out_rows
             .iter()
-            .map(|r| &r[ci])
+            .map(|row| &row[index])
             .find(|v| !v.is_null())
             .map(infer_val)
             .unwrap_or(ColumnType::Text);
-        outcols.push(ColumnDef {
-            name,
-            ty,
-            nullable: true,
-            collation: elyra_core::Collation::Ci,
-        });
     }
     Ok(QueryResult::Rows(RowStream::literal(
         Schema::new(outcols),
@@ -6132,6 +6776,59 @@ fn range_bounds(def: &TableDef, filter: Option<&Expr>) -> Result<Option<RangeQue
 }
 
 /// `col OP literal` (or `literal OP col`) -> `(col, op-relative-to-col, value)`.
+/// Where a coerced literal landed relative to the literal the query actually
+/// wrote. `None` when the two are not numerically comparable, in which case the
+/// caller must treat the coercion as exact (text/date/enum coercions, which are
+/// value-preserving in a way this check cannot see).
+fn numeric_rounding(original: &Value, coerced: &Value) -> Option<std::cmp::Ordering> {
+    if !matches!(original, Value::Float(_) | Value::Decimal(..)) {
+        return None;
+    }
+    coerced.compare(original)
+}
+
+/// Whether coercing the literal to the column's type preserved its value, so an
+/// index seek on the coerced key answers the same question the query asked.
+fn coercion_is_exact(original: &Value, coerced: &Value) -> bool {
+    !matches!(
+        numeric_rounding(original, coerced),
+        Some(std::cmp::Ordering::Less | std::cmp::Ordering::Greater)
+    )
+}
+
+/// Move a range bound into the column's domain without changing which rows it
+/// selects.
+///
+/// A bound literal is *compared*, not stored, so it must not be rounded the way
+/// an INSERT value is: on an `INT` key, `k > 1024.5` means `k >= 1025`, and
+/// rounding the bound to 1025 while keeping the strict `>` silently drops row
+/// 1025. When coercion moved the value, the bound's inclusivity is flipped to
+/// compensate. That is exact rather than approximate: coercion rounds to the
+/// *nearest* value the column can hold, so no representable value lies strictly
+/// between the literal and its coerced form.
+fn adjust_bound_op(
+    op: &sqlparser::ast::BinaryOperator,
+    original: &Value,
+    coerced: &Value,
+) -> sqlparser::ast::BinaryOperator {
+    use sqlparser::ast::BinaryOperator::*;
+    use std::cmp::Ordering;
+    match numeric_rounding(original, coerced) {
+        // Rounded up: `col > lit` and `col >= lit` are both `col >= coerced`,
+        // while `col < lit` and `col <= lit` are both `col < coerced`.
+        Some(Ordering::Greater) => match op {
+            Gt | GtEq => GtEq,
+            _ => Lt,
+        },
+        // Rounded down: the mirror image.
+        Some(Ordering::Less) => match op {
+            Gt | GtEq => Gt,
+            _ => LtEq,
+        },
+        _ => op.clone(),
+    }
+}
+
 fn as_range(
     def: &TableDef,
     expr: &Expr,
@@ -6149,20 +6846,21 @@ fn as_range(
             .iter()
             .position(|c| c.name.eq_ignore_ascii_case(n))
     };
-    let coerce_col = |col: usize, v: Value| {
+    let coerce_col = |col: usize, v: &Value| {
         let c = &def.schema.columns[col];
-        coerce(v, &c.ty, &c.name).ok()
+        coerce(v.clone(), &c.ty, &c.name).ok()
     };
     if let Some(col) = ident_name(left).and_then(col_of) {
         if let Ok(v) = eval_expr(right) {
-            if let Some(cv) = coerce_col(col, v) {
-                return Ok(Some((col, op.clone(), cv)));
+            if let Some(cv) = coerce_col(col, &v) {
+                let op = adjust_bound_op(op, &v, &cv);
+                return Ok(Some((col, op, cv)));
             }
         }
     }
     if let Some(col) = ident_name(right).and_then(col_of) {
         if let Ok(v) = eval_expr(left) {
-            if let Some(cv) = coerce_col(col, v) {
+            if let Some(cv) = coerce_col(col, &v) {
                 let flipped = match op {
                     Gt => Lt,
                     GtEq => LtEq,
@@ -6170,7 +6868,8 @@ fn as_range(
                     LtEq => GtEq,
                     _ => unreachable!(),
                 };
-                return Ok(Some((col, flipped, cv)));
+                let op = adjust_bound_op(&flipped, &v, &cv);
+                return Ok(Some((col, op, cv)));
             }
         }
     }
@@ -6198,8 +6897,19 @@ fn as_between(def: &TableDef, expr: &Expr) -> Result<Option<(usize, Value, Value
     };
     let c = &def.schema.columns[col];
     match (eval_expr(low), eval_expr(high)) {
-        (Ok(lo), Ok(hi)) => match (coerce(lo, &c.ty, &c.name), coerce(hi, &c.ty, &c.name)) {
-            (Ok(lo), Ok(hi)) => Ok(Some((col, lo, hi))),
+        (Ok(lo), Ok(hi)) => match (
+            coerce(lo.clone(), &c.ty, &c.name),
+            coerce(hi.clone(), &c.ty, &c.name),
+        ) {
+            // BETWEEN's bounds are inclusive on both ends and there is nowhere to
+            // record a flipped inclusivity, so a bound that coercion moved falls
+            // back to a scan (which re-applies the filter exactly) rather than
+            // shifting the range by one row.
+            (Ok(lo_c), Ok(hi_c))
+                if coercion_is_exact(&lo, &lo_c) && coercion_is_exact(&hi, &hi_c) =>
+            {
+                Ok(Some((col, lo_c, hi_c)))
+            }
             _ => Ok(None),
         },
         _ => Ok(None),
@@ -6412,7 +7122,7 @@ async fn build_from(
     let ordered: Vec<&TableWithJoins> = if from.len() > 1
         && from
             .iter()
-            .all(|t| t.joins.is_empty() && matches!(t.relation, TableFactor::Table { .. }))
+            .all(|t| t.joins.is_empty() && stored_table_factor(&t.relation))
     {
         let mut idx: Vec<(&TableWithJoins, u64)> = Vec::with_capacity(from.len());
         for t in from {
@@ -6469,7 +7179,7 @@ async fn build_from(
 
             // Index nested-loop join only applies to a plain (indexed) table
             // partner, not a derived table.
-            let nlj = if let TableFactor::Table { .. } = &join.relation {
+            let nlj = if stored_table_factor(&join.relation) {
                 let (pdef, pcols) = resolve_table(db, &join.relation).await?;
                 let partner_schema = Schema::new(pcols.clone());
                 on.as_ref()
@@ -7665,9 +8375,13 @@ fn eq_col_literal(def: &TableDef, filter: Option<&Expr>) -> Result<Option<(usize
     // Coerce the literal to the column's type so index/PK key encoding matches
     // the stored entries (e.g. a DATE column vs a '2024-01-01' text literal).
     let col = &def.schema.columns[idx];
-    match coerce(eval_expr(lit_expr)?, &col.ty, &col.name) {
-        Ok(v) => Ok(Some((idx, v))),
-        Err(_) => Ok(None),
+    let original = eval_expr(lit_expr)?;
+    match coerce(original.clone(), &col.ty, &col.name) {
+        // A literal the column cannot hold exactly (`k = 1024.5` on an INT key)
+        // matches nothing; seeking the rounded key would match the wrong row, so
+        // the lookup is declined and the scan's filter answers it.
+        Ok(v) if !v.is_null() && coercion_is_exact(&original, &v) => Ok(Some((idx, v))),
+        _ => Ok(None),
     }
 }
 
@@ -7730,10 +8444,9 @@ fn in_list_lookup(def: &TableDef, filter: Option<&Expr>) -> Result<Option<(usize
         //  - a column reference or expression would have to be evaluated per row,
         //    which is the thing being avoided;
         //  - a literal of a different type must be coerced before it is encoded as
-        //    a key, or the lookup silently finds nothing. PDO sends bound integers
-        //    as quoted strings, so `id IN ('1','2')` on an INT primary key is the
-        //    normal shape from Laravel, not an edge case -- without coercion it
-        //    returned zero rows while a scan returned two.
+        //    a key, or the lookup silently finds nothing. Clients can send bound
+        //    integers as quoted strings, so `id IN ('1','2')` on an INT primary
+        //    key must agree with the equivalent scan.
         let coldef = &def.schema.columns[col];
         let mut vals = Vec::with_capacity(list.len());
         let mut usable = true;
@@ -7743,8 +8456,14 @@ fn in_list_lookup(def: &TableDef, filter: Option<&Expr>) -> Result<Option<(usize
                 // of a non-match, which the residual filter re-applies -- so it can
                 // be skipped for lookup purposes.
                 Some(v) if v.is_null() => {}
-                Some(v) => match coerce(v, &coldef.ty, &coldef.name) {
-                    Ok(c) => vals.push(c),
+                Some(v) => match coerce(v.clone(), &coldef.ty, &coldef.name) {
+                    // As for `=`: a rounded key would match a row the literal does
+                    // not, so an inexact member sends the whole list to a scan.
+                    Ok(c) if coercion_is_exact(&v, &c) => vals.push(c),
+                    Ok(_) => {
+                        usable = false;
+                        break;
+                    }
                     // Not representable in the column's type: fall back to a scan
                     // rather than guess at the comparison semantics.
                     Err(_) => {
@@ -8381,6 +9100,9 @@ async fn collect_matches_inner(
     bail_on_wide_range: bool,
 ) -> Result<Option<Vec<(Vec<u8>, Vec<Value>)>>> {
     let mut out = Vec::new();
+    if limit == Some(0) {
+        return Ok(Some(out));
+    }
 
     let recheck = |row: &[Value]| -> Result<bool> {
         match filter {
@@ -8639,7 +9361,8 @@ async fn mutation_matches(
         let mut out = Vec::new();
         for (key, row) in all {
             let bound = bind_outer(f, qualifier, &def.schema, &row);
-            let resolved = resolve_subqueries(db, vindex, bound).await?;
+            let resolved =
+                resolve_subqueries_with_outer(db, vindex, bound, &def.schema, &row).await?;
             if predicate::matches(&resolved, &def.schema, &row)? {
                 out.push((key, row));
                 if let Some(l) = limit {
@@ -8662,8 +9385,15 @@ pub async fn update(
     table: &TableWithJoins,
     assignments: &[Assignment],
     selection: Option<&Expr>,
+    order_by: &[OrderByExpr],
+    limit: Option<usize>,
 ) -> Result<QueryResult> {
     if !table.joins.is_empty() {
+        if !order_by.is_empty() || limit.is_some() {
+            return Err(Error::Unsupported(
+                "ORDER BY / LIMIT is supported only for single-table UPDATE".into(),
+            ));
+        }
         return multi_update(db, vindex, table, assignments, selection).await;
     }
     let name = table_of(table)?;
@@ -8694,7 +9424,17 @@ pub async fn update(
         sets.push((idx, &a.value));
     }
 
-    let matches = mutation_matches(db, vindex, &def, &qualifier, selection, None).await?;
+    let mut matches = mutation_matches(db, vindex, &def, &qualifier, selection, None).await?;
+    if !order_by.is_empty() {
+        let order = order_by
+            .iter()
+            .map(|expr| (expr.expr.clone(), expr.asc.unwrap_or(true)))
+            .collect::<Vec<_>>();
+        sort_mutation_matches(&mut matches, &def.schema, &order, &db.cancel_token())?;
+    }
+    if let Some(limit) = limit {
+        matches.truncate(limit);
+    }
     let affected = matches.len() as u64;
 
     // Stored generated columns are recomputed after each update.
@@ -8735,12 +9475,12 @@ pub async fn update(
             // Assignment RHS may reference existing column values.
             let v = predicate::eval_row(expr, &def.schema, &old_row)?;
             let col = &def.schema.columns[*idx];
-            new_row[*idx] = coerce(v, &col.ty, &col.name)?;
+            new_row[*idx] = coerce_for_session(db, v, &col.ty, &col.name)?;
         }
         for (i, ge) in &generated {
             let v = predicate::eval_row(ge, &def.schema, &new_row)?;
             let col = &def.schema.columns[*i];
-            new_row[*i] = coerce(v, &col.ty, &col.name)?;
+            new_row[*i] = coerce_for_session(db, v, &col.ty, &col.name)?;
         }
         for t in &before_upd {
             apply_before_trigger(t, &def.schema, &mut new_row, Some(&old_row))?;
@@ -8815,7 +9555,12 @@ pub async fn update(
     Ok(QueryResult::Affected(affected))
 }
 
-pub async fn delete(db: &Session, vindex: &VectorRegistry, del: &Delete) -> Result<QueryResult> {
+pub async fn delete(
+    db: &Session,
+    vindex: &VectorRegistry,
+    del: &Delete,
+    limit_override: Option<usize>,
+) -> Result<QueryResult> {
     let relations = match &del.from {
         FromTable::WithFromKeyword(v) | FromTable::WithoutKeyword(v) => v,
     };
@@ -8827,10 +9572,12 @@ pub async fn delete(db: &Session, vindex: &VectorRegistry, del: &Delete) -> Resu
     let def = catalog::load(db, &name).await?;
     let qualifier = factor_qualifier(&relations[0].relation).unwrap_or_else(|| name.clone());
 
-    let limit = match &del.limit {
-        Some(e) => Some(eval_usize(e)?),
-        None => None,
-    };
+    let limit = del
+        .limit
+        .as_ref()
+        .map(eval_usize)
+        .transpose()?
+        .or(limit_override);
 
     let matches =
         mutation_matches(db, vindex, &def, &qualifier, del.selection.as_ref(), limit).await?;
@@ -9251,7 +9998,7 @@ async fn multi_update(
                 if &s.qual == qual {
                     let v = predicate::eval_row(s.expr, &schema, &joined)?;
                     let col = &info.def.schema.columns[s.col];
-                    new_base[s.col] = coerce(v, &col.ty, &col.name)?;
+                    new_base[s.col] = coerce_for_session(db, v, &col.ty, &col.name)?;
                 }
             }
             for (i, col) in info.def.schema.columns.iter().enumerate() {
@@ -9385,7 +10132,7 @@ fn ident_name(e: &Expr) -> Option<&str> {
     }
 }
 
-fn eval_usize(e: &Expr) -> Result<usize> {
+pub(crate) fn eval_usize(e: &Expr) -> Result<usize> {
     match eval_expr(e)? {
         Value::Int(i) if i >= 0 => Ok(i as usize),
         other => Err(Error::Query(format!(
@@ -9406,6 +10153,66 @@ fn order_ordinal(e: &Expr) -> Option<usize> {
             n.parse::<usize>().ok().filter(|&x| x >= 1)
         }
         _ => None,
+    }
+}
+
+fn projected_order_expr(
+    name: &str,
+    projection: &[sqlparser::ast::SelectItem],
+    schema: &Schema,
+) -> Option<Expr> {
+    use sqlparser::ast::{Ident, SelectItem};
+
+    let source_expr = |column: &str| {
+        let parts = column.split('.').map(Ident::new).collect::<Vec<_>>();
+        match parts.as_slice() {
+            [identifier] => Expr::Identifier(identifier.clone()),
+            _ => Expr::CompoundIdentifier(parts),
+        }
+    };
+    let mut matches = Vec::new();
+    for item in projection {
+        match item {
+            SelectItem::Wildcard(_) => {
+                matches.extend(
+                    schema
+                        .columns
+                        .iter()
+                        .filter(|column| {
+                            output_column_name(&column.name).eq_ignore_ascii_case(name)
+                        })
+                        .map(|column| source_expr(&column.name)),
+                );
+            }
+            SelectItem::QualifiedWildcard(object, _) => {
+                let qualifier = object
+                    .0
+                    .last()
+                    .map(|identifier| identifier.value.as_str())
+                    .unwrap_or_default();
+                matches.extend(schema.columns.iter().filter_map(|column| {
+                    let (column_qualifier, column_name) = column.name.split_once('.')?;
+                    (column_qualifier.eq_ignore_ascii_case(qualifier)
+                        && column_name.eq_ignore_ascii_case(name))
+                    .then(|| source_expr(&column.name))
+                }));
+            }
+            SelectItem::UnnamedExpr(expr) => {
+                if ident_name(expr).is_some_and(|output| output.eq_ignore_ascii_case(name)) {
+                    matches.push(expr.clone());
+                }
+            }
+            SelectItem::ExprWithAlias { expr, alias } => {
+                if alias.value.eq_ignore_ascii_case(name) {
+                    matches.push(expr.clone());
+                }
+            }
+        }
+    }
+    if matches.len() == 1 {
+        matches.pop()
+    } else {
+        None
     }
 }
 
@@ -9432,16 +10239,40 @@ fn resolve_order_aliases(
                     .iter()
                     .any(|c| c.name.eq_ignore_ascii_case(name));
                 if !is_column {
-                    for item in projection {
-                        if let SelectItem::ExprWithAlias { expr, alias } = item {
-                            if alias.value.eq_ignore_ascii_case(name) {
-                                return (expr.clone(), *asc);
-                            }
-                        }
+                    if let Some(expr) = projected_order_expr(name, projection, schema) {
+                        return (expr, *asc);
                     }
                 }
             }
             (e.clone(), *asc)
+        })
+        .collect()
+}
+
+fn resolve_output_order_expressions(
+    order: &[(Expr, bool)],
+    projection: &[sqlparser::ast::SelectItem],
+    output_schema: &Schema,
+) -> Vec<(Expr, bool)> {
+    use sqlparser::ast::{Ident, SelectItem};
+
+    order
+        .iter()
+        .map(|(order_expr, ascending)| {
+            let output_name = projection.iter().enumerate().find_map(|(index, item)| {
+                let projected_expr = match item {
+                    SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => expr,
+                    _ => return None,
+                };
+                (projected_expr == order_expr)
+                    .then(|| output_schema.columns.get(index))
+                    .flatten()
+                    .map(|column| column.name.clone())
+            });
+            match output_name {
+                Some(name) => (Expr::Identifier(Ident::new(name)), *ascending),
+                None => (order_expr.clone(), *ascending),
+            }
         })
         .collect()
 }
@@ -9476,7 +10307,7 @@ fn project_exprs(
         match item {
             SelectItem::Wildcard(_) => {
                 for (i, c) in schema.columns.iter().enumerate() {
-                    names.push(c.name.clone());
+                    names.push(output_column_name(&c.name).to_owned());
                     projs.push(Proj::Col(i));
                 }
             }
@@ -9486,9 +10317,9 @@ fn project_exprs(
                 let qual = obj.0.last().map(|i| i.value.clone()).unwrap_or_default();
                 let mut matched = false;
                 for (i, c) in schema.columns.iter().enumerate() {
-                    if let Some((q, _)) = c.name.split_once('.') {
+                    if let Some((q, name)) = c.name.split_once('.') {
                         if q.eq_ignore_ascii_case(&qual) {
-                            names.push(c.name.clone());
+                            names.push(name.to_owned());
                             projs.push(Proj::Col(i));
                             matched = true;
                         }
@@ -9565,6 +10396,10 @@ fn project_exprs(
     Ok((Schema::new(cols), out_rows))
 }
 
+fn output_column_name(name: &str) -> &str {
+    name.split_once('.').map_or(name, |(_, column)| column)
+}
+
 /// The (qualified) name of a plain column reference, if `e` is one.
 fn col_ref_name(e: &Expr) -> Option<String> {
     match e {
@@ -9584,6 +10419,7 @@ fn infer_val(v: &Value) -> ColumnType {
     match v {
         Value::Bool(_) => ColumnType::Bool,
         Value::Int(_) => ColumnType::Int,
+        Value::UInt(_) => ColumnType::UInt,
         Value::Float(_) => ColumnType::Float,
         Value::Bytes(_) => ColumnType::Bytes,
         Value::Vector(x) => ColumnType::Vector(x.len() as u32),
@@ -9632,6 +10468,71 @@ fn having_hidden_items(
         out.push(SelectItem::ExprWithAlias { expr: a, alias });
     }
     out
+}
+
+/// Add projection columns needed only to evaluate HAVING or ORDER BY after
+/// grouping. MySQL permits ORDER BY to reference a representative source value
+/// that is not returned when full-group enforcement is disabled.
+fn aggregate_projection_with_hidden(
+    projection: &[sqlparser::ast::SelectItem],
+    having: Option<&Expr>,
+    order: &[(Expr, bool)],
+    source_schema: &Schema,
+) -> (Vec<sqlparser::ast::SelectItem>, usize) {
+    use sqlparser::ast::SelectItem;
+
+    let mut augmented = projection.to_vec();
+    augmented.extend(having_hidden_items(projection, having));
+    let resolved_order = resolve_order_aliases(order, projection, source_schema);
+
+    for ((original, _), (resolved, _)) in order.iter().zip(resolved_order) {
+        if order_ordinal(original).is_some()
+            || projection_exposes_order_expr(&augmented, original, &resolved)
+        {
+            continue;
+        }
+        augmented.push(SelectItem::UnnamedExpr(resolved));
+    }
+
+    let hidden = augmented.len().saturating_sub(projection.len());
+    (augmented, hidden)
+}
+
+fn projection_exposes_order_expr(
+    projection: &[sqlparser::ast::SelectItem],
+    original: &Expr,
+    resolved: &Expr,
+) -> bool {
+    use sqlparser::ast::SelectItem;
+
+    let original_name = ident_name(original);
+    projection.iter().any(|item| match item {
+        SelectItem::Wildcard(_) => ident_name(resolved).is_some(),
+        SelectItem::QualifiedWildcard(_, _) => false,
+        SelectItem::UnnamedExpr(expr) => {
+            expr == original
+                || expr == resolved
+                || original_name.is_some_and(|name| {
+                    ident_name(expr).is_some_and(|output| output.eq_ignore_ascii_case(name))
+                })
+        }
+        SelectItem::ExprWithAlias { expr, alias } => {
+            expr == original
+                || expr == resolved
+                || original_name.is_some_and(|name| alias.value.eq_ignore_ascii_case(name))
+        }
+    })
+}
+
+fn truncate_hidden_columns(schema: &mut Schema, rows: &mut [Vec<Value>], hidden: usize) {
+    if hidden == 0 {
+        return;
+    }
+    let visible = schema.columns.len().saturating_sub(hidden);
+    schema.columns.truncate(visible);
+    for row in rows {
+        row.truncate(visible);
+    }
 }
 
 /// Collect aggregate-function sub-expressions (not recursing into their args).
@@ -9887,6 +10788,8 @@ async fn window_select(
     // is needed: the item either *is* a window expression, whose value is already
     // computed per row, or contains none at all.
     enum Out<'a> {
+        /// A source column expanded from `*` or `relation.*`.
+        Column(usize),
         /// The item is exactly window expression `k`: take the precomputed value.
         Window(usize),
         /// The item contains no window function: evaluate it against the row.
@@ -9895,34 +10798,93 @@ async fn window_select(
         /// substitute and evaluate, as before.
         Mixed(&'a Expr),
     }
-    let mut plan: Vec<Out> = Vec::with_capacity(select.projection.len());
+    struct PlannedOut<'a> {
+        name: String,
+        source_column: Option<usize>,
+        evaluator: Out<'a>,
+    }
+    let mut plan: Vec<PlannedOut<'_>> = Vec::with_capacity(select.projection.len());
     for item in &select.projection {
+        match item {
+            SelectItem::Wildcard(_) => {
+                plan.extend(
+                    schema
+                        .columns
+                        .iter()
+                        .enumerate()
+                        .map(|(index, column)| PlannedOut {
+                            name: output_column_name(&column.name).to_owned(),
+                            source_column: Some(index),
+                            evaluator: Out::Column(index),
+                        }),
+                );
+                continue;
+            }
+            SelectItem::QualifiedWildcard(object, _) => {
+                let qualifier = object
+                    .0
+                    .last()
+                    .map(|identifier| identifier.value.as_str())
+                    .unwrap_or_default();
+                let relation_matches = select.from.len() == 1
+                    && select.from[0].joins.is_empty()
+                    && factor_qualifier(&select.from[0].relation)
+                        .is_some_and(|relation| relation.eq_ignore_ascii_case(qualifier));
+                if !relation_matches {
+                    return Err(Error::Unsupported(format!(
+                        "qualified wildcard {object}.* matched no relation"
+                    )));
+                }
+                plan.extend(
+                    schema
+                        .columns
+                        .iter()
+                        .enumerate()
+                        .map(|(index, column)| PlannedOut {
+                            name: output_column_name(&column.name).to_owned(),
+                            source_column: Some(index),
+                            evaluator: Out::Column(index),
+                        }),
+                );
+                continue;
+            }
+            SelectItem::UnnamedExpr(_) | SelectItem::ExprWithAlias { .. } => {}
+        }
         let expr = match item {
             SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => e,
-            other => {
-                return Err(Error::Unsupported(format!(
-                    "projection item not supported with window functions: {other}"
-                )))
-            }
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => unreachable!(),
         };
-        if let Some(k) = win_values.iter().position(|(we, _)| we == expr) {
-            plan.push(Out::Window(k));
+        let evaluator = if let Some(k) = win_values.iter().position(|(we, _)| we == expr) {
+            Out::Window(k)
         } else {
             let mut nested = Vec::new();
             collect_window_exprs(expr, &mut nested);
-            plan.push(if nested.is_empty() {
+            if nested.is_empty() {
                 Out::Plain(expr)
             } else {
                 Out::Mixed(expr)
-            });
-        }
+            }
+        };
+        let name = match item {
+            SelectItem::ExprWithAlias { alias, .. } => alias.value.clone(),
+            SelectItem::UnnamedExpr(expr) => ident_name(expr)
+                .map(str::to_owned)
+                .unwrap_or_else(|| expr.to_string()),
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => unreachable!(),
+        };
+        plan.push(PlannedOut {
+            name,
+            source_column: None,
+            evaluator,
+        });
     }
 
     let mut out_rows: Vec<Vec<Value>> = Vec::with_capacity(rows.len());
     for (i, row) in rows.iter().enumerate() {
         let mut vals = Vec::with_capacity(plan.len());
-        for out in &plan {
-            vals.push(match out {
+        for planned in &plan {
+            vals.push(match &planned.evaluator {
+                Out::Column(index) => row[*index].clone(),
                 Out::Window(k) => win_values[*k].1[i].clone(),
                 Out::Plain(e) => predicate::eval_row(e, schema, row)?,
                 Out::Mixed(e) => {
@@ -9940,26 +10902,24 @@ async fn window_select(
     }
 
     // Output schema (names + inferred types).
-    let mut cols = Vec::with_capacity(select.projection.len());
-    for (ci, item) in select.projection.iter().enumerate() {
-        let name = match item {
-            SelectItem::ExprWithAlias { alias, .. } => alias.value.clone(),
-            SelectItem::UnnamedExpr(e) => ident_name(e)
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| e.to_string()),
-            _ => format!("col{ci}"),
-        };
-        let ty = out_rows
-            .iter()
-            .map(|r| &r[ci])
-            .find(|v| !v.is_null())
-            .map(infer_val)
-            .unwrap_or(ColumnType::Text);
+    let mut cols = Vec::with_capacity(plan.len());
+    for (column_index, planned) in plan.iter().enumerate() {
+        let source = planned
+            .source_column
+            .and_then(|index| schema.columns.get(index));
+        let ty = source.map(|column| column.ty.clone()).unwrap_or_else(|| {
+            out_rows
+                .iter()
+                .map(|row| &row[column_index])
+                .find(|value| !value.is_null())
+                .map(infer_val)
+                .unwrap_or(ColumnType::Text)
+        });
         cols.push(ColumnDef {
-            name,
+            name: planned.name.clone(),
             ty,
-            nullable: true,
-            collation: elyra_core::Collation::Ci,
+            nullable: source.is_none_or(|column| column.nullable),
+            collation: source.map_or(elyra_core::Collation::Ci, |column| column.collation),
         });
     }
     let out_schema = Schema::new(cols);
@@ -11027,7 +11987,7 @@ async fn correlated_select(
 
     for row in all {
         let bound = bind_outer(corr_filter, outer, &def.schema, &row);
-        let resolved = resolve_subqueries(db, vindex, bound).await?;
+        let resolved = resolve_subqueries_with_outer(db, vindex, bound, &def.schema, &row).await?;
         if predicate::matches(&resolved, &def.schema, &row)? {
             matched.push(row);
         }
@@ -11043,7 +12003,15 @@ async fn correlated_select(
 
     let resolved = resolve_order_aliases(order_exprs, &select.projection, &def.schema);
     if !resolved.is_empty() {
-        sort_full_rows(&mut matched, &def.schema, &resolved, &db.cancel_token())?;
+        sort_rows_with_subqueries(
+            db,
+            vindex,
+            &mut matched,
+            &def.schema,
+            &resolved,
+            |expr, row| bind_outer(expr, outer, &def.schema, row),
+        )
+        .await?;
     }
     apply_offset_limit(&mut matched, offset, limit);
 
@@ -11070,7 +12038,8 @@ async fn correlated_select(
                 }
             };
             let bound = bind_outer(expr, outer, &def.schema, row);
-            let resolved = resolve_subqueries(db, vindex, bound).await?;
+            let resolved =
+                resolve_subqueries_with_outer(db, vindex, bound, &def.schema, row).await?;
             vals.push(predicate::eval_row(&resolved, &def.schema, row)?);
         }
         out_rows.push(vals);
@@ -11120,10 +12089,11 @@ async fn correlated_select(
     )))
 }
 
-/// Rewrite outer column references (`outer.col`, or a bare outer column) in
-/// `expr` to literals from `row`, including inside subqueries.
+/// Rewrite qualified outer column references (`outer.col`) in `expr` to
+/// literals from `row`, including inside subqueries. Bare names remain bound
+/// to the innermost query scope.
 fn bind_outer(expr: &Expr, outer: &str, schema: &Schema, row: &[Value]) -> Expr {
-    map_expr(expr, &|e| match e {
+    bind_outer_references(expr, &[], &|e| match e {
         Expr::CompoundIdentifier(parts) if parts.len() >= 2 => {
             let tbl = &parts[parts.len() - 2].value;
             let col = &parts[parts.len() - 1].value;
@@ -11137,13 +12107,139 @@ fn bind_outer(expr: &Expr, outer: &str, schema: &Schema, row: &[Value]) -> Expr 
                 None
             }
         }
-        Expr::Identifier(id) => schema
-            .columns
-            .iter()
-            .position(|c| c.name.eq_ignore_ascii_case(&id.value))
-            .map(|i| value_to_expr(&row[i])),
         _ => None,
     })
+}
+
+/// Bind qualified references while respecting relation names introduced by
+/// nested query scopes. A local relation shadows an outer relation with the
+/// same qualifier.
+fn bind_outer_references(
+    expr: &Expr,
+    shadowed: &[String],
+    bind: &dyn Fn(&Expr) -> Option<Expr>,
+) -> Expr {
+    map_expr(expr, &|candidate| match candidate {
+        Expr::Subquery(query) => Some(Expr::Subquery(Box::new(bind_outer_query(
+            query, shadowed, bind,
+        )))),
+        Expr::InSubquery {
+            expr,
+            subquery,
+            negated,
+        } => Some(Expr::InSubquery {
+            expr: Box::new(bind_outer_references(expr, shadowed, bind)),
+            subquery: Box::new(bind_outer_query(subquery, shadowed, bind)),
+            negated: *negated,
+        }),
+        Expr::Exists { subquery, negated } => Some(Expr::Exists {
+            subquery: Box::new(bind_outer_query(subquery, shadowed, bind)),
+            negated: *negated,
+        }),
+        Expr::CompoundIdentifier(parts)
+            if parts.len() >= 2
+                && shadowed.iter().any(|qualifier| {
+                    qualifier.eq_ignore_ascii_case(&parts[parts.len() - 2].value)
+                }) =>
+        {
+            Some(candidate.clone())
+        }
+        _ => bind(candidate),
+    })
+}
+
+fn bind_outer_query(
+    query: &SqlQuery,
+    inherited_shadowing: &[String],
+    bind: &dyn Fn(&Expr) -> Option<Expr>,
+) -> SqlQuery {
+    let mut shadowed = inherited_shadowing.to_vec();
+    if let SetExpr::Select(select) = query.body.as_ref() {
+        shadowed.extend(join_qualifiers(&select.from));
+    }
+    rewrite_query(query, &|expr| {
+        Some(bind_outer_references(expr, &shadowed, bind))
+    })
+}
+
+/// Resolve subqueries after qualified correlation has been bound. If an inner
+/// scope does not own a bare column, retry that name against the immediate
+/// outer row. A name that resolves in the inner scope never reaches this path,
+/// preserving the usual nearest-scope precedence.
+async fn resolve_subqueries_with_outer(
+    db: &Session,
+    vindex: &VectorRegistry,
+    expr: Expr,
+    outer_schema: &Schema,
+    outer_row: &[Value],
+) -> Result<Expr> {
+    let mut bound = expr;
+    let mut rebound = Vec::new();
+    loop {
+        match resolve_subqueries(db, vindex, bound.clone()).await {
+            Ok(resolved) => return Ok(resolved),
+            Err(error) => {
+                let Some(column) = bare_unknown_column(&error).map(str::to_owned) else {
+                    return Err(error);
+                };
+                if rebound
+                    .iter()
+                    .any(|name: &String| name.eq_ignore_ascii_case(&column))
+                {
+                    return Err(error);
+                }
+                let index = match predicate::resolve_index(&column, outer_schema) {
+                    Ok(index) => index,
+                    Err(Error::Catalog(_)) => return Err(error),
+                    Err(error) => return Err(error),
+                };
+                let value = value_to_expr(&outer_row[index]);
+                bound = map_expr(&bound, &|candidate| match candidate {
+                    Expr::Identifier(identifier)
+                        if identifier.value.eq_ignore_ascii_case(&column) =>
+                    {
+                        Some(value.clone())
+                    }
+                    _ => None,
+                });
+                rebound.push(column);
+            }
+        }
+    }
+}
+
+fn bare_unknown_column(error: &Error) -> Option<&str> {
+    let Error::Catalog(message) = error else {
+        return None;
+    };
+    let column = message.strip_prefix("unknown column: ")?;
+    (!column.contains('.')).then_some(column)
+}
+
+async fn sort_rows_with_subqueries(
+    db: &Session,
+    vindex: &VectorRegistry,
+    rows: &mut [Vec<Value>],
+    schema: &Schema,
+    order: &[(Expr, bool)],
+    bind: impl Fn(&Expr, &[Value]) -> Expr,
+) -> Result<()> {
+    let mut check = db.cancel_check();
+    let mut keyed = Vec::with_capacity(rows.len());
+    for (position, row) in rows.iter().enumerate() {
+        check.tick()?;
+        let mut keys = Vec::with_capacity(order.len());
+        for (expr, _) in order {
+            let bound = bind(expr, row);
+            let resolved = resolve_subqueries_with_outer(db, vindex, bound, schema, row).await?;
+            keys.push(predicate::eval_row(&resolved, schema, row)?);
+        }
+        keyed.push((keys, position));
+    }
+    let collations = order_key_collations(order, schema);
+    sort_keyed_coll(&mut keyed, order, &collations);
+    reorder(rows, &keyed);
+    Ok(())
 }
 
 /// Materialise a subquery's rows by executing it through the query engine.
@@ -11182,7 +12278,7 @@ async fn run_subquery_capped(
             }
             Ok(rows)
         }
-        QueryResult::Affected(_) => Ok(Vec::new()),
+        QueryResult::Affected(_) | QueryResult::Insert { .. } => Ok(Vec::new()),
     }
 }
 
@@ -11303,7 +12399,9 @@ async fn run_subquery_schema(
             }
             Ok((schema, rows))
         }
-        QueryResult::Affected(_) => Ok((Schema::new(Vec::new()), Vec::new())),
+        QueryResult::Affected(_) | QueryResult::Insert { .. } => {
+            Ok((Schema::new(Vec::new()), Vec::new()))
+        }
     }
 }
 
@@ -13378,6 +14476,7 @@ fn agg_needed_mask(schema: &Schema, filter: Option<&Expr>, plan: &AggPlan) -> Op
     // arg_exprs, so they must be added explicitly or the scan would decode
     // them as NULL and silently produce wrong aggregates.
     refs.extend(plan.agg_input_cols());
+    refs.extend(plan.sample_input_cols());
     let mut mask = vec![false; schema.columns.len()];
     for i in refs {
         if i < mask.len() {
@@ -13543,6 +14642,34 @@ fn sort_full_rows(
     let colls = order_key_collations(order, schema);
     sort_keyed_coll(&mut keyed, order, &colls);
     reorder(rows, &keyed);
+    Ok(())
+}
+
+fn sort_mutation_matches(
+    rows: &mut [(Vec<u8>, Vec<Value>)],
+    schema: &Schema,
+    order: &[(Expr, bool)],
+    cancel: &std::sync::Arc<elyra_core::cancel::QueryCancel>,
+) -> Result<()> {
+    let mut check = elyra_core::cancel::CancelCheck::new(cancel.clone());
+    let mut keyed = Vec::with_capacity(rows.len());
+    for (position, (_, row)) in rows.iter().enumerate() {
+        check.tick()?;
+        let keys = order
+            .iter()
+            .map(|(expr, _)| predicate::eval_row(expr, schema, row))
+            .collect::<Result<Vec<_>>>()?;
+        keyed.push((keys, position));
+    }
+    let collations = order_key_collations(order, schema);
+    sort_keyed_coll(&mut keyed, order, &collations);
+    let reordered = keyed
+        .iter()
+        .map(|(_, position)| rows[*position].clone())
+        .collect::<Vec<_>>();
+    for (slot, row) in rows.iter_mut().zip(reordered) {
+        *slot = row;
+    }
     Ok(())
 }
 
@@ -13833,6 +14960,14 @@ fn source_rows(source: &SqlQuery) -> Result<Option<&[Vec<sqlparser::ast::Expr>]>
 
 /// Coerce a literal value to a column's declared type.
 fn coerce(v: Value, ty: &ColumnType, col: &str) -> Result<Value> {
+    coerce_with_mode(v, ty, col, true)
+}
+
+fn coerce_for_session(db: &Session, v: Value, ty: &ColumnType, col: &str) -> Result<Value> {
+    coerce_with_mode(v, ty, col, db.strict_sql_mode())
+}
+
+fn coerce_with_mode(v: Value, ty: &ColumnType, col: &str, strict: bool) -> Result<Value> {
     if v.is_null() {
         return Ok(Value::Null);
     }
@@ -13841,19 +14976,34 @@ fn coerce(v: Value, ty: &ColumnType, col: &str) -> Result<Value> {
         (ColumnType::Int, Value::Bool(b)) => Value::Int(b as i64),
         (ColumnType::Float, Value::Int(i)) => Value::Float(i as f64),
         (ColumnType::Float, Value::Float(f)) => Value::Float(f),
+        (ColumnType::Float, Value::Decimal(units, scale)) => {
+            Value::Float(units as f64 / 10f64.powi(scale as i32))
+        }
         (ColumnType::Bool, Value::Bool(b)) => Value::Bool(b),
         (ColumnType::Bool, Value::Int(i)) => Value::Bool(i != 0),
         (ColumnType::Text, Value::Text(s)) => Value::Text(s),
         (ColumnType::Bytes, Value::Text(s)) => Value::Bytes(s.into_bytes()),
         (ColumnType::Bytes, Value::Bytes(b)) => Value::Bytes(b),
         (ColumnType::Date, Value::Date(d)) => Value::Date(d),
-        (ColumnType::Date, Value::Text(s)) => elyra_core::datetime::parse_date(&s)
-            .map(Value::Date)
-            .ok_or_else(|| Error::Type(format!("invalid DATE literal: {s}")))?,
+        (ColumnType::Date, Value::Text(s)) => {
+            match elyra_core::datetime::parse_date(&s).or_else(|| {
+                // MySQL accepts a valid datetime-shaped string for a DATE
+                // column and stores its date component. Client libraries can
+                // bind date values in this form.
+                elyra_core::datetime::parse_datetime(&s)
+                    .map(|micros| micros.div_euclid(86_400_000_000) as i32)
+            }) {
+                Some(date) => Value::Date(date),
+                None if !strict => Value::Text("0000-00-00".into()),
+                None => return Err(Error::Type(format!("invalid DATE literal: {s}"))),
+            }
+        }
         (ColumnType::DateTime, Value::DateTime(t)) => Value::DateTime(t),
-        (ColumnType::DateTime, Value::Text(s)) => elyra_core::datetime::parse_datetime(&s)
-            .map(Value::DateTime)
-            .ok_or_else(|| Error::Type(format!("invalid DATETIME literal: {s}")))?,
+        (ColumnType::DateTime, Value::Text(s)) => match elyra_core::datetime::parse_datetime(&s) {
+            Some(datetime) => Value::DateTime(datetime),
+            None if !strict => Value::Text("0000-00-00 00:00:00".into()),
+            None => return Err(Error::Type(format!("invalid DATETIME literal: {s}"))),
+        },
         (ColumnType::Decimal(_, sc), Value::Text(s)) => elyra_core::value::parse_decimal(&s, *sc)
             .map(|(u, s)| Value::Decimal(u, s))
             .ok_or_else(|| Error::Type(format!("invalid DECIMAL literal: {s}")))?,
@@ -13867,17 +15017,16 @@ fn coerce(v: Value, ty: &ColumnType, col: &str) -> Result<Value> {
         }
         (ColumnType::Decimal(_, sc), Value::Decimal(u, s)) => {
             // Rescale to the column's declared scale.
-            let v = if s <= *sc {
-                u * 10i128.pow((*sc - s) as u32)
-            } else {
-                u / 10i128.pow((s - *sc) as u32)
-            };
+            let v = elyra_core::value::rescale_decimal(u, s, *sc)
+                .ok_or_else(|| Error::Type(format!("DECIMAL value is out of range for {col}")))?;
             Value::Decimal(v, *sc)
         }
         (ColumnType::Time, Value::Time(t)) => Value::Time(t),
-        (ColumnType::Time, Value::Text(s)) => elyra_core::datetime::parse_time(&s)
-            .map(Value::Time)
-            .ok_or_else(|| Error::Type(format!("invalid TIME literal: {s}")))?,
+        (ColumnType::Time, Value::Text(s)) => match elyra_core::datetime::parse_time(&s) {
+            Some(time) => Value::Time(time),
+            None if !strict => Value::Text("00:00:00".into()),
+            None => return Err(Error::Type(format!("invalid TIME literal: {s}"))),
+        },
         (ColumnType::Json, Value::Json(s)) => Value::Json(s),
         (ColumnType::Json, Value::Text(s)) => {
             if elyra_core::value::is_valid_json(&s) {
@@ -13889,25 +15038,77 @@ fn coerce(v: Value, ty: &ColumnType, col: &str) -> Result<Value> {
         (ColumnType::Vector(dim), Value::Text(s)) => Value::Vector(parse_vector(&s, *dim)?),
         // BIGINT UNSIGNED.
         (ColumnType::UInt, Value::UInt(u)) => Value::UInt(u),
-        (ColumnType::UInt, Value::Int(i)) => Value::UInt(i as u64),
+        (ColumnType::UInt, Value::Int(i)) if i >= 0 => Value::UInt(i as u64),
+        (ColumnType::UInt, Value::Int(_)) if !strict => Value::UInt(0),
+        (ColumnType::UInt, Value::Int(i)) => {
+            return Err(Error::Type(format!("invalid UNSIGNED value: {i}")))
+        }
         (ColumnType::UInt, Value::Bool(b)) => Value::UInt(b as u64),
-        (ColumnType::UInt, Value::Float(f)) => Value::UInt(f as u64),
-        (ColumnType::UInt, Value::Text(s)) => s
-            .trim()
-            .parse::<u64>()
-            .or_else(|_| s.trim().parse::<f64>().map(|f| f as u64))
-            .map(Value::UInt)
-            .map_err(|_| Error::Type(format!("invalid UNSIGNED value: {s}")))?,
+        (ColumnType::UInt, Value::Float(f))
+            if f.is_finite() && (0.0..18_446_744_073_709_551_616.0).contains(&f) =>
+        {
+            Value::UInt(f.round() as u64)
+        }
+        (ColumnType::UInt, Value::Float(_)) if !strict => Value::UInt(0),
+        (ColumnType::UInt, Value::Float(f)) => {
+            return Err(Error::Type(format!("invalid UNSIGNED value: {f}")))
+        }
+        (ColumnType::UInt, Value::Decimal(units, scale)) => {
+            let rounded = round_decimal_to_integer(units, scale);
+            match u64::try_from(rounded) {
+                Ok(value) => Value::UInt(value),
+                Err(_) if !strict => Value::UInt(if rounded.is_negative() { 0 } else { u64::MAX }),
+                Err(_) => {
+                    return Err(Error::Type(format!(
+                        "invalid UNSIGNED value: {}",
+                        Value::Decimal(units, scale)
+                            .to_wire_string()
+                            .unwrap_or_default()
+                    )))
+                }
+            }
+        }
+        (ColumnType::UInt, Value::Text(s)) => {
+            let text = s.trim();
+            if let Ok(value) = text.parse::<u64>() {
+                Value::UInt(value)
+            } else if let Ok(value) = text.parse::<f64>() {
+                if value.is_finite() && (0.0..18_446_744_073_709_551_616.0).contains(&value) {
+                    Value::UInt(value.round() as u64)
+                } else if !strict {
+                    Value::UInt(if value.is_sign_negative() {
+                        0
+                    } else {
+                        u64::MAX
+                    })
+                } else {
+                    return Err(Error::Type(format!("invalid UNSIGNED value: {s}")));
+                }
+            } else if !strict {
+                Value::UInt(mysql_integer_prefix(&s).max(0) as u64)
+            } else {
+                return Err(Error::Type(format!("invalid UNSIGNED value: {s}")));
+            }
+        }
         (ColumnType::Int, Value::UInt(u)) => Value::Int(u as i64),
         (ColumnType::Float, Value::UInt(u)) => Value::Float(u as f64),
         // Lenient (MySQL-style) conversions.
-        (ColumnType::Int, Value::Float(f)) => Value::Int(f as i64),
-        (ColumnType::Int, Value::Text(s)) => s
-            .trim()
-            .parse::<i64>()
-            .or_else(|_| s.trim().parse::<f64>().map(|f| f as i64))
-            .map(Value::Int)
-            .map_err(|_| Error::Type(format!("invalid INTEGER value: {s}")))?,
+        (ColumnType::Int, Value::Float(f)) => Value::Int(f.round() as i64),
+        (ColumnType::Int, Value::Decimal(units, scale)) => {
+            let rounded = round_decimal_to_integer(units, scale);
+            Value::Int(rounded.clamp(i64::MIN as i128, i64::MAX as i128) as i64)
+        }
+        (ColumnType::Int, Value::Text(s)) => {
+            match s
+                .trim()
+                .parse::<i64>()
+                .or_else(|_| s.trim().parse::<f64>().map(|f| f.round() as i64))
+            {
+                Ok(value) => Value::Int(value),
+                Err(_) if !strict => Value::Int(mysql_integer_prefix(&s)),
+                Err(_) => return Err(Error::Type(format!("invalid INTEGER value: {s}"))),
+            }
+        }
         (ColumnType::Float, Value::Text(s)) => s
             .trim()
             .parse::<f64>()
@@ -13923,6 +15124,63 @@ fn coerce(v: Value, ty: &ColumnType, col: &str) -> Result<Value> {
             )))
         }
     })
+}
+
+fn round_decimal_to_integer(units: i128, scale: u8) -> i128 {
+    if scale == 0 {
+        return units;
+    }
+    let Some(divisor) = 10_i128.checked_pow(scale.into()) else {
+        // An i128 numerator divided by 10^39 or greater has magnitude below
+        // one half, so it always rounds to zero.
+        return 0;
+    };
+    let quotient = units / divisor;
+    let remainder = units % divisor;
+    if remainder.abs() >= divisor / 2 {
+        quotient + units.signum()
+    } else {
+        quotient
+    }
+}
+
+fn mysql_integer_prefix(value: &str) -> i64 {
+    let value = value.trim_start();
+    let bytes = value.as_bytes();
+    let mut end = usize::from(matches!(bytes.first(), Some(b'+') | Some(b'-')));
+    let mut digits = 0usize;
+    while bytes.get(end).is_some_and(u8::is_ascii_digit) {
+        end += 1;
+        digits += 1;
+    }
+    if bytes.get(end) == Some(&b'.') {
+        end += 1;
+        while bytes.get(end).is_some_and(u8::is_ascii_digit) {
+            end += 1;
+            digits += 1;
+        }
+    }
+    if digits == 0 {
+        return 0;
+    }
+    if matches!(bytes.get(end), Some(b'e') | Some(b'E')) {
+        let exponent_start = end;
+        end += 1;
+        if matches!(bytes.get(end), Some(b'+') | Some(b'-')) {
+            end += 1;
+        }
+        let exponent_digits = end;
+        while bytes.get(end).is_some_and(u8::is_ascii_digit) {
+            end += 1;
+        }
+        if end == exponent_digits {
+            end = exponent_start;
+        }
+    }
+    value[..end]
+        .parse::<f64>()
+        .map(|number| number.round() as i64)
+        .unwrap_or(0)
 }
 
 fn parse_vector(s: &str, dim: u32) -> Result<Vec<f32>> {
@@ -13944,6 +15202,77 @@ fn parse_vector(s: &str, dim: u32) -> Result<Vec<f32>> {
         )));
     }
     Ok(vals)
+}
+
+#[cfg(test)]
+mod coercion_tests {
+    use elyra_core::{ColumnType, Value};
+
+    use super::{coerce_with_mode, round_decimal_to_integer};
+
+    #[test]
+    fn rounds_decimal_integers_exactly() {
+        assert_eq!(round_decimal_to_integer(14, 1), 1);
+        assert_eq!(round_decimal_to_integer(15, 1), 2);
+        assert_eq!(round_decimal_to_integer(-15, 1), -2);
+        assert_eq!(round_decimal_to_integer(i128::MAX, 39), 0);
+    }
+
+    #[test]
+    fn coerces_decimal_literals_to_unsigned_columns() {
+        assert_eq!(
+            coerce_with_mode(Value::Decimal(125, 1), &ColumnType::UInt, "n", true).unwrap(),
+            Value::UInt(13)
+        );
+        assert!(coerce_with_mode(Value::Decimal(-15, 1), &ColumnType::UInt, "n", true).is_err());
+        assert_eq!(
+            coerce_with_mode(Value::Decimal(-15, 1), &ColumnType::UInt, "n", false).unwrap(),
+            Value::UInt(0)
+        );
+    }
+}
+
+#[cfg(test)]
+mod substitution_tests {
+    use std::collections::HashMap;
+
+    use elyra_core::Value;
+
+    use super::{contains_uvar_reference, substitute_uvars, substitute_vars};
+
+    #[test]
+    fn detects_only_unquoted_user_variable_references() {
+        assert!(!contains_uvar_reference(
+            r#"INSERT INTO t VALUES ('otilia@example.com', "quoted@example", `column@example`)"#
+        ));
+        assert!(!contains_uvar_reference("SELECT @@global.max_connections"));
+        assert!(contains_uvar_reference(
+            "SELECT 'otilia@example.com', @answer"
+        ));
+        assert!(contains_uvar_reference("SELECT @answer, 'å🚗'"));
+    }
+
+    #[test]
+    fn user_variable_substitution_skips_mysql_quoted_segments() {
+        let vars = HashMap::from([("answer".to_owned(), Value::Int(42))]);
+        let sql = r#"SELECT 'otilia@example.com', 'O\'Keefe', "quoted@example", `column@example`, @answer"#;
+
+        assert_eq!(
+            substitute_uvars(sql, &vars),
+            r#"SELECT 'otilia@example.com', 'O\'Keefe', "quoted@example", `column@example`, 42"#
+        );
+    }
+
+    #[test]
+    fn procedure_variable_substitution_skips_escaped_string_literals() {
+        let vars = HashMap::from([("example".to_owned(), Value::Text("changed".to_owned()))]);
+        let sql = r#"SELECT 'O\'Keefe@example.com', example"#;
+
+        assert_eq!(
+            substitute_vars(sql, &vars),
+            r#"SELECT 'O\'Keefe@example.com', 'changed'"#
+        );
+    }
 }
 
 #[cfg(test)]

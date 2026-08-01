@@ -351,9 +351,50 @@ pub fn canonical_f64_bits(f: f64) -> u64 {
 /// string parsed to a number (MySQL coerces strings in numeric comparisons).
 fn coerce_f64(v: &Value) -> Option<f64> {
     match v {
-        Value::Text(s) | Value::Json(s) => s.trim().parse::<f64>().ok(),
+        Value::Text(s) | Value::Json(s) => Some(mysql_numeric_prefix(s)),
         _ => v.as_f64(),
     }
+}
+
+/// MySQL converts the leading numeric portion of a string in numeric context.
+/// A string with no numeric prefix converts to zero.
+fn mysql_numeric_prefix(value: &str) -> f64 {
+    let value = value.trim_start();
+    let bytes = value.as_bytes();
+    let mut end = usize::from(matches!(bytes.first(), Some(b'+') | Some(b'-')));
+    let mut digits = 0usize;
+
+    while bytes.get(end).is_some_and(u8::is_ascii_digit) {
+        end += 1;
+        digits += 1;
+    }
+    if bytes.get(end) == Some(&b'.') {
+        end += 1;
+        while bytes.get(end).is_some_and(u8::is_ascii_digit) {
+            end += 1;
+            digits += 1;
+        }
+    }
+    if digits == 0 {
+        return 0.0;
+    }
+
+    if matches!(bytes.get(end), Some(b'e') | Some(b'E')) {
+        let exponent = end;
+        end += 1;
+        if matches!(bytes.get(end), Some(b'+') | Some(b'-')) {
+            end += 1;
+        }
+        let exponent_digits = end;
+        while bytes.get(end).is_some_and(u8::is_ascii_digit) {
+            end += 1;
+        }
+        if exponent_digits == end {
+            end = exponent;
+        }
+    }
+
+    value[..end].parse().unwrap_or(0.0)
 }
 
 /// Exact ordering of a `u64` against an `i64` (no f64 rounding).
@@ -584,6 +625,10 @@ pub fn parse_decimal(s: &str, target_scale: u8) -> Option<(i128, u8)> {
         return None;
     }
     let ts = target_scale as usize;
+    let round_up = frac_part
+        .as_bytes()
+        .get(ts)
+        .is_some_and(|digit| *digit >= b'5');
     let frac = if frac_part.len() >= ts {
         frac_part[..ts].to_string()
     } else {
@@ -591,10 +636,53 @@ pub fn parse_decimal(s: &str, target_scale: u8) -> Option<(i128, u8)> {
     };
     let combined = format!("{}{}", int_part, frac);
     let mut v: i128 = combined.parse().ok()?;
+    if round_up {
+        v = v.checked_add(1)?;
+    }
     if neg {
         v = -v;
     }
     Some((v, target_scale))
+}
+
+/// Change a decimal's scale, rounding half away from zero when digits are
+/// discarded. Returns `None` if increasing the scale would overflow `i128`.
+pub fn rescale_decimal(units: i128, from_scale: u8, to_scale: u8) -> Option<i128> {
+    if from_scale <= to_scale {
+        let factor = 10i128.checked_pow((to_scale - from_scale) as u32)?;
+        return units.checked_mul(factor);
+    }
+
+    let divisor = 10i128.checked_pow((from_scale - to_scale) as u32)?;
+    let quotient = units / divisor;
+    let remainder = units % divisor;
+    if remainder.unsigned_abs() >= (divisor / 2) as u128 {
+        quotient.checked_add(if units.is_negative() { -1 } else { 1 })
+    } else {
+        Some(quotient)
+    }
+}
+
+#[cfg(test)]
+mod decimal_tests {
+    use super::{parse_decimal, rescale_decimal};
+
+    #[test]
+    fn parsing_rounds_half_away_from_zero() {
+        assert_eq!(parse_decimal("8.876543211", 2), Some((888, 2)));
+        assert_eq!(parse_decimal("-8.876543211", 2), Some((-888, 2)));
+        assert_eq!(parse_decimal("1.234", 2), Some((123, 2)));
+        assert_eq!(parse_decimal("1.235", 2), Some((124, 2)));
+    }
+
+    #[test]
+    fn rescaling_rounds_when_digits_are_discarded() {
+        assert_eq!(rescale_decimal(8_876_543_211, 9, 2), Some(888));
+        assert_eq!(rescale_decimal(-8_876_543_211, 9, 2), Some(-888));
+        assert_eq!(rescale_decimal(1234, 3, 2), Some(123));
+        assert_eq!(rescale_decimal(1235, 3, 2), Some(124));
+        assert_eq!(rescale_decimal(123, 2, 4), Some(12_300));
+    }
 }
 
 #[cfg(test)]
@@ -610,6 +698,23 @@ mod collation_tests {
         assert_eq!(fold_cmp("Apple", "apple"), Ordering::Equal);
         assert_eq!(fold_cmp("apple", "Banana"), Ordering::Less);
         assert_eq!(fold_cmp("ÆØÅ", "æøå"), Ordering::Equal);
+    }
+
+    #[test]
+    fn mixed_numeric_text_comparisons_use_leading_numeric_prefix() {
+        for (text, number) in [
+            ("Channel1", 0.0),
+            ("123tail", 123.0),
+            (" -12.5e2suffix", -1250.0),
+            (".5remaining", 0.5),
+            ("1e+suffix", 1.0),
+        ] {
+            assert_eq!(
+                Value::Text(text.into()).compare(&Value::Float(number)),
+                Some(Ordering::Equal),
+                "{text}"
+            );
+        }
     }
 
     #[test]

@@ -113,6 +113,16 @@ impl TestServer {
         self.conn_as("root", "").await
     }
 
+    pub async fn conn_to_database(&self, database: &str) -> mysql_async::Conn {
+        let opts = mysql_async::OptsBuilder::default()
+            .ip_or_hostname("127.0.0.1")
+            .tcp_port(self.port)
+            .user(Some("root"))
+            .db_name(Some(database))
+            .prefer_socket(false);
+        mysql_async::Conn::new(opts).await.expect("connect")
+    }
+
     pub async fn conn_as(&self, user: &str, password: &str) -> mysql_async::Conn {
         let opts = mysql_async::OptsBuilder::default()
             .ip_or_hostname("127.0.0.1")

@@ -619,15 +619,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for ElyraShim {
             a.record(self.conn_id, &user, &sql, res.is_ok());
         }
         match res {
-            Ok(outcomes) => {
-                write_outcomes(
-                    outcomes,
-                    results,
-                    self.session.last_insert_id() as u64,
-                    self.session.in_txn(),
-                )
-                .await
-            }
+            Ok(outcomes) => write_outcomes(outcomes, results, self.session.in_txn()).await,
             Err(e) => {
                 results
                     .error(elyra_kind(&e), e.to_string().as_bytes())
@@ -642,10 +634,10 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for ElyraShim {
 
     async fn on_init<'a>(
         &'a mut self,
-        _schema: &'a str,
+        schema: &'a str,
         writer: InitWriter<'a, W>,
     ) -> Result<(), Self::Error> {
-        // USE <db>: single-catalog for now, always accept.
+        self.session.set_database(schema);
         writer.ok().await
     }
 
@@ -655,7 +647,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for ElyraShim {
         results: QueryResultWriter<'a, W>,
     ) -> Result<(), Self::Error> {
         if let Some((cols, rows)) = self.observ_result(query) {
-            return write_string_rows(results, &cols, rows).await;
+            return write_string_rows(results, &cols, rows, self.session.in_txn()).await;
         }
         let privilege = self.privilege();
         let user = self.user();
@@ -673,15 +665,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for ElyraShim {
             a.record(self.conn_id, &user, query, res.is_ok());
         }
         match res {
-            Ok(outcomes) => {
-                write_outcomes(
-                    outcomes,
-                    results,
-                    self.session.last_insert_id() as u64,
-                    self.session.in_txn(),
-                )
-                .await
-            }
+            Ok(outcomes) => write_outcomes(outcomes, results, self.session.in_txn()).await,
             Err(e) => {
                 results
                     .error(elyra_kind(&e), e.to_string().as_bytes())
@@ -696,6 +680,7 @@ async fn write_string_rows<W: AsyncWrite + Send + Unpin>(
     results: QueryResultWriter<'_, W>,
     col_names: &[&str],
     rows: Vec<Vec<String>>,
+    in_trans: bool,
 ) -> Result<(), std::io::Error> {
     let cols: Vec<Column> = col_names
         .iter()
@@ -713,26 +698,29 @@ async fn write_string_rows<W: AsyncWrite + Send + Unpin>(
         }
         rw.end_row().await?;
     }
-    rw.finish().await
+    rw.finish_with_status(transaction_status(in_trans)).await
 }
 
 /// Rows pulled from storage per batch while streaming a result set. Bounds
 /// per-connection memory regardless of table size.
 const STREAM_BATCH: usize = 1024;
 
-async fn write_outcomes<W: AsyncWrite + Send + Unpin>(
-    mut outcomes: Vec<QueryResult>,
-    results: QueryResultWriter<'_, W>,
-    last_insert_id: u64,
-    in_trans: bool,
-) -> Result<(), std::io::Error> {
-    // Report an open transaction in the OK status flags so drivers (PDO/mysqlnd)
-    // track PDO::inTransaction() correctly.
-    let status_flags = if in_trans {
+fn transaction_status(in_trans: bool) -> StatusFlags {
+    if in_trans {
         StatusFlags::SERVER_STATUS_IN_TRANS
     } else {
         StatusFlags::empty()
-    };
+    }
+}
+
+async fn write_outcomes<W: AsyncWrite + Send + Unpin>(
+    mut outcomes: Vec<QueryResult>,
+    results: QueryResultWriter<'_, W>,
+    in_trans: bool,
+) -> Result<(), std::io::Error> {
+    // Report an open transaction in the OK status flags so clients can track
+    // transaction state correctly.
+    let status_flags = transaction_status(in_trans);
     // The text protocol returns a single result per query in this build.
     match outcomes.drain(..).next() {
         Some(QueryResult::Rows(mut stream)) => {
@@ -763,21 +751,38 @@ async fn write_outcomes<W: AsyncWrite + Send + Unpin>(
                     break;
                 }
                 for row in batch {
-                    // Write each cell with its native type so both the text
-                    // (COM_QUERY) and binary (COM_STMT_EXECUTE) encoders emit
-                    // correct wire values.
-                    for v in &row {
-                        write_cell(&mut rw, v)?;
+                    if row.len() != stream.schema.columns.len() {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "result row does not match its schema",
+                        ));
+                    }
+                    // Encode each cell as the type advertised in the result
+                    // metadata. This matters for binary prepared statements.
+                    for (v, column) in row.iter().zip(&stream.schema.columns) {
+                        write_cell(&mut rw, v, &column.ty)?;
                     }
                     rw.end_row().await?;
                 }
             }
-            rw.finish().await
+            rw.finish_with_status(status_flags).await
         }
         Some(QueryResult::Affected(n)) => {
             results
                 .completed(OkResponse {
                     affected_rows: n,
+                    status_flags,
+                    ..Default::default()
+                })
+                .await
+        }
+        Some(QueryResult::Insert {
+            affected_rows,
+            last_insert_id,
+        }) => {
+            results
+                .completed(OkResponse {
+                    affected_rows,
                     last_insert_id,
                     status_flags,
                     ..Default::default()
@@ -798,27 +803,82 @@ async fn write_outcomes<W: AsyncWrite + Send + Unpin>(
 fn write_cell<W: AsyncWrite + Send + Unpin>(
     rw: &mut elyra_wire::RowWriter<'_, W>,
     v: &elyra_core::Value,
+    ty: &elyra_core::ColumnType,
 ) -> std::io::Result<()> {
-    use elyra_core::Value;
-    match v {
-        Value::Null => rw.write_col(None::<i64>),
-        Value::Bool(b) => rw.write_col(*b as i8),
-        Value::Int(i) => rw.write_col(*i),
-        Value::UInt(u) => rw.write_col(*u),
-        Value::Float(f) => rw.write_col(*f),
-        Value::Text(s) => rw.write_col(s.as_str()),
-        Value::Bytes(b) => rw.write_col(b),
-        Value::Vector(vec) => {
-            let inner = vec
-                .iter()
-                .map(|x| x.to_string())
-                .collect::<Vec<_>>()
-                .join(",");
-            rw.write_col(format!("[{inner}]"))
-        }
-        // Date/time/decimal: their canonical string form.
-        other => rw.write_col(other.to_wire_string()),
+    use elyra_core::{ColumnType, Value};
+
+    if v.is_null() {
+        return rw.write_col(None::<i64>);
     }
+
+    match ty {
+        // Expression metadata is necessarily static, while CASE, COALESCE and
+        // aggregate results can use different runtime numeric variants. Encode
+        // the value according to the advertised type so binary-protocol rows
+        // always agree with their column descriptors.
+        ColumnType::Bool => rw.write_col(i8::from(numeric_wire_value(v, ty)? != 0.0)),
+        ColumnType::Int => match v {
+            Value::Int(i) => rw.write_col(*i),
+            Value::UInt(u) => i64::try_from(*u)
+                .map_err(|_| incompatible_wire_value(v, ty))
+                .and_then(|value| rw.write_col(value)),
+            _ => {
+                let value = numeric_wire_value(v, ty)?;
+                if !value.is_finite() || value < i64::MIN as f64 || value > i64::MAX as f64 {
+                    Err(incompatible_wire_value(v, ty))
+                } else {
+                    rw.write_col(value as i64)
+                }
+            }
+        },
+        ColumnType::UInt => match v {
+            Value::UInt(u) => rw.write_col(*u),
+            Value::Int(i) => u64::try_from(*i)
+                .map_err(|_| incompatible_wire_value(v, ty))
+                .and_then(|value| rw.write_col(value)),
+            _ => {
+                let value = numeric_wire_value(v, ty)?;
+                if !value.is_finite() || value.is_sign_negative() || value > u64::MAX as f64 {
+                    Err(incompatible_wire_value(v, ty))
+                } else {
+                    rw.write_col(value as u64)
+                }
+            }
+        },
+        ColumnType::Float => rw.write_col(numeric_wire_value(v, ty)?),
+        ColumnType::Bytes => match v {
+            Value::Bytes(bytes) => rw.write_col(bytes),
+            _ => rw.write_col(v.to_wire_string()),
+        },
+        // Text, vectors, date/time, decimal and JSON are all advertised using
+        // string-compatible MySQL wire types.
+        ColumnType::Text
+        | ColumnType::Vector(_)
+        | ColumnType::Date
+        | ColumnType::DateTime
+        | ColumnType::Decimal(_, _)
+        | ColumnType::Time
+        | ColumnType::Json => rw.write_col(v.to_wire_string()),
+    }
+}
+
+fn numeric_wire_value(v: &elyra_core::Value, ty: &elyra_core::ColumnType) -> std::io::Result<f64> {
+    v.as_f64()
+        .or_else(|| v.to_wire_string()?.trim().parse().ok())
+        .ok_or_else(|| incompatible_wire_value(v, ty))
+}
+
+fn incompatible_wire_value(
+    value: &elyra_core::Value,
+    ty: &elyra_core::ColumnType,
+) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!(
+            "value {value:?} is incompatible with result type {}",
+            ty.display_name()
+        ),
+    )
 }
 
 /// Whether a bind address accepts connections from outside the local host.

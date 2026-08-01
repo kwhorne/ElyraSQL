@@ -29,8 +29,52 @@ async fn literals_and_arithmetic() {
 
     let ver: String = c.query_first("SELECT VERSION()").await.unwrap().unwrap();
     assert!(ver.contains("ElyraSQL"), "version was {ver}");
+    assert!(ver.starts_with("8.0.12-"), "version was {ver}");
 
     drop(c);
+}
+
+#[tokio::test]
+async fn mysql_dump_literals_remain_exact() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop(
+        "CREATE TABLE literal_matrix (
+            id INT PRIMARY KEY,
+            amount DECIMAL(30,10) NOT NULL,
+            payload VARBINARY(16) NOT NULL,
+            email VARCHAR(255) NOT NULL
+        )",
+    )
+    .await
+    .unwrap();
+    c.query_drop(
+        "INSERT INTO literal_matrix VALUES
+         (1, -170812946.3720907892, X'00AF10', 'otilia@example.com')",
+    )
+    .await
+    .unwrap();
+
+    let row: (String, Vec<u8>, String) = c
+        .query_first("SELECT amount, payload, email FROM literal_matrix WHERE id = 1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.0, "-170812946.3720907892");
+    assert_eq!(row.1, vec![0x00, 0xaf, 0x10]);
+    assert_eq!(row.2, "otilia@example.com");
+
+    let odd_0x: Vec<u8> = c.query_first("SELECT 0xF").await.unwrap().unwrap();
+    assert_eq!(odd_0x, vec![0x0f]);
+    assert!(c.query_drop("SELECT X'F'").await.is_err());
+
+    assert!(c
+        .query_drop("SELECT 17014118346046923173168730371588410572.7 + 0.1")
+        .await
+        .is_err());
+    let still_connected: i64 = c.query_first("SELECT 1").await.unwrap().unwrap();
+    assert_eq!(still_connected, 1);
 }
 
 #[tokio::test]
@@ -89,6 +133,720 @@ async fn ddl_dml_roundtrip() {
 }
 
 #[tokio::test]
+async fn explicit_auto_increment_value_is_returned_in_ok_packet() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop(
+        "CREATE TABLE ai_explicit (
+            id BIGINT NOT NULL AUTO_INCREMENT,
+            a VARCHAR(10),
+            PRIMARY KEY (id)
+        )",
+    )
+    .await
+    .unwrap();
+
+    c.query_drop("INSERT INTO ai_explicit (id, a) VALUES (1697842, 'explicit')")
+        .await
+        .unwrap();
+    assert_eq!(c.last_insert_id(), Some(1_697_842));
+
+    // An explicit value affects the OK packet, but not SQL LAST_INSERT_ID().
+    let session_id: u64 = c
+        .query_first("SELECT LAST_INSERT_ID()")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(session_id, 0);
+
+    c.query_drop("INSERT INTO ai_explicit (a) VALUES ('auto')")
+        .await
+        .unwrap();
+    assert_eq!(c.last_insert_id(), Some(1_697_843));
+
+    // The binary prepared-statement path uses the same statement-local value.
+    c.exec_drop(
+        "INSERT INTO ai_explicit (id, a) VALUES (?, ?)",
+        (1_800_000_u64, "prepared"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(c.last_insert_id(), Some(1_800_000));
+
+    c.query_drop(
+        "INSERT IGNORE INTO ai_explicit (id, a)
+         VALUES (1800000, 'ignored')",
+    )
+    .await
+    .unwrap();
+    assert_eq!(c.last_insert_id(), None);
+}
+
+#[tokio::test]
+async fn mysql_index_and_foreign_key_drop_forms() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop("CREATE TABLE parents (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop(
+        "CREATE TABLE children (
+            id INT PRIMARY KEY,
+            parent_id INT,
+            name VARCHAR(20),
+            INDEX idx_name (name),
+            CONSTRAINT fk_parent FOREIGN KEY (parent_id) REFERENCES parents(id)
+        )",
+    )
+    .await
+    .unwrap();
+
+    c.query_drop("ALTER TABLE children DROP INDEX IDX_NAME")
+        .await
+        .unwrap();
+    let indexes: Vec<String> = c
+        .query("SHOW INDEX FROM children")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row: mysql_async::Row| row.get("Key_name").unwrap())
+        .collect();
+    assert!(!indexes.iter().any(|name| name == "idx_name"));
+
+    c.query_drop("CREATE UNIQUE INDEX uniq_name ON children (name)")
+        .await
+        .unwrap();
+    c.query_drop("DROP INDEX uniq_name ON children")
+        .await
+        .unwrap();
+    let indexes: Vec<String> = c
+        .query("SHOW INDEX FROM children")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row: mysql_async::Row| row.get("Key_name").unwrap())
+        .collect();
+    assert!(!indexes.iter().any(|name| name == "uniq_name"));
+
+    c.query_drop("ALTER TABLE children DROP FOREIGN KEY fk_parent")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO children VALUES (1, 999, 'orphan')")
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn multi_object_drop_processes_every_name() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    for name in ["drop_first", "drop_second", "drop_third"] {
+        c.query_drop(format!("CREATE TABLE {name} (id INT PRIMARY KEY)"))
+            .await
+            .unwrap();
+    }
+    c.query_drop("DROP TABLE drop_first, drop_second, drop_third")
+        .await
+        .unwrap();
+    let remaining: i64 = c
+        .query_first(
+            "SELECT COUNT(*) FROM information_schema.tables \
+             WHERE table_name IN ('drop_first', 'drop_second', 'drop_third')",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(remaining, 0);
+
+    c.query_drop("CREATE TABLE preserved_first (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE preserved_second (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    assert!(c
+        .query_drop("DROP TABLE preserved_first, missing_table, preserved_second")
+        .await
+        .is_err());
+    c.query_drop("INSERT INTO preserved_first VALUES (1)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO preserved_second VALUES (1)")
+        .await
+        .unwrap();
+    c.query_drop("DROP TABLE IF EXISTS preserved_first, missing_table, preserved_second")
+        .await
+        .unwrap();
+
+    c.query_drop("CREATE TABLE view_source (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop("CREATE VIEW first_view AS SELECT id FROM view_source")
+        .await
+        .unwrap();
+    c.query_drop("CREATE VIEW second_view AS SELECT id FROM view_source")
+        .await
+        .unwrap();
+    c.query_drop("DROP VIEW first_view, second_view")
+        .await
+        .unwrap();
+    assert!(c.query_drop("SELECT * FROM first_view").await.is_err());
+    assert!(c.query_drop("SELECT * FROM second_view").await.is_err());
+}
+
+#[tokio::test]
+async fn dropping_a_column_preserves_foreign_key_positions() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop("CREATE TABLE parents (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop(
+        "CREATE TABLE children (
+            id INT PRIMARY KEY,
+            obsolete INT,
+            parent_id INT,
+            payload INT,
+            CONSTRAINT fk_parent FOREIGN KEY (parent_id) REFERENCES parents(id)
+        )",
+    )
+    .await
+    .unwrap();
+    c.query_drop("INSERT INTO parents VALUES (7)")
+        .await
+        .unwrap();
+
+    c.query_drop("ALTER TABLE children DROP COLUMN obsolete")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO children VALUES (1, 7, 999)")
+        .await
+        .unwrap();
+    assert!(c
+        .query_drop("INSERT INTO children VALUES (2, 999, 7)")
+        .await
+        .is_err());
+
+    let column: String = c
+        .query_first(
+            "SELECT column_name FROM information_schema.key_column_usage \
+             WHERE table_name = 'children' AND constraint_name = 'fk_parent'",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(column, "parent_id");
+}
+
+#[tokio::test]
+async fn dropping_an_indexed_column_removes_dependent_indexes() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop(
+        "CREATE TABLE indexed_columns (
+            id INT PRIMARY KEY,
+            obsolete VARCHAR(20),
+            retained INT,
+            INDEX idx_obsolete (obsolete),
+            UNIQUE INDEX uniq_obsolete_retained (obsolete, retained),
+            INDEX idx_retained (retained)
+        )",
+    )
+    .await
+    .unwrap();
+    c.query_drop(
+        "INSERT INTO indexed_columns VALUES
+            (1, 'first', 10),
+            (2, 'second', 20)",
+    )
+    .await
+    .unwrap();
+
+    c.query_drop("ALTER TABLE indexed_columns DROP COLUMN obsolete")
+        .await
+        .unwrap();
+
+    let indexes: Vec<String> = c
+        .query("SHOW INDEX FROM indexed_columns")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row: mysql_async::Row| row.get("Key_name").unwrap())
+        .collect();
+    assert!(!indexes.iter().any(|name| name == "idx_obsolete"));
+    assert!(!indexes.iter().any(|name| name == "uniq_obsolete_retained"));
+    assert!(indexes.iter().any(|name| name == "idx_retained"));
+
+    let rows: Vec<(i64, i64)> = c
+        .query("SELECT id, retained FROM indexed_columns ORDER BY retained")
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![(1, 10), (2, 20)]);
+}
+
+#[tokio::test]
+async fn adding_not_null_columns_backfills_mysql_implicit_values() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop("CREATE TABLE alter_defaults (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO alter_defaults VALUES (1)")
+        .await
+        .unwrap();
+
+    c.query_drop("ALTER TABLE alter_defaults ADD label VARCHAR(20) NOT NULL")
+        .await
+        .unwrap();
+    c.query_drop("ALTER TABLE alter_defaults ADD attempts INT NOT NULL")
+        .await
+        .unwrap();
+
+    let row: (String, i64) = c
+        .query_first("SELECT label, attempts FROM alter_defaults WHERE id = 1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row, (String::new(), 0));
+
+    assert!(c
+        .query_drop("INSERT INTO alter_defaults (id) VALUES (2)")
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn update_order_by_limit_changes_only_the_ordered_rows() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop(
+        "CREATE TABLE users (
+            id INT PRIMARY KEY,
+            first_name VARCHAR(20),
+            active INT
+        )",
+    )
+    .await
+    .unwrap();
+    c.query_drop(
+        "INSERT INTO users VALUES
+            (1, 'Zoe', 0),
+            (2, 'Ada', 0),
+            (3, 'Ada', 0),
+            (4, 'Mia', 0)",
+    )
+    .await
+    .unwrap();
+
+    c.query_drop(
+        "UPDATE users SET active = 1
+         ORDER BY first_name ASC, users.id ASC LIMIT 1",
+    )
+    .await
+    .unwrap();
+    assert_eq!(c.affected_rows(), 1);
+
+    let active: Vec<i64> = c
+        .query("SELECT id FROM users WHERE active = 1 ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(active, vec![2]);
+
+    c.query_drop(
+        "UPDATE users SET active = 2
+         ORDER BY first_name DESC, id DESC LIMIT 2",
+    )
+    .await
+    .unwrap();
+    let updated: Vec<i64> = c
+        .query("SELECT id FROM users WHERE active = 2 ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(updated, vec![1, 4]);
+
+    c.query_drop(
+        "UPDATE users SET first_name = 'ORDER BY is data', active = 3
+         WHERE active = 0
+         ORDER BY first_name ASC, id ASC LIMIT 1",
+    )
+    .await
+    .unwrap();
+    let filtered: Vec<i64> = c
+        .query("SELECT id FROM users WHERE active = 3")
+        .await
+        .unwrap();
+    assert_eq!(filtered, vec![3]);
+}
+
+#[tokio::test]
+async fn update_and_delete_limit_bound_the_matching_rows() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop(
+        "CREATE TABLE limited_mutations (
+            id INT PRIMARY KEY,
+            bucket INT,
+            active INT
+        )",
+    )
+    .await
+    .unwrap();
+    c.query_drop(
+        "INSERT INTO limited_mutations VALUES
+            (1, 7, 0),
+            (2, 7, 0),
+            (3, 7, 0)",
+    )
+    .await
+    .unwrap();
+
+    c.query_drop("UPDATE limited_mutations SET active = 1 WHERE bucket = 7 LIMIT 0")
+        .await
+        .unwrap();
+    assert_eq!(c.affected_rows(), 0);
+    c.query_drop("DELETE FROM limited_mutations WHERE bucket = 7 LIMIT 0")
+        .await
+        .unwrap();
+    assert_eq!(c.affected_rows(), 0);
+
+    c.query_drop("UPDATE limited_mutations SET active = 1 WHERE bucket = 7 LIMIT 1")
+        .await
+        .unwrap();
+    assert_eq!(c.affected_rows(), 1);
+    let updated: i64 = c
+        .query_first("SELECT COUNT(*) FROM limited_mutations WHERE active = 1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(updated, 1);
+
+    c.query_drop("DELETE FROM limited_mutations WHERE bucket = 7 LIMIT 1")
+        .await
+        .unwrap();
+    assert_eq!(c.affected_rows(), 1);
+    let remaining: i64 = c
+        .query_first("SELECT COUNT(*) FROM limited_mutations")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(remaining, 2);
+}
+
+#[tokio::test]
+async fn create_database_fails_instead_of_succeeding_as_a_noop() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    let error = c
+        .query_drop("CREATE DATABASE unsupported_database")
+        .await
+        .unwrap_err();
+    match error {
+        mysql_async::Error::Server(error) => {
+            assert_eq!(error.code, 1235);
+            assert!(error.message.contains("single `elyra` database"));
+        }
+        other => panic!("expected a server error, got {other:?}"),
+    }
+
+    let databases: Vec<String> = c.query("SHOW DATABASES").await.unwrap();
+    assert_eq!(databases, vec!["information_schema", "elyra"]);
+
+    let error = c.query_drop("DROP DATABASE elyra").await.unwrap_err();
+    assert!(
+        matches!(error, mysql_async::Error::Server(error) if error.code == 1235),
+        "DROP DATABASE must fail loudly too"
+    );
+}
+
+/// A fractional literal compared against an integer key is a *comparison*, not a
+/// value to store, so it must not be rounded into the key's domain: `k > 1024.5`
+/// means `k >= 1025`, and `k = 1024.5` matches nothing. Every answer below was
+/// verified against MySQL 8.4 on the same data.
+#[tokio::test]
+async fn fractional_bounds_on_an_integer_key_match_mysql() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop("CREATE TABLE frac (k INT PRIMARY KEY, s INT)")
+        .await
+        .unwrap();
+    let rows: Vec<String> = (-8..=2048).map(|i| format!("({i},{i})")).collect();
+    for chunk in rows.chunks(500) {
+        c.query_drop(format!("INSERT INTO frac VALUES {}", chunk.join(",")))
+            .await
+            .unwrap();
+    }
+    c.query_drop("CREATE INDEX ix_frac_s ON frac (s)")
+        .await
+        .unwrap();
+
+    for (sql, expected) in [
+        // The bound sits between two keys: strictness must not shift by one row.
+        ("SELECT COUNT(*) FROM frac WHERE k > 1024.5", 1024),
+        ("SELECT COUNT(*) FROM frac WHERE k >= 1024.5", 1024),
+        ("SELECT COUNT(*) FROM frac WHERE k < 1024.5", 1033),
+        ("SELECT COUNT(*) FROM frac WHERE k <= 1024.5", 1033),
+        // Reversed operands, and a secondary index rather than the PK.
+        ("SELECT COUNT(*) FROM frac WHERE 1024.5 < k", 1024),
+        ("SELECT COUNT(*) FROM frac WHERE s > 1024.5", 1024),
+        // Negative bounds round away from zero, so the direction matters there too.
+        ("SELECT COUNT(*) FROM frac WHERE k > -3.5", 2052),
+        ("SELECT COUNT(*) FROM frac WHERE k < -3.5", 5),
+        // No integer equals a fractional literal -- via `=`, `IN` or `BETWEEN`.
+        ("SELECT COUNT(*) FROM frac WHERE k = 1024.5", 0),
+        ("SELECT COUNT(*) FROM frac WHERE s = 1024.5", 0),
+        ("SELECT COUNT(*) FROM frac WHERE k IN (1024.5, 7)", 1),
+        (
+            "SELECT COUNT(*) FROM frac WHERE k BETWEEN 1024.5 AND 2048.5",
+            1024,
+        ),
+        // Exact bounds keep their existing meaning.
+        ("SELECT COUNT(*) FROM frac WHERE k > 1024", 1024),
+        (
+            "SELECT COUNT(*) FROM frac WHERE k BETWEEN 1025 AND 2048",
+            1024,
+        ),
+    ] {
+        let got: Option<i64> = c.query_first(sql).await.unwrap();
+        assert_eq!(got, Some(expected), "{sql}");
+    }
+}
+
+#[tokio::test]
+async fn conditional_database_ddl_is_a_no_op() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    // Laravel's MigrateCommand, container entrypoints and our own benches ask
+    // for the database to *exist*, not to be new; that is satisfiable here.
+    c.query_drop("CREATE DATABASE IF NOT EXISTS elyra")
+        .await
+        .unwrap();
+    c.query_drop("CREATE SCHEMA IF NOT EXISTS laravel")
+        .await
+        .unwrap();
+    c.query_drop("DROP DATABASE IF EXISTS never_created")
+        .await
+        .unwrap();
+
+    let databases: Vec<String> = c.query("SHOW DATABASES").await.unwrap();
+    assert_eq!(databases, vec!["information_schema", "elyra"]);
+
+    // ... but dropping the database the session is using is not a no-op.
+    let error = c
+        .query_drop("DROP DATABASE IF EXISTS elyra")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, mysql_async::Error::Server(error) if error.code == 1235),
+        "dropping the live database must fail even with IF EXISTS"
+    );
+
+    // The connection is still usable after each refusal.
+    let one: Option<i32> = c.query_first("SELECT 1").await.unwrap();
+    assert_eq!(one, Some(1));
+}
+
+#[tokio::test]
+async fn alter_change_and_modify_accept_collation() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop(
+        "CREATE TABLE collate_changes (
+            id INT PRIMARY KEY,
+            a TEXT,
+            INDEX idx_a (a)
+        )",
+    )
+    .await
+    .unwrap();
+    c.query_drop("INSERT INTO collate_changes VALUES (1, 'Alpha')")
+        .await
+        .unwrap();
+
+    c.query_drop(
+        "ALTER TABLE collate_changes
+         CHANGE a a2 TEXT COLLATE 'utf8mb4_bin'",
+    )
+    .await
+    .unwrap();
+    let binary_matches: i64 = c
+        .query_first("SELECT COUNT(*) FROM collate_changes WHERE a2 = 'alpha'")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(binary_matches, 0);
+
+    c.query_drop(
+        "ALTER TABLE collate_changes
+         MODIFY a2 TEXT COLLATE utf8mb4_0900_ai_ci",
+    )
+    .await
+    .unwrap();
+    let insensitive_matches: i64 = c
+        .query_first("SELECT COUNT(*) FROM collate_changes WHERE a2 = 'alpha'")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(insensitive_matches, 1);
+}
+
+#[tokio::test]
+async fn standalone_rename_table_preserves_rows_indexes_and_auto_increment() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop(
+        "CREATE TABLE rename_source (
+            id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+            a INT,
+            INDEX idx_a (a)
+        )",
+    )
+    .await
+    .unwrap();
+    c.query_drop("INSERT INTO rename_source (a) VALUES (10)")
+        .await
+        .unwrap();
+    c.query_drop(
+        "CREATE TABLE rename_child (
+            id INT PRIMARY KEY,
+            source_id INT,
+            CONSTRAINT fk_rename_source
+                FOREIGN KEY (source_id) REFERENCES rename_source(id)
+        )",
+    )
+    .await
+    .unwrap();
+    c.query_drop("INSERT INTO rename_child VALUES (1, 1)")
+        .await
+        .unwrap();
+
+    c.query_drop("RENAME TABLE rename_source TO rename_target")
+        .await
+        .unwrap();
+    c.query_drop("UPDATE rename_child SET source_id = 1 WHERE id = 1")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO rename_target (a) VALUES (20)")
+        .await
+        .unwrap();
+    let rows: Vec<(i64, i64)> = c
+        .query("SELECT id, a FROM rename_target ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![(1, 10), (2, 20)]);
+
+    let indexes: Vec<String> = c
+        .query("SHOW INDEX FROM rename_target")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row: mysql_async::Row| row.get("Key_name").unwrap())
+        .collect();
+    assert!(indexes.iter().any(|name| name == "idx_a"));
+    assert!(c.query_drop("SELECT * FROM rename_source").await.is_err());
+}
+
+#[tokio::test]
+async fn alter_table_rename_index_rekeys_existing_entries() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop(
+        "CREATE TABLE rename_index_table (
+            id INT PRIMARY KEY,
+            a INT,
+            INDEX idx_old (a)
+        )",
+    )
+    .await
+    .unwrap();
+    c.query_drop("INSERT INTO rename_index_table VALUES (1, 10), (2, 20)")
+        .await
+        .unwrap();
+
+    c.query_drop("ALTER TABLE rename_index_table RENAME INDEX idx_old TO idx_new")
+        .await
+        .unwrap();
+    let indexes: Vec<String> = c
+        .query("SHOW INDEX FROM rename_index_table")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row: mysql_async::Row| row.get("Key_name").unwrap())
+        .collect();
+    assert!(!indexes.iter().any(|name| name == "idx_old"));
+    assert!(indexes.iter().any(|name| name == "idx_new"));
+
+    let id: i64 = c
+        .query_first("SELECT id FROM rename_index_table WHERE a = 20")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(id, 2);
+}
+
+#[tokio::test]
+async fn add_auto_increment_primary_key_backfills_existing_rows() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop(
+        "CREATE TABLE add_auto_primary (
+            a INT NOT NULL,
+            label VARCHAR(10),
+            INDEX idx_a (a)
+        )",
+    )
+    .await
+    .unwrap();
+    c.query_drop("INSERT INTO add_auto_primary VALUES (30, 'c'), (10, 'a'), (20, 'b')")
+        .await
+        .unwrap();
+
+    c.query_drop(
+        "ALTER TABLE add_auto_primary
+         ADD id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY",
+    )
+    .await
+    .unwrap();
+    let rows: Vec<(u64, i64, String)> = c
+        .query("SELECT id, a, label FROM add_auto_primary ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            (1, 30, "c".into()),
+            (2, 10, "a".into()),
+            (3, 20, "b".into())
+        ]
+    );
+
+    c.query_drop("INSERT INTO add_auto_primary (a, label) VALUES (40, 'd')")
+        .await
+        .unwrap();
+    assert_eq!(c.last_insert_id(), Some(4));
+    let indexed_id: u64 = c
+        .query_first("SELECT id FROM add_auto_primary WHERE a = 20")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(indexed_id, 3);
+}
+
+#[tokio::test]
 async fn transactions_commit_and_rollback() {
     let srv = TestServer::start().await;
     let mut c = srv.conn().await;
@@ -109,6 +867,46 @@ async fn transactions_commit_and_rollback() {
 
     let ids: Vec<i64> = c.query("SELECT id FROM t ORDER BY id").await.unwrap();
     assert_eq!(ids, vec![1]);
+}
+
+#[tokio::test]
+async fn transactional_update_keeps_unchanged_index_entries_visible() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop(
+        "CREATE TABLE records (
+            id INT PRIMARY KEY,
+            lookup_key INT,
+            note VARCHAR(20),
+            INDEX lookup_key_idx (lookup_key)
+        )",
+    )
+    .await
+    .unwrap();
+
+    c.query_drop("BEGIN").await.unwrap();
+    c.query_drop("INSERT INTO records VALUES (1, 7, 'before')")
+        .await
+        .unwrap();
+    c.query_drop("UPDATE records SET note = 'after' WHERE id = 1")
+        .await
+        .unwrap();
+
+    let note: String = c
+        .query_first("SELECT note FROM records WHERE lookup_key = 7")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(note, "after");
+
+    c.query_drop("COMMIT").await.unwrap();
+    let note: String = c
+        .query_first("SELECT note FROM records WHERE lookup_key = 7")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(note, "after");
 }
 
 #[tokio::test]
@@ -226,6 +1024,36 @@ async fn native_prepared_statements() {
     assert_eq!(rows, vec![(2, "pear".into(), 8), (3, "plum".into(), 13)]);
 }
 
+#[tokio::test]
+async fn prepared_aggregate_rows_match_declared_result_types() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop("CREATE TABLE measurements (id INT PRIMARY KEY, amount DOUBLE)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO measurements VALUES (1, 500.0), (2, 100.0)")
+        .await
+        .unwrap();
+
+    let row: (String, i64) = c
+        .exec_first(
+            "SELECT
+                COALESCE(
+                    MAX(CASE WHEN id = 1 THEN amount END) -
+                    MIN(CASE WHEN id = 2 THEN amount END),
+                    0
+                ) AS difference,
+                ABS(SUM(CASE WHEN id = ? THEN 1 ELSE 0 END)) AS matches
+             FROM measurements",
+            (1,),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row, ("400".into(), 1));
+}
+
 /// Qualified wildcard `alias.*` in the projection expands to that table's
 /// columns. [ESQL-9]
 #[tokio::test]
@@ -246,6 +1074,30 @@ async fn qualified_wildcard() {
         .await
         .unwrap();
 
+    let result = c
+        .query_iter("SELECT qa.* FROM qa JOIN qb ON qb.a_id = qa.id ORDER BY qa.id")
+        .await
+        .unwrap();
+    let names: Vec<String> = result
+        .columns_ref()
+        .iter()
+        .map(|column| column.name_str().into_owned())
+        .collect();
+    assert_eq!(names, ["id", "name"]);
+    result.drop_result().await.unwrap();
+
+    let result = c
+        .query_iter("SELECT * FROM qa JOIN qb ON qb.a_id = qa.id ORDER BY qa.id")
+        .await
+        .unwrap();
+    let names: Vec<String> = result
+        .columns_ref()
+        .iter()
+        .map(|column| column.name_str().into_owned())
+        .collect();
+    assert_eq!(names, ["id", "name", "id", "a_id", "label"]);
+    result.drop_result().await.unwrap();
+
     // a.* -> only qa's two columns
     let rows: Vec<(i64, String)> = c
         .query("SELECT qa.* FROM qa JOIN qb ON qb.a_id = qa.id ORDER BY qa.id")
@@ -259,6 +1111,421 @@ async fn qualified_wildcard() {
         .await
         .unwrap();
     assert_eq!(rows, vec![(1, 1, "post".into())]);
+}
+
+#[tokio::test]
+async fn correlated_exists_preserves_inner_bare_columns() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop("CREATE TABLE lists (id INT PRIMARY KEY, owner_id INT)")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE levels (id INT PRIMARY KEY, list_id INT)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO lists VALUES (10, 1), (20, 2)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO levels VALUES (20, 10), (30, 20)")
+        .await
+        .unwrap();
+
+    let rows: Vec<i64> = c
+        .query(
+            "SELECT id FROM lists WHERE owner_id = 1 AND EXISTS (\
+             SELECT * FROM levels WHERE lists.id = levels.list_id AND id = 20)",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows, [10]);
+}
+
+#[tokio::test]
+async fn nested_correlation_resolves_missing_inner_columns_from_outer_scope() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop("CREATE TABLE contacts (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop(
+        "CREATE TABLE items (\
+         id INT PRIMARY KEY, contact_id INT, kind VARCHAR(8), target_id INT)",
+    )
+    .await
+    .unwrap();
+    c.query_drop("CREATE TABLE targets (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO contacts VALUES (1), (2)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO items VALUES (10, 1, 'match', 100), (20, 2, 'other', 200)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO targets VALUES (100), (200)")
+        .await
+        .unwrap();
+
+    let rows: Vec<i64> = c
+        .query(
+            "SELECT id FROM contacts WHERE EXISTS (\
+             SELECT * FROM items WHERE contacts.id = items.contact_id AND EXISTS (\
+             SELECT * FROM targets WHERE items.target_id = targets.id \
+             AND kind = 'match' AND target_id = 100))",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows, [1]);
+}
+
+#[tokio::test]
+async fn correlated_join_preserves_shadowed_inner_qualifiers() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop("CREATE TABLE entries (id INT PRIMARY KEY, category_id INT)")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE links (id INT PRIMARY KEY, entry_id INT)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO entries VALUES (10, 7), (20, 7), (30, 8)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO links VALUES (1, 10), (2, 20), (3, 30)")
+        .await
+        .unwrap();
+
+    let rows: Vec<i64> = c
+        .query(
+            "SELECT links.id FROM links \
+             LEFT JOIN entries ON entries.id = links.entry_id \
+             WHERE EXISTS (SELECT * FROM entries \
+             WHERE links.entry_id = entries.id AND category_id = 7) \
+             ORDER BY links.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows, [1, 2]);
+}
+
+#[tokio::test]
+async fn correlated_null_equality_does_not_enter_index_key_encoding() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop("CREATE TABLE parents (id INT PRIMARY KEY, child_id INT)")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE children (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO parents VALUES (1, NULL), (2, 20)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO children VALUES (20)")
+        .await
+        .unwrap();
+
+    let rows: Vec<i64> = c
+        .query(
+            "SELECT id FROM parents WHERE EXISTS (\
+             SELECT * FROM children WHERE parents.child_id = children.id)",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows, [2]);
+}
+
+#[tokio::test]
+async fn correlated_scalar_subquery_alias_can_order_rows() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop("CREATE TABLE records (id INT PRIMARY KEY, active INT)")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE record_logs (id INT PRIMARY KEY, record_id INT)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO records VALUES (1, 1), (2, 1), (3, 0)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO record_logs VALUES (10, 1), (11, 1), (12, 2)")
+        .await
+        .unwrap();
+
+    let rows: Vec<(i64, i64)> = c
+        .query(
+            "SELECT records.id, (SELECT COUNT(*) FROM record_logs \
+             WHERE record_logs.record_id = records.id) AS log_count \
+             FROM records WHERE active = 1 ORDER BY log_count, records.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows, [(2, 1), (1, 2)]);
+}
+
+#[tokio::test]
+async fn prepared_correlated_projection_preserves_unsigned_metadata() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop("CREATE TABLE count_parents (id BIGINT UNSIGNED PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop(
+        "CREATE TABLE count_children (
+            id BIGINT UNSIGNED PRIMARY KEY,
+            parent_id BIGINT UNSIGNED,
+            deleted_at DATETIME NULL
+        )",
+    )
+    .await
+    .unwrap();
+    c.query_drop("INSERT INTO count_parents VALUES (396208)")
+        .await
+        .unwrap();
+
+    let row: Option<(u64, i64)> = c
+        .exec_first(
+            "SELECT id,
+                    (SELECT COUNT(*)
+                     FROM count_children
+                     WHERE count_parents.id = count_children.parent_id
+                       AND count_children.deleted_at IS NULL) AS child_count
+             FROM count_parents
+             WHERE count_parents.id IN (?)",
+            (396208_u64,),
+        )
+        .await
+        .unwrap();
+    assert_eq!(row, Some((396208, 0)));
+}
+
+#[tokio::test]
+async fn correlated_filter_can_feed_join_aggregation() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop(
+        "CREATE TABLE aggregate_parents (
+            id INT PRIMARY KEY,
+            scope_id INT,
+            deleted_at DATETIME NULL
+        )",
+    )
+    .await
+    .unwrap();
+    c.query_drop(
+        "CREATE TABLE aggregate_records (
+            id INT PRIMARY KEY,
+            parent_id INT,
+            item_id INT,
+            deleted_at DATETIME NULL
+        )",
+    )
+    .await
+    .unwrap();
+    c.query_drop(
+        "CREATE TABLE aggregate_items (
+            id INT PRIMARY KEY,
+            name VARCHAR(16)
+        )",
+    )
+    .await
+    .unwrap();
+    c.query_drop("INSERT INTO aggregate_parents VALUES (1, 7, NULL), (2, 8, NULL)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO aggregate_items VALUES (10, 'Zebra'), (20, 'Apple')")
+        .await
+        .unwrap();
+    c.query_drop(
+        "INSERT INTO aggregate_records VALUES
+         (100, 1, 10, NULL), (101, 1, 20, NULL), (102, 2, 10, NULL)",
+    )
+    .await
+    .unwrap();
+
+    let count: Option<i64> = c
+        .exec_first(
+            "SELECT COUNT(*) AS aggregate_count
+             FROM aggregate_records
+             INNER JOIN aggregate_items
+                 ON aggregate_items.id = aggregate_records.item_id
+             WHERE EXISTS (
+                 SELECT * FROM aggregate_parents
+                 WHERE aggregate_records.parent_id = aggregate_parents.id
+                   AND scope_id = ?
+                   AND aggregate_parents.deleted_at IS NULL
+             )
+             AND aggregate_records.deleted_at IS NULL",
+            (7,),
+        )
+        .await
+        .unwrap();
+    assert_eq!(count, Some(2));
+
+    let grouped_sql = "SELECT aggregate_records.item_id,
+                aggregate_items.name AS item_name,
+                COUNT(*) AS record_count
+         FROM aggregate_records
+         INNER JOIN aggregate_items
+             ON aggregate_items.id = aggregate_records.item_id
+         WHERE EXISTS (
+             SELECT * FROM aggregate_parents
+             WHERE aggregate_records.parent_id = aggregate_parents.id
+               AND scope_id = ?
+               AND aggregate_parents.deleted_at IS NULL
+         )
+         AND aggregate_records.deleted_at IS NULL
+         GROUP BY aggregate_records.item_id, aggregate_items.name
+         ORDER BY aggregate_items.name";
+    let mut result = c.exec_iter(grouped_sql, (7,)).await.unwrap();
+    let columns = result.columns().unwrap();
+    let names = columns
+        .iter()
+        .map(|column| column.name_str().into_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["item_id", "item_name", "record_count"]);
+    let grouped: Vec<(i64, String, i64)> = result.collect().await.unwrap();
+    assert_eq!(grouped, [(20, "Apple".into(), 1), (10, "Zebra".into(), 1)]);
+}
+
+#[tokio::test]
+async fn joined_correlated_projection_expands_qualified_wildcard() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop("CREATE TABLE parents (id INT PRIMARY KEY, label VARCHAR(8))")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE links (parent_id INT)")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE children (id INT PRIMARY KEY, parent_id INT)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO parents VALUES (1, 'one')")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO links VALUES (1)").await.unwrap();
+    c.query_drop("INSERT INTO children VALUES (10, 1), (11, 1)")
+        .await
+        .unwrap();
+
+    let rows: Vec<(i64, String, i64, i64)> = c
+        .query(
+            "SELECT parents.*, (SELECT COUNT(*) FROM children \
+             WHERE children.parent_id = parents.id) AS child_count, \
+             links.parent_id AS pivot_id FROM parents \
+             INNER JOIN links ON parents.id = links.parent_id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows, [(1, "one".into(), 2, 1)]);
+}
+
+#[tokio::test]
+async fn non_strict_sql_mode_coerces_invalid_integer_text() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop(
+        "CREATE TABLE mode_values (
+            id INT PRIMARY KEY,
+            value INT,
+            unsigned_value BIGINT UNSIGNED
+        )",
+    )
+    .await
+    .unwrap();
+    c.query_drop(
+        "SET NAMES 'utf8mb4' COLLATE 'utf8mb4_unicode_ci', \
+         SESSION sql_mode='NO_ENGINE_SUBSTITUTION'",
+    )
+    .await
+    .unwrap();
+    c.query_drop("INSERT INTO mode_values VALUES (1, '{\"name\":\"row\"}', '')")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO mode_values VALUES (2, '123.5tail', '456.5tail')")
+        .await
+        .unwrap();
+    c.exec_drop(
+        "INSERT INTO mode_values VALUES (?, ?, ?)",
+        (3, "112.5", "137.5"),
+    )
+    .await
+    .unwrap();
+    c.query_drop("INSERT INTO mode_values VALUES (4, -112.5, -112.5)")
+        .await
+        .unwrap();
+    let values: Vec<(i64, u64)> = c
+        .query("SELECT value, unsigned_value FROM mode_values ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(values, [(0, 0), (124, 457), (113, 138), (-113, 0)]);
+
+    let count: i64 = c
+        .query_first("SELECT COUNT(*) FROM mode_values WHERE value = 'Channel1'")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(count, 1);
+
+    c.query_drop("SET SESSION sql_mode='STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION'")
+        .await
+        .unwrap();
+    assert!(c
+        .query_drop("INSERT INTO mode_values VALUES (5, 'invalid', 'invalid')")
+        .await
+        .is_err());
+    assert!(c
+        .query_drop("INSERT INTO mode_values VALUES (6, 1, '')")
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn non_strict_sql_mode_coerces_invalid_temporal_text() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop("CREATE TABLE temporal_values (id INT PRIMARY KEY, d DATE, dt DATETIME, tm TIME)")
+        .await
+        .unwrap();
+    c.query_drop("SET SESSION sql_mode='NO_ENGINE_SUBSTITUTION'")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO temporal_values VALUES (1, '', '', '')")
+        .await
+        .unwrap();
+
+    let row: (String, String, String) = c
+        .query_first("SELECT d, dt, tm FROM temporal_values WHERE id = 1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row,
+        (
+            "0000-00-00".into(),
+            "0000-00-00 00:00:00".into(),
+            "00:00:00".into(),
+        )
+    );
+
+    c.query_drop("SET SESSION sql_mode='STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION'")
+        .await
+        .unwrap();
+    assert!(c
+        .query_drop("INSERT INTO temporal_values VALUES (2, '', '', '')")
+        .await
+        .is_err());
 }
 
 /// Join followed by GROUP BY over an indexed partner -- exercises the streaming
@@ -489,6 +1756,28 @@ async fn join_order_by_streaming() {
         .await
         .unwrap();
     assert_eq!(rows, vec![(3, Some("C".into())), (6, Some("C".into()))]);
+
+    // MySQL resolves an unqualified ORDER BY name against the projected output
+    // before the joined input. The qualified wildcard exposes only the driving
+    // table's `id`, so the partner's `id` does not make this ambiguous.
+    let rows: Vec<(i64, i64, i64, String)> = c
+        .query(
+            "SELECT f.*, d.cat AS through_key
+             FROM so_facts f JOIN so_dim d ON f.dim_id = d.id
+             ORDER BY id DESC LIMIT 2",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![(6, 3, 30, "C".into()), (5, 2, 90, "B".into())]);
+
+    let error = c
+        .query_drop(
+            "SELECT * FROM so_facts f JOIN so_dim d ON f.dim_id = d.id
+             ORDER BY id LIMIT 1",
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("ambiguous column: id"));
 }
 
 /// ESQL-50: the streaming join builds each combined row in a reusable buffer,
@@ -1022,6 +2311,116 @@ async fn insert_set_shorthand() {
     assert_eq!(rows, vec![(1, "a,b".into(), 105), (2, "x".into(), 9)]);
 }
 
+#[tokio::test]
+async fn scalar_subqueries_in_insert_value_rows() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop("CREATE TABLE properties (id INT PRIMARY KEY, `key` VARCHAR(16))")
+        .await
+        .unwrap();
+    c.query_drop(
+        "CREATE TABLE entity_values (id INT PRIMARY KEY, property_id INT, value VARCHAR(16))",
+    )
+    .await
+    .unwrap();
+    c.query_drop("INSERT INTO properties VALUES (10, 'first'), (20, 'second')")
+        .await
+        .unwrap();
+
+    c.query_drop(
+        "INSERT INTO entity_values (id, property_id, value) VALUES
+         (1, (SELECT id FROM properties WHERE `key` = 'first'), 'a'),
+         (2, (SELECT id FROM properties WHERE `key` = 'second'), 'b')
+         ON DUPLICATE KEY UPDATE value = VALUES(value)",
+    )
+    .await
+    .unwrap();
+    c.query_drop(
+        "INSERT INTO entity_values (id, property_id, value) VALUES
+         (1, (SELECT id FROM properties WHERE `key` = 'first'), 'updated')
+         ON DUPLICATE KEY UPDATE value = VALUES(value)",
+    )
+    .await
+    .unwrap();
+
+    let rows: Vec<(i64, i64, String)> = c
+        .query("SELECT id, property_id, value FROM entity_values ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![(1, 10, "updated".into()), (2, 20, "b".into())]);
+}
+
+#[tokio::test]
+async fn duplicate_key_update_honors_unique_secondary_indexes() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop(
+        "CREATE TABLE keyed_values (
+            id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            `key` VARCHAR(16) UNIQUE,
+            label VARCHAR(16)
+        )",
+    )
+    .await
+    .unwrap();
+    c.query_drop("INSERT INTO keyed_values (`key`, label) VALUES ('a', 'old-a'), ('b', 'old-b')")
+        .await
+        .unwrap();
+    c.query_drop(
+        "INSERT INTO keyed_values (`key`, label) VALUES ('a', 'new-a'), ('b', 'new-b')
+         ON DUPLICATE KEY UPDATE label = VALUES(label)",
+    )
+    .await
+    .unwrap();
+    c.query_drop(
+        "INSERT INTO keyed_values (`key`, label) VALUES ('c', 'first'), ('c', 'second')
+         ON DUPLICATE KEY UPDATE label = VALUES(label)",
+    )
+    .await
+    .unwrap();
+
+    let rows: Vec<(i64, String, String)> = c
+        .query("SELECT id, `key`, label FROM keyed_values ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            (1, "a".into(), "new-a".into()),
+            (2, "b".into(), "new-b".into()),
+            (5, "c".into(), "second".into()),
+        ]
+    );
+
+    c.query_drop("CREATE TABLE unique_only (`key` VARCHAR(16) UNIQUE, label VARCHAR(16))")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO unique_only VALUES ('a', 'old')")
+        .await
+        .unwrap();
+    c.query_drop(
+        "INSERT INTO unique_only VALUES ('a', 'new')
+         ON DUPLICATE KEY UPDATE label = VALUES(label)",
+    )
+    .await
+    .unwrap();
+    let rows: Vec<(String, String)> = c.query("SELECT * FROM unique_only").await.unwrap();
+    assert_eq!(rows, vec![("a".into(), "new".into())]);
+
+    c.query_drop("INSERT INTO keyed_values (`key`, label) VALUES ('d', 'old-d')")
+        .await
+        .unwrap();
+    let err = c
+        .query_drop(
+            "INSERT INTO keyed_values (id, `key`, label) VALUES (1, 'd', 'conflict')
+             ON DUPLICATE KEY UPDATE label = VALUES(label)",
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("more than one unique row"));
+}
+
 /// SELECT DISTINCT deduplicates (was previously a no-op), applies LIMIT after
 /// dedup, and is collation-aware. [ESQL-8 / ESQL-4]
 #[tokio::test]
@@ -1283,6 +2682,39 @@ async fn data_types() {
     assert!(doc.contains("\"a\""), "json was {doc}");
 }
 
+// MySQL accepts datetime-shaped bound strings for DATE columns and stores only
+// the date component, including both midnight and non-midnight values.
+#[tokio::test]
+async fn date_columns_accept_datetime_shaped_prepared_values() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop("CREATE TABLE bound_dates (id INT PRIMARY KEY, d DATE NOT NULL)")
+        .await
+        .unwrap();
+    c.exec_drop(
+        "INSERT INTO bound_dates VALUES (?, ?), (?, ?)",
+        (1, "2026-08-02 00:00:00", 2, "2026-08-03 23:59:59"),
+    )
+    .await
+    .unwrap();
+
+    let rows: Vec<(i64, String)> = c
+        .query("SELECT id, d FROM bound_dates ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![(1, "2026-08-02".into()), (2, "2026-08-03".into())]
+    );
+    assert!(c
+        .exec_drop(
+            "INSERT INTO bound_dates VALUES (?, ?)",
+            (3, "2026-02-30 00:00:00"),
+        )
+        .await
+        .is_err());
+}
+
 #[tokio::test]
 async fn introspection() {
     let srv = TestServer::start().await;
@@ -1301,6 +2733,219 @@ async fn introspection() {
         .unwrap()
         .unwrap();
     assert_eq!(n, 2);
+}
+
+// Keep the standard table-introspection columns present and binary-protocol
+// compatible even when only best-effort size metadata is available.
+#[tokio::test]
+async fn table_introspection_columns_are_available() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop("CREATE TABLE introspected_table (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+
+    let rows: Vec<(String, String, i64, String, String, String)> = c
+        .exec(
+            "SELECT table_name AS `name`, table_schema AS `schema`, \
+                    (data_length + index_length) AS `size`, \
+                    table_comment AS `comment`, engine AS `engine`, \
+                    table_collation AS `collation` \
+             FROM information_schema.tables \
+             WHERE table_type IN ('BASE TABLE', 'SYSTEM VERSIONED') \
+               AND table_schema IN ('elyra') \
+             ORDER BY table_schema, table_name",
+            (),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![(
+            "introspected_table".into(),
+            "elyra".into(),
+            0,
+            String::new(),
+            "ElyraSQL".into(),
+            "utf8mb4_0900_ai_ci".into(),
+        )]
+    );
+
+    let rows: Vec<(String, String, Option<i64>, String, String, String)> = c
+        .exec(
+            "SELECT t.TABLE_NAME, t.ENGINE, t.AUTO_INCREMENT,
+                    t.TABLE_COMMENT, t.CREATE_OPTIONS, ccsa.CHARACTER_SET_NAME
+             FROM information_schema.TABLES t
+             INNER JOIN information_schema.COLLATION_CHARACTER_SET_APPLICABILITY ccsa
+                ON ccsa.COLLATION_NAME = t.TABLE_COLLATION
+             WHERE t.TABLE_SCHEMA = 'elyra'
+               AND t.TABLE_NAME = 'introspected_table'
+               AND t.TABLE_TYPE = 'BASE TABLE'",
+            (),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![(
+            "introspected_table".into(),
+            "ElyraSQL".into(),
+            None,
+            String::new(),
+            String::new(),
+            "utf8mb4".into(),
+        )]
+    );
+}
+
+#[tokio::test]
+async fn selected_database_names_catalog_rows_for_the_session() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn_to_database("application_test").await;
+    c.query_drop("CREATE TABLE migrations (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+
+    let database: String = c.query_first("SELECT DATABASE()").await.unwrap().unwrap();
+    assert_eq!(database, "application_test");
+
+    let exists: i64 = c
+        .query_first(
+            "SELECT EXISTS (
+                SELECT 1 FROM information_schema.tables
+                WHERE table_schema = 'application_test'
+                  AND table_name = 'migrations'
+                  AND table_type = 'BASE TABLE'
+            )",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(exists, 1);
+
+    let exists: i64 = c
+        .query_first(
+            "SELECT EXISTS (
+                SELECT 1 FROM information_schema.tables
+                WHERE table_schema = DATABASE()
+                  AND table_name = 'migrations'
+            )",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(exists, 1);
+
+    c.query_drop("USE switched_test").await.unwrap();
+    let database: String = c.query_first("SELECT DATABASE()").await.unwrap().unwrap();
+    assert_eq!(database, "switched_test");
+    let schemas: Vec<String> = c.query("SHOW DATABASES").await.unwrap();
+    assert_eq!(schemas, vec!["information_schema", "switched_test"]);
+}
+
+// Foreign-key introspection joins these two virtual relations and aggregates
+// composite-key columns in ordinal order. The join must stay on the virtual
+// relation path rather than loading either view as a stored table.
+#[tokio::test]
+async fn foreign_key_introspection_reports_actions() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop(
+        "CREATE TABLE introspected_parent (
+            id INT,
+            tenant_id INT,
+            PRIMARY KEY (id, tenant_id)
+        )",
+    )
+    .await
+    .unwrap();
+    c.query_drop(
+        "CREATE TABLE introspected_child (
+            id INT PRIMARY KEY,
+            parent_id INT,
+            parent_tenant_id INT,
+            CONSTRAINT fk_introspected_parent
+                FOREIGN KEY (parent_id, parent_tenant_id)
+                REFERENCES introspected_parent (id, tenant_id)
+                ON UPDATE CASCADE ON DELETE SET NULL
+        )",
+    )
+    .await
+    .unwrap();
+
+    let rows: Vec<(String, String, String, String, String, String, String)> = c
+        .exec(
+            "SELECT kc.constraint_name AS `name`, \
+                    GROUP_CONCAT(kc.column_name ORDER BY kc.ordinal_position) AS `columns`, \
+                    kc.referenced_table_schema AS `foreign_schema`, \
+                    kc.referenced_table_name AS `foreign_table`, \
+                    GROUP_CONCAT(kc.referenced_column_name ORDER BY kc.ordinal_position) \
+                        AS `foreign_columns`, \
+                    rc.update_rule AS `on_update`, rc.delete_rule AS `on_delete` \
+             FROM information_schema.key_column_usage kc \
+             JOIN information_schema.referential_constraints rc \
+               ON kc.constraint_schema = rc.constraint_schema \
+              AND kc.constraint_name = rc.constraint_name \
+             WHERE kc.table_schema = 'elyra' \
+               AND kc.table_name = 'introspected_child' \
+               AND kc.referenced_table_name IS NOT NULL \
+             GROUP BY kc.constraint_name, kc.referenced_table_schema, \
+                      kc.referenced_table_name, rc.update_rule, rc.delete_rule",
+            (),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![(
+            "fk_introspected_parent".into(),
+            "parent_id,parent_tenant_id".into(),
+            "elyra".into(),
+            "introspected_parent".into(),
+            "id,tenant_id".into(),
+            "CASCADE".into(),
+            "SET NULL".into(),
+        )]
+    );
+
+    c.query_drop("CREATE TABLE default_action_parent (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop(
+        "CREATE TABLE default_action_child (
+            id INT PRIMARY KEY,
+            parent_id INT,
+            CONSTRAINT fk_default_action
+                FOREIGN KEY (parent_id) REFERENCES default_action_parent (id)
+        )",
+    )
+    .await
+    .unwrap();
+    let actions: (String, String) = c
+        .query_first(
+            "SELECT update_rule, delete_rule \
+             FROM information_schema.referential_constraints \
+             WHERE constraint_name = 'fk_default_action'",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(actions, ("NO ACTION".into(), "NO ACTION".into()));
+
+    let error = c
+        .query_drop(
+            "SELECT 1 FROM information_schema.key_column_usage kc \
+             JOIN information_schema.missing_constraints mc \
+               ON kc.constraint_name = mc.constraint_name LIMIT 1",
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("missing_constraints"), "{error}");
+    assert!(
+        !error.contains("no such table: key_column_usage"),
+        "{error}"
+    );
 }
 
 #[tokio::test]
@@ -1649,6 +3294,24 @@ async fn mysql_semantics_matches() {
         .unwrap()
         .unwrap();
     assert_eq!(s, "2024-02-29");
+}
+
+#[tokio::test]
+async fn decimal_scale_reduction_rounds_half_away_from_zero() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop("CREATE TABLE decimal_values (id INT PRIMARY KEY, amount DECIMAL(8,2))")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO decimal_values VALUES (1, 8.876543211), (2, -8.876543211)")
+        .await
+        .unwrap();
+
+    let rows: Vec<(i64, String)> = c
+        .query("SELECT id, amount FROM decimal_values ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![(1, "8.88".into()), (2, "-8.88".into())]);
 }
 
 // Regression for the second differential batch (ESQL-15): DIV integer division,
@@ -2068,6 +3731,32 @@ async fn group_by_expression() {
         ]
     );
 
+    // With full-group enforcement disabled, MySQL permits ordering groups by a
+    // representative source value that is not part of the returned projection.
+    let rows: Vec<(String, i64)> = c
+        .query(
+            "SELECT DATE_FORMAT(ts, '%Y-%m-%d') AS day, COUNT(*)
+             FROM logs GROUP BY day ORDER BY ts DESC",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![("2026-07-17".into(), 120)]);
+
+    let rows: Vec<(String, i64)> = c
+        .query(
+            "SELECT DATE_FORMAT(ts, '%Y-%m-%d %H:%i:00') AS bucket, COUNT(*) \
+             FROM logs GROUP BY bucket ORDER BY bucket",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            ("2026-07-17 10:00:00".into(), 60),
+            ("2026-07-17 10:01:00".into(), 60),
+        ]
+    );
+
     // Arithmetic grouping (status class).
     let klass: Vec<(i64, i64)> = c
         .query("SELECT status DIV 100 AS k, COUNT(*) FROM logs GROUP BY status DIV 100 ORDER BY k")
@@ -2083,6 +3772,40 @@ async fn group_by_expression() {
         .unwrap();
     assert_eq!(p95.len(), 2);
     assert!(p95[0].1 > 0.0);
+}
+
+#[tokio::test]
+async fn grouped_wildcard_projects_a_representative_row() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop(
+        "CREATE TABLE events (id INT PRIMARY KEY, category VARCHAR(8), amount INT, ended_at DATETIME)",
+    )
+    .await
+    .unwrap();
+    c.query_drop(
+        "INSERT INTO events VALUES
+         (1, 'a', 10, NULL), (2, 'a', 20, NULL), (3, 'b', 30, NULL)",
+    )
+    .await
+    .unwrap();
+
+    let rows: Vec<(i64, String, i64, Option<String>)> = c
+        .query(
+            "SELECT * FROM events
+             WHERE ended_at IS NULL
+             GROUP BY category
+             ORDER BY category",
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(rows.len(), 2);
+    assert!(
+        matches!(&rows[0], (1, category, 10, None) if category == "a")
+            || matches!(&rows[0], (2, category, 20, None) if category == "a")
+    );
+    assert!(matches!(&rows[1], (3, category, 30, None) if category == "b"));
 }
 
 // Indexed ORDER BY ... LIMIT (ESQL-20): reverse primary-key scan and secondary-
@@ -3187,6 +4910,57 @@ async fn group_concat_honours_its_order_by() {
     assert_eq!(got.map(|s| s.split(',').count()), Some(12));
 }
 
+// Index introspection commonly prepares this information_schema query. The
+// GROUP BY path used to declare `NOT non_unique` as text while returning an
+// integer, which terminated the binary-protocol connection.
+#[tokio::test]
+async fn prepared_index_introspection_keeps_not_result_numeric() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop(
+        "CREATE TABLE indexed_items (id BIGINT PRIMARY KEY, slug VARCHAR(32), INDEX ix_slug (slug))",
+    )
+    .await
+    .unwrap();
+
+    let mut rows: Vec<(String, String, String, i64)> = c
+        .exec(
+            "SELECT index_name AS `name`, \
+                    GROUP_CONCAT(column_name ORDER BY seq_in_index) AS `columns`, \
+                    index_type AS `type`, NOT non_unique AS `unique` \
+             FROM information_schema.statistics \
+             WHERE table_schema = schema() AND table_name = 'indexed_items' \
+             GROUP BY index_name, index_type, non_unique",
+            (),
+        )
+        .await
+        .unwrap();
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            ("PRIMARY".into(), "id".into(), "BTREE".into(), 1),
+            ("ix_slug".into(), "slug".into(), "BTREE".into(), 0),
+        ]
+    );
+
+    let rows: Vec<(i64, String, String, Option<i64>, String)> = c
+        .query(
+            "SELECT NON_UNIQUE, INDEX_NAME, COLUMN_NAME, SUB_PART, INDEX_TYPE
+             FROM information_schema.STATISTICS
+             WHERE TABLE_SCHEMA = 'elyra'
+               AND TABLE_NAME = 'indexed_items'
+               AND INDEX_NAME = 'ix_slug'
+             ORDER BY SEQ_IN_INDEX",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![(1, "ix_slug".into(), "slug".into(), None, "BTREE".into())]
+    );
+}
+
 // A secondary-index range must not be used when it matches most of the table: the
 // index fetches every matching row by key, which is far dearer per row than a
 // sequential decode. The observable contract is correctness (the planner may choose
@@ -3320,9 +5094,8 @@ async fn in_list_lookups_return_correct_rows() {
     }
 
     // Literals of a different type than the column must be coerced before they are
-    // encoded as index keys. PDO binds integers as quoted strings, so this is the
-    // ordinary shape from Laravel's whereIn - and without coercion the lookup found
-    // nothing while a scan found the rows.
+    // encoded as index keys. Clients can bind integers as quoted strings; without
+    // coercion the lookup found nothing while an equivalent scan found the rows.
     for (sql, want) in [
         ("SELECT COUNT(*) FROM il WHERE id IN ('1','2')", 2i64),
         ("SELECT COUNT(*) FROM il WHERE id IN ('1',2)", 2),
@@ -3423,6 +5196,20 @@ async fn window_functions_are_exact() {
         .await
         .unwrap();
     assert_eq!(rows, vec![(1, 2, 1), (2, 4, 2), (3, 6, 3), (4, 8, 4)]);
+
+    // Wildcards expand alongside a window expression, including when the
+    // window query is wrapped to filter on its generated row number.
+    let rows: Vec<(i64, i64, i64, i64)> = c
+        .query(
+            "SELECT * FROM (
+                 SELECT *, ROW_NUMBER() OVER (PARTITION BY g ORDER BY id DESC) AS row_num
+                 FROM w WHERE id <= 6
+             ) AS limited
+             WHERE row_num <= 1 ORDER BY g",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![(6, 0, 6, 1), (4, 1, 4, 1), (5, 2, 5, 1)]);
 
     // RANK/DENSE_RANK over ties: tie-insensitive, so exact regardless of order.
     let rows: Vec<(i64, i64, i64)> = c

@@ -40,8 +40,20 @@ use sqlparser::dialect::MySqlDialect;
 use sqlparser::keywords::Keyword;
 use sqlparser::parser::Parser;
 use sqlparser::tokenizer::{Token, Tokenizer};
+use std::borrow::Cow;
 
 pub use stream::RowStream;
+
+struct UpdateModifiers {
+    base_sql: String,
+    order_by: Vec<sqlparser::ast::OrderByExpr>,
+    limit: Option<usize>,
+}
+
+struct DmlLimit {
+    base_sql: String,
+    limit: usize,
+}
 
 /// Outcome of a single SQL statement.
 #[allow(clippy::large_enum_variant)]
@@ -50,6 +62,11 @@ pub enum QueryResult {
     Rows(RowStream),
     /// A statement that changed state; carries affected row count.
     Affected(u64),
+    /// An INSERT result, including the statement-local ID for the OK packet.
+    Insert {
+        affected_rows: u64,
+        last_insert_id: u64,
+    },
 }
 
 impl QueryResult {
@@ -847,17 +864,41 @@ impl Engine {
         // SHOW [FULL] PROCESSLIST — handled in-engine so it works over the
         // prepared-statement path too (SHOW FULL PROCESSLIST also fails to parse).
         if head.starts_with("show processlist") || head.starts_with("show full processlist") {
-            return Ok(vec![exec::show_processlist()?]);
+            return Ok(vec![exec::show_processlist(sess)?]);
+        }
+
+        // sqlparser 0.53 does not recognize standalone RENAME TABLE, and parses
+        // ALTER TABLE ... RENAME INDEX as a malformed column rename. Handle
+        // those narrow MySQL forms before the generic frontend.
+        if let Some(rename) = parse_mysql_rename(trimmed) {
+            require_privilege(privilege, PrivilegedAction::Rename)?;
+            let result = match rename {
+                MysqlRename::Table { old, new } => exec::rename_table(sess, &old, &new).await?,
+                MysqlRename::Index { table, old, new } => {
+                    exec::rename_index(sess, &table, &old, &new).await?
+                }
+            };
+            return Ok(vec![result]);
+        }
+
+        // sqlparser 0.53 does not recognize MySQL's DROP INDEX / DROP FOREIGN
+        // KEY forms. Parse these narrow DDL statements before the generic
+        // frontend so schema tools can remove indexes and keys.
+        if let Some(drop) = parse_mysql_drop(trimmed) {
+            require_privilege(privilege, PrivilegedAction::AlterTable)?;
+            let result = match drop.kind {
+                MysqlDropKind::Index => exec::drop_index(sess, &drop.table, &drop.name).await?,
+                MysqlDropKind::ForeignKey => {
+                    exec::drop_foreign_key(sess, &drop.table, &drop.name).await?
+                }
+            };
+            return Ok(vec![result]);
         }
 
         // BACKUP [DATABASE] TO '<path>' — hot, consistent copy of the whole
         // database to a new file. Not standard SQL, so handled here.
         if head.starts_with("backup") {
-            if privilege < Privilege::Admin {
-                return Err(Error::Query(
-                    "access denied: BACKUP requires ADMIN privilege".into(),
-                ));
-            }
+            require_privilege(privilege, PrivilegedAction::Backup)?;
             let toks: Vec<&str> = trimmed.split_whitespace().collect();
             let path = toks
                 .iter()
@@ -875,11 +916,7 @@ impl Engine {
 
         // CREATE FULLTEXT INDEX (not reliably parsed by the frontend).
         if head.starts_with("create fulltext index") {
-            if privilege < Privilege::Admin {
-                return Err(Error::Query(
-                    "access denied: CREATE FULLTEXT INDEX requires ADMIN privilege".into(),
-                ));
-            }
+            require_privilege(privilege, PrivilegedAction::CreateFulltextIndex)?;
             let toks: Vec<&str> = trimmed.split_whitespace().collect();
             let name = toks
                 .iter()
@@ -941,11 +978,7 @@ impl Engine {
                 None
             };
             if let Some((kw, drop_meta)) = op {
-                if privilege < Privilege::Write {
-                    return Err(Error::Query(
-                        "access denied: ALTER TABLE requires WRITE privilege".into(),
-                    ));
-                }
+                require_privilege(privilege, PrivilegedAction::AlterPartition)?;
                 let toks: Vec<&str> = trimmed.split_whitespace().collect();
                 let table = toks
                     .get(2)
@@ -983,22 +1016,14 @@ impl Engine {
             || head.starts_with("refresh materialized")
             || head.starts_with("drop materialized")
         {
-            if privilege < Privilege::Write {
-                return Err(Error::Query(
-                    "access denied: materialized views require WRITE privilege".into(),
-                ));
-            }
+            require_privilege(privilege, PrivilegedAction::MaterializedViews)?;
             return self.materialized_view(trimmed, privilege, user, sess).await;
         }
 
         // LOAD DATA INFILE '<server-side path>' INTO TABLE t ... — reads a file on
         // the server and bulk-inserts it (requires ADMIN, like MySQL's FILE priv).
         if head.starts_with("load data") {
-            if privilege < Privilege::Admin {
-                return Err(Error::Query(
-                    "access denied: LOAD DATA INFILE requires ADMIN privilege".into(),
-                ));
-            }
+            require_privilege(privilege, PrivilegedAction::LoadDataInfile)?;
             let spec = exec::parse_load_data(trimmed)?;
             let content = tokio::fs::read_to_string(&spec.path).await.map_err(|e| {
                 Error::Query(format!("LOAD DATA: cannot read '{}': {e}", spec.path))
@@ -1007,8 +1032,12 @@ impl Engine {
             let mut total = 0u64;
             for stmt in stmts {
                 for r in Box::pin(self.execute_as(&stmt, privilege, user, sess)).await? {
-                    if let QueryResult::Affected(n) = r {
-                        total += n;
+                    match r {
+                        QueryResult::Affected(n)
+                        | QueryResult::Insert {
+                            affected_rows: n, ..
+                        } => total += n,
+                        QueryResult::Rows(_) => {}
                     }
                 }
             }
@@ -1018,6 +1047,7 @@ impl Engine {
         // Pessimistic table locking (LOCK TABLES / UNLOCK TABLES) — not parsed by
         // the SQL frontend.
         if head.starts_with("lock tables") || head.starts_with("lock table ") {
+            require_privilege(privilege, PrivilegedAction::LockTables)?;
             let rest = {
                 let lower = trimmed.to_ascii_lowercase();
                 let pos = lower
@@ -1051,11 +1081,7 @@ impl Engine {
 
         // Triggers (MySQL CREATE/DROP TRIGGER, not parsed by the frontend).
         if head.starts_with("create trigger") || head.starts_with("create or replace trigger") {
-            if privilege < Privilege::Admin {
-                return Err(Error::Query(
-                    "access denied: CREATE TRIGGER requires ADMIN privilege".into(),
-                ));
-            }
+            require_privilege(privilege, PrivilegedAction::CreateTrigger)?;
             let t = parse_create_trigger(trimmed)?;
             sess.commit_write(
                 vec![
@@ -1072,11 +1098,7 @@ impl Engine {
             return Ok(vec![QueryResult::empty_ok()]);
         }
         if head.starts_with("drop trigger") {
-            if privilege < Privilege::Admin {
-                return Err(Error::Query(
-                    "access denied: DROP TRIGGER requires ADMIN privilege".into(),
-                ));
-            }
+            require_privilege(privilege, PrivilegedAction::DropTrigger)?;
             let toks: Vec<&str> = trimmed.split_whitespace().collect();
             let name = toks
                 .iter()
@@ -1110,11 +1132,7 @@ impl Engine {
             return Ok(vec![exec::show_binary_logs(sess).await?]);
         }
         if head.starts_with("purge binary") || head.starts_with("purge master") {
-            if privilege < Privilege::Admin {
-                return Err(Error::Query(
-                    "access denied: PURGE BINARY LOGS requires ADMIN privilege".into(),
-                ));
-            }
+            require_privilege(privilege, PrivilegedAction::PurgeBinaryLogs)?;
             let toks: Vec<&str> = trimmed.split_whitespace().collect();
             let to = toks
                 .iter()
@@ -1128,11 +1146,7 @@ impl Engine {
         // Stored procedures (CREATE/DROP PROCEDURE, CALL): the MySQL BEGIN..END
         // body is not parsed by the SQL frontend, so handle it here.
         if head.starts_with("create procedure") || head.starts_with("create or replace procedure") {
-            if privilege < Privilege::Admin {
-                return Err(Error::Query(
-                    "access denied: CREATE PROCEDURE requires ADMIN privilege".into(),
-                ));
-            }
+            require_privilege(privilege, PrivilegedAction::CreateProcedure)?;
             let (name, def) = parse_create_procedure(trimmed)?;
             let enc = bincode::serialize(&def).map_err(|e| Error::Storage(e.to_string()))?;
             sess.commit_write(vec![(catalog::proc_key(&name), enc)], vec![])
@@ -1140,11 +1154,7 @@ impl Engine {
             return Ok(vec![QueryResult::empty_ok()]);
         }
         if head.starts_with("drop procedure") {
-            if privilege < Privilege::Admin {
-                return Err(Error::Query(
-                    "access denied: DROP PROCEDURE requires ADMIN privilege".into(),
-                ));
-            }
+            require_privilege(privilege, PrivilegedAction::DropProcedure)?;
             let toks: Vec<&str> = trimmed.split_whitespace().collect();
             let name = toks
                 .iter()
@@ -1228,61 +1238,78 @@ impl Engine {
             return Ok(vec![users::execute(sql, sess, privilege).await?]);
         }
 
-        if let Some(r) = self.intercept_session(sql) {
+        if let Some(r) = self.intercept_session(sql, sess) {
             return Ok(vec![r]); // session/introspection: read-level
         }
 
         let dialect = MySqlDialect {};
         // Substitute @user variables (leaving @@system vars) before parsing.
-        let mut subst_sql = if sql.contains('@') {
-            exec::substitute_uvars(sql, &sess.user_vars_snapshot())
+        let mut subst_sql: Cow<'_, str> = if exec::contains_uvar_reference(sql) {
+            Cow::Owned(exec::substitute_uvars(sql, &sess.user_vars_snapshot()))
         } else {
-            sql.to_string()
+            Cow::Borrowed(sql)
         };
         // `LOCK IN SHARE MODE` is a synonym for `FOR SHARE` (not parsed by the
         // MySQL dialect on its own).
-        if subst_sql
-            .to_ascii_lowercase()
-            .contains("lock in share mode")
-        {
-            subst_sql = replace_ci(&subst_sql, "lock in share mode", "for share");
+        if contains_ci(&subst_sql, "lock in share mode") {
+            subst_sql = Cow::Owned(replace_ci(&subst_sql, "lock in share mode", "for share"));
+        }
+        // MySQL permits an odd digit count in 0x-prefixed literals and treats
+        // the leading nibble as zero. sqlparser erases the distinction between
+        // that form and X'..', which requires pairs, so normalize 0x first.
+        if let Some(rewritten) = rewrite_odd_0x_literals(&subst_sql) {
+            subst_sql = Cow::Owned(rewritten);
         }
         // Strip trailing MySQL table options (ENGINE=, DEFAULT CHARSET/CHARACTER
         // SET, COLLATE, AUTO_INCREMENT, ROW_FORMAT, COMMENT, ...) from CREATE
         // TABLE, which the parser does not accept in all their spellings. They
-        // are no-ops here (single storage engine, utf8mb4). This makes Laravel,
-        // mysqldump and ORM-emitted DDL parse.
+        // are no-ops here (single storage engine, utf8mb4). This makes schema
+        // dumps and ORM-emitted DDL parse.
         if let Some(stripped) = strip_create_table_options(&subst_sql) {
-            subst_sql = stripped;
+            subst_sql = Cow::Owned(stripped);
         }
-        // Strip a trailing `LIMIT n` from UPDATE/DELETE (not parsed; MySQL's
-        // UPDATE/DELETE ... LIMIT without ORDER BY is non-deterministic anyway,
-        // and drivers like Laravel use it only for a unique-key single row).
-        if let Some(stripped) = strip_dml_limit(&subst_sql) {
-            subst_sql = stripped;
+        // CHANGE/MODIFY parse column options manually in sqlparser 0.53 and
+        // omit COLLATE. Rewrite only top-level ALTER TABLE collation clauses to
+        // the equivalent CHARACTER SET option, which that parser path retains.
+        if let Some(rewritten) = rewrite_alter_column_collations(&subst_sql) {
+            subst_sql = Cow::Owned(rewritten);
+        }
+        let mut update_modifiers = None;
+        if let Some(parsed) = parse_update_modifiers(&subst_sql)? {
+            subst_sql = Cow::Owned(parsed.base_sql.clone());
+            update_modifiers = Some(parsed);
+        }
+        let mut dml_limit = None;
+        // sqlparser does not accept a trailing LIMIT on every MySQL UPDATE and
+        // DELETE shape. Parse it separately and pass the row bound to execution.
+        if update_modifiers.is_none() {
+            if let Some(parsed) = parse_dml_limit(&subst_sql) {
+                subst_sql = Cow::Owned(parsed.base_sql);
+                dml_limit = Some(parsed.limit);
+            }
         }
         // Rewrite MySQL's `INSERT ... SET col = val, ...` shorthand into the
         // standard `INSERT ... (cols) VALUES (...)` the parser accepts.
         if let Some(rewritten) = rewrite_insert_set(&subst_sql) {
-            subst_sql = rewritten;
+            subst_sql = Cow::Owned(rewritten);
         }
         // Rewrite comma-style multi-table `UPDATE t1, t2 SET ... WHERE ...` into
         // `UPDATE t1 CROSS JOIN t2 SET ... WHERE ...` (the WHERE supplies the
         // join condition, as in the comma form).
         if let Some(rewritten) = rewrite_comma_update(&subst_sql) {
-            subst_sql = rewritten;
+            subst_sql = Cow::Owned(rewritten);
         }
         // Rewrite unary bitwise-NOT `~x` into `(x ^ 18446744073709551615)` (the
         // parser has no `~` prefix); the result is BIGINT UNSIGNED.
         if let Some(rewritten) = rewrite_tilde(&subst_sql) {
-            subst_sql = rewritten;
+            subst_sql = Cow::Owned(rewritten);
         }
         // Rewrite the `!` logical-NOT prefix into `(NOT (...))` (after `~` so a
         // mixed `!~x` is already parenthesised).
         if let Some(rewritten) = rewrite_bang(&subst_sql) {
-            subst_sql = rewritten;
+            subst_sql = Cow::Owned(rewritten);
         }
-        let statements = match Parser::parse_sql(&dialect, &subst_sql) {
+        let statements = match Parser::parse_sql(&dialect, subst_sql.as_ref()) {
             Ok(s) => s,
             Err(e) => {
                 // The MySQL dialect rejects `GROUP BY ... WITH ROLLUP` and the
@@ -1290,10 +1317,11 @@ impl Engine {
                 // (ROLLUP into a group-by modifier, shifts into
                 // PGBitwiseShiftLeft/Right, which the evaluator handles). Only
                 // retry for those so all other syntax stays on the MySQL dialect.
-                let lower = subst_sql.to_ascii_lowercase();
-                if lower.contains("rollup") || subst_sql.contains("<<") || subst_sql.contains(">>")
+                if contains_ci(&subst_sql, "rollup")
+                    || subst_sql.contains("<<")
+                    || subst_sql.contains(">>")
                 {
-                    Parser::parse_sql(&sqlparser::dialect::GenericDialect {}, &subst_sql)
+                    Parser::parse_sql(&sqlparser::dialect::GenericDialect {}, subst_sql.as_ref())
                         .map_err(|_| Error::Parse(e.to_string()))?
                 } else {
                     return Err(Error::Parse(e.to_string()));
@@ -1307,18 +1335,20 @@ impl Engine {
             // literal) before anything inspects the statement.
             let mut stmt = stmt;
             aiembed::resolve_stmt(&mut stmt).await?;
-            // Resolve LAST_INSERT_ID()/ROW_COUNT()/FOUND_ROWS() from session
-            // state before execution (stateless evaluator can't see it).
-            sessfn::rewrite(&mut stmt, sess.last_insert_id(), sess.row_count());
+            // Resolve session-backed functions before execution because the
+            // stateless evaluator cannot read connection state.
+            let database = sess.database();
+            sessfn::rewrite(
+                &mut stmt,
+                sess.last_insert_id(),
+                sess.row_count(),
+                &database,
+            );
             let need = required_privilege(&stmt);
             let effective = self
                 .effective_privilege(privilege, user, &stmt, sess)
                 .await?;
-            if effective < need {
-                return Err(Error::Query(format!(
-                    "access denied: statement requires {need:?} privilege"
-                )));
-            }
+            require_privilege(effective, PrivilegedAction::Statement(need))?;
             // Fine-grained write enforcement: within the write tier, require the
             // *specific* privilege (INSERT/UPDATE/DELETE) on each target table,
             // not merely "some write". Skipped for Admin/open-auth connections
@@ -1366,11 +1396,16 @@ impl Engine {
                     }
                 }
             }
-            let r = self.execute_stmt(stmt, sess).await?;
+            let r = self
+                .execute_stmt(stmt, sess, update_modifiers.as_ref(), dml_limit)
+                .await?;
             // Track ROW_COUNT(): rows changed by DML, or -1 after a result set
             // (matches MySQL).
             match &r {
                 QueryResult::Affected(n) => sess.set_row_count(*n as i64),
+                QueryResult::Insert { affected_rows, .. } => {
+                    sess.set_row_count(*affected_rows as i64)
+                }
                 QueryResult::Rows(_) => sess.set_row_count(-1),
             }
             out.push(r);
@@ -1422,7 +1457,13 @@ impl Engine {
         Ok(eff)
     }
 
-    async fn execute_stmt(&self, stmt: Statement, sess: &Session) -> Result<QueryResult> {
+    async fn execute_stmt(
+        &self,
+        stmt: Statement,
+        sess: &Session,
+        update_modifiers: Option<&UpdateModifiers>,
+        dml_limit: Option<usize>,
+    ) -> Result<QueryResult> {
         match stmt {
             Statement::Query(q) => {
                 if query_has_from(&q) {
@@ -1462,13 +1503,27 @@ impl Engine {
                 selection,
                 ..
             } => {
-                let r = exec::update(sess, &self.vindex, &table, &assignments, selection.as_ref())
-                    .await?;
+                let order_by = update_modifiers
+                    .map(|modifiers| modifiers.order_by.as_slice())
+                    .unwrap_or_default();
+                let limit = update_modifiers
+                    .and_then(|modifiers| modifiers.limit)
+                    .or(dml_limit);
+                let r = exec::update(
+                    sess,
+                    &self.vindex,
+                    &table,
+                    &assignments,
+                    selection.as_ref(),
+                    order_by,
+                    limit,
+                )
+                .await?;
                 self.fire_triggers(sess).await?;
                 Ok(r)
             }
             Statement::Delete(del) => {
-                let r = exec::delete(sess, &self.vindex, &del).await?;
+                let r = exec::delete(sess, &self.vindex, &del, dml_limit).await?;
                 self.fire_triggers(sess).await?;
                 Ok(r)
             }
@@ -1478,12 +1533,24 @@ impl Engine {
                 if_exists,
                 ..
             } => {
-                let name = names
-                    .first()
-                    .and_then(|n| n.0.last())
-                    .map(|i| i.value.clone())
-                    .ok_or_else(|| Error::Catalog("empty table name".into()))?;
-                exec::drop_table(sess, &name, if_exists).await
+                let table_names = names
+                    .iter()
+                    .map(|name| {
+                        object_name_last(name)
+                            .ok_or_else(|| Error::Catalog("empty table name".into()))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                if !if_exists {
+                    for name in &table_names {
+                        if !catalog::exists(sess, name).await? {
+                            return Err(Error::Catalog(format!("no such table: {name}")));
+                        }
+                    }
+                }
+                for name in table_names {
+                    exec::drop_table(sess, &name, true).await?;
+                }
+                Ok(QueryResult::Affected(0))
             }
             Statement::Drop {
                 object_type: sqlparser::ast::ObjectType::View,
@@ -1491,12 +1558,24 @@ impl Engine {
                 if_exists,
                 ..
             } => {
-                let name = names
-                    .first()
-                    .and_then(|n| n.0.last())
-                    .map(|i| i.value.clone())
-                    .ok_or_else(|| Error::Catalog("empty view name".into()))?;
-                exec::drop_view(sess, &name, if_exists).await
+                let view_names = names
+                    .iter()
+                    .map(|name| {
+                        object_name_last(name)
+                            .ok_or_else(|| Error::Catalog("empty view name".into()))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                if !if_exists {
+                    for name in &view_names {
+                        if catalog::load_view(sess, name).await?.is_none() {
+                            return Err(Error::Catalog(format!("no such view: {name}")));
+                        }
+                    }
+                }
+                for name in view_names {
+                    exec::drop_view(sess, &name, true).await?;
+                }
+                Ok(QueryResult::Affected(0))
             }
             Statement::StartTransaction { .. } => {
                 sess.begin()?;
@@ -1557,24 +1636,52 @@ impl Engine {
                     .ok_or_else(|| Error::Catalog("empty table name".into()))?;
                 exec::show_columns(sess, &name).await
             }
-            Statement::SetVariable { .. } | Statement::Use { .. } => Ok(QueryResult::empty_ok()),
-            // ElyraSQL is a single logical schema (one file); CREATE/DROP
-            // DATABASE|SCHEMA are accepted as no-ops so tools and migrations that
-            // issue them proceed.
-            Statement::CreateDatabase { .. } | Statement::CreateSchema { .. } => {
+            Statement::SetVariable { .. } => Ok(QueryResult::empty_ok()),
+            Statement::Use(use_expr) => {
+                use sqlparser::ast::Use;
+                let database = match use_expr {
+                    Use::Database(name) | Use::Schema(name) | Use::Object(name) => {
+                        object_name_last(&name)
+                            .ok_or_else(|| Error::Catalog("empty database name".into()))?
+                    }
+                    Use::Default => "elyra".into(),
+                    other => {
+                        return Err(Error::Unsupported(format!(
+                            "USE target is not supported: {other}"
+                        )))
+                    }
+                };
+                sess.set_database(&database);
                 Ok(QueryResult::empty_ok())
             }
+            // ElyraSQL is a single logical schema backed by one file. Reporting
+            // success for an unconditional `CREATE DATABASE other` would make the
+            // caller believe it got an isolated database when every connection
+            // still shares `elyra`, so that form is refused. The conditional forms
+            // are how tooling asks "make sure this exists" rather than "give me a
+            // fresh one" -- Laravel's MigrateCommand, container entrypoints and our
+            // own benches all issue `IF NOT EXISTS` -- so they succeed as no-ops,
+            // as does naming the database that already exists.
+            Statement::CreateDatabase { if_not_exists, .. } => {
+                create_database_result(if_not_exists)
+            }
+            Statement::CreateSchema { if_not_exists, .. } => create_database_result(if_not_exists),
             Statement::Explain { statement, .. } => exec::explain(sess, &statement).await,
             Statement::Drop {
                 object_type:
                     sqlparser::ast::ObjectType::Database | sqlparser::ast::ObjectType::Schema,
+                if_exists,
+                names,
                 ..
-            } => Ok(QueryResult::empty_ok()),
+            } => {
+                let target = names.first().and_then(object_name_last);
+                drop_database_result(&sess.database(), if_exists, target.as_deref())
+            }
             // Session/introspection queries GUI tools and ORMs fire on connect.
             Statement::ShowVariables { filter, .. } => exec::show_variables(filter.as_ref()),
             Statement::ShowStatus { filter, .. } => exec::show_status(filter.as_ref()),
             Statement::ShowCollation { filter } => exec::show_collation(filter.as_ref()),
-            Statement::ShowDatabases { .. } => exec::show_databases(),
+            Statement::ShowDatabases { .. } => exec::show_databases(sess),
             Statement::ShowVariable { variable } => {
                 let kw = variable
                     .iter()
@@ -1596,15 +1703,23 @@ impl Engine {
     }
 
     /// Handle the well-known session/introspection queries MySQL drivers send.
-    fn intercept_session(&self, sql: &str) -> Option<QueryResult> {
+    fn intercept_session(&self, sql: &str, sess: &Session) -> Option<QueryResult> {
         let t = sql.trim().trim_end_matches(';').trim();
+        let is_set = t
+            .get(..4)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("set "));
+        if is_set {
+            let lower = t.to_ascii_lowercase();
+            if let Some((_, mode)) = lower.rsplit_once("sql_mode") {
+                let strict =
+                    mode.contains("strict_trans_tables") || mode.contains("strict_all_tables");
+                sess.set_strict_sql_mode(strict);
+            }
+        }
         // Every intercepted query is short; skip large statements cheaply
         // (a long `SET ...` is still swallowed).
         if t.len() > 48 {
-            return t
-                .get(..4)
-                .filter(|h| h.eq_ignore_ascii_case("set "))
-                .map(|_| QueryResult::empty_ok());
+            return is_set.then(QueryResult::empty_ok);
         }
         let lower = t.to_ascii_lowercase();
 
@@ -1624,9 +1739,9 @@ impl Engine {
             "select database()" | "select schema()" => Some(QueryResult::scalar(
                 "database()",
                 ColumnType::Text,
-                Value::Text("elyra".into()),
+                Value::Text(sess.database()),
             )),
-            _ if lower.starts_with("set ") => Some(QueryResult::empty_ok()),
+            _ if is_set => Some(QueryResult::empty_ok()),
             _ => None,
         }
     }
@@ -1646,6 +1761,61 @@ fn truthy(v: &Value) -> bool {
 
 fn object_name_last(name: &sqlparser::ast::ObjectName) -> Option<String> {
     name.0.last().map(|i| i.value.clone())
+}
+
+/// `CREATE DATABASE`/`SCHEMA` against a server that has exactly one database.
+///
+/// `IF NOT EXISTS` asks for the database to *be there*, which it already is, so
+/// it is an honest no-op — and it is the form tooling uses (Laravel's
+/// `MigrateCommand`, container entrypoints, our own benches). An unconditional
+/// `CREATE DATABASE` asks for a *new, empty* database, which this server cannot
+/// give, so refusing beats silently sharing `elyra`.
+fn create_database_result(if_not_exists: bool) -> Result<QueryResult> {
+    if if_not_exists {
+        return Ok(QueryResult::empty_ok());
+    }
+    Err(Error::Unsupported(
+        "CREATE DATABASE is not supported; ElyraSQL uses the single `elyra` database \
+         (use CREATE DATABASE IF NOT EXISTS to make this a no-op)"
+            .into(),
+    ))
+}
+
+/// `DROP DATABASE`/`SCHEMA` under the same single-database model.
+///
+/// `IF EXISTS` on a database that does not exist here is a no-op, which is what
+/// the caller asked for. Dropping the database the session is actually using is
+/// refused rather than silently ignored: the caller expects its data to be gone.
+fn drop_database_result(
+    current: &str,
+    if_exists: bool,
+    target: Option<&str>,
+) -> Result<QueryResult> {
+    let names_current = target.is_some_and(|t| t.eq_ignore_ascii_case(current));
+    if if_exists && !names_current {
+        return Ok(QueryResult::empty_ok());
+    }
+    Err(Error::Unsupported(
+        "DROP DATABASE is not supported; ElyraSQL uses the single `elyra` database".into(),
+    ))
+}
+
+#[cfg(test)]
+mod database_ddl_tests {
+    use super::{create_database_result, drop_database_result};
+
+    #[test]
+    fn conditional_create_is_a_no_op() {
+        assert!(create_database_result(true).is_ok());
+        assert!(create_database_result(false).is_err());
+    }
+
+    #[test]
+    fn conditional_drop_spares_everything_but_the_live_database() {
+        assert!(drop_database_result("elyra", true, Some("scratch")).is_ok());
+        assert!(drop_database_result("elyra", true, Some("ELYRA")).is_err());
+        assert!(drop_database_result("elyra", false, Some("scratch")).is_err());
+    }
 }
 
 /// Collect the column names referenced by an expression. Returns `false` if it
@@ -1735,12 +1905,28 @@ fn collect_col_refs(e: &sqlparser::ast::Expr, out: &mut Vec<String>) -> bool {
     }
 }
 
+/// Allocation-free ASCII case-insensitive substring search.
+fn contains_ci(haystack: &str, needle: &str) -> bool {
+    let needle = needle.as_bytes();
+    !needle.is_empty()
+        && haystack
+            .as_bytes()
+            .windows(needle.len())
+            .any(|window| window.eq_ignore_ascii_case(needle))
+}
+
 /// Case-insensitive substring replace (used to normalize `LOCK IN SHARE MODE`).
 fn replace_ci(haystack: &str, needle: &str, replacement: &str) -> String {
-    let (hl, nl) = (haystack.to_ascii_lowercase(), needle.to_ascii_lowercase());
+    let needle_bytes = needle.as_bytes();
+    if needle_bytes.is_empty() {
+        return haystack.to_owned();
+    }
     let mut out = String::with_capacity(haystack.len());
     let mut i = 0;
-    while let Some(pos) = hl[i..].find(&nl) {
+    while let Some(pos) = haystack.as_bytes()[i..]
+        .windows(needle_bytes.len())
+        .position(|window| window.eq_ignore_ascii_case(needle_bytes))
+    {
         let at = i + pos;
         out.push_str(&haystack[i..at]);
         out.push_str(replacement);
@@ -1748,6 +1934,73 @@ fn replace_ci(haystack: &str, needle: &str, replacement: &str) -> String {
     }
     out.push_str(&haystack[i..]);
     out
+}
+
+fn rewrite_odd_0x_literals(sql: &str) -> Option<String> {
+    let bytes = sql.as_bytes();
+    let mut insertions = Vec::new();
+    let mut quote = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let byte = bytes[i];
+        if let Some(delimiter) = quote {
+            if byte == b'\\' && delimiter != b'`' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if byte == delimiter {
+                if bytes.get(i + 1) == Some(&delimiter) {
+                    i += 2;
+                    continue;
+                }
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        if matches!(byte, b'\'' | b'"' | b'`') {
+            quote = Some(byte);
+            i += 1;
+            continue;
+        }
+
+        let has_prefix = byte == b'0'
+            && bytes
+                .get(i + 1)
+                .is_some_and(|next| matches!(next, b'x' | b'X'))
+            && i.checked_sub(1)
+                .and_then(|previous| bytes.get(previous))
+                .is_none_or(|previous| !previous.is_ascii_alphanumeric() && *previous != b'_');
+        if has_prefix {
+            let digits = i + 2;
+            let mut end = digits;
+            while bytes.get(end).is_some_and(u8::is_ascii_hexdigit) {
+                end += 1;
+            }
+            let has_token_boundary = bytes
+                .get(end)
+                .is_none_or(|next| !next.is_ascii_alphanumeric() && *next != b'_');
+            if end > digits && (end - digits) % 2 == 1 && has_token_boundary {
+                insertions.push(digits);
+            }
+            i = end.max(i + 1);
+            continue;
+        }
+        i += 1;
+    }
+
+    if insertions.is_empty() {
+        return None;
+    }
+    let mut out = String::with_capacity(sql.len() + insertions.len());
+    let mut copied = 0;
+    for insertion in insertions {
+        out.push_str(&sql[copied..insertion]);
+        out.push('0');
+        copied = insertion;
+    }
+    out.push_str(&sql[copied..]);
+    Some(out)
 }
 
 /// A single plain (unjoined) base table in `twj`, if that's what it is.
@@ -1918,11 +2171,80 @@ fn parse_create_procedure(sql: &str) -> Result<(String, proc::ProcDef)> {
     Ok((name, proc::ProcDef { params, body }))
 }
 
+#[derive(Clone, Copy)]
+enum PrivilegedAction {
+    Rename,
+    AlterTable,
+    AlterPartition,
+    Backup,
+    CreateFulltextIndex,
+    MaterializedViews,
+    LoadDataInfile,
+    LockTables,
+    CreateTrigger,
+    DropTrigger,
+    PurgeBinaryLogs,
+    CreateProcedure,
+    DropProcedure,
+    Statement(Privilege),
+}
+
+impl PrivilegedAction {
+    fn required(self) -> Privilege {
+        match self {
+            Self::AlterPartition | Self::MaterializedViews | Self::LockTables => Privilege::Write,
+            Self::Statement(required) => required,
+            Self::Rename
+            | Self::AlterTable
+            | Self::Backup
+            | Self::CreateFulltextIndex
+            | Self::LoadDataInfile
+            | Self::CreateTrigger
+            | Self::DropTrigger
+            | Self::PurgeBinaryLogs
+            | Self::CreateProcedure
+            | Self::DropProcedure => Privilege::Admin,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Rename => "RENAME",
+            Self::AlterTable | Self::AlterPartition => "ALTER TABLE",
+            Self::Backup => "BACKUP",
+            Self::CreateFulltextIndex => "CREATE FULLTEXT INDEX",
+            Self::MaterializedViews => "materialized views",
+            Self::LoadDataInfile => "LOAD DATA INFILE",
+            Self::LockTables => "LOCK TABLES",
+            Self::CreateTrigger => "CREATE TRIGGER",
+            Self::DropTrigger => "DROP TRIGGER",
+            Self::PurgeBinaryLogs => "PURGE BINARY LOGS",
+            Self::CreateProcedure => "CREATE PROCEDURE",
+            Self::DropProcedure => "DROP PROCEDURE",
+            Self::Statement(_) => "statement",
+        }
+    }
+}
+
+fn require_privilege(granted: Privilege, action: PrivilegedAction) -> Result<()> {
+    let required = action.required();
+    if granted >= required {
+        return Ok(());
+    }
+    let required = match required {
+        Privilege::Read => "READ",
+        Privilege::Write => "WRITE",
+        Privilege::Admin => "ADMIN",
+    };
+    Err(Error::Query(format!(
+        "access denied: {} requires {required} privilege",
+        action.label()
+    )))
+}
+
 fn required_privilege(stmt: &Statement) -> Privilege {
     match stmt {
-        Statement::Query(_) | Statement::SetVariable { .. } | Statement::Use { .. } => {
-            Privilege::Read
-        }
+        Statement::Query(_) | Statement::SetVariable { .. } | Statement::Use(_) => Privilege::Read,
         Statement::Insert(_) | Statement::Update { .. } | Statement::Delete(_) => Privilege::Write,
         Statement::StartTransaction { .. }
         | Statement::Commit { .. }
@@ -2172,6 +2494,339 @@ fn is_deepening_token(tok: &Token) -> bool {
     }
 }
 
+fn mysql_ddl_tokens(sql: &str) -> Option<Vec<Token>> {
+    let dialect = MySqlDialect {};
+    Some(
+        Tokenizer::new(&dialect, sql)
+            .tokenize()
+            .ok()?
+            .into_iter()
+            .filter(|token| !matches!(token, Token::Whitespace(_) | Token::SemiColon))
+            .collect(),
+    )
+}
+
+fn mysql_word(tokens: &[Token], position: usize) -> Option<&str> {
+    match tokens.get(position) {
+        Some(Token::Word(word)) => Some(word.value.as_str()),
+        _ => None,
+    }
+}
+
+fn mysql_keyword(tokens: &[Token], position: usize, expected: &str) -> bool {
+    mysql_word(tokens, position).is_some_and(|actual| actual.eq_ignore_ascii_case(expected))
+}
+
+fn mysql_table_name(tokens: &[Token], start: usize, end: usize) -> Option<String> {
+    match tokens.get(start..end)? {
+        [Token::Word(table)] => Some(table.value.clone()),
+        [Token::Word(_schema), Token::Period, Token::Word(table)] => Some(table.value.clone()),
+        _ => None,
+    }
+}
+
+enum MysqlRename {
+    Table {
+        old: String,
+        new: String,
+    },
+    Index {
+        table: String,
+        old: String,
+        new: String,
+    },
+}
+
+/// Parse MySQL rename forms absent from sqlparser 0.53. The commonly emitted
+/// single-pair `RENAME TABLE` form accepts quoted and schema-qualified names.
+fn parse_mysql_rename(sql: &str) -> Option<MysqlRename> {
+    let tokens = mysql_ddl_tokens(sql)?;
+
+    if mysql_keyword(&tokens, 0, "rename") && mysql_keyword(&tokens, 1, "table") {
+        let to_position = (2..tokens.len()).find(|&i| mysql_keyword(&tokens, i, "to"))?;
+        return Some(MysqlRename::Table {
+            old: mysql_table_name(&tokens, 2, to_position)?,
+            new: mysql_table_name(&tokens, to_position + 1, tokens.len())?,
+        });
+    }
+
+    if tokens.len() >= 7 && mysql_keyword(&tokens, 0, "alter") && mysql_keyword(&tokens, 1, "table")
+    {
+        let rename_position = tokens.iter().position(
+            |token| matches!(token, Token::Word(word) if word.value.eq_ignore_ascii_case("rename")),
+        )?;
+        if rename_position + 5 == tokens.len()
+            && (mysql_keyword(&tokens, rename_position + 1, "index")
+                || mysql_keyword(&tokens, rename_position + 1, "key"))
+            && mysql_keyword(&tokens, rename_position + 3, "to")
+        {
+            return Some(MysqlRename::Index {
+                table: mysql_table_name(&tokens, 2, rename_position)?,
+                old: mysql_word(&tokens, rename_position + 2)?.to_string(),
+                new: mysql_word(&tokens, rename_position + 4)?.to_string(),
+            });
+        }
+    }
+
+    None
+}
+
+#[derive(Clone, Copy)]
+enum MysqlDropKind {
+    Index,
+    ForeignKey,
+}
+
+struct MysqlDrop {
+    table: String,
+    name: String,
+    kind: MysqlDropKind,
+}
+
+/// Parse the MySQL-only index/key removal forms rejected by sqlparser 0.53:
+/// `ALTER TABLE t DROP INDEX i`, `ALTER TABLE t DROP FOREIGN KEY fk`, and
+/// `DROP INDEX i ON t`. Quoted and schema-qualified table names are accepted.
+fn parse_mysql_drop(sql: &str) -> Option<MysqlDrop> {
+    let tokens = mysql_ddl_tokens(sql)?;
+
+    if tokens.len() >= 6 && mysql_keyword(&tokens, 0, "alter") && mysql_keyword(&tokens, 1, "table")
+    {
+        let drop_position = tokens.iter().position(
+            |token| matches!(token, Token::Word(word) if word.value.eq_ignore_ascii_case("drop")),
+        )?;
+        let table = mysql_table_name(&tokens, 2, drop_position)?;
+        if drop_position + 3 == tokens.len()
+            && (mysql_keyword(&tokens, drop_position + 1, "index")
+                || mysql_keyword(&tokens, drop_position + 1, "key"))
+        {
+            return Some(MysqlDrop {
+                table,
+                name: mysql_word(&tokens, drop_position + 2)?.to_string(),
+                kind: MysqlDropKind::Index,
+            });
+        }
+        if drop_position + 4 == tokens.len()
+            && mysql_keyword(&tokens, drop_position + 1, "foreign")
+            && mysql_keyword(&tokens, drop_position + 2, "key")
+        {
+            return Some(MysqlDrop {
+                table,
+                name: mysql_word(&tokens, drop_position + 3)?.to_string(),
+                kind: MysqlDropKind::ForeignKey,
+            });
+        }
+    }
+
+    if tokens.len() >= 5
+        && mysql_keyword(&tokens, 0, "drop")
+        && mysql_keyword(&tokens, 1, "index")
+        && mysql_keyword(&tokens, 3, "on")
+    {
+        return Some(MysqlDrop {
+            table: mysql_table_name(&tokens, 4, tokens.len())?,
+            name: mysql_word(&tokens, 2)?.to_string(),
+            kind: MysqlDropKind::Index,
+        });
+    }
+
+    None
+}
+
+/// Make ALTER TABLE CHANGE/MODIFY collation clauses visible to sqlparser 0.53.
+/// Its column-option parser retains `CHARACTER SET <name>` but, unlike the
+/// CREATE/ADD column path, does not consume `COLLATE <name>`. The executor maps
+/// both spellings onto ElyraSQL's stored text collation.
+fn rewrite_alter_column_collations(sql: &str) -> Option<String> {
+    let statement = sql.trim_start();
+    if !keyword_at(statement.as_bytes(), 0, b"alter") {
+        return None;
+    }
+    let table_position = find_top_level_keyword(statement, b"table")?;
+    if !statement[..table_position]
+        .trim()
+        .eq_ignore_ascii_case("alter")
+    {
+        return None;
+    }
+    if find_top_level_keyword(statement, b"change").is_none()
+        && find_top_level_keyword(statement, b"modify").is_none()
+    {
+        return None;
+    }
+
+    let mut positions = Vec::new();
+    let mut search_from = 0;
+    while let Some(relative) = find_top_level_keyword(&sql[search_from..], b"collate") {
+        let position = search_from + relative;
+        positions.push(position);
+        search_from = position + b"collate".len();
+    }
+    if positions.is_empty() {
+        return None;
+    }
+
+    let mut rewritten = String::with_capacity(sql.len() + positions.len() * 6);
+    let mut copied_through = 0;
+    for position in positions {
+        rewritten.push_str(&sql[copied_through..position]);
+        rewritten.push_str("CHARACTER SET");
+        copied_through = position + b"collate".len();
+    }
+    rewritten.push_str(&sql[copied_through..]);
+    Some(rewritten)
+}
+
+/// Extract MySQL's single-table `UPDATE ... ORDER BY ... [LIMIT ...]` tail.
+/// The UPDATE itself remains on sqlparser 0.53; the tail is parsed by wrapping
+/// it in a SELECT, whose ORDER BY / LIMIT AST is already supported.
+fn parse_update_modifiers(sql: &str) -> Result<Option<UpdateModifiers>> {
+    let trimmed = sql.trim().trim_end_matches(';').trim_end();
+    if !keyword_at(trimmed.as_bytes(), 0, b"update") {
+        return Ok(None);
+    }
+    let Some((order_start, order_expr_start)) = find_top_level_order_by(trimmed) else {
+        return Ok(None);
+    };
+
+    let tail = &trimmed[order_expr_start..];
+    let limit_start = find_top_level_keyword(tail, b"limit");
+    let order_sql = match limit_start {
+        Some(position) => tail[..position].trim(),
+        None => tail.trim(),
+    };
+    if order_sql.is_empty() {
+        return Ok(None);
+    }
+    let limit_sql = limit_start.map(|position| tail[position..].trim());
+    let wrapper = match limit_sql {
+        Some(limit) => {
+            format!("SELECT * FROM __elyra_update_order ORDER BY {order_sql} {limit}")
+        }
+        None => format!("SELECT * FROM __elyra_update_order ORDER BY {order_sql}"),
+    };
+    let mut statements = Parser::parse_sql(&MySqlDialect {}, &wrapper)
+        .map_err(|error| Error::Parse(error.to_string()))?;
+    let Statement::Query(mut query) = statements
+        .pop()
+        .filter(|_| statements.is_empty())
+        .ok_or_else(|| Error::Parse("invalid UPDATE ORDER BY clause".into()))?
+    else {
+        return Err(Error::Parse("invalid UPDATE ORDER BY clause".into()));
+    };
+    let order_by = query
+        .order_by
+        .take()
+        .map(|order| order.exprs)
+        .unwrap_or_default();
+    if query.offset.is_some() {
+        return Err(Error::Parse(
+            "UPDATE LIMIT does not support an offset".into(),
+        ));
+    }
+
+    Ok(Some(UpdateModifiers {
+        base_sql: trimmed[..order_start].trim_end().to_string(),
+        order_by,
+        limit: query
+            .limit
+            .take()
+            .map(|limit| exec::eval_usize(&limit))
+            .transpose()?,
+    }))
+}
+
+fn find_top_level_order_by(sql: &str) -> Option<(usize, usize)> {
+    let bytes = sql.as_bytes();
+    let mut search_from = 0;
+    while let Some(order_start) = find_top_level_keyword(&sql[search_from..], b"order") {
+        let order_start = search_from + order_start;
+        let mut by_start = order_start + b"order".len();
+        while bytes.get(by_start).is_some_and(u8::is_ascii_whitespace) {
+            by_start += 1;
+        }
+        if keyword_at(bytes, by_start, b"by") {
+            return Some((order_start, by_start + b"by".len()));
+        }
+        search_from = order_start + b"order".len();
+    }
+    None
+}
+
+/// Byte offset of an ASCII keyword outside quotes and parentheses.
+fn find_top_level_keyword(sql: &str, keyword: &[u8]) -> Option<usize> {
+    let bytes = sql.as_bytes();
+    let mut quote = None;
+    let mut depth = 0usize;
+    let mut position = 0usize;
+    while position < bytes.len() {
+        let byte = bytes[position];
+        if let Some(delimiter) = quote {
+            if byte == b'\\' {
+                position = position.saturating_add(2);
+                continue;
+            }
+            if byte == delimiter {
+                if bytes.get(position + 1) == Some(&delimiter) {
+                    position += 2;
+                    continue;
+                }
+                quote = None;
+            }
+        } else {
+            match byte {
+                b'\'' | b'"' | b'`' => quote = Some(byte),
+                b'#' => {
+                    position += 1;
+                    while position < bytes.len() && bytes[position] != b'\n' {
+                        position += 1;
+                    }
+                    continue;
+                }
+                b'-' if bytes.get(position + 1) == Some(&b'-') => {
+                    position += 2;
+                    while position < bytes.len() && bytes[position] != b'\n' {
+                        position += 1;
+                    }
+                    continue;
+                }
+                b'/' if bytes.get(position + 1) == Some(&b'*') => {
+                    position += 2;
+                    while position + 1 < bytes.len()
+                        && (bytes[position] != b'*' || bytes[position + 1] != b'/')
+                    {
+                        position += 1;
+                    }
+                    position = (position + 2).min(bytes.len());
+                    continue;
+                }
+                b'(' => depth += 1,
+                b')' => depth = depth.saturating_sub(1),
+                _ if depth == 0 && keyword_at(bytes, position, keyword) => return Some(position),
+                _ => {}
+            }
+        }
+        position += 1;
+    }
+    None
+}
+
+fn keyword_at(sql: &[u8], position: usize, keyword: &[u8]) -> bool {
+    let Some(candidate) = sql.get(position..position.saturating_add(keyword.len())) else {
+        return false;
+    };
+    if !candidate.eq_ignore_ascii_case(keyword) {
+        return false;
+    }
+    let is_identifier = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$';
+    !position
+        .checked_sub(1)
+        .and_then(|previous| sql.get(previous))
+        .is_some_and(|byte| is_identifier(*byte))
+        && !sql
+            .get(position + keyword.len())
+            .is_some_and(|byte| is_identifier(*byte))
+}
+
 /// Remove trailing table options from a `CREATE TABLE (...) <options>` statement
 /// that the SQL parser cannot accept in every MySQL spelling (`ENGINE=`,
 /// `DEFAULT CHARSET`/`CHARACTER SET`, `COLLATE '...'`, `AUTO_INCREMENT=`,
@@ -2248,10 +2903,9 @@ fn strip_create_table_options(sql: &str) -> Option<String> {
     Some(sql[..=close].to_string())
 }
 
-/// Remove a trailing `LIMIT <n>` from an `UPDATE`/`DELETE` statement, which the
-/// parser does not accept. Row-limited UPDATE/DELETE is not enforced (the whole
-/// matching set is affected); the WHERE clause is respected as written.
-fn strip_dml_limit(sql: &str) -> Option<String> {
+/// Extract a trailing `LIMIT <n>` from an `UPDATE`/`DELETE` statement when the
+/// parser does not accept that MySQL form.
+fn parse_dml_limit(sql: &str) -> Option<DmlLimit> {
     let head = sql.trim_start();
     let up = head.get(..7).unwrap_or(head).to_ascii_uppercase();
     if !(up.starts_with("UPDATE ") || up.starts_with("DELETE ")) {
@@ -2274,7 +2928,10 @@ fn strip_dml_limit(sql: &str) -> Option<String> {
     let bb = before_num.as_bytes();
     if bb.len() >= 5 && bb[bb.len() - 5..].eq_ignore_ascii_case(b"limit") {
         let kept = before_num[..before_num.len() - 5].trim_end();
-        return Some(kept.to_string());
+        return Some(DmlLimit {
+            base_sql: kept.to_string(),
+            limit: trimmed[i..].parse().ok()?,
+        });
     }
     None
 }
@@ -2531,14 +3188,18 @@ pub fn fuzz_preprocess_parse(sql: &str) {
         return;
     }
     let mut s = sql.to_string();
-    if s.to_ascii_lowercase().contains("lock in share mode") {
+    if contains_ci(&s, "lock in share mode") {
         s = replace_ci(&s, "lock in share mode", "for share");
+    }
+    if let Some(x) = rewrite_odd_0x_literals(&s) {
+        s = x;
     }
     if let Some(x) = strip_create_table_options(&s) {
         s = x;
     }
-    if let Some(x) = strip_dml_limit(&s) {
-        s = x;
+    let _ = parse_update_modifiers(&s);
+    if let Some(x) = parse_dml_limit(&s) {
+        s = x.base_sql;
     }
     if let Some(x) = rewrite_insert_set(&s) {
         s = x;
@@ -3035,10 +3696,114 @@ mod comma_update_tests {
 }
 
 #[cfg(test)]
+mod mysql_ddl_compat_tests {
+    use super::{
+        parse_mysql_rename, require_privilege, rewrite_alter_column_collations, MysqlRename,
+        PrivilegedAction,
+    };
+    use elyra_core::Privilege;
+
+    #[test]
+    fn rewrites_only_alter_change_and_modify_collations() {
+        assert_eq!(
+            rewrite_alter_column_collations(
+                "ALTER TABLE t CHANGE a b TEXT COLLATE 'utf8mb4_0900_ai_ci'"
+            )
+            .as_deref(),
+            Some("ALTER TABLE t CHANGE a b TEXT CHARACTER SET 'utf8mb4_0900_ai_ci'")
+        );
+        assert_eq!(
+            rewrite_alter_column_collations(
+                "ALTER TABLE t MODIFY a TEXT COLLATE utf8mb4_bin, \
+                 CHANGE b c TEXT COLLATE utf8mb4_0900_ai_ci"
+            )
+            .as_deref(),
+            Some(
+                "ALTER TABLE t MODIFY a TEXT CHARACTER SET utf8mb4_bin, \
+                 CHANGE b c TEXT CHARACTER SET utf8mb4_0900_ai_ci"
+            )
+        );
+        assert!(
+            rewrite_alter_column_collations("CREATE TABLE t (a TEXT COLLATE utf8mb4_bin)")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn parses_mysql_rename_forms() {
+        match parse_mysql_rename("RENAME TABLE `old_table` TO `new_table`") {
+            Some(MysqlRename::Table { old, new }) => {
+                assert_eq!(old, "old_table");
+                assert_eq!(new, "new_table");
+            }
+            _ => panic!("expected a table rename"),
+        }
+        match parse_mysql_rename("ALTER TABLE db.t RENAME INDEX `old_i` TO `new_i`") {
+            Some(MysqlRename::Index { table, old, new }) => {
+                assert_eq!(table, "t");
+                assert_eq!(old, "old_i");
+                assert_eq!(new, "new_i");
+            }
+            _ => panic!("expected an index rename"),
+        }
+    }
+
+    #[test]
+    fn shared_privilege_gate_enforces_the_required_tier() {
+        assert!(require_privilege(Privilege::Admin, PrivilegedAction::AlterTable).is_ok());
+        assert!(require_privilege(Privilege::Write, PrivilegedAction::AlterTable).is_err());
+        assert!(require_privilege(Privilege::Read, PrivilegedAction::LockTables).is_err());
+        assert!(require_privilege(
+            Privilege::Write,
+            PrivilegedAction::Statement(Privilege::Write)
+        )
+        .is_ok());
+    }
+}
+
+#[cfg(test)]
+mod case_insensitive_search_tests {
+    use super::{contains_ci, replace_ci, rewrite_odd_0x_literals};
+
+    #[test]
+    fn finds_ascii_needles_without_copying_unicode_haystacks() {
+        assert!(contains_ci(
+            "SELECT 'å🚗' LOCK In ShArE MoDe",
+            "lock in share mode"
+        ));
+        assert!(!contains_ci("SELECT 'lock 🚗 mode'", "lock in share mode"));
+    }
+
+    #[test]
+    fn replaces_all_ascii_case_variants_without_damaging_unicode() {
+        assert_eq!(
+            replace_ci(
+                "SELECT 'å🚗' LOCK IN SHARE MODE lock in share mode",
+                "lock in share mode",
+                "for share"
+            ),
+            "SELECT 'å🚗' for share for share"
+        );
+    }
+
+    #[test]
+    fn pads_only_unquoted_odd_length_0x_literals() {
+        assert_eq!(
+            rewrite_odd_0x_literals(
+                r#"SELECT 0xF, 0Xabc, 0xAB, X'F', '0xF', "0xF", `0xF`, value0xF"#
+            )
+            .as_deref(),
+            Some(r#"SELECT 0x0F, 0X0abc, 0xAB, X'F', '0xF', "0xF", `0xF`, value0xF"#)
+        );
+    }
+}
+
+#[cfg(test)]
 mod fuzz_props {
     use super::{
-        rewrite_comma_update, rewrite_insert_set, split_top_level, strip_create_table_options,
-        strip_dml_limit,
+        parse_dml_limit, parse_mysql_rename, parse_update_modifiers,
+        rewrite_alter_column_collations, rewrite_comma_update, rewrite_insert_set,
+        rewrite_odd_0x_literals, split_top_level, strip_create_table_options,
     };
     use proptest::prelude::*;
 
@@ -3054,7 +3819,11 @@ mod fuzz_props {
             let _ = rewrite_insert_set(&s);
             let _ = rewrite_comma_update(&s);
             let _ = strip_create_table_options(&s);
-            let _ = strip_dml_limit(&s);
+            let _ = parse_dml_limit(&s);
+            let _ = parse_update_modifiers(&s);
+            let _ = parse_mysql_rename(&s);
+            let _ = rewrite_alter_column_collations(&s);
+            let _ = rewrite_odd_0x_literals(&s);
             let _ = split_top_level(&s, ',');
             let _ = split_top_level(&s, '=');
         }
@@ -3068,6 +3837,9 @@ mod fuzz_props {
             let _ = rewrite_insert_set(&format!("INSERT IGNORE INTO `t` SET {a}"));
             let _ = rewrite_comma_update(&format!("UPDATE {a} SET x = 1 WHERE y = 2"));
             let _ = strip_create_table_options(&format!("CREATE TABLE t (id INT) {a}"));
+            let _ = rewrite_alter_column_collations(&format!(
+                "ALTER TABLE t CHANGE a b TEXT {a}"
+            ));
         }
 
         /// split_top_level round-trips: joining the parts with the separator
@@ -3097,8 +3869,8 @@ mod fuzz_props {
 }
 
 #[cfg(test)]
-mod strip_dml_limit_utf8 {
-    use super::strip_dml_limit;
+mod parse_dml_limit_utf8 {
+    use super::parse_dml_limit;
     #[test]
     fn multibyte_before_limit_does_not_panic() {
         // 'é' is 2 bytes; various offsets before a trailing number must not panic.
@@ -3108,12 +3880,13 @@ mod strip_dml_limit_utf8 {
             "UPDATE é limité 3",
             "UPDATE tμλ 12",
         ] {
-            let _ = strip_dml_limit(s);
+            let _ = parse_dml_limit(s);
         }
-        // sanity: a real LIMIT is still stripped
+        // Sanity: a real LIMIT retains both the base statement and row bound.
         assert_eq!(
-            strip_dml_limit("UPDATE t SET x=1 LIMIT 5").unwrap(),
-            "UPDATE t SET x=1"
+            parse_dml_limit("UPDATE t SET x=1 LIMIT 5")
+                .map(|parsed| (parsed.base_sql, parsed.limit)),
+            Some(("UPDATE t SET x=1".into(), 5))
         );
     }
 }
