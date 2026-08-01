@@ -24,6 +24,11 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --workspace
 ```
 
+If you have [`just`](https://github.com/casey/just), `just check` runs these
+workspace gates plus the isolated SQL dump testbench checks. Run `just` to see
+the grouped build, run, test, stress, and Docker recipes. `just` is optional;
+the commands above remain supported directly.
+
 ## Test suites
 
 The test pyramid is regression-gated in CI (`cargo test --workspace` plus a
@@ -55,6 +60,13 @@ compatibility job):
   it in CI against a `mysql:8.4` service container; run it locally against any
   MySQL with `--ref-port`. Intentional/tracked differences are allowlisted in the
   harness with a rationale.
+- **[SQL dump correctness stress test](../testbench/sql-dump/README.md)** —
+  manually generates deterministic schemas and data, imports them into MySQL
+  8.4 and an ephemeral ElyraSQL server, and compares metadata and typed
+  contents. It is an isolated local investigation tool, not a CI gate,
+  user-facing feature, or controlled performance benchmark. Run `just stress`,
+  `just stress-data`, or `just stress-profile`; its guide also includes raw
+  commands and artifact details.
 
 When you add or change behaviour, add a test at the lowest layer that can catch a
 regression — prefer the in-process wire tests for anything protocol/SQL-visible.
