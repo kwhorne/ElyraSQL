@@ -2257,6 +2257,68 @@ async fn natural_join_bare_coalesced_key_correlates_in_filters() {
 }
 
 #[tokio::test]
+async fn quoted_dotted_coalesced_keys_correlate_without_capturing_qualified_refs() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop(
+        "CREATE TABLE corr_dot_l (
+             `dot.key` VARCHAR(8) PRIMARY KEY,
+             left_value VARCHAR(8)
+         )",
+    )
+    .await
+    .unwrap();
+    c.query_drop(
+        "CREATE TABLE corr_dot_r (
+             `dot.key` VARCHAR(8) PRIMARY KEY,
+             right_value VARCHAR(8)
+         )",
+    )
+    .await
+    .unwrap();
+    c.query_drop("INSERT INTO corr_dot_l VALUES ('same','left'),('other','left2')")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO corr_dot_r VALUES ('same','right'),('other','right2')")
+        .await
+        .unwrap();
+
+    let rows: Vec<(String, String)> = c
+        .query(
+            "SELECT `dot.key`, (SELECT `dot.key`)
+             FROM corr_dot_l AS l NATURAL JOIN corr_dot_r AS r
+             ORDER BY `dot.key`",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        [
+            ("other".into(), "other".into()),
+            ("same".into(), "same".into()),
+        ]
+    );
+
+    let rows: Vec<String> = c
+        .query(
+            "SELECT `dot.key`
+             FROM corr_dot_l AS l NATURAL JOIN corr_dot_r AS r
+             WHERE EXISTS (SELECT 1 WHERE `dot.key` = 'same')",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows, ["same"]);
+
+    c.query_drop(
+        "SELECT (SELECT dot.key)
+             FROM corr_dot_l AS l NATURAL JOIN corr_dot_r AS r",
+    )
+    .await
+    .unwrap_err();
+}
+
+#[tokio::test]
 async fn multi_key_using_preserves_sql_coercion_and_collation_semantics() {
     let srv = TestServer::start().await;
     let mut c = srv.conn().await;

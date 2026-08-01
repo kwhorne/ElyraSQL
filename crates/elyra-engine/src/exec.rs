@@ -4236,7 +4236,7 @@ async fn select_inner(
             })
             .cloned();
         let bare_filter_correlated = if let Some(filter) = potential_bare_filter {
-            match resolve_subqueries(db, vindex, filter).await {
+            match resolve_subqueries(db, vindex, filter.clone()).await {
                 Ok(resolved) => {
                     // The bare names belonged to the subquery's local scope.
                     // Preserve the one-time resolution rather than executing it
@@ -4244,7 +4244,7 @@ async fn select_inner(
                     resolved_bare_filter = Some(resolved);
                     false
                 }
-                Err(error) if bare_unknown_column(&error).is_some() => true,
+                Err(error) if bare_unknown_column(&error, &filter).is_some() => true,
                 Err(error) => return Err(error),
             }
         } else {
@@ -13596,7 +13596,7 @@ async fn resolve_subqueries_with_outer(
         match resolve_subqueries(db, vindex, bound.clone()).await {
             Ok(resolved) => return Ok(resolved),
             Err(error) => {
-                let Some(column) = bare_unknown_column(&error).map(str::to_owned) else {
+                let Some(column) = bare_unknown_column(&error, &bound).map(str::to_owned) else {
                     return Err(error);
                 };
                 if rebound
@@ -13625,12 +13625,21 @@ async fn resolve_subqueries_with_outer(
     }
 }
 
-fn bare_unknown_column(error: &Error) -> Option<&str> {
+fn bare_unknown_column<'a>(error: &'a Error, expr: &Expr) -> Option<&'a str> {
     let Error::Catalog(message) = error else {
         return None;
     };
     let column = message.strip_prefix("unknown column: ")?;
-    (!column.contains('.')).then_some(column)
+    let is_bare = std::cell::Cell::new(false);
+    let _ = map_expr(expr, &|candidate| {
+        if let Expr::Identifier(identifier) = candidate {
+            if identifier.value.eq_ignore_ascii_case(column) {
+                is_bare.set(true);
+            }
+        }
+        None
+    });
+    is_bare.get().then_some(column)
 }
 
 async fn sort_rows_with_subqueries(
