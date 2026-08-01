@@ -8,6 +8,26 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ### Fixed
 
+- **Result metadata names the source table again (ESQL-55).** MySQL puts the
+  bare column name in the name field and the relation in the `table` field, and
+  1.7.0 adopted the first half without the second — so a client had no way at
+  all to tell the two `id` columns of a join apart: not by name (they collide,
+  as in MySQL) and not by metadata. The qualifier was available all along, in
+  the internal `"alias.col"` names, and was simply dropped when the output
+  schema shortened them. It is now carried through to the wire for joins,
+  single-table scans (reporting the alias, as MySQL does) and projected
+  columns, and left empty for expressions and aggregates — which is also what
+  MySQL reports. Verified column-for-column against MySQL 8.4 on seven query
+  shapes.
+
+  `Schema` carries this in a `serde(skip)` field, so the catalog encoding is
+  byte-identical and existing databases are untouched; a test asserts that.
+- **`t.*` works over a single-table scan.** `SELECT np_a.* FROM np_a` was
+  refused with `unknown table qualifier` because a single-table scan carries
+  bare column names, so there was no qualifier to match — while the same
+  wildcard over a join worked. Naming the relation being read is now accepted;
+  naming a relation that is not in the query still errors.
+
 - **`CREATE TABLE ... AS SELECT` over an aggregate was truncated at the first
   parenthesis.** The preprocessor that strips MySQL table options (`ENGINE=`,
   `DEFAULT CHARSET`, ...) located the column list by looking for the first `(`

@@ -100,16 +100,94 @@ impl ColumnDef {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct Schema {
     pub columns: Vec<ColumnDef>,
+    /// Source table (or alias) per column, for result metadata only: MySQL puts
+    /// the bare column name in the name field and the qualifier here, which is
+    /// the only way a client can tell two same-named columns of a join apart.
+    ///
+    /// Empty, or exactly as long as `columns`. An entry is empty for anything
+    /// that has no source table (an expression, a literal, an aggregate) — MySQL
+    /// reports an empty table for those too.
+    ///
+    /// **Not persisted.** `Schema` is bincode-encoded into the catalog as part of
+    /// `TableDef`, and bincode is not self-describing, so a new *encoded* field
+    /// would make every existing database unreadable. `serde(skip)` keeps the
+    /// on-disk encoding byte-identical and gives old catalogs `Default` on read.
+    #[serde(skip)]
+    pub tables: Vec<String>,
 }
 
 impl Schema {
     pub fn new(columns: Vec<ColumnDef>) -> Self {
-        Self { columns }
+        Self {
+            columns,
+            tables: Vec::new(),
+        }
+    }
+
+    /// A schema that also knows where each column came from. `tables` is ignored
+    /// unless it lines up with `columns`, so a caller that can only qualify some
+    /// of its columns passes empty strings for the rest rather than a short list.
+    pub fn with_tables(columns: Vec<ColumnDef>, tables: Vec<String>) -> Self {
+        let tables = if tables.len() == columns.len() {
+            tables
+        } else {
+            Vec::new()
+        };
+        Self { columns, tables }
+    }
+
+    /// The source table of column `i`, if it has one.
+    pub fn table_of(&self, i: usize) -> Option<&str> {
+        self.tables
+            .get(i)
+            .map(String::as_str)
+            .filter(|t| !t.is_empty())
     }
 
     pub fn column(&self, name: &str) -> Option<&ColumnDef> {
         self.columns
             .iter()
             .find(|c| c.name.eq_ignore_ascii_case(name))
+    }
+}
+
+#[cfg(test)]
+mod schema_metadata_tests {
+    use super::{ColumnDef, ColumnType, Schema};
+
+    fn cols() -> Vec<ColumnDef> {
+        vec![
+            ColumnDef::new("id", ColumnType::Int, false),
+            ColumnDef::new("name", ColumnType::Text, true),
+        ]
+    }
+
+    #[test]
+    fn qualifiers_never_reach_the_encoded_form() {
+        let plain = Schema::new(cols());
+        let qualified = Schema::with_tables(cols(), vec!["users".into(), "users".into()]);
+        assert_eq!(
+            bincode::serialize(&plain).unwrap(),
+            bincode::serialize(&qualified).unwrap(),
+            "the catalog encoding must not change with result metadata"
+        );
+        let decoded: Schema =
+            bincode::deserialize(&bincode::serialize(&qualified).unwrap()).unwrap();
+        assert!(decoded.tables.is_empty());
+    }
+
+    #[test]
+    fn a_mismatched_qualifier_list_is_dropped_rather_than_misaligned() {
+        let short = Schema::with_tables(cols(), vec!["users".into()]);
+        assert_eq!(short.table_of(0), None);
+
+        let full = Schema::with_tables(cols(), vec!["users".into(), String::new()]);
+        assert_eq!(full.table_of(0), Some("users"));
+        assert_eq!(
+            full.table_of(1),
+            None,
+            "an empty entry means 'no source table'"
+        );
+        assert_eq!(full.table_of(9), None);
     }
 }

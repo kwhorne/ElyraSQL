@@ -562,8 +562,9 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for ElyraShim {
                 Some(schema) => schema
                     .columns
                     .iter()
-                    .map(|c| Column {
-                        table: String::new(),
+                    .enumerate()
+                    .map(|(i, c)| Column {
+                        table: schema.table_of(i).unwrap_or_default().to_string(),
                         column: c.name.clone(),
                         coltype: column_type(&c.ty),
                         colflags: column_flags(&c.ty),
@@ -728,8 +729,9 @@ async fn write_outcomes<W: AsyncWrite + Send + Unpin>(
                 .schema
                 .columns
                 .iter()
-                .map(|c| Column {
-                    table: String::new(),
+                .enumerate()
+                .map(|(i, c)| Column {
+                    table: stream.schema.table_of(i).unwrap_or_default().to_string(),
                     column: c.name.clone(),
                     coltype: column_type(&c.ty),
                     colflags: column_flags(&c.ty),

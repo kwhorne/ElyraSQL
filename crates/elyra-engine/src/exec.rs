@@ -1848,7 +1848,7 @@ async fn run_virtual_select(
         sort_full_rows(&mut rows, &schema, &resolved, &db.cancel_token())?;
     }
     apply_offset_limit(&mut rows, offset, limit);
-    let (osch, out) = project_exprs(&select.projection, &schema, &rows)?;
+    let (osch, out) = project_exprs(&select.projection, &schema, &rows, None)?;
     Ok(QueryResult::Rows(RowStream::literal(osch, out)))
 }
 
@@ -4527,7 +4527,12 @@ pub async fn select(
                     // Order the candidate set by exact distance for a clean top-k.
                     sort_full_rows(&mut rows, &def.schema, &resolved, &db.cancel_token())?;
                     rows.truncate(k);
-                    let (schema, out) = project_exprs(&select.projection, &def.schema, &rows)?;
+                    let (schema, out) = project_exprs(
+                        &select.projection,
+                        &def.schema,
+                        &rows,
+                        single_relation_alias(select).as_deref(),
+                    )?;
                     return Ok(QueryResult::Rows(RowStream::literal(schema, out)));
                 }
             }
@@ -4592,7 +4597,12 @@ pub async fn select(
                     }
                 }
                 apply_offset_limit(&mut rows, offset, limit);
-                let (schema, out) = project_exprs(&select.projection, &def.schema, &rows)?;
+                let (schema, out) = project_exprs(
+                    &select.projection,
+                    &def.schema,
+                    &rows,
+                    single_relation_alias(select).as_deref(),
+                )?;
                 return Ok(QueryResult::Rows(RowStream::literal(schema, out)));
             }
         }
@@ -4645,7 +4655,12 @@ pub async fn select(
                     } else {
                         apply_offset_limit(&mut rows, offset, limit);
                     }
-                    let (schema, out) = project_exprs(&select.projection, &def.schema, &rows)?;
+                    let (schema, out) = project_exprs(
+                        &select.projection,
+                        &def.schema,
+                        &rows,
+                        single_relation_alias(select).as_deref(),
+                    )?;
                     return Ok(QueryResult::Rows(RowStream::literal(schema, out)));
                 }
             }
@@ -4829,7 +4844,12 @@ pub async fn select(
                         } else {
                             apply_offset_limit(&mut rows, offset, limit);
                         }
-                        let (schema, out) = project_exprs(&select.projection, &def.schema, &rows)?;
+                        let (schema, out) = project_exprs(
+                            &select.projection,
+                            &def.schema,
+                            &rows,
+                            single_relation_alias(select).as_deref(),
+                        )?;
                         return Ok(QueryResult::Rows(RowStream::literal(schema, out)));
                     }
                 }
@@ -4909,7 +4929,12 @@ pub async fn select(
                 }
             }
             let rows = sorter.finish()?;
-            let (schema, out) = project_exprs(&select.projection, &def.schema, &rows)?;
+            let (schema, out) = project_exprs(
+                &select.projection,
+                &def.schema,
+                &rows,
+                single_relation_alias(select).as_deref(),
+            )?;
             return Ok(QueryResult::Rows(RowStream::literal(schema, out)));
         }
 
@@ -4918,7 +4943,12 @@ pub async fn select(
             sort_full_rows(&mut rows, &def.schema, &resolved, &db.cancel_token())?;
         }
         apply_offset_limit(&mut rows, offset, limit);
-        let (schema, out) = project_exprs(&select.projection, &def.schema, &rows)?;
+        let (schema, out) = project_exprs(
+            &select.projection,
+            &def.schema,
+            &rows,
+            single_relation_alias(select).as_deref(),
+        )?;
         return Ok(QueryResult::Rows(RowStream::literal(schema, out)));
     }
 
@@ -4974,7 +5004,15 @@ pub async fn select(
         (idxs, cols)
     };
 
-    let out_schema = Schema::new(out_cols);
+    // Every column on this path comes from the one relation being scanned, so
+    // that is what result metadata reports as their source table.
+    let out_schema = match single_relation_alias(select) {
+        Some(relation) => {
+            let tables = vec![relation; out_cols.len()];
+            Schema::with_tables(out_cols, tables)
+        }
+        None => Schema::new(out_cols),
+    };
 
     // Fast path: PK/index equality (single or composite) or a range on a
     // PK/indexed column -> fetch via the index and project, instead of a scan.
@@ -5084,7 +5122,7 @@ async fn join_select(
             sort_full_rows(&mut rows, &schema, &resolved, &cancel)?;
         }
         apply_offset_limit(&mut rows, offset, limit);
-        project_exprs(&select.projection, &schema, &rows)
+        project_exprs(&select.projection, &schema, &rows, None)
     })?;
     Ok(QueryResult::Rows(RowStream::literal(osch, out)))
 }
@@ -5196,7 +5234,7 @@ async fn streaming_nlj_select(
     }
 
     apply_offset_limit(&mut out, offset, Some(limit));
-    let (osch, rows) = project_exprs(&select.projection, &schema, &out)?;
+    let (osch, rows) = project_exprs(&select.projection, &schema, &out, None)?;
     Ok(Some(QueryResult::Rows(RowStream::literal(osch, rows))))
 }
 
@@ -6309,7 +6347,7 @@ async fn streaming_join_order(
     }
 
     let sorted = sorter.finish()?;
-    let (osch, out) = project_exprs(&select.projection, &schema, &sorted)?;
+    let (osch, out) = project_exprs(&select.projection, &schema, &sorted, None)?;
     Ok(Some(QueryResult::Rows(RowStream::literal(osch, out))))
 }
 
@@ -6442,7 +6480,7 @@ async fn join_correlated_select(
 
     // Plain projection when no SELECT-list subqueries.
     if !projection_has_subquery(&select.projection) {
-        let (osch, out) = project_exprs(&select.projection, &schema, &kept)?;
+        let (osch, out) = project_exprs(&select.projection, &schema, &kept, None)?;
         return Ok(QueryResult::Rows(RowStream::literal(osch, out)));
     }
 
@@ -6456,6 +6494,10 @@ async fn join_correlated_select(
 
     let mut projection = Vec::new();
     let mut outcols = Vec::new();
+    // Source table per output column, for result metadata. The qualifier is only
+    // available while the internal "alias.col" name is being shortened, so it is
+    // captured here rather than recovered later.
+    let mut outtables: Vec<String> = Vec::new();
     let mut inferred = Vec::new();
     for item in &select.projection {
         match item {
@@ -6463,6 +6505,11 @@ async fn join_correlated_select(
                 for (index, column) in schema.columns.iter().enumerate() {
                     projection.push(Projection::Column(index));
                     let mut column = column.clone();
+                    outtables.push(
+                        column_qualifier(&column.name)
+                            .unwrap_or_default()
+                            .to_owned(),
+                    );
                     column.name = output_column_name(&column.name).to_owned();
                     outcols.push(column);
                 }
@@ -6480,6 +6527,7 @@ async fn join_correlated_select(
                             projection.push(Projection::Column(index));
                             let mut column = column.clone();
                             column.name = name.to_owned();
+                            outtables.push(column_qualifier.to_owned());
                             outcols.push(column);
                         }
                     }
@@ -6500,6 +6548,15 @@ async fn join_correlated_select(
                 };
                 inferred.push(projection.len());
                 projection.push(Projection::Expr(expr));
+                // A projected expression has no source table -- neither does it
+                // in MySQL, which reports an empty table for computed columns.
+                outtables.push(
+                    col_ref_name(expr)
+                        .as_deref()
+                        .and_then(column_qualifier)
+                        .unwrap_or_default()
+                        .to_owned(),
+                );
                 outcols.push(ColumnDef {
                     name,
                     ty: ColumnType::Text,
@@ -6536,7 +6593,7 @@ async fn join_correlated_select(
             .unwrap_or(ColumnType::Text);
     }
     Ok(QueryResult::Rows(RowStream::literal(
-        Schema::new(outcols),
+        Schema::with_tables(outcols, outtables),
         out_rows,
     )))
 }
@@ -10337,6 +10394,11 @@ fn project_exprs(
     projection: &[sqlparser::ast::SelectItem],
     schema: &Schema,
     rows: &[Vec<Value>],
+    // The relation to credit a plain column to when the schema's names are not
+    // qualified, which is the case for a single-table scan: it reads the table's
+    // own bare column names. `None` for join/derived schemas, which carry their
+    // own "alias.col" qualifiers.
+    default_table: Option<&str>,
 ) -> Result<(Schema, Vec<Vec<Value>>)> {
     use sqlparser::ast::SelectItem;
 
@@ -10367,6 +10429,16 @@ fn project_exprs(
                             projs.push(Proj::Col(i));
                             matched = true;
                         }
+                    }
+                }
+                // A single-table scan carries bare column names, so `t.*` has no
+                // qualifier to match even though it names the relation being
+                // read. Accept it there rather than refusing valid MySQL.
+                if !matched && default_table.is_some_and(|t| t.eq_ignore_ascii_case(&qual)) {
+                    for (i, c) in schema.columns.iter().enumerate() {
+                        names.push(output_column_name(&c.name).to_owned());
+                        projs.push(Proj::Col(i));
+                        matched = true;
                     }
                 }
                 if !matched {
@@ -10405,6 +10477,7 @@ fn project_exprs(
     // Infer output column types: from the source column when the projection is
     // a column reference (join-aware), else from the first non-NULL value.
     let mut cols = Vec::with_capacity(projs.len());
+    let mut tables: Vec<String> = Vec::with_capacity(projs.len());
     for (ci, (name, p)) in names.iter().zip(&projs).enumerate() {
         // Carry the source column's type AND collation through a direct column
         // projection, so DISTINCT / ORDER BY on a projected `_bin` column stays
@@ -10429,6 +10502,20 @@ fn project_exprs(
                 }
             }
         };
+        // Result metadata: the relation a projected column came from. An
+        // expression keeps an empty table, as it does in MySQL.
+        let source_column = match p {
+            Proj::Col(i) => Some(*i),
+            Proj::Expr(e) => {
+                col_ref_name(e).and_then(|n| predicate::resolve_index(&n, schema).ok())
+            }
+        };
+        tables.push(
+            source_column
+                .and_then(|i| column_qualifier(&schema.columns[i].name).or(default_table))
+                .unwrap_or_default()
+                .to_owned(),
+        );
         cols.push(ColumnDef {
             name: name.clone(),
             ty,
@@ -10437,11 +10524,26 @@ fn project_exprs(
         });
     }
 
-    Ok((Schema::new(cols), out_rows))
+    Ok((Schema::with_tables(cols, tables), out_rows))
 }
 
 fn output_column_name(name: &str) -> &str {
     name.split_once('.').map_or(name, |(_, column)| column)
+}
+
+/// The relation an internal `"alias.col"` name came from, if it is qualified.
+fn column_qualifier(name: &str) -> Option<&str> {
+    name.split_once('.').map(|(qualifier, _)| qualifier)
+}
+
+/// The alias (or table name) of the single relation a select reads, if it reads
+/// exactly one. A single-table scan projects the table's own bare column names,
+/// so this is where its result metadata gets its source table from.
+fn single_relation_alias(select: &sqlparser::ast::Select) -> Option<String> {
+    if select.from.len() != 1 || !select.from[0].joins.is_empty() {
+        return None;
+    }
+    factor_qualifier(&select.from[0].relation)
 }
 
 /// The (qualified) name of a plain column reference, if `e` is one.
@@ -10947,10 +11049,19 @@ async fn window_select(
 
     // Output schema (names + inferred types).
     let mut cols = Vec::with_capacity(plan.len());
+    // Result metadata: a column that came straight from a relation keeps that
+    // relation's name; a window value or an expression has no source table.
+    let mut tables: Vec<String> = Vec::with_capacity(plan.len());
     for (column_index, planned) in plan.iter().enumerate() {
         let source = planned
             .source_column
             .and_then(|index| schema.columns.get(index));
+        tables.push(
+            source
+                .and_then(|column| column_qualifier(&column.name))
+                .unwrap_or_default()
+                .to_owned(),
+        );
         let ty = source.map(|column| column.ty.clone()).unwrap_or_else(|| {
             out_rows
                 .iter()
@@ -10966,7 +11077,7 @@ async fn window_select(
             collation: source.map_or(elyra_core::Collation::Ci, |column| column.collation),
         });
     }
-    let out_schema = Schema::new(cols);
+    let out_schema = Schema::with_tables(cols, tables);
 
     // ORDER BY may reference an output column *or* a base-table column that is not
     // projected -- MySQL allows both, and rejecting the latter made queries like
@@ -12061,7 +12172,12 @@ async fn correlated_select(
 
     // No SELECT-list subqueries: plain projection.
     if !projection_has_subquery(&select.projection) {
-        let (schema, out) = project_exprs(&select.projection, &def.schema, &matched)?;
+        let (schema, out) = project_exprs(
+            &select.projection,
+            &def.schema,
+            &matched,
+            single_relation_alias(select).as_deref(),
+        )?;
         return Ok(QueryResult::Rows(RowStream::literal(schema, out)));
     }
 
