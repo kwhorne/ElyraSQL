@@ -17,6 +17,10 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ### Changed
 
+- **The MySQL compatibility version advertised to clients is now 8.0.12.** The
+  previous 8.0.0 prefix made Laravel and other clients suppress window-function
+  SQL they can safely send to ElyraSQL; version-gated clients may now generate
+  different queries after connecting.
 - **The documented minimum Rust version is now 1.88.** The locked dependency
   graph already required 1.88 (notably `time` through the wire-protocol stack),
   so the previous 1.82 claim could not reproduce a locked build. The macOS CI
