@@ -6983,7 +6983,8 @@ async fn join_correlated_select(
     for item in &select.projection {
         match item {
             SelectItem::Wildcard(_) => {
-                for (index, column) in schema.columns.iter().enumerate() {
+                for index in unqualified_wildcard_indices(&schema.columns) {
+                    let column = &schema.columns[index];
                     projection.push(Projection::Column(index));
                     let mut column = column.clone();
                     outtables.push(column_table(&column).unwrap_or_default().to_owned());
@@ -7791,11 +7792,27 @@ async fn build_from(
             // Fallback: materialise the partner (with pushdown) and hash/nested join.
             let (jc, mut jr) = load_relation(db, vindex, &join.relation, conjuncts).await?;
             jr = apply_pushdown(jr, &jc, conjuncts)?;
+            let using_keys = resolve_using_keys(&join.join_operator, &cur_cols, &jc)?;
+            let resolved_on = using_keys
+                .as_ref()
+                .and_then(|keys| using_predicate(keys, &cur_cols, &jc))
+                .or(on);
             let cancel = db.cancel_token();
-            let (c, r) =
-                cpu_bound(|| combine(&cur_cols, &cur_rows, &jc, &jr, kind, on.as_ref(), &cancel))?;
-            cur_cols = c;
-            cur_rows = r;
+            let (cols, rows) = cpu_bound(|| {
+                combine(
+                    &cur_cols,
+                    &cur_rows,
+                    &jc,
+                    &jr,
+                    kind,
+                    resolved_on.as_ref(),
+                    &cancel,
+                )
+            })?;
+            (cur_cols, cur_rows) = match using_keys {
+                Some(keys) => coalesce_using_join(&cur_cols, &jc, cols, rows, kind, &keys),
+                None => (cols, rows),
+            };
         }
     }
     Ok((cur_cols, cur_rows))
@@ -8499,6 +8516,236 @@ enum JoinKind {
     Left,
     Right,
     Full,
+}
+
+#[derive(Clone, Debug)]
+struct UsingKey {
+    name: String,
+    left: usize,
+    right: usize,
+}
+
+fn logical_column_name(name: &str) -> &str {
+    name.rsplit_once('.').map_or(name, |(_, column)| column)
+}
+
+/// Columns exposed by an unqualified `*`. A USING/NATURAL join adds bare
+/// coalesced keys before retaining the qualified physical inputs; those bare
+/// keys shadow the two qualified copies for unqualified projection only.
+pub(crate) fn unqualified_wildcard_indices(columns: &[ColumnDef]) -> Vec<usize> {
+    let coalesced: std::collections::HashSet<String> = columns
+        .iter()
+        .filter(|column| !column.name.contains('.'))
+        .map(|column| column.name.to_ascii_lowercase())
+        .collect();
+
+    columns
+        .iter()
+        .enumerate()
+        .filter_map(|(index, column)| {
+            let qualified = column.name.contains('.');
+            let shadowed = qualified
+                && coalesced.contains(&logical_column_name(&column.name).to_ascii_lowercase());
+            (!shadowed).then_some(index)
+        })
+        .collect()
+}
+
+fn find_logical_column(columns: &[ColumnDef], name: &str, side: &str) -> Result<usize> {
+    let matches: Vec<usize> = unqualified_wildcard_indices(columns)
+        .into_iter()
+        .filter(|&index| logical_column_name(&columns[index].name).eq_ignore_ascii_case(name))
+        .collect();
+    match matches.as_slice() {
+        [index] => Ok(*index),
+        [] => Err(Error::Catalog(format!(
+            "unknown column '{name}' in {side} relation of USING/NATURAL join"
+        ))),
+        _ => Err(Error::Query(format!(
+            "ambiguous column '{name}' in {side} relation of USING/NATURAL join"
+        ))),
+    }
+}
+
+fn join_constraint(operator: &JoinOperator) -> Option<&JoinConstraint> {
+    match operator {
+        JoinOperator::Inner(constraint)
+        | JoinOperator::LeftOuter(constraint)
+        | JoinOperator::RightOuter(constraint)
+        | JoinOperator::FullOuter(constraint) => Some(constraint),
+        _ => None,
+    }
+}
+
+/// Resolve USING/NATURAL column pairs in MySQL's logical output order. For
+/// INNER/LEFT joins the left operand is first; RIGHT joins behave as if their
+/// operands were swapped, so the right operand determines key and unique-column
+/// order.
+fn resolve_using_keys(
+    operator: &JoinOperator,
+    left: &[ColumnDef],
+    right: &[ColumnDef],
+) -> Result<Option<Vec<UsingKey>>> {
+    let Some(constraint) = join_constraint(operator) else {
+        return Ok(None);
+    };
+    let requested = match constraint {
+        JoinConstraint::Using(columns) => Some(
+            columns
+                .iter()
+                .map(|column| column.value.clone())
+                .collect::<Vec<_>>(),
+        ),
+        JoinConstraint::Natural => None,
+        JoinConstraint::On(_) | JoinConstraint::None => return Ok(None),
+    };
+
+    if let Some(names) = &requested {
+        let mut seen = std::collections::HashSet::new();
+        for name in names {
+            if !seen.insert(name.to_ascii_lowercase()) {
+                return Err(Error::Query(format!(
+                    "column '{name}' appears more than once in USING"
+                )));
+            }
+            find_logical_column(left, name, "left")?;
+            find_logical_column(right, name, "right")?;
+        }
+    }
+
+    let right_first = matches!(operator, JoinOperator::RightOuter(_));
+    let first = if right_first { right } else { left };
+    let mut names = Vec::new();
+    for index in unqualified_wildcard_indices(first) {
+        let name = logical_column_name(&first[index].name);
+        if names
+            .iter()
+            .any(|seen: &String| seen.eq_ignore_ascii_case(name))
+        {
+            continue;
+        }
+        let selected = requested.as_ref().map_or_else(
+            || {
+                unqualified_wildcard_indices(if right_first { left } else { right })
+                    .into_iter()
+                    .any(|other| {
+                        logical_column_name(&(if right_first { left } else { right })[other].name)
+                            .eq_ignore_ascii_case(name)
+                    })
+            },
+            |using| using.iter().any(|column| column.eq_ignore_ascii_case(name)),
+        );
+        if selected {
+            names.push(name.to_owned());
+        }
+    }
+
+    names
+        .into_iter()
+        .map(|name| {
+            Ok(UsingKey {
+                left: find_logical_column(left, &name, "left")?,
+                right: find_logical_column(right, &name, "right")?,
+                name,
+            })
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(Some)
+}
+
+fn column_expr(name: &str) -> Expr {
+    let parts = name
+        .split('.')
+        .map(sqlparser::ast::Ident::new)
+        .collect::<Vec<_>>();
+    match parts.as_slice() {
+        [identifier] => Expr::Identifier(identifier.clone()),
+        _ => Expr::CompoundIdentifier(parts),
+    }
+}
+
+fn using_predicate(keys: &[UsingKey], left: &[ColumnDef], right: &[ColumnDef]) -> Option<Expr> {
+    keys.iter()
+        .map(|key| Expr::BinaryOp {
+            left: Box::new(column_expr(&left[key.left].name)),
+            op: sqlparser::ast::BinaryOperator::Eq,
+            right: Box::new(column_expr(&right[key.right].name)),
+        })
+        .reduce(|left, right| Expr::BinaryOp {
+            left: Box::new(left),
+            op: sqlparser::ast::BinaryOperator::And,
+            right: Box::new(right),
+        })
+}
+
+fn coalesce_using_join(
+    left: &[ColumnDef],
+    right: &[ColumnDef],
+    physical_columns: Vec<ColumnDef>,
+    physical_rows: Vec<Vec<Value>>,
+    kind: JoinKind,
+    keys: &[UsingKey],
+) -> (Vec<ColumnDef>, Vec<Vec<Value>>) {
+    let left_len = left.len();
+    let mut columns = keys
+        .iter()
+        .map(|key| {
+            let source = if kind == JoinKind::Right {
+                &right[key.right]
+            } else {
+                &left[key.left]
+            };
+            let mut column = source.clone();
+            column.name = key.name.clone();
+            column
+        })
+        .collect::<Vec<_>>();
+
+    let hidden_bare: std::collections::HashSet<usize> = keys
+        .iter()
+        .flat_map(|key| {
+            [
+                (key.left, &left[key.left]),
+                (left_len + key.right, &right[key.right]),
+            ]
+        })
+        .filter_map(|(index, column)| (!column.name.contains('.')).then_some(index))
+        .collect();
+    let physical_order = if kind == JoinKind::Right {
+        (left_len..physical_columns.len())
+            .chain(0..left_len)
+            .collect::<Vec<_>>()
+    } else {
+        (0..physical_columns.len()).collect()
+    };
+    let physical_order = physical_order
+        .into_iter()
+        .filter(|index| !hidden_bare.contains(index))
+        .collect::<Vec<_>>();
+    columns.extend(
+        physical_order
+            .iter()
+            .map(|&index| physical_columns[index].clone()),
+    );
+
+    let rows = physical_rows
+        .into_iter()
+        .map(|row| {
+            let mut output = Vec::with_capacity(columns.len());
+            output.extend(keys.iter().map(|key| {
+                let left_value = &row[key.left];
+                let right_value = &row[left_len + key.right];
+                match kind {
+                    JoinKind::Right => right_value.clone(),
+                    JoinKind::Full if left_value.is_null() => right_value.clone(),
+                    JoinKind::Inner | JoinKind::Left | JoinKind::Full => left_value.clone(),
+                }
+            }));
+            output.extend(physical_order.iter().map(|&index| row[index].clone()));
+            output
+        })
+        .collect();
+    (columns, rows)
 }
 
 fn join_kind(op: &JoinOperator) -> Result<(JoinKind, Option<Expr>)> {
@@ -11094,7 +11341,8 @@ fn project_exprs(
     for item in projection {
         match item {
             SelectItem::Wildcard(_) => {
-                for (i, c) in schema.columns.iter().enumerate() {
+                for i in unqualified_wildcard_indices(&schema.columns) {
+                    let c = &schema.columns[i];
                     names.push(column_name(c).to_owned());
                     projs.push(Proj::Col(i));
                 }

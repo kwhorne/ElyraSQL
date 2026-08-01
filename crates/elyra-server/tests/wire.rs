@@ -1459,6 +1459,277 @@ async fn qualified_wildcard() {
 }
 
 #[tokio::test]
+async fn using_join_coalesces_keys_and_keeps_qualified_access() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop("CREATE TABLE using_l (id INT PRIMARY KEY, lval VARCHAR(8))")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE using_r (id INT PRIMARY KEY, rval VARCHAR(8))")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO using_l VALUES (1,'L1'),(2,'L2'),(4,'L4')")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO using_r VALUES (1,'R1'),(3,'R3'),(4,'R4')")
+        .await
+        .unwrap();
+
+    let mut result = c
+        .query_iter("SELECT * FROM using_l AS l JOIN using_r AS r USING(id) ORDER BY id")
+        .await
+        .unwrap();
+    let names: Vec<String> = result
+        .columns_ref()
+        .iter()
+        .map(|column| column.name_str().into_owned())
+        .collect();
+    assert_eq!(names, ["id", "lval", "rval"]);
+    let rows: Vec<(i64, String, String)> = result.collect().await.unwrap();
+    assert_eq!(
+        rows,
+        [(1, "L1".into(), "R1".into()), (4, "L4".into(), "R4".into())]
+    );
+
+    let rows: Vec<(i64, String, Option<String>)> = c
+        .query("SELECT * FROM using_l AS l LEFT JOIN using_r AS r USING(id) ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        [
+            (1, "L1".into(), Some("R1".into())),
+            (2, "L2".into(), None),
+            (4, "L4".into(), Some("R4".into())),
+        ]
+    );
+
+    let mut result = c
+        .query_iter("SELECT * FROM using_l AS l RIGHT JOIN using_r AS r USING(id) ORDER BY id")
+        .await
+        .unwrap();
+    let names: Vec<String> = result
+        .columns_ref()
+        .iter()
+        .map(|column| column.name_str().into_owned())
+        .collect();
+    assert_eq!(names, ["id", "rval", "lval"]);
+    let rows: Vec<(i64, String, Option<String>)> = result.collect().await.unwrap();
+    assert_eq!(
+        rows,
+        [
+            (1, "R1".into(), Some("L1".into())),
+            (3, "R3".into(), None),
+            (4, "R4".into(), Some("L4".into())),
+        ]
+    );
+
+    let rows: Vec<(i64, Option<i64>, i64)> = c
+        .query(
+            "SELECT id AS bare_id, l.id AS left_id, r.id AS right_id
+             FROM using_l AS l RIGHT JOIN using_r AS r USING(id)
+             ORDER BY r.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows, [(1, Some(1), 1), (3, None, 3), (4, Some(4), 4)]);
+
+    let mut result = c
+        .query_iter(
+            "SELECT l.*, r.*
+             FROM using_l AS l LEFT JOIN using_r AS r USING(id)
+             ORDER BY l.id",
+        )
+        .await
+        .unwrap();
+    let names: Vec<String> = result
+        .columns_ref()
+        .iter()
+        .map(|column| column.name_str().into_owned())
+        .collect();
+    assert_eq!(names, ["id", "lval", "id", "rval"]);
+    let rows: Vec<(i64, String, Option<i64>, Option<String>)> = result.collect().await.unwrap();
+    assert_eq!(
+        rows,
+        [
+            (1, "L1".into(), Some(1), Some("R1".into())),
+            (2, "L2".into(), None, None),
+            (4, "L4".into(), Some(4), Some("R4".into())),
+        ]
+    );
+
+    assert!(c
+        .query_drop("SELECT * FROM using_l JOIN using_r USING(missing)")
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn natural_join_uses_all_common_columns_and_mysql_star_order() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop("CREATE TABLE natural_l (id INT PRIMARY KEY, code INT, lval VARCHAR(8))")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE natural_r (code INT, id INT PRIMARY KEY, rval VARCHAR(8))")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO natural_l VALUES (1,10,'L1'),(2,20,'L2'),(4,40,'L4')")
+        .await
+        .unwrap();
+    c.query_drop(
+        "INSERT INTO natural_r VALUES
+         (10,1,'R1'),(30,3,'R3'),(40,4,'R4'),(20,99,'code-only'),(99,2,'id-only')",
+    )
+    .await
+    .unwrap();
+
+    let mut result = c
+        .query_iter("SELECT * FROM natural_l AS l NATURAL JOIN natural_r AS r ORDER BY id")
+        .await
+        .unwrap();
+    let names: Vec<String> = result
+        .columns_ref()
+        .iter()
+        .map(|column| column.name_str().into_owned())
+        .collect();
+    assert_eq!(names, ["id", "code", "lval", "rval"]);
+    let rows: Vec<(i64, i64, String, String)> = result.collect().await.unwrap();
+    assert_eq!(
+        rows,
+        [
+            (1, 10, "L1".into(), "R1".into()),
+            (4, 40, "L4".into(), "R4".into()),
+        ]
+    );
+
+    let mut result = c
+        .query_iter(
+            "SELECT *
+             FROM natural_l AS l NATURAL JOIN natural_r AS r
+             GROUP BY id, code
+             ORDER BY id",
+        )
+        .await
+        .unwrap();
+    let names: Vec<String> = result
+        .columns_ref()
+        .iter()
+        .map(|column| column.name_str().into_owned())
+        .collect();
+    assert_eq!(names, ["id", "code", "lval", "rval"]);
+    let rows: Vec<(i64, i64, String, String)> = result.collect().await.unwrap();
+    assert_eq!(
+        rows,
+        [
+            (1, 10, "L1".into(), "R1".into()),
+            (4, 40, "L4".into(), "R4".into()),
+        ]
+    );
+
+    let mut result = c
+        .query_iter("SELECT * FROM natural_l AS l JOIN natural_r AS r USING(code, id) ORDER BY id")
+        .await
+        .unwrap();
+    let names: Vec<String> = result
+        .columns_ref()
+        .iter()
+        .map(|column| column.name_str().into_owned())
+        .collect();
+    assert_eq!(names, ["id", "code", "lval", "rval"]);
+    let rows: Vec<(i64, i64, String, String)> = result.collect().await.unwrap();
+    assert_eq!(
+        rows,
+        [
+            (1, 10, "L1".into(), "R1".into()),
+            (4, 40, "L4".into(), "R4".into()),
+        ]
+    );
+
+    let rows: Vec<(i64, i64, String, Option<String>)> = c
+        .query("SELECT * FROM natural_l AS l NATURAL LEFT JOIN natural_r AS r ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        [
+            (1, 10, "L1".into(), Some("R1".into())),
+            (2, 20, "L2".into(), None),
+            (4, 40, "L4".into(), Some("R4".into())),
+        ]
+    );
+
+    let mut result = c
+        .query_iter(
+            "SELECT * FROM natural_l AS l NATURAL RIGHT JOIN natural_r AS r ORDER BY id, code",
+        )
+        .await
+        .unwrap();
+    let names: Vec<String> = result
+        .columns_ref()
+        .iter()
+        .map(|column| column.name_str().into_owned())
+        .collect();
+    assert_eq!(names, ["code", "id", "rval", "lval"]);
+    let rows: Vec<(i64, i64, String, Option<String>)> = result.collect().await.unwrap();
+    assert_eq!(
+        rows,
+        [
+            (10, 1, "R1".into(), Some("L1".into())),
+            (99, 2, "id-only".into(), None),
+            (30, 3, "R3".into(), None),
+            (40, 4, "R4".into(), Some("L4".into())),
+            (20, 99, "code-only".into(), None),
+        ]
+    );
+
+    let mut result = c
+        .query_iter(
+            "SELECT l.*, r.*
+             FROM natural_l AS l NATURAL LEFT JOIN natural_r AS r
+             ORDER BY l.id",
+        )
+        .await
+        .unwrap();
+    let names: Vec<String> = result
+        .columns_ref()
+        .iter()
+        .map(|column| column.name_str().into_owned())
+        .collect();
+    assert_eq!(names, ["id", "code", "lval", "code", "id", "rval"]);
+    type QualifiedNaturalRow = (i64, i64, String, Option<i64>, Option<i64>, Option<String>);
+    let rows: Vec<QualifiedNaturalRow> = result.collect().await.unwrap();
+    assert_eq!(
+        rows,
+        [
+            (1, 10, "L1".into(), Some(10), Some(1), Some("R1".into())),
+            (2, 20, "L2".into(), None, None, None),
+            (4, 40, "L4".into(), Some(40), Some(4), Some("R4".into())),
+        ]
+    );
+
+    c.query_drop("CREATE TABLE natural_x (x INT)")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE natural_y (y INT)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO natural_x VALUES (1),(2)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO natural_y VALUES (8),(9)")
+        .await
+        .unwrap();
+    let rows: Vec<(i64, i64)> = c
+        .query("SELECT * FROM natural_x NATURAL JOIN natural_y ORDER BY x, y")
+        .await
+        .unwrap();
+    assert_eq!(rows, [(1, 8), (1, 9), (2, 8), (2, 9)]);
+}
+
+#[tokio::test]
 async fn correlated_exists_preserves_inner_bare_columns() {
     let srv = TestServer::start().await;
     let mut c = srv.conn().await;

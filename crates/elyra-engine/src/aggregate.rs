@@ -9,6 +9,8 @@ use elyra_core::{ColumnDef, ColumnType, Error, Result, Schema, Value};
 use elyra_olap::{AggFunc, AggSpec, GroupAggregator};
 use sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, FunctionArguments, SelectItem};
 
+use crate::exec::unqualified_wildcard_indices;
+
 /// An output column: a (grouped) source column, an aggregate result, or a
 /// scalar expression evaluated per group over the group columns + aggregate
 /// results (e.g. `ROUND(SUM(x), 2)`, `SUM(a)/COUNT(*)`, `UPPER(status)`).
@@ -523,7 +525,8 @@ pub fn build_plan(
     for item in projection {
         match item {
             SelectItem::Wildcard(_) => {
-                for (idx, column) in schema.columns.iter().enumerate() {
+                for idx in unqualified_wildcard_indices(&schema.columns) {
+                    let column = &schema.columns[idx];
                     out_cols.push(ColumnDef {
                         name: column_name(column).to_owned(),
                         ty: column.ty.clone(),
