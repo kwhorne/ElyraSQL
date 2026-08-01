@@ -4228,7 +4228,17 @@ async fn select_inner(
         let correlated = raw_filter
             .as_ref()
             .is_some_and(|f| filter_correlated_any(f, &quals))
-            || projection_correlated_any(&select.projection, &quals);
+            || projection_correlated_any(&select.projection, &quals)
+            // A bare name inside a subquery can correlate only after the joined
+            // logical schema exists. This matters for a coalesced USING/NATURAL
+            // key, which is deliberately one bare outer column. Let the
+            // per-row path first try the inner query, then fall back to that
+            // outer schema; ambiguity still propagates as an error. Keep
+            // aggregate/grouped projections on their existing path, where
+            // correlated projection subqueries are not supported.
+            || (group_by.is_empty()
+                && !aggregate::projection_has_aggregate(&select.projection)
+                && projection_has_potential_bare_correlation(&select.projection));
         if correlated {
             return join_correlated_select(
                 db,
@@ -6726,6 +6736,15 @@ fn column_table(column: &ColumnDef) -> Option<&str> {
     column.qualifier.last().map(String::as_str)
 }
 
+/// Result-metadata source for one schema column. Logical columns created by a
+/// USING/NATURAL join intentionally have no qualifier (so bare name resolution
+/// sees one key), but retain their selected source separately in `Schema`.
+fn schema_column_table(schema: &Schema, index: usize) -> Option<&str> {
+    schema
+        .table_of(index)
+        .or_else(|| schema.columns.get(index).and_then(column_table))
+}
+
 fn wildcard_column_name<'a>(
     column: &'a ColumnDef,
     qualifier: &ObjectName,
@@ -6985,7 +7004,11 @@ async fn join_correlated_select(
                     let column = &schema.columns[index];
                     projection.push(Projection::Column(index));
                     let mut column = column.clone();
-                    outtables.push(column_table(&column).unwrap_or_default().to_owned());
+                    outtables.push(
+                        schema_column_table(&schema, index)
+                            .unwrap_or_default()
+                            .to_owned(),
+                    );
                     column.name = column_name(&column).to_owned();
                     column.qualifier.clear();
                     outcols.push(column);
@@ -7001,7 +7024,11 @@ async fn join_correlated_select(
                     if let Some(name) = wildcard_column_name(column, object, unqualified_schema) {
                         projection.push(Projection::Column(index));
                         let mut column = column.clone();
-                        outtables.push(column_table(&column).unwrap_or_default().to_owned());
+                        outtables.push(
+                            schema_column_table(&schema, index)
+                                .unwrap_or_default()
+                                .to_owned(),
+                        );
                         column.name = name.to_owned();
                         column.qualifier.clear();
                         outcols.push(column);
@@ -7027,8 +7054,7 @@ async fn join_correlated_select(
                 // in MySQL, which reports an empty table for computed columns.
                 outtables.push(
                     expr_col_index(expr, &schema)
-                        .and_then(|index| schema.columns.get(index))
-                        .and_then(column_table)
+                        .and_then(|index| schema_column_table(&schema, index))
                         .unwrap_or_default()
                         .to_owned(),
                 );
@@ -8690,6 +8716,19 @@ fn coalesce_using_join(
             column
         })
         .collect::<Vec<_>>();
+    let mut tables = keys
+        .iter()
+        .map(|key| {
+            let (schema, index) = if kind == JoinKind::Right {
+                (right, key.right)
+            } else {
+                (left, key.left)
+            };
+            schema_column_table(schema, index)
+                .unwrap_or_default()
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
 
     let hidden_bare: std::collections::HashSet<usize> = keys
         .iter()
@@ -8717,12 +8756,17 @@ fn coalesce_using_join(
             .iter()
             .map(|&index| physical_schema.columns[index].clone()),
     );
+    tables.extend(physical_order.iter().map(|&index| {
+        schema_column_table(&physical_schema, index)
+            .unwrap_or_default()
+            .to_owned()
+    }));
 
     let key_physical: std::collections::HashSet<usize> = keys
         .iter()
         .flat_map(|key| [key.left, left_len + key.right])
         .collect();
-    let mut schema = Schema::new(columns);
+    let mut schema = Schema::with_tables(columns, tables);
     for (output_index, &physical_index) in physical_order.iter().enumerate() {
         if physical_schema.is_hidden_from_unqualified(physical_index)
             || key_physical.contains(&physical_index)
@@ -8792,7 +8836,19 @@ fn combine(
 ) -> Result<(Schema, Vec<Vec<Value>>)> {
     let mut cols = lschema.columns.clone();
     cols.extend_from_slice(&rschema.columns);
-    let mut schema = Schema::new(cols);
+    let tables = (0..lschema.columns.len())
+        .map(|index| {
+            schema_column_table(lschema, index)
+                .unwrap_or_default()
+                .to_owned()
+        })
+        .chain((0..rschema.columns.len()).map(|index| {
+            schema_column_table(rschema, index)
+                .unwrap_or_default()
+                .to_owned()
+        }))
+        .collect();
+    let mut schema = Schema::with_tables(cols, tables);
     for index in 0..lschema.columns.len() {
         if lschema.is_hidden_from_unqualified(index) {
             schema.hide_from_unqualified(index);
@@ -8803,6 +8859,14 @@ fn combine(
         if rschema.is_hidden_from_unqualified(index) {
             schema.hide_from_unqualified(left_len + index);
         }
+    }
+
+    // Validate analyzable ON references against the actual combined schema
+    // before a hash/merge optimization splits the expression back into its two
+    // inputs. Otherwise a bare name that is valid on the accumulated left side
+    // can bypass the ambiguity introduced by the new right side.
+    if let Some(JoinCondition::On(expression)) = condition {
+        validate_join_on_refs(expression, &schema)?;
     }
 
     // Hash join for equi INNER/LEFT/RIGHT (cost-based build side). For large
@@ -9313,6 +9377,25 @@ fn collect_refs<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) -> bool {
         }
         _ => false,
     }
+}
+
+fn validate_join_on_refs(expr: &Expr, schema: &Schema) -> Result<()> {
+    let mut references = Vec::new();
+    if !collect_refs(expr, &mut references) {
+        return Ok(());
+    }
+    for reference in references {
+        match reference {
+            Expr::Identifier(identifier) => {
+                predicate::resolve_index_parts(std::slice::from_ref(identifier), schema)?;
+            }
+            Expr::CompoundIdentifier(parts) => {
+                predicate::resolve_index_parts(parts, schema)?;
+            }
+            _ => unreachable!("collect_refs only records column references"),
+        }
+    }
+    Ok(())
 }
 
 /// If `filter` is exactly `col = <literal>` (either operand order), return the
@@ -11579,7 +11662,7 @@ fn project_exprs(
         };
         tables.push(
             source_column
-                .and_then(|i| column_table(&schema.columns[i]).or(default_table))
+                .and_then(|index| schema_column_table(schema, index).or(default_table))
                 .unwrap_or_default()
                 .to_owned(),
         );
@@ -13125,6 +13208,52 @@ fn projection_has_subquery(projection: &[sqlparser::ast::SelectItem]) -> bool {
             expr_has_subquery(e)
         }
         _ => false,
+    })
+}
+
+/// Whether a projection subquery contains a bare identifier that may belong to
+/// the joined outer schema. Qualified correlation is detected separately; this
+/// covers logical USING/NATURAL keys while avoiding the per-row path for
+/// obviously uncorrelated forms such as `(SELECT 1)`.
+fn projection_has_potential_bare_correlation(projection: &[sqlparser::ast::SelectItem]) -> bool {
+    use sqlparser::ast::SelectItem;
+
+    fn query_has_bare_identifier(query: &SqlQuery) -> bool {
+        let found = std::cell::Cell::new(false);
+        let _ = rewrite_query(query, &|candidate| {
+            if let Expr::Identifier(identifier) = candidate {
+                if !identifier.value.starts_with("@@") {
+                    found.set(true);
+                }
+            }
+            None
+        });
+        found.get()
+    }
+
+    projection.iter().any(|item| {
+        let expr = match item {
+            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => expr,
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => return false,
+        };
+        let found = std::cell::Cell::new(false);
+        let _ = map_expr(expr, &|candidate| match candidate {
+            Expr::Subquery(query)
+            | Expr::InSubquery {
+                subquery: query, ..
+            }
+            | Expr::Exists {
+                subquery: query, ..
+            } => {
+                if query_has_bare_identifier(query) {
+                    found.set(true);
+                }
+                // The nested query was inspected recursively above.
+                Some(candidate.clone())
+            }
+            _ => None,
+        });
+        found.get()
     })
 }
 

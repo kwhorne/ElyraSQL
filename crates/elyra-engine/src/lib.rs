@@ -652,6 +652,25 @@ impl Engine {
         let SetExpr::Select(sel) = q.body.as_ref() else {
             return None;
         };
+        // USING/NATURAL changes both wildcard width and column order by
+        // coalescing its key columns. The generic descriptor below only sees
+        // independent physical relations, so returning those columns would
+        // advertise a different binary result shape than execution produces.
+        // Decline static metadata until describe-time join planning can reuse
+        // the executor's logical-schema construction.
+        let has_coalescing_join = sel.from.iter().flat_map(|table| &table.joins).any(|join| {
+            use sqlparser::ast::{JoinConstraint, JoinOperator};
+            matches!(
+                &join.join_operator,
+                JoinOperator::Inner(JoinConstraint::Using(_) | JoinConstraint::Natural)
+                    | JoinOperator::LeftOuter(JoinConstraint::Using(_) | JoinConstraint::Natural)
+                    | JoinOperator::RightOuter(JoinConstraint::Using(_) | JoinConstraint::Natural)
+                    | JoinOperator::FullOuter(JoinConstraint::Using(_) | JoinConstraint::Natural)
+            )
+        });
+        if has_coalescing_join {
+            return None;
+        }
         // Resolve every plain or virtual table in FROM (across commas and joins),
         // preserving its structured factor for qualified-wildcard binding.
         // `all_plain` stays true only if every FROM relation is describable --
@@ -1879,6 +1898,32 @@ mod describe_wildcard_tests {
             )
             .await
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn logical_join_shapes_decline_physical_static_metadata() {
+        let engine = Engine::new(elyra_storage::Db::in_memory().unwrap());
+        let session = engine.session();
+        for sql in [
+            "CREATE TABLE describe_l (id INT PRIMARY KEY, lval VARCHAR(8))",
+            "CREATE TABLE describe_r (id INT PRIMARY KEY, rval VARCHAR(8))",
+        ] {
+            engine
+                .execute(sql, Privilege::Admin, &session)
+                .await
+                .unwrap();
+        }
+
+        for sql in [
+            "SELECT * FROM describe_l JOIN describe_r USING(id)",
+            "SELECT * FROM describe_l NATURAL JOIN describe_r",
+            "SELECT * FROM describe_l RIGHT JOIN describe_r USING(id)",
+        ] {
+            assert!(
+                engine.describe_query(sql, &session).await.is_none(),
+                "{sql} must not advertise its uncoalesced physical columns"
+            );
+        }
     }
 }
 

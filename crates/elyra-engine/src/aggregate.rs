@@ -654,9 +654,17 @@ pub fn build_plan(
                 .unwrap_or(elyra_core::Collation::Ci)
         })
         .collect();
-    let out_tables = out_cols
+    let out_tables = plan
         .iter()
-        .map(|column| column.qualifier.last().cloned().unwrap_or_default())
+        .zip(&out_cols)
+        .map(|(planned, column)| match planned {
+            OutCol::Column(index) => schema
+                .table_of(*index)
+                .map(str::to_owned)
+                .or_else(|| column.qualifier.last().cloned())
+                .unwrap_or_default(),
+            OutCol::Agg(_) | OutCol::Computed(_) => String::new(),
+        })
         .collect();
     for column in &mut out_cols {
         column.qualifier.clear();

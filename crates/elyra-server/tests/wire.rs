@@ -1486,6 +1486,12 @@ async fn using_join_coalesces_keys_and_keeps_qualified_access() {
         .map(|column| column.name_str().into_owned())
         .collect();
     assert_eq!(names, ["id", "lval", "rval"]);
+    let tables: Vec<String> = result
+        .columns_ref()
+        .iter()
+        .map(|column| column.table_str().into_owned())
+        .collect();
+    assert_eq!(tables, ["l", "l", "r"]);
     let rows: Vec<(i64, String, String)> = result.collect().await.unwrap();
     assert_eq!(
         rows,
@@ -1515,6 +1521,12 @@ async fn using_join_coalesces_keys_and_keeps_qualified_access() {
         .map(|column| column.name_str().into_owned())
         .collect();
     assert_eq!(names, ["id", "rval", "lval"]);
+    let tables: Vec<String> = result
+        .columns_ref()
+        .iter()
+        .map(|column| column.table_str().into_owned())
+        .collect();
+    assert_eq!(tables, ["r", "r", "l"]);
     let rows: Vec<(i64, String, Option<String>)> = result.collect().await.unwrap();
     assert_eq!(
         rows,
@@ -1792,7 +1804,10 @@ async fn using_and_natural_joins_preserve_quoted_identifier_boundaries() {
         .iter()
         .map(|column| column.table_str().into_owned())
         .collect::<Vec<_>>();
-    assert_eq!(tables, ["", "left.alias", "right.alias", "third.alias"]);
+    assert_eq!(
+        tables,
+        ["left.alias", "left.alias", "right.alias", "third.alias"]
+    );
     let rows: Vec<(i64, String, String, String)> = result.collect().await.unwrap();
     assert_eq!(rows, [(1, "L1".into(), "R1".into(), "T1".into())]);
 
@@ -1970,6 +1985,158 @@ async fn using_join_visibility_survives_later_on_and_cross_joins() {
 }
 
 #[tokio::test]
+async fn native_prepared_using_wildcard_metadata_matches_runtime_shape() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop("CREATE TABLE prep_using_l (id INT PRIMARY KEY, lval VARCHAR(8))")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE prep_using_r (id INT PRIMARY KEY, rval VARCHAR(8))")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO prep_using_l VALUES (1,'L1')")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO prep_using_r VALUES (1,'R1')")
+        .await
+        .unwrap();
+
+    // Run this test with ELYRASQL_STMT_DESCRIBE=1 to exercise static PREPARE
+    // metadata. The execute-time result has one coalesced key, not both physical
+    // key columns.
+    let mut result = c
+        .exec_iter(
+            "SELECT *
+             FROM prep_using_l AS l JOIN prep_using_r AS r USING(id)",
+            (),
+        )
+        .await
+        .unwrap();
+    let columns = result.columns_ref();
+    let names = columns
+        .iter()
+        .map(|column| column.name_str().into_owned())
+        .collect::<Vec<_>>();
+    let tables = columns
+        .iter()
+        .map(|column| column.table_str().into_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["id", "lval", "rval"]);
+    assert_eq!(tables, ["l", "l", "r"]);
+    let rows: Vec<(i64, String, String)> = result.collect().await.unwrap();
+    assert_eq!(rows, [(1, "L1".into(), "R1".into())]);
+}
+
+#[tokio::test]
+async fn using_join_fast_paths_validate_bare_on_references_for_ambiguity() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop("CREATE TABLE on_using_a (id INT PRIMARY KEY, label VARCHAR(8))")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE on_using_b (id INT PRIMARY KEY, label VARCHAR(8))")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE on_using_c (id INT PRIMARY KEY, label VARCHAR(8))")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO on_using_a VALUES (1,'same')")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO on_using_b VALUES (1,'same')")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO on_using_c VALUES (1,'same')")
+        .await
+        .unwrap();
+
+    let error = c
+        .query_drop(
+            "SELECT *
+             FROM on_using_a AS a
+             NATURAL JOIN on_using_b AS b
+             JOIN on_using_c AS c ON label = c.label",
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().to_ascii_lowercase().contains("ambiguous"),
+        "{error:?}"
+    );
+
+    let rows: Vec<(String, String)> = c
+        .query(
+            "SELECT a.label, c.label
+             FROM on_using_a AS a
+             NATURAL JOIN on_using_b AS b
+             JOIN on_using_c AS c ON a.label = c.label",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows, [("same".into(), "same".into())]);
+}
+
+#[tokio::test]
+async fn natural_join_bare_coalesced_key_correlates_as_one_outer_column() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop(
+        "CREATE TABLE corr_natural_l (
+             id INT PRIMARY KEY,
+             label VARCHAR(8) COLLATE utf8mb4_general_ci
+         )",
+    )
+    .await
+    .unwrap();
+    c.query_drop(
+        "CREATE TABLE corr_natural_r (
+             id INT PRIMARY KEY,
+             label VARCHAR(8) COLLATE utf8mb4_bin
+         )",
+    )
+    .await
+    .unwrap();
+    c.query_drop("INSERT INTO corr_natural_l VALUES (1,'same')")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO corr_natural_r VALUES (1,'same')")
+        .await
+        .unwrap();
+
+    let rows: Vec<(String, String)> = c
+        .query(
+            "SELECT label, (SELECT label)
+             FROM corr_natural_l AS l NATURAL JOIN corr_natural_r AS r",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows, [("same".into(), "same".into())]);
+
+    c.query_drop("CREATE TABLE corr_natural_c (id INT PRIMARY KEY, label VARCHAR(8))")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO corr_natural_c VALUES (1,'same')")
+        .await
+        .unwrap();
+    let error = c
+        .query_drop(
+            "SELECT (SELECT label)
+             FROM corr_natural_l AS l
+             NATURAL JOIN corr_natural_r AS r
+             JOIN corr_natural_c AS c ON l.id = c.id",
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().to_ascii_lowercase().contains("ambiguous"),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
 async fn multi_key_using_preserves_sql_coercion_and_collation_semantics() {
     let srv = TestServer::start().await;
     let mut c = srv.conn().await;
@@ -2053,7 +2220,7 @@ async fn multi_key_using_preserves_sql_coercion_and_collation_semantics() {
     c.query_drop("INSERT INTO coll_l VALUES (1,'X'),(2,'x')")
         .await
         .unwrap();
-    c.query_drop("INSERT INTO coll_r VALUES (1,'X'),(2,'X')")
+    c.query_drop("INSERT INTO coll_r VALUES (1,'X'),(2,'X'),(3,'x')")
         .await
         .unwrap();
     let rows: Vec<(i64, String, String)> = c
@@ -2064,6 +2231,21 @@ async fn multi_key_using_preserves_sql_coercion_and_collation_semantics() {
         .await
         .unwrap();
     assert_eq!(rows, [(1, "X".into(), "X".into())]);
+
+    let mut result = c
+        .query_iter(
+            "SELECT label, COUNT(*) AS n
+             FROM coll_l AS l RIGHT JOIN coll_r AS r USING(grp, label)
+             GROUP BY label
+             ORDER BY label",
+        )
+        .await
+        .unwrap();
+    let columns = result.columns_ref();
+    assert_eq!(columns[0].table_str(), "r");
+    assert_eq!(columns[1].table_str(), "");
+    let rows: Vec<(String, i64)> = result.collect().await.unwrap();
+    assert_eq!(rows, [("X".into(), 2), ("x".into(), 1)]);
 }
 
 #[tokio::test]
