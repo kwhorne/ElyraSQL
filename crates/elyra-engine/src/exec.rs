@@ -13236,11 +13236,59 @@ async fn read_autoinc(db: &Session, table: &str) -> Result<i64> {
 }
 
 static TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static TEMP_OWNER_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-fn unique_temp_name(base: &str) -> String {
-    let n = TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+#[derive(Debug, Clone)]
+struct OwnedTempTable {
+    name: String,
+    definition: Vec<u8>,
+    owner: Vec<u8>,
+}
+
+fn temp_name(n: u64, base: &str) -> String {
     let clean: String = base.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
     format!("__cte_{n}_{clean}")
+}
+
+fn temp_owner_key(name: &str) -> Vec<u8> {
+    format!("sys::cte-owner::{name}").into_bytes()
+}
+
+fn reachable_recursive_ctes(query: &SqlQuery, with: &With) -> std::collections::HashSet<String> {
+    let names = with
+        .cte_tables
+        .iter()
+        .map(|cte| cte.alias.name.value.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    let mut outer = query.clone();
+    outer.with = None;
+    let mut reachable = names
+        .iter()
+        .filter(|name| query_refs_table(&outer, name))
+        .cloned()
+        .collect::<std::collections::HashSet<_>>();
+
+    loop {
+        let before = reachable.len();
+        for (index, cte) in with.cte_tables.iter().enumerate() {
+            let name = cte.alias.name.value.to_ascii_lowercase();
+            if !reachable.contains(&name) {
+                continue;
+            }
+            // A CTE body can see earlier declarations, plus itself when the
+            // WITH clause is recursive. Later declarations do not shadow a
+            // physical table of the same name at this declaration point.
+            let visible = index + usize::from(with.recursive);
+            for dependency in names.iter().take(visible) {
+                if query_refs_table(&cte.query, dependency) {
+                    reachable.insert(dependency.clone());
+                }
+            }
+        }
+        if reachable.len() == before {
+            return reachable;
+        }
+    }
 }
 
 /// Execute a `WITH RECURSIVE` query. Each CTE is materialised into a temporary
@@ -13254,15 +13302,15 @@ async fn execute_recursive_cte(
     let with = query.with.as_ref().expect("with present");
     let mut temp_names: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
-    let mut created: Vec<String> = Vec::new();
+    let mut created: Vec<OwnedTempTable> = Vec::new();
+    let reachable = reachable_recursive_ctes(query, with);
 
     let result = async {
         for cte in &with.cte_tables {
             let cname = cte.alias.name.value.clone();
-            let temp = unique_temp_name(&cname);
-            // Register before any fallible materialisation so a partially
-            // created internal relation is always removed on the error path.
-            created.push(temp.clone());
+            if !reachable.contains(&cname.to_ascii_lowercase()) {
+                continue;
+            }
             // Rewrite references to earlier CTEs in this body.
             let body = rewrite_table_refs((*cte.query).clone(), &temp_names);
             let alias_cols: Vec<String> = cte
@@ -13272,14 +13320,17 @@ async fn execute_recursive_cte(
                 .map(|c| c.name.value.clone())
                 .collect();
 
-            if query_refs_table(&body, &cname) {
-                materialize_recursive(db, vindex, &temp, &cname, &body, &alias_cols).await?;
+            let temp = if query_refs_table(&body, &cname) {
+                materialize_recursive(db, vindex, &cname, &body, &alias_cols, &mut created).await?
             } else {
                 let (schema, rows) = run_subquery_schema(db, vindex, &body).await?;
                 let schema = apply_col_aliases(schema, &alias_cols)?;
-                create_temp_table(db, &temp, &schema).await?;
-                fill_table(db, &temp, &schema, &rows).await?;
-            }
+                let owned = create_temp_table(db, &cname, &schema).await?;
+                let temp = owned.name.clone();
+                created.push(owned.clone());
+                fill_table(db, &owned, &schema, &rows).await?;
+                temp
+            };
             temp_names.insert(cname.to_ascii_lowercase(), temp);
         }
 
@@ -13292,29 +13343,37 @@ async fn execute_recursive_cte(
     .await;
 
     // Always drop the temporary relations.
-    for t in &created {
-        let _ = drop_table(db, t, true).await;
+    for temp in &created {
+        let _ = drop_temp_table(db, temp).await;
     }
 
     let (schema, rows) = result?;
     Ok(QueryResult::Rows(RowStream::literal(schema, rows)))
 }
 
-/// Fixpoint materialisation of a recursive CTE into temp table `temp`.
+/// Fixpoint materialisation of a recursive CTE into an owned temporary table.
 async fn materialize_recursive(
     db: &Session,
     vindex: &VectorRegistry,
-    temp: &str,
     cname: &str,
     body: &SqlQuery,
     alias_cols: &[String],
-) -> Result<()> {
+    created: &mut Vec<OwnedTempTable>,
+) -> Result<String> {
     const MAX_ITERS: usize = 1000;
     let (distinct, anchor_q, rec_q) = split_recursive(body, cname)?;
 
     let (schema, anchor_rows) = run_subquery_schema(db, vindex, &anchor_q).await?;
     let schema = apply_col_aliases(schema, alias_cols)?;
-    create_temp_table(db, temp, &schema).await?;
+    let recursive_columns = schema
+        .columns
+        .iter()
+        .map(|column| column.name.clone())
+        .collect::<Vec<_>>();
+    validate_recursive_table_reference(rec_q.body.as_ref(), cname, &recursive_columns)?;
+    let owned = create_temp_table(db, cname, &schema).await?;
+    let temp = owned.name.clone();
+    created.push(owned.clone());
 
     let row_key = |r: &[Value]| -> Vec<u8> { Value::row_collation_key(r) };
     let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
@@ -13329,7 +13388,7 @@ async fn materialize_recursive(
 
     // Rewrite the recursive term's self-reference to the temp relation.
     let mut self_map = std::collections::HashMap::new();
-    self_map.insert(cname.to_ascii_lowercase(), temp.to_string());
+    self_map.insert(cname.to_ascii_lowercase(), temp.clone());
     let rec_q = rewrite_table_refs(rec_q, &self_map);
 
     let mut iters = 0;
@@ -13341,8 +13400,8 @@ async fn materialize_recursive(
             )));
         }
         // The recursive term sees only the previous iteration's rows.
-        clear_table(db, temp).await?;
-        fill_table(db, temp, &schema, &frontier).await?;
+        clear_table(db, &owned).await?;
+        fill_table(db, &owned, &schema, &frontier).await?;
 
         let new_rows = run_subquery(db, vindex, &rec_q).await?;
         let mut fresh: Vec<Vec<Value>> = Vec::new();
@@ -13359,9 +13418,9 @@ async fn materialize_recursive(
     }
 
     // Final contents: the full accumulated set.
-    clear_table(db, temp).await?;
-    fill_table(db, temp, &schema, &all_rows).await?;
-    Ok(())
+    clear_table(db, &owned).await?;
+    fill_table(db, &owned, &schema, &all_rows).await?;
+    Ok(temp)
 }
 
 /// Split a recursive CTE body `anchor UNION [ALL] recursive` into its parts.
@@ -13393,14 +13452,8 @@ fn split_recursive(body: &SqlQuery, cname: &str) -> Result<(bool, SqlQuery, SqlQ
     let left_rec = setexpr_refs_table(left, cname);
     let right_rec = setexpr_refs_table(right, cname);
     match (left_rec, right_rec) {
-        (false, true) => {
-            validate_recursive_table_reference(right, cname)?;
-            Ok((distinct, wrap(left), wrap(right)))
-        }
-        (true, false) => {
-            validate_recursive_table_reference(left, cname)?;
-            Ok((distinct, wrap(right), wrap(left)))
-        }
+        (false, true) => Ok((distinct, wrap(left), wrap(right))),
+        (true, false) => Ok((distinct, wrap(right), wrap(left))),
         _ => Err(Error::Unsupported(
             "recursive CTE must have exactly one self-referencing branch".into(),
         )),
@@ -13574,7 +13627,11 @@ impl VisitorMut for TableRefCounter<'_> {
     }
 }
 
-fn validate_recursive_table_reference(body: &SetExpr, name: &str) -> Result<()> {
+fn validate_recursive_table_reference(
+    body: &SetExpr,
+    name: &str,
+    recursive_columns: &[String],
+) -> Result<()> {
     let total = refs_table_count(body, name);
     if total != 1 {
         return Err(Error::Unsupported(format!(
@@ -13586,7 +13643,387 @@ fn validate_recursive_table_reference(body: &SetExpr, name: &str) -> Result<()> 
             "recursive table '{name}' must not be referenced in a subquery"
         )));
     }
+    if recursive_ref_on_nullable_join_side(body, name)
+        && !recursive_ref_is_null_rejected(body, name, recursive_columns)
+    {
+        return Err(Error::Unsupported(format!(
+            "recursive table '{name}' must not appear on the nullable side of an outer join"
+        )));
+    }
     Ok(())
+}
+
+fn recursive_ref_on_nullable_join_side(body: &SetExpr, name: &str) -> bool {
+    let SetExpr::Select(select) = body else {
+        return false;
+    };
+    select
+        .from
+        .iter()
+        .any(|table| table_ref_location(table, name).1)
+}
+
+/// MySQL permits a recursive reference on an outer join's nullable side when
+/// the WHERE clause rejects every NULL-extended recursive row, making the join
+/// equivalent to an inner join. Stay conservative: only recognise predicates
+/// whose three-valued-logic behaviour is unambiguous.
+fn recursive_ref_is_null_rejected(
+    body: &SetExpr,
+    name: &str,
+    recursive_columns: &[String],
+) -> bool {
+    let SetExpr::Select(select) = body else {
+        return false;
+    };
+    let Some(qualifier) = recursive_ref_qualifier(select, name) else {
+        return false;
+    };
+    select
+        .selection
+        .as_ref()
+        .is_some_and(|selection| null_rejects_qualifier(selection, &qualifier, recursive_columns))
+}
+
+fn recursive_ref_qualifier(select: &Select, name: &str) -> Option<String> {
+    select.from.iter().find_map(|table| {
+        recursive_factor_qualifier(&table.relation, name).or_else(|| {
+            table
+                .joins
+                .iter()
+                .find_map(|join| recursive_factor_qualifier(&join.relation, name))
+        })
+    })
+}
+
+fn recursive_factor_qualifier(factor: &TableFactor, name: &str) -> Option<String> {
+    match factor {
+        TableFactor::Table {
+            name: relation,
+            alias,
+            args: None,
+            ..
+        } if relation.0.len() == 1 && relation.0[0].value.eq_ignore_ascii_case(name) => {
+            Some(alias.as_ref().map_or_else(
+                || relation.0[0].value.clone(),
+                |alias| alias.name.value.clone(),
+            ))
+        }
+        TableFactor::NestedJoin {
+            table_with_joins,
+            alias,
+        } => {
+            let nested = recursive_ref_qualifier_from_table(table_with_joins, name)?;
+            Some(
+                alias
+                    .as_ref()
+                    .map_or(nested, |alias| alias.name.value.clone()),
+            )
+        }
+        _ => None,
+    }
+}
+
+fn recursive_ref_qualifier_from_table(table: &TableWithJoins, name: &str) -> Option<String> {
+    recursive_factor_qualifier(&table.relation, name).or_else(|| {
+        table
+            .joins
+            .iter()
+            .find_map(|join| recursive_factor_qualifier(&join.relation, name))
+    })
+}
+
+fn null_rejects_qualifier(expr: &Expr, qualifier: &str, recursive_columns: &[String]) -> bool {
+    !null_truth_values(expr, qualifier, recursive_columns).contains(SqlTruth::TRUE)
+}
+
+#[derive(Clone, Copy)]
+struct SqlTruth(u8);
+
+impl SqlTruth {
+    const TRUE: u8 = 1;
+    const FALSE: u8 = 2;
+    const UNKNOWN: u8 = 4;
+    const ANY: Self = Self(Self::TRUE | Self::FALSE | Self::UNKNOWN);
+
+    fn contains(self, value: u8) -> bool {
+        self.0 & value != 0
+    }
+
+    fn not(self) -> Self {
+        let mut values = self.0 & Self::UNKNOWN;
+        if self.contains(Self::TRUE) {
+            values |= Self::FALSE;
+        }
+        if self.contains(Self::FALSE) {
+            values |= Self::TRUE;
+        }
+        Self(values)
+    }
+
+    fn and(self, other: Self) -> Self {
+        let mut values = 0;
+        if self.contains(Self::TRUE) && other.contains(Self::TRUE) {
+            values |= Self::TRUE;
+        }
+        if self.contains(Self::FALSE) || other.contains(Self::FALSE) {
+            values |= Self::FALSE;
+        }
+        if (self.contains(Self::UNKNOWN)
+            && (other.contains(Self::TRUE) || other.contains(Self::UNKNOWN)))
+            || (other.contains(Self::UNKNOWN)
+                && (self.contains(Self::TRUE) || self.contains(Self::UNKNOWN)))
+        {
+            values |= Self::UNKNOWN;
+        }
+        Self(values)
+    }
+
+    fn or(self, other: Self) -> Self {
+        let mut values = 0;
+        if self.contains(Self::TRUE) || other.contains(Self::TRUE) {
+            values |= Self::TRUE;
+        }
+        if self.contains(Self::FALSE) && other.contains(Self::FALSE) {
+            values |= Self::FALSE;
+        }
+        if (self.contains(Self::UNKNOWN)
+            && (other.contains(Self::FALSE) || other.contains(Self::UNKNOWN)))
+            || (other.contains(Self::UNKNOWN)
+                && (self.contains(Self::FALSE) || self.contains(Self::UNKNOWN)))
+        {
+            values |= Self::UNKNOWN;
+        }
+        Self(values)
+    }
+
+    fn predicate_test(self, true_for: u8) -> Self {
+        let mut values = 0;
+        if self.0 & true_for != 0 {
+            values |= Self::TRUE;
+        }
+        if self.0 & (Self::TRUE | Self::FALSE | Self::UNKNOWN) & !true_for != 0 {
+            values |= Self::FALSE;
+        }
+        Self(values)
+    }
+}
+
+fn null_truth_values(expr: &Expr, qualifier: &str, recursive_columns: &[String]) -> SqlTruth {
+    use sqlparser::ast::BinaryOperator::{And, Eq, Gt, GtEq, Lt, LtEq, NotEq, Or};
+    use sqlparser::ast::UnaryOperator;
+
+    match expr {
+        Expr::Value(sqlparser::ast::Value::Boolean(true)) => SqlTruth(SqlTruth::TRUE),
+        Expr::Value(sqlparser::ast::Value::Boolean(false)) => SqlTruth(SqlTruth::FALSE),
+        Expr::Value(sqlparser::ast::Value::Null) => SqlTruth(SqlTruth::UNKNOWN),
+        Expr::Nested(inner) => null_truth_values(inner, qualifier, recursive_columns),
+        Expr::UnaryOp {
+            op: UnaryOperator::Not,
+            expr,
+        } => null_truth_values(expr, qualifier, recursive_columns).not(),
+        Expr::BinaryOp {
+            left,
+            op: And,
+            right,
+        } => null_truth_values(left, qualifier, recursive_columns).and(null_truth_values(
+            right,
+            qualifier,
+            recursive_columns,
+        )),
+        Expr::BinaryOp {
+            left,
+            op: Or,
+            right,
+        } => null_truth_values(left, qualifier, recursive_columns).or(null_truth_values(
+            right,
+            qualifier,
+            recursive_columns,
+        )),
+        Expr::BinaryOp {
+            left,
+            op: Eq | NotEq | Lt | LtEq | Gt | GtEq,
+            right,
+        } if null_propagates_from_qualifier(left, qualifier, recursive_columns)
+            || null_propagates_from_qualifier(right, qualifier, recursive_columns) =>
+        {
+            SqlTruth(SqlTruth::UNKNOWN)
+        }
+        Expr::IsNull(inner)
+            if null_propagates_from_qualifier(inner, qualifier, recursive_columns) =>
+        {
+            SqlTruth(SqlTruth::TRUE)
+        }
+        Expr::IsNotNull(inner)
+            if null_propagates_from_qualifier(inner, qualifier, recursive_columns) =>
+        {
+            SqlTruth(SqlTruth::FALSE)
+        }
+        Expr::IsTrue(inner) => {
+            null_truth_values(inner, qualifier, recursive_columns).predicate_test(SqlTruth::TRUE)
+        }
+        Expr::IsFalse(inner) => {
+            null_truth_values(inner, qualifier, recursive_columns).predicate_test(SqlTruth::FALSE)
+        }
+        Expr::IsNotTrue(inner) => null_truth_values(inner, qualifier, recursive_columns)
+            .predicate_test(SqlTruth::FALSE | SqlTruth::UNKNOWN),
+        Expr::IsNotFalse(inner) => null_truth_values(inner, qualifier, recursive_columns)
+            .predicate_test(SqlTruth::TRUE | SqlTruth::UNKNOWN),
+        Expr::IsUnknown(inner) => {
+            null_truth_values(inner, qualifier, recursive_columns).predicate_test(SqlTruth::UNKNOWN)
+        }
+        Expr::IsNotUnknown(inner) => null_truth_values(inner, qualifier, recursive_columns)
+            .predicate_test(SqlTruth::TRUE | SqlTruth::FALSE),
+        Expr::Between {
+            expr, low, high, ..
+        } if null_propagates_from_qualifier(expr, qualifier, recursive_columns)
+            || null_propagates_from_qualifier(low, qualifier, recursive_columns)
+            || null_propagates_from_qualifier(high, qualifier, recursive_columns) =>
+        {
+            SqlTruth(SqlTruth::UNKNOWN)
+        }
+        Expr::InList { expr, .. }
+            if null_propagates_from_qualifier(expr, qualifier, recursive_columns) =>
+        {
+            SqlTruth(SqlTruth::UNKNOWN)
+        }
+        Expr::Like { expr, pattern, .. }
+        | Expr::ILike { expr, pattern, .. }
+        | Expr::SimilarTo { expr, pattern, .. }
+        | Expr::RLike { expr, pattern, .. }
+            if null_propagates_from_qualifier(expr, qualifier, recursive_columns)
+                || null_propagates_from_qualifier(pattern, qualifier, recursive_columns) =>
+        {
+            SqlTruth(SqlTruth::UNKNOWN)
+        }
+        _ if null_propagates_from_qualifier(expr, qualifier, recursive_columns) => {
+            SqlTruth(SqlTruth::UNKNOWN)
+        }
+        _ => SqlTruth::ANY,
+    }
+}
+
+fn null_propagates_from_qualifier(
+    expr: &Expr,
+    qualifier: &str,
+    recursive_columns: &[String],
+) -> bool {
+    use sqlparser::ast::BinaryOperator::{And, Or, Spaceship, Xor};
+
+    match expr {
+        Expr::Identifier(identifier) => recursive_columns
+            .iter()
+            .any(|column| column.eq_ignore_ascii_case(&identifier.value)),
+        Expr::CompoundIdentifier(parts) => {
+            parts.len() >= 2 && parts[parts.len() - 2].value.eq_ignore_ascii_case(qualifier)
+        }
+        Expr::Nested(inner)
+        | Expr::UnaryOp { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. }
+        | Expr::Ceil { expr: inner, .. }
+        | Expr::Floor { expr: inner, .. } => {
+            null_propagates_from_qualifier(inner, qualifier, recursive_columns)
+        }
+        Expr::BinaryOp { left, op, right } if !matches!(op, And | Or | Xor | Spaceship) => {
+            null_propagates_from_qualifier(left, qualifier, recursive_columns)
+                || null_propagates_from_qualifier(right, qualifier, recursive_columns)
+        }
+        Expr::Function(function) => {
+            null_propagating_function(function, qualifier, recursive_columns)
+        }
+        _ => false,
+    }
+}
+
+fn null_propagating_function(
+    function: &sqlparser::ast::Function,
+    qualifier: &str,
+    recursive_columns: &[String],
+) -> bool {
+    use sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArguments};
+
+    let name = function
+        .name
+        .0
+        .last()
+        .map(|part| part.value.to_ascii_lowercase());
+    let Some(name) = name else {
+        return false;
+    };
+    if !matches!(
+        name.as_str(),
+        "abs"
+            | "ceil"
+            | "ceiling"
+            | "floor"
+            | "sign"
+            | "sqrt"
+            | "exp"
+            | "ln"
+            | "log"
+            | "log10"
+            | "log2"
+            | "upper"
+            | "ucase"
+            | "lower"
+            | "lcase"
+            | "length"
+            | "octet_length"
+            | "char_length"
+            | "character_length"
+            | "reverse"
+            | "trim"
+            | "ltrim"
+            | "rtrim"
+            | "bit_count"
+            | "to_days"
+            | "ascii"
+            | "ord"
+            | "bin"
+            | "oct"
+            | "crc32"
+    ) {
+        return false;
+    }
+    let FunctionArguments::List(arguments) = &function.args else {
+        return false;
+    };
+    let [FunctionArg::Unnamed(FunctionArgExpr::Expr(argument))] = arguments.args.as_slice() else {
+        return false;
+    };
+    null_propagates_from_qualifier(argument, qualifier, recursive_columns)
+}
+
+/// Returns `(contains_recursive_ref, ref_is_on_nullable_outer_join_side)`.
+fn table_ref_location(table: &TableWithJoins, name: &str) -> (bool, bool) {
+    let (mut left_has_ref, mut invalid) = factor_ref_location(&table.relation, name);
+    for join in &table.joins {
+        let (right_has_ref, right_invalid) = factor_ref_location(&join.relation, name);
+        invalid |= right_invalid;
+        match &join.join_operator {
+            JoinOperator::LeftOuter(_) => invalid |= right_has_ref,
+            JoinOperator::RightOuter(_) => invalid |= left_has_ref,
+            JoinOperator::FullOuter(_) => invalid |= left_has_ref || right_has_ref,
+            _ => {}
+        }
+        left_has_ref |= right_has_ref;
+    }
+    (left_has_ref, invalid)
+}
+
+fn factor_ref_location(factor: &TableFactor, name: &str) -> (bool, bool) {
+    match factor {
+        TableFactor::Table {
+            name: relation,
+            args: None,
+            ..
+        } if relation.0.len() == 1 && relation.0[0].value.eq_ignore_ascii_case(name) => {
+            (true, false)
+        }
+        TableFactor::NestedJoin {
+            table_with_joins, ..
+        } => table_ref_location(table_with_joins, name),
+        _ => (false, false),
+    }
 }
 
 fn direct_table_ref_count(body: &SetExpr, name: &str) -> usize {
@@ -13653,24 +14090,156 @@ fn apply_col_aliases(mut schema: Schema, alias_cols: &[String]) -> Result<Schema
     Ok(schema)
 }
 
-async fn create_temp_table(db: &Session, name: &str, schema: &Schema) -> Result<()> {
-    let def = TableDef {
-        name: name.to_string(),
-        schema: schema.clone(),
-        pk_cols: Vec::new(),
-        indexes: Vec::new(),
-        col_meta: Vec::new(),
-        checks: Vec::new(),
-        foreign_keys: Vec::new(),
-    };
-    db.commit_write(vec![(catalog_key(name), def.encode()?)], vec![])
-        .await?;
-    Ok(())
+async fn create_temp_table(db: &Session, base: &str, schema: &Schema) -> Result<OwnedTempTable> {
+    loop {
+        let number = TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let name = temp_name(number, base);
+        let definition = TableDef {
+            name: name.clone(),
+            schema: schema.clone(),
+            pk_cols: Vec::new(),
+            indexes: Vec::new(),
+            col_meta: Vec::new(),
+            checks: Vec::new(),
+            foreign_keys: Vec::new(),
+        }
+        .encode()?;
+        let owner_number = TEMP_OWNER_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let owner = format!(
+            "{}:{}:{owner_number}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        )
+        .into_bytes();
+        let table_key = catalog_key(&name);
+        let owner_key = temp_owner_key(&name);
+        let puts = vec![
+            (table_key.clone(), definition.clone()),
+            (owner_key.clone(), owner.clone()),
+        ];
+
+        if db.in_txn() {
+            if db.get(table_key).await?.is_some()
+                || db.get(catalog::view_key(&name)).await?.is_some()
+                || db.get(catalog::matview_key(&name)).await?.is_some()
+                || db.get(owner_key).await?.is_some()
+            {
+                continue;
+            }
+            db.commit_write(puts, vec![]).await?;
+        } else {
+            let validation = elyra_storage::Validation {
+                keys: vec![
+                    (table_key, None),
+                    (catalog::view_key(&name), None),
+                    (catalog::matview_key(&name), None),
+                    (owner_key, None),
+                ],
+                ranges: Vec::new(),
+            };
+            match db.raw_db().commit_validated(validation, puts, vec![]).await {
+                Ok(()) => catalog::bump_epoch(),
+                Err(Error::Conflict(_)) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+
+        return Ok(OwnedTempTable {
+            name,
+            definition,
+            owner,
+        });
+    }
 }
 
-async fn fill_table(db: &Session, name: &str, schema: &Schema, rows: &[Vec<Value>]) -> Result<()> {
+async fn drop_temp_table(db: &Session, temp: &OwnedTempTable) -> Result<()> {
+    let table_key = catalog_key(&temp.name);
+    let owner_key = temp_owner_key(&temp.name);
+    if db.get(table_key.clone()).await?.as_deref() != Some(temp.definition.as_slice())
+        || db.get(owner_key.clone()).await?.as_deref() != Some(temp.owner.as_slice())
+    {
+        return Ok(());
+    }
+
+    let deletes = table_delete_keys(db, &temp.name).await?;
+    if db.in_txn() {
+        return db.commit_write(vec![], deletes).await;
+    }
+
+    let validation = elyra_storage::Validation {
+        keys: vec![
+            (table_key, Some(temp.definition.clone())),
+            (owner_key, Some(temp.owner.clone())),
+        ],
+        ranges: Vec::new(),
+    };
+    match db
+        .raw_db()
+        .commit_validated(validation, vec![], deletes)
+        .await
+    {
+        Ok(()) => {
+            catalog::bump_epoch();
+            Ok(())
+        }
+        // The relation changed after our read and is no longer ours to drop.
+        Err(Error::Conflict(_)) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+async fn commit_temp_write(
+    db: &Session,
+    temp: &OwnedTempTable,
+    mut expected: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+    puts: Vec<(Vec<u8>, Vec<u8>)>,
+    deletes: Vec<Vec<u8>>,
+) -> Result<()> {
+    let table_key = catalog_key(&temp.name);
+    let owner_key = temp_owner_key(&temp.name);
+    if db.in_txn() {
+        if db.get(table_key).await?.as_deref() != Some(temp.definition.as_slice())
+            || db.get(owner_key).await?.as_deref() != Some(temp.owner.as_slice())
+        {
+            return Err(Error::Conflict(
+                "temporary CTE relation ownership changed".into(),
+            ));
+        }
+        return db.commit_write(puts, deletes).await;
+    }
+
+    expected.push((table_key, Some(temp.definition.clone())));
+    expected.push((owner_key, Some(temp.owner.clone())));
+    db.raw_db()
+        .commit_validated(
+            elyra_storage::Validation {
+                keys: expected,
+                ranges: Vec::new(),
+            },
+            puts,
+            deletes,
+        )
+        .await
+}
+
+async fn fill_table(
+    db: &Session,
+    temp: &OwnedTempTable,
+    schema: &Schema,
+    rows: &[Vec<Value>],
+) -> Result<()> {
     let mut puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(rows.len() + 1);
-    let mut rowid = read_rowid(db, name).await?;
+    let rowid_storage_key = rowid_key(&temp.name);
+    let expected_rowid = db.get(rowid_storage_key.clone()).await?;
+    let mut rowid = match expected_rowid.as_deref() {
+        Some(bytes) if bytes.len() == 8 => {
+            u64::from_le_bytes(bytes.try_into().expect("checked length"))
+        }
+        _ => 0,
+    };
     for r in rows {
         rowid += 1;
         let mut row = vec![Value::Null; schema.columns.len()];
@@ -13680,16 +14249,26 @@ async fn fill_table(db: &Session, name: &str, schema: &Schema, rows: &[Vec<Value
             }
         }
         let encoded = bincode::serialize(&row).map_err(|e| Error::Storage(e.to_string()))?;
-        puts.push((data_key(name, &keyenc::encode_rowid(rowid)), encoded));
+        puts.push((data_key(&temp.name, &keyenc::encode_rowid(rowid)), encoded));
     }
-    puts.push((rowid_key(name), rowid.to_le_bytes().to_vec()));
-    db.commit_write(puts, vec![]).await?;
-    Ok(())
+    puts.push((rowid_storage_key.clone(), rowid.to_le_bytes().to_vec()));
+    commit_temp_write(
+        db,
+        temp,
+        vec![(rowid_storage_key, expected_rowid)],
+        puts,
+        vec![],
+    )
+    .await
 }
 
-async fn clear_table(db: &Session, name: &str) -> Result<()> {
-    let prefix = data_prefix(name);
-    let mut deletes = vec![rowid_key(name)];
+async fn clear_table(db: &Session, temp: &OwnedTempTable) -> Result<()> {
+    let prefix = data_prefix(&temp.name);
+    let rowid_storage_key = rowid_key(&temp.name);
+    // Read the row counter before the range. Every normal insert advances it,
+    // so validating this value catches rows added during the subsequent scan.
+    let expected_rowid = db.get(rowid_storage_key.clone()).await?;
+    let mut deletes = vec![rowid_storage_key.clone()];
     let mut cursor: Option<Vec<u8>> = None;
     loop {
         let batch = db.scan_batch(prefix.clone(), cursor.clone(), 4096).await?;
@@ -13703,8 +14282,14 @@ async fn clear_table(db: &Session, name: &str) -> Result<()> {
             break;
         }
     }
-    db.commit_write(vec![], deletes).await?;
-    Ok(())
+    commit_temp_write(
+        db,
+        temp,
+        vec![(rowid_storage_key, expected_rowid)],
+        vec![],
+        deletes,
+    )
+    .await
 }
 
 /// True if a projection contains any subquery (scalar/IN/EXISTS).
@@ -16989,8 +17574,21 @@ pub async fn drop_table(db: &Session, name: &str, if_exists: bool) -> Result<Que
         return Err(Error::Catalog(format!("no such table: {name}")));
     }
 
+    let deletes = table_delete_keys(db, name).await?;
+    db.commit_write(vec![], deletes).await?;
+    Ok(QueryResult::Affected(0))
+}
+
+/// Collect every key owned by a table. Keeping this shared with temporary CTE
+/// cleanup ensures ordinary DROP also clears any internal ownership marker.
+async fn table_delete_keys(db: &Session, name: &str) -> Result<Vec<Vec<u8>>> {
     // Collect the table's data and index keys in batches.
-    let mut deletes = vec![catalog_key(name), rowid_key(name), autoinc_key(name)];
+    let mut deletes = vec![
+        catalog_key(name),
+        rowid_key(name),
+        autoinc_key(name),
+        temp_owner_key(name),
+    ];
     for prefix in [
         data_prefix(name),
         index_table_prefix(name),
@@ -17010,8 +17608,7 @@ pub async fn drop_table(db: &Session, name: &str, if_exists: bool) -> Result<Que
             }
         }
     }
-    db.commit_write(vec![], deletes).await?;
-    Ok(QueryResult::Affected(0))
+    Ok(deletes)
 }
 
 async fn read_rowid(db: &Session, table: &str) -> Result<u64> {
@@ -17280,7 +17877,7 @@ fn parse_vector(s: &str, dim: u32) -> Result<Vec<f32>> {
 #[cfg(test)]
 mod cte_rewrite_tests {
     use crate::{Engine, QueryResult, Session};
-    use elyra_core::{Error, Privilege, Value};
+    use elyra_core::{ColumnDef, ColumnType, Error, Privilege, Schema, Value};
     use elyra_storage::Db;
 
     const EXPANSION_LIMIT_CHILD: &str = "ELYRASQL_CTE_EXPANSION_LIMIT_CHILD";
@@ -17560,6 +18157,7 @@ mod cte_rewrite_tests {
                 vec![Value::Int(3)]
             ]
         );
+
         assert_eq!(
             rows(
                 &engine,
@@ -17603,6 +18201,11 @@ mod cte_rewrite_tests {
                  SELECT left_seq.n + 1 FROM seq AS left_seq JOIN seq AS right_seq \
                  ON left_seq.n = right_seq.n WHERE left_seq.n < 3\
              ) SELECT n FROM seq",
+            "WITH RECURSIVE seq(n) AS (\
+                 SELECT 1 UNION ALL \
+                 SELECT COALESCE(seq.n, 2) FROM (SELECT 1 AS x) AS seed \
+                 LEFT JOIN seq ON seq.n < 0\
+             ) SELECT n FROM seq",
         ] {
             let Err(error) = engine.execute(sql, Privilege::Admin, &session).await else {
                 panic!("invalid recursive table placement unexpectedly succeeded")
@@ -17612,6 +18215,139 @@ mod cte_rewrite_tests {
                 "unexpected error for `{sql}`: {error}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn null_rejecting_where_allows_recursive_ref_on_outer_join_nullable_side() {
+        let (engine, session) = engine_and_session();
+
+        for recursive_value in ["c.n", "n", "ABS(c.n)"] {
+            let sql = format!(
+                "WITH RECURSIVE c(n) AS (\
+                     SELECT 1 UNION ALL \
+                     SELECT c.n + 1 FROM (SELECT 1 AS d) seed \
+                     LEFT JOIN c ON TRUE WHERE {recursive_value} < 3\
+                 ) SELECT n FROM c ORDER BY n"
+            );
+            assert_eq!(
+                rows(&engine, &session, &sql).await,
+                vec![
+                    vec![Value::Int(1)],
+                    vec![Value::Int(2)],
+                    vec![Value::Int(3)]
+                ],
+                "{sql}"
+            );
+        }
+        for predicate in ["c.n < 3 OR FALSE", "NOT (c.n IS NULL OR c.n >= 3)"] {
+            let sql = format!(
+                "WITH RECURSIVE c(n) AS (\
+                     SELECT 1 UNION ALL \
+                     SELECT c.n + 1 FROM (SELECT 1 AS d) seed \
+                     LEFT JOIN c ON TRUE WHERE {predicate}\
+                 ) SELECT n FROM c ORDER BY n"
+            );
+            assert_eq!(
+                rows(&engine, &session, &sql).await,
+                vec![
+                    vec![Value::Int(1)],
+                    vec![Value::Int(2)],
+                    vec![Value::Int(3)]
+                ],
+                "{sql}"
+            );
+        }
+        for (anchor, predicate) in [(0, "c.n"), (1, "NOT c.n"), (0, "c.n IS TRUE")] {
+            let sql = format!(
+                "WITH RECURSIVE c(n) AS (\
+                     SELECT {anchor} UNION ALL \
+                     SELECT c.n + 1 FROM (SELECT 1 AS d) seed \
+                     LEFT JOIN c ON TRUE WHERE {predicate}\
+                 ) SELECT n FROM c"
+            );
+            assert_eq!(
+                rows(&engine, &session, &sql).await,
+                vec![vec![Value::Int(anchor)]],
+                "{sql}"
+            );
+        }
+        assert_eq!(
+            rows(
+                &engine,
+                &session,
+                "WITH RECURSIVE c AS (\
+                     SELECT 1 AS n UNION ALL \
+                     SELECT c.n + 1 FROM (SELECT 1 AS d) seed \
+                     LEFT JOIN c ON TRUE WHERE n < 3\
+                 ) SELECT n FROM c ORDER BY n",
+            )
+            .await,
+            vec![
+                vec![Value::Int(1)],
+                vec![Value::Int(2)],
+                vec![Value::Int(3)]
+            ]
+        );
+
+        engine
+            .execute(
+                "CREATE TABLE cte_wildcard_anchor (n INT)",
+                Privilege::Admin,
+                &session,
+            )
+            .await
+            .unwrap();
+        engine
+            .execute(
+                "INSERT INTO cte_wildcard_anchor VALUES (1)",
+                Privilege::Admin,
+                &session,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rows(
+                &engine,
+                &session,
+                "WITH RECURSIVE c AS (\
+                     SELECT * FROM cte_wildcard_anchor UNION ALL \
+                     SELECT c.n + 1 FROM (SELECT 1 AS d) seed \
+                     LEFT JOIN c ON TRUE WHERE n < 3\
+                 ) SELECT n FROM c ORDER BY n",
+            )
+            .await,
+            vec![
+                vec![Value::Int(1)],
+                vec![Value::Int(2)],
+                vec![Value::Int(3)]
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn unused_recursive_ctes_are_not_materialized_or_validated() {
+        let (engine, session) = engine_and_session();
+
+        assert_eq!(
+            rows(
+                &engine,
+                &session,
+                "WITH RECURSIVE unused(x, y) AS (SELECT 1) SELECT 42",
+            )
+            .await,
+            vec![vec![Value::Int(42)]]
+        );
+        assert!(
+            engine
+                .execute(
+                    "WITH RECURSIVE used(x, y) AS (SELECT 1) SELECT * FROM used",
+                    Privilege::Admin,
+                    &session,
+                )
+                .await
+                .is_err(),
+            "a referenced CTE must still validate its declared width"
+        );
     }
 
     #[tokio::test]
@@ -17732,8 +18468,99 @@ mod cte_rewrite_tests {
     }
 
     #[tokio::test]
+    async fn earlier_recursive_cte_resolves_later_name_as_physical_table() {
+        let (engine, session) = engine_and_session();
+        engine
+            .execute("CREATE TABLE later (n INT)", Privilege::Admin, &session)
+            .await
+            .unwrap();
+        engine
+            .execute("INSERT INTO later VALUES (5)", Privilege::Admin, &session)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            rows(
+                &engine,
+                &session,
+                "WITH RECURSIVE early AS (SELECT n FROM later), \
+                                later(x, y) AS (SELECT 1) \
+                 SELECT n FROM early",
+            )
+            .await,
+            vec![vec![Value::Int(5)]]
+        );
+    }
+
+    #[tokio::test]
+    async fn temp_cleanup_does_not_drop_a_replacement_table() {
+        let (engine, session) = engine_and_session();
+        let schema = Schema::new(vec![ColumnDef::new("n", ColumnType::Int, true)]);
+        let owned = super::create_temp_table(&session, "owner_race", &schema)
+            .await
+            .unwrap();
+
+        engine
+            .execute(
+                &format!("DROP TABLE {}", owned.name),
+                Privilege::Admin,
+                &session,
+            )
+            .await
+            .unwrap();
+        engine
+            .execute(
+                &format!("CREATE TABLE {} (n INT)", owned.name),
+                Privilege::Admin,
+                &session,
+            )
+            .await
+            .unwrap();
+        engine
+            .execute(
+                &format!("INSERT INTO {} VALUES (99)", owned.name),
+                Privilege::Admin,
+                &session,
+            )
+            .await
+            .unwrap();
+
+        let replacement_write =
+            super::fill_table(&session, &owned, &schema, &[vec![Value::Int(7)]]).await;
+        assert!(
+            matches!(replacement_write, Err(Error::Conflict(_))),
+            "materialization must stop when the temporary relation was replaced"
+        );
+        super::drop_temp_table(&session, &owned).await.unwrap();
+        assert_eq!(
+            rows(&engine, &session, &format!("SELECT n FROM {}", owned.name),).await,
+            vec![vec![Value::Int(99)]]
+        );
+    }
+
+    #[tokio::test]
     async fn failed_recursive_cte_materialization_cleans_up_internal_tables() {
         let (engine, session) = engine_and_session();
+        let counter = 8_000_000_000_000_000_000_u64;
+        let sentinel = super::temp_name(counter, "cleanup_seq");
+        super::TEMP_COUNTER.store(counter, std::sync::atomic::Ordering::SeqCst);
+        engine
+            .execute(
+                &format!("CREATE TABLE {sentinel} (n INT)"),
+                Privilege::Admin,
+                &session,
+            )
+            .await
+            .unwrap();
+        engine
+            .execute(
+                &format!("INSERT INTO {sentinel} VALUES (99)"),
+                Privilege::Admin,
+                &session,
+            )
+            .await
+            .unwrap();
+
         let result = engine
             .execute(
                 "WITH RECURSIVE cleanup_seq(n) AS (\
@@ -17746,14 +18573,30 @@ mod cte_rewrite_tests {
             .await;
         assert!(result.is_err());
 
+        assert_eq!(
+            rows(&engine, &session, &format!("SELECT n FROM {sentinel}"),).await,
+            vec![vec![Value::Int(99)]],
+            "recursive cleanup must not remove a pre-existing user relation"
+        );
+
         let internal_catalog_rows = session
             .scan_batch(b"catalog::__cte_".to_vec(), None, 128)
             .await
             .unwrap();
         assert!(
-            internal_catalog_rows.is_empty(),
+            internal_catalog_rows
+                .iter()
+                .all(|(key, _)| { key == &super::catalog_key(&sentinel) }),
             "failed recursive CTE leaked internal catalog rows"
         );
+        engine
+            .execute(
+                &format!("DROP TABLE {sentinel}"),
+                Privilege::Admin,
+                &session,
+            )
+            .await
+            .unwrap();
         assert_eq!(
             rows(
                 &engine,
