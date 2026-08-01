@@ -597,7 +597,7 @@ pub fn build_plan(
                     name: alias.unwrap_or_else(|| column_name(&schema.columns[idx]).to_owned()),
                     ty: schema.columns[idx].ty.clone(),
                     nullable: schema.columns[idx].nullable,
-                    collation: ci,
+                    collation: schema.columns[idx].collation,
                     qualifier: schema.columns[idx].qualifier.clone(),
                 });
                 plan.push(OutCol::Column(idx));

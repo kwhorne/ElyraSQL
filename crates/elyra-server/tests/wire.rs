@@ -2076,6 +2076,52 @@ async fn using_join_fast_paths_validate_bare_on_references_for_ambiguity() {
         .await
         .unwrap();
     assert_eq!(rows, [("same".into(), "same".into())]);
+
+    c.query_drop(
+        "CREATE TABLE on_using_indexed (
+             label VARCHAR(8) PRIMARY KEY,
+             payload VARCHAR(8)
+         )",
+    )
+    .await
+    .unwrap();
+    c.query_drop("INSERT INTO on_using_indexed VALUES ('same','indexed')")
+        .await
+        .unwrap();
+    let error = c
+        .query_drop(
+            "SELECT *
+             FROM on_using_a AS a
+             NATURAL JOIN on_using_b AS b
+             JOIN on_using_indexed AS i ON label = i.label",
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().to_ascii_lowercase().contains("ambiguous"),
+        "indexed NLJ must reject the same ambiguous ON reference: {error:?}"
+    );
+    let rows: Vec<(String, String)> = c
+        .query(
+            "SELECT a.label, i.payload
+             FROM on_using_a AS a
+             NATURAL JOIN on_using_b AS b
+             JOIN on_using_indexed AS i ON a.label = i.label",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows, [("same".into(), "indexed".into())]);
+
+    let count: i64 = c
+        .query_first(
+            "SELECT COUNT(*)
+             FROM on_using_a AS a
+             JOIN on_using_indexed AS i ON CURRENT_DATE IS NOT NULL",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(count, 1);
 }
 
 #[tokio::test]
@@ -2127,6 +2173,80 @@ async fn natural_join_bare_coalesced_key_correlates_as_one_outer_column() {
              FROM corr_natural_l AS l
              NATURAL JOIN corr_natural_r AS r
              JOIN corr_natural_c AS c ON l.id = c.id",
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().to_ascii_lowercase().contains("ambiguous"),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
+async fn natural_join_bare_coalesced_key_correlates_in_filters() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop("CREATE TABLE corr_filter_l (id INT PRIMARY KEY, label VARCHAR(8))")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE corr_filter_r (id INT PRIMARY KEY, label VARCHAR(8))")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO corr_filter_l VALUES (1,'same'),(2,'other')")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO corr_filter_r VALUES (1,'same'),(2,'other')")
+        .await
+        .unwrap();
+
+    for sql in [
+        "SELECT id FROM corr_filter_l AS l NATURAL JOIN corr_filter_r AS r
+         WHERE (SELECT label) = 'same'",
+        "SELECT id FROM corr_filter_l AS l NATURAL JOIN corr_filter_r AS r
+         WHERE EXISTS (SELECT 1 WHERE label = 'same')",
+        "SELECT id FROM corr_filter_l AS l NATURAL JOIN corr_filter_r AS r
+         WHERE 1 IN (SELECT 1 WHERE label = 'same')",
+    ] {
+        let rows: Vec<i64> = c
+            .query(sql)
+            .await
+            .unwrap_or_else(|error| panic!("{sql}: {error:?}"));
+        assert_eq!(rows, [1], "{sql}");
+    }
+
+    c.query_drop("CREATE TABLE corr_filter_local (marker INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO corr_filter_local VALUES (1)")
+        .await
+        .unwrap();
+    let rows: Vec<i64> = c
+        .query(
+            "SELECT id
+             FROM corr_filter_l AS l NATURAL JOIN corr_filter_r AS r
+             WHERE EXISTS (
+                 SELECT 1 FROM corr_filter_local WHERE marker = 1
+             )
+             ORDER BY id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows, [1, 2]);
+
+    c.query_drop("CREATE TABLE corr_filter_c (id INT PRIMARY KEY, label VARCHAR(8))")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO corr_filter_c VALUES (1,'same')")
+        .await
+        .unwrap();
+    let error = c
+        .query_drop(
+            "SELECT *
+             FROM corr_filter_l AS l
+             NATURAL JOIN corr_filter_r AS r
+             JOIN corr_filter_c AS c ON l.id = c.id
+             WHERE EXISTS (SELECT 1 WHERE label = 'same')",
         )
         .await
         .unwrap_err();
@@ -2246,6 +2366,17 @@ async fn multi_key_using_preserves_sql_coercion_and_collation_semantics() {
     assert_eq!(columns[1].table_str(), "");
     let rows: Vec<(String, i64)> = result.collect().await.unwrap();
     assert_eq!(rows, [("X".into(), 2), ("x".into(), 1)]);
+
+    let rows: Vec<String> = c
+        .query(
+            "SELECT DISTINCT label
+             FROM coll_l AS l RIGHT JOIN coll_r AS r USING(grp, label)
+             GROUP BY label
+             ORDER BY label DESC",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows, ["x", "X"]);
 }
 
 #[tokio::test]

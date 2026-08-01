@@ -4225,9 +4225,33 @@ async fn select_inner(
         // A subquery that references one of the join's tables is correlated;
         // evaluate it per joined row.
         let quals = join_qualifiers(db, &select.from);
-        let correlated = raw_filter
+        let qualified_filter_correlated = raw_filter
             .as_ref()
-            .is_some_and(|f| filter_correlated_any(f, &quals))
+            .is_some_and(|filter| filter_correlated_any(filter, &quals));
+        let mut resolved_bare_filter = None;
+        let potential_bare_filter = raw_filter
+            .as_ref()
+            .filter(|filter| {
+                !qualified_filter_correlated && expr_has_potential_bare_correlation(filter)
+            })
+            .cloned();
+        let bare_filter_correlated = if let Some(filter) = potential_bare_filter {
+            match resolve_subqueries(db, vindex, filter).await {
+                Ok(resolved) => {
+                    // The bare names belonged to the subquery's local scope.
+                    // Preserve the one-time resolution rather than executing it
+                    // again for every joined row.
+                    resolved_bare_filter = Some(resolved);
+                    false
+                }
+                Err(error) if bare_unknown_column(&error).is_some() => true,
+                Err(error) => return Err(error),
+            }
+        } else {
+            false
+        };
+        let correlated = qualified_filter_correlated
+            || bare_filter_correlated
             || projection_correlated_any(&select.projection, &quals)
             // A bare name inside a subquery can correlate only after the joined
             // logical schema exists. This matters for a coalesced USING/NATURAL
@@ -4253,7 +4277,10 @@ async fn select_inner(
             .await;
         }
         let filter = match raw_filter {
-            Some(f) => Some(resolve_subqueries(db, vindex, f).await?),
+            Some(filter) => match resolved_bare_filter {
+                Some(resolved) => Some(resolved),
+                None => Some(resolve_subqueries(db, vindex, filter).await?),
+            },
             None => None,
         };
         // Streaming index nested-loop fast path for
@@ -7774,6 +7801,12 @@ async fn build_from(
             let nlj = if stored_table_factor(&join.relation) {
                 let (pdef, pcols) = resolve_table(db, &join.relation).await?;
                 let partner_schema = Schema::new(pcols.clone());
+                if let Some(expression) = on.as_ref() {
+                    validate_join_on_refs(
+                        expression,
+                        &combined_join_schema(&driving_schema, &partner_schema),
+                    )?;
+                }
                 on.as_ref()
                     .filter(|_| matches!(kind, JoinKind::Inner | JoinKind::Left))
                     .and_then(|e| equi_nlj(e, &driving_schema, &partner_schema))
@@ -8834,32 +8867,7 @@ fn combine(
     condition: Option<JoinCondition<'_>>,
     cancel: &std::sync::Arc<elyra_core::cancel::QueryCancel>,
 ) -> Result<(Schema, Vec<Vec<Value>>)> {
-    let mut cols = lschema.columns.clone();
-    cols.extend_from_slice(&rschema.columns);
-    let tables = (0..lschema.columns.len())
-        .map(|index| {
-            schema_column_table(lschema, index)
-                .unwrap_or_default()
-                .to_owned()
-        })
-        .chain((0..rschema.columns.len()).map(|index| {
-            schema_column_table(rschema, index)
-                .unwrap_or_default()
-                .to_owned()
-        }))
-        .collect();
-    let mut schema = Schema::with_tables(cols, tables);
-    for index in 0..lschema.columns.len() {
-        if lschema.is_hidden_from_unqualified(index) {
-            schema.hide_from_unqualified(index);
-        }
-    }
-    let left_len = lschema.columns.len();
-    for index in 0..rschema.columns.len() {
-        if rschema.is_hidden_from_unqualified(index) {
-            schema.hide_from_unqualified(left_len + index);
-        }
-    }
+    let schema = combined_join_schema(lschema, rschema);
 
     // Validate analyzable ON references against the actual combined schema
     // before a hash/merge optimization splits the expression back into its two
@@ -8966,6 +8974,38 @@ fn combine(
         }
     }
     Ok((schema, out))
+}
+
+/// Physical joined schema with lookup visibility and result metadata preserved.
+fn combined_join_schema(lschema: &Schema, rschema: &Schema) -> Schema {
+    let mut cols = lschema.columns.clone();
+    cols.extend_from_slice(&rschema.columns);
+    let tables = (0..lschema.columns.len())
+        .map(|index| {
+            schema_column_table(lschema, index)
+                .unwrap_or_default()
+                .to_owned()
+        })
+        .chain((0..rschema.columns.len()).map(|index| {
+            schema_column_table(rschema, index)
+                .unwrap_or_default()
+                .to_owned()
+        }))
+        .collect();
+    let mut schema = Schema::with_tables(cols, tables);
+    for index in 0..lschema.columns.len() {
+        if lschema.is_hidden_from_unqualified(index) {
+            schema.hide_from_unqualified(index);
+        }
+    }
+    let left_len = lschema.columns.len();
+    for index in 0..rschema.columns.len() {
+        if rschema.is_hidden_from_unqualified(index) {
+            schema.hide_from_unqualified(left_len + index);
+        }
+    }
+
+    schema
 }
 
 fn resolved_key_pairs_match(
@@ -9385,15 +9425,10 @@ fn validate_join_on_refs(expr: &Expr, schema: &Schema) -> Result<()> {
         return Ok(());
     }
     for reference in references {
-        match reference {
-            Expr::Identifier(identifier) => {
-                predicate::resolve_index_parts(std::slice::from_ref(identifier), schema)?;
-            }
-            Expr::CompoundIdentifier(parts) => {
-                predicate::resolve_index_parts(parts, schema)?;
-            }
-            _ => unreachable!("collect_refs only records column references"),
-        }
+        // Use the expression evaluator's exact identifier rules so niladic
+        // functions and system variables remain valid while unknown or
+        // ambiguous columns still fail before an optimized join path.
+        predicate::eval_row(reference, schema, &[])?;
     }
     Ok(())
 }
@@ -13215,45 +13250,48 @@ fn projection_has_subquery(projection: &[sqlparser::ast::SelectItem]) -> bool {
 /// the joined outer schema. Qualified correlation is detected separately; this
 /// covers logical USING/NATURAL keys while avoiding the per-row path for
 /// obviously uncorrelated forms such as `(SELECT 1)`.
+fn query_has_bare_identifier(query: &SqlQuery) -> bool {
+    let found = std::cell::Cell::new(false);
+    let _ = rewrite_query(query, &|candidate| {
+        if let Expr::Identifier(identifier) = candidate {
+            if !identifier.value.starts_with("@@") {
+                found.set(true);
+            }
+        }
+        None
+    });
+    found.get()
+}
+
+fn expr_has_potential_bare_correlation(expr: &Expr) -> bool {
+    let found = std::cell::Cell::new(false);
+    let _ = map_expr(expr, &|candidate| match candidate {
+        Expr::Subquery(query)
+        | Expr::InSubquery {
+            subquery: query, ..
+        }
+        | Expr::Exists {
+            subquery: query, ..
+        } => {
+            if query_has_bare_identifier(query) {
+                found.set(true);
+            }
+            // The nested query was inspected recursively above.
+            Some(candidate.clone())
+        }
+        _ => None,
+    });
+    found.get()
+}
+
 fn projection_has_potential_bare_correlation(projection: &[sqlparser::ast::SelectItem]) -> bool {
     use sqlparser::ast::SelectItem;
 
-    fn query_has_bare_identifier(query: &SqlQuery) -> bool {
-        let found = std::cell::Cell::new(false);
-        let _ = rewrite_query(query, &|candidate| {
-            if let Expr::Identifier(identifier) = candidate {
-                if !identifier.value.starts_with("@@") {
-                    found.set(true);
-                }
-            }
-            None
-        });
-        found.get()
-    }
-
-    projection.iter().any(|item| {
-        let expr = match item {
-            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => expr,
-            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => return false,
-        };
-        let found = std::cell::Cell::new(false);
-        let _ = map_expr(expr, &|candidate| match candidate {
-            Expr::Subquery(query)
-            | Expr::InSubquery {
-                subquery: query, ..
-            }
-            | Expr::Exists {
-                subquery: query, ..
-            } => {
-                if query_has_bare_identifier(query) {
-                    found.set(true);
-                }
-                // The nested query was inspected recursively above.
-                Some(candidate.clone())
-            }
-            _ => None,
-        });
-        found.get()
+    projection.iter().any(|item| match item {
+        SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+            expr_has_potential_bare_correlation(expr)
+        }
+        SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => false,
     })
 }
 
