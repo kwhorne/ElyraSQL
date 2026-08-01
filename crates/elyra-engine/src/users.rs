@@ -13,6 +13,7 @@ use elyra_core::users::{
 };
 use elyra_core::{Error, Privilege, Result, Schema, Value};
 
+use crate::predicate;
 use crate::session::Session;
 use crate::stream::RowStream;
 use crate::QueryResult;
@@ -601,12 +602,22 @@ async fn grant_revoke(toks: &[Tok], sess: &Session, grant: bool) -> Result<Query
             // Per-column grant: SELECT(col, ...) ON table.
             let mut puts = Vec::new();
             let mut dels = Vec::new();
+            let stored_columns = if grant {
+                Vec::new()
+            } else {
+                column_grants(sess, &name, table).await?.unwrap_or_default()
+            };
             for col in &cols {
-                let key = elyra_core::users::col_grant_key(&name, table, col);
                 if grant {
+                    let key = elyra_core::users::col_grant_key(&name, table, col);
                     puts.push((key, encode_privilege(Privilege::Read)));
                 } else {
-                    dels.push(key);
+                    dels.extend(
+                        stored_columns
+                            .iter()
+                            .filter(|stored| predicate::identifier_eq(stored, col))
+                            .map(|stored| elyra_core::users::col_grant_key(&name, table, stored)),
+                    );
                 }
             }
             sess.commit_write(puts, dels).await?;

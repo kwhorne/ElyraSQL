@@ -16,6 +16,8 @@ use std::collections::HashSet;
 use elyra_core::{canonical_f64_bits, ColumnType, Schema, Value};
 use sqlparser::ast::{BinaryOperator, Expr, Value as SqlValue};
 
+use crate::predicate;
+
 #[derive(Clone, Copy)]
 enum Op {
     Eq,
@@ -268,7 +270,7 @@ fn numeric_col(e: &Expr, schema: &Schema) -> Option<usize> {
     let i = schema
         .columns
         .iter()
-        .position(|c| c.name.eq_ignore_ascii_case(&name))?;
+        .position(|c| predicate::identifier_eq(&c.name, &name))?;
     match schema.columns[i].ty {
         ColumnType::Int | ColumnType::Float => Some(i),
         _ => None,

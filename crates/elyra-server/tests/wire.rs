@@ -1459,6 +1459,311 @@ async fn qualified_wildcard() {
 }
 
 #[tokio::test]
+async fn relation_qualifiers_follow_mysql_case_rules() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop("CREATE TABLE qualifier_case_a (id INT PRIMARY KEY, value INT)")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE qualifier_case_b (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO qualifier_case_a VALUES (1, 10)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO qualifier_case_b VALUES (1)")
+        .await
+        .unwrap();
+
+    let value: i64 = c
+        .query_first("SELECT a.id FROM qualifier_case_a AS a")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(value, 1);
+    let wrong_case = c
+        .query_drop("SELECT A.id FROM qualifier_case_a AS a")
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        wrong_case,
+        mysql_async::Error::Server(ref error)
+            if error.code == 1054 && error.state == "42S22"
+    ));
+    assert!(c
+        .query_drop("SELECT ELYRA.qualifier_case_a.id FROM elyra.qualifier_case_a")
+        .await
+        .is_err());
+    for invalid in [
+        "SELECT garbage.a.id FROM qualifier_case_a AS a",
+        "SELECT qualifier_case_a.id FROM qualifier_case_a AS a",
+        "SELECT wrong.qualifier_case_a.id FROM qualifier_case_a",
+        "SELECT extra.elyra.qualifier_case_a.id FROM qualifier_case_a",
+        "SELECT a.id FROM qualifier_case_a AS a
+         WHERE EXISTS (
+             SELECT 1 FROM qualifier_case_b AS b
+             WHERE A.id = b.id
+         )",
+    ] {
+        assert!(
+            c.query_drop(invalid).await.is_err(),
+            "query succeeded: {invalid}"
+        );
+    }
+
+    let joined: Vec<(i64, i64)> = c
+        .query(
+            "SELECT Dup.id, dUP.id
+             FROM qualifier_case_a AS Dup
+             JOIN qualifier_case_b AS dUP ON Dup.id = dUP.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(joined, [(1, 1)]);
+
+    assert!(c
+        .query_drop("UPDATE qualifier_case_a AS a SET A.value = 11 WHERE A.id = 1")
+        .await
+        .is_err());
+    let unchanged: i64 = c
+        .query_first("SELECT value FROM qualifier_case_a WHERE id = 1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(unchanged, 10);
+
+    let derived: i64 = c
+        .query_first(
+            "SELECT arbitrary.d.id
+             FROM (SELECT id FROM qualifier_case_a) AS d",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(derived, 1);
+    assert!(c
+        .query_drop(
+            "SELECT arbitrary.d.*
+             FROM (SELECT id FROM qualifier_case_a) AS d",
+        )
+        .await
+        .is_err());
+
+    let cte: i64 = c
+        .query_first(
+            "WITH case_cte AS (SELECT id FROM qualifier_case_a)
+             SELECT elyra.case_cte.id FROM case_cte",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(cte, 1);
+    assert!(c
+        .query_drop(
+            "WITH case_cte AS (SELECT id FROM qualifier_case_a)
+             SELECT elyra.case_cte.* FROM case_cte",
+        )
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn column_identifiers_remain_case_insensitive() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop("CREATE TABLE column_case (`MixedCase` INT, `Ünicode` INT, `ẞ` INT)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO column_case VALUES (7, 13, 19)")
+        .await
+        .unwrap();
+
+    let row: (i64, i64, i64) = c
+        .query_first("SELECT mixedcase, `ünicode`, `ẞ` FROM column_case")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row, (7, 13, 19));
+    assert!(c.query_drop("SELECT `ß` FROM column_case").await.is_err());
+
+    c.query_drop(
+        "CREATE TABLE unicode_alias_case (
+            id INT PRIMARY KEY,
+            `Ünicode` INT,
+            plain INT
+        )",
+    )
+    .await
+    .unwrap();
+    c.query_drop(
+        "INSERT INTO unicode_alias_case VALUES
+         (1, 1, 30), (2, 1, 21), (3, 2, 10), (4, 3, 1)",
+    )
+    .await
+    .unwrap();
+
+    let ordered_alias: Vec<i64> = c
+        .query("SELECT -id AS `İ` FROM unicode_alias_case ORDER BY i")
+        .await
+        .unwrap();
+    assert_eq!(ordered_alias, [-4, -3, -2, -1]);
+
+    let grouped_alias: Vec<(i64, i64)> = c
+        .query(
+            "SELECT plain % 2 AS `İ`, COUNT(*)
+             FROM unicode_alias_case GROUP BY i ORDER BY i",
+        )
+        .await
+        .unwrap();
+    assert_eq!(grouped_alias, [(0, 2), (1, 2)]);
+
+    let ordered_output: Vec<i64> = c
+        .query(
+            "SELECT plain AS `ünicode`
+             FROM unicode_alias_case ORDER BY `ünicode`, id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(ordered_output, [1, 10, 21, 30]);
+}
+
+#[tokio::test]
+async fn unicode_column_identifiers_match_across_writes_indexes_and_joins() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop("CREATE TABLE unicode_dml (id INT PRIMARY KEY, `Ünicode` INT)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO unicode_dml (id, `ünicode`) VALUES (1, 10)")
+        .await
+        .unwrap();
+    c.query_drop("UPDATE unicode_dml SET `ünicode` = 11 WHERE id = 1")
+        .await
+        .unwrap();
+    let invalid_target = c
+        .query_drop("UPDATE unicode_dml AS a SET b.`Ünicode` = 13 WHERE a.id = 1")
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        invalid_target,
+        mysql_async::Error::Server(ref error) if error.code == 1054
+    ));
+    let invalid_long_target = c
+        .query_drop(
+            "UPDATE unicode_dml AS a
+             SET extra.unicode_dml.a.`Ünicode` = 13 WHERE a.id = 1",
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        invalid_long_target,
+        mysql_async::Error::Server(ref error) if error.code == 1064
+    ));
+    let invalid_upsert_target = c
+        .query_drop(
+            "INSERT INTO unicode_dml VALUES (1, 13)
+             ON DUPLICATE KEY UPDATE b.`Ünicode` = 13",
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        invalid_upsert_target,
+        mysql_async::Error::Server(ref error) if error.code == 1054
+    ));
+
+    c.query_drop("CREATE INDEX unicode_idx ON unicode_dml (`ünicode`)")
+        .await
+        .unwrap();
+    let value: i64 = c
+        .query_first("SELECT `Ünicode` FROM unicode_dml WHERE `ünicode` = 11")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(value, 11);
+    let filtered_sum: i64 = c
+        .query_first("SELECT SUM(id) FROM unicode_dml WHERE `ünicode` = 11")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(filtered_sum, 1);
+
+    c.query_drop("CREATE TABLE unicode_join_left (`Ünicode` INT, left_value INT)")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE unicode_join_right (`ünicode` INT, right_value INT)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO unicode_join_left VALUES (7, 70)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO unicode_join_right VALUES (7, 700)")
+        .await
+        .unwrap();
+
+    let using_row: (i64, i64) = c
+        .query_first(
+            "SELECT l.left_value, r.right_value
+             FROM unicode_join_left AS l
+             JOIN unicode_join_right AS r USING (`ünicode`)",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(using_row, (70, 700));
+
+    let mut natural = c
+        .query_iter("SELECT * FROM unicode_join_left NATURAL JOIN unicode_join_right")
+        .await
+        .unwrap();
+    let names = natural
+        .columns_ref()
+        .iter()
+        .map(|column| column.name_str().into_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["Ünicode", "left_value", "right_value"]);
+    let rows: Vec<(i64, i64, i64)> = natural.collect().await.unwrap();
+    assert_eq!(rows, [(7, 70, 700)]);
+}
+
+#[tokio::test]
+async fn unicode_column_grants_follow_identifier_case_rules() {
+    let srv = TestServer::start_with_auth("root", "rootpw").await;
+    let mut root = srv.conn_as("root", "rootpw").await;
+
+    root.query_drop("CREATE TABLE unicode_grants (id INT PRIMARY KEY, `Ünicode` INT)")
+        .await
+        .unwrap();
+    root.query_drop("INSERT INTO unicode_grants VALUES (1, 10)")
+        .await
+        .unwrap();
+    root.query_drop("CREATE USER 'unicode_reader' IDENTIFIED BY 'passw0rd'")
+        .await
+        .unwrap();
+    root.query_drop("GRANT SELECT (id, `Ünicode`) ON unicode_grants TO 'unicode_reader'")
+        .await
+        .unwrap();
+
+    let mut reader = srv.conn_as("unicode_reader", "passw0rd").await;
+    let value: i64 = reader
+        .query_first("SELECT `ünicode` FROM unicode_grants")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(value, 10);
+
+    root.query_drop("REVOKE SELECT (`ünicode`) ON unicode_grants FROM 'unicode_reader'")
+        .await
+        .unwrap();
+    assert!(reader
+        .query_drop("SELECT `Ünicode` FROM unicode_grants")
+        .await
+        .is_err());
+}
+
+#[tokio::test]
 async fn using_join_coalesces_keys_and_keeps_qualified_access() {
     let srv = TestServer::start().await;
     let mut c = srv.conn().await;
@@ -5281,7 +5586,7 @@ async fn duplicate_mutation_aliases_are_rejected_before_writes() {
 }
 
 #[tokio::test]
-async fn mutation_target_mapping_is_case_insensitive_and_structured() {
+async fn mutation_target_mapping_preserves_structured_aliases() {
     let srv = TestServer::start().await;
     let mut c = srv.conn().await;
     c.query_drop("CREATE TABLE case_target (id INT PRIMARY KEY, value INT)")
@@ -5717,12 +6022,9 @@ async fn duplicate_select_aliases_are_rejected() {
         .await
         .unwrap();
 
-    for sql in [
-        "SELECT * FROM select_alias_a AS dup
-         JOIN select_alias_b AS dup ON 1 = 1",
-        "SELECT * FROM select_alias_a AS Dup
-         JOIN select_alias_b AS dUP ON 1 = 1",
-    ] {
+    for sql in ["SELECT * FROM select_alias_a AS dup
+         JOIN select_alias_b AS dup ON 1 = 1"]
+    {
         let error = c.query_drop(sql).await.unwrap_err();
         assert!(
             matches!(error, mysql_async::Error::Server(_)),
