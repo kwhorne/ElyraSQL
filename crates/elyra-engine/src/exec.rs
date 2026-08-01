@@ -12131,6 +12131,21 @@ impl CteExpansionCost {
         self.nodes = nodes;
         Ok(())
     }
+
+    fn merge(&mut self, nested: Self) -> Result<()> {
+        let nodes = self
+            .nodes
+            .checked_add(nested.nodes)
+            .filter(|nodes| *nodes <= MAX_CTE_EXPANSION_NODES)
+            .ok_or_else(|| {
+                Error::Parse(format!(
+                    "CTE expansion limit exceeded (node limit {MAX_CTE_EXPANSION_NODES}); simplify the query"
+                ))
+            })?;
+        self.depth = self.depth.max(nested.depth);
+        self.nodes = nodes;
+        Ok(())
+    }
 }
 
 /// Expand every non-recursive `WITH` visible from `query`, inlining CTEs as
@@ -12161,6 +12176,7 @@ fn expand_ctes_with_scope(
     let mut expander = InlineCteExpander {
         scopes: vec![parent_scope],
         cost: CteExpansionCost::default(),
+        saved_with: Vec::new(),
     };
     match query.visit(&mut expander) {
         ControlFlow::Continue(()) => Ok(expander.cost),
@@ -12171,6 +12187,7 @@ fn expand_ctes_with_scope(
 struct InlineCteExpander {
     scopes: Vec<InlineCteScope>,
     cost: CteExpansionCost,
+    saved_with: Vec<Option<sqlparser::ast::With>>,
 }
 
 impl VisitorMut for InlineCteExpander {
@@ -12178,15 +12195,23 @@ impl VisitorMut for InlineCteExpander {
 
     fn pre_visit_query(&mut self, query: &mut SqlQuery) -> ControlFlow<Self::Break> {
         let mut scope = self.scopes.last().cloned().unwrap_or_default();
-        if let Some(with) = query.with.take() {
+        let mut saved_with = None;
+        if let Some(mut with) = query.with.take() {
             if with.recursive {
                 // A nested recursive WITH is materialised when that query is
-                // executed. Its names shadow outer inline CTEs in every local
-                // body, while differently named outer CTEs remain visible.
-                for cte in &with.cte_tables {
+                // executed. Earlier names and the current self-reference are
+                // local; later names do not hide an outer binding yet.
+                for cte in &mut with.cte_tables {
                     scope = scope.shadow(cte.alias.name.value.clone());
+                    let cost = match expand_ctes_with_scope(cte.query.as_mut(), scope.clone()) {
+                        Ok(cost) => cost,
+                        Err(error) => return ControlFlow::Break(error),
+                    };
+                    if let Err(error) = self.cost.merge(cost) {
+                        return ControlFlow::Break(error);
+                    }
                 }
-                query.with = Some(with);
+                saved_with = Some(with);
             } else {
                 for cte in with.cte_tables {
                     let mut body = *cte.query;
@@ -12204,12 +12229,14 @@ impl VisitorMut for InlineCteExpander {
                 }
             }
         }
+        self.saved_with.push(saved_with);
         self.scopes.push(scope);
         ControlFlow::Continue(())
     }
 
-    fn post_visit_query(&mut self, _query: &mut SqlQuery) -> ControlFlow<Self::Break> {
+    fn post_visit_query(&mut self, query: &mut SqlQuery) -> ControlFlow<Self::Break> {
         self.scopes.pop();
+        query.with = self.saved_with.pop().flatten();
         ControlFlow::Continue(())
     }
 
@@ -13367,12 +13394,10 @@ impl VisitorMut for TempTableRewriter {
         let mut scope = self.scopes.last().cloned().unwrap_or_default();
         let mut saved_with = query.with.take();
         if let Some(with) = &mut saved_with {
-            if with.recursive {
-                for cte in &with.cte_tables {
+            for cte in &mut with.cte_tables {
+                if with.recursive {
                     scope = scope.shadow(cte.alias.name.value.clone());
                 }
-            }
-            for cte in &mut with.cte_tables {
                 let mut nested = Self {
                     scopes: vec![scope.clone()],
                     saved_with: Vec::new(),
@@ -13448,15 +13473,10 @@ impl VisitorMut for TableRefFinder<'_> {
         let mut shadowed = self.shadowed.last().copied().unwrap_or(false);
         let mut saved_with = query.with.take();
         if let Some(with) = &mut saved_with {
-            if with.recursive
-                && with
-                    .cte_tables
-                    .iter()
-                    .any(|cte| cte.alias.name.value.eq_ignore_ascii_case(self.name))
-            {
-                shadowed = true;
-            }
             for cte in &mut with.cte_tables {
+                if with.recursive && cte.alias.name.value.eq_ignore_ascii_case(self.name) {
+                    shadowed = true;
+                }
                 let mut nested = Self {
                     name: self.name,
                     shadowed: vec![shadowed],
@@ -17349,6 +17369,62 @@ mod cte_rewrite_tests {
         );
     }
 
+    #[tokio::test]
+    async fn nested_recursive_ctes_do_not_pre_shadow_an_outer_recursive_name() {
+        let (engine, session) = engine_and_session();
+
+        assert_eq!(
+            rows(
+                &engine,
+                &session,
+                "WITH RECURSIVE seq(n) AS (\
+                     SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 2\
+                 ) SELECT nested.n FROM (\
+                     WITH RECURSIVE shifted AS (SELECT n + 10 AS n FROM seq), \
+                                    seq AS (SELECT n FROM shifted) \
+                     SELECT n FROM seq\
+                 ) AS nested ORDER BY nested.n",
+            )
+            .await,
+            vec![vec![Value::Int(11)], vec![Value::Int(12)]]
+        );
+    }
+
+    #[tokio::test]
+    async fn nested_recursive_ctes_do_not_pre_shadow_an_outer_inline_name() {
+        let (engine, session) = engine_and_session();
+
+        assert_eq!(
+            rows(
+                &engine,
+                &session,
+                "WITH seq AS (SELECT 1 AS n) \
+                 SELECT nested.n FROM (\
+                     WITH RECURSIVE shifted AS (SELECT n + 10 AS n FROM seq), \
+                                    seq AS (SELECT n FROM shifted) \
+                     SELECT n FROM seq\
+                 ) AS nested ORDER BY nested.n",
+            )
+            .await,
+            vec![vec![Value::Int(11)]]
+        );
+
+        assert_eq!(
+            rows(
+                &engine,
+                &session,
+                "WITH seq AS (SELECT 100 AS n) \
+                 SELECT nested.n FROM (\
+                     WITH RECURSIVE seq(n) AS (\
+                         SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 2\
+                     ) SELECT n FROM seq\
+                 ) AS nested ORDER BY nested.n",
+            )
+            .await,
+            vec![vec![Value::Int(1)], vec![Value::Int(2)]]
+        );
+    }
+
     #[test]
     fn recursive_reference_finder_observes_declaration_point_scope() {
         let query =
@@ -17364,6 +17440,30 @@ mod cte_rewrite_tests {
         )
         .unwrap();
         assert!(!super::query_refs_table(&shadowed, "seq"));
+
+        let nested_recursive = super::parse_query(
+            "WITH RECURSIVE shifted AS (SELECT n + 10 AS n FROM seq), \
+                            seq AS (SELECT n FROM shifted) \
+             SELECT n FROM seq",
+        )
+        .unwrap();
+        assert!(super::query_refs_table(&nested_recursive, "seq"));
+    }
+
+    #[tokio::test]
+    async fn recursive_cte_forward_references_remain_rejected() {
+        let (engine, session) = engine_and_session();
+        let result = engine
+            .execute(
+                "WITH RECURSIVE early AS (SELECT n FROM later), \
+                                later AS (SELECT 1 AS n) \
+                 SELECT n FROM early",
+                Privilege::Admin,
+                &session,
+            )
+            .await;
+
+        assert!(result.is_err());
     }
 
     #[tokio::test]
