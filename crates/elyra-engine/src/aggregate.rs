@@ -323,6 +323,30 @@ fn agg_of(expr: &Expr) -> Option<(AggFunc, &sqlparser::ast::Function)> {
     Some((func, f))
 }
 
+pub(crate) fn validate_function_arity(name: &str, arity: usize) -> Result<()> {
+    let valid = match name {
+        "group_concat" => arity >= 1,
+        "facet" => (1..=2).contains(&arity),
+        "percentile" | "quantile" => arity == 2,
+        "count" | "sum" | "avg" | "min" | "max" | "stddev" | "std" | "stddev_pop"
+        | "stddev_samp" | "variance" | "var_pop" | "var_samp" | "bit_or" | "bit_and"
+        | "bit_xor" | "median" => arity == 1,
+        _ => {
+            return Err(Error::Unsupported(format!(
+                "unknown aggregate function: {name}"
+            )))
+        }
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(Error::Query(format!(
+            "invalid argument count for {}",
+            name.to_ascii_uppercase()
+        )))
+    }
+}
+
 /// Does this projection contain any aggregate function (including nested in an
 /// expression, e.g. `ROUND(SUM(x), 2)`)?
 pub fn projection_has_aggregate(projection: &[SelectItem]) -> bool {
@@ -692,7 +716,28 @@ fn register_agg(
     arg_exprs: &mut Vec<Expr>,
     agg_types: &mut Vec<ColumnType>,
 ) -> Result<usize> {
+    let name = f
+        .name
+        .0
+        .last()
+        .map(|identifier| identifier.value.to_ascii_lowercase())
+        .unwrap_or_default();
+    let arity = match &f.args {
+        FunctionArguments::None => 0,
+        FunctionArguments::List(arguments) => arguments.args.len(),
+        FunctionArguments::Subquery(_) => {
+            return Err(Error::Unsupported("subquery aggregate argument".into()))
+        }
+    };
+    validate_function_arity(&name, arity)?;
     let (arg_expr, distinct) = agg_arg(f);
+    if arg_expr
+        .is_some_and(|expression| contains_aggregate(expression) || contains_window(expression))
+    {
+        return Err(Error::Query(format!(
+            "aggregate function {name} cannot contain an aggregate or window function"
+        )));
+    }
     let (arg, arg_ty): (Option<usize>, Option<ColumnType>) = match arg_expr {
         None => (None, None),
         Some(e) => match ident_index(e, schema) {
@@ -788,6 +833,32 @@ fn contains_aggregate(expr: &Expr) -> bool {
         }
         _ => false,
     }
+}
+
+fn contains_window(expr: &Expr) -> bool {
+    use sqlparser::ast::{Visit, Visitor};
+    use std::ops::ControlFlow;
+
+    #[derive(Default)]
+    struct WindowFinder {
+        found: bool,
+    }
+
+    impl Visitor for WindowFinder {
+        type Break = ();
+
+        fn pre_visit_expr(&mut self, expression: &Expr) -> ControlFlow<Self::Break> {
+            if matches!(expression, Expr::Function(function) if function.over.is_some()) {
+                self.found = true;
+                return ControlFlow::Break(());
+            }
+            ControlFlow::Continue(())
+        }
+    }
+
+    let mut finder = WindowFinder::default();
+    let _ = expr.visit(&mut finder);
+    finder.found
 }
 
 /// Replace every aggregate call in `expr` with an `__agg_i` identifier

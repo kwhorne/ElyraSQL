@@ -473,10 +473,10 @@ pub async fn execute(sql: &str, sess: &Session, privilege: Privilege) -> Result<
 
     // GRANT / REVOKE
     if toks.first().map(|t| t.is_word("grant")).unwrap_or(false) {
-        return grant_revoke(&toks, sess, true).await;
+        return grant_revoke(sql, &toks, sess, true).await;
     }
     if toks.first().map(|t| t.is_word("revoke")).unwrap_or(false) {
-        return grant_revoke(&toks, sess, false).await;
+        return grant_revoke(sql, &toks, sess, false).await;
     }
 
     Err(Error::Parse("unsupported user-management statement".into()))
@@ -535,7 +535,7 @@ async fn set_password(
     Ok(QueryResult::Affected(0))
 }
 
-async fn grant_revoke(toks: &[Tok], sess: &Session, grant: bool) -> Result<QueryResult> {
+async fn grant_revoke(sql: &str, toks: &[Tok], sess: &Session, grant: bool) -> Result<QueryResult> {
     // Collect action words up to ON, capturing any `ACTION(col, col)` column list
     // (per-column grants).
     let mut i = 1;
@@ -560,22 +560,13 @@ async fn grant_revoke(toks: &[Tok], sess: &Session, grant: bool) -> Result<Query
     // Parse the object clause (ON <obj>). `*`/`*.*`/`db.*` → global; otherwise
     // the last dotted component names a specific table (scoped grant).
     let sep = if grant { "to" } else { "from" };
-    let mut obj = String::new();
     if i < toks.len() && toks[i].is_word("on") {
         i += 1;
         while i < toks.len() && !toks[i].is_word(sep) {
-            match &toks[i] {
-                Tok::Word(s) | Tok::Str(s) => obj.push_str(s),
-                Tok::Sym(c) => obj.push(*c),
-            }
             i += 1;
         }
     }
-    let scoped_table: Option<String> = if obj.is_empty() || obj.contains('*') {
-        None
-    } else {
-        obj.rsplit('.').next().map(|s| s.trim().to_string())
-    };
+    let scoped_table = crate::mysql_grant_scope(sql, sess, sep)?;
     while i < toks.len() && !toks[i].is_word(sep) {
         i += 1;
     }

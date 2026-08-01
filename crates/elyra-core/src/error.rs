@@ -12,6 +12,15 @@ pub enum Error {
     #[error("catalog error: {0}")]
     Catalog(String),
 
+    #[error("unknown database: {0}")]
+    UnknownDatabase(String),
+
+    #[error("unknown table: {0}")]
+    UnknownTable(String),
+
+    #[error("unknown column: {0}")]
+    UnknownColumn(String),
+
     #[error("storage error: {0}")]
     Storage(String),
 
@@ -53,7 +62,10 @@ impl Error {
         match self {
             Error::Parse(_) => 1064,
             Error::Catalog(m) => catalog_code(m),
-            Error::Type(_) => 1366, // ER_TRUNCATED_WRONG_VALUE
+            Error::UnknownDatabase(_) => 1049, // ER_BAD_DB_ERROR
+            Error::UnknownTable(_) => 1109,    // ER_UNKNOWN_TABLE
+            Error::UnknownColumn(_) => 1054,   // ER_BAD_FIELD_ERROR
+            Error::Type(_) => 1366,            // ER_TRUNCATED_WRONG_VALUE
             // MySQL answers 1264 for a value that does not fit the *column* and
             // 1690 for an expression that overflows its type. Storing a value is
             // by far the common case here, and both share SQLSTATE 22003.
@@ -76,6 +88,9 @@ impl Error {
                 1061 | 1176 => b"42000",
                 _ => b"42S02", // ER_NO_SUCH_TABLE
             },
+            Error::UnknownDatabase(_) => b"42000",
+            Error::UnknownTable(_) => b"42S02",
+            Error::UnknownColumn(_) => b"42S22",
             Error::OutOfRange(_) => b"22003",
             _ => b"HY000",
         }

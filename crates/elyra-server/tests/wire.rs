@@ -339,20 +339,17 @@ async fn stored_set_operations_and_deep_view_chains_are_stack_safe() {
         .unwrap();
     assert_eq!(nested_count, 4);
 
-    c.query_drop("CREATE VIEW cyclic_set_view_a AS SELECT id FROM cyclic_set_view_b")
-        .await
-        .unwrap();
-    c.query_drop("CREATE VIEW cyclic_set_view_b AS SELECT id FROM cyclic_set_view_a")
-        .await
-        .unwrap();
+    // Static view validation rejects a forward reference before it can form a
+    // cycle. The execution-depth guard remains covered on the base recursion
+    // branch for catalogs created by older versions.
     let error = c
-        .query_drop("SELECT * FROM cyclic_set_view_a")
+        .query_drop("CREATE VIEW cyclic_set_view_a AS SELECT id FROM cyclic_set_view_b")
         .await
         .unwrap_err();
     assert!(
         error
             .to_string()
-            .contains("query nesting exceeds 64 levels"),
+            .contains("no such table: cyclic_set_view_b"),
         "unexpected error: {error}"
     );
 
@@ -4983,7 +4980,7 @@ async fn catalog_wildcards_bind_to_one_same_named_join_relation() {
 }
 
 #[tokio::test]
-async fn qualified_wildcards_keep_the_complete_unaliased_relation_identity() {
+async fn qualified_wildcards_reject_an_unselected_database() {
     let srv = TestServer::start().await;
     let mut c = srv.conn().await;
     c.query_drop("CREATE TABLE same_named_relation (id INT PRIMARY KEY, label VARCHAR(16))")
@@ -5002,23 +4999,15 @@ async fn qualified_wildcards_keep_the_complete_unaliased_relation_identity() {
          JOIN shadow.same_named_relation ON shadow.same_named_relation.id = 1
          GROUP BY elyra.same_named_relation.id",
     ] {
-        let mut result = c.query_iter(sql).await.unwrap();
-        let names = result
-            .columns_ref()
-            .iter()
-            .map(|column| column.name_str().into_owned())
-            .collect::<Vec<_>>();
-        let expected = if sql.contains("COUNT") {
-            vec!["id", "label", "matching_rows"]
-        } else {
-            vec!["id", "label"]
-        };
-        assert_eq!(names, expected, "{sql}");
-        let rows: Vec<mysql_async::Row> = result.collect().await.unwrap();
-        assert_eq!(rows.len(), 1, "{sql}");
+        let error = c.query_drop(sql).await.unwrap_err();
+        assert!(
+            matches!(error, mysql_async::Error::Server(ref error)
+                if error.code == 1049 && error.message.contains("shadow")),
+            "{sql}: expected unknown database, got {error:?}"
+        );
     }
 
-    let mut result = c
+    let error = c
         .exec_iter(
             "SELECT elyra.same_named_relation.*
              FROM elyra.same_named_relation
@@ -5026,10 +5015,12 @@ async fn qualified_wildcards_keep_the_complete_unaliased_relation_identity() {
             (1,),
         )
         .await
-        .unwrap();
-    assert_eq!(result.columns().unwrap().len(), 2);
-    let rows: Vec<mysql_async::Row> = result.collect().await.unwrap();
-    assert_eq!(rows.len(), 1);
+        .unwrap_err();
+    assert!(
+        matches!(error, mysql_async::Error::Server(ref error)
+            if error.code == 1049 && error.message.contains("shadow")),
+        "prepared wildcard expected unknown database, got {error:?}"
+    );
 }
 
 #[tokio::test]
@@ -6147,6 +6138,1945 @@ async fn selected_database_names_catalog_rows_for_the_session() {
     assert_eq!(schemas, vec!["information_schema", "switched_test"]);
 }
 
+#[tokio::test]
+async fn from_schema_qualifiers_must_match_the_selected_database() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn_to_database("tenant_test").await;
+
+    c.query_drop("CREATE TABLE schema_left (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE schema_right (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO schema_left VALUES (1)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO schema_right VALUES (1)")
+        .await
+        .unwrap();
+    c.query_drop("CREATE VIEW schema_view AS SELECT id FROM schema_left")
+        .await
+        .unwrap();
+
+    let id: i64 = c
+        .query_first("SELECT id FROM tenant_test.schema_left")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(id, 1);
+
+    c.query_drop(
+        "EXPLAIN WITH RECURSIVE seq(n) AS (
+             SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 2
+         )
+         SELECT n FROM seq",
+    )
+    .await
+    .unwrap();
+
+    let id: i64 = c
+        .query_first("SELECT id FROM tenant_test.schema_view")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(id, 1);
+
+    let catalog_rows: i64 = c
+        .query_first(
+            "SELECT COUNT(*) FROM information_schema.tables
+             WHERE table_schema = 'tenant_test' AND table_name = 'schema_left'",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(catalog_rows, 1);
+
+    let id: i64 = c
+        .query_first(
+            "SELECT l.id
+             FROM tenant_test.schema_left AS l
+             JOIN tenant_test.schema_right AS r ON r.id = l.id",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(id, 1);
+
+    // A schema-qualified name is a physical relation, not a reference to a
+    // same-named CTE in the query scope.
+    let id: i64 = c
+        .query_first(
+            "WITH schema_left AS (SELECT 99 AS id)
+             SELECT id FROM tenant_test.schema_left",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(id, 1);
+
+    for sql in [
+        "SELECT id FROM missing_database.schema_left",
+        "SELECT l.id FROM schema_left AS l
+         JOIN missing_database.schema_right AS r ON r.id = l.id",
+        "SELECT id FROM (
+             SELECT id FROM missing_database.schema_left
+         ) AS nested_schema_source",
+        "SELECT id FROM schema_left
+         UNION ALL SELECT id FROM missing_database.schema_right",
+        "WITH schema_left AS (SELECT 99 AS id)
+         SELECT id FROM missing_database.schema_left",
+        "SELECT id FROM missing_database.schema_view",
+    ] {
+        let error = match c.query_drop(sql).await {
+            Err(error) => error,
+            Ok(()) => panic!("{sql}: expected MySQL error 1049"),
+        };
+        match error {
+            mysql_async::Error::Server(error) => {
+                assert_eq!(error.code, 1049, "{sql}: {error:?}");
+                assert!(
+                    error.message.contains("missing_database"),
+                    "{sql}: {error:?}"
+                );
+            }
+            other => panic!("{sql}: expected a server error, got {other:?}"),
+        }
+    }
+
+    // Match MySQL/Linux database-name semantics; system schemas remain
+    // case-insensitive through their dedicated virtual-relation path.
+    let error = c
+        .query_drop("SELECT id FROM TENANT_TEST.schema_left")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, mysql_async::Error::Server(error) if error.code == 1049),
+        "a differently-cased physical database name must not be discarded"
+    );
+
+    let error = c
+        .query_drop("SELECT id FROM def.tenant_test.schema_left")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, mysql_async::Error::Server(error) if error.code == 1064),
+        "an excessive table-name prefix must be a syntax error"
+    );
+
+    let one: i64 = c.query_first("SELECT 1").await.unwrap().unwrap();
+    assert_eq!(one, 1);
+}
+
+#[tokio::test]
+async fn mutation_and_ddl_schema_qualifiers_cannot_target_the_selected_database() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn_to_database("tenant_mutations").await;
+
+    c.query_drop("CREATE TABLE victim (id INT PRIMARY KEY, payload INT NOT NULL)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO victim VALUES (1, 10)")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE helper (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO helper VALUES (1)").await.unwrap();
+    c.query_drop("CREATE VIEW victim_view AS SELECT id, payload FROM victim")
+        .await
+        .unwrap();
+    c.query_drop("CREATE INDEX base_idx ON victim (payload)")
+        .await
+        .unwrap();
+    c.query_drop("CREATE MATERIALIZED VIEW victim_mv AS SELECT id FROM victim")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE auto_refresh_source (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO auto_refresh_source VALUES (1)")
+        .await
+        .unwrap();
+    c.query_drop(
+        "CREATE MATERIALIZED VIEW auto_refresh_mv AS \
+         SELECT id FROM auto_refresh_source",
+    )
+    .await
+    .unwrap();
+    c.query_drop("CREATE INDEX refresh_marker ON auto_refresh_mv (id)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO auto_refresh_source VALUES (2)")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE cte_refresh_source (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO cte_refresh_source VALUES (1)")
+        .await
+        .unwrap();
+    c.query_drop(
+        "CREATE MATERIALIZED VIEW cte_refresh_mv AS \
+         SELECT id FROM cte_refresh_source",
+    )
+    .await
+    .unwrap();
+    c.query_drop("CREATE INDEX cte_refresh_marker ON cte_refresh_mv (id)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO cte_refresh_source VALUES (2)")
+        .await
+        .unwrap();
+    c.query_drop(
+        "CREATE TABLE partition_target (id INT PRIMARY KEY)
+         PARTITION BY RANGE (id) (
+             PARTITION p0 VALUES LESS THAN (10),
+             PARTITION pmax VALUES LESS THAN (MAXVALUE)
+         )",
+    )
+    .await
+    .unwrap();
+    c.query_drop("CREATE TABLE load_target (id INT PRIMARY KEY, payload INT)")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE dangling_dependency (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop(
+        "CREATE VIEW dangling_view AS
+         SELECT id FROM dangling_dependency",
+    )
+    .await
+    .unwrap();
+    c.query_drop("DROP TABLE dangling_dependency")
+        .await
+        .unwrap();
+    let load_path = std::env::temp_dir().join(format!(
+        "elyrasql-schema-load-{}-{}.tsv",
+        std::process::id(),
+        srv.port
+    ));
+    std::fs::write(&load_path, "7\t70\n").unwrap();
+
+    for (target, code) in [
+        ("missing_database.load_target", 1049),
+        ("def.tenant_mutations.load_target", 1064),
+    ] {
+        let sql = format!(
+            "LOAD DATA INFILE '{}' INTO TABLE {target}",
+            load_path.display()
+        );
+        let error = match c.query_drop(&sql).await {
+            Err(error) => error,
+            Ok(()) => panic!("{sql}: expected MySQL error {code}"),
+        };
+        assert!(
+            matches!(error, mysql_async::Error::Server(ref error) if error.code == code),
+            "{sql}: expected MySQL error {code}, got {error:?}"
+        );
+    }
+
+    let missing_join_error = c
+        .query_drop(
+            "SELECT * FROM auto_refresh_mv AS mv
+             JOIN no_such_auto_refresh_table AS missing ON missing.id = mv.id",
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(missing_join_error, mysql_async::Error::Server(_)));
+    let missing_nested_error = c
+        .query_drop(
+            "SELECT * FROM auto_refresh_mv AS mv
+             WHERE EXISTS (
+                 SELECT 1 FROM no_such_nested_refresh_table AS missing
+                 WHERE missing.id = mv.id
+             )",
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        missing_nested_error,
+        mysql_async::Error::Server(_)
+    ));
+    for sql in [
+        "SELECT no_such_column FROM auto_refresh_mv",
+        "SELECT * FROM auto_refresh_mv AS mv
+         JOIN information_schema.no_such_view AS missing ON 1 = 1",
+        "SELECT * FROM auto_refresh_mv AS mv
+         JOIN dangling_view AS dangling ON dangling.id = mv.id",
+    ] {
+        assert!(
+            c.query_drop(sql).await.is_err(),
+            "{sql}: expected failure before materialized-view refresh"
+        );
+    }
+    let auto_refresh_indexes: Vec<String> = c
+        .query("SHOW INDEX FROM auto_refresh_mv")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row: mysql_async::Row| row.get("Key_name").unwrap())
+        .collect();
+    assert!(auto_refresh_indexes
+        .iter()
+        .any(|name| name == "refresh_marker"));
+
+    c.query_drop("START TRANSACTION").await.unwrap();
+    c.query_drop("INSERT INTO victim VALUES (2, 20)")
+        .await
+        .unwrap();
+    assert!(c
+        .query_drop("SELECT no_such_column FROM auto_refresh_mv")
+        .await
+        .is_err());
+    let staged_payload: i64 = c
+        .query_first("SELECT payload FROM victim WHERE id = 2")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        staged_payload, 20,
+        "auto-refresh rollback must preserve earlier transaction writes"
+    );
+    let transactional_indexes: Vec<String> = c
+        .query("SHOW INDEX FROM auto_refresh_mv")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row: mysql_async::Row| row.get("Key_name").unwrap())
+        .collect();
+    assert!(transactional_indexes
+        .iter()
+        .any(|name| name == "refresh_marker"));
+    c.query_drop("ROLLBACK").await.unwrap();
+    let rolled_back_rows: i64 = c
+        .query_first("SELECT COUNT(*) FROM victim WHERE id = 2")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(rolled_back_rows, 0);
+
+    for sql in [
+        "CREATE VIEW invalid_virtual_view AS
+         SELECT * FROM information_schema.no_such_view",
+        "CREATE VIEW invalid_mysql_view AS
+         SELECT * FROM mysql.no_such_view",
+        "CREATE VIEW invalid_dangling_view AS
+         SELECT * FROM dangling_view",
+        "CREATE VIEW invalid_column_view AS
+         SELECT no_such_column FROM victim",
+        "CREATE VIEW invalid_table_expr AS TABLE missing_database.victim",
+        "EXPLAIN SELECT * FROM information_schema.no_such_view",
+    ] {
+        assert!(c.query_drop(sql).await.is_err(), "{sql}: expected failure");
+    }
+
+    for (sql, code, state) in [
+        (
+            "UPDATE victim SET payload = 99
+             WHERE missing_database.victim.id = 1",
+            1054,
+            "42S22",
+        ),
+        (
+            "UPDATE victim SET payload = missing_database.victim.payload + 1
+             WHERE id = 1",
+            1054,
+            "42S22",
+        ),
+        (
+            "UPDATE victim SET payload = 99
+             ORDER BY missing_database.victim.id LIMIT 1",
+            1054,
+            "42S22",
+        ),
+        (
+            "DELETE FROM victim WHERE missing_database.victim.id = 1",
+            1054,
+            "42S22",
+        ),
+        (
+            "DELETE FROM victim ORDER BY missing_database.victim.id LIMIT 1",
+            1054,
+            "42S22",
+        ),
+        (
+            "DELETE missing_database.victim
+             FROM victim JOIN helper ON helper.id = victim.id
+             WHERE victim.id = 1",
+            1109,
+            "42S02",
+        ),
+        (
+            "UPDATE victim JOIN helper ON helper.id = victim.id
+             SET def.tenant_mutations.victim.payload = 99
+             WHERE victim.id = 1",
+            1064,
+            "42000",
+        ),
+        (
+            "INSERT INTO victim VALUES (1, 300)
+             ON DUPLICATE KEY UPDATE missing_database.victim.payload = VALUES(payload)",
+            1054,
+            "42S22",
+        ),
+        (
+            "INSERT INTO victim VALUES (1, 300)
+             ON DUPLICATE KEY UPDATE
+                 payload = missing_database.victim.payload + 1",
+            1054,
+            "42S22",
+        ),
+    ] {
+        let error = c.query_drop(sql).await.unwrap_err();
+        assert!(
+            matches!(error, mysql_async::Error::Server(ref error)
+                if error.code == code && error.state == state),
+            "{sql}: expected {code}/{state}, got {error:?}"
+        );
+        let row: (i64, i64) = c
+            .query_first("SELECT id, payload FROM victim WHERE id = 1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row, (1, 10), "{sql}: rejected mutation changed victim");
+    }
+    let prepared_error = c
+        .exec_drop(
+            "UPDATE victim
+             SET missing_database.victim.payload = ? WHERE id = 1",
+            (99,),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(prepared_error, mysql_async::Error::Server(ref error)
+            if error.code == 1054 && error.state == "42S22"),
+        "prepared target expected 1054/42S22, got {prepared_error:?}"
+    );
+    let row: (i64, i64) = c
+        .query_first("SELECT id, payload FROM victim WHERE id = 1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row, (1, 10));
+
+    c.query_drop(
+        "CREATE TABLE atomic_victim (
+             id INT PRIMARY KEY,
+             payload INT NOT NULL
+         )",
+    )
+    .await
+    .unwrap();
+    let atomic_error = c
+        .query_drop(
+            "ALTER TABLE atomic_victim
+             ADD COLUMN leaked INT DEFAULT 7,
+             ADD INDEX leaked_idx (payload),
+             ADD CONSTRAINT fk_bad
+                 FOREIGN KEY (payload) REFERENCES missing_database.victim (id)",
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        atomic_error,
+        mysql_async::Error::Server(ref error) if error.code == 1049
+    ));
+    let leaked_columns: i64 = c
+        .query_first(
+            "SELECT COUNT(*) FROM information_schema.columns
+             WHERE table_schema = 'tenant_mutations'
+               AND table_name = 'atomic_victim'
+               AND column_name = 'leaked'",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(leaked_columns, 0, "failed ALTER leaked an earlier column");
+    let atomic_indexes: Vec<String> = c
+        .query("SHOW INDEX FROM atomic_victim")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row: mysql_async::Row| row.get("Key_name").unwrap())
+        .collect();
+    assert!(
+        atomic_indexes.iter().all(|name| name != "leaked_idx"),
+        "failed ALTER leaked an earlier index: {atomic_indexes:?}"
+    );
+
+    for sql in [
+        "INSERT INTO missing_database.victim VALUES (2, 20)",
+        "INSERT INTO missing_database.victim SELECT 2, 20",
+        "UPDATE missing_database.victim SET payload = 99 WHERE id = 1",
+        "UPDATE missing_database.victim AS v
+             JOIN victim AS local ON local.id = v.id
+         SET v.payload = 99",
+        "DELETE FROM missing_database.victim WHERE id = 1",
+        "DELETE v FROM missing_database.victim AS v
+             JOIN victim AS local ON local.id = v.id",
+        "CREATE TABLE missing_database.created_wrong (id INT PRIMARY KEY)",
+        "ALTER TABLE missing_database.victim ADD COLUMN corrupted INT",
+        "ALTER TABLE victim RENAME TO missing_database.renamed",
+        "RENAME TABLE missing_database.victim TO renamed",
+        "RENAME TABLE victim TO missing_database.renamed",
+        "ALTER TABLE missing_database.victim RENAME INDEX base_idx TO renamed_idx",
+        "DROP INDEX base_idx ON missing_database.victim",
+        "ALTER TABLE missing_database.victim DROP INDEX base_idx",
+        "CREATE INDEX wrong_idx ON missing_database.victim (payload)",
+        "CREATE TABLE copied_wrong LIKE missing_database.victim",
+        "CREATE TABLE child_wrong (
+             id INT PRIMARY KEY,
+             victim_id INT,
+             FOREIGN KEY (victim_id) REFERENCES missing_database.victim (id)
+         )",
+        "ALTER TABLE victim ADD CONSTRAINT fk_wrong
+             FOREIGN KEY (payload) REFERENCES missing_database.victim (id)",
+        "TRUNCATE TABLE missing_database.victim",
+        "DROP TABLE missing_database.victim",
+        "CREATE VIEW missing_database.created_view AS SELECT id FROM victim",
+        "CREATE VIEW invalid_source_view
+             AS SELECT id FROM missing_database.victim",
+        "CREATE VIEW invalid_derived_view AS
+             SELECT id FROM (SELECT id FROM missing_database.victim) AS nested_source",
+        "CREATE VIEW invalid_union_view AS
+             SELECT id FROM victim
+             UNION ALL SELECT id FROM missing_database.victim",
+        "CREATE VIEW invalid_scalar_view AS
+             SELECT (SELECT id FROM missing_database.victim LIMIT 1) AS id",
+        "CREATE VIEW invalid_case_view AS
+             SELECT CASE WHEN 1 = 1 THEN (
+                 SELECT id FROM missing_database.victim LIMIT 1
+             ) ELSE 0 END AS id",
+        "DROP VIEW missing_database.victim_view",
+        "CREATE MATERIALIZED VIEW missing_database.mv_wrong
+             AS SELECT id FROM victim",
+        "REFRESH MATERIALIZED VIEW missing_database.victim_mv",
+        "DROP MATERIALIZED VIEW missing_database.victim_mv",
+        "SELECT * FROM missing_database.auto_refresh_mv",
+        "SELECT * FROM auto_refresh_mv AS mv
+             JOIN missing_database.victim AS bad ON bad.id = mv.id",
+        "CREATE TABLE missing_database.partition_wrong (id INT PRIMARY KEY)
+             PARTITION BY RANGE (id) (
+                 PARTITION p0 VALUES LESS THAN (10),
+                 PARTITION pmax VALUES LESS THAN (MAXVALUE)
+             )",
+        "ALTER TABLE missing_database.partition_target TRUNCATE PARTITION p0",
+        "ANALYZE TABLE missing_database.victim",
+        "SHOW CREATE TABLE missing_database.victim",
+        "SHOW COLUMNS FROM missing_database.victim",
+        "SHOW INDEX FROM missing_database.victim",
+        "SHOW KEYS FROM missing_database.victim",
+        "SHOW TABLES FROM missing_database",
+        "SHOW TABLE STATUS FROM missing_database",
+        "SHOW INDEX FROM victim FROM missing_database",
+        "CREATE FULLTEXT INDEX wrong_ft
+             ON missing_database.victim (payload)",
+        "EXPLAIN missing_database.victim",
+        "EXPLAIN SELECT id FROM missing_database.victim",
+        "EXPLAIN SELECT id FROM
+             (SELECT id FROM missing_database.victim) AS nested_source",
+        "EXPLAIN SELECT (SELECT id FROM missing_database.victim LIMIT 1)",
+    ] {
+        let error = match c.query_drop(sql).await {
+            Err(error) => error,
+            Ok(()) => panic!("{sql}: expected MySQL error 1049"),
+        };
+        assert!(
+            matches!(error, mysql_async::Error::Server(ref error) if error.code == 1049),
+            "{sql}: expected MySQL error 1049, got {error:?}"
+        );
+    }
+
+    let rows: Vec<(i64, i64)> = c
+        .query("SELECT id, payload FROM victim ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(rows, [(1, 10)], "rejected writes must not change victim");
+
+    let corrupted_columns: i64 = c
+        .query_first(
+            "SELECT COUNT(*) FROM information_schema.columns
+             WHERE table_schema = 'tenant_mutations'
+               AND table_name = 'victim'
+               AND column_name = 'corrupted'",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        corrupted_columns, 0,
+        "rejected ALTER must not change victim"
+    );
+    let invalid_view_count: i64 = c
+        .query_first(
+            "SELECT COUNT(*) FROM information_schema.views
+             WHERE table_schema = 'tenant_mutations'
+               AND table_name IN (
+                   'invalid_source_view',
+                   'invalid_derived_view',
+                   'invalid_union_view',
+                   'invalid_scalar_view',
+                   'invalid_case_view',
+                   'invalid_virtual_view',
+                   'invalid_mysql_view',
+                   'invalid_dangling_view',
+                   'invalid_column_view',
+                   'invalid_table_expr'
+               )",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(invalid_view_count, 0, "invalid view source was persisted");
+
+    let view_payload: i64 = c
+        .query_first("SELECT payload FROM victim_view WHERE id = 1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        view_payload, 10,
+        "rejected DROP VIEW must preserve the view"
+    );
+    let materialized_id: i64 = c
+        .query_first("SELECT id FROM victim_mv")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        materialized_id, 1,
+        "rejected materialized-view commands must preserve the view"
+    );
+    let auto_refresh_indexes: Vec<String> = c
+        .query("SHOW INDEX FROM auto_refresh_mv")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row: mysql_async::Row| row.get("Key_name").unwrap())
+        .collect();
+    assert!(auto_refresh_indexes
+        .iter()
+        .any(|name| name == "refresh_marker"));
+
+    let cte_value: i64 = c
+        .query_first(
+            "WITH cte_refresh_mv AS (SELECT 99 AS id)
+             SELECT id FROM cte_refresh_mv",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(cte_value, 99);
+    let cte_refresh_indexes: Vec<String> = c
+        .query("SHOW INDEX FROM cte_refresh_mv")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row: mysql_async::Row| row.get("Key_name").unwrap())
+        .collect();
+    assert!(cte_refresh_indexes
+        .iter()
+        .any(|name| name == "cte_refresh_marker"));
+
+    for sql in [
+        "INSERT INTO def.tenant_mutations.victim VALUES (2, 20)",
+        "UPDATE def.tenant_mutations.victim SET payload = 99",
+        "DELETE FROM def.tenant_mutations.victim",
+        "CREATE TABLE def.tenant_mutations.created_wrong (id INT)",
+        "ALTER TABLE def.tenant_mutations.victim ADD COLUMN corrupted INT",
+        "TRUNCATE TABLE def.tenant_mutations.victim",
+        "DROP TABLE def.tenant_mutations.victim",
+        "CREATE VIEW invalid_source_view
+             AS SELECT id FROM def.tenant_mutations.victim",
+        "SHOW INDEX FROM def.tenant_mutations.victim",
+        "SHOW TABLES FROM def.tenant_mutations",
+        "SHOW TABLE STATUS FROM def.tenant_mutations",
+        "SHOW INDEX FROM victim FROM def.tenant_mutations",
+        "CREATE FULLTEXT INDEX wrong_ft
+             ON def.tenant_mutations.victim (payload)",
+        "CREATE MATERIALIZED VIEW def.tenant_mutations.mv_wrong
+             AS SELECT id FROM victim",
+        "REFRESH MATERIALIZED VIEW def.tenant_mutations.victim_mv",
+        "DROP MATERIALIZED VIEW def.tenant_mutations.victim_mv",
+        "SELECT * FROM def.tenant_mutations.auto_refresh_mv",
+        "EXPLAIN SELECT id FROM def.tenant_mutations.victim",
+        "CREATE TABLE def.tenant_mutations.partition_wrong (id INT PRIMARY KEY)
+             PARTITION BY RANGE (id) (
+                 PARTITION p0 VALUES LESS THAN (10),
+                 PARTITION pmax VALUES LESS THAN (MAXVALUE)
+             )",
+        "ALTER TABLE def.tenant_mutations.partition_target TRUNCATE PARTITION p0",
+    ] {
+        let error = match c.query_drop(sql).await {
+            Err(error) => error,
+            Ok(()) => panic!("{sql}: expected MySQL error 1064"),
+        };
+        assert!(
+            matches!(error, mysql_async::Error::Server(ref error) if error.code == 1064),
+            "{sql}: expected MySQL error 1064, got {error:?}"
+        );
+    }
+
+    let auto_refresh_indexes: Vec<String> = c
+        .query("SHOW INDEX FROM auto_refresh_mv")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row: mysql_async::Row| row.get("Key_name").unwrap())
+        .collect();
+    assert!(auto_refresh_indexes
+        .iter()
+        .any(|name| name == "refresh_marker"));
+
+    let case_error = c
+        .query_drop("SHOW TABLE STATUS FROM TENANT_MUTATIONS")
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        case_error,
+        mysql_async::Error::Server(ref error) if error.code == 1049
+    ));
+
+    c.query_drop("SHOW TABLES FROM tenant_mutations")
+        .await
+        .unwrap();
+    c.query_drop("SHOW TABLE STATUS FROM tenant_mutations")
+        .await
+        .unwrap();
+    let status_names: Vec<String> = c
+        .query("SHOW TABLE STATUS FROM tenant_mutations LIKE 'victim'")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row: mysql_async::Row| row.get("Name").unwrap())
+        .collect();
+    assert_eq!(status_names, ["victim"]);
+    c.query_drop("EXPLAIN SELECT id FROM tenant_mutations.victim")
+        .await
+        .unwrap();
+    c.query_drop(
+        "CREATE VIEW valid_cte_view AS
+         WITH source AS (SELECT id FROM tenant_mutations.victim)
+         SELECT id FROM source",
+    )
+    .await
+    .unwrap();
+    c.query_drop(
+        "CREATE VIEW valid_system_view AS
+         SELECT table_name FROM information_schema.tables
+         WHERE table_schema = 'tenant_mutations'",
+    )
+    .await
+    .unwrap();
+    c.query_drop("DROP VIEW valid_cte_view, valid_system_view")
+        .await
+        .unwrap();
+
+    c.query_drop("CREATE TABLE nested_refresh_source (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO nested_refresh_source VALUES (1)")
+        .await
+        .unwrap();
+    c.query_drop(
+        "CREATE MATERIALIZED VIEW nested_refresh_mv AS \
+         SELECT id FROM nested_refresh_source",
+    )
+    .await
+    .unwrap();
+    c.query_drop("INSERT INTO nested_refresh_source VALUES (2)")
+        .await
+        .unwrap();
+    let derived_max: i64 = c
+        .query_first(
+            "SELECT MAX(id) FROM (
+                 SELECT id FROM nested_refresh_mv
+             ) AS nested",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        derived_max, 2,
+        "derived-table reads must refresh nested MVs"
+    );
+
+    c.query_drop("INSERT INTO nested_refresh_source VALUES (3)")
+        .await
+        .unwrap();
+    let set_ids: Vec<i64> = c
+        .query(
+            "SELECT id FROM nested_refresh_mv
+             UNION ALL SELECT 0
+             ORDER BY id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        set_ids,
+        [0, 1, 2, 3],
+        "set-operation reads must refresh MVs"
+    );
+
+    c.query_drop("INSERT INTO nested_refresh_source VALUES (4)")
+        .await
+        .unwrap();
+    let scalar_max: i64 = c
+        .query_first("SELECT (SELECT MAX(id) FROM nested_refresh_mv)")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(scalar_max, 4, "scalar-subquery reads must refresh MVs");
+
+    // A valid selected-database reference may refresh the stale view.
+    let auto_refresh_count: i64 = c
+        .query_first("SELECT COUNT(*) FROM tenant_mutations.auto_refresh_mv")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(auto_refresh_count, 2);
+
+    // Matching qualifiers remain valid for write and DDL targets.
+    c.query_drop("INSERT INTO tenant_mutations.victim VALUES (2, 20)")
+        .await
+        .unwrap();
+    c.query_drop("UPDATE tenant_mutations.victim SET payload = 21 WHERE id = 2")
+        .await
+        .unwrap();
+    c.query_drop("DELETE FROM tenant_mutations.victim WHERE id = 2")
+        .await
+        .unwrap();
+    c.query_drop("ALTER TABLE tenant_mutations.victim ADD COLUMN added INT")
+        .await
+        .unwrap();
+
+    c.query_drop("CREATE INDEX payload_idx ON tenant_mutations.victim (payload)")
+        .await
+        .unwrap();
+    c.query_drop("SHOW INDEX FROM tenant_mutations.victim")
+        .await
+        .unwrap();
+    c.query_drop("SHOW INDEX FROM victim FROM tenant_mutations")
+        .await
+        .unwrap();
+    c.query_drop(
+        "ALTER TABLE tenant_mutations.victim
+         RENAME INDEX base_idx TO renamed_idx",
+    )
+    .await
+    .unwrap();
+    c.query_drop("DROP INDEX renamed_idx ON tenant_mutations.victim")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE tenant_mutations.rename_source (id INT)")
+        .await
+        .unwrap();
+    c.query_drop(
+        "RENAME TABLE tenant_mutations.rename_source
+         TO tenant_mutations.rename_target",
+    )
+    .await
+    .unwrap();
+    c.query_drop("DROP TABLE tenant_mutations.rename_target")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE tenant_mutations.ft_target (body TEXT)")
+        .await
+        .unwrap();
+    c.query_drop(
+        "CREATE FULLTEXT INDEX body_ft
+         ON tenant_mutations.ft_target (body)",
+    )
+    .await
+    .unwrap();
+    c.query_drop("DROP TABLE tenant_mutations.ft_target")
+        .await
+        .unwrap();
+    c.query_drop(
+        "CREATE TABLE tenant_mutations.qualified_copy
+         LIKE tenant_mutations.victim",
+    )
+    .await
+    .unwrap();
+    c.query_drop("TRUNCATE TABLE tenant_mutations.qualified_copy")
+        .await
+        .unwrap();
+    c.query_drop("DROP TABLE tenant_mutations.qualified_copy")
+        .await
+        .unwrap();
+    c.query_drop(
+        "CREATE VIEW tenant_mutations.qualified_view AS
+         SELECT id FROM tenant_mutations.victim",
+    )
+    .await
+    .unwrap();
+    c.query_drop("DROP VIEW tenant_mutations.qualified_view")
+        .await
+        .unwrap();
+    c.query_drop(
+        "CREATE MATERIALIZED VIEW tenant_mutations.qualified_mv AS SELECT id \
+         FROM tenant_mutations.victim",
+    )
+    .await
+    .unwrap();
+    let materialized_id: i64 = c
+        .query_first("SELECT id FROM tenant_mutations.qualified_mv")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(materialized_id, 1);
+    c.query_drop("REFRESH MATERIALIZED VIEW tenant_mutations.qualified_mv")
+        .await
+        .unwrap();
+    c.query_drop("DROP MATERIALIZED VIEW tenant_mutations.qualified_mv")
+        .await
+        .unwrap();
+    c.query_drop(
+        "CREATE TABLE tenant_mutations.qualified_partition (id INT PRIMARY KEY)
+         PARTITION BY RANGE (id) (
+             PARTITION p0 VALUES LESS THAN (10),
+             PARTITION pmax VALUES LESS THAN (MAXVALUE)
+         )",
+    )
+    .await
+    .unwrap();
+    c.query_drop("INSERT INTO tenant_mutations.qualified_partition VALUES (1), (20)")
+        .await
+        .unwrap();
+    c.query_drop(
+        "ALTER TABLE tenant_mutations.qualified_partition
+         TRUNCATE PARTITION p0",
+    )
+    .await
+    .unwrap();
+    let partition_ids: Vec<i64> = c
+        .query("SELECT id FROM tenant_mutations.qualified_partition ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(partition_ids, [20]);
+    c.query_drop("DROP TABLE tenant_mutations.qualified_partition")
+        .await
+        .unwrap();
+
+    let load_sql = format!(
+        "LOAD DATA INFILE '{}' INTO TABLE tenant_mutations.load_target",
+        load_path.display()
+    );
+    c.query_drop(load_sql).await.unwrap();
+    let loaded: Vec<(i64, i64)> = c
+        .query("SELECT id, payload FROM load_target ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(loaded, [(7, 70)]);
+    std::fs::remove_file(&load_path).unwrap();
+
+    let rows: Vec<(i64, i64)> = c
+        .query("SELECT id, payload FROM victim ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(rows, [(1, 10)]);
+}
+
+#[tokio::test]
+async fn rejected_multi_table_lock_does_not_retain_earlier_locks() {
+    let srv = TestServer::start().await;
+    let mut owner = srv.conn_to_database("lock_atomicity").await;
+    let mut peer = srv.conn_to_database("lock_atomicity").await;
+
+    owner
+        .query_drop("CREATE TABLE local_lock (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+
+    let error = owner
+        .query_drop("LOCK TABLES local_lock WRITE, missing_database.local_lock WRITE")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, mysql_async::Error::Server(error) if error.code == 1049),
+        "the invalid database must reject the whole lock statement"
+    );
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        peer.query_drop("INSERT INTO local_lock VALUES (1)"),
+    )
+    .await
+    .expect("the rejected statement must not leave local_lock locked")
+    .unwrap();
+}
+
+#[tokio::test]
+async fn qualifier_preflight_review_regressions() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn_to_database("review_tenant").await;
+
+    c.query_drop("CREATE TABLE checkpoint_source (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO checkpoint_source VALUES (1)")
+        .await
+        .unwrap();
+    c.query_drop("CREATE MATERIALIZED VIEW checkpoint_mv AS SELECT id FROM checkpoint_source")
+        .await
+        .unwrap();
+    c.query_drop("CREATE INDEX checkpoint_marker ON checkpoint_mv (id)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO checkpoint_source VALUES (2)")
+        .await
+        .unwrap();
+    let error = c
+        .query_drop("SELECT no_such_function(id) FROM checkpoint_mv")
+        .await
+        .unwrap_err();
+    assert!(matches!(error, mysql_async::Error::Server(_)));
+    let indexes: Vec<String> = c
+        .query("SHOW INDEX FROM checkpoint_mv")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row: mysql_async::Row| row.get("Key_name").unwrap())
+        .collect();
+    assert!(
+        indexes.iter().any(|name| name == "checkpoint_marker"),
+        "a failed consuming query must roll its materialized-view refresh back"
+    );
+    c.query_drop("CREATE TABLE checkpoint_user_write (id INT PRIMARY KEY, value INT)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO checkpoint_user_write VALUES (1, 10)")
+        .await
+        .unwrap();
+    c.query_drop("START TRANSACTION").await.unwrap();
+    c.query_drop("SAVEPOINT __elyra_auto_refresh_0")
+        .await
+        .unwrap();
+    c.query_drop("UPDATE checkpoint_user_write SET value = 20 WHERE id = 1")
+        .await
+        .unwrap();
+    let refreshed: i64 = c
+        .query_first("SELECT COUNT(*) FROM checkpoint_mv")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(refreshed, 2);
+    c.query_drop("ROLLBACK TO SAVEPOINT __elyra_auto_refresh_0")
+        .await
+        .unwrap();
+    let value: i64 = c
+        .query_first("SELECT value FROM checkpoint_user_write WHERE id = 1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(value, 10, "internal refresh must preserve user savepoints");
+    c.query_drop("ROLLBACK").await.unwrap();
+
+    for (source, view) in [("case_source_a", "CaseMV"), ("case_source_b", "casemv")] {
+        c.query_drop(format!("CREATE TABLE {source} (id INT PRIMARY KEY)"))
+            .await
+            .unwrap();
+        c.query_drop(format!("INSERT INTO {source} VALUES (1)"))
+            .await
+            .unwrap();
+        c.query_drop(format!(
+            "CREATE MATERIALIZED VIEW `{view}` AS SELECT id FROM {source}"
+        ))
+        .await
+        .unwrap();
+        c.query_drop(format!("INSERT INTO {source} VALUES (2)"))
+            .await
+            .unwrap();
+    }
+    let case_counts: (i64, i64) = c
+        .query_first(
+            "SELECT (SELECT COUNT(*) FROM `CaseMV`),
+                    (SELECT COUNT(*) FROM `casemv`)",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(case_counts, (2, 2));
+
+    c.query_drop("CREATE TABLE set_dep_a (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE set_dep_b (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO set_dep_a VALUES (1)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO set_dep_b VALUES (10)")
+        .await
+        .unwrap();
+    c.query_drop(
+        "CREATE MATERIALIZED VIEW set_dep_mv AS SELECT id FROM set_dep_a
+         UNION ALL SELECT id FROM set_dep_b",
+    )
+    .await
+    .unwrap();
+    c.query_drop("INSERT INTO set_dep_a VALUES (2)")
+        .await
+        .unwrap();
+    let set_count: i64 = c
+        .query_first("SELECT COUNT(*) FROM set_dep_mv")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(set_count, 3);
+
+    c.query_drop("CREATE TABLE chain_source (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO chain_source VALUES (1)")
+        .await
+        .unwrap();
+    c.query_drop("CREATE MATERIALIZED VIEW chain_inner AS SELECT id FROM chain_source")
+        .await
+        .unwrap();
+    c.query_drop("CREATE MATERIALIZED VIEW chain_outer AS SELECT id FROM chain_inner")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO chain_source VALUES (2)")
+        .await
+        .unwrap();
+    let chain_max: i64 = c
+        .query_first("SELECT MAX(id) FROM chain_outer")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(chain_max, 2);
+
+    c.query_drop("CREATE TABLE recursive_mv_source (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO recursive_mv_source VALUES (1)")
+        .await
+        .unwrap();
+    c.query_drop("CREATE MATERIALIZED VIEW recursive_mv AS SELECT id FROM recursive_mv_source")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO recursive_mv_source VALUES (2)")
+        .await
+        .unwrap();
+    let recursive_rows: Vec<i64> = c
+        .query(
+            "WITH RECURSIVE seq(n) AS (
+                 SELECT id FROM recursive_mv WHERE id = 1
+                 UNION ALL
+                 SELECT n + 1 FROM seq WHERE n < 2
+             )
+             SELECT n FROM seq ORDER BY n",
+        )
+        .await
+        .unwrap();
+    assert_eq!(recursive_rows, [1, 2]);
+
+    c.query_drop("CREATE MATERIALIZED VIEW collision_mv AS SELECT id FROM chain_source")
+        .await
+        .unwrap();
+    c.query_drop("CREATE VIEW collision_shadow AS SELECT id FROM collision_mv")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE collision_shadow (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO chain_source VALUES (3)")
+        .await
+        .unwrap();
+    let collision_max: i64 = c
+        .query_first("SELECT MAX(id) FROM collision_shadow")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        collision_max, 3,
+        "validation must follow view expansion priority"
+    );
+
+    c.query_drop("CREATE TABLE view_source (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO view_source VALUES (1), (2)")
+        .await
+        .unwrap();
+    c.query_drop("CREATE VIEW stored_v AS SELECT id FROM view_source")
+        .await
+        .unwrap();
+    c.query_drop(
+        "CREATE VIEW union_over_view AS
+         SELECT id FROM stored_v UNION ALL SELECT id FROM view_source",
+    )
+    .await
+    .unwrap();
+    let union_view_count: i64 = c
+        .query_first(
+            "SELECT COUNT(*) FROM information_schema.views
+             WHERE table_name = 'union_over_view'",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(union_view_count, 1);
+    let invalid_function = c
+        .query_drop(
+            "CREATE VIEW invalid_function_view AS
+             SELECT no_such_function(id) AS bad FROM view_source",
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(invalid_function, mysql_async::Error::Server(_)));
+    let invalid_count: i64 = c
+        .query_first(
+            "SELECT COUNT(*) FROM information_schema.views
+             WHERE table_name = 'invalid_function_view'",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(invalid_count, 0);
+    for sql in [
+        "CREATE VIEW invalid_where_view AS
+         SELECT id FROM view_source WHERE no_such_column = 1",
+        "EXPLAIN SELECT no_such_column FROM view_source",
+        "EXPLAIN SELECT id FROM view_source WHERE no_such_column = 1",
+    ] {
+        let error = c.query_drop(sql).await.unwrap_err();
+        assert!(
+            matches!(error, mysql_async::Error::Server(ref error)
+                if error.code == 1054 && error.state == "42S22"),
+            "{sql}: expected unknown-column error, got {error:?}"
+        );
+    }
+    c.query_drop(
+        "CREATE VIEW deferred_scalar_view AS
+         SELECT (SELECT id FROM view_source) AS id",
+    )
+    .await
+    .unwrap();
+    let deferred_count: i64 = c
+        .query_first(
+            "SELECT COUNT(*) FROM information_schema.views
+             WHERE table_name = 'deferred_scalar_view'",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(deferred_count, 1);
+
+    c.query_drop("CREATE TABLE `m_` (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE mx (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    let escaped_names: Vec<String> = c
+        .query("SHOW TABLE STATUS LIKE 'm\\\\_'")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row: mysql_async::Row| row.get("Name").unwrap())
+        .collect();
+    assert_eq!(escaped_names, ["m_"]);
+    for sql in [
+        "SHOW TABLE STATUS LIKE 'mx' garbage",
+        "SHOW TABLE STATUS LIKE 'mx' FROM review_tenant",
+        "SHOW TABLE STATUS WHERE Name = 'mx'",
+    ] {
+        assert!(
+            c.query_drop(sql).await.is_err(),
+            "{sql}: expected rejection"
+        );
+    }
+
+    c.query_drop("CREATE TABLE missing_database (line TEXT)")
+        .await
+        .unwrap();
+    c.query_drop(
+        "CREATE TABLE wrong_partition (id INT PRIMARY KEY)
+         PARTITION BY RANGE (id) (
+             PARTITION p0 VALUES LESS THAN (10),
+             PARTITION pmax VALUES LESS THAN (MAXVALUE)
+         )",
+    )
+    .await
+    .unwrap();
+    c.query_drop("INSERT INTO wrong_partition VALUES (1), (20)")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE trigger_schema (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE trigger_audit (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    for sql in [
+        "CREATE TRIGGER missing_database.wrong_name
+         AFTER INSERT ON trigger_schema
+         FOR EACH ROW INSERT INTO trigger_audit VALUES (NEW.id)",
+        "CREATE PROCEDURE missing_database.wrong_name()
+         BEGIN SELECT 1; END",
+    ] {
+        let error = c.query_drop(sql).await.unwrap_err();
+        assert!(
+            matches!(error, mysql_async::Error::Server(ref error) if error.code == 1049),
+            "{sql}: expected 1049, got {error:?}"
+        );
+    }
+    c.query_drop(
+        "CREATE TRIGGER local_trigger AFTER INSERT ON trigger_schema
+         FOR EACH ROW INSERT INTO trigger_audit VALUES (NEW.id)",
+    )
+    .await
+    .unwrap();
+    c.query_drop("CREATE PROCEDURE local_procedure() BEGIN SELECT 1; END")
+        .await
+        .unwrap();
+    for sql in [
+        "DROP TRIGGER missing_database.local_trigger",
+        "DROP PROCEDURE missing_database.local_procedure",
+        "CALL missing_database.local_procedure()",
+    ] {
+        let error = c.query_drop(sql).await.unwrap_err();
+        assert!(
+            matches!(error, mysql_async::Error::Server(ref error) if error.code == 1049),
+            "{sql}: expected 1049, got {error:?}"
+        );
+    }
+    c.query_drop("INSERT INTO trigger_schema VALUES (7)")
+        .await
+        .unwrap();
+    let audit_id: i64 = c
+        .query_first("SELECT id FROM trigger_audit")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(audit_id, 7);
+    c.query_drop("CALL local_procedure()").await.unwrap();
+    let load_path = std::env::temp_dir().join(format!(
+        "elyrasql-review-load-{}-{}.txt",
+        std::process::id(),
+        srv.port
+    ));
+    std::fs::write(&load_path, "unsafe\n").unwrap();
+    let load_sql = format!(
+        "LOAD DATA INFILE '{}' INTO TABLE missing_database . load_target",
+        load_path.display()
+    );
+    for (sql, code) in [
+        (load_sql.as_str(), 1049),
+        (
+            "ALTER TABLE missing_database . wrong_partition TRUNCATE PARTITION p0",
+            1049,
+        ),
+        (
+            "CREATE TRIGGER wrong_target AFTER INSERT ON missing_database . trigger_schema
+             FOR EACH ROW INSERT INTO trigger_audit VALUES (NEW.id)",
+            1049,
+        ),
+        ("LOCK TABLES missing_database . trigger_schema WRITE", 1049),
+    ] {
+        let error = c.query_drop(sql).await.unwrap_err();
+        assert!(
+            matches!(error, mysql_async::Error::Server(ref error) if error.code == code),
+            "{sql}: expected {code}, got {error:?}"
+        );
+    }
+    std::fs::remove_file(load_path).unwrap();
+    let partition_rows: Vec<i64> = c
+        .query("SELECT id FROM wrong_partition ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(partition_rows, [1, 20]);
+
+    c.query_drop(
+        "CREATE TABLE review_tenant . spaced_partition (id INT PRIMARY KEY)
+         PARTITION BY RANGE (id) (
+             PARTITION p0 VALUES LESS THAN (10),
+             PARTITION pmax VALUES LESS THAN (MAXVALUE)
+         )",
+    )
+    .await
+    .unwrap();
+    c.query_drop("INSERT INTO spaced_partition VALUES (1), (20)")
+        .await
+        .unwrap();
+    c.query_drop("ALTER TABLE review_tenant . spaced_partition TRUNCATE PARTITION p0")
+        .await
+        .unwrap();
+    let spaced_rows: Vec<i64> = c
+        .query("SELECT id FROM spaced_partition ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(spaced_rows, [20]);
+
+    c.query_drop("CREATE TABLE DmlCase (id INT PRIMARY KEY, payload INT)")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE dmlcase (id INT PRIMARY KEY, payload INT)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO DmlCase VALUES (1, 10)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO dmlcase VALUES (1, 20)")
+        .await
+        .unwrap();
+    let case_error = c
+        .query_drop("UPDATE DmlCase SET review_tenant.dmlcase.payload = 99 WHERE id = 1")
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        case_error,
+        mysql_async::Error::Server(ref error) if error.code == 1054
+    ));
+    let payloads: (i64, i64) = (
+        c.query_first("SELECT payload FROM DmlCase WHERE id = 1")
+            .await
+            .unwrap()
+            .unwrap(),
+        c.query_first("SELECT payload FROM dmlcase WHERE id = 1")
+            .await
+            .unwrap()
+            .unwrap(),
+    );
+    assert_eq!(payloads, (10, 20));
+}
+
+#[tokio::test]
+async fn static_validation_matches_supported_query_shapes() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn_to_database("static_validation").await;
+
+    c.query_drop("CREATE TABLE source (id INT PRIMARY KEY, doc JSON)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO source VALUES (1, '{\"ok\": true}')")
+        .await
+        .unwrap();
+
+    for (name, sql) in [
+        (
+            "invalid_json_arity",
+            "CREATE VIEW invalid_json_arity AS
+             SELECT JSON_EXTRACT(doc) AS value FROM source",
+        ),
+        (
+            "invalid_where_aggregate",
+            "CREATE VIEW invalid_where_aggregate AS
+             SELECT id FROM source WHERE SUM(id) > 0",
+        ),
+        (
+            "invalid_recursive_anchor",
+            "CREATE VIEW invalid_recursive_anchor AS
+             WITH RECURSIVE seq(n) AS (
+                 SELECT no_such_column FROM source
+                 UNION ALL
+                 SELECT n + 1 FROM seq WHERE n < 2
+             )
+             SELECT n FROM seq",
+        ),
+    ] {
+        let error = c.query_drop(sql).await.unwrap_err();
+        assert!(
+            matches!(error, mysql_async::Error::Server(_)),
+            "{sql}: expected a server error, got {error:?}"
+        );
+        let persisted: i64 = c
+            .exec_first(
+                "SELECT COUNT(*) FROM information_schema.views WHERE table_name = ?",
+                (name,),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted, 0, "{name} must not be persisted");
+    }
+    for sql in [
+        "EXPLAIN SELECT JSON_EXTRACT(doc) FROM source",
+        "EXPLAIN SELECT id FROM source WHERE SUM(id) > 0",
+        "EXPLAIN WITH RECURSIVE seq(n) AS (
+             SELECT no_such_column FROM source
+             UNION ALL
+             SELECT n + 1 FROM seq WHERE n < 2
+         )
+         SELECT n FROM seq",
+    ] {
+        let error = c.query_drop(sql).await.unwrap_err();
+        assert!(
+            matches!(error, mysql_async::Error::Server(_)),
+            "{sql}: expected a server error, got {error:?}"
+        );
+    }
+
+    c.query_drop(
+        "CREATE VIEW recursive_view AS
+         WITH RECURSIVE seq(n) AS (
+             SELECT id FROM source
+             UNION ALL
+             SELECT n + 1 FROM seq WHERE n < 2
+         )
+         SELECT n FROM seq",
+    )
+    .await
+    .unwrap();
+    c.query_drop("EXPLAIN SELECT n FROM recursive_view")
+        .await
+        .unwrap();
+    c.query_drop("CREATE VIEW recursive_wrapper AS SELECT n FROM recursive_view")
+        .await
+        .unwrap();
+
+    c.query_drop(
+        "CREATE TABLE hybrid_docs (
+             id INT PRIMARY KEY,
+             body TEXT,
+             embedding VECTOR(2)
+         )",
+    )
+    .await
+    .unwrap();
+    c.query_drop("INSERT INTO hybrid_docs VALUES (1, 'privacy law', '[1, 0]')")
+        .await
+        .unwrap();
+    c.query_drop("CREATE INDEX hybrid_embedding ON hybrid_docs (embedding)")
+        .await
+        .unwrap();
+    let hybrid =
+        "SELECT id, HYBRID(body, 'privacy', embedding, '[1, 0]') AS score FROM hybrid_docs";
+    let live_rows: Vec<(i64, f64)> = c.query(hybrid).await.unwrap();
+    assert_eq!(live_rows.len(), 1);
+    c.query_drop(format!("EXPLAIN {hybrid}")).await.unwrap();
+    c.query_drop(format!("CREATE VIEW hybrid_view AS {hybrid}"))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn static_validation_rejects_runtime_incompatible_shapes() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn_to_database("static_review").await;
+
+    c.query_drop("CREATE TABLE source (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO source VALUES (1), (2)")
+        .await
+        .unwrap();
+
+    let aliases: Vec<i64> = c
+        .query(
+            "WITH c(alias_id) AS (SELECT id FROM source) SELECT alias_id FROM c ORDER BY alias_id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(aliases, [1, 2]);
+    c.query_drop(
+        "CREATE VIEW valid_cte_alias AS
+         WITH c(alias_id) AS (SELECT id FROM source) SELECT alias_id FROM c",
+    )
+    .await
+    .unwrap();
+    c.query_drop("EXPLAIN WITH c(alias_id) AS (SELECT id FROM source) SELECT alias_id FROM c")
+        .await
+        .unwrap();
+
+    for sql in [
+        "WITH c(a, b) AS (SELECT id FROM source) SELECT * FROM c",
+        "WITH RECURSIVE c(a, b) AS (
+             SELECT id FROM source WHERE id = 1
+             UNION ALL SELECT a + 1 FROM c WHERE a < 2
+         ) SELECT * FROM c",
+        "SELECT SUM(MAX(id)) FROM source",
+        "SELECT SUM(id, id) FROM source",
+        "SELECT SUM(ROW_NUMBER() OVER (ORDER BY id)) FROM source",
+        "SELECT YEAR() FROM source",
+    ] {
+        let error = c.query_drop(sql).await.unwrap_err();
+        assert!(
+            matches!(error, mysql_async::Error::Server(_)),
+            "{sql}: expected a server error, got {error:?}"
+        );
+        let alive: i64 = c.query_first("SELECT 1").await.unwrap().unwrap();
+        assert_eq!(alive, 1, "{sql}: the connection must survive rejection");
+    }
+
+    for (name, body) in [
+        (
+            "invalid_cte_width",
+            "WITH c(a, b) AS (SELECT id FROM source) SELECT * FROM c",
+        ),
+        (
+            "invalid_recursive_width",
+            "WITH RECURSIVE c(a, b) AS (
+                 SELECT id FROM source WHERE id = 1
+                 UNION ALL SELECT a + 1 FROM c WHERE a < 2
+             ) SELECT * FROM c",
+        ),
+        (
+            "invalid_nested_aggregate",
+            "SELECT SUM(MAX(id)) FROM source",
+        ),
+        ("invalid_aggregate_arity", "SELECT SUM(id, id) FROM source"),
+        (
+            "invalid_window_nesting",
+            "SELECT SUM(ROW_NUMBER() OVER (ORDER BY id)) FROM source",
+        ),
+        ("invalid_year_arity", "SELECT YEAR() FROM source"),
+        ("invalid_values", "VALUES (1)"),
+        ("invalid_table_query", "TABLE source"),
+        (
+            "invalid_union_values",
+            "SELECT id FROM source UNION ALL VALUES (3)",
+        ),
+    ] {
+        let create = format!("CREATE VIEW {name} AS {body}");
+        assert!(c.query_drop(&create).await.is_err(), "{create}");
+        let explain = format!("EXPLAIN {body}");
+        assert!(c.query_drop(&explain).await.is_err(), "{explain}");
+        let persisted: i64 = c
+            .exec_first(
+                "SELECT COUNT(*) FROM information_schema.views WHERE table_name = ?",
+                (name,),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted, 0, "{name} must not be persisted");
+    }
+
+    c.query_drop("CREATE TABLE outer_source (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE left_source (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE right_source (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    let ambiguous = "SELECT o.id FROM outer_source AS o
+         WHERE EXISTS (
+             SELECT 1 FROM left_source AS l JOIN right_source AS r ON l.id = r.id
+             WHERE id = o.id
+         )";
+    assert!(c.query_drop(format!("EXPLAIN {ambiguous}")).await.is_err());
+    assert!(c
+        .query_drop(format!(
+            "CREATE VIEW invalid_ambiguous_local AS {ambiguous}"
+        ))
+        .await
+        .is_err());
+    c.query_drop(
+        "CREATE VIEW valid_qualified_local AS
+         SELECT o.id FROM outer_source AS o
+         WHERE EXISTS (
+             SELECT 1 FROM left_source AS l JOIN right_source AS r ON l.id = r.id
+             WHERE l.id = o.id
+         )",
+    )
+    .await
+    .unwrap();
+
+    c.query_drop(
+        "CREATE TABLE hybrid_docs (
+             id INT PRIMARY KEY,
+             body TEXT,
+             embedding VECTOR(2)
+         )",
+    )
+    .await
+    .unwrap();
+    let hybrid_order = "SELECT id FROM hybrid_docs
+         ORDER BY HYBRID(body, 'privacy', embedding, '[1, 0]')";
+    assert!(c
+        .query_drop(format!("EXPLAIN {hybrid_order}"))
+        .await
+        .is_err());
+    assert!(c
+        .query_drop(format!(
+            "CREATE VIEW invalid_hybrid_order AS {hybrid_order}"
+        ))
+        .await
+        .is_err());
+
+    for (name, body) in [
+        (
+            "invalid_offset_column",
+            "SELECT id FROM source LIMIT 1 OFFSET no_such_column",
+        ),
+        (
+            "invalid_offset_function",
+            "SELECT id FROM source LIMIT 1 OFFSET YEAR()",
+        ),
+        (
+            "invalid_offset_relation",
+            "SELECT id FROM source LIMIT 1
+             OFFSET (SELECT id FROM missing_offset_relation)",
+        ),
+    ] {
+        let explain = format!("EXPLAIN {body}");
+        assert!(c.query_drop(&explain).await.is_err(), "{explain}");
+        let create = format!("CREATE VIEW {name} AS {body}");
+        assert!(c.query_drop(&create).await.is_err(), "{create}");
+    }
+    c.query_drop("EXPLAIN SELECT id FROM source LIMIT 1 OFFSET 1")
+        .await
+        .unwrap();
+
+    let sum: i64 = c
+        .query_first("SELECT SUM(id) FROM source")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(sum, 3);
+    let year: i64 = c
+        .query_first("SELECT YEAR('2024-01-02')")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(year, 2024);
+    c.query_drop("EXPLAIN SELECT id FROM source UNION ALL SELECT 3")
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn static_validation_integrates_runtime_relation_semantics() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn_to_database("static_integration").await;
+
+    c.query_drop("CREATE TABLE source (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO source VALUES (1)").await.unwrap();
+    c.query_drop("CREATE TABLE joined (id INT PRIMARY KEY, label TEXT)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO joined VALUES (1, 'one')")
+        .await
+        .unwrap();
+
+    for (name, body) in [
+        ("wrong_column", "SELECT wrong.id FROM source"),
+        ("hidden_column", "SELECT source.id FROM source AS visible"),
+        ("wrong_wildcard", "SELECT wrong.* FROM source"),
+        ("hidden_wildcard", "SELECT source.* FROM source AS visible"),
+        (
+            "invalid_using",
+            "SELECT * FROM source JOIN joined USING (no_such)",
+        ),
+    ] {
+        assert!(c.query_drop(body).await.is_err(), "runtime accepted {body}");
+        assert!(
+            c.query_drop(format!("EXPLAIN {body}")).await.is_err(),
+            "EXPLAIN accepted {body}"
+        );
+        let create = format!("CREATE VIEW {name} AS {body}");
+        assert!(c.query_drop(&create).await.is_err(), "{create}");
+        let persisted: i64 = c
+            .exec_first(
+                "SELECT COUNT(*) FROM information_schema.views WHERE table_name = ?",
+                (name,),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted, 0, "{name} must not be persisted");
+    }
+
+    let nested_cte = "WITH base AS (SELECT id FROM source)
+        SELECT nested.id FROM (
+            WITH inner_cte AS (SELECT id FROM base)
+            SELECT id FROM inner_cte
+        ) AS nested";
+    c.query_drop(format!("EXPLAIN {nested_cte}")).await.unwrap();
+    c.query_drop(format!("CREATE VIEW nested_cte_view AS {nested_cte}"))
+        .await
+        .unwrap();
+    let nested_id: i64 = c
+        .query_first("SELECT id FROM nested_cte_view")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(nested_id, 1);
+
+    let valid_using = "SELECT id, source.id AS source_id, joined.id AS joined_id
+        FROM source JOIN joined USING (id)";
+    c.query_drop(format!("EXPLAIN {valid_using}"))
+        .await
+        .unwrap();
+    c.query_drop(format!("CREATE VIEW valid_using_view AS {valid_using}"))
+        .await
+        .unwrap();
+    let joined_ids: (i64, i64, i64) = c
+        .query_first("SELECT id, source_id, joined_id FROM valid_using_view")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(joined_ids, (1, 1, 1));
+}
+
+#[tokio::test]
+async fn explicit_materialized_view_refresh_is_atomic() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn_to_database("explicit_refresh").await;
+
+    c.query_drop("CREATE TABLE refresh_rows (id INT PRIMARY KEY, doc TEXT)")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE user_writes (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop(
+        "CREATE MATERIALIZED VIEW atomic_mv AS SELECT id
+         FROM refresh_rows WHERE doc REGEXP '['",
+    )
+    .await
+    .unwrap();
+    c.query_drop("CREATE INDEX refresh_marker ON atomic_mv (id)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO refresh_rows VALUES (1, 'trigger')")
+        .await
+        .unwrap();
+
+    assert!(c
+        .query_drop("REFRESH MATERIALIZED VIEW atomic_mv")
+        .await
+        .is_err());
+    let marker_count: i64 = c
+        .query_first(
+            "SELECT COUNT(*) FROM information_schema.statistics
+             WHERE table_name = 'atomic_mv' AND index_name = 'refresh_marker'",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(marker_count, 1, "failed refresh must preserve indexes");
+
+    c.query_drop("START TRANSACTION").await.unwrap();
+    c.query_drop("INSERT INTO user_writes VALUES (0)")
+        .await
+        .unwrap();
+    c.query_drop("SAVEPOINT __elyra_auto_refresh_0")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO user_writes VALUES (1)")
+        .await
+        .unwrap();
+    assert!(c
+        .query_drop("REFRESH MATERIALIZED VIEW atomic_mv")
+        .await
+        .is_err());
+    c.query_drop("ROLLBACK TO SAVEPOINT __elyra_auto_refresh_0")
+        .await
+        .unwrap();
+    let staged: i64 = c
+        .query_first("SELECT COUNT(*) FROM user_writes")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(staged, 1, "the client savepoint must remain addressable");
+    c.query_drop("ROLLBACK").await.unwrap();
+
+    c.query_drop("DELETE FROM refresh_rows WHERE id = 1")
+        .await
+        .unwrap();
+    c.query_drop("REFRESH MATERIALIZED VIEW atomic_mv")
+        .await
+        .unwrap();
+    let row_count: i64 = c
+        .query_first("SELECT COUNT(*) FROM atomic_mv")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row_count, 0);
+}
+
+#[tokio::test]
+async fn recursive_ctes_do_not_capture_schema_qualified_relations() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn_to_database("recursive_tenant").await;
+
+    c.query_drop("CREATE TABLE recursive_source (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO recursive_source VALUES (1)")
+        .await
+        .unwrap();
+
+    // WITH RECURSIVE also permits non-recursive CTEs. A qualified relation is
+    // physical even when its final component matches a CTE in the same scope.
+    let id: i64 = c
+        .query_first(
+            "WITH RECURSIVE recursive_source AS (SELECT 99 AS id)
+             SELECT id FROM recursive_tenant.recursive_source",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(id, 1);
+
+    for (sql, code) in [
+        (
+            "WITH RECURSIVE recursive_source AS (SELECT 99 AS id)
+             SELECT id FROM missing_database.recursive_source",
+            1049,
+        ),
+        (
+            "WITH RECURSIVE recursive_source AS (SELECT 99 AS id)
+             SELECT id FROM def.recursive_tenant.recursive_source",
+            1064,
+        ),
+    ] {
+        let error = c.query_drop(sql).await.unwrap_err();
+        assert!(
+            matches!(error, mysql_async::Error::Server(ref error) if error.code == code),
+            "{sql}: expected MySQL error {code}, got {error:?}"
+        );
+    }
+
+    let catalog_rows: i64 = c
+        .query_first(
+            "WITH RECURSIVE tables AS (SELECT 99 AS marker)
+             SELECT COUNT(*) FROM information_schema.tables
+             WHERE table_schema = 'recursive_tenant'
+               AND table_name = 'recursive_source'",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(catalog_rows, 1);
+
+    let users: Vec<String> = c
+        .query(
+            "WITH RECURSIVE user AS (SELECT 'fake' AS User)
+             SELECT User FROM mysql.user WHERE User = 'root'",
+        )
+        .await
+        .unwrap();
+    assert_eq!(users, ["root"]);
+
+    // The qualified physical relation is the anchor, not another recursive
+    // self-reference. Only the unqualified relation in the second arm is recursive.
+    let ids: Vec<i64> = c
+        .query(
+            "WITH RECURSIVE recursive_source (id) AS (
+                 SELECT id FROM recursive_tenant.recursive_source
+                 UNION ALL
+                 SELECT id + 1 FROM recursive_source WHERE id < 2
+             )
+             SELECT id FROM recursive_source ORDER BY id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(ids, [1, 2]);
+}
+
 // Foreign-key introspection joins these two virtual relations and aggregates
 // composite-key columns in ordinal order. The join must stay on the virtual
 // relation path rather than loading either view as a stored table.
@@ -6789,6 +8719,121 @@ async fn fine_grained_privileges() {
         .await
         .is_err());
     del2.query_drop("DELETE FROM t WHERE id=1").await.unwrap();
+}
+
+#[tokio::test]
+async fn grant_and_revoke_reject_unselected_database_qualifiers() {
+    let srv = TestServer::start_with_auth("root", "rootpw").await;
+    let mut root = srv.conn_as("root", "rootpw").await;
+    let database: String = root
+        .query_first("SELECT DATABASE()")
+        .await
+        .unwrap()
+        .unwrap();
+
+    root.query_drop("CREATE TABLE grant_victim (id INT PRIMARY KEY, payload INT)")
+        .await
+        .unwrap();
+    root.query_drop("INSERT INTO grant_victim VALUES (1, 10)")
+        .await
+        .unwrap();
+    root.query_drop(format!(
+        "CREATE TABLE `{database}.grant_victim` (id INT PRIMARY KEY, payload INT)"
+    ))
+    .await
+    .unwrap();
+    root.query_drop(format!(
+        "INSERT INTO `{database}.grant_victim` VALUES (1, 100)"
+    ))
+    .await
+    .unwrap();
+    root.query_drop("CREATE TABLE `*.*` (id INT PRIMARY KEY, payload INT)")
+        .await
+        .unwrap();
+    root.query_drop("INSERT INTO `*.*` VALUES (1, 1000)")
+        .await
+        .unwrap();
+    for user in [
+        "table_reader",
+        "database_reader",
+        "quoted_reader",
+        "quoted_star_reader",
+    ] {
+        root.query_drop(format!("CREATE USER '{user}' IDENTIFIED BY 'passw0rd'"))
+            .await
+            .unwrap();
+    }
+
+    for sql in [
+        "GRANT UPDATE ON missing_database.grant_victim TO 'table_reader'",
+        "GRANT UPDATE ON missing_database.* TO 'database_reader'",
+        "REVOKE UPDATE ON missing_database.grant_victim FROM 'table_reader'",
+        "REVOKE UPDATE ON missing_database.* FROM 'database_reader'",
+    ] {
+        let error = root.query_drop(sql).await.unwrap_err();
+        assert!(
+            matches!(error, mysql_async::Error::Server(ref error) if error.code == 1049),
+            "{sql}: expected 1049, got {error:?}"
+        );
+    }
+
+    let mut table_reader = srv.conn_as("table_reader", "passw0rd").await;
+    let mut database_reader = srv.conn_as("database_reader", "passw0rd").await;
+    assert!(table_reader
+        .query_drop("UPDATE grant_victim SET payload = 20 WHERE id = 1")
+        .await
+        .is_err());
+    assert!(database_reader
+        .query_drop("UPDATE grant_victim SET payload = 30 WHERE id = 1")
+        .await
+        .is_err());
+
+    root.query_drop(format!(
+        "GRANT UPDATE ON `{database}.grant_victim` TO 'quoted_reader'"
+    ))
+    .await
+    .unwrap();
+    let mut quoted_reader = srv.conn_as("quoted_reader", "passw0rd").await;
+    assert!(quoted_reader
+        .query_drop("UPDATE grant_victim SET payload = 40 WHERE id = 1")
+        .await
+        .is_err());
+    quoted_reader
+        .query_drop(format!(
+            "UPDATE `{database}.grant_victim` SET payload = 110 WHERE id = 1"
+        ))
+        .await
+        .unwrap();
+
+    root.query_drop("GRANT UPDATE ON `*.*` TO 'quoted_star_reader'")
+        .await
+        .unwrap();
+    let mut quoted_star_reader = srv.conn_as("quoted_star_reader", "passw0rd").await;
+    assert!(quoted_star_reader
+        .query_drop("UPDATE grant_victim SET payload = 50 WHERE id = 1")
+        .await
+        .is_err());
+    quoted_star_reader
+        .query_drop("UPDATE `*.*` SET payload = 1010 WHERE id = 1")
+        .await
+        .unwrap();
+
+    root.query_drop(format!(
+        "GRANT UPDATE ON {database}.grant_victim TO 'table_reader'"
+    ))
+    .await
+    .unwrap();
+    root.query_drop(format!("GRANT UPDATE ON {database}.* TO 'database_reader'"))
+        .await
+        .unwrap();
+    table_reader
+        .query_drop("UPDATE grant_victim SET payload = 20 WHERE id = 1")
+        .await
+        .unwrap();
+    database_reader
+        .query_drop("UPDATE grant_victim SET payload = 30 WHERE id = 1")
+        .await
+        .unwrap();
 }
 
 // Faceted search (ESQL-17): FACET(col[, n]) returns a value->count JSON object

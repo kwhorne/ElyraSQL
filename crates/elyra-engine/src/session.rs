@@ -42,6 +42,10 @@ struct TxnState {
     locked: BTreeSet<Vec<u8>>,
     /// Named savepoints (markers into `undo`/`ranges`), innermost last.
     savepoints: Vec<Savepoint>,
+    /// Engine-owned statement checkpoints currently keeping the undo log live.
+    /// These are separate from named savepoints so SQL clients cannot collide
+    /// with or release an internal marker.
+    checkpoints: usize,
     /// Reversible log of buffered-write mutations, recorded only while at least
     /// one savepoint is active. Lets `ROLLBACK TO` revert in
     /// O(changes-since-savepoint) instead of cloning the whole staged write set
@@ -60,12 +64,55 @@ struct Savepoint {
     ranges_len: usize,
 }
 
+/// Opaque marker used to make an engine-internal operation atomic inside an
+/// existing transaction without entering the user-visible savepoint namespace.
+pub(crate) struct TransactionCheckpoint {
+    undo_mark: usize,
+    ranges_len: usize,
+    savepoints_len: usize,
+}
+
 /// One reversible mutation to the buffered write set for a single key: the
 /// state of that key (in `puts` / `deletes`) *before* the mutation.
 struct UndoEntry {
     key: Vec<u8>,
     prev_put: Option<Vec<u8>>,
     prev_deleted: bool,
+}
+
+fn rollback_tx_to(tx: &mut TxnState, undo_mark: usize, ranges_len: usize) {
+    while tx.undo.len() > undo_mark {
+        let UndoEntry {
+            key,
+            prev_put,
+            prev_deleted,
+        } = tx.undo.pop().unwrap();
+        if let Some(value) = tx.puts.get(&key) {
+            tx.mem -= key.len() + value.len();
+        }
+        if tx.deletes.contains(&key) {
+            tx.mem -= key.len();
+        }
+        match prev_put {
+            Some(value) => {
+                tx.mem += key.len() + value.len();
+                tx.puts.insert(key.clone(), value);
+            }
+            None => {
+                tx.puts.remove(&key);
+            }
+        }
+        if prev_deleted {
+            tx.mem += key.len();
+            tx.deletes.insert(key);
+        } else {
+            tx.deletes.remove(&key);
+        }
+    }
+    // Ranges are append-only, so truncation restores them exactly. `reads`
+    // and `locked` deliberately remain: they only make conflict validation
+    // more conservative, never incorrect.
+    tx.ranges.truncate(ranges_len);
 }
 
 pub struct Session {
@@ -350,6 +397,7 @@ impl Session {
             ranges: Vec::new(),
             locked: BTreeSet::new(),
             savepoints: Vec::new(),
+            checkpoints: 0,
             undo: Vec::new(),
             mem: 0,
         });
@@ -393,41 +441,7 @@ impl Session {
             .ok_or_else(|| Error::Query(format!("no such savepoint: {name}")))?;
         let mark = tx.savepoints[pos].undo_mark;
         let ranges_len = tx.savepoints[pos].ranges_len;
-        // Revert buffered-write mutations back to the savepoint, newest first;
-        // each entry restores one key's prior put/delete state.
-        while tx.undo.len() > mark {
-            let UndoEntry {
-                key,
-                prev_put,
-                prev_deleted,
-            } = tx.undo.pop().unwrap();
-            if let Some(v) = tx.puts.get(&key) {
-                tx.mem -= key.len() + v.len();
-            }
-            if tx.deletes.contains(&key) {
-                tx.mem -= key.len();
-            }
-            match prev_put {
-                Some(v) => {
-                    tx.mem += key.len() + v.len();
-                    tx.puts.insert(key.clone(), v);
-                }
-                None => {
-                    tx.puts.remove(&key);
-                }
-            }
-            if prev_deleted {
-                tx.mem += key.len();
-                tx.deletes.insert(key);
-            } else {
-                tx.deletes.remove(&key);
-            }
-        }
-        // Ranges are append-only, so truncation restores them exactly. `reads`
-        // and `locked` are intentionally kept: they only make commit-time
-        // conflict validation more conservative (never incorrect), and reverting
-        // them would reintroduce the expensive per-savepoint set clones.
-        tx.ranges.truncate(ranges_len);
+        rollback_tx_to(tx, mark, ranges_len);
         tx.savepoints.truncate(pos + 1);
         Ok(())
     }
@@ -446,8 +460,60 @@ impl Session {
             .ok_or_else(|| Error::Query(format!("no such savepoint: {name}")))?;
         tx.savepoints.truncate(pos);
         // With no savepoints left, the undo log is no longer needed.
-        if tx.savepoints.is_empty() {
+        if tx.savepoints.is_empty() && tx.checkpoints == 0 {
             tx.undo = Vec::new();
+        }
+        Ok(())
+    }
+
+    pub(crate) fn transaction_checkpoint(&self) -> Result<TransactionCheckpoint> {
+        let mut guard = self.txn.lock().unwrap();
+        let tx = guard
+            .as_mut()
+            .ok_or_else(|| Error::Query("transaction checkpoint outside a transaction".into()))?;
+        let checkpoint = TransactionCheckpoint {
+            undo_mark: tx.undo.len(),
+            ranges_len: tx.ranges.len(),
+            savepoints_len: tx.savepoints.len(),
+        };
+        tx.checkpoints += 1;
+        Ok(checkpoint)
+    }
+
+    pub(crate) fn release_transaction_checkpoint(
+        &self,
+        _checkpoint: TransactionCheckpoint,
+    ) -> Result<()> {
+        let mut guard = self.txn.lock().unwrap();
+        let tx = guard
+            .as_mut()
+            .ok_or_else(|| Error::Query("transaction checkpoint outside a transaction".into()))?;
+        tx.checkpoints = tx
+            .checkpoints
+            .checked_sub(1)
+            .ok_or_else(|| Error::Query("no active transaction checkpoint".into()))?;
+        if tx.checkpoints == 0 && tx.savepoints.is_empty() {
+            tx.undo.clear();
+        }
+        Ok(())
+    }
+
+    pub(crate) fn rollback_transaction_checkpoint(
+        &self,
+        checkpoint: TransactionCheckpoint,
+    ) -> Result<()> {
+        let mut guard = self.txn.lock().unwrap();
+        let tx = guard
+            .as_mut()
+            .ok_or_else(|| Error::Query("transaction checkpoint outside a transaction".into()))?;
+        tx.checkpoints = tx
+            .checkpoints
+            .checked_sub(1)
+            .ok_or_else(|| Error::Query("no active transaction checkpoint".into()))?;
+        rollback_tx_to(tx, checkpoint.undo_mark, checkpoint.ranges_len);
+        tx.savepoints.truncate(checkpoint.savepoints_len);
+        if tx.checkpoints == 0 && tx.savepoints.is_empty() {
+            tx.undo.clear();
         }
         Ok(())
     }
@@ -464,6 +530,7 @@ impl Session {
             ranges,
             locked,
             savepoints: _,
+            checkpoints: _,
             undo: _,
             mem: _,
         } = tx;
@@ -692,7 +759,7 @@ impl Session {
             let mut guard = self.txn.lock().unwrap();
             if let Some(tx) = guard.as_mut() {
                 let budget = txn_max_bytes();
-                let logging = !tx.savepoints.is_empty();
+                let logging = !tx.savepoints.is_empty() || tx.checkpoints > 0;
                 // Match the storage-layer write order: deletes first, then
                 // puts. An unchanged index entry can occur in both collections
                 // during UPDATE, and the replacement must remain visible.

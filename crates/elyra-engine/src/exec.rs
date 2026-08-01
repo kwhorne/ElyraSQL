@@ -8,9 +8,9 @@ use elyra_core::{ColumnDef, ColumnType, Error, Result, Schema, Value};
 use sqlparser::ast::{
     AlterColumnOperation, AlterTableOperation, Assignment, AssignmentTarget, ColumnOption,
     CreateIndex, CreateTable, DataType, Delete, FromTable, Ident, Insert, JoinConstraint,
-    JoinOperator, ObjectName, OrderByExpr, Query as SqlQuery, Select, SetExpr, Statement,
-    TableAlias, TableAliasColumnDef, TableConstraint, TableFactor, TableWithJoins, Visit, VisitMut,
-    Visitor, VisitorMut, With,
+    JoinOperator, ObjectName, OrderByExpr, Query as SqlQuery, Select, SetExpr, TableAlias,
+    TableAliasColumnDef, TableConstraint, TableFactor, TableWithJoins, Visit, VisitMut, Visitor,
+    VisitorMut, With,
 };
 use std::ops::ControlFlow;
 
@@ -37,11 +37,71 @@ use crate::QueryResult;
 use elyra_vector::Metric;
 use sqlparser::ast::Expr;
 
-fn table_ident(name: &ObjectName) -> Result<String> {
-    name.0
-        .last()
-        .map(|i| i.value.clone())
-        .ok_or_else(|| Error::Catalog("empty table name".into()))
+/// Resolve a stored relation name in the session's single logical database.
+/// ElyraSQL has one physical catalog per session, so silently discarding a
+/// different schema qualifier would read the wrong relation.
+pub(crate) fn stored_table_ident(db: &Session, name: &ObjectName) -> Result<String> {
+    match name.0.as_slice() {
+        [table] => Ok(table.value.clone()),
+        [schema, table] if schema.value == db.database() => Ok(table.value.clone()),
+        [schema, _] => Err(Error::UnknownDatabase(schema.value.clone())),
+        [] => Err(Error::Catalog("empty table name".into())),
+        _ => Err(Error::Parse(format!(
+            "invalid qualified table name: {name}"
+        ))),
+    }
+}
+
+/// Validate a database argument used by metadata statements that do not name
+/// a table. ElyraSQL exposes exactly the session's selected logical database.
+pub(crate) fn selected_database_ident(db: &Session, name: &ObjectName) -> Result<()> {
+    match name.0.as_slice() {
+        [database] if database.value == db.database() => Ok(()),
+        [database] => Err(Error::UnknownDatabase(database.value.clone())),
+        [] => Err(Error::Catalog("empty database name".into())),
+        _ => Err(Error::Parse(format!(
+            "invalid qualified database name: {name}"
+        ))),
+    }
+}
+
+/// Resolve the column portion of an assignment while retaining and validating
+/// every qualifier. Dropping leading components can redirect a rejected MySQL
+/// statement to the local table, which is especially dangerous for DML.
+fn assignment_column_for_table(
+    db: &Session,
+    relation: &ObjectName,
+    alias: Option<&sqlparser::ast::TableAlias>,
+    target: &ObjectName,
+) -> Result<String> {
+    let relation_name = stored_table_ident(db, relation)?;
+    match target.0.as_slice() {
+        [column] => Ok(column.value.clone()),
+        [qualifier, column] => {
+            let expected = alias
+                .map(|a| a.name.value.as_str())
+                .unwrap_or(relation_name.as_str());
+            if qualifier.value == expected {
+                Ok(column.value.clone())
+            } else {
+                Err(Error::UnknownColumn(target.to_string()))
+            }
+        }
+        [schema, qualifier, column] => {
+            let expected = alias
+                .map(|a| a.name.value.as_str())
+                .unwrap_or(relation_name.as_str());
+            if schema.value == db.database() && qualifier.value == expected {
+                Ok(column.value.clone())
+            } else {
+                Err(Error::UnknownColumn(target.to_string()))
+            }
+        }
+        [] => Err(Error::UnknownColumn(String::new())),
+        _ => Err(Error::Parse(format!(
+            "invalid qualified assignment target: {target}"
+        ))),
+    }
 }
 
 fn map_collation(name: &ObjectName) -> elyra_core::Collation {
@@ -179,7 +239,7 @@ pub async fn create_table(
     vindex: &VectorRegistry,
     ct: CreateTable,
 ) -> Result<QueryResult> {
-    let name = table_ident(&ct.name)?;
+    let name = stored_table_ident(db, &ct.name)?;
 
     if catalog::exists(db, &name).await? {
         if ct.if_not_exists {
@@ -190,11 +250,7 @@ pub async fn create_table(
 
     // CREATE TABLE ... LIKE source: copy the structure, no data.
     if let Some(src) = &ct.like {
-        let sname = src
-            .0
-            .last()
-            .map(|i| i.value.clone())
-            .ok_or_else(|| Error::Catalog("empty source table".into()))?;
+        let sname = stored_table_ident(db, src)?;
         let mut def = catalog::load(db, &sname).await?;
         def.name = name.clone();
         db.commit_write(vec![(catalog_key(&name), def.encode()?)], vec![])
@@ -409,6 +465,7 @@ pub async fn create_table(
                 on_update,
                 ..
             } => {
+                let ref_table = stored_table_ident(db, foreign_table)?;
                 let mut fk_cols = Vec::new();
                 for ident in cols {
                     let i = columns
@@ -440,11 +497,7 @@ pub async fn create_table(
                         .map(|n| n.value.clone())
                         .unwrap_or_else(|| format!("fk_{name}_{}", foreign_keys.len())),
                     columns: fk_cols,
-                    ref_table: foreign_table
-                        .0
-                        .last()
-                        .map(|i| i.value.clone())
-                        .unwrap_or_default(),
+                    ref_table,
                     ref_columns: referred_columns.iter().map(|i| i.value.clone()).collect(),
                     on_delete: map_ref_action(on_delete),
                     on_update: map_ref_action(on_update),
@@ -611,19 +664,63 @@ fn system_variables() -> Vec<(&'static str, String)> {
 
 /// Case-insensitive SQL LIKE (`%` = any run, `_` = one char) for SHOW filters.
 fn show_like(name: &str, pattern: &str) -> bool {
-    let n: Vec<char> = name.to_ascii_lowercase().chars().collect();
-    let p: Vec<char> = pattern.to_ascii_lowercase().chars().collect();
-    fn m(n: &[char], p: &[char]) -> bool {
-        if p.is_empty() {
-            return n.is_empty();
-        }
-        match p[0] {
-            '%' => m(n, &p[1..]) || (!n.is_empty() && m(&n[1..], p)),
-            '_' => !n.is_empty() && m(&n[1..], &p[1..]),
-            c => !n.is_empty() && n[0] == c && m(&n[1..], &p[1..]),
+    enum Token {
+        Literal(char),
+        Any,
+        One,
+    }
+
+    let text = name
+        .chars()
+        .map(|character| character.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    let mut tokens = Vec::with_capacity(pattern.len());
+    let mut characters = pattern.chars();
+    while let Some(character) = characters.next() {
+        if character == '\\' {
+            tokens.push(Token::Literal(
+                characters.next().unwrap_or('\\').to_ascii_lowercase(),
+            ));
+        } else {
+            tokens.push(match character {
+                '%' => Token::Any,
+                '_' => Token::One,
+                literal => Token::Literal(literal.to_ascii_lowercase()),
+            });
         }
     }
-    m(&n, &p)
+
+    let (mut text_index, mut token_index) = (0usize, 0usize);
+    let (mut wildcard, mut retry_text) = (None, 0usize);
+    while text_index < text.len() {
+        match tokens.get(token_index) {
+            Some(Token::Any) => {
+                wildcard = Some(token_index);
+                retry_text = text_index;
+                token_index += 1;
+            }
+            Some(Token::One) => {
+                text_index += 1;
+                token_index += 1;
+            }
+            Some(Token::Literal(literal)) if *literal == text[text_index] => {
+                text_index += 1;
+                token_index += 1;
+            }
+            _ => {
+                let Some(wildcard_index) = wildcard else {
+                    return false;
+                };
+                retry_text += 1;
+                text_index = retry_text;
+                token_index = wildcard_index + 1;
+            }
+        }
+    }
+    while matches!(tokens.get(token_index), Some(Token::Any)) {
+        token_index += 1;
+    }
+    token_index == tokens.len()
 }
 
 /// The LIKE/NoKeyword pattern of a SHOW filter, if any (WHERE returns all).
@@ -789,8 +886,7 @@ pub fn show_routine_status() -> Result<QueryResult> {
 }
 
 /// `SHOW TABLE STATUS [FROM db] [LIKE ...]` — one metadata row per table.
-/// Any FROM/LIKE clause is ignored (all tables are returned; tools tolerate it).
-pub async fn show_table_status(db: &Session) -> Result<QueryResult> {
+pub async fn show_table_status(db: &Session, pattern: Option<&str>) -> Result<QueryResult> {
     let schema = text_schema(&[
         "Name",
         "Engine",
@@ -813,7 +909,10 @@ pub async fn show_table_status(db: &Session) -> Result<QueryResult> {
     ]);
     let names = catalog::list_tables(db).await?;
     let mut rows = Vec::with_capacity(names.len());
-    for n in names {
+    for n in names
+        .into_iter()
+        .filter(|name| pattern.is_none_or(|pattern| show_like(name, pattern)))
+    {
         let nrows = match catalog::load_stats(db, &n).await? {
             Some(s) => s.rows.to_string(),
             None => "0".to_string(),
@@ -1967,7 +2066,27 @@ pub async fn alter_table(
     name: &ObjectName,
     ops: &[AlterTableOperation],
 ) -> Result<QueryResult> {
-    let tname = table_ident(name)?;
+    let tname = stored_table_ident(db, name)?;
+
+    // Qualifier errors must be discovered before any ALTER operation commits.
+    // Several ALTER helpers persist independently, so validating lazily inside
+    // the loop could leave an earlier column or index behind after a later FK
+    // or rename target is rejected.
+    for op in ops {
+        match op {
+            AlterTableOperation::RenameTable { table_name } => {
+                stored_table_ident(db, table_name)?;
+            }
+            AlterTableOperation::AddConstraint(TableConstraint::ForeignKey {
+                foreign_table,
+                ..
+            }) => {
+                stored_table_ident(db, foreign_table)?;
+            }
+            _ => {}
+        }
+    }
+
     let mut def = catalog::load(db, &tname).await?;
     let mut persist_catalog = true;
 
@@ -1992,7 +2111,7 @@ pub async fn alter_table(
                 def.schema.columns[i].name = new_column_name.value.clone();
             }
             AlterTableOperation::RenameTable { table_name } => {
-                let new = table_ident(table_name)?;
+                let new = stored_table_ident(db, table_name)?;
                 alter_rename_table(db, &mut def, &new).await?;
                 persist_catalog = false;
             }
@@ -2041,6 +2160,7 @@ pub async fn alter_table(
                     ..
                 } = tc
                 {
+                    let ref_table = stored_table_ident(db, foreign_table)?;
                     let mut fk_cols = Vec::new();
                     for ident in cols {
                         let i = def
@@ -2087,11 +2207,7 @@ pub async fn alter_table(
                             .map(|n| n.value.clone())
                             .unwrap_or_else(|| format!("fk_{tname}_{}", def.foreign_keys.len())),
                         columns: fk_cols,
-                        ref_table: foreign_table
-                            .0
-                            .last()
-                            .map(|i| i.value.clone())
-                            .unwrap_or_default(),
+                        ref_table,
                         ref_columns: referred_columns.iter().map(|i| i.value.clone()).collect(),
                         on_delete: map_ref_action(on_delete),
                         on_update: map_ref_action(on_update),
@@ -2780,7 +2896,7 @@ pub async fn create_fulltext_index(
 }
 
 pub async fn create_index(db: &Session, ci: CreateIndex) -> Result<QueryResult> {
-    let table = table_ident(&ci.table_name)?;
+    let table = stored_table_ident(db, &ci.table_name)?;
     let mut def = catalog::load(db, &table).await?;
 
     if ci.columns.is_empty() {
@@ -2958,7 +3074,7 @@ pub async fn drop_foreign_key(db: &Session, table: &str, name: &str) -> Result<Q
 }
 
 pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Result<QueryResult> {
-    let name = table_ident(&ins.table_name)?;
+    let name = stored_table_ident(db, &ins.table_name)?;
     let def = catalog::load(db, &name).await?;
 
     // Resolve target column order.
@@ -3009,20 +3125,27 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
     let dup_sets: Vec<(usize, Expr)> = match &ins.on {
         Some(sqlparser::ast::OnInsert::DuplicateKeyUpdate(assigns)) => {
             let mut v = Vec::with_capacity(assigns.len());
-            let visible = vec![if let Some(alias) = &ins.table_alias {
-                vec![db.database().to_owned(), alias.value.clone()]
-            } else if ins.table_name.0.len() >= 2 {
-                object_name_parts(&ins.table_name)
-            } else {
-                vec![db.database().to_owned(), name.clone()]
-            }];
+            let target = ins
+                .table_alias
+                .as_ref()
+                .cloned()
+                .or_else(|| ins.table_name.0.last().cloned())
+                .ok_or_else(|| Error::Catalog("empty insert target".into()))?;
+            let qualifier = canonical_relation_qualifier(db, Some(&ins.table_name), &target);
+            let validation_schema = qualify_relation_schema(def.schema.clone(), &qualifier);
+            let ctes = std::collections::HashMap::new();
             for a in assigns {
+                validate_expression_column_references(
+                    db,
+                    &a.value,
+                    &validation_schema,
+                    None,
+                    &ctes,
+                )
+                .await?;
                 let col = match &a.target {
                     AssignmentTarget::ColumnName(n) => {
-                        validate_assignment_target_qualifier(n, &visible)?;
-                        n.0.last()
-                            .map(|i| i.value.clone())
-                            .ok_or_else(|| Error::Query("empty assignment target".into()))?
+                        assignment_column_for_table(db, &ins.table_name, None, n)?
                     }
                     AssignmentTarget::Tuple(_) => {
                         return Err(Error::Unsupported(
@@ -3035,7 +3158,7 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
                     .columns
                     .iter()
                     .position(|c| predicate::identifier_eq(&c.name, &col))
-                    .ok_or_else(|| Error::Catalog(format!("unknown column: {col}")))?;
+                    .ok_or_else(|| Error::UnknownColumn(col.clone()))?;
                 v.push((idx, a.value.clone()));
             }
             v
@@ -3992,8 +4115,9 @@ async fn execute_rollup(
 }
 
 // Client SQL is checked before parsing, but stored views compose already-parsed
-// queries and can therefore create nesting that the text-level complexity guard
-// cannot see. Keep that recursion bounded, including cyclic view definitions.
+// queries during both validation and execution. Keep that recursion bounded,
+// including cyclic definitions, and poll large recursive futures on a growable
+// stack segment.
 const MAX_QUERY_NESTING: usize = 64;
 
 tokio::task_local! {
@@ -4045,10 +4169,6 @@ async fn select_with_stack(
     vindex: &VectorRegistry,
     query: &SqlQuery,
 ) -> Result<QueryResult> {
-    // `select_inner` has a large debug-build poll frame. Derived relations call
-    // back into it synchronously while their subquery is ready, so an otherwise
-    // modest stored-view chain can exhaust a Tokio worker's native stack. Grow
-    // only near the guard page; completed segments are released on return.
     const RED_ZONE: usize = 1024 * 1024;
     const STACK_SIZE: usize = 2 * 1024 * 1024;
 
@@ -4447,7 +4567,7 @@ async fn select_inner(
     }
 
     let table = match &select.from[0].relation {
-        TableFactor::Table { name, .. } => table_ident(name)?,
+        TableFactor::Table { name, .. } => stored_table_ident(db, name)?,
         _ => {
             return Err(Error::Unsupported(
                 "only plain table references are supported".into(),
@@ -6926,7 +7046,7 @@ fn validate_assignment_target_qualifier(name: &ObjectName, visible: &[Vec<String
             .iter()
             .any(|source| ident_qualifier_is_visible_source_suffix(qualifier, source))
     {
-        return Err(Error::Catalog(format!("unknown column: {name}")));
+        return Err(Error::UnknownColumn(name.to_string()));
     }
     Ok(())
 }
@@ -7179,7 +7299,7 @@ pub(crate) async fn describe_relation_schema(
             "only plain table references can be described".into(),
         ));
     };
-    catalog::load(db, &table_ident(name)?)
+    catalog::load(db, &stored_table_ident(db, name)?)
         .await
         .map(|definition| definition.schema)
 }
@@ -7438,7 +7558,7 @@ async fn join_correlated_select(
 async fn resolve_table(db: &Session, tf: &TableFactor) -> Result<(TableDef, Vec<ColumnDef>)> {
     match tf {
         TableFactor::Table { name, .. } => {
-            let tname = table_ident(name)?;
+            let tname = stored_table_ident(db, name)?;
             let def = catalog::load(db, &tname).await?;
             let qualifier = factor_qualifier_object(db, tf)
                 .ok_or_else(|| Error::Catalog("empty table qualifier".into()))?;
@@ -8253,28 +8373,6 @@ fn simple_pred(e: &Expr) -> Option<(String, catalog::SelOp, String)> {
     None
 }
 
-/// Extract the table name from a `CREATE TABLE [IF NOT EXISTS] name (...)`.
-pub fn create_table_name(sql: &str) -> Result<String> {
-    let lower = sql.to_ascii_lowercase();
-    let after = lower
-        .find("table")
-        .map(|p| p + "table".len())
-        .ok_or_else(|| Error::Parse("expected CREATE TABLE".into()))?;
-    let mut rest = sql[after..].trim_start();
-    if rest.to_ascii_lowercase().starts_with("if not exists") {
-        rest = rest["if not exists".len()..].trim_start();
-    }
-    let name = rest
-        .split(|ch: char| ch.is_whitespace() || ch == '(')
-        .next()
-        .unwrap_or("")
-        .trim_matches(['`', '"']);
-    if name.is_empty() {
-        return Err(Error::Parse("CREATE TABLE: empty name".into()));
-    }
-    Ok(name.to_string())
-}
-
 /// Parse a `PARTITION BY ...` clause (the text after `PARTITION BY`).
 pub fn parse_partition_clause(clause: &str) -> Result<catalog::PartitionSpec> {
     let c = clause.trim();
@@ -8394,42 +8492,13 @@ pub fn partition_where(spec: &catalog::PartitionSpec, name: &str) -> Option<Stri
     }
 }
 
-/// Base tables referenced in the FROM of a (materialized view) query.
-pub fn matview_base_tables(query: &str) -> Vec<String> {
-    use sqlparser::dialect::MySqlDialect;
-    use sqlparser::parser::Parser;
-    let Ok(stmts) = Parser::parse_sql(&MySqlDialect {}, query) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    for stmt in &stmts {
-        if let Statement::Query(q) = stmt {
-            if let SetExpr::Select(select) = q.body.as_ref() {
-                for twj in &select.from {
-                    if let TableFactor::Table { name, .. } = &twj.relation {
-                        if let Some(n) = name.0.last() {
-                            out.push(n.value.clone());
-                        }
-                    }
-                    for j in &twj.joins {
-                        if let TableFactor::Table { name, .. } = &j.relation {
-                            if let Some(n) = name.0.last() {
-                                out.push(n.value.clone());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    out
-}
-
 /// Encode `(matdep_key, value)` capturing each base table's current write count,
 /// so staleness can be detected later.
 pub async fn matview_deps_put(db: &Session, name: &str, query: &str) -> Result<(Vec<u8>, Vec<u8>)> {
+    let query = parse_query(query)?;
+    let relations = validated_query_relations(db, &query, None).await?;
     let mut deps: Vec<(String, u64)> = Vec::new();
-    for t in matview_base_tables(query) {
+    for t in relations.base_tables {
         let wc = crate::vindex::read_wcount(db, &t).await?;
         deps.push((t, wc));
     }
@@ -8504,7 +8573,6 @@ pub fn parse_load_data(sql: &str) -> Result<LoadSpec> {
         .split(|c: char| c.is_whitespace() || c == '(')
         .next()
         .unwrap_or("")
-        .trim_matches(['`', '"'])
         .to_string();
     if table.is_empty() {
         return Err(Error::Parse("LOAD DATA: empty table name".into()));
@@ -9306,6 +9374,24 @@ fn combined_join_schema(lschema: &Schema, rschema: &Schema) -> Schema {
         }
     }
 
+    schema
+}
+
+/// Schema visible to GROUP BY, HAVING, and ORDER BY after projection aliases
+/// have been introduced. A bare projection alias takes precedence over a
+/// same-named input column, while the input remains available when qualified.
+fn projected_expression_schema(source: &Schema, output: &Schema) -> Schema {
+    let mut schema = combined_join_schema(output, source);
+    let output_len = output.columns.len();
+    for (index, column) in source.columns.iter().enumerate() {
+        if output
+            .columns
+            .iter()
+            .any(|projected| predicate::identifier_eq(column_name(projected), column_name(column)))
+        {
+            schema.hide_from_unqualified(output_len + index);
+        }
+    }
     schema
 }
 
@@ -10719,9 +10805,9 @@ async fn collect_matches_inner(
     Ok(Some(out))
 }
 
-fn table_of(twj: &TableWithJoins) -> Result<String> {
+fn table_of(db: &Session, twj: &TableWithJoins) -> Result<String> {
     match &twj.relation {
-        TableFactor::Table { name, .. } => table_ident(name),
+        TableFactor::Table { name, .. } => stored_table_ident(db, name),
         _ => Err(Error::Unsupported(
             "only plain table references are supported".into(),
         )),
@@ -10788,7 +10874,7 @@ pub async fn update(
             let qualifier = &name.0[..name.0.len().saturating_sub(1)];
             validate_assignment_target_qualifier(name, &visible)?;
             if qualifier_is_hidden(qualifier, &hidden, &visible) {
-                return Err(Error::Catalog(format!("unknown column: {name}")));
+                return Err(Error::UnknownColumn(name.to_string()));
             }
         }
     }
@@ -10800,20 +10886,61 @@ pub async fn update(
         }
         return multi_update(db, vindex, table, assignments, selection).await;
     }
-    let name = table_of(table)?;
+    let name = table_of(db, table)?;
     let def = catalog::load(db, &name).await?;
-    let qualifier = factor_qualifier_object(db, &table.relation)
-        .map(|qualifier| object_name_parts(&qualifier))
-        .unwrap_or_else(|| vec![name.clone()]);
+    let qualifier_object = factor_qualifier_object(db, &table.relation)
+        .ok_or_else(|| Error::Catalog("empty table qualifier".into()))?;
+    let qualifier = object_name_parts(&qualifier_object);
+    let validation_schema = qualify_relation_schema(def.schema.clone(), &qualifier_object);
+    let ctes = std::collections::HashMap::new();
+    if let Some(selection) = selection {
+        validate_expression_columns(
+            db,
+            selection,
+            &validation_schema,
+            None,
+            &ctes,
+            ROW_FUNCTIONS,
+        )
+        .await?;
+    }
+    for order in order_by {
+        validate_expression_columns(
+            db,
+            &order.expr,
+            &validation_schema,
+            None,
+            &ctes,
+            ROW_FUNCTIONS,
+        )
+        .await?;
+    }
+    for assignment in assignments {
+        validate_expression_columns(
+            db,
+            &assignment.value,
+            &validation_schema,
+            None,
+            &ctes,
+            ROW_FUNCTIONS,
+        )
+        .await?;
+    }
+    let (relation_name, relation_alias) = match &table.relation {
+        TableFactor::Table { name, alias, .. } => (name, alias.as_ref()),
+        _ => {
+            return Err(Error::Unsupported(
+                "only plain table references are supported".into(),
+            ))
+        }
+    };
 
     // Resolve assignment targets to column indices.
     let mut sets: Vec<(usize, &Expr)> = Vec::with_capacity(assignments.len());
     for a in assignments {
         let col = match &a.target {
             AssignmentTarget::ColumnName(n) => {
-                n.0.last()
-                    .map(|i| i.value.clone())
-                    .ok_or_else(|| Error::Query("empty assignment target".into()))?
+                assignment_column_for_table(db, relation_name, relation_alias, n)?
             }
             AssignmentTarget::Tuple(_) => {
                 return Err(Error::Unsupported(
@@ -10826,7 +10953,7 @@ pub async fn update(
             .columns
             .iter()
             .position(|c| predicate::identifier_eq(&c.name, &col))
-            .ok_or_else(|| Error::Catalog(format!("unknown column: {col}")))?;
+            .ok_or_else(|| Error::UnknownColumn(col.clone()))?;
         sets.push((idx, &a.value));
     }
 
@@ -10990,11 +11117,35 @@ pub async fn delete(
     {
         return multi_delete(db, vindex, del, relations).await;
     }
-    let name = table_of(&relations[0])?;
+    let name = table_of(db, &relations[0])?;
     let def = catalog::load(db, &name).await?;
-    let qualifier = factor_qualifier_object(db, &relations[0].relation)
-        .map(|qualifier| object_name_parts(&qualifier))
-        .unwrap_or_else(|| vec![name.clone()]);
+    let qualifier_object = factor_qualifier_object(db, &relations[0].relation)
+        .ok_or_else(|| Error::Catalog("empty table qualifier".into()))?;
+    let qualifier = object_name_parts(&qualifier_object);
+    let validation_schema = qualify_relation_schema(def.schema.clone(), &qualifier_object);
+    let ctes = std::collections::HashMap::new();
+    if let Some(selection) = &del.selection {
+        validate_expression_columns(
+            db,
+            selection,
+            &validation_schema,
+            None,
+            &ctes,
+            ROW_FUNCTIONS,
+        )
+        .await?;
+    }
+    for order in &del.order_by {
+        validate_expression_columns(
+            db,
+            &order.expr,
+            &validation_schema,
+            None,
+            &ctes,
+            ROW_FUNCTIONS,
+        )
+        .await?;
+    }
 
     let limit = del
         .limit
@@ -11296,6 +11447,12 @@ fn resolve_target_qualifier(
     requested: &[String],
     operation: &str,
 ) -> Result<Vec<String>> {
+    if requested.len() > 2 {
+        return Err(Error::Parse(format!(
+            "invalid qualified table name: {}",
+            requested.join(".")
+        )));
+    }
     if targets.contains_key(requested) {
         return Ok(requested.to_vec());
     }
@@ -11307,9 +11464,7 @@ fn resolve_target_qualifier(
     let requested_text = requested.join(".");
     match matches.as_slice() {
         [qualifier] => Ok(qualifier.clone()),
-        [] => Err(Error::Catalog(format!(
-            "unknown table in {operation}: {requested_text}"
-        ))),
+        [] => Err(Error::UnknownTable(requested_text)),
         _ => Err(Error::Query(format!(
             "ambiguous table in {operation}: {requested_text}"
         ))),
@@ -11334,11 +11489,7 @@ async fn collect_targets(
         std::collections::HashMap::new();
     for tf in factors {
         if let TableFactor::Table { name, .. } = tf {
-            let tname = name
-                .0
-                .last()
-                .map(|i| i.value.clone())
-                .ok_or_else(|| Error::Catalog("empty table name".into()))?;
+            let tname = stored_table_ident(db, name)?;
             let qualifier = factor_qualifier_object(db, tf)
                 .ok_or_else(|| Error::Catalog("empty table qualifier".into()))?;
             let qualifier = qualifier
@@ -11458,7 +11609,7 @@ async fn multi_update(
             .columns
             .iter()
             .position(|c| predicate::identifier_eq(&c.name, &colname))
-            .ok_or_else(|| Error::Catalog(format!("unknown column: {colname}")))?;
+            .ok_or_else(|| Error::UnknownColumn(colname.clone()))?;
         sets.push(SetOp {
             qual,
             col,
@@ -11587,7 +11738,7 @@ async fn multi_delete(
     for q in &del_quals {
         let info = targets
             .get(q)
-            .ok_or_else(|| Error::Catalog(format!("unknown table in DELETE: {}", q.join("."))))?;
+            .ok_or_else(|| Error::UnknownTable(q.join(".")))?;
         if !info.def.has_pk() {
             return Err(Error::Unsupported(
                 "multi-table DELETE requires a primary key on the target table".into(),
@@ -12945,6 +13096,7 @@ fn compute_window(rows: &[Vec<Value>], schema: &Schema, func: &Expr) -> Result<V
         .last()
         .map(|i| i.value.to_ascii_lowercase())
         .unwrap_or_default();
+    validate_window_function_arity(&name, function_argument_count(f)?)?;
     let spec = match &f.over {
         Some(sqlparser::ast::WindowType::WindowSpec(s)) => s,
         _ => return Err(Error::Unsupported("named windows are not supported".into())),
@@ -13352,6 +13504,1124 @@ fn agg_over(name: &str, vals: &[Value], count_star: usize) -> Value {
     }
 }
 
+fn virtual_relation_name(name: &ObjectName) -> Option<String> {
+    let [schema, table] = name.0.as_slice() else {
+        return None;
+    };
+    if schema.value.eq_ignore_ascii_case("information_schema") {
+        Some(table.value.to_ascii_lowercase())
+    } else if schema.value.eq_ignore_ascii_case("mysql") {
+        Some(format!("mysql.{}", table.value.to_ascii_lowercase()))
+    } else {
+        None
+    }
+}
+
+fn virtual_relation_supported(name: &str) -> bool {
+    matches!(
+        name,
+        "tables"
+            | "columns"
+            | "statistics"
+            | "key_column_usage"
+            | "referential_constraints"
+            | "column_statistics"
+            | "partitions"
+            | "engines"
+            | "triggers"
+            | "routines"
+            | "views"
+            | "events"
+            | "schemata"
+            | "collation_character_set_applicability"
+            | "mysql.user"
+            | "mysql.db"
+    )
+}
+
+fn collect_expr_subqueries(expr: &Expr) -> Vec<SqlQuery> {
+    use sqlparser::ast::{Visit, Visitor};
+    use std::ops::ControlFlow;
+
+    #[derive(Default)]
+    struct ImmediateQueryCollector {
+        depth: usize,
+        queries: Vec<SqlQuery>,
+    }
+
+    impl Visitor for ImmediateQueryCollector {
+        type Break = std::convert::Infallible;
+
+        fn pre_visit_query(&mut self, query: &SqlQuery) -> ControlFlow<Self::Break> {
+            if self.depth == 0 {
+                self.queries.push(query.clone());
+            }
+            self.depth += 1;
+            ControlFlow::Continue(())
+        }
+
+        fn post_visit_query(&mut self, _query: &SqlQuery) -> ControlFlow<Self::Break> {
+            self.depth -= 1;
+            ControlFlow::Continue(())
+        }
+    }
+
+    let mut collector = ImmediateQueryCollector::default();
+    let _ = expr.visit(&mut collector);
+    collector.queries
+}
+
+fn collect_factor_relations(
+    factor: &TableFactor,
+    ctes: &std::collections::HashSet<String>,
+    relations: &mut Vec<ObjectName>,
+) {
+    match factor {
+        TableFactor::Table { name, .. } => {
+            let is_cte = matches!(name.0.as_slice(), [relation]
+                if ctes.contains(&relation.value.to_ascii_lowercase()));
+            if !is_cte {
+                relations.push(name.clone());
+            }
+        }
+        TableFactor::Derived { subquery, .. } => {
+            collect_query_relations_inner(subquery, ctes, relations)
+        }
+        TableFactor::NestedJoin {
+            table_with_joins, ..
+        } => collect_table_with_joins_relations(table_with_joins, ctes, relations),
+        _ => {}
+    }
+}
+
+fn collect_table_with_joins_relations(
+    table: &TableWithJoins,
+    ctes: &std::collections::HashSet<String>,
+    relations: &mut Vec<ObjectName>,
+) {
+    collect_factor_relations(&table.relation, ctes, relations);
+    for join in &table.joins {
+        collect_factor_relations(&join.relation, ctes, relations);
+        let constraint = match &join.join_operator {
+            JoinOperator::Inner(constraint)
+            | JoinOperator::LeftOuter(constraint)
+            | JoinOperator::RightOuter(constraint)
+            | JoinOperator::FullOuter(constraint)
+            | JoinOperator::LeftSemi(constraint)
+            | JoinOperator::RightSemi(constraint)
+            | JoinOperator::LeftAnti(constraint)
+            | JoinOperator::RightAnti(constraint) => Some(constraint),
+            _ => None,
+        };
+        if let Some(JoinConstraint::On(expr)) = constraint {
+            for query in collect_expr_subqueries(expr) {
+                collect_query_relations_inner(&query, ctes, relations);
+            }
+        }
+    }
+}
+
+fn collect_select_expr_relations(
+    select: &Select,
+    ctes: &std::collections::HashSet<String>,
+    relations: &mut Vec<ObjectName>,
+) {
+    let mut expressions: Vec<&Expr> = Vec::new();
+    for item in &select.projection {
+        match item {
+            sqlparser::ast::SelectItem::UnnamedExpr(expr)
+            | sqlparser::ast::SelectItem::ExprWithAlias { expr, .. } => expressions.push(expr),
+            _ => {}
+        }
+    }
+    expressions.extend(select.prewhere.iter());
+    expressions.extend(select.selection.iter());
+    expressions.extend(select.having.iter());
+    expressions.extend(select.qualify.iter());
+    expressions.extend(&select.cluster_by);
+    expressions.extend(&select.distribute_by);
+    expressions.extend(&select.sort_by);
+    if let sqlparser::ast::GroupByExpr::Expressions(group_by, _) = &select.group_by {
+        expressions.extend(group_by);
+    }
+    for expr in expressions {
+        for query in collect_expr_subqueries(expr) {
+            collect_query_relations_inner(&query, ctes, relations);
+        }
+    }
+}
+
+fn collect_set_relations(
+    body: &SetExpr,
+    ctes: &std::collections::HashSet<String>,
+    relations: &mut Vec<ObjectName>,
+) {
+    match body {
+        SetExpr::Select(select) => {
+            for table in &select.from {
+                collect_table_with_joins_relations(table, ctes, relations);
+            }
+            collect_select_expr_relations(select, ctes, relations);
+        }
+        SetExpr::SetOperation { left, right, .. } => {
+            collect_set_relations(left, ctes, relations);
+            collect_set_relations(right, ctes, relations);
+        }
+        SetExpr::Query(query) => collect_query_relations_inner(query, ctes, relations),
+        SetExpr::Table(table) => {
+            if let Some(table_name) = &table.table_name {
+                if table.schema_name.is_none() && ctes.contains(&table_name.to_ascii_lowercase()) {
+                    return;
+                }
+                let mut parts = Vec::with_capacity(2);
+                if let Some(schema_name) = &table.schema_name {
+                    parts.push(sqlparser::ast::Ident::new(schema_name.clone()));
+                }
+                parts.push(sqlparser::ast::Ident::new(table_name.clone()));
+                relations.push(ObjectName(parts));
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_query_relations_inner(
+    query: &SqlQuery,
+    outer_ctes: &std::collections::HashSet<String>,
+    relations: &mut Vec<ObjectName>,
+) {
+    let mut ctes = outer_ctes.clone();
+    if let Some(with) = &query.with {
+        for cte in &with.cte_tables {
+            let name = cte.alias.name.value.to_ascii_lowercase();
+            let mut body_ctes = ctes.clone();
+            if with.recursive {
+                body_ctes.insert(name.clone());
+            }
+            collect_query_relations_inner(&cte.query, &body_ctes, relations);
+            ctes.insert(name);
+        }
+    }
+    collect_set_relations(&query.body, &ctes, relations);
+
+    if let Some(order_by) = &query.order_by {
+        for order in &order_by.exprs {
+            for nested in collect_expr_subqueries(&order.expr) {
+                collect_query_relations_inner(&nested, &ctes, relations);
+            }
+        }
+    }
+    if let Some(limit) = &query.limit {
+        for nested in collect_expr_subqueries(limit) {
+            collect_query_relations_inner(&nested, &ctes, relations);
+        }
+    }
+    if let Some(offset) = &query.offset {
+        for nested in collect_expr_subqueries(&offset.value) {
+            collect_query_relations_inner(&nested, &ctes, relations);
+        }
+    }
+    for limit_by in &query.limit_by {
+        for nested in collect_expr_subqueries(limit_by) {
+            collect_query_relations_inner(&nested, &ctes, relations);
+        }
+    }
+}
+
+fn relation_dependency_order(
+    graph: &std::collections::HashMap<String, Vec<String>>,
+) -> Result<Vec<String>> {
+    fn visit(
+        view: &str,
+        graph: &std::collections::HashMap<String, Vec<String>>,
+        active: &mut std::collections::HashSet<String>,
+        complete: &mut std::collections::HashSet<String>,
+        order: &mut Vec<String>,
+    ) -> Result<()> {
+        if complete.contains(view) {
+            return Ok(());
+        }
+        if !active.insert(view.to_string()) {
+            return Err(Error::Query(format!(
+                "circular view dependency involving {view}"
+            )));
+        }
+        if let Some(dependencies) = graph.get(view) {
+            for dependency in dependencies {
+                visit(dependency, graph, active, complete, order)?;
+            }
+        }
+        active.remove(view);
+        complete.insert(view.to_string());
+        order.push(view.to_string());
+        Ok(())
+    }
+
+    let mut active = std::collections::HashSet::new();
+    let mut complete = std::collections::HashSet::new();
+    let mut order = Vec::new();
+    for view in graph.keys() {
+        visit(view, graph, &mut active, &mut complete, &mut order)?;
+    }
+    Ok(order)
+}
+
+struct ValidatedQueryRelations {
+    base_tables: Vec<String>,
+    matviews: Vec<String>,
+}
+
+async fn validated_query_relations(
+    db: &Session,
+    query: &SqlQuery,
+    forbidden_view: Option<&str>,
+) -> Result<ValidatedQueryRelations> {
+    let mut pending: Vec<(Option<String>, SqlQuery)> = vec![(None, query.clone())];
+    let mut loaded_views = std::collections::HashSet::new();
+    let mut dependency_graph: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    let mut base_tables = Vec::new();
+    let mut seen_base_tables = std::collections::HashSet::new();
+    let mut matviews = std::collections::HashSet::new();
+
+    while let Some((owner, query)) = pending.pop() {
+        let mut relations = Vec::new();
+        collect_query_relations_inner(&query, &std::collections::HashSet::new(), &mut relations);
+        for relation in relations {
+            if let Some(virtual_name) = virtual_relation_name(&relation) {
+                if !virtual_relation_supported(&virtual_name) {
+                    return Err(Error::Catalog(format!("no such table: {relation}")));
+                }
+                continue;
+            }
+
+            let table = stored_table_ident(db, &relation)?;
+            if forbidden_view.is_some_and(|target| table == target) {
+                return Err(Error::Query(format!(
+                    "view {table} cannot reference itself"
+                )));
+            }
+            if let Some(sql) = catalog::load_view(db, &table).await? {
+                if let Some(owner) = &owner {
+                    dependency_graph
+                        .entry(owner.clone())
+                        .or_default()
+                        .push(table.clone());
+                }
+                dependency_graph.entry(table.clone()).or_default();
+                if loaded_views.insert(table.clone()) {
+                    pending.push((Some(table), parse_query(&sql)?));
+                }
+                continue;
+            }
+            if !catalog::exists(db, &table).await? {
+                return Err(Error::Catalog(format!("no such table: {table}")));
+            }
+            if let Some(sql) = db.get(catalog::matview_key(&table)).await? {
+                let sql = String::from_utf8_lossy(&sql).into_owned();
+                if let Some(owner) = &owner {
+                    dependency_graph
+                        .entry(owner.clone())
+                        .or_default()
+                        .push(table.clone());
+                }
+                dependency_graph.entry(table.clone()).or_default();
+                matviews.insert(table.clone());
+                if loaded_views.insert(table.clone()) {
+                    pending.push((Some(table), parse_query(&sql)?));
+                }
+            } else if seen_base_tables.insert(table.clone()) {
+                base_tables.push(table);
+            }
+        }
+    }
+
+    let dependency_order = relation_dependency_order(&dependency_graph)?;
+    Ok(ValidatedQueryRelations {
+        base_tables,
+        matviews: dependency_order
+            .into_iter()
+            .filter(|relation| matviews.contains(relation))
+            .collect(),
+    })
+}
+
+/// Validate every physical relation named by a query, recursively including
+/// stored-view dependencies, before an operation with side effects begins.
+pub(crate) async fn validate_query_relations(db: &Session, query: &SqlQuery) -> Result<()> {
+    validated_query_relations(db, query, None).await.map(|_| ())
+}
+
+pub(crate) async fn query_materialized_relations(
+    db: &Session,
+    query: &SqlQuery,
+) -> Result<Vec<String>> {
+    validated_query_relations(db, query, None)
+        .await
+        .map(|relations| relations.matviews)
+}
+
+#[cfg(test)]
+mod query_relation_validation_tests {
+    use super::collect_query_relations_inner;
+    use sqlparser::ast::Statement;
+    use sqlparser::dialect::MySqlDialect;
+    use sqlparser::parser::Parser;
+
+    #[test]
+    fn collects_relations_from_expression_subqueries() {
+        let mut statements = Parser::parse_sql(
+            &MySqlDialect {},
+            "SELECT * FROM outer_table AS o
+             WHERE EXISTS (
+                 SELECT 1 FROM nested_table AS n WHERE n.id = o.id
+             )",
+        )
+        .unwrap();
+        let Statement::Query(query) = statements.remove(0) else {
+            panic!("expected query")
+        };
+        let mut relations = Vec::new();
+        collect_query_relations_inner(&query, &std::collections::HashSet::new(), &mut relations);
+        let names = relations
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["outer_table", "nested_table"]);
+    }
+}
+
+fn immediate_column_references(expr: &Expr) -> Vec<Expr> {
+    use sqlparser::ast::{Visit, Visitor};
+    use std::ops::ControlFlow;
+
+    #[derive(Default)]
+    struct Collector {
+        query_depth: usize,
+        references: Vec<Expr>,
+    }
+
+    impl Visitor for Collector {
+        type Break = std::convert::Infallible;
+
+        fn pre_visit_query(&mut self, _query: &SqlQuery) -> ControlFlow<Self::Break> {
+            self.query_depth += 1;
+            ControlFlow::Continue(())
+        }
+
+        fn post_visit_query(&mut self, _query: &SqlQuery) -> ControlFlow<Self::Break> {
+            self.query_depth -= 1;
+            ControlFlow::Continue(())
+        }
+
+        fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
+            if self.query_depth == 0
+                && matches!(expr, Expr::Identifier(_) | Expr::CompoundIdentifier(_))
+            {
+                self.references.push(expr.clone());
+            }
+            ControlFlow::Continue(())
+        }
+    }
+
+    let mut collector = Collector::default();
+    let _ = expr.visit(&mut collector);
+    collector.references
+}
+
+fn column_reference_resolves(reference: &Expr, schema: &Schema) -> Result<bool> {
+    let (resolution, qualified) = match reference {
+        Expr::Identifier(identifier) if identifier.value.starts_with('@') => return Ok(true),
+        Expr::Identifier(identifier) => {
+            (predicate::resolve_index(&identifier.value, schema), false)
+        }
+        Expr::CompoundIdentifier(parts)
+            if parts
+                .first()
+                .is_some_and(|part| part.value.starts_with('@')) =>
+        {
+            return Ok(true);
+        }
+        Expr::CompoundIdentifier(parts) => (predicate::resolve_index_parts(parts, schema), true),
+        _ => return Ok(true),
+    };
+    match resolution {
+        Ok(_) => Ok(true),
+        Err(Error::Catalog(_)) | Err(Error::UnknownColumn(_)) => Ok(false),
+        // A qualified correlated reference can share its bare column name with
+        // multiple local relations. No local exact match means it belongs to an
+        // outer scope; only an unqualified local ambiguity is terminal here.
+        Err(Error::Query(_)) if qualified => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn column_reference_name(reference: &Expr) -> String {
+    match reference {
+        Expr::Identifier(identifier) => identifier.value.clone(),
+        Expr::CompoundIdentifier(parts) => parts
+            .iter()
+            .map(|part| part.value.as_str())
+            .collect::<Vec<_>>()
+            .join("."),
+        _ => reference.to_string(),
+    }
+}
+
+fn function_name(function: &sqlparser::ast::Function) -> String {
+    function
+        .name
+        .0
+        .last()
+        .map(|identifier| identifier.value.to_ascii_lowercase())
+        .unwrap_or_default()
+}
+
+fn aggregate_function(name: &str) -> bool {
+    matches!(
+        name,
+        "count"
+            | "sum"
+            | "avg"
+            | "min"
+            | "max"
+            | "group_concat"
+            | "stddev"
+            | "std"
+            | "stddev_pop"
+            | "stddev_samp"
+            | "variance"
+            | "var_pop"
+            | "var_samp"
+            | "bit_or"
+            | "bit_and"
+            | "bit_xor"
+            | "facet"
+            | "percentile"
+            | "quantile"
+            | "median"
+    )
+}
+
+fn window_function(name: &str) -> bool {
+    matches!(
+        name,
+        "row_number"
+            | "rank"
+            | "dense_rank"
+            | "lag"
+            | "lead"
+            | "sum"
+            | "count"
+            | "avg"
+            | "min"
+            | "max"
+            | "ntile"
+            | "first_value"
+            | "last_value"
+            | "nth_value"
+    )
+}
+
+fn validate_window_function_arity(name: &str, arity: usize) -> Result<()> {
+    let valid = match name {
+        "row_number" | "rank" | "dense_rank" => arity == 0,
+        "lag" | "lead" => (1..=3).contains(&arity),
+        "sum" | "count" | "avg" | "min" | "max" | "ntile" | "first_value" | "last_value" => {
+            arity == 1
+        }
+        "nth_value" => arity == 2,
+        _ => {
+            return Err(Error::Unsupported(format!(
+                "unknown window function: {name}"
+            )))
+        }
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(Error::Query(format!(
+            "invalid argument count for window function {}",
+            name.to_ascii_uppercase()
+        )))
+    }
+}
+
+fn function_argument_count(function: &sqlparser::ast::Function) -> Result<usize> {
+    match &function.args {
+        sqlparser::ast::FunctionArguments::None => Ok(0),
+        sqlparser::ast::FunctionArguments::List(arguments) => Ok(arguments.args.len()),
+        sqlparser::ast::FunctionArguments::Subquery(_) => {
+            Err(Error::Unsupported("subquery function argument".into()))
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct FunctionContext {
+    aggregates: bool,
+    windows: bool,
+    hybrid: bool,
+    clause: &'static str,
+}
+
+const ROW_FUNCTIONS: FunctionContext = FunctionContext {
+    aggregates: false,
+    windows: false,
+    hybrid: false,
+    clause: "row expression",
+};
+const PROJECTION_FUNCTIONS: FunctionContext = FunctionContext {
+    aggregates: true,
+    windows: true,
+    hybrid: true,
+    clause: "projection",
+};
+const ORDER_FUNCTIONS: FunctionContext = FunctionContext {
+    aggregates: true,
+    windows: true,
+    hybrid: false,
+    clause: "ORDER BY",
+};
+const AGGREGATE_FUNCTIONS: FunctionContext = FunctionContext {
+    aggregates: true,
+    windows: false,
+    hybrid: false,
+    clause: "aggregate expression",
+};
+
+fn validate_function(function: &sqlparser::ast::Function, context: FunctionContext) -> Result<()> {
+    let name = function_name(function);
+    let arity = function_argument_count(function)?;
+
+    if function.over.is_some() {
+        if !context.windows {
+            return Err(Error::Query(format!(
+                "window function {name} is not allowed in {}",
+                context.clause
+            )));
+        }
+        if !window_function(&name) {
+            return Err(Error::Unsupported(format!(
+                "unknown window function: {name}"
+            )));
+        }
+        return validate_window_function_arity(&name, arity);
+    }
+    if aggregate_function(&name) {
+        if !context.aggregates {
+            return Err(Error::Query(format!(
+                "aggregate function {name} is not allowed in {}",
+                context.clause
+            )));
+        }
+        return aggregate::validate_function_arity(&name, arity);
+    }
+    if name == "hybrid" {
+        if !context.hybrid {
+            return Err(Error::Query(format!(
+                "HYBRID is not allowed in {}",
+                context.clause
+            )));
+        }
+        if arity != 4 {
+            return Err(Error::Query("HYBRID expects 4 arguments".into()));
+        }
+        return Ok(());
+    }
+    if predicate::scalar_function_supported(&name) {
+        return predicate::validate_scalar_function_arity(&name, arity);
+    }
+    Err(Error::Unsupported(format!("unknown function: {name}")))
+}
+
+struct FunctionValidator {
+    context: FunctionContext,
+    query_depth: usize,
+    expression_depth: usize,
+    aggregate_depth: usize,
+    window_depth: usize,
+    error: Option<Error>,
+}
+
+impl FunctionValidator {
+    fn new(context: FunctionContext) -> Self {
+        Self {
+            context,
+            query_depth: 0,
+            expression_depth: 0,
+            aggregate_depth: 0,
+            window_depth: 0,
+            error: None,
+        }
+    }
+}
+
+impl sqlparser::ast::Visitor for FunctionValidator {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, _query: &SqlQuery) -> std::ops::ControlFlow<Self::Break> {
+        self.query_depth += 1;
+        std::ops::ControlFlow::Continue(())
+    }
+
+    fn post_visit_query(&mut self, _query: &SqlQuery) -> std::ops::ControlFlow<Self::Break> {
+        self.query_depth -= 1;
+        std::ops::ControlFlow::Continue(())
+    }
+
+    fn pre_visit_expr(&mut self, expression: &Expr) -> std::ops::ControlFlow<Self::Break> {
+        if self.query_depth != 0 {
+            return std::ops::ControlFlow::Continue(());
+        }
+        let mut context = self.context;
+        context.hybrid &= self.expression_depth == 0;
+        self.expression_depth += 1;
+        let Expr::Function(function) = expression else {
+            return std::ops::ControlFlow::Continue(());
+        };
+        let name = function_name(function);
+        let aggregate = function.over.is_none() && aggregate_function(&name);
+        let window = function.over.is_some();
+        if (aggregate || window) && (self.aggregate_depth != 0 || self.window_depth != 0) {
+            self.error = Some(Error::Query(
+                "aggregate and window functions cannot be nested".into(),
+            ));
+            return std::ops::ControlFlow::Break(());
+        }
+        if let Err(error) = validate_function(function, context) {
+            self.error = Some(error);
+            return std::ops::ControlFlow::Break(());
+        }
+        self.aggregate_depth += usize::from(aggregate);
+        self.window_depth += usize::from(window);
+        std::ops::ControlFlow::Continue(())
+    }
+
+    fn post_visit_expr(&mut self, expression: &Expr) -> std::ops::ControlFlow<Self::Break> {
+        if self.query_depth == 0 {
+            if let Expr::Function(function) = expression {
+                let name = function_name(function);
+                self.aggregate_depth -=
+                    usize::from(function.over.is_none() && aggregate_function(&name));
+                self.window_depth -= usize::from(function.over.is_some());
+            }
+            self.expression_depth -= 1;
+        }
+        std::ops::ControlFlow::Continue(())
+    }
+}
+
+fn validate_expression_functions(expression: &Expr, context: FunctionContext) -> Result<()> {
+    use sqlparser::ast::Visit;
+
+    let mut validator = FunctionValidator::new(context);
+    let _ = expression.visit(&mut validator);
+    match validator.error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+async fn validate_expression_columns(
+    db: &Session,
+    expression: &Expr,
+    local: &Schema,
+    outer: Option<&Schema>,
+    ctes: &std::collections::HashMap<String, Schema>,
+    functions: FunctionContext,
+) -> Result<()> {
+    validate_expression_functions(expression, functions)?;
+    validate_expression_column_references(db, expression, local, outer, ctes).await
+}
+
+async fn validate_expression_column_references(
+    db: &Session,
+    expression: &Expr,
+    local: &Schema,
+    outer: Option<&Schema>,
+    ctes: &std::collections::HashMap<String, Schema>,
+) -> Result<()> {
+    for reference in immediate_column_references(expression) {
+        if column_reference_resolves(&reference, local)? {
+            continue;
+        }
+        if let Some(outer) = outer {
+            if column_reference_resolves(&reference, outer)? {
+                continue;
+            }
+        }
+        return Err(Error::UnknownColumn(column_reference_name(&reference)));
+    }
+    let mut nested_outer = local.clone();
+    if let Some(outer) = outer {
+        nested_outer.columns.extend(outer.columns.iter().cloned());
+    }
+    for subquery in collect_expr_subqueries(expression) {
+        Box::pin(static_query_schema_scoped(
+            db,
+            &subquery,
+            Some(&nested_outer),
+            ctes,
+        ))
+        .await?;
+    }
+    Ok(())
+}
+
+fn qualify_static_schema(db: &Session, schema: Schema, factor: &TableFactor) -> Result<Schema> {
+    let qualifier = factor_qualifier_object(db, factor)
+        .ok_or_else(|| Error::Catalog("empty table qualifier".into()))?;
+    Ok(qualify_relation_schema(schema, &qualifier))
+}
+
+async fn static_factor_schema(
+    db: &Session,
+    factor: &TableFactor,
+    outer: Option<&Schema>,
+    ctes: &std::collections::HashMap<String, Schema>,
+) -> Result<Schema> {
+    match factor {
+        TableFactor::Table { name, alias, .. } => {
+            if let [relation] = name.0.as_slice() {
+                if let Some(schema) = ctes.get(&relation.value.to_ascii_lowercase()) {
+                    let alias_columns = alias
+                        .as_ref()
+                        .map(|alias| {
+                            alias
+                                .columns
+                                .iter()
+                                .map(|column| column.name.value.clone())
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    let schema = apply_col_aliases(schema.clone(), &alias_columns)?;
+                    return qualify_static_schema(db, schema, factor);
+                }
+            }
+            if let Some(view) = information_schema_view(factor) {
+                let (schema, _) = information_schema(db, &view).await?;
+                return qualify_static_schema(db, schema, factor);
+            }
+            let table = stored_table_ident(db, name)?;
+            if let Some(sql) = catalog::load_view(db, &table).await? {
+                let schema = Box::pin(static_query_schema(db, &parse_query(&sql)?, outer)).await?;
+                return qualify_static_schema(db, schema, factor);
+            }
+            resolve_table(db, factor)
+                .await
+                .map(|(_, columns)| Schema::new(columns))
+        }
+        TableFactor::Derived {
+            subquery, alias, ..
+        } => {
+            let schema = Box::pin(static_query_schema_scoped(db, subquery, outer, ctes)).await?;
+            let alias = alias.as_ref().ok_or_else(|| {
+                Error::Query("a derived table (FROM (SELECT ...)) needs an alias".into())
+            })?;
+            let alias_columns = alias
+                .columns
+                .iter()
+                .map(|column| column.name.value.clone())
+                .collect::<Vec<_>>();
+            let schema = apply_col_aliases(schema, &alias_columns)?;
+            qualify_static_schema(db, schema, factor)
+        }
+        TableFactor::NestedJoin {
+            table_with_joins, ..
+        } => static_table_with_joins_schema(db, table_with_joins, outer, ctes).await,
+        _ => Err(Error::Unsupported(
+            "only plain and derived table references can be validated".into(),
+        )),
+    }
+}
+
+async fn static_table_with_joins_schema(
+    db: &Session,
+    table: &TableWithJoins,
+    outer: Option<&Schema>,
+    ctes: &std::collections::HashMap<String, Schema>,
+) -> Result<Schema> {
+    let mut schema = Box::pin(static_factor_schema(db, &table.relation, outer, ctes)).await?;
+    for join in &table.joins {
+        let joined = Box::pin(static_factor_schema(db, &join.relation, outer, ctes)).await?;
+        let (kind, _) = join_kind(&join.join_operator)?;
+        let using_keys = resolve_using_keys(&join.join_operator, &schema, &joined)?;
+        let physical = combined_join_schema(&schema, &joined);
+        let constraint = join_constraint(&join.join_operator);
+        if let Some(JoinConstraint::On(expression)) = constraint {
+            Box::pin(validate_expression_columns(
+                db,
+                expression,
+                &physical,
+                outer,
+                ctes,
+                ROW_FUNCTIONS,
+            ))
+            .await?;
+        }
+        schema = match using_keys {
+            Some(keys) => {
+                coalesce_using_join(&schema, &joined, physical, Vec::new(), kind, &keys).0
+            }
+            None => physical,
+        };
+    }
+    Ok(schema)
+}
+
+async fn static_select_schema(
+    db: &Session,
+    select: &Select,
+    outer: Option<&Schema>,
+    ctes: &std::collections::HashMap<String, Schema>,
+) -> Result<(Schema, Schema)> {
+    let mut source = Schema::new(Vec::new());
+    for table in &select.from {
+        let schema = Box::pin(static_table_with_joins_schema(db, table, outer, ctes)).await?;
+        source = combined_join_schema(&source, &schema);
+    }
+
+    if let Some(selection) = &select.selection {
+        Box::pin(validate_expression_columns(
+            db,
+            selection,
+            &source,
+            outer,
+            ctes,
+            ROW_FUNCTIONS,
+        ))
+        .await?;
+    }
+    for item in &select.projection {
+        if let sqlparser::ast::SelectItem::UnnamedExpr(expression)
+        | sqlparser::ast::SelectItem::ExprWithAlias {
+            expr: expression, ..
+        } = item
+        {
+            Box::pin(validate_expression_columns(
+                db,
+                expression,
+                &source,
+                outer,
+                ctes,
+                PROJECTION_FUNCTIONS,
+            ))
+            .await?;
+        }
+    }
+    let default_table = single_relation_alias(select);
+    let output = project_exprs(&select.projection, &source, &[], default_table.as_deref())
+        .map(|(schema, _)| schema)?;
+    let visible = projected_expression_schema(&source, &output);
+    if let sqlparser::ast::GroupByExpr::Expressions(expressions, _) = &select.group_by {
+        for expression in expressions {
+            Box::pin(validate_expression_columns(
+                db,
+                expression,
+                &visible,
+                outer,
+                ctes,
+                ROW_FUNCTIONS,
+            ))
+            .await?;
+        }
+    }
+    if let Some(having) = &select.having {
+        Box::pin(validate_expression_columns(
+            db,
+            having,
+            &visible,
+            outer,
+            ctes,
+            AGGREGATE_FUNCTIONS,
+        ))
+        .await?;
+    }
+    Ok((output, visible))
+}
+
+async fn static_set_schema(
+    db: &Session,
+    body: &SetExpr,
+    outer: Option<&Schema>,
+    ctes: &std::collections::HashMap<String, Schema>,
+) -> Result<Schema> {
+    match body {
+        SetExpr::Select(select) => static_select_schema(db, select, outer, ctes)
+            .await
+            .map(|(output, _)| output),
+        SetExpr::Query(query) => Box::pin(static_query_schema_scoped(db, query, outer, ctes)).await,
+        SetExpr::SetOperation { left, right, .. } => {
+            let left = Box::pin(static_set_schema(db, left, outer, ctes)).await?;
+            let right = Box::pin(static_set_schema(db, right, outer, ctes)).await?;
+            if left.columns.len() != right.columns.len() {
+                return Err(Error::Query(
+                    "set-operation arms have different column counts".into(),
+                ));
+            }
+            Ok(left)
+        }
+        SetExpr::Values(_) | SetExpr::Table(_) => Err(Error::Unsupported(
+            "query form is not supported by execution".into(),
+        )),
+        _ => Err(Error::Unsupported(
+            "query form cannot be statically validated".into(),
+        )),
+    }
+}
+
+async fn static_query_schema(
+    db: &Session,
+    query: &SqlQuery,
+    outer: Option<&Schema>,
+) -> Result<Schema> {
+    static_query_schema_scoped(db, query, outer, &std::collections::HashMap::new()).await
+}
+
+async fn static_query_schema_scoped(
+    db: &Session,
+    query: &SqlQuery,
+    outer: Option<&Schema>,
+    inherited_ctes: &std::collections::HashMap<String, Schema>,
+) -> Result<Schema> {
+    if QUERY_NESTING.try_with(|_| ()).is_ok() {
+        static_query_schema_with_stack(db, query, outer, inherited_ctes).await
+    } else {
+        QUERY_NESTING
+            .scope(
+                std::cell::Cell::new(0),
+                static_query_schema_with_stack(db, query, outer, inherited_ctes),
+            )
+            .await
+    }
+}
+
+async fn static_query_schema_with_stack(
+    db: &Session,
+    query: &SqlQuery,
+    outer: Option<&Schema>,
+    inherited_ctes: &std::collections::HashMap<String, Schema>,
+) -> Result<Schema> {
+    const RED_ZONE: usize = 1024 * 1024;
+    const STACK_SIZE: usize = 2 * 1024 * 1024;
+
+    let _nesting = QueryNestingGuard::enter()?;
+    let mut future = Box::pin(static_query_schema_scoped_inner(
+        db,
+        query,
+        outer,
+        inherited_ctes,
+    ));
+    std::future::poll_fn(move |context| {
+        stacker::maybe_grow(RED_ZONE, STACK_SIZE, || {
+            std::future::Future::poll(future.as_mut(), context)
+        })
+    })
+    .await
+}
+
+async fn static_query_schema_scoped_inner(
+    db: &Session,
+    query: &SqlQuery,
+    outer: Option<&Schema>,
+    inherited_ctes: &std::collections::HashMap<String, Schema>,
+) -> Result<Schema> {
+    let mut ctes = inherited_ctes.clone();
+    if let Some(with) = &query.with {
+        let reachable = reachable_recursive_ctes(query, with);
+        for cte in &with.cte_tables {
+            let name = cte.alias.name.value.clone();
+            let key = name.to_ascii_lowercase();
+            if !reachable.contains(&key) {
+                continue;
+            }
+            let alias_columns = cte
+                .alias
+                .columns
+                .iter()
+                .map(|column| column.name.value.clone())
+                .collect::<Vec<_>>();
+            let recursive = with.recursive && query_refs_table(&cte.query, &name);
+            let schema = if recursive {
+                let (_, anchor, recursive_term) = split_recursive(&cte.query, &name)?;
+                let anchor_schema =
+                    Box::pin(static_query_schema_scoped(db, &anchor, outer, &ctes)).await?;
+                let anchor_schema = apply_col_aliases(anchor_schema, &alias_columns)?;
+                ctes.insert(key.clone(), anchor_schema.clone());
+                let recursive_schema = Box::pin(static_query_schema_scoped(
+                    db,
+                    &recursive_term,
+                    outer,
+                    &ctes,
+                ))
+                .await?;
+                if anchor_schema.columns.len() != recursive_schema.columns.len() {
+                    return Err(Error::Query(format!(
+                        "recursive CTE {name} arms have different column counts"
+                    )));
+                }
+                anchor_schema
+            } else {
+                let schema =
+                    Box::pin(static_query_schema_scoped(db, &cte.query, outer, &ctes)).await?;
+                apply_col_aliases(schema, &alias_columns)?
+            };
+            ctes.insert(key, schema);
+        }
+    }
+
+    let (schema, order_schema) = match query.body.as_ref() {
+        SetExpr::Select(select) => static_select_schema(db, select, outer, &ctes).await?,
+        _ => {
+            let schema = Box::pin(static_set_schema(db, &query.body, outer, &ctes)).await?;
+            (schema.clone(), schema)
+        }
+    };
+    if let Some(order_by) = &query.order_by {
+        for order in &order_by.exprs {
+            Box::pin(validate_expression_columns(
+                db,
+                &order.expr,
+                &order_schema,
+                outer,
+                &ctes,
+                ORDER_FUNCTIONS,
+            ))
+            .await?;
+        }
+    }
+    if let Some(limit) = &query.limit {
+        Box::pin(validate_expression_columns(
+            db,
+            limit,
+            &Schema::new(Vec::new()),
+            outer,
+            &ctes,
+            ROW_FUNCTIONS,
+        ))
+        .await?;
+    }
+    if let Some(offset) = &query.offset {
+        Box::pin(validate_expression_columns(
+            db,
+            &offset.value,
+            &Schema::new(Vec::new()),
+            outer,
+            &ctes,
+            ROW_FUNCTIONS,
+        ))
+        .await?;
+    }
+    Ok(schema)
+}
+
+pub(crate) async fn validate_query_columns(db: &Session, query: &SqlQuery) -> Result<()> {
+    let mut normalized = query.clone();
+    normalize_query_qualifiers(&mut normalized, &db.database())?;
+    static_query_schema(db, &normalized, None).await.map(|_| ())
+}
+
 /// `CREATE VIEW name [(cols)] AS SELECT ...` — store the view's SELECT text.
 pub async fn create_view(
     db: &Session,
@@ -13360,7 +14630,7 @@ pub async fn create_view(
     query: &SqlQuery,
     or_replace: bool,
 ) -> Result<QueryResult> {
-    let name = table_ident(name)?;
+    let name = stored_table_ident(db, name)?;
     if catalog::exists(db, &name).await? {
         return Err(Error::Catalog(format!(
             "cannot create view: a table named '{name}' exists"
@@ -13369,6 +14639,8 @@ pub async fn create_view(
     if !or_replace && catalog::load_view(db, &name).await?.is_some() {
         return Err(Error::Catalog(format!("view already exists: {name}")));
     }
+    validated_query_relations(db, query, Some(&name)).await?;
+    validate_query_columns(db, query).await?;
 
     // Apply an explicit column list by aliasing the projection.
     let mut q = query.clone();
@@ -13436,20 +14708,22 @@ async fn expand_views(db: &Session, query: &SqlQuery) -> Result<SqlQuery> {
 }
 
 async fn expand_view_factor(db: &Session, tf: &mut TableFactor) -> Result<()> {
+    if information_schema_view(tf).is_some() {
+        return Ok(());
+    }
     if let TableFactor::Table { name, alias, .. } = tf {
-        if let Some(last) = name.0.last() {
-            if let Some(sql) = catalog::load_view(db, &last.value).await? {
-                let vq = parse_query(&sql)?;
-                let al = alias.clone().unwrap_or_else(|| sqlparser::ast::TableAlias {
-                    name: sqlparser::ast::Ident::new(last.value.clone()),
-                    columns: Vec::new(),
-                });
-                *tf = TableFactor::Derived {
-                    lateral: false,
-                    subquery: Box::new(vq),
-                    alias: Some(al),
-                };
-            }
+        let table = stored_table_ident(db, name)?;
+        if let Some(sql) = catalog::load_view(db, &table).await? {
+            let vq = parse_query(&sql)?;
+            let al = alias.clone().unwrap_or_else(|| sqlparser::ast::TableAlias {
+                name: sqlparser::ast::Ident::new(table),
+                columns: Vec::new(),
+            });
+            *tf = TableFactor::Derived {
+                lateral: false,
+                subquery: Box::new(vq),
+                alias: Some(al),
+            };
         }
     }
     Ok(())
@@ -13660,6 +14934,12 @@ async fn materialize_recursive(
     let mut self_map = std::collections::HashMap::new();
     self_map.insert(cname.to_ascii_lowercase(), temp.clone());
     let rec_q = rewrite_table_refs(rec_q, &self_map);
+    let (recursive_schema, _) = run_subquery_schema(db, vindex, &rec_q).await?;
+    if recursive_schema.columns.len() != schema.columns.len() {
+        return Err(Error::Query(format!(
+            "recursive CTE {cname} arms have different column counts"
+        )));
+    }
 
     let mut iters = 0;
     while !frontier.is_empty() {

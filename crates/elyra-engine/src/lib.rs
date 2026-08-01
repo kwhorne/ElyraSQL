@@ -474,13 +474,15 @@ impl Engine {
             let as_pos = rest.to_ascii_lowercase().find(" as ").ok_or_else(|| {
                 Error::Parse("CREATE MATERIALIZED VIEW requires AS <query>".into())
             })?;
-            let name = rest[..as_pos].trim().trim_matches(['`', '"']).to_string();
+            let raw_name = rest[..as_pos].trim();
             let query = rest[as_pos + 4..].trim().trim_end_matches(';').to_string();
-            if name.is_empty() || query.is_empty() {
+            if raw_name.is_empty() || query.is_empty() {
                 return Err(Error::Parse(
                     "CREATE MATERIALIZED VIEW: name and query required".into(),
                 ));
             }
+            let name = mysql_table_name_fragment(raw_name)?;
+            let name = exec::stored_table_ident(sess, &name)?;
             let ctas = format!("CREATE TABLE `{name}` AS {query}");
             Box::pin(self.execute_as(&ctas, privilege, user, sess)).await?;
             let dep = exec::matview_deps_put(sess, &name, &query).await?;
@@ -493,12 +495,11 @@ impl Engine {
         }
 
         if verb.starts_with("refresh") {
-            let name = rest
-                .trim()
-                .trim_end_matches(';')
-                .trim_matches(['`', '"'])
-                .to_string();
-            self.refresh_matview(&name, privilege, user, sess).await?;
+            let raw_name = rest.trim().trim_end_matches(';');
+            let name = mysql_table_name_fragment(raw_name)?;
+            let name = exec::stored_table_ident(sess, &name)?;
+            self.refresh_matview_atomic(&name, privilege, user, sess)
+                .await?;
             return Ok(vec![QueryResult::empty_ok()]);
         }
 
@@ -508,7 +509,8 @@ impl Engine {
             let cut = name.len() - stripped.len();
             name = name[cut..].trim();
         }
-        let name = name.trim_matches(['`', '"']).to_string();
+        let name = mysql_table_name_fragment(name)?;
+        let name = exec::stored_table_ident(sess, &name)?;
         if sess.get(catalog::matview_key(&name)).await?.is_none() {
             return Err(Error::Catalog(format!("no such materialized view: {name}")));
         }
@@ -547,37 +549,60 @@ impl Engine {
         Ok(())
     }
 
-    /// Before reading, auto-refresh any stale materialized view the query reads.
-    async fn auto_refresh_matviews(
+    /// Run an explicit materialized-view refresh as one recoverable unit. The
+    /// rebuild drops the old table before executing its defining query, so a
+    /// failure must restore both the table and its indexes.
+    async fn refresh_matview_atomic(
         &self,
-        stmt: &Statement,
+        name: &str,
         privilege: Privilege,
         user: &str,
         sess: &Session,
     ) -> Result<()> {
-        use sqlparser::ast::SetExpr;
-        let Statement::Query(q) = stmt else {
-            return Ok(());
+        let mut refresh_transaction = false;
+        let checkpoint = if sess.in_txn() {
+            Some(sess.transaction_checkpoint()?)
+        } else {
+            sess.begin()?;
+            refresh_transaction = true;
+            None
         };
-        let SetExpr::Select(select) = q.body.as_ref() else {
-            return Ok(());
-        };
-        for twj in &select.from {
-            for factor in
-                std::iter::once(&twj.relation).chain(twj.joins.iter().map(|j| &j.relation))
-            {
-                if let sqlparser::ast::TableFactor::Table { name, .. } = factor {
-                    if let Some(t) = object_name_last(name) {
-                        if sess.get(catalog::matview_key(&t)).await?.is_some()
-                            && exec::matview_is_stale(sess, &t).await?
-                        {
-                            self.refresh_matview(&t, privilege, user, sess).await?;
-                        }
-                    }
+
+        match self.refresh_matview(name, privilege, user, sess).await {
+            Ok(()) => {
+                if refresh_transaction {
+                    sess.commit().await?;
+                } else if let Some(checkpoint) = checkpoint {
+                    sess.release_transaction_checkpoint(checkpoint)?;
                 }
+                Ok(())
+            }
+            Err(error) => {
+                if refresh_transaction {
+                    sess.rollback();
+                } else if let Some(checkpoint) = checkpoint {
+                    sess.rollback_transaction_checkpoint(checkpoint)?;
+                }
+                Err(error)
             }
         }
-        Ok(())
+    }
+
+    /// Find every stale materialized view read anywhere in a query, including
+    /// through derived tables, set operations, scalar subqueries, and views.
+    async fn stale_matviews(&self, stmt: &Statement, sess: &Session) -> Result<Vec<String>> {
+        let Statement::Query(q) = stmt else {
+            return Ok(Vec::new());
+        };
+        let mut stale = Vec::new();
+        for table in exec::query_materialized_relations(sess, q).await? {
+            if sess.get(catalog::matview_key(&table)).await?.is_some()
+                && exec::matview_is_stale(sess, &table).await?
+            {
+                stale.push(table);
+            }
+        }
+        Ok(stale)
     }
 
     /// Execute a query and materialize all of its rows (for a cursor OPEN).
@@ -853,14 +878,22 @@ impl Engine {
 
         // SHOW INDEX / SHOW KEYS is not parsed by the SQL frontend; handle it here.
         if head.starts_with("show index") || head.starts_with("show key") {
-            let toks: Vec<&str> = trimmed.split_whitespace().collect();
-            let name = toks
-                .iter()
-                .position(|t| t.eq_ignore_ascii_case("from") || t.eq_ignore_ascii_case("in"))
-                .and_then(|i| toks.get(i + 1))
-                .map(|s| s.trim_matches(['`', '"', '\'', ';']).to_string())
-                .ok_or_else(|| Error::Parse("SHOW INDEX requires FROM <table>".into()))?;
+            let name = mysql_show_index_table(trimmed)?;
+            let name = exec::stored_table_ident(sess, &name)?;
             return Ok(vec![exec::show_index(sess, &name).await?]);
+        }
+
+        // sqlparser flattens SHOW TABLE STATUS into an identifier list and
+        // loses the dots/clause boundaries. Parse the optional database from
+        // tokens so LIKE/WHERE is not mistaken for another name component.
+        if head.starts_with("show table status") {
+            let (database, pattern) = mysql_show_table_status_options(trimmed)?;
+            if let Some(database) = database {
+                exec::selected_database_ident(sess, &database)?;
+            }
+            return Ok(vec![
+                exec::show_table_status(sess, pattern.as_deref()).await?,
+            ]);
         }
 
         // SHOW FUNCTION/PROCEDURE STATUS [WHERE ...] — the WHERE form doesn't
@@ -881,8 +914,13 @@ impl Engine {
         if let Some(rename) = parse_mysql_rename(trimmed) {
             require_privilege(privilege, PrivilegedAction::Rename)?;
             let result = match rename {
-                MysqlRename::Table { old, new } => exec::rename_table(sess, &old, &new).await?,
+                MysqlRename::Table { old, new } => {
+                    let old = exec::stored_table_ident(sess, &old)?;
+                    let new = exec::stored_table_ident(sess, &new)?;
+                    exec::rename_table(sess, &old, &new).await?
+                }
                 MysqlRename::Index { table, old, new } => {
+                    let table = exec::stored_table_ident(sess, &table)?;
                     exec::rename_index(sess, &table, &old, &new).await?
                 }
             };
@@ -894,10 +932,11 @@ impl Engine {
         // frontend so schema tools can remove indexes and keys.
         if let Some(drop) = parse_mysql_drop(trimmed) {
             require_privilege(privilege, PrivilegedAction::AlterTable)?;
+            let table = exec::stored_table_ident(sess, &drop.table)?;
             let result = match drop.kind {
-                MysqlDropKind::Index => exec::drop_index(sess, &drop.table, &drop.name).await?,
+                MysqlDropKind::Index => exec::drop_index(sess, &table, &drop.name).await?,
                 MysqlDropKind::ForeignKey => {
-                    exec::drop_foreign_key(sess, &drop.table, &drop.name).await?
+                    exec::drop_foreign_key(sess, &table, &drop.name).await?
                 }
             };
             return Ok(vec![result]);
@@ -940,7 +979,8 @@ impl Engine {
             let open = rest
                 .find('(')
                 .ok_or_else(|| Error::Parse("CREATE FULLTEXT INDEX requires (columns)".into()))?;
-            let table = rest[..open].trim().trim_matches(['`', '"']).to_string();
+            let table = mysql_table_name_fragment(rest[..open].trim())?;
+            let table = exec::stored_table_ident(sess, &table)?;
             let close = rest
                 .rfind(')')
                 .ok_or_else(|| Error::Parse("CREATE FULLTEXT INDEX requires (columns)".into()))?;
@@ -966,9 +1006,14 @@ impl Engine {
                     .trim()
                     .trim_end_matches(';');
                 let spec = exec::parse_partition_clause(clause)?;
+                let statements = Parser::parse_sql(&MySqlDialect {}, &base)
+                    .map_err(|error| Error::Parse(error.to_string()))?;
+                let table = match statements.as_slice() {
+                    [Statement::CreateTable(table)] => table.name.clone(),
+                    _ => return Err(Error::Parse("expected one CREATE TABLE statement".into())),
+                };
+                let table = exec::stored_table_ident(sess, &table)?;
                 Box::pin(self.execute_as(&base, privilege, user, sess)).await?;
-                // Table name follows CREATE TABLE [IF NOT EXISTS].
-                let table = exec::create_table_name(&base)?;
                 let enc = bincode::serialize(&spec).map_err(|e| Error::Storage(e.to_string()))?;
                 sess.commit_write(vec![(catalog::partmeta_key(&table), enc)], vec![])
                     .await?;
@@ -987,30 +1032,22 @@ impl Engine {
             };
             if let Some((kw, drop_meta)) = op {
                 require_privilege(privilege, PrivilegedAction::AlterPartition)?;
-                let toks: Vec<&str> = trimmed.split_whitespace().collect();
-                let table = toks
-                    .get(2)
-                    .map(|s| s.trim_matches(['`', '"']))
-                    .unwrap_or("");
-                let pname = lower
-                    .find(kw)
-                    .and_then(|p| trimmed[p + kw.len()..].split_whitespace().next())
-                    .map(|s| s.trim_matches(['`', '"', ';']))
-                    .unwrap_or("");
-                let spec = catalog::load_partspec(sess, table)
+                let (table, pname) = mysql_alter_partition_target(trimmed, kw)?;
+                let table = exec::stored_table_ident(sess, &table)?;
+                let spec = catalog::load_partspec(sess, &table)
                     .await?
                     .ok_or_else(|| Error::Catalog(format!("table '{table}' is not partitioned")))?;
-                let where_ = exec::partition_where(&spec, pname).ok_or_else(|| {
+                let where_ = exec::partition_where(&spec, &pname).ok_or_else(|| {
                     Error::Query(format!("cannot drop partition '{pname}' (unknown or HASH)"))
                 })?;
                 let del = format!("DELETE FROM `{table}` WHERE {where_}");
                 let r = Box::pin(self.execute_as(&del, privilege, user, sess)).await?;
                 if drop_meta {
                     let mut spec2 = spec;
-                    spec2.parts.retain(|p| !p.name.eq_ignore_ascii_case(pname));
+                    spec2.parts.retain(|p| !p.name.eq_ignore_ascii_case(&pname));
                     let enc =
                         bincode::serialize(&spec2).map_err(|e| Error::Storage(e.to_string()))?;
-                    sess.commit_write(vec![(catalog::partmeta_key(table), enc)], vec![])
+                    sess.commit_write(vec![(catalog::partmeta_key(&table), enc)], vec![])
                         .await?;
                 }
                 return Ok(r);
@@ -1032,7 +1069,9 @@ impl Engine {
         // the server and bulk-inserts it (requires ADMIN, like MySQL's FILE priv).
         if head.starts_with("load data") {
             require_privilege(privilege, PrivilegedAction::LoadDataInfile)?;
-            let spec = exec::parse_load_data(trimmed)?;
+            let mut spec = exec::parse_load_data(trimmed)?;
+            let table = mysql_load_data_table(trimmed)?;
+            spec.table = exec::stored_table_ident(sess, &table)?;
             let content = tokio::fs::read_to_string(&spec.path).await.map_err(|e| {
                 Error::Query(format!("LOAD DATA: cannot read '{}': {e}", spec.path))
             })?;
@@ -1056,28 +1095,14 @@ impl Engine {
         // the SQL frontend.
         if head.starts_with("lock tables") || head.starts_with("lock table ") {
             require_privilege(privilege, PrivilegedAction::LockTables)?;
-            let rest = {
-                let lower = trimmed.to_ascii_lowercase();
-                let pos = lower
-                    .find("tables")
-                    .or_else(|| lower.find("table"))
-                    .unwrap();
-                trimmed[pos..]
-                    .split_once(char::is_whitespace)
-                    .map(|x| x.1)
-                    .unwrap_or("")
-            };
-            for entry in rest.trim_end_matches(';').split(',') {
-                let toks: Vec<&str> = entry.split_whitespace().collect();
-                if toks.is_empty() {
-                    continue;
-                }
-                let table = toks[0].trim_matches(['`', '"']).to_string();
-                let mode = if entry.to_ascii_lowercase().contains("write") {
-                    lockmgr::LockMode::Exclusive
-                } else {
-                    lockmgr::LockMode::Shared
-                };
+            // Resolve every qualifier before taking the first lock. Otherwise a
+            // later invalid database leaves the earlier locks held even though
+            // the statement itself was rejected.
+            let locks = mysql_lock_tables(trimmed)?
+                .into_iter()
+                .map(|(table, mode)| Ok((exec::stored_table_ident(sess, &table)?, mode)))
+                .collect::<Result<Vec<_>>>()?;
+            for (table, mode) in locks {
                 sess.lock_table(&table, mode).await?;
             }
             return Ok(vec![QueryResult::empty_ok()]);
@@ -1090,7 +1115,11 @@ impl Engine {
         // Triggers (MySQL CREATE/DROP TRIGGER, not parsed by the frontend).
         if head.starts_with("create trigger") || head.starts_with("create or replace trigger") {
             require_privilege(privilege, PrivilegedAction::CreateTrigger)?;
-            let t = parse_create_trigger(trimmed)?;
+            let mut t = parse_create_trigger(trimmed)?;
+            let trigger = mysql_named_object(trimmed, "trigger")?;
+            t.name = exec::stored_table_ident(sess, &trigger)?;
+            let table = mysql_trigger_table(trimmed)?;
+            t.table = exec::stored_table_ident(sess, &table)?;
             sess.commit_write(
                 vec![
                     (
@@ -1107,14 +1136,8 @@ impl Engine {
         }
         if head.starts_with("drop trigger") {
             require_privilege(privilege, PrivilegedAction::DropTrigger)?;
-            let toks: Vec<&str> = trimmed.split_whitespace().collect();
-            let name = toks
-                .iter()
-                .position(|t| t.eq_ignore_ascii_case("trigger"))
-                .and_then(|i| toks.get(i + 1))
-                .map(|s| s.trim_matches(['`', '"', ';']).to_string())
-                .filter(|s| !s.eq_ignore_ascii_case("if"))
-                .ok_or_else(|| Error::Parse("DROP TRIGGER requires a name".into()))?;
+            let trigger = mysql_named_object(trimmed, "trigger")?;
+            let name = exec::stored_table_ident(sess, &trigger)?;
             match catalog::find_trigger(sess, &name).await? {
                 Some(t) => {
                     sess.commit_write(
@@ -1155,7 +1178,9 @@ impl Engine {
         // body is not parsed by the SQL frontend, so handle it here.
         if head.starts_with("create procedure") || head.starts_with("create or replace procedure") {
             require_privilege(privilege, PrivilegedAction::CreateProcedure)?;
-            let (name, def) = parse_create_procedure(trimmed)?;
+            let (_, def) = parse_create_procedure(trimmed)?;
+            let procedure = mysql_named_object(trimmed, "procedure")?;
+            let name = exec::stored_table_ident(sess, &procedure)?;
             let enc = bincode::serialize(&def).map_err(|e| Error::Storage(e.to_string()))?;
             sess.commit_write(vec![(catalog::proc_key(&name), enc)], vec![])
                 .await?;
@@ -1163,26 +1188,16 @@ impl Engine {
         }
         if head.starts_with("drop procedure") {
             require_privilege(privilege, PrivilegedAction::DropProcedure)?;
-            let toks: Vec<&str> = trimmed.split_whitespace().collect();
-            let name = toks
-                .iter()
-                .position(|t| t.eq_ignore_ascii_case("procedure"))
-                .and_then(|i| toks.get(i + 1))
-                .map(|s| s.trim_matches(['`', '"', ';', '(']).to_string())
-                .filter(|s| !s.eq_ignore_ascii_case("if"))
-                .ok_or_else(|| Error::Parse("DROP PROCEDURE requires a name".into()))?;
+            let procedure = mysql_named_object(trimmed, "procedure")?;
+            let name = exec::stored_table_ident(sess, &procedure)?;
             sess.commit_write(vec![], vec![catalog::proc_key(&name)])
                 .await?;
             return Ok(vec![QueryResult::empty_ok()]);
         }
         if head.starts_with("call ") {
             let call = trimmed[4..].trim().trim_end_matches(';');
-            let name = call
-                .split(['(', ' '])
-                .next()
-                .unwrap_or("")
-                .trim_matches(['`', '"'])
-                .to_string();
+            let procedure = mysql_named_object(trimmed, "call")?;
+            let name = exec::stored_table_ident(sess, &procedure)?;
             let def: proc::ProcDef = match sess.get(catalog::proc_key(&name)).await? {
                 Some(b) => bincode::deserialize(&b).map_err(|e| Error::Storage(e.to_string()))?,
                 None => return Err(Error::Query(format!("procedure does not exist: {name}"))),
@@ -1373,40 +1388,76 @@ impl Engine {
                     }
                 }
             }
-            // Auto-refresh any stale materialized view this statement reads.
-            // Skipped entirely when the database has no materialized views
-            // (avoids a per-query catalog read on the common path).
-            if catalog::matviews_exist(sess).await {
-                self.auto_refresh_matviews(&stmt, privilege, user, sess)
-                    .await?;
-            }
+            // Refreshes and the query that consumes them are one atomic unit.
+            // Autocommit uses a temporary transaction; an explicit transaction
+            // uses a private checkpoint outside the client's savepoint namespace.
+            let stale_matviews = if catalog::matviews_exist(sess).await {
+                self.stale_matviews(&stmt, sess).await?
+            } else {
+                Vec::new()
+            };
+            let mut refresh_transaction = false;
+            let refresh_checkpoint = if stale_matviews.is_empty() {
+                None
+            } else if sess.in_txn() {
+                Some(sess.transaction_checkpoint()?)
+            } else {
+                sess.begin()?;
+                refresh_transaction = true;
+                None
+            };
 
-            // Per-column masking: a column-restricted user may only read the
-            // columns granted to them on a table. Skipped when no column grants
-            // exist anywhere.
-            if !user.is_empty() && catalog::colgrants_exist(sess).await {
-                self.enforce_column_masking(user, &stmt, sess).await?;
-            }
+            let statement_result: Result<QueryResult> = async {
+                for table in &stale_matviews {
+                    self.refresh_matview(table, privilege, user, sess).await?;
+                }
 
-            // Pessimistic locking: while another session holds an explicit
-            // LOCK TABLES, acquire a transient lock on this statement's target
-            // tables for the statement's duration (skipped entirely otherwise).
-            let mut _guards: Vec<lockmgr::LockGuard> = Vec::new();
-            if self.locks.explicit_active() {
-                let mode = if need >= Privilege::Write {
-                    lockmgr::LockMode::Exclusive
-                } else {
-                    lockmgr::LockMode::Shared
-                };
-                for t in stmt_targets(&stmt) {
-                    if !sess.holds_lock(&t) {
-                        _guards.push(lockmgr::transient(&self.locks, &t, mode).await?);
+                // Per-column masking: a column-restricted user may only read the
+                // columns granted to them on a table. Skipped when no column grants
+                // exist anywhere.
+                if !user.is_empty() && catalog::colgrants_exist(sess).await {
+                    self.enforce_column_masking(user, &stmt, sess).await?;
+                }
+
+                // Pessimistic locking: while another session holds an explicit
+                // LOCK TABLES, acquire a transient lock on this statement's target
+                // tables for the statement's duration (skipped entirely otherwise).
+                let mut _guards: Vec<lockmgr::LockGuard> = Vec::new();
+                if self.locks.explicit_active() {
+                    let mode = if need >= Privilege::Write {
+                        lockmgr::LockMode::Exclusive
+                    } else {
+                        lockmgr::LockMode::Shared
+                    };
+                    for t in stmt_targets(&stmt) {
+                        if !sess.holds_lock(&t) {
+                            _guards.push(lockmgr::transient(&self.locks, &t, mode).await?);
+                        }
                     }
                 }
+                self.execute_stmt(stmt, sess, update_modifiers.as_ref(), dml_limit)
+                    .await
             }
-            let r = self
-                .execute_stmt(stmt, sess, update_modifiers.as_ref(), dml_limit)
-                .await?;
+            .await;
+
+            let r = match statement_result {
+                Ok(result) => {
+                    if refresh_transaction {
+                        sess.commit().await?;
+                    } else if let Some(checkpoint) = refresh_checkpoint {
+                        sess.release_transaction_checkpoint(checkpoint)?;
+                    }
+                    result
+                }
+                Err(error) => {
+                    if refresh_transaction {
+                        sess.rollback();
+                    } else if let Some(checkpoint) = refresh_checkpoint {
+                        sess.rollback_transaction_checkpoint(checkpoint)?;
+                    }
+                    return Err(error);
+                }
+            };
             // Track ROW_COUNT(): rows changed by DML, or -1 after a result set
             // (matches MySQL).
             match &r {
@@ -1475,6 +1526,13 @@ impl Engine {
         match stmt {
             Statement::Query(q) => {
                 if query_has_from(&q) {
+                    // Resolve columns against the same structured schemas used
+                    // by CREATE VIEW and EXPLAIN before execution. The row
+                    // evaluator intentionally accepts qualified references on
+                    // an unqualified single-table scan, so this preflight is
+                    // what prevents an unknown qualifier from degrading into a
+                    // unique bare-column match.
+                    exec::validate_query_columns(sess, &q).await?;
                     exec::select(sess, &self.vindex, &q).await
                 } else {
                     eval::eval_literal_select(&q)
@@ -1484,8 +1542,8 @@ impl Engine {
             Statement::Truncate { table_names, .. } => {
                 let name = table_names
                     .first()
-                    .and_then(|t| t.name.0.last())
-                    .map(|i| i.value.clone())
+                    .map(|t| exec::stored_table_ident(sess, &t.name))
+                    .transpose()?
                     .ok_or_else(|| Error::Catalog("empty table name".into()))?;
                 exec::truncate(sess, &name).await
             }
@@ -1543,10 +1601,7 @@ impl Engine {
             } => {
                 let table_names = names
                     .iter()
-                    .map(|name| {
-                        object_name_last(name)
-                            .ok_or_else(|| Error::Catalog("empty table name".into()))
-                    })
+                    .map(|name| exec::stored_table_ident(sess, name))
                     .collect::<Result<Vec<_>>>()?;
                 if !if_exists {
                     for name in &table_names {
@@ -1568,10 +1623,7 @@ impl Engine {
             } => {
                 let view_names = names
                     .iter()
-                    .map(|name| {
-                        object_name_last(name)
-                            .ok_or_else(|| Error::Catalog("empty view name".into()))
-                    })
+                    .map(|name| exec::stored_table_ident(sess, name))
                     .collect::<Result<Vec<_>>>()?;
                 if !if_exists {
                     for name in &view_names {
@@ -1605,43 +1657,36 @@ impl Engine {
                 Ok(QueryResult::empty_ok())
             }
             Statement::Analyze { table_name, .. } => {
-                let name = table_name
-                    .0
-                    .last()
-                    .map(|i| i.value.clone())
-                    .ok_or_else(|| Error::Catalog("empty table name".into()))?;
+                let name = exec::stored_table_ident(sess, &table_name)?;
                 exec::analyze_table(sess, &name).await
             }
             Statement::ReleaseSavepoint { name } => {
                 sess.release_savepoint(&name.value)?;
                 Ok(QueryResult::empty_ok())
             }
-            Statement::ShowTables { .. } => exec::show_tables(sess).await,
+            Statement::ShowTables { show_options, .. } => {
+                if let Some(database) = show_options.show_in.and_then(|show| show.parent_name) {
+                    exec::selected_database_ident(sess, &database)?;
+                }
+                exec::show_tables(sess).await
+            }
             Statement::ShowCreate {
                 obj_type: sqlparser::ast::ShowCreateObject::Table,
                 obj_name,
             } => {
-                let name = obj_name
-                    .0
-                    .last()
-                    .map(|i| i.value.clone())
-                    .ok_or_else(|| Error::Catalog("empty table name".into()))?;
+                let name = exec::stored_table_ident(sess, &obj_name)?;
                 exec::show_create_table(sess, &name).await
             }
             Statement::ShowColumns { show_options, .. } => {
                 let name = show_options
                     .show_in
                     .and_then(|si| si.parent_name)
-                    .and_then(|n| n.0.last().map(|i| i.value.clone()))
                     .ok_or_else(|| Error::Catalog("SHOW COLUMNS requires a table".into()))?;
+                let name = exec::stored_table_ident(sess, &name)?;
                 exec::show_columns(sess, &name).await
             }
             Statement::ExplainTable { table_name, .. } => {
-                let name = table_name
-                    .0
-                    .last()
-                    .map(|i| i.value.clone())
-                    .ok_or_else(|| Error::Catalog("empty table name".into()))?;
+                let name = exec::stored_table_ident(sess, &table_name)?;
                 exec::show_columns(sess, &name).await
             }
             Statement::SetVariable { .. } => Ok(QueryResult::empty_ok()),
@@ -1674,7 +1719,13 @@ impl Engine {
                 create_database_result(if_not_exists)
             }
             Statement::CreateSchema { if_not_exists, .. } => create_database_result(if_not_exists),
-            Statement::Explain { statement, .. } => exec::explain(sess, &statement).await,
+            Statement::Explain { statement, .. } => {
+                if let Statement::Query(query) = statement.as_ref() {
+                    exec::validate_query_relations(sess, query).await?;
+                    exec::validate_query_columns(sess, query).await?;
+                }
+                exec::explain(sess, &statement).await
+            }
             Statement::Drop {
                 object_type:
                     sqlparser::ast::ObjectType::Database | sqlparser::ast::ObjectType::Schema,
@@ -1698,7 +1749,9 @@ impl Engine {
                     .join(" ");
                 match kw.as_str() {
                     "warnings" | "errors" => exec::show_warnings(),
-                    _ if kw.starts_with("table status") => exec::show_table_status(sess).await,
+                    _ if kw.starts_with("table status") => {
+                        exec::show_table_status(sess, None).await
+                    }
                     _ => Err(Error::Unsupported(format!(
                         "statement not yet implemented: SHOW {kw}"
                     ))),
@@ -2621,24 +2674,312 @@ fn mysql_word(tokens: &[Token], position: usize) -> Option<&str> {
 }
 
 fn mysql_keyword(tokens: &[Token], position: usize, expected: &str) -> bool {
-    mysql_word(tokens, position).is_some_and(|actual| actual.eq_ignore_ascii_case(expected))
+    matches!(
+        tokens.get(position),
+        Some(Token::Word(word))
+            if word.quote_style.is_none() && word.value.eq_ignore_ascii_case(expected)
+    )
 }
 
-fn mysql_table_name(tokens: &[Token], start: usize, end: usize) -> Option<String> {
+fn mysql_table_name(
+    tokens: &[Token],
+    start: usize,
+    end: usize,
+) -> Option<sqlparser::ast::ObjectName> {
     match tokens.get(start..end)? {
-        [Token::Word(table)] => Some(table.value.clone()),
-        [Token::Word(_schema), Token::Period, Token::Word(table)] => Some(table.value.clone()),
+        [Token::Word(table)] => Some(sqlparser::ast::ObjectName(vec![
+            sqlparser::ast::Ident::new(table.value.clone()),
+        ])),
+        [Token::Word(schema), Token::Period, Token::Word(table)] => {
+            Some(sqlparser::ast::ObjectName(vec![
+                sqlparser::ast::Ident::new(schema.value.clone()),
+                sqlparser::ast::Ident::new(table.value.clone()),
+            ]))
+        }
         _ => None,
     }
 }
 
+fn mysql_named_object(sql: &str, keyword: &str) -> Result<sqlparser::ast::ObjectName> {
+    let tokens = mysql_ddl_tokens(sql)
+        .ok_or_else(|| Error::Parse(format!("invalid {keyword} object name")))?;
+    let keyword_position = (0..tokens.len())
+        .find(|&position| mysql_keyword(&tokens, position, keyword))
+        .ok_or_else(|| Error::Parse(format!("missing {keyword} object name")))?;
+    let mut start = keyword_position + 1;
+    if mysql_keyword(&tokens, start, "if") && mysql_keyword(&tokens, start + 1, "exists") {
+        start += 2;
+    }
+    let end = if matches!(tokens.get(start + 1), Some(Token::Period)) {
+        start + 3
+    } else {
+        start + 1
+    };
+    if matches!(tokens.get(end), Some(Token::Period)) {
+        return Err(Error::Parse(format!(
+            "invalid qualified {keyword} object name"
+        )));
+    }
+    mysql_table_name(&tokens, start, end)
+        .ok_or_else(|| Error::Parse(format!("invalid qualified {keyword} object name")))
+}
+
+pub(crate) fn mysql_grant_scope(
+    sql: &str,
+    db: &Session,
+    separator: &str,
+) -> Result<Option<String>> {
+    let tokens = mysql_ddl_tokens(sql)
+        .ok_or_else(|| Error::Parse("invalid GRANT/REVOKE object scope".into()))?;
+    let end = (0..tokens.len())
+        .rfind(|&position| mysql_keyword(&tokens, position, separator))
+        .ok_or_else(|| {
+            Error::Parse(format!(
+                "GRANT/REVOKE requires {} <principal>",
+                separator.to_ascii_uppercase()
+            ))
+        })?;
+    // Search backwards from TO/FROM so a privilege column named `on` cannot be
+    // mistaken for the object-clause delimiter.
+    let on = (0..end)
+        .rfind(|&position| mysql_keyword(&tokens, position, "on"))
+        .ok_or_else(|| Error::Parse("GRANT/REVOKE requires ON <object>".into()))?;
+    match tokens.get(on + 1..end).unwrap_or_default() {
+        [Token::Mul] | [Token::Mul, Token::Period, Token::Mul] => Ok(None),
+        [Token::Word(database), Token::Period, Token::Mul] => {
+            let database = sqlparser::ast::ObjectName(vec![sqlparser::ast::Ident::new(
+                database.value.clone(),
+            )]);
+            exec::selected_database_ident(db, &database)?;
+            Ok(None)
+        }
+        _ => {
+            let table = mysql_table_name(&tokens, on + 1, end)
+                .ok_or_else(|| Error::Parse("invalid GRANT/REVOKE object scope".into()))?;
+            exec::stored_table_ident(db, &table).map(Some)
+        }
+    }
+}
+
+fn mysql_table_name_fragment(raw_name: &str) -> Result<sqlparser::ast::ObjectName> {
+    let tokens = mysql_ddl_tokens(raw_name)
+        .ok_or_else(|| Error::Parse(format!("invalid qualified table name: {raw_name}")))?;
+    mysql_table_name(&tokens, 0, tokens.len())
+        .ok_or_else(|| Error::Parse(format!("invalid qualified table name: {raw_name}")))
+}
+
+fn mysql_alter_partition_target(
+    sql: &str,
+    operation: &str,
+) -> Result<(sqlparser::ast::ObjectName, String)> {
+    let tokens = mysql_ddl_tokens(sql)
+        .ok_or_else(|| Error::Parse("invalid ALTER TABLE partition statement".into()))?;
+    let verb = operation
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| Error::Parse("missing partition operation".into()))?;
+    let operation = (2..tokens.len())
+        .find(|&position| {
+            mysql_keyword(&tokens, position, verb)
+                && mysql_keyword(&tokens, position + 1, "partition")
+        })
+        .ok_or_else(|| Error::Parse("ALTER TABLE requires a partition operation".into()))?;
+    let table = mysql_table_name(&tokens, 2, operation)
+        .ok_or_else(|| Error::Parse("ALTER TABLE has an invalid table name".into()))?;
+    let partition = match tokens.get(operation + 2) {
+        Some(Token::Word(name)) if operation + 3 == tokens.len() => name.value.clone(),
+        _ => {
+            return Err(Error::Parse(
+                "ALTER TABLE partition operation requires one partition name".into(),
+            ))
+        }
+    };
+    Ok((table, partition))
+}
+
+fn mysql_load_data_table(sql: &str) -> Result<sqlparser::ast::ObjectName> {
+    let tokens =
+        mysql_ddl_tokens(sql).ok_or_else(|| Error::Parse("invalid LOAD DATA statement".into()))?;
+    let into = (0..tokens.len())
+        .find(|&position| {
+            mysql_keyword(&tokens, position, "into")
+                && mysql_keyword(&tokens, position + 1, "table")
+        })
+        .ok_or_else(|| Error::Parse("LOAD DATA requires INTO TABLE <table>".into()))?;
+    let start = into + 2;
+    let end = (start..tokens.len())
+        .find(|&position| {
+            matches!(tokens[position], Token::LParen)
+                || ["fields", "columns", "lines", "ignore", "character", "set"]
+                    .iter()
+                    .any(|keyword| mysql_keyword(&tokens, position, keyword))
+        })
+        .unwrap_or(tokens.len());
+    mysql_table_name(&tokens, start, end)
+        .ok_or_else(|| Error::Parse("LOAD DATA has an invalid table name".into()))
+}
+
+fn mysql_lock_tables(sql: &str) -> Result<Vec<(sqlparser::ast::ObjectName, lockmgr::LockMode)>> {
+    let tokens = mysql_ddl_tokens(sql)
+        .ok_or_else(|| Error::Parse("invalid LOCK TABLES statement".into()))?;
+    if !mysql_keyword(&tokens, 0, "lock")
+        || !(mysql_keyword(&tokens, 1, "table") || mysql_keyword(&tokens, 1, "tables"))
+    {
+        return Err(Error::Parse("invalid LOCK TABLES statement".into()));
+    }
+    let mut entries = Vec::new();
+    let mut start = 2;
+    while start < tokens.len() {
+        let end = tokens[start..]
+            .iter()
+            .position(|token| matches!(token, Token::Comma))
+            .map(|offset| start + offset)
+            .unwrap_or(tokens.len());
+        let name_end = match tokens.get(start..end) {
+            Some([Token::Word(_), Token::Period, Token::Word(_), ..]) => start + 3,
+            Some([Token::Word(_), ..]) => start + 1,
+            _ => return Err(Error::Parse("LOCK TABLES has an invalid table name".into())),
+        };
+        let name = mysql_table_name(&tokens, start, name_end)
+            .ok_or_else(|| Error::Parse("LOCK TABLES has an invalid table name".into()))?;
+        let modifiers = &tokens[name_end..end];
+        let write = modifiers.iter().any(
+            |token| matches!(token, Token::Word(word) if word.value.eq_ignore_ascii_case("write")),
+        );
+        let read = modifiers.iter().any(
+            |token| matches!(token, Token::Word(word) if word.value.eq_ignore_ascii_case("read")),
+        );
+        if !write && !read {
+            return Err(Error::Parse(
+                "LOCK TABLES requires READ or WRITE for each table".into(),
+            ));
+        }
+        entries.push((
+            name,
+            if write {
+                lockmgr::LockMode::Exclusive
+            } else {
+                lockmgr::LockMode::Shared
+            },
+        ));
+        start = end + usize::from(end < tokens.len());
+    }
+    Ok(entries)
+}
+
+fn mysql_trigger_table(sql: &str) -> Result<sqlparser::ast::ObjectName> {
+    let tokens = mysql_ddl_tokens(sql)
+        .ok_or_else(|| Error::Parse("invalid CREATE TRIGGER statement".into()))?;
+    let on = (0..tokens.len())
+        .find(|&position| mysql_keyword(&tokens, position, "on"))
+        .ok_or_else(|| Error::Parse("CREATE TRIGGER requires ON <table>".into()))?;
+    let for_each_row = (on + 1..tokens.len())
+        .find(|&position| {
+            mysql_keyword(&tokens, position, "for")
+                && mysql_keyword(&tokens, position + 1, "each")
+                && mysql_keyword(&tokens, position + 2, "row")
+        })
+        .ok_or_else(|| Error::Parse("CREATE TRIGGER requires FOR EACH ROW".into()))?;
+    mysql_table_name(&tokens, on + 1, for_each_row)
+        .ok_or_else(|| Error::Parse("CREATE TRIGGER has an invalid table name".into()))
+}
+
+fn mysql_show_table_status_options(
+    sql: &str,
+) -> Result<(Option<sqlparser::ast::ObjectName>, Option<String>)> {
+    let tokens = mysql_ddl_tokens(sql)
+        .ok_or_else(|| Error::Parse("invalid SHOW TABLE STATUS statement".into()))?;
+    if !(mysql_keyword(&tokens, 0, "show")
+        && mysql_keyword(&tokens, 1, "table")
+        && mysql_keyword(&tokens, 2, "status"))
+    {
+        return Err(Error::Parse("invalid SHOW TABLE STATUS statement".into()));
+    }
+    let mut position = 3;
+    let database = if mysql_keyword(&tokens, position, "from")
+        || mysql_keyword(&tokens, position, "in")
+    {
+        let database = mysql_table_name(&tokens, position + 1, position + 2)
+            .ok_or_else(|| Error::Parse("SHOW TABLE STATUS has an invalid database name".into()))?;
+        position += 2;
+        Some(database)
+    } else {
+        None
+    };
+    if mysql_keyword(&tokens, position, "where") {
+        return Err(Error::Unsupported(
+            "SHOW TABLE STATUS WHERE is not supported".into(),
+        ));
+    }
+    let pattern = if mysql_keyword(&tokens, position, "like") {
+        let pattern = match tokens.get(position + 1) {
+            Some(Token::SingleQuotedString(pattern) | Token::DoubleQuotedString(pattern)) => {
+                pattern.clone()
+            }
+            _ => {
+                return Err(Error::Parse(
+                    "SHOW TABLE STATUS LIKE requires a string pattern".into(),
+                ))
+            }
+        };
+        position += 2;
+        Some(pattern)
+    } else {
+        None
+    };
+    if position != tokens.len() {
+        return Err(Error::Parse(
+            "SHOW TABLE STATUS has unexpected trailing tokens".into(),
+        ));
+    }
+    Ok((database, pattern))
+}
+
+fn mysql_show_index_table(sql: &str) -> Result<sqlparser::ast::ObjectName> {
+    let tokens = mysql_ddl_tokens(sql)
+        .ok_or_else(|| Error::Parse("SHOW INDEX requires FROM <table>".into()))?;
+    let from = tokens
+        .iter()
+        .enumerate()
+        .skip(2)
+        .find_map(|(position, _)| {
+            (mysql_keyword(&tokens, position, "from") || mysql_keyword(&tokens, position, "in"))
+                .then_some(position)
+        })
+        .ok_or_else(|| Error::Parse("SHOW INDEX requires FROM <table>".into()))?;
+    let table_start = from + 1;
+    let suffix = (table_start..tokens.len()).find(|&position| {
+        mysql_keyword(&tokens, position, "from")
+            || mysql_keyword(&tokens, position, "in")
+            || mysql_keyword(&tokens, position, "where")
+    });
+    let table_end = suffix.unwrap_or(tokens.len());
+    let table = mysql_table_name(&tokens, table_start, table_end)
+        .ok_or_else(|| Error::Parse("SHOW INDEX requires FROM <table>".into()))?;
+
+    let Some(schema_marker) = suffix.filter(|&position| {
+        mysql_keyword(&tokens, position, "from") || mysql_keyword(&tokens, position, "in")
+    }) else {
+        return Ok(table);
+    };
+    let schema_start = schema_marker + 1;
+    let schema_end = (schema_start..tokens.len())
+        .find(|&position| mysql_keyword(&tokens, position, "where"))
+        .unwrap_or(tokens.len());
+    let schema = mysql_table_name(&tokens, schema_start, schema_end)
+        .ok_or_else(|| Error::Parse("SHOW INDEX has an invalid database qualifier".into()))?;
+    let mut parts = schema.0;
+    parts.extend(table.0);
+    Ok(sqlparser::ast::ObjectName(parts))
+}
+
 enum MysqlRename {
     Table {
-        old: String,
-        new: String,
+        old: sqlparser::ast::ObjectName,
+        new: sqlparser::ast::ObjectName,
     },
     Index {
-        table: String,
+        table: sqlparser::ast::ObjectName,
         old: String,
         new: String,
     },
@@ -2685,7 +3026,7 @@ enum MysqlDropKind {
 }
 
 struct MysqlDrop {
-    table: String,
+    table: sqlparser::ast::ObjectName,
     name: String,
     kind: MysqlDropKind,
 }
@@ -3819,8 +4160,8 @@ mod comma_update_tests {
 #[cfg(test)]
 mod mysql_ddl_compat_tests {
     use super::{
-        parse_mysql_rename, require_privilege, rewrite_alter_column_collations,
-        strip_create_table_options, MysqlRename, PrivilegedAction,
+        mysql_show_index_table, parse_mysql_rename, require_privilege,
+        rewrite_alter_column_collations, strip_create_table_options, MysqlRename, PrivilegedAction,
     };
     use elyra_core::Privilege;
 
@@ -3884,19 +4225,41 @@ mod mysql_ddl_compat_tests {
     fn parses_mysql_rename_forms() {
         match parse_mysql_rename("RENAME TABLE `old_table` TO `new_table`") {
             Some(MysqlRename::Table { old, new }) => {
-                assert_eq!(old, "old_table");
-                assert_eq!(new, "new_table");
+                assert_eq!(old.to_string(), "old_table");
+                assert_eq!(new.to_string(), "new_table");
             }
             _ => panic!("expected a table rename"),
         }
         match parse_mysql_rename("ALTER TABLE db.t RENAME INDEX `old_i` TO `new_i`") {
             Some(MysqlRename::Index { table, old, new }) => {
-                assert_eq!(table, "t");
+                assert_eq!(table.to_string(), "db.t");
                 assert_eq!(old, "old_i");
                 assert_eq!(new, "new_i");
             }
             _ => panic!("expected an index rename"),
         }
+    }
+
+    #[test]
+    fn parses_mysql_show_index_qualifiers() {
+        assert_eq!(
+            mysql_show_index_table("SHOW INDEX FROM `tenant`.`victim` WHERE Key_name = 'idx'")
+                .unwrap()
+                .to_string(),
+            "tenant.victim"
+        );
+        assert_eq!(
+            mysql_show_index_table("SHOW KEYS FROM `victim` IN `tenant`")
+                .unwrap()
+                .to_string(),
+            "tenant.victim"
+        );
+        assert_eq!(
+            mysql_show_index_table("SHOW INDEX FROM `where`")
+                .unwrap()
+                .to_string(),
+            "where"
+        );
     }
 
     #[test]
