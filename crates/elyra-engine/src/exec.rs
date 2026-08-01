@@ -7190,20 +7190,8 @@ async fn load_relation(
         let qualifier = factor_qualifier_object(db, tf).ok_or_else(|| {
             Error::Query("a derived table (FROM (SELECT ...)) needs an alias".into())
         })?;
-        let alias = object_name_text(&qualifier);
-        let qualifier_parts = object_name_parts(&qualifier);
         let (schema, rows) = run_subquery_schema(db, vindex, subquery).await?;
-        let cols = schema
-            .columns
-            .iter()
-            .map(|c| ColumnDef {
-                name: format!("{alias}.{}", c.name),
-                ty: c.ty.clone(),
-                nullable: c.nullable,
-                collation: c.collation,
-                qualifier: qualifier_parts.clone(),
-            })
-            .collect();
+        let cols = qualify_columns(&schema, &qualifier);
         return Ok((cols, rows));
     }
 
@@ -7225,6 +7213,10 @@ async fn load_relation(
         None => scan_rows(db, &def, None).await?,
     };
     Ok((cols, rows))
+}
+
+fn qualify_columns(schema: &Schema, qualifier: &ObjectName) -> Vec<ColumnDef> {
+    qualify_relation_schema(schema.clone(), qualifier).columns
 }
 
 /// Driving-side row count at or below which we prefer an index nested-loop
@@ -11963,10 +11955,11 @@ fn query_refs_qualifier(q: &SqlQuery, qualifier: &[String]) -> bool {
     found.get()
 }
 
-// sqlparser's generated visitors, query execution, and AST drop path recurse
-// through every derived query. Keep enough headroom for the rest of the
-// statement on a Tokio worker's comparatively small stack.
-const MAX_CTE_EXPANSION_DEPTH: usize = 2;
+// sqlparser's generated visitors and AST drop path recurse through every
+// derived query. Keep enough headroom for the rest of the statement on a Tokio
+// worker's comparatively small stack; routine linear execution is flattened by
+// `run_derived_query_chain` below.
+const MAX_CTE_EXPANSION_DEPTH: usize = 16;
 // A shallow CTE can still expand exponentially when it references a previous
 // definition more than once. Bound the generated tree as well as its depth.
 const MAX_CTE_EXPANSION_NODES: usize = 256;
@@ -13964,7 +13957,151 @@ async fn run_subquery_schema(
     vindex: &VectorRegistry,
     q: &SqlQuery,
 ) -> Result<(Schema, Vec<Vec<Value>>)> {
-    match Box::pin(select(db, vindex, q)).await? {
+    if let Some(result) = run_derived_query_chain(db, vindex, q).await? {
+        return Ok(result);
+    }
+    materialize_query_result(Box::pin(select(db, vindex, q)).await?).await
+}
+
+struct DerivedQueryLayer<'a> {
+    query: &'a SqlQuery,
+    select: &'a Select,
+    subquery: &'a SqlQuery,
+    input_alias: &'a Ident,
+    group_by: &'a [Expr],
+}
+
+/// Return a derived-table layer that can be evaluated over already-materialised
+/// rows without changing the normal SELECT semantics. Unsupported or recursive
+/// shapes fall back to the regular executor.
+fn derived_query_layer(query: &SqlQuery) -> Option<DerivedQueryLayer<'_>> {
+    if query.with.is_some()
+        || !query.limit_by.is_empty()
+        || query.fetch.is_some()
+        || !query.locks.is_empty()
+        || query.for_clause.is_some()
+        || query.settings.is_some()
+        || query.format_clause.is_some()
+    {
+        return None;
+    }
+
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return None;
+    };
+    let sqlparser::ast::GroupByExpr::Expressions(group_by, modifiers) = &select.group_by else {
+        return None;
+    };
+    if select.distinct.is_some()
+        || select.top.is_some()
+        || select.into.is_some()
+        || !select.lateral_views.is_empty()
+        || select.prewhere.is_some()
+        || !select.cluster_by.is_empty()
+        || !select.distribute_by.is_empty()
+        || !select.sort_by.is_empty()
+        || !select.named_window.is_empty()
+        || select.qualify.is_some()
+        || select.value_table_mode.is_some()
+        || select.connect_by.is_some()
+        || !modifiers.is_empty()
+        || projection_has_subquery(&select.projection)
+        || projection_has_window(&select.projection)
+        || select.selection.as_ref().is_some_and(expr_has_subquery)
+        || select.having.as_ref().is_some_and(expr_has_subquery)
+        || group_by.iter().any(expr_has_subquery)
+        || query.order_by.as_ref().is_some_and(|order_by| {
+            order_by
+                .exprs
+                .iter()
+                .any(|order| expr_has_subquery(&order.expr))
+        })
+        || select.from.len() != 1
+    {
+        return None;
+    }
+
+    let relation = &select.from[0];
+    if !relation.joins.is_empty() {
+        return None;
+    }
+    let TableFactor::Derived {
+        lateral: false,
+        subquery,
+        alias: Some(alias),
+    } = &relation.relation
+    else {
+        return None;
+    };
+
+    Some(DerivedQueryLayer {
+        query,
+        select,
+        subquery,
+        input_alias: &alias.name,
+        group_by,
+    })
+}
+
+/// Evaluate a linear chain of simple derived tables from the inside out. Doing
+/// this iteratively avoids recursively polling the full SELECT/join executor for
+/// every inlined CTE dependency, which can exhaust a worker's stack even for a
+/// routine chain.
+async fn run_derived_query_chain(
+    db: &Session,
+    vindex: &VectorRegistry,
+    query: &SqlQuery,
+) -> Result<Option<(Schema, Vec<Vec<Value>>)>> {
+    let mut current = query;
+    let mut layers = Vec::new();
+    while let Some(layer) = derived_query_layer(current) {
+        current = layer.subquery;
+        layers.push(layer);
+    }
+    if layers.is_empty() {
+        return Ok(None);
+    }
+
+    let (mut schema, mut rows) =
+        materialize_query_result(Box::pin(select(db, vindex, current)).await?).await?;
+    for layer in layers.into_iter().rev() {
+        let input_qualifier = canonical_relation_qualifier(db, None, layer.input_alias);
+        let input_schema = Schema::new(qualify_columns(&schema, &input_qualifier));
+        let order_exprs: Vec<(Expr, bool)> = match &layer.query.order_by {
+            Some(order_by) => order_by
+                .exprs
+                .iter()
+                .map(|order| (order.expr.clone(), order.asc.unwrap_or(true)))
+                .collect(),
+            None => Vec::new(),
+        };
+        let offset = match &layer.query.offset {
+            Some(offset) => eval_usize(&offset.value)?,
+            None => 0,
+        };
+        let limit = match &layer.query.limit {
+            Some(limit) => Some(eval_usize(limit)?),
+            None => None,
+        };
+        let result = run_virtual_select(
+            db,
+            vindex,
+            layer.select,
+            input_schema,
+            rows,
+            layer.group_by,
+            &order_exprs,
+            offset,
+            limit,
+        )
+        .await?;
+        (schema, rows) = materialize_query_result(result).await?;
+    }
+    Ok(Some((schema, rows)))
+}
+
+async fn materialize_query_result(result: QueryResult) -> Result<(Schema, Vec<Vec<Value>>)> {
+    match result {
         QueryResult::Rows(mut stream) => {
             let schema = stream.schema.clone();
             let mut rows = Vec::new();
@@ -17006,14 +17143,14 @@ mod cte_rewrite_tests {
     }
 
     #[tokio::test]
-    async fn ordinary_sibling_cte_aliases_still_execute() {
+    async fn ordinary_cte_dependency_chain_still_executes() {
         let (engine, session) = engine_and_session();
-        let definitions = (0..=1)
+        let definitions = (0..super::MAX_CTE_EXPANSION_DEPTH)
             .map(|index| {
                 if index == 0 {
                     "c0 AS (SELECT 7 AS n)".to_owned()
                 } else {
-                    format!("c{index} AS (SELECT n FROM c{})", index - 1)
+                    format!("c{index} AS (SELECT n + 1 AS n FROM c{})", index - 1)
                 }
             })
             .collect::<Vec<_>>()
@@ -17023,11 +17160,121 @@ mod cte_rewrite_tests {
             rows(
                 &engine,
                 &session,
-                &format!("WITH {definitions} SELECT n FROM c1"),
+                &format!(
+                    "WITH {definitions} SELECT n FROM c{}",
+                    super::MAX_CTE_EXPANSION_DEPTH - 1
+                ),
             )
             .await,
-            vec![vec![Value::Int(7)]]
+            vec![vec![Value::Int(22)]]
         );
+    }
+
+    #[tokio::test]
+    async fn binary_collation_survives_a_cte_dependency_chain() {
+        let (engine, session) = engine_and_session();
+        engine
+            .execute(
+                "CREATE TABLE cte_bin_values (s VARCHAR(8) COLLATE utf8mb4_bin)",
+                Privilege::Admin,
+                &session,
+            )
+            .await
+            .unwrap();
+        engine
+            .execute(
+                "INSERT INTO cte_bin_values VALUES ('a'), ('A')",
+                Privilege::Admin,
+                &session,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rows(
+                &engine,
+                &session,
+                "SELECT s FROM cte_bin_values WHERE s = 'a'",
+            )
+            .await,
+            vec![vec![Value::Text("a".into())]]
+        );
+        let definitions = (0..super::MAX_CTE_EXPANSION_DEPTH)
+            .map(|index| {
+                if index == 0 {
+                    "c0 AS (SELECT s FROM cte_bin_values)".to_owned()
+                } else {
+                    format!("c{index} AS (SELECT s FROM c{})", index - 1)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        assert_eq!(
+            rows(
+                &engine,
+                &session,
+                &format!(
+                    "WITH {definitions} SELECT s FROM c{} WHERE s = 'a'",
+                    super::MAX_CTE_EXPANSION_DEPTH - 1
+                ),
+            )
+            .await,
+            vec![vec![Value::Text("a".into())]]
+        );
+        assert_eq!(
+            rows(
+                &engine,
+                &session,
+                &format!(
+                    "WITH {definitions} SELECT s FROM c{} ORDER BY s",
+                    super::MAX_CTE_EXPANSION_DEPTH - 1
+                ),
+            )
+            .await,
+            vec![vec![Value::Text("A".into())], vec![Value::Text("a".into())]]
+        );
+        let grouped = rows(
+            &engine,
+            &session,
+            &format!(
+                "WITH {definitions} SELECT s FROM c{} GROUP BY s",
+                super::MAX_CTE_EXPANSION_DEPTH - 1
+            ),
+        )
+        .await;
+        assert_eq!(grouped.len(), 2);
+        assert!(grouped.contains(&vec![Value::Text("A".into())]));
+        assert!(grouped.contains(&vec![Value::Text("a".into())]));
+    }
+
+    #[tokio::test]
+    async fn cte_dependency_chain_over_the_depth_limit_is_rejected() {
+        let (engine, session) = engine_and_session();
+        let definitions = (0..=super::MAX_CTE_EXPANSION_DEPTH)
+            .map(|index| {
+                if index == 0 {
+                    "c0 AS (SELECT 7 AS n)".to_owned()
+                } else {
+                    format!("c{index} AS (SELECT n FROM c{})", index - 1)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let result = engine
+            .execute(
+                &format!(
+                    "WITH {definitions} SELECT n FROM c{}",
+                    super::MAX_CTE_EXPANSION_DEPTH
+                ),
+                Privilege::Admin,
+                &session,
+            )
+            .await;
+
+        let Err(Error::Parse(message)) = result else {
+            panic!("over-limit CTE dependency chain unexpectedly succeeded");
+        };
+        assert!(message.contains("CTE expansion limit exceeded (depth limit"));
     }
 
     #[tokio::test]
