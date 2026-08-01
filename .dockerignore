@@ -1,6 +1,10 @@
 target
 .git
 .github
+.cache
+site
+**/target
+**/artifacts
 *.edb
 *.edb-lock
 dist
