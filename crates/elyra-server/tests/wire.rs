@@ -298,6 +298,73 @@ async fn multi_object_drop_processes_every_name() {
 }
 
 #[tokio::test]
+async fn stored_set_operations_and_deep_view_chains_are_stack_safe() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop("CREATE TABLE set_view_source (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO set_view_source VALUES (1), (2)")
+        .await
+        .unwrap();
+    c.query_drop("CREATE VIEW set_view_inner AS SELECT id FROM set_view_source")
+        .await
+        .unwrap();
+    c.query_drop(
+        "CREATE VIEW set_view_outer AS
+         SELECT id FROM set_view_inner UNION ALL SELECT id FROM set_view_source",
+    )
+    .await
+    .unwrap();
+
+    let count: i64 = c
+        .query_first("SELECT COUNT(*) FROM set_view_outer")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(count, 4);
+
+    let mut previous = "set_view_outer".to_string();
+    for depth in 0..24 {
+        let view = format!("nested_set_view_{depth}");
+        c.query_drop(format!("CREATE VIEW {view} AS SELECT id FROM {previous}"))
+            .await
+            .unwrap();
+        previous = view;
+    }
+    let nested_count: i64 = c
+        .query_first(format!("SELECT COUNT(*) FROM {previous}"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(nested_count, 4);
+
+    c.query_drop("CREATE VIEW cyclic_set_view_a AS SELECT id FROM cyclic_set_view_b")
+        .await
+        .unwrap();
+    c.query_drop("CREATE VIEW cyclic_set_view_b AS SELECT id FROM cyclic_set_view_a")
+        .await
+        .unwrap();
+    let error = c
+        .query_drop("SELECT * FROM cyclic_set_view_a")
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("query nesting exceeds 64 levels"),
+        "unexpected error: {error}"
+    );
+
+    let source_count: i64 = c
+        .query_first("SELECT COUNT(*) FROM set_view_source")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(source_count, 2);
+}
+
+#[tokio::test]
 async fn dropping_a_column_preserves_foreign_key_positions() {
     let srv = TestServer::start().await;
     let mut c = srv.conn().await;
