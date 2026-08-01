@@ -74,14 +74,17 @@ fn map_type(dt: &DataType) -> Result<ColumnType> {
         | DataType::MediumInt(_)
         | DataType::Int(_)
         | DataType::Integer(_)
-        | DataType::BigInt(_)
-        | DataType::UnsignedTinyInt(_)
+        | DataType::BigInt(_) => ColumnType::Int,
+        // Every integer width is stored as 64 bits, but `UNSIGNED` is a
+        // *constraint*, not a width: dropping it on the narrower types (as this
+        // used to) let `TINYINT UNSIGNED` accept -1 while `BIGINT UNSIGNED`
+        // rejected it, so the same schema was enforced inconsistently.
+        DataType::UnsignedTinyInt(_)
         | DataType::UnsignedSmallInt(_)
         | DataType::UnsignedMediumInt(_)
         | DataType::UnsignedInt(_)
-        | DataType::UnsignedInteger(_) => ColumnType::Int,
-        // BIGINT UNSIGNED can exceed i64::MAX, so it needs the unsigned type.
-        DataType::UnsignedBigInt(_) => ColumnType::UInt,
+        | DataType::UnsignedInteger(_)
+        | DataType::UnsignedBigInt(_) => ColumnType::UInt,
         DataType::Float(_)
         | DataType::Real
         | DataType::Double
@@ -15201,7 +15204,7 @@ fn coerce_with_mode(v: Value, ty: &ColumnType, col: &str, strict: bool) -> Resul
         (ColumnType::UInt, Value::Int(i)) if i >= 0 => Value::UInt(i as u64),
         (ColumnType::UInt, Value::Int(_)) if !strict => Value::UInt(0),
         (ColumnType::UInt, Value::Int(i)) => {
-            return Err(Error::Type(format!("invalid UNSIGNED value: {i}")))
+            return Err(Error::OutOfRange(format!("invalid UNSIGNED value: {i}")))
         }
         (ColumnType::UInt, Value::Bool(b)) => Value::UInt(b as u64),
         (ColumnType::UInt, Value::Float(f))
@@ -15211,7 +15214,7 @@ fn coerce_with_mode(v: Value, ty: &ColumnType, col: &str, strict: bool) -> Resul
         }
         (ColumnType::UInt, Value::Float(_)) if !strict => Value::UInt(0),
         (ColumnType::UInt, Value::Float(f)) => {
-            return Err(Error::Type(format!("invalid UNSIGNED value: {f}")))
+            return Err(Error::OutOfRange(format!("invalid UNSIGNED value: {f}")))
         }
         (ColumnType::UInt, Value::Decimal(units, scale)) => {
             let rounded = round_decimal_to_integer(units, scale);
@@ -15242,12 +15245,12 @@ fn coerce_with_mode(v: Value, ty: &ColumnType, col: &str, strict: bool) -> Resul
                         u64::MAX
                     })
                 } else {
-                    return Err(Error::Type(format!("invalid UNSIGNED value: {s}")));
+                    return Err(Error::OutOfRange(format!("invalid UNSIGNED value: {s}")));
                 }
             } else if !strict {
                 Value::UInt(mysql_integer_prefix(&s).max(0) as u64)
             } else {
-                return Err(Error::Type(format!("invalid UNSIGNED value: {s}")));
+                return Err(Error::OutOfRange(format!("invalid UNSIGNED value: {s}")));
             }
         }
         (ColumnType::Int, Value::UInt(u)) => Value::Int(u as i64),

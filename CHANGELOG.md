@@ -8,6 +8,28 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ### Fixed
 
+- **`UNSIGNED` is enforced on every integer width (ESQL-56).** Only
+  `BIGINT UNSIGNED` mapped to the unsigned type; `TINYINT`/`SMALLINT`/
+  `MEDIUMINT`/`INT UNSIGNED` were stored as *signed*, so the same schema was
+  enforced inconsistently — `INSERT INTO t (unsigned_int_col) VALUES (-1)`
+  succeeded and read back `-1`, while the identical insert into a
+  `BIGINT UNSIGNED` column was refused. Laravel generates both shapes
+  (`foreignId()` is an unsigned big integer, `unsignedInteger()` is not), so an
+  application got the constraint on some columns and not others. Width is still
+  advisory — every integer is stored as 64 bits, and that is now stated plainly
+  in the [data types](docs/sql/data-types.md) page rather than left to be
+  discovered.
+
+  A column created by an earlier version keeps the type it was created with, so
+  it goes on accepting negatives until the table is recreated; there is no
+  migration and no on-disk change.
+
+  Found by the differential SQL-dump harness in #26, on its first fixture.
+- **Out-of-range column values report MySQL's code.** Storing a value a column
+  cannot hold answered 1366 (`ER_TRUNCATED_WRONG_VALUE`, SQLSTATE `HY000`);
+  MySQL answers **1264** (`ER_WARN_DATA_OUT_OF_RANGE`, SQLSTATE `22003`), which
+  is what a client checking for an overflow looks for.
+
 - **Result metadata names the source table again (ESQL-55).** MySQL puts the
   bare column name in the name field and the relation in the `table` field, and
   1.7.0 adopted the first half without the second — so a client had no way at

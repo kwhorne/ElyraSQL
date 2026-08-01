@@ -53,8 +53,11 @@ impl Error {
         match self {
             Error::Parse(_) => 1064,
             Error::Catalog(m) => catalog_code(m),
-            Error::Type(_) => 1366,        // ER_TRUNCATED_WRONG_VALUE
-            Error::OutOfRange(_) => 1690,  // ER_DATA_OUT_OF_RANGE
+            Error::Type(_) => 1366, // ER_TRUNCATED_WRONG_VALUE
+            // MySQL answers 1264 for a value that does not fit the *column* and
+            // 1690 for an expression that overflows its type. Storing a value is
+            // by far the common case here, and both share SQLSTATE 22003.
+            Error::OutOfRange(_) => 1264,  // ER_WARN_DATA_OUT_OF_RANGE
             Error::Unsupported(_) => 1235, // ER_NOT_SUPPORTED_YET
             Error::Conflict(_) => 1213,    // ER_LOCK_DEADLOCK (serialization failure)
             Error::Duplicate(_) => 1062,   // ER_DUP_ENTRY
