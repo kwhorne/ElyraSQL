@@ -3426,22 +3426,8 @@ pub(crate) fn substitute_vars(sql: &str, env: &std::collections::HashMap<String,
     let mut i = 0;
     while i < cs.len() {
         let c = cs[i];
-        if c == '\'' {
-            out.push(c);
-            i += 1;
-            while i < cs.len() {
-                out.push(cs[i]);
-                if cs[i] == '\'' {
-                    if i + 1 < cs.len() && cs[i + 1] == '\'' {
-                        out.push(cs[i + 1]);
-                        i += 2;
-                        continue;
-                    }
-                    i += 1;
-                    break;
-                }
-                i += 1;
-            }
+        if matches!(c, '\'' | '"' | '`') {
+            i = copy_quoted_segment(&cs, i, &mut out);
             continue;
         }
         if c.is_ascii_alphabetic() || c == '_' {
@@ -3468,6 +3454,50 @@ pub(crate) fn substitute_vars(sql: &str, env: &std::collections::HashMap<String,
 
 /// Replace `@user` variable references with their SQL literals (unset = NULL),
 /// leaving `@@system` variables and string literals untouched.
+pub(crate) fn contains_uvar_reference(sql: &str) -> bool {
+    let bytes = sql.as_bytes();
+    let mut quote = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let byte = bytes[i];
+        if let Some(delimiter) = quote {
+            if byte == b'\\' && delimiter != b'`' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if byte == delimiter {
+                if bytes.get(i + 1) == Some(&delimiter) {
+                    i += 2;
+                    continue;
+                }
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+
+        if matches!(byte, b'\'' | b'"' | b'`') {
+            quote = Some(byte);
+            i += 1;
+            continue;
+        }
+        if byte == b'@' {
+            if bytes.get(i + 1) == Some(&b'@') {
+                i += 2;
+                continue;
+            }
+            if bytes
+                .get(i + 1)
+                .is_some_and(|next| next.is_ascii_alphanumeric() || *next == b'_')
+            {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
 pub(crate) fn substitute_uvars(
     sql: &str,
     vars: &std::collections::HashMap<String, Value>,
@@ -3477,22 +3507,8 @@ pub(crate) fn substitute_uvars(
     let mut i = 0;
     while i < cs.len() {
         let c = cs[i];
-        if c == '\'' {
-            out.push(c);
-            i += 1;
-            while i < cs.len() {
-                out.push(cs[i]);
-                if cs[i] == '\'' {
-                    if i + 1 < cs.len() && cs[i + 1] == '\'' {
-                        out.push(cs[i + 1]);
-                        i += 2;
-                        continue;
-                    }
-                    i += 1;
-                    break;
-                }
-                i += 1;
-            }
+        if matches!(c, '\'' | '"' | '`') {
+            i = copy_quoted_segment(&cs, i, &mut out);
             continue;
         }
         if c == '@' {
@@ -3519,6 +3535,31 @@ pub(crate) fn substitute_uvars(
         i += 1;
     }
     out
+}
+
+fn copy_quoted_segment(chars: &[char], start: usize, out: &mut String) -> usize {
+    let quote = chars[start];
+    out.push(quote);
+    let mut i = start + 1;
+    while i < chars.len() {
+        let current = chars[i];
+        out.push(current);
+        if current == '\\' && quote != '`' && i + 1 < chars.len() {
+            out.push(chars[i + 1]);
+            i += 2;
+            continue;
+        }
+        if current == quote {
+            if i + 1 < chars.len() && chars[i + 1] == quote {
+                out.push(chars[i + 1]);
+                i += 2;
+                continue;
+            }
+            return i + 1;
+        }
+        i += 1;
+    }
+    i
 }
 
 /// Render a value as a SQL literal (for splicing NEW/OLD into trigger bodies).
@@ -14859,6 +14900,9 @@ fn coerce_with_mode(v: Value, ty: &ColumnType, col: &str, strict: bool) -> Resul
         (ColumnType::Int, Value::Bool(b)) => Value::Int(b as i64),
         (ColumnType::Float, Value::Int(i)) => Value::Float(i as f64),
         (ColumnType::Float, Value::Float(f)) => Value::Float(f),
+        (ColumnType::Float, Value::Decimal(units, scale)) => {
+            Value::Float(units as f64 / 10f64.powi(scale as i32))
+        }
         (ColumnType::Bool, Value::Bool(b)) => Value::Bool(b),
         (ColumnType::Bool, Value::Int(i)) => Value::Bool(i != 0),
         (ColumnType::Text, Value::Text(s)) => Value::Text(s),
@@ -14933,6 +14977,21 @@ fn coerce_with_mode(v: Value, ty: &ColumnType, col: &str, strict: bool) -> Resul
         (ColumnType::UInt, Value::Float(f)) => {
             return Err(Error::Type(format!("invalid UNSIGNED value: {f}")))
         }
+        (ColumnType::UInt, Value::Decimal(units, scale)) => {
+            let rounded = round_decimal_to_integer(units, scale);
+            match u64::try_from(rounded) {
+                Ok(value) => Value::UInt(value),
+                Err(_) if !strict => Value::UInt(if rounded.is_negative() { 0 } else { u64::MAX }),
+                Err(_) => {
+                    return Err(Error::Type(format!(
+                        "invalid UNSIGNED value: {}",
+                        Value::Decimal(units, scale)
+                            .to_wire_string()
+                            .unwrap_or_default()
+                    )))
+                }
+            }
+        }
         (ColumnType::UInt, Value::Text(s)) => {
             let text = s.trim();
             if let Ok(value) = text.parse::<u64>() {
@@ -14959,6 +15018,10 @@ fn coerce_with_mode(v: Value, ty: &ColumnType, col: &str, strict: bool) -> Resul
         (ColumnType::Float, Value::UInt(u)) => Value::Float(u as f64),
         // Lenient (MySQL-style) conversions.
         (ColumnType::Int, Value::Float(f)) => Value::Int(f.round() as i64),
+        (ColumnType::Int, Value::Decimal(units, scale)) => {
+            let rounded = round_decimal_to_integer(units, scale);
+            Value::Int(rounded.clamp(i64::MIN as i128, i64::MAX as i128) as i64)
+        }
         (ColumnType::Int, Value::Text(s)) => {
             match s
                 .trim()
@@ -14985,6 +15048,24 @@ fn coerce_with_mode(v: Value, ty: &ColumnType, col: &str, strict: bool) -> Resul
             )))
         }
     })
+}
+
+fn round_decimal_to_integer(units: i128, scale: u8) -> i128 {
+    if scale == 0 {
+        return units;
+    }
+    let Some(divisor) = 10_i128.checked_pow(scale.into()) else {
+        // An i128 numerator divided by 10^39 or greater has magnitude below
+        // one half, so it always rounds to zero.
+        return 0;
+    };
+    let quotient = units / divisor;
+    let remainder = units % divisor;
+    if remainder.abs() >= divisor / 2 {
+        quotient + units.signum()
+    } else {
+        quotient
+    }
 }
 
 fn mysql_integer_prefix(value: &str) -> i64 {
@@ -15045,6 +15126,77 @@ fn parse_vector(s: &str, dim: u32) -> Result<Vec<f32>> {
         )));
     }
     Ok(vals)
+}
+
+#[cfg(test)]
+mod coercion_tests {
+    use elyra_core::{ColumnType, Value};
+
+    use super::{coerce_with_mode, round_decimal_to_integer};
+
+    #[test]
+    fn rounds_decimal_integers_exactly() {
+        assert_eq!(round_decimal_to_integer(14, 1), 1);
+        assert_eq!(round_decimal_to_integer(15, 1), 2);
+        assert_eq!(round_decimal_to_integer(-15, 1), -2);
+        assert_eq!(round_decimal_to_integer(i128::MAX, 39), 0);
+    }
+
+    #[test]
+    fn coerces_decimal_literals_to_unsigned_columns() {
+        assert_eq!(
+            coerce_with_mode(Value::Decimal(125, 1), &ColumnType::UInt, "n", true).unwrap(),
+            Value::UInt(13)
+        );
+        assert!(coerce_with_mode(Value::Decimal(-15, 1), &ColumnType::UInt, "n", true).is_err());
+        assert_eq!(
+            coerce_with_mode(Value::Decimal(-15, 1), &ColumnType::UInt, "n", false).unwrap(),
+            Value::UInt(0)
+        );
+    }
+}
+
+#[cfg(test)]
+mod substitution_tests {
+    use std::collections::HashMap;
+
+    use elyra_core::Value;
+
+    use super::{contains_uvar_reference, substitute_uvars, substitute_vars};
+
+    #[test]
+    fn detects_only_unquoted_user_variable_references() {
+        assert!(!contains_uvar_reference(
+            r#"INSERT INTO t VALUES ('otilia@example.com', "quoted@example", `column@example`)"#
+        ));
+        assert!(!contains_uvar_reference("SELECT @@global.max_connections"));
+        assert!(contains_uvar_reference(
+            "SELECT 'otilia@example.com', @answer"
+        ));
+        assert!(contains_uvar_reference("SELECT @answer, 'å🚗'"));
+    }
+
+    #[test]
+    fn user_variable_substitution_skips_mysql_quoted_segments() {
+        let vars = HashMap::from([("answer".to_owned(), Value::Int(42))]);
+        let sql = r#"SELECT 'otilia@example.com', 'O\'Keefe', "quoted@example", `column@example`, @answer"#;
+
+        assert_eq!(
+            substitute_uvars(sql, &vars),
+            r#"SELECT 'otilia@example.com', 'O\'Keefe', "quoted@example", `column@example`, 42"#
+        );
+    }
+
+    #[test]
+    fn procedure_variable_substitution_skips_escaped_string_literals() {
+        let vars = HashMap::from([("example".to_owned(), Value::Text("changed".to_owned()))]);
+        let sql = r#"SELECT 'O\'Keefe@example.com', example"#;
+
+        assert_eq!(
+            substitute_vars(sql, &vars),
+            r#"SELECT 'O\'Keefe@example.com', 'changed'"#
+        );
+    }
 }
 
 #[cfg(test)]

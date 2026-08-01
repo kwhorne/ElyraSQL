@@ -130,6 +130,10 @@ pub fn eval_row(expr: &Expr, schema: &Schema, row: &[Value]) -> Result<Value> {
                     })
                 }
                 (UnaryOperator::Minus, Value::Float(f)) => Ok(Value::Float(-f)),
+                (UnaryOperator::Minus, Value::Decimal(units, scale)) => units
+                    .checked_neg()
+                    .map(|units| Value::Decimal(units, scale))
+                    .ok_or_else(|| Error::OutOfRange("DECIMAL value is out of range".into())),
                 // Negating a large unsigned literal (e.g. `-9223372036854775808`,
                 // parsed as UInt because it exceeds i64::MAX): valid iff it fits
                 // the signed range once negated, else out of range like MySQL.
@@ -2658,22 +2662,7 @@ pub fn resolve_index(name: &str, schema: &Schema) -> Result<usize> {
 }
 
 fn literal(v: &SqlValue) -> Result<Value> {
-    match v {
-        SqlValue::Number(n, _) => n
-            .parse::<i64>()
-            .map(Value::Int)
-            .or_else(|_| n.parse::<u64>().map(Value::UInt))
-            .or_else(|_| n.parse::<f64>().map(Value::Float))
-            .map_err(|_| Error::Type(format!("invalid number: {n}"))),
-        SqlValue::SingleQuotedString(s) | SqlValue::DoubleQuotedString(s) => {
-            Ok(Value::Text(s.clone()))
-        }
-        SqlValue::Boolean(b) => Ok(Value::Bool(*b)),
-        SqlValue::Null => Ok(Value::Null),
-        other => Err(Error::Unsupported(format!(
-            "literal not supported: {other}"
-        ))),
-    }
+    crate::eval::literal(v)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2820,7 +2809,7 @@ fn arith(l: Value, op: &BinaryOperator, r: Value) -> Result<Value> {
     }
     // Exact DECIMAL arithmetic for +, -, * (division/modulo fall back to float).
     if matches!(l, Value::Decimal(..)) || matches!(r, Value::Decimal(..)) {
-        if let Some(v) = decimal_arith(&l, op, &r) {
+        if let Some(v) = decimal_arith(&l, op, &r)? {
             return Ok(v);
         }
     }
@@ -2959,9 +2948,9 @@ fn num(v: &Value) -> Option<f64> {
     v.as_f64()
 }
 
-/// Exact decimal `+`/`-`/`*`. Returns `None` (fall back to float) for division,
-/// modulo, or when a non-decimal/non-integer operand is involved.
-fn decimal_arith(l: &Value, op: &BinaryOperator, r: &Value) -> Option<Value> {
+/// Exact decimal `+`/`-`/`*`. Returns `Ok(None)` (fall back to float) for
+/// division, modulo, or when a non-decimal/non-integer operand is involved.
+fn decimal_arith(l: &Value, op: &BinaryOperator, r: &Value) -> Result<Option<Value>> {
     use BinaryOperator::*;
     let to_dec = |v: &Value| -> Option<(i128, u8)> {
         match v {
@@ -2971,18 +2960,58 @@ fn decimal_arith(l: &Value, op: &BinaryOperator, r: &Value) -> Option<Value> {
             _ => None,
         }
     };
-    let (a, asc) = to_dec(l)?;
-    let (b, bsc) = to_dec(r)?;
-    Some(match op {
+    let (Some((a, asc)), Some((b, bsc))) = (to_dec(l), to_dec(r)) else {
+        return Ok(None);
+    };
+    let out_of_range = || Error::OutOfRange("DECIMAL arithmetic is out of range".into());
+    Ok(Some(match op {
         Plus | Minus => {
             let sc = asc.max(bsc);
-            let aa = a.checked_mul(10i128.pow((sc - asc) as u32))?;
-            let bb = b.checked_mul(10i128.pow((sc - bsc) as u32))?;
-            Value::Decimal(if matches!(op, Plus) { aa + bb } else { aa - bb }, sc)
+            let a_factor = 10i128
+                .checked_pow((sc - asc) as u32)
+                .ok_or_else(out_of_range)?;
+            let b_factor = 10i128
+                .checked_pow((sc - bsc) as u32)
+                .ok_or_else(out_of_range)?;
+            let aa = a.checked_mul(a_factor).ok_or_else(out_of_range)?;
+            let bb = b.checked_mul(b_factor).ok_or_else(out_of_range)?;
+            let units = if matches!(op, Plus) {
+                aa.checked_add(bb).ok_or_else(out_of_range)?
+            } else {
+                aa.checked_sub(bb).ok_or_else(out_of_range)?
+            };
+            Value::Decimal(units, sc)
         }
-        Multiply => Value::Decimal(a.checked_mul(b)?, asc.saturating_add(bsc)),
-        _ => return None,
-    })
+        Multiply => Value::Decimal(
+            a.checked_mul(b).ok_or_else(out_of_range)?,
+            asc.checked_add(bsc).ok_or_else(out_of_range)?,
+        ),
+        _ => return Ok(None),
+    }))
+}
+
+#[cfg(test)]
+mod decimal_arithmetic_tests {
+    use elyra_core::Value;
+    use sqlparser::ast::BinaryOperator;
+
+    use super::decimal_arith;
+
+    #[test]
+    fn rejects_decimal_operations_that_exceed_the_representation() {
+        assert!(decimal_arith(
+            &Value::Decimal(1, 39),
+            &BinaryOperator::Plus,
+            &Value::Int(1)
+        )
+        .is_err());
+        assert!(decimal_arith(
+            &Value::Decimal(i128::MAX, 0),
+            &BinaryOperator::Plus,
+            &Value::Int(1)
+        )
+        .is_err());
+    }
 }
 
 fn truthy(v: &Value) -> bool {

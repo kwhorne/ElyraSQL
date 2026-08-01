@@ -40,6 +40,7 @@ use sqlparser::dialect::MySqlDialect;
 use sqlparser::keywords::Keyword;
 use sqlparser::parser::Parser;
 use sqlparser::tokenizer::{Token, Tokenizer};
+use std::borrow::Cow;
 
 pub use stream::RowStream;
 
@@ -1243,18 +1244,21 @@ impl Engine {
 
         let dialect = MySqlDialect {};
         // Substitute @user variables (leaving @@system vars) before parsing.
-        let mut subst_sql = if sql.contains('@') {
-            exec::substitute_uvars(sql, &sess.user_vars_snapshot())
+        let mut subst_sql: Cow<'_, str> = if exec::contains_uvar_reference(sql) {
+            Cow::Owned(exec::substitute_uvars(sql, &sess.user_vars_snapshot()))
         } else {
-            sql.to_string()
+            Cow::Borrowed(sql)
         };
         // `LOCK IN SHARE MODE` is a synonym for `FOR SHARE` (not parsed by the
         // MySQL dialect on its own).
-        if subst_sql
-            .to_ascii_lowercase()
-            .contains("lock in share mode")
-        {
-            subst_sql = replace_ci(&subst_sql, "lock in share mode", "for share");
+        if contains_ci(&subst_sql, "lock in share mode") {
+            subst_sql = Cow::Owned(replace_ci(&subst_sql, "lock in share mode", "for share"));
+        }
+        // MySQL permits an odd digit count in 0x-prefixed literals and treats
+        // the leading nibble as zero. sqlparser erases the distinction between
+        // that form and X'..', which requires pairs, so normalize 0x first.
+        if let Some(rewritten) = rewrite_odd_0x_literals(&subst_sql) {
+            subst_sql = Cow::Owned(rewritten);
         }
         // Strip trailing MySQL table options (ENGINE=, DEFAULT CHARSET/CHARACTER
         // SET, COLLATE, AUTO_INCREMENT, ROW_FORMAT, COMMENT, ...) from CREATE
@@ -1262,17 +1266,17 @@ impl Engine {
         // are no-ops here (single storage engine, utf8mb4). This makes schema
         // dumps and ORM-emitted DDL parse.
         if let Some(stripped) = strip_create_table_options(&subst_sql) {
-            subst_sql = stripped;
+            subst_sql = Cow::Owned(stripped);
         }
         // CHANGE/MODIFY parse column options manually in sqlparser 0.53 and
         // omit COLLATE. Rewrite only top-level ALTER TABLE collation clauses to
         // the equivalent CHARACTER SET option, which that parser path retains.
         if let Some(rewritten) = rewrite_alter_column_collations(&subst_sql) {
-            subst_sql = rewritten;
+            subst_sql = Cow::Owned(rewritten);
         }
         let mut update_modifiers = None;
         if let Some(parsed) = parse_update_modifiers(&subst_sql)? {
-            subst_sql = parsed.base_sql.clone();
+            subst_sql = Cow::Owned(parsed.base_sql.clone());
             update_modifiers = Some(parsed);
         }
         let mut dml_limit = None;
@@ -1280,32 +1284,32 @@ impl Engine {
         // DELETE shape. Parse it separately and pass the row bound to execution.
         if update_modifiers.is_none() {
             if let Some(parsed) = parse_dml_limit(&subst_sql) {
-                subst_sql = parsed.base_sql;
+                subst_sql = Cow::Owned(parsed.base_sql);
                 dml_limit = Some(parsed.limit);
             }
         }
         // Rewrite MySQL's `INSERT ... SET col = val, ...` shorthand into the
         // standard `INSERT ... (cols) VALUES (...)` the parser accepts.
         if let Some(rewritten) = rewrite_insert_set(&subst_sql) {
-            subst_sql = rewritten;
+            subst_sql = Cow::Owned(rewritten);
         }
         // Rewrite comma-style multi-table `UPDATE t1, t2 SET ... WHERE ...` into
         // `UPDATE t1 CROSS JOIN t2 SET ... WHERE ...` (the WHERE supplies the
         // join condition, as in the comma form).
         if let Some(rewritten) = rewrite_comma_update(&subst_sql) {
-            subst_sql = rewritten;
+            subst_sql = Cow::Owned(rewritten);
         }
         // Rewrite unary bitwise-NOT `~x` into `(x ^ 18446744073709551615)` (the
         // parser has no `~` prefix); the result is BIGINT UNSIGNED.
         if let Some(rewritten) = rewrite_tilde(&subst_sql) {
-            subst_sql = rewritten;
+            subst_sql = Cow::Owned(rewritten);
         }
         // Rewrite the `!` logical-NOT prefix into `(NOT (...))` (after `~` so a
         // mixed `!~x` is already parenthesised).
         if let Some(rewritten) = rewrite_bang(&subst_sql) {
-            subst_sql = rewritten;
+            subst_sql = Cow::Owned(rewritten);
         }
-        let statements = match Parser::parse_sql(&dialect, &subst_sql) {
+        let statements = match Parser::parse_sql(&dialect, subst_sql.as_ref()) {
             Ok(s) => s,
             Err(e) => {
                 // The MySQL dialect rejects `GROUP BY ... WITH ROLLUP` and the
@@ -1313,10 +1317,11 @@ impl Engine {
                 // (ROLLUP into a group-by modifier, shifts into
                 // PGBitwiseShiftLeft/Right, which the evaluator handles). Only
                 // retry for those so all other syntax stays on the MySQL dialect.
-                let lower = subst_sql.to_ascii_lowercase();
-                if lower.contains("rollup") || subst_sql.contains("<<") || subst_sql.contains(">>")
+                if contains_ci(&subst_sql, "rollup")
+                    || subst_sql.contains("<<")
+                    || subst_sql.contains(">>")
                 {
-                    Parser::parse_sql(&sqlparser::dialect::GenericDialect {}, &subst_sql)
+                    Parser::parse_sql(&sqlparser::dialect::GenericDialect {}, subst_sql.as_ref())
                         .map_err(|_| Error::Parse(e.to_string()))?
                 } else {
                     return Err(Error::Parse(e.to_string()));
@@ -1839,12 +1844,28 @@ fn collect_col_refs(e: &sqlparser::ast::Expr, out: &mut Vec<String>) -> bool {
     }
 }
 
+/// Allocation-free ASCII case-insensitive substring search.
+fn contains_ci(haystack: &str, needle: &str) -> bool {
+    let needle = needle.as_bytes();
+    !needle.is_empty()
+        && haystack
+            .as_bytes()
+            .windows(needle.len())
+            .any(|window| window.eq_ignore_ascii_case(needle))
+}
+
 /// Case-insensitive substring replace (used to normalize `LOCK IN SHARE MODE`).
 fn replace_ci(haystack: &str, needle: &str, replacement: &str) -> String {
-    let (hl, nl) = (haystack.to_ascii_lowercase(), needle.to_ascii_lowercase());
+    let needle_bytes = needle.as_bytes();
+    if needle_bytes.is_empty() {
+        return haystack.to_owned();
+    }
     let mut out = String::with_capacity(haystack.len());
     let mut i = 0;
-    while let Some(pos) = hl[i..].find(&nl) {
+    while let Some(pos) = haystack.as_bytes()[i..]
+        .windows(needle_bytes.len())
+        .position(|window| window.eq_ignore_ascii_case(needle_bytes))
+    {
         let at = i + pos;
         out.push_str(&haystack[i..at]);
         out.push_str(replacement);
@@ -1852,6 +1873,73 @@ fn replace_ci(haystack: &str, needle: &str, replacement: &str) -> String {
     }
     out.push_str(&haystack[i..]);
     out
+}
+
+fn rewrite_odd_0x_literals(sql: &str) -> Option<String> {
+    let bytes = sql.as_bytes();
+    let mut insertions = Vec::new();
+    let mut quote = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let byte = bytes[i];
+        if let Some(delimiter) = quote {
+            if byte == b'\\' && delimiter != b'`' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if byte == delimiter {
+                if bytes.get(i + 1) == Some(&delimiter) {
+                    i += 2;
+                    continue;
+                }
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        if matches!(byte, b'\'' | b'"' | b'`') {
+            quote = Some(byte);
+            i += 1;
+            continue;
+        }
+
+        let has_prefix = byte == b'0'
+            && bytes
+                .get(i + 1)
+                .is_some_and(|next| matches!(next, b'x' | b'X'))
+            && i.checked_sub(1)
+                .and_then(|previous| bytes.get(previous))
+                .is_none_or(|previous| !previous.is_ascii_alphanumeric() && *previous != b'_');
+        if has_prefix {
+            let digits = i + 2;
+            let mut end = digits;
+            while bytes.get(end).is_some_and(u8::is_ascii_hexdigit) {
+                end += 1;
+            }
+            let has_token_boundary = bytes
+                .get(end)
+                .is_none_or(|next| !next.is_ascii_alphanumeric() && *next != b'_');
+            if end > digits && (end - digits) % 2 == 1 && has_token_boundary {
+                insertions.push(digits);
+            }
+            i = end.max(i + 1);
+            continue;
+        }
+        i += 1;
+    }
+
+    if insertions.is_empty() {
+        return None;
+    }
+    let mut out = String::with_capacity(sql.len() + insertions.len());
+    let mut copied = 0;
+    for insertion in insertions {
+        out.push_str(&sql[copied..insertion]);
+        out.push('0');
+        copied = insertion;
+    }
+    out.push_str(&sql[copied..]);
+    Some(out)
 }
 
 /// A single plain (unjoined) base table in `twj`, if that's what it is.
@@ -3039,8 +3127,11 @@ pub fn fuzz_preprocess_parse(sql: &str) {
         return;
     }
     let mut s = sql.to_string();
-    if s.to_ascii_lowercase().contains("lock in share mode") {
+    if contains_ci(&s, "lock in share mode") {
         s = replace_ci(&s, "lock in share mode", "for share");
+    }
+    if let Some(x) = rewrite_odd_0x_literals(&s) {
+        s = x;
     }
     if let Some(x) = strip_create_table_options(&s) {
         s = x;
@@ -3610,11 +3701,48 @@ mod mysql_ddl_compat_tests {
 }
 
 #[cfg(test)]
+mod case_insensitive_search_tests {
+    use super::{contains_ci, replace_ci, rewrite_odd_0x_literals};
+
+    #[test]
+    fn finds_ascii_needles_without_copying_unicode_haystacks() {
+        assert!(contains_ci(
+            "SELECT 'å🚗' LOCK In ShArE MoDe",
+            "lock in share mode"
+        ));
+        assert!(!contains_ci("SELECT 'lock 🚗 mode'", "lock in share mode"));
+    }
+
+    #[test]
+    fn replaces_all_ascii_case_variants_without_damaging_unicode() {
+        assert_eq!(
+            replace_ci(
+                "SELECT 'å🚗' LOCK IN SHARE MODE lock in share mode",
+                "lock in share mode",
+                "for share"
+            ),
+            "SELECT 'å🚗' for share for share"
+        );
+    }
+
+    #[test]
+    fn pads_only_unquoted_odd_length_0x_literals() {
+        assert_eq!(
+            rewrite_odd_0x_literals(
+                r#"SELECT 0xF, 0Xabc, 0xAB, X'F', '0xF', "0xF", `0xF`, value0xF"#
+            )
+            .as_deref(),
+            Some(r#"SELECT 0x0F, 0X0abc, 0xAB, X'F', '0xF', "0xF", `0xF`, value0xF"#)
+        );
+    }
+}
+
+#[cfg(test)]
 mod fuzz_props {
     use super::{
         parse_dml_limit, parse_mysql_rename, parse_update_modifiers,
-        rewrite_alter_column_collations, rewrite_comma_update, rewrite_insert_set, split_top_level,
-        strip_create_table_options,
+        rewrite_alter_column_collations, rewrite_comma_update, rewrite_insert_set,
+        rewrite_odd_0x_literals, split_top_level, strip_create_table_options,
     };
     use proptest::prelude::*;
 
@@ -3634,6 +3762,7 @@ mod fuzz_props {
             let _ = parse_update_modifiers(&s);
             let _ = parse_mysql_rename(&s);
             let _ = rewrite_alter_column_collations(&s);
+            let _ = rewrite_odd_0x_literals(&s);
             let _ = split_top_level(&s, ',');
             let _ = split_top_level(&s, '=');
         }
