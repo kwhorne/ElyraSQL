@@ -1730,6 +1730,158 @@ async fn natural_join_uses_all_common_columns_and_mysql_star_order() {
 }
 
 #[tokio::test]
+async fn using_join_visibility_survives_later_on_and_cross_joins() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop("CREATE TABLE mix_a (id INT PRIMARY KEY, aval VARCHAR(8))")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE mix_b (id INT PRIMARY KEY, bval VARCHAR(8))")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE mix_c (id INT PRIMARY KEY, cval VARCHAR(8))")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE mix_d (id INT PRIMARY KEY, dval VARCHAR(8))")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO mix_a VALUES (1,'A1'),(2,'A2')")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO mix_b VALUES (1,'B1'),(2,'B2')")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO mix_c VALUES (1,'C1'),(3,'C3')")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO mix_d VALUES (1,'D1'),(2,'D2'),(3,'D3')")
+        .await
+        .unwrap();
+
+    let mut result = c
+        .query_iter(
+            "SELECT *
+             FROM mix_a AS a
+             JOIN mix_b AS b USING(id)
+             JOIN mix_c AS c ON c.id = a.id",
+        )
+        .await
+        .unwrap();
+    let names: Vec<String> = result
+        .columns_ref()
+        .iter()
+        .map(|column| column.name_str().into_owned())
+        .collect();
+    assert_eq!(names, ["id", "aval", "bval", "id", "cval"]);
+    let rows: Vec<(i64, String, String, i64, String)> = result.collect().await.unwrap();
+    assert_eq!(rows, [(1, "A1".into(), "B1".into(), 1, "C1".into())]);
+
+    let rows: Vec<(i64, i64, i64)> = c
+        .query(
+            "SELECT a.id, b.id, c.id
+             FROM mix_a AS a
+             JOIN mix_b AS b USING(id)
+             JOIN mix_c AS c ON c.id = a.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows, [(1, 1, 1)]);
+
+    let err = c
+        .query_drop(
+            "SELECT id
+             FROM mix_a AS a
+             JOIN mix_b AS b USING(id)
+             JOIN mix_c AS c ON c.id = a.id",
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().to_ascii_lowercase().contains("ambiguous"));
+    let err = c
+        .query_drop(
+            "SELECT *
+             FROM mix_a AS a
+             JOIN mix_b AS b USING(id)
+             JOIN mix_c AS c ON c.id = a.id
+             JOIN mix_d AS d USING(id)",
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().to_ascii_lowercase().contains("ambiguous"));
+
+    let mut result = c
+        .query_iter(
+            "SELECT *
+             FROM mix_a AS a
+             JOIN mix_b AS b USING(id)
+             CROSS JOIN mix_c AS c
+             WHERE a.id = 1 AND c.id = 3",
+        )
+        .await
+        .unwrap();
+    let names: Vec<String> = result
+        .columns_ref()
+        .iter()
+        .map(|column| column.name_str().into_owned())
+        .collect();
+    assert_eq!(names, ["id", "aval", "bval", "id", "cval"]);
+    let rows: Vec<(i64, String, String, i64, String)> = result.collect().await.unwrap();
+    assert_eq!(rows, [(1, "A1".into(), "B1".into(), 3, "C3".into())]);
+    let rows: Vec<(i64, i64, i64)> = c
+        .query(
+            "SELECT a.id, b.id, c.id
+             FROM mix_a AS a
+             JOIN mix_b AS b USING(id)
+             CROSS JOIN mix_c AS c
+             WHERE a.id = 1 AND c.id = 3",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows, [(1, 1, 3)]);
+    let err = c
+        .query_drop(
+            "SELECT id
+             FROM mix_a AS a
+             JOIN mix_b AS b USING(id)
+             CROSS JOIN mix_c AS c",
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().to_ascii_lowercase().contains("ambiguous"));
+    let err = c
+        .query_drop(
+            "SELECT *
+             FROM mix_a AS a
+             JOIN mix_b AS b USING(id)
+             CROSS JOIN mix_c AS c
+             JOIN mix_d AS d USING(id)",
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().to_ascii_lowercase().contains("ambiguous"));
+
+    let mut result = c
+        .query_iter(
+            "SELECT *
+             FROM mix_a AS a
+             JOIN mix_b AS b USING(id)
+             JOIN mix_c AS c ON c.id = a.id
+             GROUP BY a.id, c.id",
+        )
+        .await
+        .unwrap();
+    let names: Vec<String> = result
+        .columns_ref()
+        .iter()
+        .map(|column| column.name_str().into_owned())
+        .collect();
+    assert_eq!(names, ["id", "aval", "bval", "id", "cval"]);
+    let rows: Vec<(i64, String, String, i64, String)> = result.collect().await.unwrap();
+    assert_eq!(rows, [(1, "A1".into(), "B1".into(), 1, "C1".into())]);
+}
+
+#[tokio::test]
 async fn correlated_exists_preserves_inner_bare_columns() {
     let srv = TestServer::start().await;
     let mut c = srv.conn().await;

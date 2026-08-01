@@ -2628,7 +2628,7 @@ pub fn resolve_index_parts(parts: &[sqlparser::ast::Ident], schema: &Schema) -> 
         } else {
             column_name(c)
         };
-        if name.eq_ignore_ascii_case(&last.value) {
+        if !schema.is_hidden_from_unqualified(i) && name.eq_ignore_ascii_case(&last.value) {
             n += 1;
             hit = Some(i);
         }
@@ -2649,70 +2649,23 @@ fn dotted(parts: &[sqlparser::ast::Ident]) -> String {
         .join(".")
 }
 
-/// Resolve a column reference to an index. Handles both single-table (bare
-/// names) and joined (qualified "table.col") schemas: exact match first, then
-/// a unique qualified suffix (`t.col` against `db.t.col`), then a unique bare
-/// suffix (`col` against `t.col`).
+/// Resolve a single identifier to an index. Qualified references must use
+/// [`resolve_index_parts`] so quoted dots remain identifier data rather than
+/// being mistaken for component separators.
 pub fn resolve_index(name: &str, schema: &Schema) -> Result<usize> {
-    let exact_names = schema
+    let hits = schema
         .columns
         .iter()
         .enumerate()
-        .filter(|(_, column)| column_name(column).eq_ignore_ascii_case(name))
+        .filter(|(index, column)| {
+            !schema.is_hidden_from_unqualified(*index)
+                && column_name(column).eq_ignore_ascii_case(name)
+        })
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
-    match exact_names.as_slice() {
-        [index] => return Ok(*index),
-        [] => {}
-        _ => return Err(Error::Query(format!("ambiguous column: {name}"))),
-    }
-    if name.contains('.') {
-        let reference = name.split('.').collect::<Vec<_>>();
-        let (requested_qualifier, requested_column) =
-            reference.split_at(reference.len().saturating_sub(1));
-        let hits = schema
-            .columns
-            .iter()
-            .enumerate()
-            .filter(|(_, column)| {
-                !column.qualifier.is_empty()
-                    && column_name(column).eq_ignore_ascii_case(requested_column[0])
-                    && requested_qualifier.len() <= column.qualifier.len()
-                    && column.qualifier[column.qualifier.len() - requested_qualifier.len()..]
-                        .iter()
-                        .zip(requested_qualifier)
-                        .all(|(stored, requested)| stored.eq_ignore_ascii_case(requested))
-            })
-            .map(|(index, _)| index)
-            .collect::<Vec<_>>();
-        match hits.as_slice() {
-            [index] => return Ok(*index),
-            [] => {}
-            _ => return Err(Error::Query(format!("ambiguous column: {name}"))),
-        }
-    }
-    // Match on the bare (unqualified) name on both sides, so a qualified
-    // reference like `t.col` resolves against a single-table (bare) schema and
-    // a bare `col` resolves against a joined (`alias.col`) schema.
-    let bare = |n: &str| n.rsplit('.').next().unwrap_or(n).to_string();
-    let target = bare(name);
-    let hits: Vec<usize> = schema
-        .columns
-        .iter()
-        .enumerate()
-        .filter(|(_, c)| {
-            let candidate = if c.qualifier.is_empty() {
-                c.name.clone()
-            } else {
-                column_name(c).to_owned()
-            };
-            candidate.eq_ignore_ascii_case(&target)
-        })
-        .map(|(i, _)| i)
-        .collect();
-    match hits.len() {
-        1 => Ok(hits[0]),
-        0 => Err(Error::Catalog(format!("unknown column: {name}"))),
+    match hits.as_slice() {
+        [index] => Ok(*index),
+        [] => Err(Error::Catalog(format!("unknown column: {name}"))),
         _ => Err(Error::Query(format!("ambiguous column: {name}"))),
     }
 }

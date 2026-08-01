@@ -525,7 +525,7 @@ pub fn build_plan(
     for item in projection {
         match item {
             SelectItem::Wildcard(_) => {
-                for idx in unqualified_wildcard_indices(&schema.columns) {
+                for idx in unqualified_wildcard_indices(schema) {
                     let column = &schema.columns[idx];
                     out_cols.push(ColumnDef {
                         name: column_name(column).to_owned(),

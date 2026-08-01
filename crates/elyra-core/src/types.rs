@@ -127,13 +127,19 @@ pub struct Schema {
     /// on-disk encoding byte-identical and gives old catalogs `Default` on read.
     #[serde(skip)]
     pub tables: Vec<String>,
+    /// Execution-only columns that qualified references may access, but bare
+    /// references and unqualified wildcards must ignore.
+    #[serde(skip)]
+    unqualified_hidden: Vec<bool>,
 }
 
 impl Schema {
     pub fn new(columns: Vec<ColumnDef>) -> Self {
+        let unqualified_hidden = vec![false; columns.len()];
         Self {
             columns,
             tables: Vec::new(),
+            unqualified_hidden,
         }
     }
 
@@ -146,7 +152,12 @@ impl Schema {
         } else {
             Vec::new()
         };
-        Self { columns, tables }
+        let unqualified_hidden = vec![false; columns.len()];
+        Self {
+            columns,
+            tables,
+            unqualified_hidden,
+        }
     }
 
     /// The source table of column `i`, if it has one.
@@ -161,6 +172,27 @@ impl Schema {
         self.columns
             .iter()
             .find(|c| c.name.eq_ignore_ascii_case(name))
+    }
+
+    /// Hide one physical column from bare resolution and unqualified `*` while
+    /// retaining it for an exact qualified reference such as `table.column`.
+    pub fn hide_from_unqualified(&mut self, index: usize) {
+        if self.unqualified_hidden.len() < self.columns.len() {
+            self.unqualified_hidden.resize(self.columns.len(), false);
+        }
+        if let Some(hidden) = self.unqualified_hidden.get_mut(index) {
+            *hidden = true;
+        }
+    }
+
+    /// Whether a physical column is excluded from bare resolution and `*`.
+    pub fn is_hidden_from_unqualified(&self, index: usize) -> bool {
+        self.unqualified_hidden.get(index).copied().unwrap_or(false)
+    }
+
+    /// Physical indexes exposed through an unqualified wildcard.
+    pub fn unqualified_indices(&self) -> impl Iterator<Item = usize> + '_ {
+        (0..self.columns.len()).filter(|&index| !self.is_hidden_from_unqualified(index))
     }
 }
 
