@@ -83,6 +83,13 @@ pub struct ColumnDef {
     /// Text collation (defaults to the case-insensitive `Ci`).
     #[serde(default)]
     pub collation: Collation,
+    /// Structured relation qualifier used while planning and executing a query.
+    ///
+    /// Keeping identifier components separate is necessary because both table
+    /// and column identifiers may themselves contain dots. Like result metadata
+    /// on [`Schema`], this is transient so catalog encoding stays compatible.
+    #[serde(skip)]
+    pub qualifier: Vec<String>,
 }
 
 impl ColumnDef {
@@ -93,7 +100,13 @@ impl ColumnDef {
             ty,
             nullable,
             collation: Collation::Ci,
+            qualifier: Vec::new(),
         }
+    }
+
+    pub fn with_qualifier(mut self, qualifier: Vec<String>) -> Self {
+        self.qualifier = qualifier;
+        self
     }
 }
 
@@ -165,7 +178,12 @@ mod schema_metadata_tests {
     #[test]
     fn qualifiers_never_reach_the_encoded_form() {
         let plain = Schema::new(cols());
-        let qualified = Schema::with_tables(cols(), vec!["users".into(), "users".into()]);
+        let qualified_columns = cols()
+            .into_iter()
+            .map(|column| column.with_qualifier(vec!["elyra".into(), "users".into()]))
+            .collect();
+        let qualified =
+            Schema::with_tables(qualified_columns, vec!["users".into(), "users".into()]);
         assert_eq!(
             bincode::serialize(&plain).unwrap(),
             bincode::serialize(&qualified).unwrap(),
@@ -174,6 +192,10 @@ mod schema_metadata_tests {
         let decoded: Schema =
             bincode::deserialize(&bincode::serialize(&qualified).unwrap()).unwrap();
         assert!(decoded.tables.is_empty());
+        assert!(decoded
+            .columns
+            .iter()
+            .all(|column| column.qualifier.is_empty()));
     }
 
     #[test]

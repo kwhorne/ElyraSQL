@@ -34,7 +34,7 @@ elyra-vector = { path = "crates/elyra-vector" }
 elyra-server = { path = "crates/elyra-server" }
 
 # SQL frontend (shared parser)
-sqlparser = "0.53"
+sqlparser = { version = "0.53", features = ["visitor"] }
 
 # Regular expressions (REGEXP / RLIKE)
 regex = "1"

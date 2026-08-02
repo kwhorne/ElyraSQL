@@ -42,6 +42,7 @@ pub fn eval_literal_select(q: &Query) -> Result<QueryResult> {
             ty,
             nullable: true,
             collation: elyra_core::Collation::Ci,
+            qualifier: Vec::new(),
         });
         row.push(value);
     }

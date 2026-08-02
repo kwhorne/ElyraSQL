@@ -342,28 +342,33 @@ fn item_expr_and_alias(item: &SelectItem) -> Result<(&Expr, Option<String>)> {
     }
 }
 
-fn col_index(schema: &Schema, name: &str) -> Result<usize> {
-    crate::predicate::resolve_index(name, schema)
-}
-
-fn ident_of(expr: &Expr) -> Option<String> {
+fn ident_index(expr: &Expr, schema: &Schema) -> Option<usize> {
     match expr {
-        Expr::Identifier(id) => Some(id.value.clone()),
-        Expr::CompoundIdentifier(parts) => Some(
-            parts
-                .iter()
-                .map(|i| i.value.as_str())
-                .collect::<Vec<_>>()
-                .join("."),
-        ),
+        Expr::Identifier(identifier) => {
+            crate::predicate::resolve_index_parts(std::slice::from_ref(identifier), schema).ok()
+        }
+        Expr::CompoundIdentifier(parts) => {
+            crate::predicate::resolve_index_parts(parts, schema).ok()
+        }
         _ => None,
     }
 }
 
-fn output_column_name(name: &str) -> String {
-    name.rsplit_once('.')
-        .map_or(name, |(_, column)| column)
-        .to_owned()
+fn column_name(column: &ColumnDef) -> &str {
+    if column.qualifier.is_empty() {
+        return &column.name;
+    }
+    let qualifier_len = column.qualifier.iter().map(String::len).sum::<usize>()
+        + column.qualifier.len().saturating_sub(1);
+    column.name.get(qualifier_len + 1..).unwrap_or(&column.name)
+}
+
+fn qualifier_matches(qualifier: &[String], requested: &sqlparser::ast::ObjectName) -> bool {
+    requested.0.len() <= qualifier.len()
+        && qualifier[qualifier.len() - requested.0.len()..]
+            .iter()
+            .zip(&requested.0)
+            .all(|(stored, requested)| stored.eq_ignore_ascii_case(&requested.value))
 }
 
 fn resolve_group_alias<'a>(
@@ -374,13 +379,10 @@ fn resolve_group_alias<'a>(
     let Expr::Identifier(id) = expr else {
         return expr;
     };
-    let source_column_exists = schema.columns.iter().any(|column| {
-        column.name.eq_ignore_ascii_case(&id.value)
-            || column
-                .name
-                .split_once('.')
-                .is_some_and(|(_, name)| name.eq_ignore_ascii_case(&id.value))
-    });
+    let source_column_exists = schema
+        .columns
+        .iter()
+        .any(|column| column_name(column).eq_ignore_ascii_case(&id.value));
     if source_column_exists {
         return expr;
     }
@@ -507,7 +509,7 @@ pub fn build_plan(
     let mut group_cols = Vec::new();
     for g in group_by {
         let g = resolve_group_alias(g, schema, projection);
-        match ident_of(g).and_then(|n| col_index(schema, &n).ok()) {
+        match ident_index(g, schema) {
             Some(idx) => group_cols.push(idx),
             None => {
                 let idx = schema.columns.len() + arg_exprs.len();
@@ -523,35 +525,41 @@ pub fn build_plan(
             SelectItem::Wildcard(_) => {
                 for (idx, column) in schema.columns.iter().enumerate() {
                     out_cols.push(ColumnDef {
-                        name: output_column_name(&column.name),
+                        name: column_name(column).to_owned(),
                         ty: column.ty.clone(),
                         nullable: column.nullable,
                         collation: column.collation,
+                        qualifier: column.qualifier.clone(),
                     });
                     plan.push(OutCol::Column(idx));
                 }
                 continue;
             }
             SelectItem::QualifiedWildcard(object, _) => {
-                let qualifier = object
-                    .0
-                    .last()
-                    .map(|identifier| identifier.value.as_str())
-                    .unwrap_or_default();
+                let unqualified_schema = schema
+                    .columns
+                    .iter()
+                    .all(|column| column.qualifier.is_empty());
                 let before = plan.len();
                 for (idx, column) in schema.columns.iter().enumerate() {
-                    let Some((column_qualifier, name)) = column.name.split_once('.') else {
+                    let name = if unqualified_schema || qualifier_matches(&column.qualifier, object)
+                    {
+                        column_name(column)
+                    } else {
                         continue;
                     };
-                    if column_qualifier.eq_ignore_ascii_case(qualifier) {
-                        out_cols.push(ColumnDef {
-                            name: name.to_owned(),
-                            ty: column.ty.clone(),
-                            nullable: column.nullable,
-                            collation: column.collation,
-                        });
-                        plan.push(OutCol::Column(idx));
-                    }
+                    out_cols.push(ColumnDef {
+                        name: name.to_owned(),
+                        ty: column.ty.clone(),
+                        nullable: column.nullable,
+                        collation: column.collation,
+                        qualifier: if column.qualifier.is_empty() {
+                            object.0.iter().map(|part| part.value.clone()).collect()
+                        } else {
+                            column.qualifier.clone()
+                        },
+                    });
+                    plan.push(OutCol::Column(idx));
                 }
                 if plan.len() == before {
                     return Err(Error::Unsupported(format!(
@@ -572,6 +580,7 @@ pub fn build_plan(
                 ty: agg_types[slot].clone(),
                 nullable: true,
                 collation: ci,
+                qualifier: Vec::new(),
             });
             plan.push(OutCol::Agg(slot));
             continue;
@@ -580,12 +589,13 @@ pub fn build_plan(
         // 2/3) No aggregate anywhere: a plain group column, or a scalar
         // expression over the group columns (e.g. UPPER(status)).
         if !contains_aggregate(expr) {
-            if let Some(idx) = ident_of(expr).and_then(|n| col_index(schema, &n).ok()) {
+            if let Some(idx) = ident_index(expr, schema) {
                 out_cols.push(ColumnDef {
-                    name: alias.unwrap_or_else(|| output_column_name(&schema.columns[idx].name)),
+                    name: alias.unwrap_or_else(|| column_name(&schema.columns[idx]).to_owned()),
                     ty: schema.columns[idx].ty.clone(),
                     nullable: schema.columns[idx].nullable,
                     collation: ci,
+                    qualifier: schema.columns[idx].qualifier.clone(),
                 });
                 plan.push(OutCol::Column(idx));
             } else {
@@ -594,6 +604,7 @@ pub fn build_plan(
                     ty: infer_computed_type(expr),
                     nullable: true,
                     collation: ci,
+                    qualifier: Vec::new(),
                 });
                 plan.push(OutCol::Computed(Box::new(expr.clone())));
             }
@@ -610,6 +621,7 @@ pub fn build_plan(
             ty: infer_computed_type(expr),
             nullable: true,
             collation: ci,
+            qualifier: Vec::new(),
         });
         plan.push(OutCol::Computed(Box::new(rewritten)));
     }
@@ -623,6 +635,7 @@ pub fn build_plan(
             ty: t.clone(),
             nullable: true,
             collation: ci,
+            qualifier: Vec::new(),
         });
     }
 
@@ -638,12 +651,19 @@ pub fn build_plan(
                 .unwrap_or(elyra_core::Collation::Ci)
         })
         .collect();
+    let out_tables = out_cols
+        .iter()
+        .map(|column| column.qualifier.last().cloned().unwrap_or_default())
+        .collect();
+    for column in &mut out_cols {
+        column.qualifier.clear();
+    }
     Ok(AggPlan {
         group_cols,
         group_collations,
         aggs,
         plan,
-        out_schema: Schema::new(out_cols),
+        out_schema: Schema::with_tables(out_cols, out_tables),
         arg_exprs,
         input_schema: schema.clone(),
         eval_schema: Schema::new(eval_cols),
@@ -664,7 +684,7 @@ fn register_agg(
     let (arg_expr, distinct) = agg_arg(f);
     let (arg, arg_ty): (Option<usize>, Option<ColumnType>) = match arg_expr {
         None => (None, None),
-        Some(e) => match ident_of(e).and_then(|n| col_index(schema, &n).ok()) {
+        Some(e) => match ident_index(e, schema) {
             Some(ci) => (Some(ci), Some(schema.columns[ci].ty.clone())),
             None => {
                 let ci = schema.columns.len() + arg_exprs.len();
@@ -691,7 +711,7 @@ fn register_agg(
     };
     let mut order = Vec::new();
     for (e, asc) in agg_order(f) {
-        let idx = match ident_of(&e).and_then(|nm| col_index(schema, &nm).ok()) {
+        let idx = match ident_index(&e, schema) {
             Some(i) => i,
             None => {
                 let i = schema.columns.len() + arg_exprs.len();

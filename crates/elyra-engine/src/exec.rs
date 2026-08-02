@@ -7,10 +7,11 @@ use crate::session::Session;
 use elyra_core::{ColumnDef, ColumnType, Error, Result, Schema, Value};
 use sqlparser::ast::{
     AlterColumnOperation, AlterTableOperation, Assignment, AssignmentTarget, ColumnOption,
-    CreateIndex, CreateTable, DataType, Delete, FromTable, Insert, JoinConstraint, JoinOperator,
-    ObjectName, OrderByExpr, Query as SqlQuery, Select, SetExpr, Statement, TableConstraint,
-    TableFactor, TableWithJoins,
+    CreateIndex, CreateTable, DataType, Delete, FromTable, Ident, Insert, JoinConstraint,
+    JoinOperator, ObjectName, OrderByExpr, Query as SqlQuery, Select, SetExpr, Statement,
+    TableConstraint, TableFactor, TableWithJoins, Visit, Visitor,
 };
+use std::ops::ControlFlow;
 
 use crate::aggregate;
 use crate::aggregate::AggPlan;
@@ -298,6 +299,7 @@ pub async fn create_table(
             ty,
             nullable,
             collation,
+            qualifier: Vec::new(),
         });
         col_meta.push(meta);
     }
@@ -473,6 +475,7 @@ pub async fn show_tables(db: &Session) -> Result<QueryResult> {
         ty: ColumnType::Text,
         nullable: false,
         collation: elyra_core::Collation::Ci,
+        qualifier: Vec::new(),
     }]);
     let rows = names.into_iter().map(|n| vec![Value::Text(n)]).collect();
     Ok(QueryResult::Rows(RowStream::literal(schema, rows)))
@@ -488,6 +491,7 @@ fn text_schema(names: &[&str]) -> Schema {
                 ty: ColumnType::Text,
                 nullable: true,
                 collation: elyra_core::Collation::Ci,
+                qualifier: Vec::new(),
             })
             .collect(),
     )
@@ -848,6 +852,7 @@ pub async fn show_columns(db: &Session, table: &str) -> Result<QueryResult> {
                 ty: ColumnType::Text,
                 nullable: *n == "Default",
                 collation: elyra_core::Collation::Ci,
+                qualifier: Vec::new(),
             })
             .collect(),
     );
@@ -983,12 +988,14 @@ pub async fn show_create_table(db: &Session, name: &str) -> Result<QueryResult> 
             ty: ColumnType::Text,
             nullable: false,
             collation: elyra_core::Collation::Ci,
+            qualifier: Vec::new(),
         },
         ColumnDef {
             name: "Create Table".into(),
             ty: ColumnType::Text,
             nullable: false,
             collation: elyra_core::Collation::Ci,
+            qualifier: Vec::new(),
         },
     ]);
     let rows = vec![vec![Value::Text(name.to_string()), Value::Text(ddl)]];
@@ -1020,6 +1027,7 @@ pub async fn show_index(db: &Session, name: &str) -> Result<QueryResult> {
                 },
                 nullable: true,
                 collation: elyra_core::Collation::Ci,
+                qualifier: Vec::new(),
             })
             .collect(),
     );
@@ -1054,17 +1062,17 @@ pub async fn show_index(db: &Session, name: &str) -> Result<QueryResult> {
 /// If `tf` is `information_schema.<view>`, return the lowercase view name.
 fn information_schema_view(tf: &TableFactor) -> Option<String> {
     if let TableFactor::Table { name, .. } = tf {
-        if name.0.len() >= 2 {
-            let schema = name.0[name.0.len() - 2].value.to_ascii_lowercase();
-            let table = name.0.last()?.value.to_ascii_lowercase();
-            if schema == "information_schema" {
-                return Some(table);
-            }
-            // Expose a few `mysql.*` catalog tables (prefixed so the virtual-
-            // table provider can tell them apart).
-            if schema == "mysql" {
-                return Some(format!("mysql.{table}"));
-            }
+        let [schema, table] = name.0.as_slice() else {
+            return None;
+        };
+        let table = table.value.to_ascii_lowercase();
+        if schema.value.eq_ignore_ascii_case("information_schema") {
+            return Some(table);
+        }
+        // Expose a few `mysql.*` catalog tables (prefixed so the virtual-
+        // table provider can tell them apart).
+        if schema.value.eq_ignore_ascii_case("mysql") {
+            return Some(format!("mysql.{table}"));
         }
     }
     None
@@ -1110,37 +1118,228 @@ fn ref_action_name(action: RefAction) -> &'static str {
     }
 }
 
-/// Build the rows of an `information_schema` view (`tables` or `columns`).
-async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec<Value>>)> {
-    let text = |n: &str| ColumnDef {
-        name: n.to_string(),
+fn information_schema_schema(view: &str) -> Result<Schema> {
+    let text = |name: &str| ColumnDef {
+        name: name.to_owned(),
         ty: ColumnType::Text,
         nullable: true,
         collation: elyra_core::Collation::Ci,
+        qualifier: Vec::new(),
     };
-    let int = |n: &str| ColumnDef {
-        name: n.to_string(),
+    let int = |name: &str| ColumnDef {
+        name: name.to_owned(),
         ty: ColumnType::Int,
         nullable: true,
         collation: elyra_core::Collation::Ci,
+        qualifier: Vec::new(),
     };
+    let text_columns = |names: &[&str]| Schema::new(names.iter().map(|name| text(name)).collect());
+
+    let schema = match view {
+        "tables" => Schema::new(vec![
+            text("TABLE_SCHEMA"),
+            text("TABLE_NAME"),
+            text("TABLE_TYPE"),
+            text("ENGINE"),
+            int("TABLE_ROWS"),
+            int("DATA_LENGTH"),
+            int("INDEX_LENGTH"),
+            text("TABLE_COMMENT"),
+            text("TABLE_COLLATION"),
+            int("AUTO_INCREMENT"),
+            text("CREATE_OPTIONS"),
+        ]),
+        "columns" => Schema::new(vec![
+            text("TABLE_SCHEMA"),
+            text("TABLE_NAME"),
+            text("COLUMN_NAME"),
+            int("ORDINAL_POSITION"),
+            text("COLUMN_DEFAULT"),
+            text("IS_NULLABLE"),
+            text("DATA_TYPE"),
+            text("COLUMN_TYPE"),
+            text("COLUMN_KEY"),
+            text("EXTRA"),
+            text("COLLATION_NAME"),
+            text("COLUMN_COMMENT"),
+            text("GENERATION_EXPRESSION"),
+            text("CHARACTER_SET_NAME"),
+        ]),
+        "statistics" => Schema::new(vec![
+            text("TABLE_SCHEMA"),
+            text("TABLE_NAME"),
+            int("NON_UNIQUE"),
+            text("INDEX_NAME"),
+            int("SEQ_IN_INDEX"),
+            text("COLUMN_NAME"),
+            text("COLLATION"),
+            int("CARDINALITY"),
+            int("SUB_PART"),
+            text("NULLABLE"),
+            text("INDEX_TYPE"),
+        ]),
+        "key_column_usage" => Schema::new(vec![
+            text("CONSTRAINT_SCHEMA"),
+            text("CONSTRAINT_NAME"),
+            text("TABLE_SCHEMA"),
+            text("TABLE_NAME"),
+            text("COLUMN_NAME"),
+            int("ORDINAL_POSITION"),
+            int("POSITION_IN_UNIQUE_CONSTRAINT"),
+            text("REFERENCED_TABLE_SCHEMA"),
+            text("REFERENCED_TABLE_NAME"),
+            text("REFERENCED_COLUMN_NAME"),
+        ]),
+        "referential_constraints" => Schema::new(vec![
+            text("CONSTRAINT_SCHEMA"),
+            text("CONSTRAINT_NAME"),
+            text("UPDATE_RULE"),
+            text("DELETE_RULE"),
+        ]),
+        "column_statistics" => Schema::new(vec![
+            text("TABLE_NAME"),
+            text("COLUMN_NAME"),
+            int("NDV"),
+            int("NULLS"),
+            text("MIN_VALUE"),
+            text("MAX_VALUE"),
+            text("HISTOGRAM"),
+        ]),
+        "partitions" => Schema::new(vec![
+            text("TABLE_NAME"),
+            text("PARTITION_NAME"),
+            text("PARTITION_METHOD"),
+            text("PARTITION_EXPRESSION"),
+            text("PARTITION_DESCRIPTION"),
+        ]),
+        "mysql.user" => text_columns(&[
+            "Host",
+            "User",
+            "Select_priv",
+            "Insert_priv",
+            "Update_priv",
+            "Delete_priv",
+            "Create_priv",
+            "Drop_priv",
+            "Super_priv",
+            "plugin",
+            "authentication_string",
+            "account_locked",
+            "password_expired",
+        ]),
+        "mysql.db" => text_columns(&["Host", "Db", "User", "Select_priv", "Insert_priv"]),
+        "engines" => text_columns(&[
+            "ENGINE",
+            "SUPPORT",
+            "COMMENT",
+            "TRANSACTIONS",
+            "XA",
+            "SAVEPOINTS",
+        ]),
+        "triggers" => text_columns(&[
+            "TRIGGER_CATALOG",
+            "TRIGGER_SCHEMA",
+            "TRIGGER_NAME",
+            "EVENT_MANIPULATION",
+            "EVENT_OBJECT_CATALOG",
+            "EVENT_OBJECT_SCHEMA",
+            "EVENT_OBJECT_TABLE",
+            "ACTION_ORDER",
+            "ACTION_CONDITION",
+            "ACTION_STATEMENT",
+            "ACTION_ORIENTATION",
+            "ACTION_TIMING",
+            "CREATED",
+            "SQL_MODE",
+            "DEFINER",
+            "CHARACTER_SET_CLIENT",
+            "COLLATION_CONNECTION",
+            "DATABASE_COLLATION",
+        ]),
+        "routines" => text_columns(&[
+            "SPECIFIC_NAME",
+            "ROUTINE_CATALOG",
+            "ROUTINE_SCHEMA",
+            "ROUTINE_NAME",
+            "ROUTINE_TYPE",
+            "DATA_TYPE",
+            "ROUTINE_BODY",
+            "ROUTINE_DEFINITION",
+            "SQL_DATA_ACCESS",
+            "SECURITY_TYPE",
+            "CREATED",
+            "LAST_ALTERED",
+            "SQL_MODE",
+            "ROUTINE_COMMENT",
+            "DEFINER",
+            "CHARACTER_SET_CLIENT",
+            "COLLATION_CONNECTION",
+            "DATABASE_COLLATION",
+        ]),
+        "views" => text_columns(&[
+            "TABLE_CATALOG",
+            "TABLE_SCHEMA",
+            "TABLE_NAME",
+            "VIEW_DEFINITION",
+            "CHECK_OPTION",
+            "IS_UPDATABLE",
+            "DEFINER",
+            "SECURITY_TYPE",
+            "CHARACTER_SET_CLIENT",
+            "COLLATION_CONNECTION",
+        ]),
+        "events" => text_columns(&[
+            "EVENT_CATALOG",
+            "EVENT_SCHEMA",
+            "EVENT_NAME",
+            "DEFINER",
+            "TIME_ZONE",
+            "EVENT_BODY",
+            "EVENT_DEFINITION",
+            "EVENT_TYPE",
+            "EXECUTE_AT",
+            "INTERVAL_VALUE",
+            "INTERVAL_FIELD",
+            "SQL_MODE",
+            "STARTS",
+            "ENDS",
+            "STATUS",
+            "ON_COMPLETION",
+            "CREATED",
+            "LAST_ALTERED",
+            "LAST_EXECUTED",
+            "EVENT_COMMENT",
+            "ORIGINATOR",
+            "CHARACTER_SET_CLIENT",
+            "COLLATION_CONNECTION",
+            "DATABASE_COLLATION",
+        ]),
+        "schemata" => text_columns(&[
+            "CATALOG_NAME",
+            "SCHEMA_NAME",
+            "DEFAULT_CHARACTER_SET_NAME",
+            "DEFAULT_COLLATION_NAME",
+            "SQL_PATH",
+        ]),
+        "collation_character_set_applicability" => {
+            text_columns(&["COLLATION_NAME", "CHARACTER_SET_NAME"])
+        }
+        other => {
+            return Err(Error::Unsupported(format!(
+                "information_schema.{other} is not available"
+            )))
+        }
+    };
+    Ok(schema)
+}
+
+/// Build the rows of an `information_schema` view (`tables` or `columns`).
+async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec<Value>>)> {
+    let schema = information_schema_schema(view)?;
     let names = catalog::list_tables(db).await?;
     let database = db.database();
     match view {
         "tables" => {
-            let schema = Schema::new(vec![
-                text("TABLE_SCHEMA"),
-                text("TABLE_NAME"),
-                text("TABLE_TYPE"),
-                text("ENGINE"),
-                int("TABLE_ROWS"),
-                int("DATA_LENGTH"),
-                int("INDEX_LENGTH"),
-                text("TABLE_COMMENT"),
-                text("TABLE_COLLATION"),
-                int("AUTO_INCREMENT"),
-                text("CREATE_OPTIONS"),
-            ]);
             let mut rows = Vec::with_capacity(names.len());
             for n in names {
                 let def = catalog::load(db, &n).await?;
@@ -1176,22 +1375,6 @@ async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec
             Ok((schema, rows))
         }
         "columns" => {
-            let schema = Schema::new(vec![
-                text("TABLE_SCHEMA"),
-                text("TABLE_NAME"),
-                text("COLUMN_NAME"),
-                int("ORDINAL_POSITION"),
-                text("COLUMN_DEFAULT"),
-                text("IS_NULLABLE"),
-                text("DATA_TYPE"),
-                text("COLUMN_TYPE"),
-                text("COLUMN_KEY"),
-                text("EXTRA"),
-                text("COLLATION_NAME"),
-                text("COLUMN_COMMENT"),
-                text("GENERATION_EXPRESSION"),
-                text("CHARACTER_SET_NAME"),
-            ]);
             let mut rows = Vec::new();
             for tname in names {
                 let def = catalog::load(db, &tname).await?;
@@ -1236,19 +1419,6 @@ async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec
             Ok((schema, rows))
         }
         "statistics" => {
-            let schema = Schema::new(vec![
-                text("TABLE_SCHEMA"),
-                text("TABLE_NAME"),
-                int("NON_UNIQUE"),
-                text("INDEX_NAME"),
-                int("SEQ_IN_INDEX"),
-                text("COLUMN_NAME"),
-                text("COLLATION"),
-                int("CARDINALITY"),
-                int("SUB_PART"),
-                text("NULLABLE"),
-                text("INDEX_TYPE"),
-            ]);
             let mut rows = Vec::new();
             for tname in names {
                 let def = catalog::load(db, &tname).await?;
@@ -1284,18 +1454,6 @@ async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec
             Ok((schema, rows))
         }
         "key_column_usage" => {
-            let schema = Schema::new(vec![
-                text("CONSTRAINT_SCHEMA"),
-                text("CONSTRAINT_NAME"),
-                text("TABLE_SCHEMA"),
-                text("TABLE_NAME"),
-                text("COLUMN_NAME"),
-                int("ORDINAL_POSITION"),
-                int("POSITION_IN_UNIQUE_CONSTRAINT"),
-                text("REFERENCED_TABLE_SCHEMA"),
-                text("REFERENCED_TABLE_NAME"),
-                text("REFERENCED_COLUMN_NAME"),
-            ]);
             let mut rows = Vec::new();
             for tname in names {
                 let def = catalog::load(db, &tname).await?;
@@ -1345,12 +1503,6 @@ async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec
             Ok((schema, rows))
         }
         "referential_constraints" => {
-            let schema = Schema::new(vec![
-                text("CONSTRAINT_SCHEMA"),
-                text("CONSTRAINT_NAME"),
-                text("UPDATE_RULE"),
-                text("DELETE_RULE"),
-            ]);
             let mut rows = Vec::new();
             for table_name in names {
                 let def = catalog::load(db, &table_name).await?;
@@ -1366,15 +1518,6 @@ async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec
             Ok((schema, rows))
         }
         "column_statistics" => {
-            let schema = Schema::new(vec![
-                text("TABLE_NAME"),
-                text("COLUMN_NAME"),
-                int("NDV"),
-                int("NULLS"),
-                text("MIN_VALUE"),
-                text("MAX_VALUE"),
-                text("HISTOGRAM"),
-            ]);
             let mut rows = Vec::new();
             for tname in names {
                 let Some(stats) = catalog::load_stats(db, &tname).await? else {
@@ -1406,13 +1549,6 @@ async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec
             Ok((schema, rows))
         }
         "partitions" => {
-            let schema = Schema::new(vec![
-                text("TABLE_NAME"),
-                text("PARTITION_NAME"),
-                text("PARTITION_METHOD"),
-                text("PARTITION_EXPRESSION"),
-                text("PARTITION_DESCRIPTION"),
-            ]);
             let mut rows = Vec::new();
             for tname in names {
                 let Some(spec) = catalog::load_partspec(db, &tname).await? else {
@@ -1453,22 +1589,6 @@ async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec
             Ok((schema, rows))
         }
         "mysql.user" => {
-            let cols = [
-                "Host",
-                "User",
-                "Select_priv",
-                "Insert_priv",
-                "Update_priv",
-                "Delete_priv",
-                "Create_priv",
-                "Drop_priv",
-                "Super_priv",
-                "plugin",
-                "authentication_string",
-                "account_locked",
-                "password_expired",
-            ];
-            let schema = Schema::new(cols.iter().map(|n| text(n)).collect());
             let prefix = elyra_core::users::USER_PREFIX.to_vec();
             // Always include the built-in admin account (configured via
             // --user/--password, not stored in the catalog) so the user list is
@@ -1528,23 +1648,9 @@ async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec
         }
         "mysql.db" => {
             // No per-database grant table; report an empty, shaped result.
-            let schema = Schema::new(
-                ["Host", "Db", "User", "Select_priv", "Insert_priv"]
-                    .iter()
-                    .map(|n| text(n))
-                    .collect(),
-            );
             Ok((schema, Vec::new()))
         }
         "engines" => {
-            let schema = Schema::new(vec![
-                text("ENGINE"),
-                text("SUPPORT"),
-                text("COMMENT"),
-                text("TRANSACTIONS"),
-                text("XA"),
-                text("SAVEPOINTS"),
-            ]);
             let rows = vec![vec![
                 Value::Text("InnoDB".into()),
                 Value::Text("DEFAULT".into()),
@@ -1556,31 +1662,6 @@ async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec
             Ok((schema, rows))
         }
         "triggers" => {
-            let schema = Schema::new(
-                [
-                    "TRIGGER_CATALOG",
-                    "TRIGGER_SCHEMA",
-                    "TRIGGER_NAME",
-                    "EVENT_MANIPULATION",
-                    "EVENT_OBJECT_CATALOG",
-                    "EVENT_OBJECT_SCHEMA",
-                    "EVENT_OBJECT_TABLE",
-                    "ACTION_ORDER",
-                    "ACTION_CONDITION",
-                    "ACTION_STATEMENT",
-                    "ACTION_ORIENTATION",
-                    "ACTION_TIMING",
-                    "CREATED",
-                    "SQL_MODE",
-                    "DEFINER",
-                    "CHARACTER_SET_CLIENT",
-                    "COLLATION_CONNECTION",
-                    "DATABASE_COLLATION",
-                ]
-                .iter()
-                .map(|n| text(n))
-                .collect(),
-            );
             let prefix = b"sys::trigger::".to_vec();
             let mut rows = Vec::new();
             let mut after: Option<Vec<u8>> = None;
@@ -1627,31 +1708,6 @@ async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec
             Ok((schema, rows))
         }
         "routines" => {
-            let schema = Schema::new(
-                [
-                    "SPECIFIC_NAME",
-                    "ROUTINE_CATALOG",
-                    "ROUTINE_SCHEMA",
-                    "ROUTINE_NAME",
-                    "ROUTINE_TYPE",
-                    "DATA_TYPE",
-                    "ROUTINE_BODY",
-                    "ROUTINE_DEFINITION",
-                    "SQL_DATA_ACCESS",
-                    "SECURITY_TYPE",
-                    "CREATED",
-                    "LAST_ALTERED",
-                    "SQL_MODE",
-                    "ROUTINE_COMMENT",
-                    "DEFINER",
-                    "CHARACTER_SET_CLIENT",
-                    "COLLATION_CONNECTION",
-                    "DATABASE_COLLATION",
-                ]
-                .iter()
-                .map(|n| text(n))
-                .collect(),
-            );
             let prefix = b"sys::proc::".to_vec();
             let mut rows = Vec::new();
             let mut after: Option<Vec<u8>> = None;
@@ -1691,18 +1747,6 @@ async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec
             Ok((schema, rows))
         }
         "views" => {
-            let schema = Schema::new(vec![
-                text("TABLE_CATALOG"),
-                text("TABLE_SCHEMA"),
-                text("TABLE_NAME"),
-                text("VIEW_DEFINITION"),
-                text("CHECK_OPTION"),
-                text("IS_UPDATABLE"),
-                text("DEFINER"),
-                text("SECURITY_TYPE"),
-                text("CHARACTER_SET_CLIENT"),
-                text("COLLATION_CONNECTION"),
-            ]);
             let prefix = b"view::".to_vec();
             let mut rows = Vec::new();
             let mut after: Option<Vec<u8>> = None;
@@ -1737,47 +1781,9 @@ async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec
         "events" => {
             // ElyraSQL has no scheduled events; report an empty, correctly-shaped
             // table so tools that introspect events don't error.
-            let schema = Schema::new(
-                [
-                    "EVENT_CATALOG",
-                    "EVENT_SCHEMA",
-                    "EVENT_NAME",
-                    "DEFINER",
-                    "TIME_ZONE",
-                    "EVENT_BODY",
-                    "EVENT_DEFINITION",
-                    "EVENT_TYPE",
-                    "EXECUTE_AT",
-                    "INTERVAL_VALUE",
-                    "INTERVAL_FIELD",
-                    "SQL_MODE",
-                    "STARTS",
-                    "ENDS",
-                    "STATUS",
-                    "ON_COMPLETION",
-                    "CREATED",
-                    "LAST_ALTERED",
-                    "LAST_EXECUTED",
-                    "EVENT_COMMENT",
-                    "ORIGINATOR",
-                    "CHARACTER_SET_CLIENT",
-                    "COLLATION_CONNECTION",
-                    "DATABASE_COLLATION",
-                ]
-                .iter()
-                .map(|n| text(n))
-                .collect(),
-            );
             Ok((schema, Vec::new()))
         }
         "schemata" => {
-            let schema = Schema::new(vec![
-                text("CATALOG_NAME"),
-                text("SCHEMA_NAME"),
-                text("DEFAULT_CHARACTER_SET_NAME"),
-                text("DEFAULT_COLLATION_NAME"),
-                text("SQL_PATH"),
-            ]);
             let rows = ["information_schema".to_string(), database]
                 .into_iter()
                 .map(|schema_name| {
@@ -1793,7 +1799,6 @@ async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec
             Ok((schema, rows))
         }
         "collation_character_set_applicability" => {
-            let schema = Schema::new(vec![text("COLLATION_NAME"), text("CHARACTER_SET_NAME")]);
             let rows = ["utf8mb4_0900_ai_ci", "utf8mb4_unicode_ci", "utf8mb4_bin"]
                 .into_iter()
                 .map(|collation| vec![Value::Text(collation.into()), Value::Text("utf8mb4".into())])
@@ -1870,10 +1875,11 @@ async fn create_table_as(
             .columns
             .iter()
             .map(|c| ColumnDef {
-                name: c.name.rsplit('.').next().unwrap_or(&c.name).to_string(),
+                name: column_name(c).to_owned(),
                 ty: c.ty.clone(),
                 nullable: true,
                 collation: elyra_core::Collation::Ci,
+                qualifier: Vec::new(),
             })
             .collect()
     } else {
@@ -1884,6 +1890,7 @@ async fn create_table_as(
                 ty: map_type(&c.data_type)?,
                 nullable: true,
                 collation: elyra_core::Collation::Ci,
+                qualifier: Vec::new(),
             });
         }
         v
@@ -2435,6 +2442,7 @@ async fn alter_add_column(
                     .find_map(|option| option_collation(&option.option))
             })
             .unwrap_or_default(),
+        qualifier: Vec::new(),
     });
     def.col_meta.push(meta.clone());
     if is_primary {
@@ -4060,6 +4068,11 @@ async fn select_inner(
         return Box::pin(select(db, vindex, &expanded)).await;
     }
 
+    validate_select_alias_hiding(db, query)?;
+
+    let wildcard_bound = bind_qualified_wildcards(db, query)?;
+    let query = wildcard_bound.as_ref().unwrap_or(query);
+
     // Expand view references in FROM into derived tables.
     let view_expanded;
     let query = if from_has_plain_table(query) {
@@ -4138,7 +4151,7 @@ async fn select_inner(
     // `select` local shadows the function name below.
     if let SetExpr::Select(s) = query.body.as_ref() {
         if s.from.len() > 1 && s.from.iter().all(|t| t.joins.is_empty()) {
-            if let Some(chain) = comma_join_chain(&s.from, s.selection.as_ref()) {
+            if let Some(chain) = comma_join_chain(db, &s.from, s.selection.as_ref()) {
                 let mut q2 = query.clone();
                 if let SetExpr::Select(sm) = q2.body.as_mut() {
                     sm.from = vec![chain];
@@ -4211,7 +4224,7 @@ async fn select_inner(
     if is_join {
         // A subquery that references one of the join's tables is correlated;
         // evaluate it per joined row.
-        let quals = join_qualifiers(&select.from);
+        let quals = join_qualifiers(db, &select.from);
         let correlated = raw_filter
             .as_ref()
             .is_some_and(|f| filter_correlated_any(f, &quals))
@@ -4325,6 +4338,7 @@ async fn select_inner(
                 ty: infer_val(&v),
                 nullable: true,
                 collation: elyra_core::Collation::Ci,
+                qualifier: Vec::new(),
             });
             vals.push(v);
         }
@@ -4344,6 +4358,9 @@ async fn select_inner(
     // information_schema.<view> as a single virtual relation.
     if let Some(view) = information_schema_view(&select.from[0].relation) {
         let (schema, rows) = information_schema(db, &view).await?;
+        let qualifier = wildcard_schema_qualifier(db, &select.from[0].relation)
+            .unwrap_or_else(|| ObjectName(vec![Ident::new(view)]));
+        let schema = qualify_relation_schema(schema, &qualifier);
         return run_virtual_select(
             db,
             vindex,
@@ -4369,13 +4386,9 @@ async fn select_inner(
     let def = catalog::load(db, &table).await?;
 
     // Outer table name/alias, used to detect and bind correlated subqueries.
-    let outer = match &select.from[0].relation {
-        TableFactor::Table { alias, .. } => alias
-            .as_ref()
-            .map(|a| a.name.value.clone())
-            .unwrap_or_else(|| table.clone()),
-        _ => table.clone(),
-    };
+    let outer = factor_qualifier_object(db, &select.from[0].relation)
+        .map(|qualifier| object_name_parts(&qualifier))
+        .unwrap_or_else(|| vec![table.clone()]);
 
     // A WHERE or SELECT-list subquery that references `outer.<col>` is
     // correlated: evaluate per outer row with the outer columns bound.
@@ -6426,37 +6439,424 @@ async fn streaming_join_order(
 }
 
 /// The table qualifiers (alias or name) of every relation in a FROM clause.
-fn join_qualifiers(from: &[TableWithJoins]) -> Vec<String> {
-    let mut q = Vec::new();
-    for twj in from {
-        if let Some(n) = factor_qualifier(&twj.relation) {
-            q.push(n);
-        }
-        for j in &twj.joins {
-            if let Some(n) = factor_qualifier(&j.relation) {
-                q.push(n);
-            }
-        }
-    }
-    q
+fn join_qualifiers(db: &Session, from: &[TableWithJoins]) -> Vec<Vec<String>> {
+    join_qualifier_bindings(db, from)
+        .into_iter()
+        .map(|(qualifier, _)| qualifier)
+        .collect()
 }
 
-fn factor_qualifier(tf: &TableFactor) -> Option<String> {
-    match tf {
-        TableFactor::Table { name, alias, .. } => alias
+fn join_qualifier_bindings(db: &Session, from: &[TableWithJoins]) -> Vec<(Vec<String>, bool)> {
+    let mut bindings = Vec::new();
+    let mut push = |relation: &TableFactor| {
+        let Some(qualifier) = factor_qualifier_object(db, relation) else {
+            return;
+        };
+        let explicit_alias = match relation {
+            TableFactor::Table { alias, .. } | TableFactor::Derived { alias, .. } => {
+                alias.is_some()
+            }
+            _ => false,
+        };
+        bindings.push((object_name_parts(&qualifier), explicit_alias));
+    };
+    for table in from {
+        push(&table.relation);
+        for join in &table.joins {
+            push(&join.relation);
+        }
+    }
+    bindings
+}
+
+fn object_names_equal(left: &ObjectName, right: &ObjectName) -> bool {
+    left.0.len() == right.0.len()
+        && left
+            .0
+            .iter()
+            .zip(&right.0)
+            .all(|(left, right)| left.value.eq_ignore_ascii_case(&right.value))
+}
+
+fn canonical_relation_qualifier(
+    db: &Session,
+    name: Option<&ObjectName>,
+    alias: &Ident,
+) -> ObjectName {
+    let schema = name
+        .and_then(|name| (name.0.len() >= 2).then(|| name.0[name.0.len() - 2].clone()))
+        .unwrap_or_else(|| Ident::new(db.database()));
+    ObjectName(vec![schema, alias.clone()])
+}
+
+fn factor_qualifier_object(db: &Session, relation: &TableFactor) -> Option<ObjectName> {
+    match relation {
+        TableFactor::Table { name, alias, .. } => {
+            let relation_name = alias
+                .as_ref()
+                .map(|alias| alias.name.clone())
+                .or_else(|| name.0.last().cloned())?;
+            Some(canonical_relation_qualifier(db, Some(name), &relation_name))
+        }
+        TableFactor::Derived { alias, .. } => alias
             .as_ref()
-            .map(|a| a.name.value.clone())
-            .or_else(|| name.0.last().map(|i| i.value.clone())),
-        TableFactor::Derived { alias, .. } => alias.as_ref().map(|a| a.name.value.clone()),
+            .map(|alias| canonical_relation_qualifier(db, None, &alias.name)),
         _ => None,
     }
 }
 
-fn filter_correlated_any(f: &Expr, quals: &[String]) -> bool {
+pub(crate) fn wildcard_matches_relation(
+    db: &Session,
+    object: &ObjectName,
+    relation: &TableFactor,
+) -> bool {
+    let Some(canonical) = factor_qualifier_object(db, relation) else {
+        return false;
+    };
+    object_names_equal(object, &canonical)
+        || matches!(
+            (object.0.as_slice(), canonical.0.last()),
+            ([qualifier], Some(relation_name))
+                if qualifier.value.eq_ignore_ascii_case(&relation_name.value)
+        )
+}
+
+fn object_name_text(name: &ObjectName) -> String {
+    name.0
+        .iter()
+        .map(|part| part.value.as_str())
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+fn object_name_parts(name: &ObjectName) -> Vec<String> {
+    name.0.iter().map(|part| part.value.clone()).collect()
+}
+
+fn hidden_source_qualifier(relation: &TableFactor) -> Option<Vec<String>> {
+    let TableFactor::Table {
+        name,
+        alias: Some(alias),
+        ..
+    } = relation
+    else {
+        return None;
+    };
+    let source = object_name_parts(name);
+    source
+        .last()
+        .is_none_or(|part| !part.eq_ignore_ascii_case(&alias.name.value))
+        .then_some(source)
+}
+
+fn hidden_source_qualifiers(from: &[TableWithJoins]) -> Vec<Vec<String>> {
+    from.iter()
+        .flat_map(|table| {
+            std::iter::once(&table.relation).chain(table.joins.iter().map(|join| &join.relation))
+        })
+        .filter_map(hidden_source_qualifier)
+        .collect()
+}
+
+fn qualifier_components_equal(left: &[String], right: &[String]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| left.eq_ignore_ascii_case(right))
+}
+
+fn qualifier_short_names_equal(left: &[String], right: &[String]) -> bool {
+    left.last()
+        .zip(right.last())
+        .is_some_and(|(left, right)| left.eq_ignore_ascii_case(right))
+}
+
+fn validate_unique_relation_qualifiers(
+    db: &Session,
+    from: &[TableWithJoins],
+    operation: &str,
+) -> Result<Vec<Vec<String>>> {
+    let bindings = join_qualifier_bindings(db, from);
+    for (index, (qualifier, explicit_alias)) in bindings.iter().enumerate() {
+        if bindings[..index]
+            .iter()
+            .any(|(other, other_explicit_alias)| {
+                qualifier_components_equal(other, qualifier)
+                    || ((*explicit_alias || *other_explicit_alias)
+                        && qualifier_short_names_equal(other, qualifier))
+            })
+        {
+            return Err(Error::Query(format!(
+                "duplicate table alias in {operation}: {}",
+                qualifier.join(".")
+            )));
+        }
+    }
+    Ok(bindings
+        .into_iter()
+        .map(|(qualifier, _)| qualifier)
+        .collect())
+}
+
+fn qualifier_is_hidden(
+    reference: &[Ident],
+    hidden: &[Vec<String>],
+    visible: &[Vec<String>],
+) -> bool {
+    !visible
+        .iter()
+        .any(|source| ident_qualifier_has_source_suffix(reference, source))
+        && hidden
+            .iter()
+            .any(|source| ident_qualifier_has_source_suffix(reference, source))
+}
+
+struct HiddenSourceVisitor<'a> {
+    hidden: &'a [Vec<String>],
+    visible: &'a [Vec<String>],
+    nested_query_depth: usize,
+}
+
+impl Visitor for HiddenSourceVisitor<'_> {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, _query: &SqlQuery) -> ControlFlow<Self::Break> {
+        self.nested_query_depth += 1;
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_query(&mut self, _query: &SqlQuery) -> ControlFlow<Self::Break> {
+        self.nested_query_depth = self.nested_query_depth.saturating_sub(1);
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
+        if self.nested_query_depth == 0 {
+            if let Expr::CompoundIdentifier(parts) = expr {
+                if parts.len() >= 2
+                    && qualifier_is_hidden(&parts[..parts.len() - 1], self.hidden, self.visible)
+                {
+                    return ControlFlow::Break(());
+                }
+            }
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+fn ast_uses_hidden_source<T: Visit>(
+    ast: &T,
+    hidden: &[Vec<String>],
+    visible: &[Vec<String>],
+) -> bool {
+    let mut visitor = HiddenSourceVisitor {
+        hidden,
+        visible,
+        nested_query_depth: 0,
+    };
+    matches!(ast.visit(&mut visitor), ControlFlow::Break(()))
+}
+
+fn ident_qualifier_has_source_suffix(reference: &[Ident], source: &[String]) -> bool {
+    if reference.is_empty() || source.is_empty() {
+        return false;
+    }
+    let reference_ends_with_source = source.len() <= reference.len()
+        && reference[reference.len() - source.len()..]
+            .iter()
+            .zip(source)
+            .all(|(reference, source)| reference.value.eq_ignore_ascii_case(source));
+    let source_ends_with_reference = reference.len() <= source.len()
+        && source[source.len() - reference.len()..]
+            .iter()
+            .zip(reference)
+            .all(|(source, reference)| source.eq_ignore_ascii_case(&reference.value));
+    reference_ends_with_source || source_ends_with_reference
+}
+
+fn validate_ast_alias_hiding<T: Visit>(
+    ast: &T,
+    hidden: &[Vec<String>],
+    visible: &[Vec<String>],
+) -> Result<()> {
+    if ast_uses_hidden_source(ast, hidden, visible) {
+        return Err(Error::Catalog(
+            "an aliased table must be referenced by its alias".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_select_alias_hiding(db: &Session, query: &SqlQuery) -> Result<()> {
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return Ok(());
+    };
+    let visible = validate_unique_relation_qualifiers(db, &select.from, "SELECT")?;
+    let hidden = hidden_source_qualifiers(&select.from);
+    if hidden.is_empty() {
+        return Ok(());
+    }
+    validate_ast_alias_hiding(select.as_ref(), &hidden, &visible)?;
+    if let Some(order_by) = &query.order_by {
+        for order in &order_by.exprs {
+            validate_ast_alias_hiding(&order.expr, &hidden, &visible)?;
+        }
+    }
+    Ok(())
+}
+
+fn column_name(column: &ColumnDef) -> &str {
+    if column.qualifier.is_empty() {
+        return &column.name;
+    }
+    let qualifier_len = column.qualifier.iter().map(String::len).sum::<usize>()
+        + column.qualifier.len().saturating_sub(1);
+    column.name.get(qualifier_len + 1..).unwrap_or(&column.name)
+}
+
+fn qualifier_parts_match(stored: &[String], requested: &[Ident]) -> bool {
+    requested.len() <= stored.len()
+        && stored[stored.len() - requested.len()..]
+            .iter()
+            .zip(requested)
+            .all(|(stored, requested)| stored.eq_ignore_ascii_case(&requested.value))
+}
+
+fn column_table(column: &ColumnDef) -> Option<&str> {
+    column.qualifier.last().map(String::as_str)
+}
+
+fn wildcard_column_name<'a>(
+    column: &'a ColumnDef,
+    qualifier: &ObjectName,
+    unqualified_schema: bool,
+) -> Option<&'a str> {
+    if unqualified_schema {
+        return Some(column_name(column));
+    }
+    qualifier_parts_match(&column.qualifier, &qualifier.0).then(|| column_name(column))
+}
+
+fn wildcard_schema_qualifier(db: &Session, relation: &TableFactor) -> Option<ObjectName> {
+    factor_qualifier_object(db, relation)
+}
+
+fn malformed_virtual_source(relation: &TableFactor) -> Option<&ObjectName> {
+    let TableFactor::Table { name, .. } = relation else {
+        return None;
+    };
+    (name.0.len() != 2
+        && name.0[..name.0.len().saturating_sub(1)].iter().any(|part| {
+            part.value.eq_ignore_ascii_case("information_schema")
+                || part.value.eq_ignore_ascii_case("mysql")
+        }))
+    .then_some(name)
+}
+
+fn bind_qualified_wildcards(db: &Session, query: &SqlQuery) -> Result<Option<SqlQuery>> {
+    use sqlparser::ast::SelectItem;
+
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return Ok(None);
+    };
+    let relations = select
+        .from
+        .iter()
+        .flat_map(|table| {
+            std::iter::once(&table.relation).chain(table.joins.iter().map(|join| &join.relation))
+        })
+        .collect::<Vec<_>>();
+    if let Some(name) = relations
+        .iter()
+        .find_map(|relation| malformed_virtual_source(relation))
+    {
+        return Err(Error::Unsupported(format!(
+            "virtual relation {name} must have exactly two name components"
+        )));
+    }
+
+    let mut bindings = Vec::new();
+    for (index, item) in select.projection.iter().enumerate() {
+        let SelectItem::QualifiedWildcard(object, _) = item else {
+            continue;
+        };
+        let mut matches = relations
+            .iter()
+            .copied()
+            .filter(|relation| wildcard_matches_relation(db, object, relation));
+        let Some(relation) = matches.next() else {
+            return Err(Error::Unsupported(format!(
+                "qualified wildcard {object}.* matched no relation"
+            )));
+        };
+        if matches.next().is_some() {
+            return Err(Error::Query(format!(
+                "qualified wildcard {object}.* is ambiguous"
+            )));
+        }
+        let qualifier = wildcard_schema_qualifier(db, relation).ok_or_else(|| {
+            Error::Unsupported(format!("qualified wildcard {object}.* matched no relation"))
+        })?;
+        bindings.push((index, qualifier));
+    }
+    if bindings.is_empty() {
+        return Ok(None);
+    }
+
+    let mut bound = query.clone();
+    let SetExpr::Select(select) = bound.body.as_mut() else {
+        unreachable!("the original query body was SELECT")
+    };
+    for (index, qualifier) in bindings {
+        let SelectItem::QualifiedWildcard(object, _) = &mut select.projection[index] else {
+            unreachable!("binding indices only contain qualified wildcards")
+        };
+        *object = qualifier;
+    }
+    Ok(Some(bound))
+}
+
+pub(crate) async fn describe_relation_schema(
+    db: &Session,
+    relation: &TableFactor,
+) -> Result<Schema> {
+    if let Some(name) = malformed_virtual_source(relation) {
+        return Err(Error::Unsupported(format!(
+            "virtual relation {name} must have exactly two name components"
+        )));
+    }
+    if let Some(view) = information_schema_view(relation) {
+        return information_schema_schema(&view);
+    }
+    let TableFactor::Table { name, .. } = relation else {
+        return Err(Error::Unsupported(
+            "only plain table references can be described".into(),
+        ));
+    };
+    catalog::load(db, &table_ident(name)?)
+        .await
+        .map(|definition| definition.schema)
+}
+
+fn qualify_relation_schema(mut schema: Schema, qualifier: &ObjectName) -> Schema {
+    let qualifier_text = object_name_text(qualifier);
+    let qualifier_parts = object_name_parts(qualifier);
+    for column in &mut schema.columns {
+        column.name = format!("{qualifier_text}.{}", column.name);
+        column.qualifier.clone_from(&qualifier_parts);
+    }
+    schema
+}
+
+fn filter_correlated_any(f: &Expr, quals: &[Vec<String>]) -> bool {
     quals.iter().any(|q| filter_correlated(f, q))
 }
 
-fn projection_correlated_any(projection: &[sqlparser::ast::SelectItem], quals: &[String]) -> bool {
+fn projection_correlated_any(
+    projection: &[sqlparser::ast::SelectItem],
+    quals: &[Vec<String>],
+) -> bool {
     quals.iter().any(|q| projection_correlated(projection, q))
 }
 
@@ -6464,26 +6864,33 @@ fn projection_correlated_any(projection: &[sqlparser::ast::SelectItem], quals: &
 /// joined `schema` to its literal value from `row`, including inside
 /// subqueries. Outer references in correlated subqueries become literals; the
 /// subquery's own columns are left untouched.
-fn bind_row(expr: &Expr, schema: &Schema, row: &[Value]) -> Expr {
-    bind_outer_references(expr, &[], &|e| {
+fn row_binding_index(parts: &[Ident], schema: &Schema) -> Result<Option<usize>> {
+    match predicate::resolve_index_parts(parts, schema) {
+        Ok(index) => Ok(Some(index)),
+        Err(ambiguous @ Error::Query(_)) => Err(ambiguous),
+        Err(_) => Ok(None),
+    }
+}
+
+fn bind_row(db: &Session, expr: &Expr, schema: &Schema, row: &[Value]) -> Result<Expr> {
+    let error = std::cell::RefCell::new(None);
+    let bound = bind_outer_references(db, expr, &[], &|e| {
         if let Expr::CompoundIdentifier(parts) = e {
-            if parts.len() >= 2 {
-                let qual = format!(
-                    "{}.{}",
-                    parts[parts.len() - 2].value,
-                    parts[parts.len() - 1].value
-                );
-                if let Some(i) = schema
-                    .columns
-                    .iter()
-                    .position(|c| c.name.eq_ignore_ascii_case(&qual))
-                {
-                    return Some(value_to_expr(&row[i]));
+            match row_binding_index(parts, schema) {
+                Ok(Some(index)) => return Some(value_to_expr(&row[index])),
+                Err(ambiguous) => {
+                    *error.borrow_mut() = Some(ambiguous);
+                    return Some(e.clone());
                 }
+                Ok(None) => {}
             }
         }
         None
-    })
+    });
+    match error.into_inner() {
+        Some(error) => Err(error),
+        None => Ok(bound),
+    }
 }
 
 /// Execute a join whose WHERE or SELECT list has a correlated subquery: build
@@ -6514,7 +6921,7 @@ async fn join_correlated_select(
     let mut kept: Vec<Vec<Value>> = Vec::new();
     for row in rows {
         if let Some(f) = &raw_filter {
-            let bound = bind_row(f, &schema, &row);
+            let bound = bind_row(db, f, &schema, &row)?;
             let resolved = resolve_subqueries_with_outer(db, vindex, bound, &schema, &row).await?;
             if !predicate::matches(&resolved, &schema, &row)? {
                 continue;
@@ -6546,7 +6953,7 @@ async fn join_correlated_select(
             &mut kept,
             &schema,
             &resolved_order,
-            |expr, row| bind_row(expr, &schema, row),
+            |expr, row| bind_row(db, expr, &schema, row),
         )
         .await?;
     }
@@ -6579,31 +6986,26 @@ async fn join_correlated_select(
                 for (index, column) in schema.columns.iter().enumerate() {
                     projection.push(Projection::Column(index));
                     let mut column = column.clone();
-                    outtables.push(
-                        column_qualifier(&column.name)
-                            .unwrap_or_default()
-                            .to_owned(),
-                    );
-                    column.name = output_column_name(&column.name).to_owned();
+                    outtables.push(column_table(&column).unwrap_or_default().to_owned());
+                    column.name = column_name(&column).to_owned();
+                    column.qualifier.clear();
                     outcols.push(column);
                 }
             }
             SelectItem::QualifiedWildcard(object, _) => {
-                let qualifier = object
-                    .0
-                    .last()
-                    .map(|identifier| identifier.value.as_str())
-                    .unwrap_or_default();
+                let unqualified_schema = schema
+                    .columns
+                    .iter()
+                    .all(|column| column.qualifier.is_empty());
                 let before = projection.len();
                 for (index, column) in schema.columns.iter().enumerate() {
-                    if let Some((column_qualifier, name)) = column.name.split_once('.') {
-                        if column_qualifier.eq_ignore_ascii_case(qualifier) {
-                            projection.push(Projection::Column(index));
-                            let mut column = column.clone();
-                            column.name = name.to_owned();
-                            outtables.push(column_qualifier.to_owned());
-                            outcols.push(column);
-                        }
+                    if let Some(name) = wildcard_column_name(column, object, unqualified_schema) {
+                        projection.push(Projection::Column(index));
+                        let mut column = column.clone();
+                        outtables.push(column_table(&column).unwrap_or_default().to_owned());
+                        column.name = name.to_owned();
+                        column.qualifier.clear();
+                        outcols.push(column);
                     }
                 }
                 if projection.len() == before {
@@ -6625,9 +7027,9 @@ async fn join_correlated_select(
                 // A projected expression has no source table -- neither does it
                 // in MySQL, which reports an empty table for computed columns.
                 outtables.push(
-                    col_ref_name(expr)
-                        .as_deref()
-                        .and_then(column_qualifier)
+                    expr_col_index(expr, &schema)
+                        .and_then(|index| schema.columns.get(index))
+                        .and_then(column_table)
                         .unwrap_or_default()
                         .to_owned(),
                 );
@@ -6636,6 +7038,7 @@ async fn join_correlated_select(
                     ty: ColumnType::Text,
                     nullable: true,
                     collation: elyra_core::Collation::Ci,
+                    qualifier: Vec::new(),
                 });
             }
         }
@@ -6648,7 +7051,7 @@ async fn join_correlated_select(
             match item {
                 Projection::Column(index) => vals.push(row[*index].clone()),
                 Projection::Expr(expr) => {
-                    let bound = bind_row(expr, &schema, row);
+                    let bound = bind_row(db, expr, &schema, row)?;
                     let resolved =
                         resolve_subqueries_with_outer(db, vindex, bound, &schema, row).await?;
                     vals.push(predicate::eval_row(&resolved, &schema, row)?);
@@ -6682,13 +7085,17 @@ async fn join_correlated_select(
 /// columns, without reading any rows.
 async fn resolve_table(db: &Session, tf: &TableFactor) -> Result<(TableDef, Vec<ColumnDef>)> {
     match tf {
-        TableFactor::Table { name, alias, .. } => {
+        TableFactor::Table { name, .. } => {
             let tname = table_ident(name)?;
             let def = catalog::load(db, &tname).await?;
-            let a = alias
-                .as_ref()
-                .map(|al| al.name.value.clone())
-                .unwrap_or_else(|| tname.clone());
+            let qualifier = factor_qualifier_object(db, tf)
+                .ok_or_else(|| Error::Catalog("empty table qualifier".into()))?;
+            let qualifier_parts = qualifier
+                .0
+                .iter()
+                .map(|part| part.value.clone())
+                .collect::<Vec<_>>();
+            let a = object_name_text(&qualifier);
             let cols = def
                 .schema
                 .columns
@@ -6701,6 +7108,7 @@ async fn resolve_table(db: &Session, tf: &TableFactor) -> Result<(TableDef, Vec<
                     // GROUP BY and DISTINCT over a joined `_bin` column stay
                     // case-sensitive.
                     collation: c.collation,
+                    qualifier: qualifier_parts.clone(),
                 })
                 .collect();
             Ok((def, cols))
@@ -6720,31 +7128,18 @@ async fn load_relation(
     // information_schema.<view>: synthesize a virtual relation.
     if let Some(view) = information_schema_view(tf) {
         let (schema, rows) = information_schema(db, &view).await?;
-        let qual = factor_qualifier(tf).unwrap_or(view);
-        let cols = schema
-            .columns
-            .iter()
-            .map(|c| ColumnDef {
-                name: format!("{qual}.{}", c.name),
-                ty: c.ty.clone(),
-                nullable: c.nullable,
-                collation: elyra_core::Collation::Ci,
-            })
-            .collect();
-        return Ok((cols, rows));
+        let qualifier =
+            wildcard_schema_qualifier(db, tf).unwrap_or_else(|| ObjectName(vec![Ident::new(view)]));
+        return Ok((qualify_relation_schema(schema, &qualifier).columns, rows));
     }
 
     // Derived table: materialise the subquery and qualify its columns.
-    if let TableFactor::Derived {
-        subquery, alias, ..
-    } = tf
-    {
-        let alias = alias
-            .as_ref()
-            .map(|a| a.name.value.clone())
-            .ok_or_else(|| {
-                Error::Query("a derived table (FROM (SELECT ...)) needs an alias".into())
-            })?;
+    if let TableFactor::Derived { subquery, .. } = tf {
+        let qualifier = factor_qualifier_object(db, tf).ok_or_else(|| {
+            Error::Query("a derived table (FROM (SELECT ...)) needs an alias".into())
+        })?;
+        let alias = object_name_text(&qualifier);
+        let qualifier_parts = object_name_parts(&qualifier);
         let (schema, rows) = run_subquery_schema(db, vindex, subquery).await?;
         let cols = schema
             .columns
@@ -6754,6 +7149,7 @@ async fn load_relation(
                 ty: c.ty.clone(),
                 nullable: c.nullable,
                 collation: elyra_core::Collation::Ci,
+                qualifier: qualifier_parts.clone(),
             })
             .collect();
         return Ok((cols, rows));
@@ -6858,30 +7254,23 @@ fn equi_nlj(on: &Expr, driving: &Schema, partner: &Schema) -> Option<(Expr, usiz
     else {
         return None;
     };
-    let plain = |e: &Expr| -> Option<String> {
+    let plain_index = |e: &Expr, schema: &Schema| -> Option<usize> {
         match e {
-            Expr::Identifier(id) => Some(id.value.clone()),
-            Expr::CompoundIdentifier(p) => Some(
-                p.iter()
-                    .map(|i| i.value.as_str())
-                    .collect::<Vec<_>>()
-                    .join("."),
-            ),
+            Expr::Identifier(identifier) => {
+                predicate::resolve_index_parts(std::slice::from_ref(identifier), schema).ok()
+            }
+            Expr::CompoundIdentifier(parts) => predicate::resolve_index_parts(parts, schema).ok(),
             _ => None,
         }
     };
     if refs_in_schema(left, driving) {
-        if let Some(n) = plain(right) {
-            if let Ok(i) = predicate::resolve_index(&n, partner) {
-                return Some(((**left).clone(), i));
-            }
+        if let Some(index) = plain_index(right, partner) {
+            return Some(((**left).clone(), index));
         }
     }
     if refs_in_schema(right, driving) {
-        if let Some(n) = plain(left) {
-            if let Ok(i) = predicate::resolve_index(&n, partner) {
-                return Some(((**right).clone(), i));
-            }
+        if let Some(index) = plain_index(left, partner) {
+            return Some(((**right).clone(), index));
         }
     }
     None
@@ -7897,8 +8286,10 @@ async fn build_inner_join_reordered(
             let t_aliases = relation_aliases(&loaded[i].cols);
             for pred in &on_preds {
                 if let Some((lq, rq)) = equi_qualifiers(pred) {
-                    let connects = (cur_aliases.contains(&lq) && t_aliases.contains(&rq))
-                        || (cur_aliases.contains(&rq) && t_aliases.contains(&lq));
+                    let connects = (relation_aliases_contain(&cur_aliases, &lq)
+                        && relation_aliases_contain(&t_aliases, &rq))
+                        || (relation_aliases_contain(&cur_aliases, &rq)
+                            && relation_aliases_contain(&t_aliases, &lq));
                     if connects && loaded[i].est < best_est {
                         best_est = loaded[i].est;
                         best = Some((pos, pred.clone()));
@@ -7931,16 +8322,39 @@ async fn build_inner_join_reordered(
     Ok(Some((cur_cols, cur_rows)))
 }
 
-/// The set of alias/table qualifiers present in a relation's column names
-/// (`"o.cust"` -> `"o"`).
-fn relation_aliases(cols: &[ColumnDef]) -> std::collections::HashSet<String> {
+/// Structured alias/table qualifiers present in a relation.
+fn relation_aliases(cols: &[ColumnDef]) -> std::collections::HashSet<Vec<String>> {
     cols.iter()
-        .filter_map(|c| c.name.split_once('.').map(|(q, _)| q.to_ascii_lowercase()))
+        .filter(|column| !column.qualifier.is_empty())
+        .map(|column| {
+            column
+                .qualifier
+                .iter()
+                .map(|part| part.to_ascii_lowercase())
+                .collect()
+        })
         .collect()
 }
 
+fn qualifier_component_suffix(stored: &[String], reference: &[String]) -> bool {
+    reference.len() <= stored.len()
+        && stored[stored.len() - reference.len()..]
+            .iter()
+            .zip(reference)
+            .all(|(stored, reference)| stored.eq_ignore_ascii_case(reference))
+}
+
+fn relation_aliases_contain(
+    relations: &std::collections::HashSet<Vec<String>>,
+    reference: &[String],
+) -> bool {
+    relations
+        .iter()
+        .any(|relation| qualifier_component_suffix(relation, reference))
+}
+
 /// For an equi predicate `A.x = B.y`, the two operand qualifiers `(a, b)`.
-fn equi_qualifiers(pred: &Expr) -> Option<(String, String)> {
+fn equi_qualifiers(pred: &Expr) -> Option<(Vec<String>, Vec<String>)> {
     let Expr::BinaryOp {
         left,
         op: sqlparser::ast::BinaryOperator::Eq,
@@ -7960,7 +8374,11 @@ fn equi_qualifiers(pred: &Expr) -> Option<(String, String)> {
 /// an equi-predicate. The original WHERE is kept unchanged by the caller (the
 /// equi-predicates remain as harmless residual filters), so semantics are
 /// preserved -- comma joins are always inner.
-fn comma_join_chain(from: &[TableWithJoins], selection: Option<&Expr>) -> Option<TableWithJoins> {
+fn comma_join_chain(
+    db: &Session,
+    from: &[TableWithJoins],
+    selection: Option<&Expr>,
+) -> Option<TableWithJoins> {
     use sqlparser::ast::Join;
     if from.len() < 2
         || !from
@@ -7969,25 +8387,31 @@ fn comma_join_chain(from: &[TableWithJoins], selection: Option<&Expr>) -> Option
     {
         return None;
     }
-    let quals: Vec<String> = from
+    let quals: Vec<Vec<String>> = from
         .iter()
-        .map(|t| factor_qualifier(&t.relation).map(|q| q.to_ascii_lowercase()))
+        .map(|table| {
+            factor_qualifier_object(db, &table.relation).map(|qualifier| {
+                qualifier
+                    .0
+                    .iter()
+                    .map(|part| part.value.to_ascii_lowercase())
+                    .collect()
+            })
+        })
         .collect::<Option<Vec<_>>>()?;
     let mut conjuncts = Vec::new();
     if let Some(f) = selection {
         split_and(f, &mut conjuncts);
     }
     // (qual_a, qual_b, predicate) for each equi-conjunct connecting two tables.
-    let equis: Vec<(String, String, &Expr)> = conjuncts
+    let equis: Vec<(Vec<String>, Vec<String>, &Expr)> = conjuncts
         .iter()
-        .filter_map(|c| {
-            equi_qualifiers(c).map(|(a, b)| (a.to_ascii_lowercase(), b.to_ascii_lowercase(), c))
-        })
+        .filter_map(|c| equi_qualifiers(c).map(|(a, b)| (a, b, c)))
         .collect();
 
     let mut used = vec![false; from.len()];
     used[0] = true;
-    let mut acc: std::collections::HashSet<String> = [quals[0].clone()].into_iter().collect();
+    let mut acc: std::collections::HashSet<Vec<String>> = [quals[0].clone()].into_iter().collect();
     let mut joins: Vec<Join> = Vec::with_capacity(from.len() - 1);
     for _ in 1..from.len() {
         let mut found: Option<(usize, Expr)> = None;
@@ -7996,7 +8420,15 @@ fn comma_join_chain(from: &[TableWithJoins], selection: Option<&Expr>) -> Option
                 continue;
             }
             for (a, b, e) in &equis {
-                if (a == q && acc.contains(b)) || (b == q && acc.contains(a)) {
+                if (qualifier_component_suffix(q, a)
+                    && acc
+                        .iter()
+                        .any(|relation| qualifier_component_suffix(relation, b)))
+                    || (qualifier_component_suffix(q, b)
+                        && acc
+                            .iter()
+                            .any(|relation| qualifier_component_suffix(relation, a)))
+                {
                     found = Some((i, (*e).clone()));
                     break 'outer;
                 }
@@ -8017,11 +8449,14 @@ fn comma_join_chain(from: &[TableWithJoins], selection: Option<&Expr>) -> Option
     })
 }
 
-fn expr_qualifier(e: &Expr) -> Option<String> {
+fn expr_qualifier(e: &Expr) -> Option<Vec<String>> {
     match e {
-        Expr::CompoundIdentifier(parts) if parts.len() >= 2 => {
-            Some(parts[parts.len() - 2].value.to_ascii_lowercase())
-        }
+        Expr::CompoundIdentifier(parts) if parts.len() >= 2 => Some(
+            parts[..parts.len() - 1]
+                .iter()
+                .map(|part| part.value.to_ascii_lowercase())
+                .collect(),
+        ),
         _ => None,
     }
 }
@@ -8377,10 +8812,9 @@ fn expr_col_index(e: &Expr, schema: &Schema) -> Option<usize> {
         // exactly: `eval_row` reads `@@var` as a system variable and a name like
         // CURRENT_TIMESTAMP as a niladic function whenever it is *not* an exact
         // column name, and the fast path must not disagree with it.
-        Expr::Identifier(id) => schema
-            .columns
-            .iter()
-            .position(|c| c.name.eq_ignore_ascii_case(&id.value)),
+        Expr::Identifier(id) => {
+            predicate::resolve_index_parts(std::slice::from_ref(id), schema).ok()
+        }
         // `@@session.var` arrives here too, and fails to resolve -> None.
         Expr::CompoundIdentifier(parts) => predicate::resolve_index_parts(parts, schema).ok(),
         Expr::Nested(inner) => expr_col_index(inner, schema),
@@ -8454,42 +8888,19 @@ fn refs_in_schema(expr: &Expr, schema: &Schema) -> bool {
     if !collect_refs(expr, &mut refs) {
         return false;
     }
-    // In a joined schema the columns are qualified (`a.v`, `b.v`), and a
-    // *qualified* reference must match the qualifier: `predicate::resolve_index`
-    // falls back to matching on the bare suffix, which is right when resolving a
-    // value but wrong when deciding which side of a join an expression belongs
-    // to -- it would report `b.v` as living in the left schema because `a.v` ends
-    // the same way. A bare reference keeps the unique-suffix rule, which is how
-    // `col` resolves against a joined schema in the first place.
-    let qualified = schema.columns.iter().any(|c| c.name.contains('.'));
-    refs.iter().all(|r| {
-        if qualified && r.contains('.') {
-            schema
-                .columns
-                .iter()
-                .any(|c| c.name.eq_ignore_ascii_case(r))
-        } else {
-            predicate::resolve_index(r, schema).is_ok()
-        }
+    refs.iter().all(|reference| match reference {
+        Expr::Identifier(id) => predicate::resolve_index(&id.value, schema).is_ok(),
+        Expr::CompoundIdentifier(parts) => predicate::resolve_index_parts(parts, schema).is_ok(),
+        _ => false,
     })
 }
 
 /// Collect column references from `expr`. Returns false if the expression
 /// contains a construct we do not analyse (so callers stay conservative).
-fn collect_refs(expr: &Expr, out: &mut Vec<String>) -> bool {
+fn collect_refs<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) -> bool {
     match expr {
-        Expr::Identifier(id) => {
-            out.push(id.value.clone());
-            true
-        }
-        Expr::CompoundIdentifier(parts) => {
-            out.push(
-                parts
-                    .iter()
-                    .map(|i| i.value.as_str())
-                    .collect::<Vec<_>>()
-                    .join("."),
-            );
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
+            out.push(expr);
             true
         }
         Expr::Value(_) => true,
@@ -8602,12 +9013,11 @@ fn in_list_lookup(def: &TableDef, filter: Option<&Expr>) -> Result<Option<(usize
         let Some(name) = ident_name(expr.as_ref()) else {
             continue;
         };
-        let short = name.rsplit('.').next().unwrap_or(name);
         let Some(col) = def
             .schema
             .columns
             .iter()
-            .position(|c| c.name.eq_ignore_ascii_case(short))
+            .position(|c| c.name.eq_ignore_ascii_case(name))
         else {
             continue;
         };
@@ -9524,7 +9934,7 @@ async fn mutation_matches(
     db: &Session,
     vindex: &VectorRegistry,
     def: &TableDef,
-    qualifier: &str,
+    qualifier: &[String],
     selection: Option<&Expr>,
     limit: Option<usize>,
 ) -> Result<Vec<(Vec<u8>, Vec<Value>)>> {
@@ -9535,7 +9945,7 @@ async fn mutation_matches(
         let all = collect_matches(db, def, None, None).await?;
         let mut out = Vec::new();
         for (key, row) in all {
-            let bound = bind_outer(f, qualifier, &def.schema, &row);
+            let bound = bind_outer(db, f, qualifier, &def.schema, &row);
             let resolved =
                 resolve_subqueries_with_outer(db, vindex, bound, &def.schema, &row).await?;
             if predicate::matches(&resolved, &def.schema, &row)? {
@@ -9563,6 +9973,25 @@ pub async fn update(
     order_by: &[OrderByExpr],
     limit: Option<usize>,
 ) -> Result<QueryResult> {
+    let hidden = hidden_source_qualifiers(std::slice::from_ref(table));
+    let visible = validate_unique_relation_qualifiers(db, std::slice::from_ref(table), "mutation")?;
+    if let Some(selection) = selection {
+        validate_ast_alias_hiding(selection, &hidden, &visible)?;
+    }
+    for order in order_by {
+        validate_ast_alias_hiding(&order.expr, &hidden, &visible)?;
+    }
+    for assignment in assignments {
+        validate_ast_alias_hiding(&assignment.value, &hidden, &visible)?;
+        if let AssignmentTarget::ColumnName(name) = &assignment.target {
+            let qualifier = &name.0[..name.0.len().saturating_sub(1)];
+            if qualifier_is_hidden(qualifier, &hidden, &visible) {
+                return Err(Error::Catalog(
+                    "an aliased table must be referenced by its alias".into(),
+                ));
+            }
+        }
+    }
     if !table.joins.is_empty() {
         if !order_by.is_empty() || limit.is_some() {
             return Err(Error::Unsupported(
@@ -9573,7 +10002,9 @@ pub async fn update(
     }
     let name = table_of(table)?;
     let def = catalog::load(db, &name).await?;
-    let qualifier = factor_qualifier(&table.relation).unwrap_or_else(|| name.clone());
+    let qualifier = factor_qualifier_object(db, &table.relation)
+        .map(|qualifier| object_name_parts(&qualifier))
+        .unwrap_or_else(|| vec![name.clone()]);
 
     // Resolve assignment targets to column indices.
     let mut sets: Vec<(usize, &Expr)> = Vec::with_capacity(assignments.len());
@@ -9739,13 +10170,31 @@ pub async fn delete(
     let relations = match &del.from {
         FromTable::WithFromKeyword(v) | FromTable::WithoutKeyword(v) => v,
     };
-    // Multi-table DELETE: a join in FROM, or explicit target tables.
-    if relations.len() != 1 || !relations[0].joins.is_empty() || !del.tables.is_empty() {
+    // In `DELETE FROM targets USING sources`, `from` names writable targets;
+    // only `using` introduces the relation scope. In `DELETE targets FROM
+    // sources`, the source scope is carried directly in `from`.
+    let scope = del.using.as_deref().unwrap_or(relations);
+    let hidden = hidden_source_qualifiers(scope);
+    let visible = validate_unique_relation_qualifiers(db, scope, "mutation")?;
+    if let Some(selection) = &del.selection {
+        validate_ast_alias_hiding(selection, &hidden, &visible)?;
+    }
+    for order in &del.order_by {
+        validate_ast_alias_hiding(&order.expr, &hidden, &visible)?;
+    }
+    // Multi-table DELETE: USING, a join in FROM, or explicit target tables.
+    if del.using.is_some()
+        || relations.len() != 1
+        || !relations[0].joins.is_empty()
+        || !del.tables.is_empty()
+    {
         return multi_delete(db, vindex, del, relations).await;
     }
     let name = table_of(&relations[0])?;
     let def = catalog::load(db, &name).await?;
-    let qualifier = factor_qualifier(&relations[0].relation).unwrap_or_else(|| name.clone());
+    let qualifier = factor_qualifier_object(db, &relations[0].relation)
+        .map(|qualifier| object_name_parts(&qualifier))
+        .unwrap_or_else(|| vec![name.clone()]);
 
     let limit = del
         .limit
@@ -9763,7 +10212,16 @@ pub async fn delete(
     let mut wcounts: Vec<String> = vec![name.clone()];
 
     // Foreign keys referencing this table: RESTRICT / CASCADE / SET NULL.
-    cascade_parent_delete(db, &def, &matches, &mut puts, &mut deletes, &mut wcounts).await?;
+    cascade_parent_delete(
+        db,
+        &def,
+        &matches,
+        &mut puts,
+        &mut deletes,
+        &mut wcounts,
+        None,
+    )
+    .await?;
 
     let after_del: Vec<catalog::TriggerDef> = catalog::load_triggers(db, &name)
         .await?
@@ -9817,6 +10275,7 @@ async fn cascade_parent_delete(
     puts: &mut Vec<(Vec<u8>, Vec<u8>)>,
     deletes: &mut Vec<Vec<u8>>,
     wcounts: &mut Vec<String>,
+    scheduled_deletes: Option<&std::collections::HashSet<Vec<u8>>>,
 ) -> Result<()> {
     let children = referencing_children(db, &parent.name).await?;
     if children.is_empty() || matches.is_empty() {
@@ -9854,13 +10313,19 @@ async fn cascade_parent_delete(
                 match fk.on_delete {
                     RefAction::Cascade => {
                         for (ck, crow) in child_rows {
+                            if scheduled_deletes.is_some_and(|keys| keys.contains(&ck)) {
+                                continue;
+                            }
                             deletes.extend(index::entry_keys_for_row(child, &crow, &ck)?);
                             deletes.push(ck);
+                            touched = true;
                         }
-                        touched = true;
                     }
                     RefAction::SetNull => {
                         for (ck, crow) in child_rows {
+                            if scheduled_deletes.is_some_and(|keys| keys.contains(&ck)) {
+                                continue;
+                            }
                             let mut nrow = crow.clone();
                             for &fc in &fk.columns {
                                 nrow[fc] = Value::Null;
@@ -9870,10 +10335,15 @@ async fn cascade_parent_delete(
                                 .map_err(|e| Error::Storage(e.to_string()))?;
                             puts.push((ck.clone(), enc));
                             puts.extend(index::entries_for_row(child, &nrow, &ck)?);
+                            touched = true;
                         }
-                        touched = true;
                     }
                     _ => {
+                        if scheduled_deletes.is_some_and(|keys| {
+                            child_rows.iter().all(|(key, _)| keys.contains(key))
+                        }) {
+                            continue;
+                        }
                         return Err(Error::ForeignKey(format!(
                             "cannot delete from '{}': rows in '{}' reference it (constraint '{}')",
                             parent.name, child.name, fk.name
@@ -10021,13 +10491,38 @@ struct TargetInfo {
     col_idx: Vec<usize>,
 }
 
+fn resolve_target_qualifier(
+    targets: &std::collections::HashMap<Vec<String>, TargetInfo>,
+    requested: &[String],
+    operation: &str,
+) -> Result<Vec<String>> {
+    if targets.contains_key(requested) {
+        return Ok(requested.to_vec());
+    }
+    let matches = targets
+        .iter()
+        .filter(|(qualifier, _)| qualifier_component_suffix(qualifier, requested))
+        .map(|(qualifier, _)| qualifier.clone())
+        .collect::<Vec<_>>();
+    let requested_text = requested.join(".");
+    match matches.as_slice() {
+        [qualifier] => Ok(qualifier.clone()),
+        [] => Err(Error::Catalog(format!(
+            "unknown table in {operation}: {requested_text}"
+        ))),
+        _ => Err(Error::Query(format!(
+            "ambiguous table in {operation}: {requested_text}"
+        ))),
+    }
+}
+
 /// Map each plain table in `from` (by qualifier) to its base definition and the
 /// combined-schema indices of its columns.
 async fn collect_targets(
     db: &Session,
     from: &[TableWithJoins],
     schema: &Schema,
-) -> Result<std::collections::HashMap<String, TargetInfo>> {
+) -> Result<std::collections::HashMap<Vec<String>, TargetInfo>> {
     let mut factors: Vec<&TableFactor> = Vec::new();
     for twj in from {
         factors.push(&twj.relation);
@@ -10035,31 +10530,52 @@ async fn collect_targets(
             factors.push(&j.relation);
         }
     }
-    let mut map = std::collections::HashMap::new();
+    let mut map: std::collections::HashMap<Vec<String>, TargetInfo> =
+        std::collections::HashMap::new();
     for tf in factors {
-        if let TableFactor::Table { name, alias, .. } = tf {
+        if let TableFactor::Table { name, .. } = tf {
             let tname = name
                 .0
                 .last()
                 .map(|i| i.value.clone())
                 .ok_or_else(|| Error::Catalog("empty table name".into()))?;
-            let qual = alias
-                .as_ref()
-                .map(|a| a.name.value.clone())
-                .unwrap_or_else(|| tname.clone());
+            let qualifier = factor_qualifier_object(db, tf)
+                .ok_or_else(|| Error::Catalog("empty table qualifier".into()))?;
+            let qualifier = qualifier
+                .0
+                .iter()
+                .map(|part| part.value.to_ascii_lowercase())
+                .collect::<Vec<_>>();
+            if map
+                .keys()
+                .any(|existing| qualifier_short_names_equal(existing, &qualifier))
+            {
+                return Err(Error::Query(format!(
+                    "duplicate table alias in mutation: {}",
+                    qualifier.join(".")
+                )));
+            }
             let def = catalog::load(db, &tname).await?;
             let mut col_idx = Vec::with_capacity(def.schema.columns.len());
             for c in &def.schema.columns {
-                let qn = format!("{qual}.{}", c.name);
                 let i = schema
                     .columns
                     .iter()
-                    .position(|sc| sc.name.eq_ignore_ascii_case(&qn))
-                    .ok_or_else(|| Error::Query(format!("column {qn} not found in join output")))?;
+                    .position(|column| {
+                        qualifier_components_equal(&column.qualifier, &qualifier)
+                            && column_name(column).eq_ignore_ascii_case(&c.name)
+                    })
+                    .ok_or_else(|| {
+                        Error::Query(format!(
+                            "column {}.{} not found in join output",
+                            qualifier.join("."),
+                            c.name
+                        ))
+                    })?;
                 col_idx.push(i);
             }
             map.insert(
-                qual.to_ascii_lowercase(),
+                qualifier,
                 TargetInfo {
                     name: tname,
                     def,
@@ -10091,10 +10607,16 @@ async fn multi_update(
         None => None,
     };
     let targets = collect_targets(db, from, &schema).await?;
-    let primary = factor_qualifier(&table.relation).map(|q| q.to_ascii_lowercase());
+    let primary = factor_qualifier_object(db, &table.relation).map(|qualifier| {
+        qualifier
+            .0
+            .iter()
+            .map(|part| part.value.to_ascii_lowercase())
+            .collect::<Vec<_>>()
+    });
 
     struct SetOp<'a> {
-        qual: String,
+        qual: Vec<String>,
         col: usize,
         expr: &'a Expr,
     }
@@ -10108,9 +10630,12 @@ async fn multi_update(
                 ))
             }
         };
-        let (qual, colname) = if n.0.len() >= 2 {
+        let (requested, colname) = if n.0.len() >= 2 {
             (
-                n.0[n.0.len() - 2].value.to_ascii_lowercase(),
+                n.0[..n.0.len() - 1]
+                    .iter()
+                    .map(|part| part.value.to_ascii_lowercase())
+                    .collect::<Vec<_>>(),
                 n.0.last().unwrap().value.clone(),
             )
         } else {
@@ -10121,9 +10646,8 @@ async fn multi_update(
                 n.0.last().unwrap().value.clone(),
             )
         };
-        let info = targets
-            .get(&qual)
-            .ok_or_else(|| Error::Catalog(format!("unknown table in UPDATE: {qual}")))?;
+        let qual = resolve_target_qualifier(&targets, &requested, "UPDATE")?;
+        let info = &targets[&qual];
         if !info.def.has_pk() {
             return Err(Error::Unsupported(
                 "multi-table UPDATE requires a primary key on the target table".into(),
@@ -10146,7 +10670,8 @@ async fn multi_update(
     // Per target table: pk -> (old base row, new base row). A base row hit by
     // multiple joined rows is updated once (first match).
     type RowMap = std::collections::HashMap<Vec<u8>, (Vec<Value>, Vec<Value>)>;
-    let mut updated: std::collections::HashMap<String, RowMap> = std::collections::HashMap::new();
+    let mut updated: std::collections::HashMap<Vec<String>, RowMap> =
+        std::collections::HashMap::new();
     let mut affected = 0u64;
     for joined in rows {
         if let Some(f) = &filter {
@@ -10226,32 +10751,57 @@ async fn multi_delete(
     del: &Delete,
     relations: &[TableWithJoins],
 ) -> Result<QueryResult> {
-    let mut from_all: Vec<TableWithJoins> = relations.to_vec();
-    if let Some(using) = &del.using {
-        from_all.extend(using.clone());
-    }
-    let (cols, rows) = build_from(db, vindex, &from_all, &[]).await?;
+    let source_relations = del.using.as_deref().unwrap_or(relations);
+    let (cols, rows) = build_from(db, vindex, source_relations, &[]).await?;
     let schema = Schema::new(cols);
     let filter = match &del.selection {
         Some(f) => Some(resolve_subqueries(db, vindex, f.clone()).await?),
         None => None,
     };
-    let targets = collect_targets(db, &from_all, &schema).await?;
+    let targets = collect_targets(db, source_relations, &schema).await?;
 
-    let del_quals: Vec<String> = if del.tables.is_empty() {
-        vec![factor_qualifier(&relations[0].relation)
-            .map(|q| q.to_ascii_lowercase())
-            .ok_or_else(|| Error::Query("no target table for DELETE".into()))?]
+    let requested_quals: Vec<Vec<String>> = if del.tables.is_empty() {
+        let target_relations = if del.using.is_some() {
+            relations
+        } else {
+            &relations[..1]
+        };
+        target_relations
+            .iter()
+            .map(|table| {
+                factor_qualifier_object(db, &table.relation)
+                    .map(|qualifier| {
+                        qualifier
+                            .0
+                            .iter()
+                            .map(|part| part.value.to_ascii_lowercase())
+                            .collect()
+                    })
+                    .ok_or_else(|| Error::Query("no target table for DELETE".into()))
+            })
+            .collect::<Result<Vec<_>>>()?
     } else {
         del.tables
             .iter()
-            .filter_map(|t| t.0.last().map(|i| i.value.to_ascii_lowercase()))
+            .map(|table| {
+                table
+                    .0
+                    .iter()
+                    .map(|part| part.value.to_ascii_lowercase())
+                    .collect()
+            })
             .collect()
     };
+    let mut del_quals = requested_quals
+        .iter()
+        .map(|qualifier| resolve_target_qualifier(&targets, qualifier, "DELETE"))
+        .collect::<Result<Vec<_>>>()?;
+    del_quals.sort();
+    del_quals.dedup();
     for q in &del_quals {
         let info = targets
             .get(q)
-            .ok_or_else(|| Error::Catalog(format!("unknown table in DELETE: {q}")))?;
+            .ok_or_else(|| Error::Catalog(format!("unknown table in DELETE: {}", q.join("."))))?;
         if !info.def.has_pk() {
             return Err(Error::Unsupported(
                 "multi-table DELETE requires a primary key on the target table".into(),
@@ -10260,10 +10810,9 @@ async fn multi_delete(
     }
 
     let mut per_table: std::collections::HashMap<
-        String,
+        Vec<String>,
         std::collections::HashMap<Vec<u8>, Vec<Value>>,
     > = std::collections::HashMap::new();
-    let mut affected = 0u64;
     for joined in rows {
         if let Some(f) = &filter {
             if !predicate::matches(f, &schema, &joined)? {
@@ -10278,24 +10827,73 @@ async fn multi_delete(
                 &info.name,
                 &keyenc::encode_key_coll(&pk_vals, &info.def.pk_collations())?,
             );
-            let entry = per_table.entry(q.clone()).or_default();
-            if entry.insert(pk_key, base).is_none() {
-                affected += 1;
-            }
+            per_table.entry(q.clone()).or_default().insert(pk_key, base);
         }
     }
 
+    let scheduled_deletes = per_table
+        .values()
+        .flat_map(|rows| rows.keys().cloned())
+        .collect::<std::collections::HashSet<_>>();
+    let affected = scheduled_deletes.len() as u64;
+    let mut processed_deletes = std::collections::HashSet::new();
+    let mut puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     let mut deletes: Vec<Vec<u8>> = Vec::new();
-    let mut wcs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-    for (q, rowsmap) in &per_table {
+    let mut wcounts: Vec<String> = Vec::new();
+    let mut after_work: Vec<(Vec<catalog::TriggerDef>, Schema, Vec<Vec<Value>>)> = Vec::new();
+    for q in &del_quals {
+        let Some(rowsmap) = per_table.get(q) else {
+            continue;
+        };
         let info = &targets[q];
-        for (pk_key, base) in rowsmap {
-            deletes.extend(index::entry_keys_for_row(&info.def, base, pk_key)?);
-            deletes.push(pk_key.clone());
+        let matches = rowsmap
+            .iter()
+            .filter(|&(key, _)| processed_deletes.insert(key.clone()))
+            .map(|(key, row)| (key.clone(), row.clone()))
+            .collect::<Vec<_>>();
+        if matches.is_empty() {
+            continue;
         }
-        wcs.push(bump_wcount(db, &info.name).await?);
+        cascade_parent_delete(
+            db,
+            &info.def,
+            &matches,
+            &mut puts,
+            &mut deletes,
+            &mut wcounts,
+            Some(&scheduled_deletes),
+        )
+        .await?;
+
+        let after_del = catalog::load_triggers(db, &info.name)
+            .await?
+            .into_iter()
+            .filter(|trigger| !trigger.before && trigger.event == catalog::TrigEvent::Delete)
+            .collect::<Vec<_>>();
+        let mut deleted_rows = Vec::new();
+        for (pk_key, base) in matches {
+            if !after_del.is_empty() {
+                deleted_rows.push(base.clone());
+            }
+            deletes.extend(index::entry_keys_for_row(&info.def, &base, &pk_key)?);
+            deletes.push(pk_key);
+        }
+        wcounts.push(info.name.clone());
+        if !after_del.is_empty() {
+            after_work.push((after_del, info.def.schema.clone(), deleted_rows));
+        }
     }
-    db.commit_write(wcs, deletes).await?;
+    wcounts.sort_by_key(|name| name.to_ascii_lowercase());
+    wcounts.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+    for table in wcounts {
+        puts.push(bump_wcount(db, &table).await?);
+    }
+    db.commit_write(puts, deletes).await?;
+    for (triggers, schema, rows) in after_work {
+        for row in rows {
+            queue_after(db, &triggers, &schema, None, Some(&row))?;
+        }
+    }
     Ok(QueryResult::Affected(affected))
 }
 
@@ -10338,8 +10936,14 @@ fn projected_order_expr(
 ) -> Option<Expr> {
     use sqlparser::ast::{Ident, SelectItem};
 
-    let source_expr = |column: &str| {
-        let parts = column.split('.').map(Ident::new).collect::<Vec<_>>();
+    let source_expr = |column: &ColumnDef| {
+        let mut parts = column
+            .qualifier
+            .iter()
+            .cloned()
+            .map(Ident::new)
+            .collect::<Vec<_>>();
+        parts.push(Ident::new(column_name(column)));
         match parts.as_slice() {
             [identifier] => Expr::Identifier(identifier.clone()),
             _ => Expr::CompoundIdentifier(parts),
@@ -10353,23 +10957,20 @@ fn projected_order_expr(
                     schema
                         .columns
                         .iter()
-                        .filter(|column| {
-                            output_column_name(&column.name).eq_ignore_ascii_case(name)
-                        })
-                        .map(|column| source_expr(&column.name)),
+                        .filter(|column| column_name(column).eq_ignore_ascii_case(name))
+                        .map(source_expr),
                 );
             }
             SelectItem::QualifiedWildcard(object, _) => {
-                let qualifier = object
-                    .0
-                    .last()
-                    .map(|identifier| identifier.value.as_str())
-                    .unwrap_or_default();
+                let unqualified_schema = schema
+                    .columns
+                    .iter()
+                    .all(|column| column.qualifier.is_empty());
                 matches.extend(schema.columns.iter().filter_map(|column| {
-                    let (column_qualifier, column_name) = column.name.split_once('.')?;
-                    (column_qualifier.eq_ignore_ascii_case(qualifier)
-                        && column_name.eq_ignore_ascii_case(name))
-                    .then(|| source_expr(&column.name))
+                    let column_name = wildcard_column_name(column, object, unqualified_schema)?;
+                    column_name
+                        .eq_ignore_ascii_case(name)
+                        .then(|| source_expr(column))
                 }));
             }
             SelectItem::UnnamedExpr(expr) => {
@@ -10480,6 +11081,13 @@ fn project_exprs(
         Col(usize),
         Expr(&'a Expr),
     }
+    let direct_column = |expr: &Expr| match expr {
+        Expr::Identifier(identifier) => {
+            predicate::resolve_index_parts(std::slice::from_ref(identifier), schema).ok()
+        }
+        Expr::CompoundIdentifier(parts) => predicate::resolve_index_parts(parts, schema).ok(),
+        _ => None,
+    };
     let mut names: Vec<String> = Vec::new();
     let mut projs: Vec<Proj> = Vec::new();
 
@@ -10487,37 +11095,45 @@ fn project_exprs(
         match item {
             SelectItem::Wildcard(_) => {
                 for (i, c) in schema.columns.iter().enumerate() {
-                    names.push(output_column_name(&c.name).to_owned());
+                    names.push(column_name(c).to_owned());
                     projs.push(Proj::Col(i));
                 }
             }
             // `alias.*` -> every column qualified by `alias` (join schemas name
             // columns `alias.col`). Falls back to matching the bare table name.
             SelectItem::QualifiedWildcard(obj, _) => {
-                let qual = obj.0.last().map(|i| i.value.clone()).unwrap_or_default();
+                let unqualified_schema = schema
+                    .columns
+                    .iter()
+                    .all(|column| column.qualifier.is_empty());
                 let mut matched = false;
                 for (i, c) in schema.columns.iter().enumerate() {
-                    if let Some((q, name)) = c.name.split_once('.') {
-                        if q.eq_ignore_ascii_case(&qual) {
-                            names.push(name.to_owned());
-                            projs.push(Proj::Col(i));
-                            matched = true;
-                        }
+                    if let Some(name) = wildcard_column_name(c, obj, unqualified_schema) {
+                        names.push(name.to_owned());
+                        projs.push(Proj::Col(i));
+                        matched = true;
                     }
                 }
                 // A single-table scan carries bare column names, so `t.*` has no
                 // qualifier to match even though it names the relation being
                 // read. Accept it there rather than refusing valid MySQL.
-                if !matched && default_table.is_some_and(|t| t.eq_ignore_ascii_case(&qual)) {
+                let qualifier = object_name_text(obj);
+                if !matched
+                    && default_table.is_some_and(|table| {
+                        obj.0
+                            .last()
+                            .is_some_and(|part| part.value.eq_ignore_ascii_case(table))
+                    })
+                {
                     for (i, c) in schema.columns.iter().enumerate() {
-                        names.push(output_column_name(&c.name).to_owned());
+                        names.push(column_name(c).to_owned());
                         projs.push(Proj::Col(i));
                         matched = true;
                     }
                 }
                 if !matched {
                     return Err(Error::Unsupported(format!(
-                        "unknown table qualifier in `{qual}.*`"
+                        "unknown table qualifier in `{qualifier}.*`"
                     )));
                 }
             }
@@ -10558,35 +11174,31 @@ fn project_exprs(
         // case-sensitive. Computed expressions default to Text/Ci.
         let (ty, collation) = match p {
             Proj::Col(i) => (schema.columns[*i].ty.clone(), schema.columns[*i].collation),
-            Proj::Expr(e) => {
-                match col_ref_name(e).and_then(|n| predicate::resolve_index(&n, schema).ok()) {
-                    Some(idx) => (
-                        schema.columns[idx].ty.clone(),
-                        schema.columns[idx].collation,
-                    ),
-                    None => (
-                        out_rows
-                            .iter()
-                            .map(|r| &r[ci])
-                            .find(|v| !v.is_null())
-                            .map(infer_val)
-                            .unwrap_or(ColumnType::Text),
-                        elyra_core::Collation::Ci,
-                    ),
-                }
-            }
+            Proj::Expr(e) => match direct_column(e) {
+                Some(idx) => (
+                    schema.columns[idx].ty.clone(),
+                    schema.columns[idx].collation,
+                ),
+                None => (
+                    out_rows
+                        .iter()
+                        .map(|r| &r[ci])
+                        .find(|v| !v.is_null())
+                        .map(infer_val)
+                        .unwrap_or(ColumnType::Text),
+                    elyra_core::Collation::Ci,
+                ),
+            },
         };
         // Result metadata: the relation a projected column came from. An
         // expression keeps an empty table, as it does in MySQL.
         let source_column = match p {
             Proj::Col(i) => Some(*i),
-            Proj::Expr(e) => {
-                col_ref_name(e).and_then(|n| predicate::resolve_index(&n, schema).ok())
-            }
+            Proj::Expr(e) => direct_column(e),
         };
         tables.push(
             source_column
-                .and_then(|i| column_qualifier(&schema.columns[i].name).or(default_table))
+                .and_then(|i| column_table(&schema.columns[i]).or(default_table))
                 .unwrap_or_default()
                 .to_owned(),
         );
@@ -10595,19 +11207,11 @@ fn project_exprs(
             ty,
             nullable: true,
             collation,
+            qualifier: Vec::new(),
         });
     }
 
     Ok((Schema::with_tables(cols, tables), out_rows))
-}
-
-fn output_column_name(name: &str) -> &str {
-    name.split_once('.').map_or(name, |(_, column)| column)
-}
-
-/// The relation an internal `"alias.col"` name came from, if it is qualified.
-fn column_qualifier(name: &str) -> Option<&str> {
-    name.split_once('.').map(|(qualifier, _)| qualifier)
 }
 
 /// The alias (or table name) of the single relation a select reads, if it reads
@@ -10617,20 +11221,12 @@ fn single_relation_alias(select: &sqlparser::ast::Select) -> Option<String> {
     if select.from.len() != 1 || !select.from[0].joins.is_empty() {
         return None;
     }
-    factor_qualifier(&select.from[0].relation)
-}
-
-/// The (qualified) name of a plain column reference, if `e` is one.
-fn col_ref_name(e: &Expr) -> Option<String> {
-    match e {
-        Expr::Identifier(id) => Some(id.value.clone()),
-        Expr::CompoundIdentifier(parts) => Some(
-            parts
-                .iter()
-                .map(|i| i.value.as_str())
-                .collect::<Vec<_>>()
-                .join("."),
-        ),
+    match &select.from[0].relation {
+        TableFactor::Table { name, alias, .. } => alias
+            .as_ref()
+            .map(|alias| alias.name.value.clone())
+            .or_else(|| name.0.last().map(|name| name.value.clone())),
+        TableFactor::Derived { alias, .. } => alias.as_ref().map(|alias| alias.name.value.clone()),
         _ => None,
     }
 }
@@ -10833,7 +11429,7 @@ fn apply_having(
 /// True if any subquery in `filter` references `outer.<col>` (i.e. correlates
 /// with the outer query). Correlated references must be qualified with the
 /// outer table name/alias.
-fn filter_correlated(filter: &Expr, outer: &str) -> bool {
+fn filter_correlated(filter: &Expr, outer: &[String]) -> bool {
     let found = std::cell::Cell::new(false);
     let check = |e: &Expr| -> Option<Expr> {
         if let Expr::Subquery(q)
@@ -10851,15 +11447,14 @@ fn filter_correlated(filter: &Expr, outer: &str) -> bool {
 }
 
 /// True if any expression in `q` (recursively) is a `qualifier.<col>` reference.
-fn query_refs_qualifier(q: &SqlQuery, qualifier: &str) -> bool {
+fn query_refs_qualifier(q: &SqlQuery, qualifier: &[String]) -> bool {
     let found = std::cell::Cell::new(false);
     let check = |e: &Expr| -> Option<Expr> {
         if let Expr::CompoundIdentifier(parts) = e {
-            if parts
-                .first()
-                .map(|i| i.value.eq_ignore_ascii_case(qualifier))
-                .unwrap_or(false)
-            {
+            let prefix = parts
+                .get(..parts.len().saturating_sub(1))
+                .unwrap_or_default();
+            if qualifier_parts_match(qualifier, prefix) {
                 found.set(true);
             }
         }
@@ -11023,6 +11618,13 @@ async fn window_select(
         source_column: Option<usize>,
         evaluator: Out<'a>,
     }
+    let direct_column = |expr: &Expr| match expr {
+        Expr::Identifier(identifier) => {
+            predicate::resolve_index_parts(std::slice::from_ref(identifier), schema).ok()
+        }
+        Expr::CompoundIdentifier(parts) => predicate::resolve_index_parts(parts, schema).ok(),
+        _ => None,
+    };
     let mut plan: Vec<PlannedOut<'_>> = Vec::with_capacity(select.projection.len());
     for item in &select.projection {
         match item {
@@ -11033,7 +11635,7 @@ async fn window_select(
                         .iter()
                         .enumerate()
                         .map(|(index, column)| PlannedOut {
-                            name: output_column_name(&column.name).to_owned(),
+                            name: column_name(column).to_owned(),
                             source_column: Some(index),
                             evaluator: Out::Column(index),
                         }),
@@ -11041,15 +11643,7 @@ async fn window_select(
                 continue;
             }
             SelectItem::QualifiedWildcard(object, _) => {
-                let qualifier = object
-                    .0
-                    .last()
-                    .map(|identifier| identifier.value.as_str())
-                    .unwrap_or_default();
-                let relation_matches = select.from.len() == 1
-                    && select.from[0].joins.is_empty()
-                    && factor_qualifier(&select.from[0].relation)
-                        .is_some_and(|relation| relation.eq_ignore_ascii_case(qualifier));
+                let relation_matches = select.from.len() == 1 && select.from[0].joins.is_empty();
                 if !relation_matches {
                     return Err(Error::Unsupported(format!(
                         "qualified wildcard {object}.* matched no relation"
@@ -11061,7 +11655,7 @@ async fn window_select(
                         .iter()
                         .enumerate()
                         .map(|(index, column)| PlannedOut {
-                            name: output_column_name(&column.name).to_owned(),
+                            name: column_name(column).to_owned(),
                             source_column: Some(index),
                             evaluator: Out::Column(index),
                         }),
@@ -11094,7 +11688,7 @@ async fn window_select(
         };
         plan.push(PlannedOut {
             name,
-            source_column: None,
+            source_column: direct_column(expr),
             evaluator,
         });
     }
@@ -11126,13 +11720,15 @@ async fn window_select(
     // Result metadata: a column that came straight from a relation keeps that
     // relation's name; a window value or an expression has no source table.
     let mut tables: Vec<String> = Vec::with_capacity(plan.len());
+    let default_table = single_relation_alias(select);
     for (column_index, planned) in plan.iter().enumerate() {
         let source = planned
             .source_column
             .and_then(|index| schema.columns.get(index));
         tables.push(
             source
-                .and_then(|column| column_qualifier(&column.name))
+                .and_then(column_table)
+                .or(default_table.as_deref())
                 .unwrap_or_default()
                 .to_owned(),
         );
@@ -11149,6 +11745,7 @@ async fn window_select(
             ty,
             nullable: source.is_none_or(|column| column.nullable),
             collation: source.map_or(elyra_core::Collation::Ci, |column| column.collation),
+            qualifier: Vec::new(),
         });
     }
     let out_schema = Schema::with_tables(cols, tables);
@@ -12165,7 +12762,7 @@ fn expr_has_subquery(e: &Expr) -> bool {
 }
 
 /// True if a projection item references `outer.<col>` inside a subquery.
-fn projection_correlated(projection: &[sqlparser::ast::SelectItem], outer: &str) -> bool {
+fn projection_correlated(projection: &[sqlparser::ast::SelectItem], outer: &[String]) -> bool {
     use sqlparser::ast::SelectItem;
     projection.iter().any(|it| match it {
         SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
@@ -12204,7 +12801,7 @@ async fn correlated_select(
     vindex: &VectorRegistry,
     select: &Select,
     def: &TableDef,
-    outer: &str,
+    outer: &[String],
     corr_filter: &Expr,
     group_by: &[Expr],
     order_exprs: &[(Expr, bool)],
@@ -12215,7 +12812,7 @@ async fn correlated_select(
     let mut matched: Vec<Vec<Value>> = Vec::new();
 
     for row in all {
-        let bound = bind_outer(corr_filter, outer, &def.schema, &row);
+        let bound = bind_outer(db, corr_filter, outer, &def.schema, &row);
         let resolved = resolve_subqueries_with_outer(db, vindex, bound, &def.schema, &row).await?;
         if predicate::matches(&resolved, &def.schema, &row)? {
             matched.push(row);
@@ -12238,7 +12835,7 @@ async fn correlated_select(
             &mut matched,
             &def.schema,
             &resolved,
-            |expr, row| bind_outer(expr, outer, &def.schema, row),
+            |expr, row| Ok(bind_outer(db, expr, outer, &def.schema, row)),
         )
         .await?;
     }
@@ -12271,7 +12868,7 @@ async fn correlated_select(
                     continue;
                 }
             };
-            let bound = bind_outer(expr, outer, &def.schema, row);
+            let bound = bind_outer(db, expr, outer, &def.schema, row);
             let resolved =
                 resolve_subqueries_with_outer(db, vindex, bound, &def.schema, row).await?;
             vals.push(predicate::eval_row(&resolved, &def.schema, row)?);
@@ -12291,6 +12888,7 @@ async fn correlated_select(
                         ty: c.ty.clone(),
                         nullable: c.nullable,
                         collation: c.collation,
+                        qualifier: Vec::new(),
                     });
                 }
             }
@@ -12313,6 +12911,7 @@ async fn correlated_select(
                     ty,
                     nullable: true,
                     collation: elyra_core::Collation::Ci,
+                    qualifier: Vec::new(),
                 });
             }
         }
@@ -12326,12 +12925,12 @@ async fn correlated_select(
 /// Rewrite qualified outer column references (`outer.col`) in `expr` to
 /// literals from `row`, including inside subqueries. Bare names remain bound
 /// to the innermost query scope.
-fn bind_outer(expr: &Expr, outer: &str, schema: &Schema, row: &[Value]) -> Expr {
-    bind_outer_references(expr, &[], &|e| match e {
+fn bind_outer(db: &Session, expr: &Expr, outer: &[String], schema: &Schema, row: &[Value]) -> Expr {
+    bind_outer_references(db, expr, &[], &|e| match e {
         Expr::CompoundIdentifier(parts) if parts.len() >= 2 => {
-            let tbl = &parts[parts.len() - 2].value;
+            let qualifier = &parts[..parts.len() - 1];
             let col = &parts[parts.len() - 1].value;
-            if tbl.eq_ignore_ascii_case(outer) {
+            if qualifier_parts_match(outer, qualifier) {
                 schema
                     .columns
                     .iter()
@@ -12349,31 +12948,32 @@ fn bind_outer(expr: &Expr, outer: &str, schema: &Schema, row: &[Value]) -> Expr 
 /// nested query scopes. A local relation shadows an outer relation with the
 /// same qualifier.
 fn bind_outer_references(
+    db: &Session,
     expr: &Expr,
-    shadowed: &[String],
+    shadowed: &[Vec<String>],
     bind: &dyn Fn(&Expr) -> Option<Expr>,
 ) -> Expr {
     map_expr(expr, &|candidate| match candidate {
         Expr::Subquery(query) => Some(Expr::Subquery(Box::new(bind_outer_query(
-            query, shadowed, bind,
+            db, query, shadowed, bind,
         )))),
         Expr::InSubquery {
             expr,
             subquery,
             negated,
         } => Some(Expr::InSubquery {
-            expr: Box::new(bind_outer_references(expr, shadowed, bind)),
-            subquery: Box::new(bind_outer_query(subquery, shadowed, bind)),
+            expr: Box::new(bind_outer_references(db, expr, shadowed, bind)),
+            subquery: Box::new(bind_outer_query(db, subquery, shadowed, bind)),
             negated: *negated,
         }),
         Expr::Exists { subquery, negated } => Some(Expr::Exists {
-            subquery: Box::new(bind_outer_query(subquery, shadowed, bind)),
+            subquery: Box::new(bind_outer_query(db, subquery, shadowed, bind)),
             negated: *negated,
         }),
         Expr::CompoundIdentifier(parts)
             if parts.len() >= 2
                 && shadowed.iter().any(|qualifier| {
-                    qualifier.eq_ignore_ascii_case(&parts[parts.len() - 2].value)
+                    qualifier_parts_match(qualifier, &parts[..parts.len() - 1])
                 }) =>
         {
             Some(candidate.clone())
@@ -12383,17 +12983,52 @@ fn bind_outer_references(
 }
 
 fn bind_outer_query(
+    db: &Session,
     query: &SqlQuery,
-    inherited_shadowing: &[String],
+    inherited_shadowing: &[Vec<String>],
     bind: &dyn Fn(&Expr) -> Option<Expr>,
 ) -> SqlQuery {
-    let mut shadowed = inherited_shadowing.to_vec();
-    if let SetExpr::Select(select) = query.body.as_ref() {
-        shadowed.extend(join_qualifiers(&select.from));
+    fn bind_set_expr(
+        db: &Session,
+        set_expr: &mut SetExpr,
+        inherited_shadowing: &[Vec<String>],
+        bind: &dyn Fn(&Expr) -> Option<Expr>,
+    ) {
+        match set_expr {
+            SetExpr::Select(select) => {
+                let mut shadowed = inherited_shadowing.to_vec();
+                shadowed.extend(join_qualifiers(db, &select.from));
+                rewrite_select_expressions(select, &|expr| {
+                    Some(bind_outer_references(db, expr, &shadowed, bind))
+                });
+            }
+            SetExpr::SetOperation { left, right, .. } => {
+                bind_set_expr(db, left, inherited_shadowing, bind);
+                bind_set_expr(db, right, inherited_shadowing, bind);
+            }
+            SetExpr::Query(query) => {
+                **query = bind_outer_query(db, query, inherited_shadowing, bind);
+            }
+            SetExpr::Values(_) | SetExpr::Insert(_) | SetExpr::Update(_) | SetExpr::Table(_) => {}
+        }
     }
-    rewrite_query(query, &|expr| {
-        Some(bind_outer_references(expr, &shadowed, bind))
-    })
+
+    let mut query = query.clone();
+    bind_set_expr(db, &mut query.body, inherited_shadowing, bind);
+    let order_shadowing = match query.body.as_ref() {
+        SetExpr::Select(select) => {
+            let mut shadowed = inherited_shadowing.to_vec();
+            shadowed.extend(join_qualifiers(db, &select.from));
+            shadowed
+        }
+        _ => inherited_shadowing.to_vec(),
+    };
+    if let Some(order_by) = &mut query.order_by {
+        for order in &mut order_by.exprs {
+            order.expr = bind_outer_references(db, &order.expr, &order_shadowing, bind);
+        }
+    }
+    query
 }
 
 /// Resolve subqueries after qualified correlation has been bound. If an inner
@@ -12456,7 +13091,7 @@ async fn sort_rows_with_subqueries(
     rows: &mut [Vec<Value>],
     schema: &Schema,
     order: &[(Expr, bool)],
-    bind: impl Fn(&Expr, &[Value]) -> Expr,
+    bind: impl Fn(&Expr, &[Value]) -> Result<Expr>,
 ) -> Result<()> {
     let mut check = db.cancel_check();
     let mut keyed = Vec::with_capacity(rows.len());
@@ -12464,7 +13099,7 @@ async fn sort_rows_with_subqueries(
         check.tick()?;
         let mut keys = Vec::with_capacity(order.len());
         for (expr, _) in order {
-            let bound = bind(expr, row);
+            let bound = bind(expr, row)?;
             let resolved = resolve_subqueries_with_outer(db, vindex, bound, schema, row).await?;
             keys.push(predicate::eval_row(&resolved, schema, row)?);
         }
@@ -12800,40 +13435,78 @@ fn map_expr(expr: &Expr, f: &dyn Fn(&Expr) -> Option<Expr>) -> Expr {
 
 /// Apply `map_expr` to the expression positions of a query (projection, WHERE,
 /// JOIN conditions, GROUP BY, HAVING, ORDER BY), recursing into subqueries.
+fn rewrite_select_expressions(select: &mut Select, f: &dyn Fn(&Expr) -> Option<Expr>) {
+    for item in &mut select.projection {
+        match item {
+            sqlparser::ast::SelectItem::UnnamedExpr(e)
+            | sqlparser::ast::SelectItem::ExprWithAlias { expr: e, .. } => {
+                *e = map_expr(e, f);
+            }
+            _ => {}
+        }
+    }
+    if let Some(selection) = &select.selection {
+        select.selection = Some(map_expr(selection, f));
+    }
+    if let Some(having) = &select.having {
+        select.having = Some(map_expr(having, f));
+    }
+    if let sqlparser::ast::GroupByExpr::Expressions(expressions, _) = &mut select.group_by {
+        for expression in expressions {
+            *expression = map_expr(expression, f);
+        }
+    }
+    for table in &mut select.from {
+        rewrite_table_factor(&mut table.relation, f);
+        for join in &mut table.joins {
+            rewrite_table_factor(&mut join.relation, f);
+            if let sqlparser::ast::JoinOperator::Inner(sqlparser::ast::JoinConstraint::On(e))
+            | sqlparser::ast::JoinOperator::LeftOuter(sqlparser::ast::JoinConstraint::On(e))
+            | sqlparser::ast::JoinOperator::RightOuter(sqlparser::ast::JoinConstraint::On(e))
+            | sqlparser::ast::JoinOperator::FullOuter(sqlparser::ast::JoinConstraint::On(e)) =
+                &mut join.join_operator
+            {
+                *e = map_expr(e, f);
+            }
+        }
+    }
+}
+
+fn rewrite_table_factor(table: &mut TableFactor, f: &dyn Fn(&Expr) -> Option<Expr>) {
+    match table {
+        TableFactor::Derived { subquery, .. } => {
+            **subquery = rewrite_query(subquery, f);
+        }
+        TableFactor::NestedJoin {
+            table_with_joins, ..
+        } => {
+            rewrite_table_factor(&mut table_with_joins.relation, f);
+            for join in &mut table_with_joins.joins {
+                rewrite_table_factor(&mut join.relation, f);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn rewrite_set_expr(set_expr: &mut SetExpr, f: &dyn Fn(&Expr) -> Option<Expr>) {
+    match set_expr {
+        SetExpr::Select(select) => rewrite_select_expressions(select, f),
+        SetExpr::SetOperation { left, right, .. } => {
+            rewrite_set_expr(left, f);
+            rewrite_set_expr(right, f);
+        }
+        SetExpr::Query(query) => **query = rewrite_query(query, f),
+        SetExpr::Values(_) | SetExpr::Insert(_) | SetExpr::Update(_) | SetExpr::Table(_) => {}
+    }
+}
+
 fn rewrite_query(q: &SqlQuery, f: &dyn Fn(&Expr) -> Option<Expr>) -> SqlQuery {
     let mut q = q.clone();
-    if let SetExpr::Select(select) = q.body.as_mut() {
-        for item in &mut select.projection {
-            match item {
-                sqlparser::ast::SelectItem::UnnamedExpr(e)
-                | sqlparser::ast::SelectItem::ExprWithAlias { expr: e, .. } => {
-                    *e = map_expr(e, f);
-                }
-                _ => {}
-            }
-        }
-        if let Some(sel) = &select.selection {
-            select.selection = Some(map_expr(sel, f));
-        }
-        if let Some(h) = &select.having {
-            select.having = Some(map_expr(h, f));
-        }
-        for twj in &mut select.from {
-            for join in &mut twj.joins {
-                if let sqlparser::ast::JoinOperator::Inner(sqlparser::ast::JoinConstraint::On(e))
-                | sqlparser::ast::JoinOperator::LeftOuter(
-                    sqlparser::ast::JoinConstraint::On(e),
-                )
-                | sqlparser::ast::JoinOperator::RightOuter(
-                    sqlparser::ast::JoinConstraint::On(e),
-                )
-                | sqlparser::ast::JoinOperator::FullOuter(
-                    sqlparser::ast::JoinConstraint::On(e),
-                ) = &mut join.join_operator
-                {
-                    *e = map_expr(e, f);
-                }
-            }
+    rewrite_set_expr(&mut q.body, f);
+    if let Some(order_by) = &mut q.order_by {
+        for order in &mut order_by.exprs {
+            order.expr = map_expr(&order.expr, f);
         }
     }
     q
@@ -13074,6 +13747,7 @@ async fn hybrid_select(
         ty,
         nullable: true,
         collation: elyra_core::Collation::Ci,
+        qualifier: Vec::new(),
     };
     let mut cols: Vec<elyra_core::ColumnDef> = Vec::new();
     let mut plan: Vec<P> = Vec::new();
@@ -14525,8 +15199,8 @@ fn collect_col_refs(e: &Expr, schema: &Schema, out: &mut Vec<usize>) -> bool {
     // qualified (`a.k`, `b.k`), so matching on the bare suffix alone would map
     // `b.k` onto `a.k` -- the mask would then skip the column the query reads
     // and it would decode as NULL, silently wrong.
-    let find = |name: &str, out: &mut Vec<usize>| -> bool {
-        match predicate::resolve_index(name, schema) {
+    let find = |parts: &[Ident], out: &mut Vec<usize>| -> bool {
+        match predicate::resolve_index_parts(parts, schema) {
             Ok(i) => {
                 out.push(i);
                 true
@@ -14538,15 +15212,8 @@ fn collect_col_refs(e: &Expr, schema: &Schema, out: &mut Vec<usize>) -> bool {
     };
     match e {
         Expr::Value(_) | Expr::TypedString { .. } => true,
-        Expr::Identifier(id) => find(&id.value, out),
-        Expr::CompoundIdentifier(parts) => {
-            let qualified = parts
-                .iter()
-                .map(|i| i.value.as_str())
-                .collect::<Vec<_>>()
-                .join(".");
-            find(&qualified, out)
-        }
+        Expr::Identifier(id) => find(std::slice::from_ref(id), out),
+        Expr::CompoundIdentifier(parts) => find(parts, out),
         Expr::BinaryOp { left, right, .. } => {
             collect_col_refs(left, schema, out) && collect_col_refs(right, schema, out)
         }
@@ -14843,16 +15510,15 @@ fn order_key_collations(order: &[(Expr, bool)], schema: &Schema) -> Vec<elyra_co
 
 /// The collation of a direct column-reference expression, else the default.
 fn expr_collation(e: &Expr, schema: &Schema) -> elyra_core::Collation {
-    if let Some(name) = ident_name(e) {
-        let want = name.rsplit('.').next().unwrap_or(name);
-        if let Some(c) = schema.columns.iter().find(|c| {
-            let have = c.name.rsplit('.').next().unwrap_or(&c.name);
-            c.name.eq_ignore_ascii_case(name) || have.eq_ignore_ascii_case(want)
-        }) {
-            return c.collation;
-        }
-    }
-    elyra_core::Collation::Ci
+    let index = match e {
+        Expr::Identifier(id) => predicate::resolve_index(&id.value, schema).ok(),
+        Expr::CompoundIdentifier(parts) => predicate::resolve_index_parts(parts, schema).ok(),
+        Expr::Nested(inner) => return expr_collation(inner, schema),
+        _ => None,
+    };
+    index
+        .map(|index| schema.columns[index].collation)
+        .unwrap_or(elyra_core::Collation::Ci)
 }
 
 fn sort_full_rows(
@@ -14933,14 +15599,10 @@ fn order_output_rows(
         let name = ident_name(e)
             .map(|s| s.to_string())
             .unwrap_or_else(|| e.to_string());
-        let want = name.rsplit('.').next().unwrap_or(&name);
         let idx = schema
             .columns
             .iter()
-            .position(|c| {
-                let have = c.name.rsplit('.').next().unwrap_or(&c.name);
-                c.name.eq_ignore_ascii_case(&name) || have.eq_ignore_ascii_case(want)
-            })
+            .position(|c| c.name.eq_ignore_ascii_case(&name))
             .ok_or_else(|| {
                 Error::Query(format!("ORDER BY references unknown output column: {name}"))
             })?;
@@ -15512,7 +16174,8 @@ mod substitution_tests {
 #[cfg(test)]
 mod plan_tests {
     use super::{
-        order_col_index, order_is_pk_prefix, ordered_scan_budget, secondary_order_plan, NullMode,
+        expr_qualifier, order_col_index, order_is_pk_prefix, ordered_scan_budget, relation_aliases,
+        row_binding_index, secondary_order_plan, NullMode,
     };
     use crate::catalog::{IndexDef, TableDef};
     use elyra_core::{ColumnDef, ColumnType, Schema};
@@ -15553,6 +16216,46 @@ mod plan_tests {
 
     fn ob(name: &str, asc: bool) -> (Expr, bool) {
         (Expr::Identifier(Ident::new(name)), asc)
+    }
+
+    #[test]
+    fn join_planning_preserves_complete_relation_qualifiers() {
+        let schema = Schema::new(vec![ColumnDef::new(
+            "elyra.orders.id",
+            ColumnType::Int,
+            false,
+        )
+        .with_qualifier(vec!["elyra".into(), "orders".into()])]);
+        assert_eq!(
+            relation_aliases(&schema.columns),
+            [vec!["elyra".to_string(), "orders".to_string()]]
+                .into_iter()
+                .collect()
+        );
+        let expression = Expr::CompoundIdentifier(vec![
+            Ident::new("elyra"),
+            Ident::new("orders"),
+            Ident::new("id"),
+        ]);
+        assert_eq!(
+            expr_qualifier(&expression),
+            Some(vec!["elyra".to_string(), "orders".to_string()])
+        );
+    }
+
+    #[test]
+    fn ambiguous_short_outer_qualifiers_are_not_silently_left_unbound() {
+        let schema = Schema::new(vec![
+            ColumnDef::new("db1.qa.id", ColumnType::Int, false)
+                .with_qualifier(vec!["db1".into(), "qa".into()]),
+            ColumnDef::new("db2.qa.id", ColumnType::Int, false)
+                .with_qualifier(vec!["db2".into(), "qa".into()]),
+        ]);
+        let parts = [Ident::new("qa"), Ident::new("id")];
+        assert!(matches!(
+            row_binding_index(&parts, &schema),
+            Err(elyra_core::Error::Query(message)) if message.contains("ambiguous")
+        ));
     }
 
     #[test]

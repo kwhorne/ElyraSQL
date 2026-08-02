@@ -81,6 +81,7 @@ impl QueryResult {
             ty,
             nullable: true,
             collation: elyra_core::Collation::Ci,
+            qualifier: Vec::new(),
         }]);
         QueryResult::Rows(RowStream::literal(schema, vec![vec![value]]))
     }
@@ -651,51 +652,33 @@ impl Engine {
         let SetExpr::Select(sel) = q.body.as_ref() else {
             return None;
         };
-        // Resolve every plain base table in FROM (across commas and joins), each
-        // paired with its alias/name qualifier, for `*` expansion and column
-        // typing. `all_plain` stays true only if every FROM relation is a plain,
-        // loadable table -- required to know the exact column count for `*`.
+        // Resolve every plain or virtual table in FROM (across commas and joins),
+        // preserving its structured factor for qualified-wildcard binding.
+        // `all_plain` stays true only if every FROM relation is describable --
+        // required to know the exact column count for `*`.
         // (Explicit projection items are always described by best-effort type,
         // so what matters for a prepared statement is an exact column count.)
-        let mut defs: Vec<(String, catalog::TableDef)> = Vec::new();
+        let factors = sel
+            .from
+            .iter()
+            .flat_map(|table| {
+                std::iter::once(&table.relation)
+                    .chain(table.joins.iter().map(|join| &join.relation))
+            })
+            .collect::<Vec<_>>();
+        let mut relations: Vec<(&TableFactor, Schema)> = Vec::new();
         let mut all_plain = !sel.from.is_empty();
-        {
-            let add = |tf: &TableFactor, all_plain: &mut bool| -> Option<(String, String)> {
-                if let TableFactor::Table { name, alias, .. } = tf {
-                    let tname = name.0.last()?.value.clone();
-                    let qual = alias
-                        .as_ref()
-                        .map(|a| a.name.value.clone())
-                        .unwrap_or_else(|| tname.clone());
-                    Some((qual, tname))
-                } else {
-                    *all_plain = false;
-                    None
-                }
-            };
-            let mut pending: Vec<(String, String)> = Vec::new();
-            for twj in &sel.from {
-                if let Some(p) = add(&twj.relation, &mut all_plain) {
-                    pending.push(p);
-                }
-                for j in &twj.joins {
-                    if let Some(p) = add(&j.relation, &mut all_plain) {
-                        pending.push(p);
-                    }
-                }
-            }
-            for (qual, tname) in pending {
-                match catalog::load(sess, &tname).await.ok() {
-                    Some(d) => defs.push((qual, d)),
-                    None => all_plain = false,
-                }
+        for factor in factors {
+            match exec::describe_relation_schema(sess, factor).await {
+                Ok(schema) => relations.push((factor, schema)),
+                Err(_) => all_plain = false,
             }
         }
         let col_by_name =
             |n: &str| -> Option<ColumnType> {
                 let want = n.rsplit('.').next().unwrap_or(n);
-                for (_, d) in &defs {
-                    if let Some(c) = d.schema.columns.iter().find(|c| {
+                for (_, schema) in &relations {
+                    if let Some(c) = schema.columns.iter().find(|c| {
                         c.name.eq_ignore_ascii_case(n) || c.name.eq_ignore_ascii_case(want)
                     }) {
                         return Some(c.ty.clone());
@@ -754,18 +737,24 @@ impl Engine {
                 // FROM relations to be plain, loadable tables (else the count is
                 // unknown -> None).
                 SelectItem::Wildcard(_) => {
-                    if !all_plain || defs.is_empty() {
+                    if !all_plain || relations.is_empty() {
                         return None;
                     }
-                    for (_, d) in &defs {
-                        out.extend(d.schema.columns.iter().cloned());
+                    for (_, schema) in &relations {
+                        out.extend(schema.columns.iter().cloned());
                     }
                 }
-                // `t.*`: the columns of the table whose alias/name is `t`.
+                // Bind the complete wildcard identity to one relation before
+                // expanding its columns. This keeps same-final-name joins exact.
                 SelectItem::QualifiedWildcard(obj, _) => {
-                    let qual = obj.0.last()?.value.clone();
-                    let (_, d) = defs.iter().find(|(q, _)| q.eq_ignore_ascii_case(&qual))?;
-                    out.extend(d.schema.columns.iter().cloned());
+                    let mut matches = relations
+                        .iter()
+                        .filter(|(factor, _)| exec::wildcard_matches_relation(sess, obj, factor));
+                    let (_, schema) = matches.next()?;
+                    if matches.next().is_some() {
+                        return None;
+                    }
+                    out.extend(schema.columns.iter().cloned());
                 }
                 SelectItem::UnnamedExpr(e) => {
                     let name = match e {
@@ -778,6 +767,7 @@ impl Engine {
                         ty: expr_type(e, &col_by_name),
                         nullable: true,
                         collation: elyra_core::Collation::Ci,
+                        qualifier: Vec::new(),
                     });
                 }
                 SelectItem::ExprWithAlias { expr, alias } => {
@@ -786,6 +776,7 @@ impl Engine {
                         ty: expr_type(expr, &col_by_name),
                         nullable: true,
                         collation: elyra_core::Collation::Ci,
+                        qualifier: Vec::new(),
                     });
                 }
             }
@@ -1815,6 +1806,79 @@ mod database_ddl_tests {
         assert!(drop_database_result("elyra", true, Some("scratch")).is_ok());
         assert!(drop_database_result("elyra", true, Some("ELYRA")).is_err());
         assert!(drop_database_result("elyra", false, Some("scratch")).is_err());
+    }
+}
+
+#[cfg(test)]
+mod describe_wildcard_tests {
+    use super::{Engine, Privilege};
+
+    #[tokio::test]
+    async fn qualified_wildcard_metadata_uses_the_bound_relation() {
+        let engine = Engine::new(elyra_storage::Db::in_memory().unwrap());
+        let session = engine.session();
+        engine
+            .execute(
+                "CREATE TABLE TABLES (stored_id INT PRIMARY KEY, stored_label VARCHAR(16))",
+                Privilege::Admin,
+                &session,
+            )
+            .await
+            .unwrap();
+
+        let schema = engine
+            .describe_query(
+                "SELECT information_schema.TABLES.*
+                 FROM information_schema.TABLES
+                 JOIN TABLES ON TABLES.stored_id = 1
+                 WHERE information_schema.TABLES.TABLE_NAME = ?",
+                &session,
+            )
+            .await
+            .unwrap();
+        let names = schema
+            .columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            [
+                "TABLE_SCHEMA",
+                "TABLE_NAME",
+                "TABLE_TYPE",
+                "ENGINE",
+                "TABLE_ROWS",
+                "DATA_LENGTH",
+                "INDEX_LENGTH",
+                "TABLE_COMMENT",
+                "TABLE_COLLATION",
+                "AUTO_INCREMENT",
+                "CREATE_OPTIONS",
+            ]
+        );
+
+        let schema = engine
+            .describe_query("SELECT elyra.t.* FROM elyra.TABLES AS t", &session)
+            .await
+            .unwrap();
+        assert_eq!(
+            schema
+                .columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            ["stored_id", "stored_label"]
+        );
+
+        assert!(engine
+            .describe_query(
+                "SELECT def.information_schema.TABLES.*
+                     FROM def.information_schema.TABLES",
+                &session,
+            )
+            .await
+            .is_none());
     }
 }
 

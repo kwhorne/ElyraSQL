@@ -737,6 +737,12 @@ async fn result_metadata_reports_the_source_table() {
     c.query_drop("INSERT INTO meta_b VALUES (1,1,'post')")
         .await
         .unwrap();
+    c.query_drop("CREATE TABLE `meta.dot` (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO `meta.dot` VALUES (1)")
+        .await
+        .unwrap();
 
     // (sql, expected "table.column" per result column)
     for (sql, expected) in [
@@ -755,9 +761,22 @@ async fn result_metadata_reports_the_source_table() {
             vec!["meta_a.name", "meta_b.label"],
         ),
         ("SELECT * FROM meta_a", vec!["meta_a.id", "meta_a.name"]),
+        (
+            "SELECT elyra.meta_a.id FROM elyra.meta_a",
+            vec!["meta_a.id"],
+        ),
         // The alias, not the table name -- as MySQL reports it.
         ("SELECT x.id FROM meta_a x", vec!["x.id"]),
         ("SELECT x.* FROM meta_a x", vec!["x.id", "x.name"]),
+        ("SELECT elyra.x.id FROM elyra.meta_a x", vec!["x.id"]),
+        (
+            "SELECT `meta.dot`.id FROM elyra.`meta.dot`",
+            vec!["meta.dot.id"],
+        ),
+        (
+            "SELECT `alias.dot`.id FROM meta_a AS `alias.dot`",
+            vec!["alias.dot.id"],
+        ),
         // A computed column has no source table in MySQL either.
         (
             "SELECT id + 1 AS next, name FROM meta_a",
@@ -3122,6 +3141,1474 @@ async fn table_introspection_columns_are_available() {
             "utf8mb4".into(),
         )]
     );
+}
+
+#[tokio::test]
+async fn catalog_qualified_wildcards_validate_complete_relation_paths() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop("CREATE TABLE wildcard_catalog_target (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+
+    for sql in [
+        "SELECT catalog_table.*
+         FROM information_schema.TABLES AS catalog_table
+         WHERE catalog_table.TABLE_NAME = 'wildcard_catalog_target'",
+        "SELECT information_schema.catalog_table.*
+         FROM information_schema.TABLES AS catalog_table
+         WHERE catalog_table.TABLE_NAME = 'wildcard_catalog_target'",
+        "SELECT information_schema.TABLES.*
+         FROM information_schema.TABLES
+         WHERE information_schema.TABLES.TABLE_NAME = 'wildcard_catalog_target'",
+        "SELECT catalog_table.*, COUNT(*) AS matching_rows
+         FROM information_schema.TABLES AS catalog_table
+         WHERE catalog_table.TABLE_NAME = 'wildcard_catalog_target'
+         GROUP BY catalog_table.TABLE_NAME",
+        "SELECT mysql.user.*
+         FROM mysql.user
+         WHERE mysql.user.User = 'root'",
+        "SELECT mysql.catalog_user.*
+         FROM mysql.user AS catalog_user
+         WHERE catalog_user.User = 'root'",
+        "SELECT catalog_user.*, COUNT(*) AS matching_rows
+         FROM mysql.user AS catalog_user
+         WHERE catalog_user.User = 'root'
+         GROUP BY catalog_user.User",
+        "SELECT information_schema.TABLES.*, mysql.user.*
+         FROM information_schema.TABLES
+         JOIN mysql.user ON mysql.user.User = 'root'
+         WHERE information_schema.TABLES.TABLE_NAME = 'wildcard_catalog_target'",
+        "SELECT catalog_table.*, catalog_user.*
+         FROM information_schema.TABLES AS catalog_table
+         JOIN mysql.user AS catalog_user ON catalog_user.User = 'root'
+         WHERE catalog_table.TABLE_NAME = 'wildcard_catalog_target'",
+    ] {
+        let rows: Vec<mysql_async::Row> = c.query(sql).await.unwrap();
+        assert_eq!(rows.len(), 1, "{sql}");
+        if sql.contains("TABLES") {
+            assert_eq!(
+                rows[0].get::<String, _>("TABLE_NAME").as_deref(),
+                Some("wildcard_catalog_target"),
+                "{sql}"
+            );
+        }
+        if sql.contains("user") {
+            assert_eq!(
+                rows[0].get::<String, _>("User").as_deref(),
+                Some("root"),
+                "{sql}"
+            );
+        }
+        assert!(
+            rows[0]
+                .columns_ref()
+                .iter()
+                .all(|column| !column.name_str().contains('.')),
+            "wildcard output names must remain unqualified: {sql}"
+        );
+        if sql.contains("matching_rows") {
+            assert_eq!(rows[0].get::<i64, _>("matching_rows"), Some(1), "{sql}");
+        }
+    }
+
+    for sql in [
+        // Plain virtual-relation projection: a multi-part wildcard must name the
+        // exact unaliased relation, or schema plus alias for a two-part source.
+        "SELECT missing_alias.* FROM information_schema.TABLES AS catalog_table LIMIT 1",
+        "SELECT mysql.TABLES.* FROM information_schema.TABLES LIMIT 1",
+        "SELECT def.information_schema.TABLES.* FROM information_schema.TABLES LIMIT 1",
+        "SELECT mysql.catalog_table.* FROM information_schema.TABLES AS catalog_table LIMIT 1",
+        "SELECT def.information_schema.catalog_table.*
+         FROM information_schema.TABLES AS catalog_table LIMIT 1",
+        "SELECT information_schema.TABLES.*
+         FROM information_schema.TABLES AS catalog_table LIMIT 1",
+        "SELECT information_schema.user.* FROM mysql.user LIMIT 1",
+        "SELECT def.mysql.user.* FROM mysql.user LIMIT 1",
+        "SELECT information_schema.catalog_user.*
+         FROM mysql.user AS catalog_user LIMIT 1",
+        "SELECT def.mysql.catalog_user.* FROM mysql.user AS catalog_user LIMIT 1",
+        "SELECT mysql.user.* FROM mysql.user AS catalog_user LIMIT 1",
+        // Aggregate projection has its own wildcard expansion plan.
+        "SELECT mysql.TABLES.*, COUNT(*)
+         FROM information_schema.TABLES GROUP BY TABLE_NAME LIMIT 1",
+        "SELECT information_schema.user.*, COUNT(*)
+         FROM mysql.user GROUP BY User LIMIT 1",
+        // Joined relations are qualified after materialisation and must not let
+        // an unrelated schema prefix select a relation by its final name.
+        "SELECT mysql.TABLES.*
+         FROM information_schema.TABLES
+         JOIN mysql.user ON mysql.user.User = 'root' LIMIT 1",
+        "SELECT def.mysql.user.*
+         FROM information_schema.TABLES
+         JOIN mysql.user ON mysql.user.User = 'root' LIMIT 1",
+        "SELECT mysql.catalog_table.*
+         FROM information_schema.TABLES AS catalog_table
+         JOIN mysql.user AS catalog_user ON catalog_user.User = 'root' LIMIT 1",
+    ] {
+        let error = c.query_drop(sql).await.unwrap_err();
+        assert!(
+            matches!(error, mysql_async::Error::Server(_)),
+            "expected invalid wildcard relation for {sql}, got {error:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn malformed_virtual_source_paths_are_rejected_everywhere() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    for sql in [
+        // Plain projection, unaliased and aliased, for both virtual schemas.
+        "SELECT def.information_schema.TABLES.*
+         FROM def.information_schema.TABLES LIMIT 1",
+        "SELECT t.* FROM def.information_schema.TABLES AS t LIMIT 1",
+        "SELECT def.mysql.user.* FROM def.mysql.user LIMIT 1",
+        "SELECT u.* FROM def.mysql.user AS u LIMIT 1",
+        // Aggregate wildcard planning is a separate engine path.
+        "SELECT def.information_schema.TABLES.*, COUNT(*)
+         FROM def.information_schema.TABLES GROUP BY TABLE_NAME LIMIT 1",
+        "SELECT t.*, COUNT(*)
+         FROM def.information_schema.TABLES AS t GROUP BY TABLE_NAME LIMIT 1",
+        "SELECT def.mysql.user.*, COUNT(*)
+         FROM def.mysql.user GROUP BY User LIMIT 1",
+        "SELECT u.*, COUNT(*) FROM def.mysql.user AS u GROUP BY User LIMIT 1",
+        // Materialised joins must reject the malformed source before loading it.
+        "SELECT def.information_schema.TABLES.*
+         FROM def.information_schema.TABLES
+         JOIN mysql.user AS u ON u.User = 'root' LIMIT 1",
+        "SELECT t.* FROM def.information_schema.TABLES AS t
+         JOIN mysql.user AS u ON u.User = 'root' LIMIT 1",
+        "SELECT def.mysql.user.* FROM information_schema.TABLES AS t
+         JOIN def.mysql.user ON User = 'root' LIMIT 1",
+        "SELECT u.* FROM information_schema.TABLES AS t
+         JOIN def.mysql.user AS u ON u.User = 'root' LIMIT 1",
+    ] {
+        let error = c.query_drop(sql).await.unwrap_err();
+        assert!(
+            matches!(error, mysql_async::Error::Server(_)),
+            "expected malformed virtual source error for {sql}, got {error:?}"
+        );
+    }
+
+    for (sql, params) in [
+        (
+            "SELECT def.information_schema.TABLES.*
+             FROM def.information_schema.TABLES WHERE TABLE_NAME = ?",
+            ("missing",),
+        ),
+        (
+            "SELECT t.* FROM def.information_schema.TABLES AS t WHERE TABLE_NAME = ?",
+            ("missing",),
+        ),
+        (
+            "SELECT def.mysql.user.* FROM def.mysql.user WHERE User = ?",
+            ("root",),
+        ),
+        (
+            "SELECT u.* FROM def.mysql.user AS u WHERE User = ?",
+            ("root",),
+        ),
+    ] {
+        let error = c.exec_drop(sql, params).await.unwrap_err();
+        assert!(
+            matches!(error, mysql_async::Error::Server(_)),
+            "native prepared execution accepted malformed source {sql}: {error:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn schema_qualified_alias_wildcards_follow_mysql_identity() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop(
+        "CREATE TABLE wildcard_alias_source (
+            id INT PRIMARY KEY,
+            label VARCHAR(16)
+        )",
+    )
+    .await
+    .unwrap();
+    c.query_drop("INSERT INTO wildcard_alias_source VALUES (1, 'stored')")
+        .await
+        .unwrap();
+
+    for (sql, expected_names) in [
+        (
+            "SELECT information_schema.t.*
+             FROM information_schema.TABLES AS t
+             WHERE t.TABLE_NAME = 'wildcard_alias_source'",
+            vec![
+                "TABLE_SCHEMA",
+                "TABLE_NAME",
+                "TABLE_TYPE",
+                "ENGINE",
+                "TABLE_ROWS",
+                "DATA_LENGTH",
+                "INDEX_LENGTH",
+                "TABLE_COMMENT",
+                "TABLE_COLLATION",
+                "AUTO_INCREMENT",
+                "CREATE_OPTIONS",
+            ],
+        ),
+        (
+            "SELECT mysql.u.* FROM mysql.user AS u WHERE u.User = 'root'",
+            vec![
+                "Host",
+                "User",
+                "Select_priv",
+                "Insert_priv",
+                "Update_priv",
+                "Delete_priv",
+                "Create_priv",
+                "Drop_priv",
+                "Super_priv",
+                "plugin",
+                "authentication_string",
+                "account_locked",
+                "password_expired",
+            ],
+        ),
+        (
+            "SELECT elyra.o.* FROM elyra.wildcard_alias_source AS o",
+            vec!["id", "label"],
+        ),
+        (
+            "SELECT elyra.wildcard_alias_source.* FROM wildcard_alias_source",
+            vec!["id", "label"],
+        ),
+        (
+            "SELECT elyra.o.* FROM wildcard_alias_source AS o",
+            vec!["id", "label"],
+        ),
+    ] {
+        let mut result = c.query_iter(sql).await.unwrap();
+        let names = result
+            .columns_ref()
+            .iter()
+            .map(|column| column.name_str().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(names, expected_names, "{sql}");
+        let rows: Vec<mysql_async::Row> = result.collect().await.unwrap();
+        assert_eq!(rows.len(), 1, "{sql}");
+    }
+
+    for sql in [
+        "SELECT mysql.t.* FROM information_schema.TABLES AS t LIMIT 1",
+        "SELECT def.information_schema.t.* FROM information_schema.TABLES AS t LIMIT 1",
+        "SELECT information_schema.TABLES.* FROM information_schema.TABLES AS t LIMIT 1",
+        "SELECT information_schema.u.* FROM mysql.user AS u LIMIT 1",
+        "SELECT def.mysql.u.* FROM mysql.user AS u LIMIT 1",
+        "SELECT mysql.user.* FROM mysql.user AS u LIMIT 1",
+        "SELECT mysql.o.* FROM elyra.wildcard_alias_source AS o",
+        "SELECT def.elyra.o.* FROM elyra.wildcard_alias_source AS o",
+        "SELECT elyra.wildcard_alias_source.* FROM elyra.wildcard_alias_source AS o",
+    ] {
+        let error = c.query_drop(sql).await.unwrap_err();
+        assert!(
+            matches!(error, mysql_async::Error::Server(_)),
+            "expected invalid schema-qualified alias for {sql}, got {error:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn catalog_wildcards_bind_to_one_same_named_join_relation() {
+    const TABLE_FIELDS: [&str; 11] = [
+        "TABLE_SCHEMA",
+        "TABLE_NAME",
+        "TABLE_TYPE",
+        "ENGINE",
+        "TABLE_ROWS",
+        "DATA_LENGTH",
+        "INDEX_LENGTH",
+        "TABLE_COMMENT",
+        "TABLE_COLLATION",
+        "AUTO_INCREMENT",
+        "CREATE_OPTIONS",
+    ];
+
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop("CREATE TABLE TABLES (stored_id INT PRIMARY KEY, stored_label VARCHAR(16))")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO TABLES VALUES (1, 'stored')")
+        .await
+        .unwrap();
+
+    let plain_sql = "SELECT information_schema.TABLES.*
+        FROM information_schema.TABLES
+        JOIN TABLES ON TABLES.stored_id = 1
+        WHERE information_schema.TABLES.TABLE_NAME = 'TABLES'";
+    let mut result = c.query_iter(plain_sql).await.unwrap();
+    let names = result
+        .columns_ref()
+        .iter()
+        .map(|column| column.name_str().into_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(names, TABLE_FIELDS, "plain join metadata");
+    let rows: Vec<mysql_async::Row> = result.collect().await.unwrap();
+    assert_eq!(rows.len(), 1);
+
+    let aggregate_sql = "SELECT information_schema.TABLES.*, COUNT(*) AS matching_rows
+        FROM information_schema.TABLES
+        JOIN TABLES ON TABLES.stored_id = 1
+        WHERE information_schema.TABLES.TABLE_NAME = 'TABLES'
+        GROUP BY information_schema.TABLES.TABLE_NAME";
+    let mut result = c.query_iter(aggregate_sql).await.unwrap();
+    let names = result
+        .columns_ref()
+        .iter()
+        .map(|column| column.name_str().into_owned())
+        .collect::<Vec<_>>();
+    let mut aggregate_fields = TABLE_FIELDS.to_vec();
+    aggregate_fields.push("matching_rows");
+    assert_eq!(names, aggregate_fields, "aggregate join metadata");
+    let rows: Vec<mysql_async::Row> = result.collect().await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<i64, _>("matching_rows"), Some(1));
+
+    let prepared_sql = "SELECT information_schema.TABLES.*
+        FROM information_schema.TABLES
+        JOIN TABLES ON TABLES.stored_id = 1
+        WHERE information_schema.TABLES.TABLE_NAME = ?";
+    let mut result = c.exec_iter(prepared_sql, ("TABLES",)).await.unwrap();
+    let names = result
+        .columns()
+        .unwrap()
+        .iter()
+        .map(|column| column.name_str().into_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(names, TABLE_FIELDS, "native prepared metadata");
+    let rows: Vec<mysql_async::Row> = result.collect().await.unwrap();
+    assert_eq!(rows.len(), 1);
+}
+
+#[tokio::test]
+async fn qualified_wildcards_keep_the_complete_unaliased_relation_identity() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop("CREATE TABLE same_named_relation (id INT PRIMARY KEY, label VARCHAR(16))")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO same_named_relation VALUES (1, 'stored')")
+        .await
+        .unwrap();
+
+    for sql in [
+        "SELECT elyra.same_named_relation.*
+         FROM elyra.same_named_relation
+         JOIN shadow.same_named_relation ON shadow.same_named_relation.id = 1",
+        "SELECT elyra.same_named_relation.*, COUNT(*) AS matching_rows
+         FROM elyra.same_named_relation
+         JOIN shadow.same_named_relation ON shadow.same_named_relation.id = 1
+         GROUP BY elyra.same_named_relation.id",
+    ] {
+        let mut result = c.query_iter(sql).await.unwrap();
+        let names = result
+            .columns_ref()
+            .iter()
+            .map(|column| column.name_str().into_owned())
+            .collect::<Vec<_>>();
+        let expected = if sql.contains("COUNT") {
+            vec!["id", "label", "matching_rows"]
+        } else {
+            vec!["id", "label"]
+        };
+        assert_eq!(names, expected, "{sql}");
+        let rows: Vec<mysql_async::Row> = result.collect().await.unwrap();
+        assert_eq!(rows.len(), 1, "{sql}");
+    }
+
+    let mut result = c
+        .exec_iter(
+            "SELECT elyra.same_named_relation.*
+             FROM elyra.same_named_relation
+             JOIN shadow.same_named_relation ON shadow.same_named_relation.id = ?",
+            (1,),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.columns().unwrap().len(), 2);
+    let rows: Vec<mysql_async::Row> = result.collect().await.unwrap();
+    assert_eq!(rows.len(), 1);
+}
+
+#[tokio::test]
+async fn complete_virtual_relation_names_bind_in_correlated_subqueries() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop("CREATE TABLE correlated_catalog_target (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+
+    let names: Vec<String> = c
+        .query(
+            "SELECT information_schema.TABLES.TABLE_NAME
+             FROM information_schema.TABLES
+             JOIN mysql.user ON mysql.user.User = 'root'
+             WHERE EXISTS (
+                 SELECT 1
+                 WHERE information_schema.TABLES.TABLE_NAME = 'correlated_catalog_target'
+             )",
+        )
+        .await
+        .unwrap();
+    assert_eq!(names, ["correlated_catalog_target"]);
+}
+
+#[tokio::test]
+async fn fully_qualified_join_identity_is_consistent_across_plans_and_mutations() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop("CREATE TABLE qa (id INT PRIMARY KEY, value INT)")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE qb (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO qa VALUES (1, 10), (2, 20)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO qb VALUES (1), (2)")
+        .await
+        .unwrap();
+
+    let joined: Vec<(i64, i64)> = c
+        .query(
+            "SELECT elyra.qa.id, elyra.qa.value
+             FROM elyra.qa
+             JOIN elyra.qb ON elyra.qa.id = elyra.qb.id
+             ORDER BY elyra.qa.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(joined, [(1, 10), (2, 20)]);
+
+    let short_qualified: Vec<(i64, i64)> = c
+        .query(
+            "SELECT qa.id, qa.value
+             FROM elyra.qa
+             JOIN elyra.qb ON qa.id = qb.id
+             ORDER BY qa.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(short_qualified, [(1, 10), (2, 20)]);
+
+    let aliased: Vec<(i64, i64)> = c
+        .query(
+            "SELECT elyra.q.id, elyra.q.value
+             FROM elyra.qa AS q
+             JOIN elyra.qb AS b ON elyra.q.id = elyra.b.id
+             ORDER BY elyra.q.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(aliased, [(1, 10), (2, 20)]);
+
+    let correlated: Vec<i64> = c
+        .query(
+            "SELECT elyra.qa.id
+             FROM elyra.qa
+             JOIN elyra.qb ON elyra.qa.id = elyra.qb.id
+             WHERE EXISTS (SELECT 1 WHERE qa.id = 1)
+             ORDER BY elyra.qa.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(correlated, [1]);
+
+    let aliased_correlated: Vec<i64> = c
+        .query(
+            "SELECT elyra.q.id
+             FROM elyra.qa AS q
+             JOIN elyra.qb AS b ON elyra.q.id = elyra.b.id
+             WHERE EXISTS (SELECT 1 WHERE elyra.q.id = 1)
+             ORDER BY elyra.q.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(aliased_correlated, [1]);
+
+    let shadowed: Vec<i64> = c
+        .query(
+            "SELECT elyra.qa.id FROM elyra.qa
+             WHERE EXISTS (
+                 SELECT 1 FROM qa WHERE elyra.qa.id = 2
+             )
+             ORDER BY elyra.qa.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(shadowed, [1, 2]);
+
+    c.query_drop(
+        "UPDATE elyra.qa AS q
+         JOIN elyra.qb AS b ON elyra.q.id = elyra.b.id
+         SET elyra.q.value = 35
+         WHERE elyra.q.id = 1",
+    )
+    .await
+    .unwrap();
+    let aliased_update: i64 = c
+        .query_first("SELECT value FROM qa WHERE id = 1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(aliased_update, 35);
+
+    c.query_drop(
+        "UPDATE elyra.qa
+         JOIN elyra.qb ON qa.id = qb.id
+         SET qa.value = 40
+         WHERE qa.id = 1",
+    )
+    .await
+    .unwrap();
+    let short_updated: i64 = c
+        .query_first("SELECT value FROM qa WHERE id = 1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(short_updated, 40);
+
+    c.query_drop(
+        "UPDATE elyra.qa
+         JOIN elyra.qb ON elyra.qa.id = elyra.qb.id
+         SET elyra.qa.value = 30
+         WHERE elyra.qa.id = 1",
+    )
+    .await
+    .unwrap();
+    let updated: i64 = c
+        .query_first("SELECT value FROM qa WHERE id = 1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(updated, 30);
+
+    c.query_drop(
+        "DELETE elyra.qa
+         FROM elyra.qa
+         JOIN elyra.qb ON elyra.qa.id = elyra.qb.id
+         WHERE elyra.qa.id = 2",
+    )
+    .await
+    .unwrap();
+    let remaining: Vec<i64> = c.query("SELECT id FROM qa ORDER BY id").await.unwrap();
+    assert_eq!(remaining, [1]);
+
+    c.query_drop("INSERT INTO qa VALUES (2, 20)").await.unwrap();
+    c.query_drop(
+        "DELETE qa
+         FROM elyra.qa
+         JOIN elyra.qb ON qa.id = qb.id
+         WHERE qa.id = 2",
+    )
+    .await
+    .unwrap();
+    let remaining: Vec<i64> = c.query("SELECT id FROM qa ORDER BY id").await.unwrap();
+    assert_eq!(remaining, [1]);
+}
+
+#[tokio::test]
+async fn fully_qualified_wildcards_preserve_unaliased_view_identity() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop("CREATE TABLE view_source (id INT PRIMARY KEY, label VARCHAR(20))")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO view_source VALUES (1, 'one'), (2, 'two')")
+        .await
+        .unwrap();
+    c.query_drop("CREATE VIEW qualified_view AS SELECT id, label FROM view_source")
+        .await
+        .unwrap();
+
+    let rows: Vec<(i64, String)> = c
+        .query("SELECT elyra.qualified_view.* FROM elyra.qualified_view ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(rows, [(1, "one".into()), (2, "two".into())]);
+
+    let count: i64 = c
+        .query_first("SELECT COUNT(elyra.qualified_view.id) FROM elyra.qualified_view")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(count, 2);
+
+    let distinct: Vec<(i64, String)> = c
+        .query(
+            "SELECT DISTINCT elyra.qualified_view.*
+             FROM elyra.qualified_view ORDER BY id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(distinct, [(1, "one".into()), (2, "two".into())]);
+
+    let prepared_rows: Vec<mysql_async::Row> = c
+        .exec_iter(
+            "SELECT DISTINCT elyra.qualified_view.* FROM elyra.qualified_view",
+            (),
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(prepared_rows.len(), 2);
+
+    let rollup_rows: Vec<mysql_async::Row> = c
+        .query(
+            "SELECT elyra.qualified_view.*, COUNT(*)
+             FROM elyra.qualified_view
+             GROUP BY id, label WITH ROLLUP",
+        )
+        .await
+        .unwrap();
+    assert!(!rollup_rows.is_empty());
+}
+
+#[tokio::test]
+async fn quoted_dotted_relation_names_keep_identifier_boundaries() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop("CREATE TABLE `dot.name` (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE dot_partner (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO `dot.name` VALUES (1)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO dot_partner VALUES (1)")
+        .await
+        .unwrap();
+
+    let id: i64 = c
+        .query_first(
+            "SELECT `dot.name`.id
+             FROM elyra.`dot.name`
+             JOIN elyra.dot_partner
+               ON `dot.name`.id = dot_partner.id",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(id, 1);
+}
+
+#[tokio::test]
+async fn quoted_dotted_column_names_keep_identifier_boundaries() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop("CREATE TABLE dotcol (id INT PRIMARY KEY, `a.b` INT)")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE dotcol_partner (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO dotcol VALUES (1, 10), (2, 20)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO dotcol_partner VALUES (1), (2)")
+        .await
+        .unwrap();
+
+    for (sql, expected_table) in [
+        ("SELECT dotcol.* FROM dotcol ORDER BY id", "dotcol"),
+        ("SELECT d.* FROM dotcol AS d ORDER BY id", "d"),
+        ("SELECT d.* FROM dotcol AS d JOIN dotcol_partner AS p ON p.id = d.id ORDER BY d.id", "d"),
+        ("SELECT d.*, COUNT(*) AS n FROM dotcol AS d JOIN dotcol_partner AS p ON p.id = d.id GROUP BY d.id, d.`a.b` ORDER BY d.id", "d"),
+        ("SELECT d.*, ROW_NUMBER() OVER (ORDER BY d.id) AS rn FROM dotcol AS d ORDER BY d.id", "d"),
+        ("SELECT d.id, d.`a.b`, ROW_NUMBER() OVER (ORDER BY d.id) AS rn FROM dotcol AS d ORDER BY d.id", "d"),
+        ("SELECT d.id, d.`a.b` FROM dotcol AS d JOIN dotcol_partner AS p ON p.id = d.id ORDER BY d.id", "d"),
+    ] {
+        let mut result = c
+            .query_iter(sql)
+            .await
+            .unwrap_or_else(|error| panic!("{sql}: {error:?}"));
+        let columns = result.columns_ref();
+        assert_eq!(columns[0].name_str(), "id", "{sql}");
+        assert_eq!(columns[1].name_str(), "a.b", "{sql}");
+        assert_eq!(columns[0].table_str(), expected_table, "{sql}");
+        assert_eq!(columns[1].table_str(), expected_table, "{sql}");
+        let rows: Vec<mysql_async::Row> = result.collect().await.unwrap();
+        assert_eq!(rows.len(), 2, "{sql}");
+        assert_eq!(rows[0].get::<i64, _>("a.b"), Some(10), "{sql}");
+        assert_eq!(rows[1].get::<i64, _>("a.b"), Some(20), "{sql}");
+    }
+}
+
+#[tokio::test]
+async fn qualified_dotted_columns_never_collide_with_flattened_names() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop(
+        "CREATE TABLE boundary_t (
+            id INT PRIMARY KEY,
+            `a.b` INT,
+            `boundary_t.a.b` INT,
+            `elyra.boundary_t.id` INT
+        )",
+    )
+    .await
+    .unwrap();
+    c.query_drop("CREATE TABLE boundary_partner (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO boundary_t VALUES (1, 10, 99, 777)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO boundary_partner VALUES (1)")
+        .await
+        .unwrap();
+
+    let value: i64 = c
+        .query_first(
+            "SELECT boundary_t.`a.b`
+             FROM boundary_t
+             WHERE boundary_t.`a.b` = 10",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(value, 10);
+
+    let sum: i64 = c
+        .query_first("SELECT SUM(boundary_t.`a.b`) FROM boundary_t")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(sum, 10);
+
+    let quoted_identifier: i64 = c
+        .query_first(
+            "SELECT `elyra.boundary_t.id`
+             FROM boundary_t
+             JOIN boundary_partner ON boundary_t.id = boundary_partner.id",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(quoted_identifier, 777);
+}
+
+#[tokio::test]
+async fn correlated_set_operation_arms_bind_the_outer_scope_independently() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop("CREATE TABLE set_outer (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO set_outer VALUES (1), (2)")
+        .await
+        .unwrap();
+
+    for sql in [
+        "SELECT o.id FROM set_outer AS o
+         WHERE EXISTS (
+             SELECT 1 WHERE 0
+             UNION ALL
+             SELECT 1 WHERE o.id = 2
+         ) ORDER BY o.id",
+        "SELECT elyra.set_outer.id FROM elyra.set_outer
+         WHERE EXISTS (
+             SELECT 1 WHERE elyra.set_outer.id = 2
+             INTERSECT
+             SELECT 1 WHERE elyra.set_outer.id = 2
+         ) ORDER BY elyra.set_outer.id",
+        "SELECT o.id FROM set_outer AS o
+         WHERE EXISTS (
+             SELECT 1 WHERE o.id = 2
+             EXCEPT
+             SELECT 1 WHERE 0
+         ) ORDER BY o.id",
+        "SELECT o.id FROM set_outer AS o
+         WHERE EXISTS (
+             SELECT 1 FROM set_outer AS o WHERE o.id = 99
+             UNION ALL
+             SELECT 1 WHERE o.id = 2
+         ) ORDER BY o.id",
+        "SELECT o.id FROM set_outer AS o
+         WHERE EXISTS (
+             SELECT 1 WHERE 0
+             UNION ALL
+             SELECT 1 WHERE EXISTS (
+                 SELECT 1 WHERE o.id = 2
+             )
+         ) ORDER BY o.id",
+    ] {
+        let ids: Vec<i64> = c.query(sql).await.unwrap();
+        assert_eq!(ids, [2], "{sql}");
+    }
+}
+
+#[tokio::test]
+async fn query_level_order_by_uses_the_local_relation_scope() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop("CREATE TABLE order_outer (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE order_inner (id INT PRIMARY KEY, value INT)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO order_outer VALUES (1), (2)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO order_inner VALUES (1, 10), (2, 20)")
+        .await
+        .unwrap();
+
+    let rows: Vec<(i64, i64)> = c
+        .query(
+            "SELECT o.id,
+                    (SELECT o.value
+                     FROM order_inner AS o
+                     ORDER BY o.id DESC LIMIT 1)
+             FROM order_outer AS o
+             ORDER BY o.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows, [(1, 20), (2, 20)]);
+}
+
+#[tokio::test]
+async fn quoted_relation_names_do_not_collide_with_qualified_suffixes() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop("CREATE TABLE name (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE `dot.name` (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO name VALUES (1)").await.unwrap();
+    c.query_drop("INSERT INTO `dot.name` VALUES (1)")
+        .await
+        .unwrap();
+
+    let ids: Vec<i64> = c
+        .query(
+            "SELECT name.id FROM name
+             JOIN `dot.name` ON name.id = `dot.name`.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(ids, [1]);
+
+    c.query_drop(
+        "UPDATE name JOIN `dot.name` ON name.id = `dot.name`.id
+         SET name.id = 2 WHERE `dot.name`.id = 1",
+    )
+    .await
+    .unwrap();
+    let ids: Vec<i64> = c.query("SELECT id FROM name").await.unwrap();
+    assert_eq!(ids, [2]);
+
+    let joined: i64 = c
+        .query_first(
+            "SELECT COUNT(*) FROM name
+             JOIN `dot.name` ON 1 = 1 WHERE `dot.name`.id = 1",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(joined, 1);
+
+    let result = c
+        .query_iter(
+            "DELETE `dot.name` FROM name
+             JOIN `dot.name` ON 1 = 1 WHERE `dot.name`.id = 1",
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.affected_rows(), 1);
+    result.drop_result().await.unwrap();
+    let count: i64 = c
+        .query_first("SELECT COUNT(*) FROM `dot.name`")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[tokio::test]
+async fn duplicate_mutation_aliases_are_rejected_before_writes() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop("CREATE TABLE duplicate_alias_a (id INT PRIMARY KEY, value INT)")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE duplicate_alias_b (id INT PRIMARY KEY, value INT)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO duplicate_alias_a VALUES (1, 10)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO duplicate_alias_b VALUES (1, 20)")
+        .await
+        .unwrap();
+
+    for sql in [
+        "UPDATE duplicate_alias_a AS x
+         JOIN duplicate_alias_b AS x ON x.id = x.id
+         SET x.value = 99",
+        "DELETE x FROM duplicate_alias_a AS x
+         JOIN duplicate_alias_b AS x ON x.id = x.id",
+        "UPDATE duplicate_alias_a AS x
+         JOIN (SELECT id FROM duplicate_alias_b) AS x ON 1 = 1
+         SET x.value = 99",
+        "DELETE x FROM duplicate_alias_a AS x
+         JOIN (SELECT id FROM duplicate_alias_b) AS x ON 1 = 1",
+    ] {
+        let error = c.query_drop(sql).await.unwrap_err();
+        assert!(
+            matches!(error, mysql_async::Error::Server(_)),
+            "{sql}: {error:?}"
+        );
+    }
+
+    let a: i64 = c
+        .query_first("SELECT value FROM duplicate_alias_a WHERE id = 1")
+        .await
+        .unwrap()
+        .unwrap();
+    let b: i64 = c
+        .query_first("SELECT value FROM duplicate_alias_b WHERE id = 1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((a, b), (10, 20));
+}
+
+#[tokio::test]
+async fn mutation_target_mapping_is_case_insensitive_and_structured() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop("CREATE TABLE case_target (id INT PRIMARY KEY, value INT)")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE case_partner (id INT PRIMARY KEY, value INT)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO case_target VALUES (1, 10)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO case_partner VALUES (1, 40)")
+        .await
+        .unwrap();
+
+    c.query_drop(
+        "UPDATE case_target AS X
+         JOIN case_partner AS Y ON X.id = Y.id
+         SET X.value = 20",
+    )
+    .await
+    .unwrap();
+    c.query_drop(
+        "UPDATE case_target AS `X.Dot`
+         JOIN case_partner AS `Y.Dot` ON `X.Dot`.id = `Y.Dot`.id
+         SET `X.Dot`.value = 30",
+    )
+    .await
+    .unwrap();
+    let value: i64 = c
+        .query_first("SELECT value FROM case_target WHERE id = 1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(value, 30);
+
+    let result = c
+        .query_iter(
+            "DELETE `Y.Dot` FROM case_target AS `X.Dot`
+             JOIN case_partner AS `Y.Dot` ON `X.Dot`.id = `Y.Dot`.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.affected_rows(), 1);
+    result.drop_result().await.unwrap();
+    let remaining: i64 = c
+        .query_first("SELECT COUNT(*) FROM case_partner")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(remaining, 0);
+}
+
+#[tokio::test]
+async fn delete_using_reads_rows_from_the_using_scope() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop("CREATE TABLE using_target (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE using_partner (id INT PRIMARY KEY, target_id INT)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO using_target VALUES (1), (2), (99)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO using_partner VALUES (99, 1)")
+        .await
+        .unwrap();
+
+    let result = c
+        .query_iter(
+            "DELETE FROM using_target
+             USING using_target
+             JOIN using_partner ON using_target.id = using_partner.target_id
+             WHERE using_partner.id = 99",
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.affected_rows(), 1);
+    result.drop_result().await.unwrap();
+
+    let ids: Vec<i64> = c
+        .query("SELECT id FROM using_target ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(ids, [2, 99]);
+
+    c.query_drop("CREATE TABLE using_a (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE using_b (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop(
+        "CREATE TABLE using_link (
+            id INT PRIMARY KEY,
+            a_id INT,
+            b_id INT
+        )",
+    )
+    .await
+    .unwrap();
+    c.query_drop("INSERT INTO using_a VALUES (1)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO using_b VALUES (2)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO using_link VALUES (99, 1, 2)")
+        .await
+        .unwrap();
+
+    let result = c
+        .query_iter(
+            "DELETE FROM using_a, using_b
+             USING using_a
+             JOIN using_link ON using_a.id = using_link.a_id
+             JOIN using_b ON using_b.id = using_link.b_id
+             WHERE using_link.id = 99",
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.affected_rows(), 2);
+    result.drop_result().await.unwrap();
+    let a: i64 = c
+        .query_first("SELECT COUNT(*) FROM using_a")
+        .await
+        .unwrap()
+        .unwrap();
+    let b: i64 = c
+        .query_first("SELECT COUNT(*) FROM using_b")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((a, b), (0, 0));
+}
+
+#[tokio::test]
+async fn delete_using_preserves_foreign_keys_and_after_triggers() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop("CREATE TABLE using_restrict_parent (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop(
+        "CREATE TABLE using_restrict_child (
+            id INT PRIMARY KEY,
+            parent_id INT,
+            CONSTRAINT fk_using_restrict
+                FOREIGN KEY (parent_id) REFERENCES using_restrict_parent(id)
+        )",
+    )
+    .await
+    .unwrap();
+    c.query_drop("CREATE TABLE using_restrict_match (id INT PRIMARY KEY, parent_id INT)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO using_restrict_parent VALUES (1)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO using_restrict_child VALUES (1, 1)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO using_restrict_match VALUES (1, 1)")
+        .await
+        .unwrap();
+
+    let error = c
+        .query_drop(
+            "DELETE FROM using_restrict_parent
+             USING using_restrict_parent
+             JOIN using_restrict_match
+               ON using_restrict_parent.id = using_restrict_match.parent_id
+             WHERE using_restrict_match.id = 1",
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("reference"), "{error}");
+    let counts: (i64, i64) = c
+        .query_first(
+            "SELECT
+                (SELECT COUNT(*) FROM using_restrict_parent),
+                (SELECT COUNT(*) FROM using_restrict_child)",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(counts, (1, 1));
+
+    c.query_drop("CREATE TABLE using_cascade_parent (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop(
+        "CREATE TABLE using_cascade_child (
+            id INT PRIMARY KEY,
+            parent_id INT,
+            CONSTRAINT fk_using_cascade
+                FOREIGN KEY (parent_id) REFERENCES using_cascade_parent(id)
+                ON DELETE CASCADE
+        )",
+    )
+    .await
+    .unwrap();
+    c.query_drop("CREATE TABLE using_cascade_match (id INT PRIMARY KEY, parent_id INT)")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE using_delete_audit (parent_id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop(
+        "CREATE TRIGGER audit_using_delete
+         AFTER DELETE ON using_cascade_parent
+         FOR EACH ROW INSERT INTO using_delete_audit VALUES (OLD.id)",
+    )
+    .await
+    .unwrap();
+    c.query_drop("INSERT INTO using_cascade_parent VALUES (2)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO using_cascade_child VALUES (2, 2)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO using_cascade_match VALUES (2, 2)")
+        .await
+        .unwrap();
+
+    let result = c
+        .query_iter(
+            "DELETE FROM using_cascade_parent
+             USING using_cascade_parent
+             JOIN using_cascade_match
+               ON using_cascade_parent.id = using_cascade_match.parent_id
+             WHERE using_cascade_match.id = 2",
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.affected_rows(), 1);
+    result.drop_result().await.unwrap();
+    let counts: (i64, i64, i64) = c
+        .query_first(
+            "SELECT
+                (SELECT COUNT(*) FROM using_cascade_parent),
+                (SELECT COUNT(*) FROM using_cascade_child),
+                (SELECT COUNT(*) FROM using_delete_audit)",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(counts, (0, 0, 1));
+
+    c.query_drop("CREATE TABLE using_self_target (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE using_self_audit (parent_id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop(
+        "CREATE TRIGGER audit_using_self_delete
+         AFTER DELETE ON using_self_target
+         FOR EACH ROW INSERT INTO using_self_audit VALUES (OLD.id)",
+    )
+    .await
+    .unwrap();
+    c.query_drop("INSERT INTO using_self_target VALUES (3)")
+        .await
+        .unwrap();
+
+    let result = c
+        .query_iter(
+            "DELETE FROM a, b
+             USING using_self_target AS a
+             JOIN using_self_target AS b ON a.id = b.id
+             WHERE a.id = 3",
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.affected_rows(), 1);
+    result.drop_result().await.unwrap();
+    let counts: (i64, i64) = c
+        .query_first(
+            "SELECT
+                (SELECT COUNT(*) FROM using_self_target),
+                (SELECT COUNT(*) FROM using_self_audit)",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(counts, (0, 1));
+
+    c.query_drop("INSERT INTO using_self_target VALUES (4), (5)")
+        .await
+        .unwrap();
+    let result = c
+        .query_iter(
+            "DELETE FROM a, b
+             USING using_self_target AS a
+             JOIN using_self_target AS b ON a.id <> b.id
+             WHERE a.id = 4 AND b.id = 5",
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.affected_rows(), 2);
+    result.drop_result().await.unwrap();
+    let counts: (i64, i64) = c
+        .query_first(
+            "SELECT
+                (SELECT COUNT(*) FROM using_self_target),
+                (SELECT COUNT(*) FROM using_self_audit)",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(counts, (0, 3));
+}
+
+#[tokio::test]
+async fn relation_aliases_hide_original_names_in_all_expression_paths() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop("CREATE TABLE hidden_original (id INT PRIMARY KEY, value INT)")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE hidden_partner (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO hidden_original VALUES (1, 10)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO hidden_partner VALUES (1)")
+        .await
+        .unwrap();
+
+    for sql in [
+        "SELECT hidden_original.id FROM hidden_original AS x",
+        "SELECT hidden_original.id FROM elyra.hidden_original AS x",
+        "SELECT x.id FROM hidden_original AS x WHERE hidden_original.id = 1",
+        "SELECT hidden_original.id FROM hidden_original AS x
+         JOIN hidden_partner AS p ON p.id = x.id",
+        "SELECT x.id FROM hidden_original AS x
+         JOIN hidden_partner AS p ON p.id = x.id
+         WHERE hidden_original.id = 1",
+        "UPDATE hidden_original AS x
+         SET x.value = 99 WHERE hidden_original.id = 1",
+        "UPDATE hidden_original AS x
+         SET x.value = 99 ORDER BY hidden_original.id LIMIT 1",
+        "UPDATE hidden_original AS x
+         JOIN hidden_partner AS p ON p.id = x.id
+         SET x.value = 99 WHERE hidden_original.id = 1",
+        "DELETE x FROM hidden_original AS x
+         WHERE hidden_original.id = 1",
+        "DELETE FROM hidden_original AS x
+         ORDER BY hidden_original.id LIMIT 1",
+        "DELETE x FROM hidden_original AS x
+         JOIN hidden_partner AS p ON p.id = x.id
+         WHERE hidden_original.id = 1",
+    ] {
+        let error = c.query_drop(sql).await.unwrap_err();
+        assert!(
+            matches!(error, mysql_async::Error::Server(_)),
+            "{sql}: {error:?}"
+        );
+    }
+
+    let value: i64 = c
+        .query_first("SELECT value FROM hidden_original WHERE id = 1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(value, 10);
+}
+
+#[tokio::test]
+async fn alias_hiding_honors_visible_self_joins_and_nested_expressions() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop("CREATE TABLE self_alias (id INT PRIMARY KEY, value INT)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO self_alias VALUES (1, 10)")
+        .await
+        .unwrap();
+
+    let id: i64 = c
+        .query_first(
+            "SELECT self_alias.id
+             FROM self_alias AS x
+             JOIN self_alias ON self_alias.id = x.id",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(id, 1);
+
+    for sql in [
+        "SELECT CASE WHEN self_alias.id = 1 THEN x.value END
+         FROM self_alias AS x",
+        "SELECT CAST(self_alias.value AS SIGNED)
+         FROM self_alias AS x",
+        "SELECT x.id FROM self_alias AS x
+         WHERE self_alias.value LIKE '1%'",
+        "SELECT ROW_NUMBER() OVER (ORDER BY self_alias.id)
+         FROM self_alias AS x",
+        "SELECT ROW_NUMBER() OVER w FROM self_alias AS x
+         WINDOW w AS (ORDER BY self_alias.id)",
+        "UPDATE self_alias AS x
+         SET x.value = CASE WHEN self_alias.id = 1 THEN 99 ELSE x.value END",
+    ] {
+        let error = c.query_drop(sql).await.unwrap_err();
+        assert!(
+            matches!(error, mysql_async::Error::Server(_)),
+            "{sql}: {error:?}"
+        );
+    }
+    let value: i64 = c
+        .query_first("SELECT value FROM self_alias WHERE id = 1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(value, 10);
+}
+
+#[tokio::test]
+async fn duplicate_select_aliases_are_rejected() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop("CREATE TABLE select_alias_a (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE select_alias_b (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+
+    for sql in [
+        "SELECT * FROM select_alias_a AS dup
+         JOIN select_alias_b AS dup ON 1 = 1",
+        "SELECT * FROM select_alias_a AS Dup
+         JOIN select_alias_b AS dUP ON 1 = 1",
+    ] {
+        let error = c.query_drop(sql).await.unwrap_err();
+        assert!(
+            matches!(error, mysql_async::Error::Server(_)),
+            "{sql}: {error:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn qualified_join_predicates_preserve_binary_collation() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop("CREATE TABLE bin_first (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop(
+        "CREATE TABLE bin_second (
+            id INT PRIMARY KEY,
+            code VARCHAR(8) COLLATE utf8mb4_bin
+        )",
+    )
+    .await
+    .unwrap();
+    c.query_drop("INSERT INTO bin_first VALUES (1)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO bin_second VALUES (1, 'x')")
+        .await
+        .unwrap();
+
+    let count: i64 = c
+        .query_first(
+            "SELECT COUNT(*)
+             FROM bin_first
+             JOIN bin_second ON bin_first.id = bin_second.id
+             WHERE bin_second.code = 'X'",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[tokio::test]
+async fn fully_qualified_inner_relations_shadow_outer_join_relations() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop("CREATE TABLE shadow_qa (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE shadow_qb (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO shadow_qa VALUES (1), (2)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO shadow_qb VALUES (1), (2)")
+        .await
+        .unwrap();
+
+    let ids: Vec<i64> = c
+        .query(
+            "SELECT elyra.shadow_qa.id
+             FROM elyra.shadow_qa
+             JOIN elyra.shadow_qb
+               ON elyra.shadow_qb.id = elyra.shadow_qa.id
+             WHERE EXISTS (
+                 SELECT 1 FROM elyra.shadow_qa
+                 WHERE elyra.shadow_qa.id = 2
+             )
+             ORDER BY elyra.shadow_qa.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(ids, [1, 2]);
 }
 
 #[tokio::test]
