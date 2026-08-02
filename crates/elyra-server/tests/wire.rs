@@ -9,6 +9,15 @@ mod common;
 use common::TestServer;
 use mysql_async::prelude::*;
 
+type ColumnMetadata = (
+    String,
+    String,
+    String,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+);
+
 #[tokio::test]
 async fn literals_and_arithmetic() {
     let srv = TestServer::start().await;
@@ -725,6 +734,267 @@ async fn integer_width_is_enforced_and_survives_alter() {
     c.query_drop("INSERT INTO wa VALUES (9223372036854775807)")
         .await
         .unwrap();
+}
+
+/// The compact execution schema may store several MySQL declarations in the
+/// same physical type, but schema tooling must still see the declaration the
+/// user wrote and its standard width/precision metadata.
+#[tokio::test]
+async fn declared_types_survive_catalog_metadata_and_strict_character_limits() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop(
+        "CREATE TABLE declared_type_test (
+            i INT,
+            bi BIGINT,
+            v VARCHAR(4),
+            c CHAR(2),
+            tb TINYINT(1),
+            b BOOLEAN,
+            ts TIMESTAMP,
+            dt DATETIME,
+            tt TINYTEXT,
+            t TEXT,
+            mt MEDIUMTEXT,
+            lt LONGTEXT,
+            amount DECIMAL(16,2)
+        )",
+    )
+    .await
+    .unwrap();
+
+    let metadata: Vec<ColumnMetadata> = c
+        .query(
+            "SELECT column_name, data_type, column_type,
+                    character_maximum_length, numeric_precision, numeric_scale
+             FROM information_schema.columns
+             WHERE table_name = 'declared_type_test'
+             ORDER BY ordinal_position",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        metadata,
+        vec![
+            (
+                "i".into(),
+                "int".into(),
+                "int".into(),
+                None,
+                Some(10),
+                Some(0)
+            ),
+            (
+                "bi".into(),
+                "bigint".into(),
+                "bigint".into(),
+                None,
+                Some(19),
+                Some(0)
+            ),
+            (
+                "v".into(),
+                "varchar".into(),
+                "varchar(4)".into(),
+                Some(4),
+                None,
+                None
+            ),
+            (
+                "c".into(),
+                "char".into(),
+                "char(2)".into(),
+                Some(2),
+                None,
+                None
+            ),
+            (
+                "tb".into(),
+                "tinyint".into(),
+                "tinyint(1)".into(),
+                None,
+                Some(3),
+                Some(0)
+            ),
+            (
+                "b".into(),
+                "tinyint".into(),
+                "tinyint(1)".into(),
+                None,
+                Some(3),
+                Some(0)
+            ),
+            (
+                "ts".into(),
+                "timestamp".into(),
+                "timestamp".into(),
+                None,
+                None,
+                None
+            ),
+            (
+                "dt".into(),
+                "datetime".into(),
+                "datetime".into(),
+                None,
+                None,
+                None
+            ),
+            (
+                "tt".into(),
+                "tinytext".into(),
+                "tinytext".into(),
+                Some(255),
+                None,
+                None
+            ),
+            (
+                "t".into(),
+                "text".into(),
+                "text".into(),
+                Some(65_535),
+                None,
+                None
+            ),
+            (
+                "mt".into(),
+                "mediumtext".into(),
+                "mediumtext".into(),
+                Some(16_777_215),
+                None,
+                None
+            ),
+            (
+                "lt".into(),
+                "longtext".into(),
+                "longtext".into(),
+                Some(4_294_967_295),
+                None,
+                None
+            ),
+            (
+                "amount".into(),
+                "decimal".into(),
+                "decimal(16,2)".into(),
+                None,
+                Some(16),
+                Some(2)
+            ),
+        ]
+    );
+
+    let show: Vec<(String, String, String, String, Option<String>, String)> = c
+        .query("SHOW COLUMNS FROM declared_type_test")
+        .await
+        .unwrap();
+    assert_eq!(show[2].1, "varchar(4)");
+    assert_eq!(show[4].1, "tinyint(1)");
+    assert_eq!(show[6].1, "timestamp");
+    let ddl: Option<(String, String)> = c
+        .query_first("SHOW CREATE TABLE declared_type_test")
+        .await
+        .unwrap();
+    let ddl = ddl.unwrap().1;
+    assert!(ddl.contains("`v` VARCHAR(4)"), "{ddl}");
+    assert!(ddl.contains("`ts` TIMESTAMP"), "{ddl}");
+
+    // The sidecars are part of a schema copy and follow an ALTER type change.
+    c.query_drop("CREATE TABLE declared_type_copy LIKE declared_type_test")
+        .await
+        .unwrap();
+    c.query_drop("ALTER TABLE declared_type_copy MODIFY v VARCHAR(5)")
+        .await
+        .unwrap();
+    let copied: Option<(String, Option<i64>)> = c
+        .query_first(
+            "SELECT column_type, character_maximum_length
+             FROM information_schema.columns
+             WHERE table_name = 'declared_type_copy' AND column_name = 'v'",
+        )
+        .await
+        .unwrap();
+    assert_eq!(copied, Some(("varchar(5)".into(), Some(5))));
+
+    c.query_drop("CREATE TABLE declared_type_ctas (v VARCHAR(3)) AS SELECT 'ok'")
+        .await
+        .unwrap();
+    let ctas: Option<(String, Option<i64>)> = c
+        .query_first(
+            "SELECT column_type, character_maximum_length
+             FROM information_schema.columns
+             WHERE table_name = 'declared_type_ctas' AND column_name = 'v'",
+        )
+        .await
+        .unwrap();
+    assert_eq!(ctas, Some(("varchar(3)".into(), Some(3))));
+
+    c.query_drop("SET SESSION sql_mode='STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION'")
+        .await
+        .unwrap();
+    match c
+        .query_drop("CREATE TABLE declared_type_ctas_too_long (v VARCHAR(3)) AS SELECT 'toolong'")
+        .await
+        .unwrap_err()
+    {
+        mysql_async::Error::Server(error) => {
+            assert_eq!(error.code, 1406);
+            assert_eq!(error.state, "22001");
+        }
+        other => panic!("expected data-too-long from strict CTAS, got {other:?}"),
+    }
+    c.query_drop("CREATE TABLE declared_widths (id INT PRIMARY KEY, v VARCHAR(4), c CHAR(2))")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO declared_widths VALUES (1, 'åäöü', 'xy')")
+        .await
+        .unwrap();
+    match c
+        .query_drop("ALTER TABLE declared_widths MODIFY v VARCHAR(3)")
+        .await
+        .unwrap_err()
+    {
+        mysql_async::Error::Server(error) => {
+            assert_eq!(error.code, 1406);
+            assert_eq!(error.state, "22001");
+        }
+        other => panic!("expected data-too-long from strict ALTER, got {other:?}"),
+    }
+    for sql in [
+        "INSERT INTO declared_widths VALUES (2, 'abcde', 'xy')",
+        "INSERT INTO declared_widths VALUES (3, 'abcd', 'xyz')",
+        "UPDATE declared_widths SET v = 'abcde' WHERE id = 1",
+    ] {
+        match c.query_drop(sql).await.unwrap_err() {
+            mysql_async::Error::Server(error) => {
+                assert_eq!(error.code, 1406, "{sql}");
+                assert_eq!(error.state, "22001", "{sql}");
+            }
+            other => panic!("expected data-too-long for {sql}, got {other:?}"),
+        }
+    }
+
+    c.query_drop("CREATE TABLE declared_width_source (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO declared_width_source VALUES (1)")
+        .await
+        .unwrap();
+    match c
+        .query_drop(
+            "UPDATE declared_widths AS target
+             JOIN declared_width_source AS source ON source.id = target.id
+             SET target.v = 'abcde'",
+        )
+        .await
+        .unwrap_err()
+    {
+        mysql_async::Error::Server(error) => {
+            assert_eq!(error.code, 1406);
+            assert_eq!(error.state, "22001");
+        }
+        other => panic!("expected data-too-long from multi-table update, got {other:?}"),
+    }
 }
 
 /// A table cannot hold two columns of the same name: name resolution would pick
@@ -2310,7 +2580,7 @@ async fn natural_join_uses_all_common_columns_and_mysql_star_order() {
     c.query_drop("CREATE TABLE natural_l (id INT PRIMARY KEY, code INT, lval VARCHAR(8))")
         .await
         .unwrap();
-    c.query_drop("CREATE TABLE natural_r (code INT, id INT PRIMARY KEY, rval VARCHAR(8))")
+    c.query_drop("CREATE TABLE natural_r (code INT, id INT PRIMARY KEY, rval VARCHAR(16))")
         .await
         .unwrap();
     c.query_drop("INSERT INTO natural_l VALUES (1,10,'L1'),(2,20,'L2'),(4,40,'L4')")

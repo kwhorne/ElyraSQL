@@ -349,6 +349,49 @@ pub fn colwidth_key(table: &str) -> Vec<u8> {
     format!("colwidth::{table}").into_bytes()
 }
 
+/// The MySQL declaration of every column in a table, stored separately from
+/// [`TableDef`] so adding it does not change bincode's positional catalog
+/// encoding. The execution schema intentionally remains compact: it records
+/// only the storage type, while this sidecar retains the information schema
+/// and `SHOW` need to report the original MySQL family and modifiers.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ColumnDeclarations {
+    /// Parallel to `schema.columns`. An older sidecar may be shorter; callers
+    /// fall back to the storage type for an absent entry.
+    pub columns: Vec<ColumnDeclaration>,
+}
+
+/// The pieces of a declared MySQL type exposed by `SHOW COLUMNS` and
+/// `information_schema.COLUMNS`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ColumnDeclaration {
+    /// Canonical lowercase base type, such as `varchar` or `decimal`.
+    pub data_type: String,
+    /// Canonical lowercase complete type, such as `varchar(255)` or
+    /// `decimal(16,2)`.
+    pub column_type: String,
+    /// Character count limit for character columns, when the type has one.
+    pub character_maximum_length: Option<u64>,
+    /// Decimal-digit precision for numeric columns, when defined.
+    pub numeric_precision: Option<u64>,
+    /// Decimal scale for exact numeric columns, when defined.
+    pub numeric_scale: Option<u64>,
+}
+
+pub fn coldecl_key(table: &str) -> Vec<u8> {
+    format!("coldecl::{table}").into_bytes()
+}
+
+/// The declared types of `table`, or `None` when the table predates this
+/// metadata. Missing metadata is deliberately not an error: old catalog files
+/// stay readable and retain their pre-existing storage semantics.
+pub async fn load_declarations(db: &Session, table: &str) -> Result<Option<ColumnDeclarations>> {
+    match db.get(coldecl_key(table)).await? {
+        Some(bytes) => Ok(bincode::deserialize(&bytes).ok()),
+        None => Ok(None),
+    }
+}
+
 /// The declared integer widths of `table`, or `None` when the table predates
 /// this metadata (in which case width is not enforced for it).
 pub async fn load_widths(db: &Session, table: &str) -> Result<Option<ColumnWidths>> {
