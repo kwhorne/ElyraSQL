@@ -76,19 +76,19 @@ jobs:
 
       - name: Build Linux static binary
         if: matrix.platform == 'linux'
-        run: cargo build --release --locked --target ${{ matrix.target }} -p elyra-cli
+        run: cargo build --profile dist --locked --target ${{ matrix.target }} -p elyra-cli
 
       - name: Build macOS binary
         if: matrix.platform == 'macos'
         env:
           MACOSX_DEPLOYMENT_TARGET: "11.0"
-        run: cargo build --release --locked --target ${{ matrix.target }} -p elyra-cli
+        run: cargo build --profile dist --locked --target ${{ matrix.target }} -p elyra-cli
 
       - name: Package
         run: |
           VERSION=${GITHUB_REF_NAME#v}
           NAME=elyrasql-${VERSION}-${{ matrix.platform }}-${{ matrix.arch }}
-          BIN=target/${{ matrix.target }}/release/elyrasql
+          BIN=target/${{ matrix.target }}/dist/elyrasql
           mkdir -p "dist/$NAME"
           cp "$BIN" "dist/$NAME/"
           cp README.md LICENSE "dist/$NAME/"
