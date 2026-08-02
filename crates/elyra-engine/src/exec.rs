@@ -10326,35 +10326,74 @@ fn combine(
     // Bound the buffered product: without this a cross join grows until the
     // process is killed. Released when this join finishes, errors, or unwinds.
     let mut budget = JoinBudget::new();
-    for l in lrows {
-        let mut matched = false;
-        for (ri, r) in rrows.iter().enumerate() {
-            #[cfg(test)]
-            NESTED_JOIN_COMPARISONS.with(|comparisons| comparisons.set(comparisons.get() + 1));
+
+    // Fast path for a simple cross-relation comparison (non-equi join like
+    // `a.v < b.v`): compare two values directly per pair and clone only when
+    // the condition matches, skipping the general predicate evaluator and its
+    // repeated schema lookups.
+    let fast_cmp = condition.as_ref().and_then(|c| {
+        if let JoinCondition::On(expression) = c {
+            cross_comparison(expression, lschema, rschema)
+        } else {
+            None
+        }
+    });
+
+    if let Some(ref fc) = fast_cmp {
+        for l in lrows {
             check.tick()?;
-            budget.account(out.len())?;
-            let mut combined = l.clone();
-            combined.extend_from_slice(r);
-            budget.sample(&combined);
-            let keep = match condition {
-                Some(JoinCondition::On(expression)) => {
-                    predicate::matches(expression, &schema, &combined)?
+            let mut matched = false;
+            for (ri, r) in rrows.iter().enumerate() {
+                #[cfg(test)]
+                NESTED_JOIN_COMPARISONS.with(|c| c.set(c.get() + 1));
+                if !fc.matches_row(l, r) {
+                    continue;
                 }
-                Some(JoinCondition::ResolvedKeys(keys)) => {
-                    resolved_key_pairs_match(l, lschema, r, rschema, keys)?
-                }
-                None => true,
-            };
-            if keep {
+                budget.account(out.len())?;
+                let mut combined = l.clone();
+                combined.extend_from_slice(r);
+                budget.sample(&combined);
                 out.push(combined);
                 matched = true;
                 right_matched[ri] = true;
             }
+            if matches!(kind, JoinKind::Left | JoinKind::Full) && !matched {
+                let mut combined = l.clone();
+                combined.extend(std::iter::repeat_n(Value::Null, rlen));
+                out.push(combined);
+            }
         }
-        if matches!(kind, JoinKind::Left | JoinKind::Full) && !matched {
-            let mut combined = l.clone();
-            combined.extend(std::iter::repeat_n(Value::Null, rlen));
-            out.push(combined);
+    } else {
+        for l in lrows {
+            let mut matched = false;
+            for (ri, r) in rrows.iter().enumerate() {
+                #[cfg(test)]
+                NESTED_JOIN_COMPARISONS.with(|c| c.set(c.get() + 1));
+                check.tick()?;
+                budget.account(out.len())?;
+                let mut combined = l.clone();
+                combined.extend_from_slice(r);
+                budget.sample(&combined);
+                let keep = match condition {
+                    Some(JoinCondition::On(expression)) => {
+                        predicate::matches(expression, &schema, &combined)?
+                    }
+                    Some(JoinCondition::ResolvedKeys(keys)) => {
+                        resolved_key_pairs_match(l, lschema, r, rschema, keys)?
+                    }
+                    None => true,
+                };
+                if keep {
+                    out.push(combined);
+                    matched = true;
+                    right_matched[ri] = true;
+                }
+            }
+            if matches!(kind, JoinKind::Left | JoinKind::Full) && !matched {
+                let mut combined = l.clone();
+                combined.extend(std::iter::repeat_n(Value::Null, rlen));
+                out.push(combined);
+            }
         }
     }
 
@@ -10714,6 +10753,91 @@ fn equi_keys(on: &Expr, lschema: &Schema, rschema: &Schema) -> Option<(Expr, Exp
     } else {
         None
     }
+}
+
+/// A pre-solved comparison between a column in the left schema and a column in
+/// the right schema. Recognising one (for a non-equi join like `a.v < b.v`) lets
+/// the nested-loop join compare two values directly per pair — neither cloning
+/// the full combined row nor evaluating the general predicate — and only clone
+/// for rows that survive the condition.
+struct CrossComparison {
+    left_col: usize,
+    right_col: usize,
+    bin: bool,
+    op: ComparisonOp,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ComparisonOp {
+    Eq,
+    NotEq,
+    Lt,
+    LtEq,
+    Gt,
+    GtEq,
+}
+
+impl CrossComparison {
+    #[inline]
+    fn matches_row(&self, lrow: &[Value], rrow: &[Value]) -> bool {
+        if lrow[self.left_col].is_null() || rrow[self.right_col].is_null() {
+            return false;
+        }
+        let coll = if self.bin {
+            elyra_core::Collation::Bin
+        } else {
+            elyra_core::Collation::Ci
+        };
+        let ordering = lrow[self.left_col].compare_coll(&rrow[self.right_col], coll);
+        match self.op {
+            ComparisonOp::Eq => ordering == Some(std::cmp::Ordering::Equal),
+            ComparisonOp::NotEq => ordering.is_some_and(|o| o != std::cmp::Ordering::Equal),
+            ComparisonOp::Lt => ordering == Some(std::cmp::Ordering::Less),
+            ComparisonOp::LtEq => ordering.is_some_and(|o| o != std::cmp::Ordering::Greater),
+            ComparisonOp::Gt => ordering == Some(std::cmp::Ordering::Greater),
+            ComparisonOp::GtEq => ordering.is_some_and(|o| o != std::cmp::Ordering::Less),
+        }
+    }
+}
+
+/// If `on` is `A <op> B` where `A` references only the left relation and `B`
+/// only the right (or vice-versa), return a pre-solved [`CrossComparison`].
+/// Falls back to `None` for anything more complex (literals, compound
+/// expressions), leaving the caller to use the general predicate evaluator.
+fn cross_comparison(on: &Expr, lschema: &Schema, rschema: &Schema) -> Option<CrossComparison> {
+    use sqlparser::ast::BinaryOperator as B;
+    let Expr::BinaryOp { left, op, right } = on else {
+        return None;
+    };
+    let op = match op {
+        B::Eq => ComparisonOp::Eq,
+        B::NotEq => ComparisonOp::NotEq,
+        B::Lt => ComparisonOp::Lt,
+        B::LtEq => ComparisonOp::LtEq,
+        B::Gt => ComparisonOp::Gt,
+        B::GtEq => ComparisonOp::GtEq,
+        _ => return None,
+    };
+    let (left_col, right_col) = if refs_in_schema(left, lschema) && refs_in_schema(right, rschema) {
+        (
+            expr_col_index(left, lschema)?,
+            expr_col_index(right, rschema)?,
+        )
+    } else if refs_in_schema(right, lschema) && refs_in_schema(left, rschema) {
+        (
+            expr_col_index(right, lschema)?,
+            expr_col_index(left, rschema)?,
+        )
+    } else {
+        return None;
+    };
+    let bin = expr_collation(left, lschema).is_bin() || expr_collation(right, rschema).is_bin();
+    Some(CrossComparison {
+        left_col,
+        right_col,
+        bin,
+        op,
+    })
 }
 
 /// Extract every cross-relation equality from a predicate made entirely of

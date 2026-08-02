@@ -11146,6 +11146,129 @@ async fn cross_join_streams_and_materialising_shapes_stay_bounded() {
     assert_eq!(got, Some(120));
 }
 
+/// Non-equi join results must match MySQL for every operator, including NULL
+/// handling, LEFT JOIN extensions, and the path that hits `combine`'s nested
+/// loop (the materialising path — no aggregate, no ORDER BY LIMIT).
+/// Expectations verified against MySQL 8.4.
+#[tokio::test]
+async fn non_equi_join_results_match_mysql() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    // Left: (1,1), (2,2), (3,3), (4,NULL), (5,1)
+    // Right: (1,2), (2,3), (3,1), (4,NULL), (5,1)
+    c.query_drop("CREATE TABLE ln (id INT PRIMARY KEY, v INT)")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE rn (id INT PRIMARY KEY, v INT)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO ln VALUES (1,1),(2,2),(3,3),(4,NULL),(5,1)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO rn VALUES (1,2),(2,3),(3,1),(4,NULL),(5,1)")
+        .await
+        .unwrap();
+
+    // All queries omit ORDER BY so they route through the materialising path
+    // (join_select → combine) which exercises the CrossComparison fast path.
+    // Sort the returned rows for deterministic assertions.
+
+    // --- a.v < b.v (INNER) ---
+    let mut rows: Vec<(i64, i64)> = c
+        .query("SELECT a.id, b.id FROM ln a JOIN rn b ON a.v < b.v")
+        .await
+        .unwrap();
+    rows.sort();
+    assert_eq!(rows, vec![(1, 1), (1, 2), (2, 2), (5, 1), (5, 2)]);
+
+    // --- a.v > b.v ---
+    let mut rows: Vec<(i64, i64)> = c
+        .query("SELECT a.id, b.id FROM ln a JOIN rn b ON a.v > b.v")
+        .await
+        .unwrap();
+    rows.sort();
+    assert_eq!(rows, vec![(2, 3), (2, 5), (3, 1), (3, 3), (3, 5)]);
+
+    // --- a.v <= b.v (includes equality) ---
+    let mut rows: Vec<(i64, i64)> = c
+        .query("SELECT a.id, b.id FROM ln a JOIN rn b ON a.v <= b.v")
+        .await
+        .unwrap();
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            (1, 1),
+            (1, 2),
+            (1, 3),
+            (1, 5),
+            (2, 1),
+            (2, 2),
+            (3, 2),
+            (5, 1),
+            (5, 2),
+            (5, 3),
+            (5, 5)
+        ]
+    );
+
+    // --- a.v = b.v ---
+    let mut rows: Vec<(i64, i64)> = c
+        .query("SELECT a.id, b.id FROM ln a JOIN rn b ON a.v = b.v")
+        .await
+        .unwrap();
+    rows.sort();
+    assert_eq!(rows, vec![(1, 3), (1, 5), (2, 1), (3, 2), (5, 3), (5, 5)]);
+
+    // --- a.v != b.v ---
+    let mut rows: Vec<(i64, i64)> = c
+        .query("SELECT a.id, b.id FROM ln a JOIN rn b ON a.v != b.v")
+        .await
+        .unwrap();
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            (1, 1),
+            (1, 2),
+            (2, 2),
+            (2, 3),
+            (2, 5),
+            (3, 1),
+            (3, 3),
+            (3, 5),
+            (5, 1),
+            (5, 2)
+        ]
+    );
+    // NULL right (b.id=4) must not appear.
+    assert!(!rows.iter().any(|(_, b)| *b == 4));
+    // NULL left (a.id=4) must not appear.
+    assert!(!rows.iter().any(|(a, _)| *a == 4));
+
+    // --- LEFT JOIN non-equi: unmatched left rows get NULL right ---
+    let mut rows: Vec<(i64, Option<i64>)> = c
+        .query("SELECT a.id, b.id FROM ln a LEFT JOIN rn b ON a.v > 1 AND a.v < b.v")
+        .await
+        .unwrap();
+    rows.sort_by_key(|(a, _)| *a);
+    assert_eq!(
+        rows,
+        vec![(1, None), (2, Some(2)), (3, None), (4, None), (5, None)]
+    );
+
+    // --- LEFT JOIN with impossible condition (all unmatched) ---
+    let mut rows: Vec<(i64, Option<i64>)> = c
+        .query("SELECT a.id, b.id FROM ln a LEFT JOIN rn b ON a.v = 999")
+        .await
+        .unwrap();
+    rows.sort_by_key(|(a, _)| *a);
+    assert_eq!(
+        rows,
+        vec![(1, None), (2, None), (3, None), (4, None), (5, None)]
+    );
+}
+
 /// A join `ON` whose sides are expressions must be attributed to the right
 /// relation. `equi_keys` asked "does this expression reference only left-schema
 /// columns?" through a resolver that falls back to matching on the bare column
