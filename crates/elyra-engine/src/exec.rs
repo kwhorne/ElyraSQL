@@ -13666,7 +13666,7 @@ fn compute_partition(
             let off = args
                 .get(1)
                 .and_then(|e| predicate::eval_row(e, schema, &rows[idxs[0]]).ok())
-                .and_then(|v| v.as_f64())
+                .and_then(|v| v.as_mysql_f64())
                 .unwrap_or(1.0) as isize;
             let default = match args.get(2) {
                 Some(e) => predicate::eval_row(e, schema, &rows[idxs[0]])?,
@@ -13726,7 +13726,7 @@ fn compute_partition(
             let buckets = args
                 .first()
                 .and_then(|e| predicate::eval_row(e, schema, &rows[idxs[0]]).ok())
-                .and_then(|v| v.as_f64())
+                .and_then(|v| v.as_mysql_f64())
                 .unwrap_or(1.0)
                 .max(1.0) as usize;
             let n = idxs.len();
@@ -13779,7 +13779,7 @@ fn compute_partition(
             let nth = args
                 .get(1)
                 .and_then(|e| predicate::eval_row(e, schema, &rows[idxs[0]]).ok())
-                .and_then(|v| v.as_f64())
+                .and_then(|v| v.as_mysql_f64())
                 .unwrap_or(1.0) as usize;
             let v = if nth >= 1 && nth <= idxs.len() {
                 arg_val(idxs[nth - 1])?
@@ -13874,7 +13874,7 @@ fn rows_bounds(
 
 fn const_isize(e: &Expr, schema: &Schema, rows: &[Vec<Value>], idxs: &[usize]) -> Result<isize> {
     let v = predicate::eval_row(e, schema, &rows[idxs[0]])?;
-    Ok(v.as_f64().unwrap_or(0.0) as isize)
+    Ok(v.as_mysql_f64().unwrap_or(0.0) as isize)
 }
 
 /// Aggregate `name` over the given member rows (evaluating `arg` per row).
@@ -13903,7 +13903,7 @@ fn agg_over(name: &str, vals: &[Value], count_star: usize) -> Value {
     match name {
         "count" => Value::Int(vals.iter().filter(|v| !v.is_null()).count() as i64),
         "sum" | "avg" => {
-            let nums: Vec<f64> = vals.iter().filter_map(|v| v.as_f64()).collect();
+            let nums: Vec<f64> = vals.iter().filter_map(Value::as_mysql_f64).collect();
             if nums.is_empty() {
                 return Value::Null;
             }
@@ -20907,6 +20907,113 @@ mod coercion_tests {
             coerce_with_mode(Value::Decimal(-15, 1), &ColumnType::UInt, "n", false).unwrap(),
             Value::UInt(0)
         );
+    }
+}
+
+#[cfg(test)]
+mod numeric_evaluation_coercion_tests {
+    use crate::{Engine, QueryResult, Session};
+    use elyra_core::{Privilege, Value};
+    use elyra_storage::Db;
+
+    async fn rows(engine: &Engine, session: &Session, sql: &str) -> Vec<Vec<Value>> {
+        let mut outcomes = engine
+            .execute(sql, Privilege::Admin, session)
+            .await
+            .unwrap_or_else(|error| panic!("query failed for {sql}: {error}"));
+        assert_eq!(outcomes.len(), 1, "expected one outcome for {sql}");
+        let QueryResult::Rows(mut stream) = outcomes.remove(0) else {
+            panic!("expected rows for {sql}");
+        };
+        let mut result = Vec::new();
+        loop {
+            let batch = stream.next_batch(128).await.unwrap();
+            if batch.is_empty() {
+                return result;
+            }
+            result.extend(batch);
+        }
+    }
+
+    #[tokio::test]
+    async fn numeric_evaluation_coerces_text_consistently() {
+        let engine = Engine::new(Db::in_memory().unwrap());
+        let session = engine.session();
+
+        assert_eq!(
+            rows(
+                &engine,
+                &session,
+                "SELECT '3.5tail' + 0, 0 + '3', '3' * 2, -'3tail', \
+                        CAST('3.25tail' AS FLOAT), CAST('4.5tail' AS DOUBLE), \
+                        ABS('-3.5tail'), ROUND('3.7tail'), SQRT('9tail'), \
+                        UNIX_TIMESTAMP('1970-01-02 00:00:00')",
+            )
+            .await,
+            vec![vec![
+                Value::Float(3.5),
+                Value::Float(3.0),
+                Value::Float(6.0),
+                Value::Float(-3.0),
+                Value::Float(3.25),
+                Value::Float(4.5),
+                Value::Float(3.5),
+                Value::Int(4),
+                Value::Float(3.0),
+                Value::Int(86_400),
+            ]]
+        );
+
+        assert_eq!(
+            rows(
+                &engine,
+                &session,
+                "SELECT 'not a number' + 1, CAST('not a number' AS FLOAT), \
+                        ABS('not a number'), ROUND('not a number'), \
+                        SQRT('not a number'), UNIX_TIMESTAMP('not a number'), \
+                        NULL + '3'",
+            )
+            .await,
+            vec![vec![
+                Value::Float(1.0),
+                Value::Float(0.0),
+                Value::Float(0.0),
+                Value::Int(0),
+                Value::Float(0.0),
+                Value::Int(0),
+                Value::Null,
+            ]]
+        );
+    }
+
+    #[tokio::test]
+    async fn sum_and_avg_include_text_coerced_to_zero() {
+        let engine = Engine::new(Db::in_memory().unwrap());
+        let session = engine.session();
+        engine
+            .execute(
+                "CREATE TABLE numeric_text (v VARCHAR(32))",
+                Privilege::Admin,
+                &session,
+            )
+            .await
+            .unwrap();
+        engine
+            .execute(
+                "INSERT INTO numeric_text VALUES ('2.5tail'), ('3'), ('not a number'), (NULL)",
+                Privilege::Admin,
+                &session,
+            )
+            .await
+            .unwrap();
+
+        let result = rows(&engine, &session, "SELECT SUM(v), AVG(v) FROM numeric_text").await;
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0][0], Value::Float(5.5));
+        let Value::Float(avg) = result[0][1] else {
+            panic!("AVG must return a float: {:?}", result[0][1]);
+        };
+        assert!((avg - 5.5 / 3.0).abs() < f64::EPSILON);
     }
 }
 

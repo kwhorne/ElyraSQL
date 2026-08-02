@@ -96,6 +96,20 @@ impl Value {
         }
     }
 
+    /// Numeric view for MySQL expression evaluation.
+    ///
+    /// In addition to native numeric values, MySQL evaluates text and JSON by
+    /// converting their leading numeric prefix. A value with no such prefix is
+    /// zero; only SQL `NULL` and values with no numeric representation stay
+    /// absent. Keep this separate from [`Self::as_f64`], whose callers need a
+    /// native numeric type rather than SQL's implicit conversion.
+    pub fn as_mysql_f64(&self) -> Option<f64> {
+        match self {
+            Value::Text(s) | Value::Json(s) => Some(mysql_numeric_prefix(s)),
+            _ => self.as_f64(),
+        }
+    }
+
     /// SQL comparison with implicit cross-type coercion. `None` when either
     /// operand is NULL (three-valued logic) or the types are incomparable.
     pub fn compare(&self, other: &Value) -> Option<Ordering> {
@@ -128,8 +142,9 @@ impl Value {
                 .zip(to_micros(other))
                 .map(|(a, b)| a.cmp(&b)),
             (Decimal(au, asc), Decimal(bu, bsc)) => Some(cmp_decimal(*au, *asc, *bu, *bsc)),
-            (Decimal(..), _) | (_, Decimal(..)) => coerce_f64(self)
-                .zip(coerce_f64(other))
+            (Decimal(..), _) | (_, Decimal(..)) => self
+                .as_mysql_f64()
+                .zip(other.as_mysql_f64())
                 .and_then(|(a, b)| a.partial_cmp(&b)),
             (Time(_), _) | (_, Time(_)) => to_micros_of_day(self)
                 .zip(to_micros_of_day(other))
@@ -148,8 +163,9 @@ impl Value {
             // Mixed numeric/string comparison coerces the string to a number
             // (MySQL implicit conversion), so `int_col = '5'` and bound
             // parameters rendered as string literals match numeric columns.
-            _ => coerce_f64(self)
-                .zip(coerce_f64(other))
+            _ => self
+                .as_mysql_f64()
+                .zip(other.as_mysql_f64())
                 .and_then(|(a, b)| a.partial_cmp(&b)),
         }
     }
@@ -344,15 +360,6 @@ pub fn canonical_f64_bits(f: f64) -> u64 {
         f64::NAN.to_bits() // canonical quiet NaN
     } else {
         f.to_bits()
-    }
-}
-
-/// Numeric value for comparison: the native numeric types, plus a numeric
-/// string parsed to a number (MySQL coerces strings in numeric comparisons).
-fn coerce_f64(v: &Value) -> Option<f64> {
-    match v {
-        Value::Text(s) | Value::Json(s) => Some(mysql_numeric_prefix(s)),
-        _ => v.as_f64(),
     }
 }
 
@@ -715,6 +722,24 @@ mod collation_tests {
                 "{text}"
             );
         }
+    }
+
+    #[test]
+    fn numeric_evaluation_uses_mysql_numeric_prefixes() {
+        for (text, number) in [
+            ("  -12.5e2suffix", -1250.0),
+            (".5remaining", 0.5),
+            ("1e+suffix", 1.0),
+            ("not a number", 0.0),
+            ("+.", 0.0),
+        ] {
+            assert_eq!(
+                Value::Text(text.into()).as_mysql_f64(),
+                Some(number),
+                "{text}"
+            );
+        }
+        assert_eq!(Value::Null.as_mysql_f64(), None);
     }
 
     #[test]
