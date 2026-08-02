@@ -6,6 +6,42 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **A multi-row `INSERT` could not satisfy a self-referencing foreign key from
+  its own rows (ESQL-58).** `INSERT INTO emp VALUES (1,NULL),(2,1),(3,2)` was
+  refused with 1452 while MySQL accepts it: the key was checked against the
+  table as it stood *before* the statement, so a row referencing one earlier in
+  the same batch found no parent. Every dump tool batches inserts, which made
+  any table with a `parent_id`-shaped key impossible to restore. Rows earlier in
+  the statement (and the row itself, for `(5,5)`) now count — while a *forward*
+  reference still fails, as it does in MySQL, because that is a genuine ordering
+  error rather than a batching artefact.
+- **A self-referencing `ON DELETE CASCADE` did not cascade (ESQL-59).** Deleting
+  the root of a hierarchy left its children behind, pointing at a row that no
+  longer existed — a table violating its own foreign key. The helper that finds
+  referencing tables skipped the table being deleted from, so a key pointing at
+  its own table never fired. Cascades now also run to a **fixed point**, so they
+  reach grandchildren instead of stopping after one level, with a depth bound
+  and a visited set so a cycle terminates. Relatedly, `DELETE FROM t` on a
+  self-referencing table without `CASCADE` is now refused with 1451 like MySQL,
+  instead of quietly deleting rows that were still referenced.
+- **Integer width is enforced (ESQL-56).** `TINYINT` accepted 300, `SMALLINT`
+  32768, `INT` 2147483648 — storage is 64-bit for every integer type, and
+  nothing carried the declared width, so MySQL's 1264 never happened. Widths are
+  now recorded and checked for `TINYINT`/`SMALLINT`/`MEDIUMINT`/`INT`, signed and
+  unsigned, and maintained through `ADD`/`DROP`/`MODIFY COLUMN`.
+
+  They live in a **separate catalog key**, not on `ColMeta`: `TableDef` is
+  bincode-encoded and bincode is positional, so a new field would make every
+  existing catalog undecodable. A table created before this release simply has
+  no widths recorded and keeps the old behaviour until it is recreated.
+- **`ADD COLUMN` accepted a name the table already had (ESQL-57)**, producing
+  two identically named columns — one unreachable, both occupying a slot in
+  every stored row, and DDL that could not be replayed. Now 1060 `42S21`,
+  matching MySQL, on both `ALTER TABLE ... ADD COLUMN` and `CREATE TABLE`, and
+  compared case-insensitively as MySQL does.
+
 ## [1.9.0] - 2026-08-02
 
 **Upgrade promptly.** This release fixes two bugs that could return or write the

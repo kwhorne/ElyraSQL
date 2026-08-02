@@ -127,6 +127,33 @@ fn regex_escape(s: &str) -> String {
     out
 }
 
+/// The declared width of an integer type, in bits, or `None` for anything whose
+/// range is the full 64 bits (or which is not an integer at all).
+///
+/// Storage is 64-bit regardless; this is only the *constraint* MySQL applies, so
+/// `TINYINT` refuses 300 while still occupying the same slot as a `BIGINT`.
+fn declared_int_bits(dt: &DataType) -> Option<u8> {
+    match dt {
+        DataType::TinyInt(_) | DataType::UnsignedTinyInt(_) => Some(8),
+        DataType::SmallInt(_) | DataType::UnsignedSmallInt(_) => Some(16),
+        DataType::MediumInt(_) | DataType::UnsignedMediumInt(_) => Some(24),
+        DataType::Int(_)
+        | DataType::Integer(_)
+        | DataType::UnsignedInt(_)
+        | DataType::UnsignedInteger(_) => Some(32),
+        _ => None,
+    }
+}
+
+/// Inclusive range a value must fall in for a column of `bits` width.
+fn int_bounds(bits: u8, unsigned: bool) -> (i128, i128) {
+    if unsigned {
+        (0, (1i128 << bits) - 1)
+    } else {
+        (-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1)
+    }
+}
+
 fn map_type(dt: &DataType) -> Result<ColumnType> {
     Ok(match dt {
         DataType::TinyInt(_) if is_tinyint_bool(dt) => ColumnType::Bool,
@@ -271,6 +298,17 @@ pub async fn create_table(
     let mut foreign_keys: Vec<ForeignKey> = Vec::new();
 
     for (idx, col) in ct.columns.iter().enumerate() {
+        // Same rule as ALTER TABLE ADD COLUMN: a table cannot hold two columns
+        // of the same name, so say so instead of creating one.
+        if ct.columns[..idx]
+            .iter()
+            .any(|earlier| predicate::identifier_eq(&earlier.name.value, &col.name.value))
+        {
+            return Err(Error::Duplicate(format!(
+                "duplicate column name '{}'",
+                col.name.value
+            )));
+        }
         let ty = map_type(&col.data_type)?;
         // ENUM columns are constrained to their declared members via a synthesized
         // CHECK (`col IN ('a','b',...)`), reusing the existing CHECK enforcement.
@@ -516,8 +554,23 @@ pub async fn create_table(
         checks,
         foreign_keys,
     };
-    db.commit_write(vec![(catalog_key(&name), def.encode()?)], vec![])
-        .await?;
+    let widths = catalog::ColumnWidths {
+        bits: ct
+            .columns
+            .iter()
+            .map(|c| declared_int_bits(&c.data_type))
+            .collect(),
+    };
+    // Written unconditionally: a table re-created under a name that previously
+    // had widths must not inherit them.
+    let puts = vec![
+        (catalog_key(&name), def.encode()?),
+        (
+            catalog::colwidth_key(&name),
+            bincode::serialize(&widths).map_err(|e| Error::Storage(e.to_string()))?,
+        ),
+    ];
+    db.commit_write(puts, vec![]).await?;
     Ok(QueryResult::Affected(0))
 }
 
@@ -2435,6 +2488,7 @@ async fn alter_change_column(
         }
         rebuild_indexes_for_column(db, def, i).await?;
     }
+    adjust_widths(db, &def.name, i, WidthOp::Set(declared_int_bits(data_type))).await?;
     Ok(())
 }
 
@@ -2536,11 +2590,68 @@ async fn recoerce_column(db: &Session, def: &TableDef, i: usize) -> Result<()> {
     Ok(())
 }
 
+/// Keep the declared-width list aligned with a table's columns as `ALTER`
+/// changes them. Absent list = a table from before widths were recorded; leave
+/// it absent so its behaviour does not change under the user.
+async fn adjust_widths(db: &Session, table: &str, at: usize, op: WidthOp) -> Result<()> {
+    let Some(mut widths) = catalog::load_widths(db, table).await? else {
+        return Ok(());
+    };
+    match op {
+        WidthOp::Insert(bits) => {
+            if at <= widths.bits.len() {
+                widths.bits.insert(at, bits);
+            }
+        }
+        WidthOp::Remove => {
+            if at < widths.bits.len() {
+                widths.bits.remove(at);
+            }
+        }
+        WidthOp::Set(bits) => {
+            if at < widths.bits.len() {
+                widths.bits[at] = bits;
+            }
+        }
+    }
+    db.commit_write(
+        vec![(
+            catalog::colwidth_key(table),
+            bincode::serialize(&widths).map_err(|e| Error::Storage(e.to_string()))?,
+        )],
+        vec![],
+    )
+    .await
+}
+
+enum WidthOp {
+    Insert(Option<u8>),
+    Remove,
+    Set(Option<u8>),
+}
+
 async fn alter_add_column(
     db: &Session,
     def: &mut TableDef,
     col: &sqlparser::ast::ColumnDef,
 ) -> Result<()> {
+    // Two columns of the same name is not a state the rest of the engine can
+    // represent: name resolution picks whichever it finds first, so the second
+    // is unreachable while still occupying a slot in every stored row, and the
+    // DDL we emit for the table can no longer be replayed. A migration runner
+    // retrying a partly applied migration is the usual way to get here, and it
+    // needs the same 1060 it would get from MySQL.
+    if def
+        .schema
+        .columns
+        .iter()
+        .any(|existing| predicate::identifier_eq(&existing.name, &col.name.value))
+    {
+        return Err(Error::Duplicate(format!(
+            "duplicate column name '{}'",
+            col.name.value
+        )));
+    }
     let ty = map_type(&col.data_type)?;
     let options = col
         .options
@@ -2665,6 +2776,13 @@ async fn alter_add_column(
     }
     puts.push(bump_wcount(db, &def.name).await?);
     db.commit_write(puts, deletes).await?;
+    adjust_widths(
+        db,
+        &def.name,
+        def.schema.columns.len().saturating_sub(1),
+        WidthOp::Insert(declared_int_bits(&col.data_type)),
+    )
+    .await?;
     Ok(())
 }
 
@@ -2762,6 +2880,7 @@ async fn alter_drop_column(db: &Session, def: &mut TableDef, name: &str) -> Resu
     }
     puts.push(bump_wcount(db, &def.name).await?);
     db.commit_write(puts, deletes).await?;
+    adjust_widths(db, &def.name, idx, WidthOp::Remove).await?;
     Ok(())
 }
 
@@ -3403,6 +3522,7 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
     // transaction itself (redb returns the previous value), avoiding any
     // existence read. This is the bulk-load hot path.
     if !replace && !on_dup && !ignore && has_pk && !db.in_txn() {
+        check_widths_batch(db, &def, &built).await?;
         if !def.foreign_keys.is_empty() {
             check_fk_batch(db, &def, &built).await?;
         }
@@ -3513,6 +3633,7 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
     if !replace && !on_dup && !ignore && index::has_unique(&def) {
         check_unique_batch(db, &def, &batch).await?;
     }
+    check_widths_batch(db, &def, &batch).await?;
     if !def.foreign_keys.is_empty() {
         check_fk_batch(db, &def, &batch).await?;
     }
@@ -3997,6 +4118,20 @@ fn check_row(def: &TableDef, checks: &[Expr], row: &[Value]) -> Result<()> {
 
 /// The parent-table storage key to probe for a referenced-key's existence.
 /// Foreign keys must reference the parent's primary key or a unique index.
+/// Positions of `ref_cols` in the parent's schema, or `None` if any is unknown.
+fn referenced_column_indexes(parent: &TableDef, ref_cols: &[String]) -> Option<Vec<usize>> {
+    ref_cols
+        .iter()
+        .map(|name| {
+            parent
+                .schema
+                .columns
+                .iter()
+                .position(|c| predicate::identifier_eq(&c.name, name))
+        })
+        .collect()
+}
+
 fn fk_probe_key(parent: &TableDef, ref_cols: &[String], vals: &[Value]) -> Result<Vec<u8>> {
     let name_match = |cols: &[usize]| {
         cols.len() == ref_cols.len()
@@ -4022,6 +4157,44 @@ fn fk_probe_key(parent: &TableDef, ref_cols: &[String], vals: &[Value]) -> Resul
     )))
 }
 
+/// Refuse values that do not fit their column's *declared* integer width.
+///
+/// Storage is 64-bit for every integer type, so this is the only thing standing
+/// between `TINYINT` and a value MySQL would reject with 1264. Tables written
+/// before widths were recorded have no entry and keep the old behaviour.
+async fn check_widths_batch(
+    db: &Session,
+    def: &TableDef,
+    batch: &[(Vec<u8>, Vec<Value>)],
+) -> Result<()> {
+    let Some(widths) = catalog::load_widths(db, &def.name).await? else {
+        return Ok(());
+    };
+    for (_, row) in batch {
+        for (i, bits) in widths.bits.iter().enumerate() {
+            let (Some(bits), Some(value), Some(column)) =
+                (*bits, row.get(i), def.schema.columns.get(i))
+            else {
+                continue;
+            };
+            let unsigned = matches!(column.ty, ColumnType::UInt);
+            let n: i128 = match value {
+                Value::Int(v) => *v as i128,
+                Value::UInt(v) => *v as i128,
+                _ => continue,
+            };
+            let (lo, hi) = int_bounds(bits, unsigned);
+            if n < lo || n > hi {
+                return Err(Error::OutOfRange(format!(
+                    "value {n} is out of range for column '{}'",
+                    column.name
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Verify every foreign key of `def` for the rows in `batch`: each non-NULL
 /// referencing tuple must exist in the parent (error 1452 otherwise).
 async fn check_fk_batch(
@@ -4030,22 +4203,50 @@ async fn check_fk_batch(
     batch: &[(Vec<u8>, Vec<Value>)],
 ) -> Result<()> {
     for fk in &def.foreign_keys {
-        let mut referenced_values = Vec::new();
+        // A self-referencing key can be satisfied by a row of this same
+        // statement: MySQL checks each row as it is inserted, so a row may point
+        // at one written *earlier in the batch* (or at itself). Batched dumps of
+        // any `parent_id`-shaped table depend on this — without it a multi-row
+        // INSERT of a hierarchy is refused however it is ordered.
+        let parent_is_self = predicate::identifier_eq(&fk.ref_table, &def.name);
+        let parent = if parent_is_self {
+            def.clone()
+        } else {
+            catalog::load(db, &fk.ref_table).await?
+        };
+        let parent_key_cols = if parent_is_self {
+            referenced_column_indexes(&parent, &fk.ref_columns)
+        } else {
+            None
+        };
+
+        let mut supplied: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        let mut probes = Vec::new();
         for (_, row) in batch {
+            // Record what this row offers as a parent before checking what it
+            // needs, so a row that references itself (`(5, 5)`) is satisfied.
+            if let Some(cols) = &parent_key_cols {
+                let key_vals: Vec<Value> = cols.iter().map(|&i| row[i].clone()).collect();
+                if !key_vals.iter().any(|v| v.is_null()) {
+                    if let Ok(key) = fk_probe_key(&parent, &fk.ref_columns, &key_vals) {
+                        supplied.insert(key);
+                    }
+                }
+            }
+
             let vals: Vec<Value> = fk.columns.iter().map(|&i| row[i].clone()).collect();
             if vals.iter().any(|v| v.is_null()) {
                 continue; // a NULL in the referencing tuple is allowed
             }
-            referenced_values.push(vals);
+            let probe = fk_probe_key(&parent, &fk.ref_columns, &vals)?;
+            if supplied.contains(&probe) {
+                continue; // satisfied by an earlier row of this statement
+            }
+            probes.push(probe);
         }
-        if referenced_values.is_empty() {
+        if probes.is_empty() {
             continue;
         }
-        let parent = catalog::load(db, &fk.ref_table).await?;
-        let probes = referenced_values
-            .iter()
-            .map(|values| fk_probe_key(&parent, &fk.ref_columns, values))
-            .collect::<Result<Vec<_>>>()?;
         for found in db.multi_get(probes).await? {
             if found.is_none() {
                 return Err(Error::ForeignKey(format!(
@@ -11110,6 +11311,7 @@ pub async fn update(
     if check_uniq {
         check_unique_batch(db, &def, &uniq_batch).await?;
     }
+    check_widths_batch(db, &def, &uniq_batch).await?;
     if check_fk {
         check_fk_batch(db, &def, &uniq_batch).await?;
     }
@@ -11247,13 +11449,13 @@ pub async fn delete(
     Ok(QueryResult::Affected(affected))
 }
 
-/// Tables (other than `parent`) that declare a foreign key referencing it.
+/// Tables that declare a foreign key referencing `parent`, **including `parent`
+/// itself** when it references its own key. Excluding it meant a self-referencing
+/// `ON DELETE CASCADE` never fired, so deleting the root of a hierarchy left the
+/// children behind pointing at a row that no longer existed.
 async fn referencing_children(db: &Session, parent: &str) -> Result<Vec<TableDef>> {
     let mut out = Vec::new();
     for t in catalog::list_tables(db).await? {
-        if t.eq_ignore_ascii_case(parent) {
-            continue;
-        }
         let def = catalog::load(db, &t).await?;
         if def
             .foreign_keys
@@ -11268,7 +11470,11 @@ async fn referencing_children(db: &Session, parent: &str) -> Result<Vec<TableDef
 
 /// Apply referential actions for deleted `parent` rows: block on RESTRICT/NO
 /// ACTION, delete child rows on CASCADE, or null their FK columns on SET NULL.
-/// (Single level — cascades do not currently recurse into grandchildren.)
+///
+/// Runs to a fixed point, so a cascade reaches grandchildren and follows a
+/// self-referencing key down a hierarchy. Rows already removed are remembered,
+/// which both prevents duplicate work and terminates a cycle; `MAX_CASCADE_DEPTH`
+/// is a backstop so a pathological schema cannot loop forever.
 async fn cascade_parent_delete(
     db: &Session,
     parent: &TableDef,
@@ -11277,6 +11483,53 @@ async fn cascade_parent_delete(
     deletes: &mut Vec<Vec<u8>>,
     wcounts: &mut Vec<String>,
     scheduled_deletes: Option<&std::collections::HashSet<Vec<u8>>>,
+) -> Result<()> {
+    const MAX_CASCADE_DEPTH: usize = 64;
+    let mut removed: std::collections::HashSet<Vec<u8>> = scheduled_deletes
+        .map(|keys| keys.iter().cloned().collect())
+        .unwrap_or_default();
+    let mut frontier: CascadeLevel = vec![(parent.clone(), matches.to_vec())];
+    for _ in 0..MAX_CASCADE_DEPTH {
+        let mut next: CascadeLevel = Vec::new();
+        for (level_parent, level_rows) in &frontier {
+            cascade_one_level(
+                db,
+                level_parent,
+                level_rows,
+                puts,
+                deletes,
+                wcounts,
+                &mut removed,
+                &mut next,
+            )
+            .await?;
+        }
+        if next.is_empty() {
+            return Ok(());
+        }
+        frontier = next;
+    }
+    Err(Error::Query(format!(
+        "ON DELETE CASCADE exceeded {MAX_CASCADE_DEPTH} levels from '{}'",
+        parent.name
+    )))
+}
+
+/// A table and the rows of it that were just deleted, for the next cascade level.
+type CascadeLevel = Vec<(TableDef, Vec<(Vec<u8>, Vec<Value>)>)>;
+
+/// One level of the cascade. Newly deleted child rows are appended to `next` so
+/// the caller can follow them.
+#[allow(clippy::too_many_arguments)]
+async fn cascade_one_level(
+    db: &Session,
+    parent: &TableDef,
+    matches: &[(Vec<u8>, Vec<Value>)],
+    puts: &mut Vec<(Vec<u8>, Vec<u8>)>,
+    deletes: &mut Vec<Vec<u8>>,
+    wcounts: &mut Vec<String>,
+    removed: &mut std::collections::HashSet<Vec<u8>>,
+    next: &mut CascadeLevel,
 ) -> Result<()> {
     let children = referencing_children(db, &parent.name).await?;
     if children.is_empty() || matches.is_empty() {
@@ -11313,18 +11566,23 @@ async fn cascade_parent_delete(
                 }
                 match fk.on_delete {
                     RefAction::Cascade => {
+                        let mut cascaded: Vec<(Vec<u8>, Vec<Value>)> = Vec::new();
                         for (ck, crow) in child_rows {
-                            if scheduled_deletes.is_some_and(|keys| keys.contains(&ck)) {
-                                continue;
+                            if !removed.insert(ck.clone()) {
+                                continue; // already going, or scheduled by the caller
                             }
                             deletes.extend(index::entry_keys_for_row(child, &crow, &ck)?);
-                            deletes.push(ck);
+                            deletes.push(ck.clone());
+                            cascaded.push((ck, crow));
                             touched = true;
+                        }
+                        if !cascaded.is_empty() {
+                            next.push((child.clone(), cascaded));
                         }
                     }
                     RefAction::SetNull => {
                         for (ck, crow) in child_rows {
-                            if scheduled_deletes.is_some_and(|keys| keys.contains(&ck)) {
+                            if removed.contains(&ck) {
                                 continue;
                             }
                             let mut nrow = crow.clone();
@@ -11340,9 +11598,10 @@ async fn cascade_parent_delete(
                         }
                     }
                     _ => {
-                        if scheduled_deletes.is_some_and(|keys| {
-                            child_rows.iter().all(|(key, _)| keys.contains(key))
-                        }) {
+                        // A row that is itself being deleted cannot block the
+                        // delete: that is what makes `DELETE FROM t` work on a
+                        // self-referencing table.
+                        if child_rows.iter().all(|(key, _)| removed.contains(key)) {
                             continue;
                         }
                         return Err(Error::ForeignKey(format!(
@@ -19188,6 +19447,7 @@ async fn table_delete_keys(db: &Session, name: &str) -> Result<Vec<Vec<u8>>> {
         rowid_key(name),
         autoinc_key(name),
         temp_owner_key(name),
+        catalog::colwidth_key(name),
     ];
     for prefix in [
         data_prefix(name),

@@ -631,6 +631,259 @@ async fn create_database_fails_instead_of_succeeding_as_a_noop() {
     );
 }
 
+/// Declared integer width is a constraint, not just documentation: storage is
+/// 64-bit for every integer type, so nothing else stops a `TINYINT` holding 300
+/// (ESQL-56). Widths live in a separate catalog key, so a table created before
+/// this existed keeps the old behaviour instead of changing under the user.
+#[tokio::test]
+async fn integer_width_is_enforced_and_survives_alter() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    for (i, (ty, ok, too_big)) in [
+        ("TINYINT", 127i64, 128i64),
+        ("SMALLINT", 32767, 32768),
+        ("MEDIUMINT", 8388607, 8388608),
+        ("INT", 2147483647, 2147483648),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let t = format!("w{i}");
+        c.query_drop(format!("CREATE TABLE {t} (a {ty})"))
+            .await
+            .unwrap();
+        c.query_drop(format!("INSERT INTO {t} VALUES ({ok})"))
+            .await
+            .unwrap();
+        match c
+            .query_drop(format!("INSERT INTO {t} VALUES ({too_big})"))
+            .await
+            .unwrap_err()
+        {
+            mysql_async::Error::Server(e) => {
+                assert_eq!(e.code, 1264, "{ty}");
+                assert_eq!(e.state, "22003", "{ty}");
+            }
+            other => panic!("{ty} accepted {too_big}: {other:?}"),
+        }
+    }
+
+    // Unsigned bounds, and the negative end of a signed one.
+    c.query_drop("CREATE TABLE wu (a TINYINT UNSIGNED, b TINYINT)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO wu VALUES (255, -128)")
+        .await
+        .unwrap();
+    for bad in [
+        "INSERT INTO wu VALUES (256, 0)",
+        "INSERT INTO wu VALUES (0, -129)",
+    ] {
+        assert!(
+            matches!(c.query_drop(bad).await.unwrap_err(),
+                     mysql_async::Error::Server(ref e) if e.code == 1264),
+            "{bad}"
+        );
+    }
+
+    // BIGINT has no narrower bound to apply.
+    c.query_drop("CREATE TABLE wb (a BIGINT)").await.unwrap();
+    c.query_drop("INSERT INTO wb VALUES (9223372036854775807)")
+        .await
+        .unwrap();
+
+    // The width list has to track ALTER, or it drifts out of alignment with the
+    // columns and starts rejecting the wrong ones.
+    c.query_drop("CREATE TABLE wa (id INT PRIMARY KEY, a BIGINT)")
+        .await
+        .unwrap();
+    c.query_drop("ALTER TABLE wa ADD COLUMN t TINYINT")
+        .await
+        .unwrap();
+    assert!(matches!(
+        c.query_drop("INSERT INTO wa VALUES (1,1,300)").await.unwrap_err(),
+        mysql_async::Error::Server(ref e) if e.code == 1264
+    ));
+    c.query_drop("INSERT INTO wa VALUES (2,1,100)")
+        .await
+        .unwrap();
+    c.query_drop("ALTER TABLE wa MODIFY t BIGINT")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO wa VALUES (3,1,300)")
+        .await
+        .unwrap();
+    c.query_drop("ALTER TABLE wa DROP COLUMN a").await.unwrap();
+    c.query_drop("INSERT INTO wa VALUES (4, 999999999999)")
+        .await
+        .unwrap();
+
+    // A table re-created under a name that had widths must not inherit them.
+    c.query_drop("DROP TABLE wa").await.unwrap();
+    c.query_drop("CREATE TABLE wa (a BIGINT)").await.unwrap();
+    c.query_drop("INSERT INTO wa VALUES (9223372036854775807)")
+        .await
+        .unwrap();
+}
+
+/// A table cannot hold two columns of the same name: name resolution would pick
+/// one and the other would be unreachable but still occupy a slot in every row
+/// (ESQL-57).
+#[tokio::test]
+async fn a_duplicate_column_name_is_refused() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    let dup = c
+        .query_drop("CREATE TABLE d (a INT, b INT, a TEXT)")
+        .await
+        .unwrap_err();
+    match dup {
+        mysql_async::Error::Server(ref e) => {
+            assert_eq!(e.code, 1060);
+            assert_eq!(e.state, "42S21");
+        }
+        other => panic!("expected 1060, got {other:?}"),
+    }
+
+    c.query_drop("CREATE TABLE d (id INT PRIMARY KEY, a INT)")
+        .await
+        .unwrap();
+    // Case-insensitively, as MySQL compares column names.
+    for sql in [
+        "ALTER TABLE d ADD COLUMN a INT",
+        "ALTER TABLE d ADD COLUMN A INT",
+        "ALTER TABLE d ADD COLUMN b INT, ADD COLUMN a INT",
+    ] {
+        assert!(
+            matches!(c.query_drop(sql).await.unwrap_err(),
+                     mysql_async::Error::Server(ref e) if e.code == 1060),
+            "{sql}"
+        );
+    }
+    // The refused multi-operation ALTER left nothing behind (see #37).
+    let cols: Vec<(String, String, String, String, Option<String>, String)> =
+        c.query("SHOW COLUMNS FROM d").await.unwrap();
+    assert_eq!(cols.len(), 2, "a failed ALTER must not add columns");
+}
+
+/// A self-referencing `ON DELETE CASCADE` has to follow the chain, or deleting
+/// the root of a hierarchy leaves rows pointing at a parent that is gone
+/// (ESQL-59).
+#[tokio::test]
+async fn a_self_referencing_cascade_follows_the_chain() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop(
+        "CREATE TABLE cc (id INT PRIMARY KEY, p INT,
+         FOREIGN KEY (p) REFERENCES cc(id) ON DELETE CASCADE)",
+    )
+    .await
+    .unwrap();
+    c.query_drop("INSERT INTO cc VALUES (1,NULL),(2,1),(3,2),(4,3)")
+        .await
+        .unwrap();
+
+    c.query_drop("DELETE FROM cc WHERE id = 1").await.unwrap();
+    let left: Option<i64> = c.query_first("SELECT COUNT(*) FROM cc").await.unwrap();
+    assert_eq!(left, Some(0), "the whole chain must go, not just the root");
+
+    // Without CASCADE, a row that is still referenced blocks the delete -- and a
+    // referencing row is not exempt just because it is in the same table.
+    c.query_drop("CREATE TABLE nc (id INT PRIMARY KEY, p INT, FOREIGN KEY (p) REFERENCES nc(id))")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO nc VALUES (1,NULL),(2,1)")
+        .await
+        .unwrap();
+    assert!(matches!(
+        c.query_drop("DELETE FROM nc WHERE id = 1").await.unwrap_err(),
+        mysql_async::Error::Server(ref e) if e.code == 1451 || e.code == 1452
+    ));
+    let left: Option<i64> = c.query_first("SELECT COUNT(*) FROM nc").await.unwrap();
+    assert_eq!(left, Some(2));
+}
+
+/// MySQL checks a foreign key as each row of a multi-row `INSERT` is written, so
+/// a row may reference one written earlier in the same statement -- or itself.
+/// Every dump tool batches inserts, so without this a table with a
+/// `parent_id`-shaped key cannot be restored (ESQL-58).
+#[tokio::test]
+async fn a_batched_insert_satisfies_its_own_self_referencing_key() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop(
+        "CREATE TABLE emp (id INT PRIMARY KEY, boss INT, FOREIGN KEY (boss) REFERENCES emp(id))",
+    )
+    .await
+    .unwrap();
+
+    // A hierarchy in one statement, parents before children.
+    c.query_drop("INSERT INTO emp VALUES (1,NULL),(2,1),(3,2)")
+        .await
+        .unwrap();
+    let n: Option<i64> = c.query_first("SELECT COUNT(*) FROM emp").await.unwrap();
+    assert_eq!(n, Some(3));
+
+    // A row may reference itself.
+    c.query_drop("INSERT INTO emp VALUES (5,5)").await.unwrap();
+
+    // ... but only rows *earlier* in the statement count, as in MySQL.
+    let forward = c
+        .query_drop("INSERT INTO emp VALUES (7,8),(8,NULL)")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(forward, mysql_async::Error::Server(ref e) if e.code == 1452),
+        "a forward reference must still fail: {forward:?}"
+    );
+
+    // A parent that exists nowhere is still refused, and nothing is written.
+    let missing = c
+        .query_drop("INSERT INTO emp VALUES (10,NULL),(11,99)")
+        .await
+        .unwrap_err();
+    assert!(matches!(missing, mysql_async::Error::Server(ref e) if e.code == 1452));
+    let n: Option<i64> = c.query_first("SELECT COUNT(*) FROM emp").await.unwrap();
+    assert_eq!(n, Some(4), "the refused batch must not have been written");
+
+    // A composite self key behaves the same way.
+    c.query_drop(
+        "CREATE TABLE comp (a INT, b INT, pa INT, pb INT, PRIMARY KEY (a,b),
+         FOREIGN KEY (pa,pb) REFERENCES comp(a,b))",
+    )
+    .await
+    .unwrap();
+    c.query_drop("INSERT INTO comp VALUES (1,1,NULL,NULL),(2,2,1,1)")
+        .await
+        .unwrap();
+    let bad = c
+        .query_drop("INSERT INTO comp VALUES (3,3,9,9)")
+        .await
+        .unwrap_err();
+    assert!(matches!(bad, mysql_async::Error::Server(ref e) if e.code == 1452));
+
+    // A key pointing at another table is unaffected by any of this.
+    c.query_drop("CREATE TABLE par (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop(
+        "CREATE TABLE ch (id INT PRIMARY KEY, pid INT, FOREIGN KEY (pid) REFERENCES par(id))",
+    )
+    .await
+    .unwrap();
+    let orphan = c
+        .query_drop("INSERT INTO ch VALUES (1,99)")
+        .await
+        .unwrap_err();
+    assert!(matches!(orphan, mysql_async::Error::Server(ref e) if e.code == 1452));
+    c.query_drop("INSERT INTO par VALUES (99)").await.unwrap();
+    c.query_drop("INSERT INTO ch VALUES (1,99)").await.unwrap();
+}
+
 /// `UNSIGNED` is a constraint, not a width. Every integer width is stored as 64
 /// bits here, but the signedness has to be enforced on all of them or the same
 /// schema is enforced inconsistently -- which is what happened while only
