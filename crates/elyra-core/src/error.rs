@@ -42,6 +42,9 @@ pub enum Error {
     #[error("out of range: {0}")]
     OutOfRange(String),
 
+    #[error("data too long: {0}")]
+    DataTooLong(String),
+
     #[error("vector error: {0}")]
     Vector(String),
 
@@ -70,6 +73,7 @@ impl Error {
             // 1690 for an expression that overflows its type. Storing a value is
             // by far the common case here, and both share SQLSTATE 22003.
             Error::OutOfRange(_) => 1264,  // ER_WARN_DATA_OUT_OF_RANGE
+            Error::DataTooLong(_) => 1406, // ER_DATA_TOO_LONG
             Error::Unsupported(_) => 1235, // ER_NOT_SUPPORTED_YET
             Error::Conflict(_) => 1213,    // ER_LOCK_DEADLOCK (serialization failure)
             // A duplicate *key value* and a duplicate *column name* are
@@ -96,6 +100,7 @@ impl Error {
             Error::UnknownTable(_) => b"42S02",
             Error::UnknownColumn(_) => b"42S22",
             Error::OutOfRange(_) => b"22003",
+            Error::DataTooLong(_) => b"22001",
             Error::Duplicate(m) if m.starts_with("duplicate column name") => b"42S21",
             _ => b"HY000",
         }
@@ -152,5 +157,12 @@ mod catalog_code_tests {
             Error::Catalog("no such table: t".into()).sqlstate(),
             b"42S02"
         );
+    }
+
+    #[test]
+    fn data_too_long_uses_mysqls_string_truncation_error() {
+        let error = Error::DataTooLong("Data too long for column 'name' at row 1".into());
+        assert_eq!(error.mysql_code(), 1406);
+        assert_eq!(error.sqlstate(), b"22001");
     }
 }

@@ -6,11 +6,11 @@
 use crate::session::Session;
 use elyra_core::{ColumnDef, ColumnType, Error, Result, Schema, Value};
 use sqlparser::ast::{
-    AlterColumnOperation, AlterTableOperation, Assignment, AssignmentTarget, ColumnOption,
-    CreateIndex, CreateTable, DataType, Delete, FromTable, Ident, Insert, JoinConstraint,
-    JoinOperator, ObjectName, OrderByExpr, Query as SqlQuery, Select, SetExpr, TableAlias,
-    TableAliasColumnDef, TableConstraint, TableFactor, TableWithJoins, Visit, VisitMut, Visitor,
-    VisitorMut, With,
+    AlterColumnOperation, AlterTableOperation, Assignment, AssignmentTarget, CharacterLength,
+    ColumnOption, CreateIndex, CreateTable, DataType, Delete, ExactNumberInfo, FromTable, Ident,
+    Insert, JoinConstraint, JoinOperator, ObjectName, OrderByExpr, Query as SqlQuery, Select,
+    SetExpr, TableAlias, TableAliasColumnDef, TableConstraint, TableFactor, TableWithJoins, Visit,
+    VisitMut, Visitor, VisitorMut, With,
 };
 use std::ops::ControlFlow;
 
@@ -154,6 +154,193 @@ fn int_bounds(bits: u8, unsigned: bool) -> (i128, i128) {
     }
 }
 
+fn character_length(length: &Option<CharacterLength>) -> Option<u64> {
+    match length {
+        Some(CharacterLength::IntegerLength { length, .. }) => Some(*length),
+        Some(CharacterLength::Max) | None => None,
+    }
+}
+
+fn exact_number(precision: &ExactNumberInfo) -> (u64, u64) {
+    match precision {
+        ExactNumberInfo::None => (10, 0),
+        ExactNumberInfo::Precision(precision) => (*precision, 0),
+        ExactNumberInfo::PrecisionAndScale(precision, scale) => (*precision, *scale),
+    }
+}
+
+fn declaration(
+    data_type: impl Into<String>,
+    column_type: impl Into<String>,
+    character_maximum_length: Option<u64>,
+    numeric_precision: Option<u64>,
+    numeric_scale: Option<u64>,
+) -> catalog::ColumnDeclaration {
+    catalog::ColumnDeclaration {
+        data_type: data_type.into(),
+        column_type: column_type.into(),
+        character_maximum_length,
+        numeric_precision,
+        numeric_scale,
+    }
+}
+
+fn integer_declaration(
+    name: &str,
+    display_width: Option<u64>,
+    unsigned: bool,
+    precision: u64,
+) -> catalog::ColumnDeclaration {
+    let display_width = (name == "tinyint").then_some(display_width).flatten();
+    let mut column_type = match display_width {
+        Some(width) => format!("{name}({width})"),
+        None => name.to_owned(),
+    };
+    if unsigned {
+        column_type.push_str(" unsigned");
+    }
+    declaration(name, column_type, None, Some(precision), Some(0))
+}
+
+/// Preserve the MySQL declaration separately from the compact storage type.
+/// `ColumnType` intentionally merges families that share a representation
+/// (for example `INT` and `BIGINT`), so it cannot reconstruct this later.
+fn declaration_from_data_type(dt: &DataType) -> Result<catalog::ColumnDeclaration> {
+    Ok(match dt {
+        DataType::Bool | DataType::Boolean => {
+            declaration("tinyint", "tinyint(1)", None, Some(3), Some(0))
+        }
+        DataType::TinyInt(width) => integer_declaration("tinyint", *width, false, 3),
+        DataType::UnsignedTinyInt(width) => integer_declaration("tinyint", *width, true, 3),
+        DataType::SmallInt(width) => integer_declaration("smallint", *width, false, 5),
+        DataType::UnsignedSmallInt(width) => integer_declaration("smallint", *width, true, 5),
+        DataType::MediumInt(width) => integer_declaration("mediumint", *width, false, 7),
+        DataType::UnsignedMediumInt(width) => integer_declaration("mediumint", *width, true, 7),
+        DataType::Int(width) | DataType::Integer(width) => {
+            integer_declaration("int", *width, false, 10)
+        }
+        DataType::UnsignedInt(width) | DataType::UnsignedInteger(width) => {
+            integer_declaration("int", *width, true, 10)
+        }
+        DataType::BigInt(width) => integer_declaration("bigint", *width, false, 19),
+        DataType::UnsignedBigInt(width) => integer_declaration("bigint", *width, true, 20),
+        DataType::Varchar(length)
+        | DataType::Nvarchar(length)
+        | DataType::CharacterVarying(length)
+        | DataType::CharVarying(length) => {
+            let maximum = character_length(length);
+            let column_type = maximum
+                .map(|length| format!("varchar({length})"))
+                .unwrap_or_else(|| "varchar".into());
+            declaration("varchar", column_type, maximum, None, None)
+        }
+        DataType::Char(length) | DataType::Character(length) => {
+            let maximum = character_length(length).or(Some(1));
+            let column_type = maximum
+                .map(|length| format!("char({length})"))
+                .unwrap_or_else(|| "char".into());
+            declaration("char", column_type, maximum, None, None)
+        }
+        DataType::Text => declaration("text", "text", Some(65_535), None, None),
+        DataType::TinyText => declaration("tinytext", "tinytext", Some(255), None, None),
+        DataType::MediumText => {
+            declaration("mediumtext", "mediumtext", Some(16_777_215), None, None)
+        }
+        DataType::LongText => declaration("longtext", "longtext", Some(4_294_967_295), None, None),
+        DataType::Datetime(precision) => {
+            let column_type = precision
+                .map(|precision| format!("datetime({precision})"))
+                .unwrap_or_else(|| "datetime".into());
+            declaration("datetime", column_type, None, None, None)
+        }
+        DataType::Timestamp(precision, _) => {
+            let column_type = precision
+                .map(|precision| format!("timestamp({precision})"))
+                .unwrap_or_else(|| "timestamp".into());
+            declaration("timestamp", column_type, None, None, None)
+        }
+        DataType::Decimal(info) | DataType::Numeric(info) | DataType::Dec(info) => {
+            let (precision, scale) = exact_number(info);
+            declaration(
+                "decimal",
+                format!("decimal({precision},{scale})"),
+                None,
+                Some(precision),
+                Some(scale),
+            )
+        }
+        _ => declaration_from_storage_type(&map_type(dt)?),
+    })
+}
+
+/// Metadata fallback for catalogs created before declared-type sidecars existed.
+fn declaration_from_storage_type(ty: &ColumnType) -> catalog::ColumnDeclaration {
+    match ty {
+        ColumnType::Bool => declaration("tinyint", "tinyint(1)", None, Some(3), Some(0)),
+        ColumnType::Int => declaration("bigint", "bigint", None, Some(19), Some(0)),
+        ColumnType::UInt => declaration("bigint", "bigint unsigned", None, Some(20), Some(0)),
+        ColumnType::Float => declaration("double", "double", None, Some(53), None),
+        ColumnType::Text => declaration("text", "text", Some(65_535), None, None),
+        ColumnType::Bytes => declaration("blob", "blob", None, None, None),
+        ColumnType::Vector(dimension) => {
+            declaration("vector", format!("vector({dimension})"), None, None, None)
+        }
+        ColumnType::Date => declaration("date", "date", None, None, None),
+        ColumnType::DateTime => declaration("datetime", "datetime", None, None, None),
+        ColumnType::Decimal(precision, scale) => declaration(
+            "decimal",
+            format!("decimal({precision},{scale})"),
+            None,
+            Some(u64::from(*precision)),
+            Some(u64::from(*scale)),
+        ),
+        ColumnType::Time => declaration("time", "time", None, None, None),
+        ColumnType::Json => declaration("json", "json", None, None, None),
+    }
+}
+
+fn column_declaration<'a>(
+    declarations: Option<&'a catalog::ColumnDeclarations>,
+    column: &ColumnDef,
+    index: usize,
+) -> std::borrow::Cow<'a, catalog::ColumnDeclaration> {
+    declarations
+        .and_then(|declarations| declarations.columns.get(index))
+        .map(std::borrow::Cow::Borrowed)
+        .unwrap_or_else(|| std::borrow::Cow::Owned(declaration_from_storage_type(&column.ty)))
+}
+
+fn optional_u64_value(value: Option<u64>) -> Value {
+    value
+        .and_then(|value| i64::try_from(value).ok())
+        .map(Value::Int)
+        .unwrap_or(Value::Null)
+}
+
+fn check_declared_character_length(
+    declaration: &catalog::ColumnDeclaration,
+    value: &Value,
+    column: &str,
+    row_number: usize,
+) -> Result<()> {
+    if !matches!(declaration.data_type.as_str(), "char" | "varchar") {
+        return Ok(());
+    }
+    let Some(maximum) = declaration.character_maximum_length else {
+        return Ok(());
+    };
+    let Some(value) = value.to_wire_string() else {
+        return Ok(());
+    };
+    let too_long = usize::try_from(maximum).map_or(true, |maximum| value.chars().count() > maximum);
+    if too_long {
+        return Err(Error::DataTooLong(format!(
+            "Data too long for column '{column}' at row {row_number}"
+        )));
+    }
+    Ok(())
+}
+
 fn map_type(dt: &DataType) -> Result<ColumnType> {
     Ok(match dt {
         DataType::TinyInt(_) if is_tinyint_bool(dt) => ColumnType::Bool,
@@ -188,6 +375,8 @@ fn map_type(dt: &DataType) -> Result<ColumnType> {
         | DataType::Varchar(_)
         | DataType::Nvarchar(_)
         | DataType::CharacterVarying(_)
+        | DataType::CharVarying(_)
+        | DataType::Character(_)
         | DataType::Char(_) => ColumnType::Text,
         // ENUM/SET are stored as their string value.
         DataType::Enum(..) | DataType::Set(_) => ColumnType::Text,
@@ -280,8 +469,19 @@ pub async fn create_table(
         let sname = stored_table_ident(db, src)?;
         let mut def = catalog::load(db, &sname).await?;
         def.name = name.clone();
-        db.commit_write(vec![(catalog_key(&name), def.encode()?)], vec![])
-            .await?;
+        let mut puts = vec![(catalog_key(&name), def.encode()?)];
+        // Declarations and integer constraints are table-scoped sidecars, not
+        // part of `TableDef`; `CREATE ... LIKE` must copy them alongside the
+        // catalog entry or the clone becomes a lossy schema copy.
+        for key in [
+            catalog::colwidth_key as fn(&str) -> Vec<u8>,
+            catalog::coldecl_key,
+        ] {
+            if let Some(value) = db.get(key(&sname)).await? {
+                puts.push((key(&name), value));
+            }
+        }
+        db.commit_write(puts, vec![]).await?;
         return Ok(QueryResult::Affected(0));
     }
 
@@ -291,6 +491,7 @@ pub async fn create_table(
     }
 
     let mut columns = Vec::with_capacity(ct.columns.len());
+    let mut declarations = Vec::with_capacity(ct.columns.len());
     let mut col_meta: Vec<ColMeta> = Vec::with_capacity(ct.columns.len());
     let mut pk_cols: Vec<usize> = Vec::new();
     let mut indexes: Vec<IndexDef> = Vec::new();
@@ -310,6 +511,7 @@ pub async fn create_table(
             )));
         }
         let ty = map_type(&col.data_type)?;
+        let declared_type = declaration_from_data_type(&col.data_type)?;
         // ENUM columns are constrained to their declared members via a synthesized
         // CHECK (`col IN ('a','b',...)`), reusing the existing CHECK enforcement.
         // No on-disk format change (checks already live in TableDef); NULL passes
@@ -396,6 +598,7 @@ pub async fn create_table(
             collation,
             qualifier: Vec::new(),
         });
+        declarations.push(declared_type);
         col_meta.push(meta);
     }
 
@@ -566,6 +769,9 @@ pub async fn create_table(
             .map(|c| declared_int_bits(&c.data_type))
             .collect(),
     };
+    let declarations = catalog::ColumnDeclarations {
+        columns: declarations,
+    };
     // Written unconditionally: a table re-created under a name that previously
     // had widths must not inherit them.
     let puts = vec![
@@ -573,6 +779,10 @@ pub async fn create_table(
         (
             catalog::colwidth_key(&name),
             bincode::serialize(&widths).map_err(|e| Error::Storage(e.to_string()))?,
+        ),
+        (
+            catalog::coldecl_key(&name),
+            bincode::serialize(&declarations).map_err(|e| Error::Storage(e.to_string()))?,
         ),
     ];
     db.commit_write(puts, vec![]).await?;
@@ -1014,6 +1224,7 @@ pub async fn show_table_status(db: &Session, pattern: Option<&str>) -> Result<Qu
 /// SHOW COLUMNS / DESCRIBE: column metadata (Field/Type/Null/Key/Default/Extra).
 pub async fn show_columns(db: &Session, table: &str) -> Result<QueryResult> {
     let def = catalog::load(db, table).await?;
+    let declarations = catalog::load_declarations(db, table).await?;
     let head = ["Field", "Type", "Null", "Key", "Default", "Extra"];
     let schema = Schema::new(
         head.iter()
@@ -1028,6 +1239,7 @@ pub async fn show_columns(db: &Session, table: &str) -> Result<QueryResult> {
     );
     let mut rows = Vec::with_capacity(def.schema.columns.len());
     for (i, c) in def.schema.columns.iter().enumerate() {
+        let declaration = column_declaration(declarations.as_ref(), c, i);
         let meta = def.meta(i);
         let key = if def.pk_cols.contains(&i) {
             "PRI"
@@ -1051,7 +1263,7 @@ pub async fn show_columns(db: &Session, table: &str) -> Result<QueryResult> {
         };
         rows.push(vec![
             Value::Text(c.name.clone()),
-            Value::Text(c.ty.display_name()),
+            Value::Text(declaration.column_type.clone()),
             Value::Text(if c.nullable { "YES" } else { "NO" }.to_string()),
             Value::Text(key.to_string()),
             default,
@@ -1075,10 +1287,16 @@ fn ref_action_sql(action: catalog::RefAction) -> Option<&'static str> {
 /// SHOW CREATE TABLE: reconstruct the DDL from the catalog definition.
 pub async fn show_create_table(db: &Session, name: &str) -> Result<QueryResult> {
     let def = catalog::load(db, name).await?;
+    let declarations = catalog::load_declarations(db, name).await?;
     let mut lines: Vec<String> = Vec::new();
     for (i, c) in def.schema.columns.iter().enumerate() {
+        let declaration = column_declaration(declarations.as_ref(), c, i);
         let meta = def.meta(i);
-        let mut s = format!("  `{}` {}", c.name, c.ty.display_name());
+        let mut s = format!(
+            "  `{}` {}",
+            c.name,
+            declaration.column_type.to_ascii_uppercase()
+        );
         if !c.nullable {
             s.push_str(" NOT NULL");
         }
@@ -1431,6 +1649,9 @@ fn information_schema_schema(view: &str) -> Result<Schema> {
             text("COLUMN_DEFAULT"),
             text("IS_NULLABLE"),
             text("DATA_TYPE"),
+            int("CHARACTER_MAXIMUM_LENGTH"),
+            int("NUMERIC_PRECISION"),
+            int("NUMERIC_SCALE"),
             text("COLUMN_TYPE"),
             text("COLUMN_KEY"),
             text("EXTRA"),
@@ -1700,9 +1921,10 @@ async fn information_schema(
             let mut rows = Vec::new();
             for tname in names {
                 let def = catalog::load(db, &tname).await?;
+                let declarations = catalog::load_declarations(db, &tname).await?;
                 for (i, c) in def.schema.columns.iter().enumerate() {
+                    let declaration = column_declaration(declarations.as_ref(), c, i);
                     let meta = def.meta(i);
-                    let ty = c.ty.display_name();
                     let is_text = matches!(c.ty, ColumnType::Text | ColumnType::Json);
                     let collation = match (is_text, c.collation) {
                         (true, elyra_core::Collation::Bin) => Value::Text("utf8mb4_bin".into()),
@@ -1724,8 +1946,11 @@ async fn information_schema(
                             None => Value::Null,
                         },
                         Value::Text(if c.nullable { "YES" } else { "NO" }.into()),
-                        Value::Text(ty.clone()),
-                        Value::Text(ty),
+                        Value::Text(declaration.data_type.clone()),
+                        optional_u64_value(declaration.character_maximum_length),
+                        optional_u64_value(declaration.numeric_precision),
+                        optional_u64_value(declaration.numeric_scale),
+                        Value::Text(declaration.column_type.clone()),
                         Value::Text(column_key(&def, i).into()),
                         Value::Text(column_extra(&meta).into()),
                         collation,
@@ -2309,6 +2534,14 @@ async fn create_table_as(
     q: &SqlQuery,
 ) -> Result<QueryResult> {
     let (qschema, rows) = run_subquery_schema(db, vindex, q).await?;
+    let declarations = (!ct.columns.is_empty())
+        .then(|| {
+            ct.columns
+                .iter()
+                .map(|column| declaration_from_data_type(&column.data_type))
+                .collect::<Result<Vec<_>>>()
+        })
+        .transpose()?;
     let columns: Vec<ColumnDef> = if ct.columns.is_empty() {
         qschema
             .columns
@@ -2350,6 +2583,15 @@ async fn create_table_as(
         foreign_keys: Vec::new(),
     };
     let mut puts = vec![(catalog_key(name), def.encode()?)];
+    if let Some(declarations) = declarations.as_ref() {
+        puts.push((
+            catalog::coldecl_key(name),
+            bincode::serialize(&catalog::ColumnDeclarations {
+                columns: declarations.clone(),
+            })
+            .map_err(|e| Error::Storage(e.to_string()))?,
+        ));
+    }
     let mut rowid = 0u64;
     for row in &rows {
         rowid += 1;
@@ -2357,6 +2599,17 @@ async fn create_table_as(
         for (i, col) in def.schema.columns.iter().enumerate() {
             if let Some(v) = row.get(i) {
                 r[i] = coerce(v.clone(), &col.ty, &col.name)?;
+            }
+        }
+        if db.strict_sql_mode() {
+            if let Some(declarations) = declarations.as_ref() {
+                for (i, declaration) in declarations.iter().enumerate() {
+                    let (Some(value), Some(column)) = (r.get(i), def.schema.columns.get(i)) else {
+                        continue;
+                    };
+                    let row_number = usize::try_from(rowid).unwrap_or(usize::MAX);
+                    check_declared_character_length(declaration, value, &column.name, row_number)?;
+                }
             }
         }
         let enc = bincode::serialize(&r).map_err(|e| Error::Storage(e.to_string()))?;
@@ -2728,6 +2981,7 @@ async fn alter_change_column(
         .ok_or_else(|| Error::Catalog(format!("unknown column: {old}")))?;
 
     let new_ty = map_type(data_type)?;
+    let declared_type = declaration_from_data_type(data_type)?;
     let old_ty = def.schema.columns[i].ty.clone();
     let old_collation = def.schema.columns[i].collation;
     let new_collation = options
@@ -2745,6 +2999,8 @@ async fn alter_change_column(
             "cannot change the collation of a primary key column".into(),
         ));
     }
+    let check_name = new_name.unwrap_or(&def.schema.columns[i].name);
+    check_existing_character_length(db, def, i, &declared_type, check_name).await?;
     if let Some(nn) = new_name {
         def.schema.columns[i].name = nn.to_string();
     }
@@ -2775,6 +3031,7 @@ async fn alter_change_column(
         rebuild_indexes_for_column(db, def, i).await?;
     }
     adjust_widths(db, &def.name, i, WidthOp::Set(declared_int_bits(data_type))).await?;
+    adjust_declarations(db, &def.name, i, DeclarationOp::Set(declared_type)).await?;
     Ok(())
 }
 
@@ -2830,21 +3087,54 @@ async fn alter_column_op(
         AlterColumnOperation::DropNotNull => def.schema.columns[i].nullable = true,
         AlterColumnOperation::SetDataType { data_type, .. } => {
             let new_ty = map_type(data_type)?;
+            let declared_type = declaration_from_data_type(data_type)?;
             let old_ty = def.schema.columns[i].ty.clone();
             if def.pk_cols.contains(&i) && new_ty != old_ty {
                 return Err(Error::Unsupported(
                     "cannot change the type of a primary key column".into(),
                 ));
             }
+            check_existing_character_length(
+                db,
+                def,
+                i,
+                &declared_type,
+                &def.schema.columns[i].name,
+            )
+            .await?;
             def.schema.columns[i].ty = new_ty.clone();
             if new_ty != old_ty {
                 recoerce_column(db, def, i).await?;
             }
+            adjust_widths(db, &def.name, i, WidthOp::Set(declared_int_bits(data_type))).await?;
+            adjust_declarations(db, &def.name, i, DeclarationOp::Set(declared_type)).await?;
         }
         other => {
             return Err(Error::Unsupported(format!(
                 "ALTER COLUMN operation not supported: {other}"
             )))
+        }
+    }
+    Ok(())
+}
+
+/// Reject an ALTER that would leave existing character data too wide for its
+/// new declaration. The calling ALTER runs behind a private checkpoint, so an
+/// error leaves both rows and catalog metadata unchanged.
+async fn check_existing_character_length(
+    db: &Session,
+    def: &TableDef,
+    column: usize,
+    declaration: &catalog::ColumnDeclaration,
+    column_name: &str,
+) -> Result<()> {
+    if !db.strict_sql_mode() {
+        return Ok(());
+    }
+    let rows = collect_matches(db, def, None, None).await?;
+    for (row_number, (_, row)) in rows.iter().enumerate() {
+        if let Some(value) = row.get(column) {
+            check_declared_character_length(declaration, value, column_name, row_number + 1)?;
         }
     }
     Ok(())
@@ -2916,6 +3206,52 @@ enum WidthOp {
     Set(Option<u8>),
 }
 
+/// Keep declared-type metadata positional with schema columns. As with integer
+/// widths, a missing sidecar identifies a catalog written before this feature;
+/// do not create one during ALTER because that would fabricate declarations the
+/// old catalog never recorded.
+async fn adjust_declarations(
+    db: &Session,
+    table: &str,
+    at: usize,
+    op: DeclarationOp,
+) -> Result<()> {
+    let Some(mut declarations) = catalog::load_declarations(db, table).await? else {
+        return Ok(());
+    };
+    match op {
+        DeclarationOp::Insert(declaration) => {
+            if at <= declarations.columns.len() {
+                declarations.columns.insert(at, declaration);
+            }
+        }
+        DeclarationOp::Remove => {
+            if at < declarations.columns.len() {
+                declarations.columns.remove(at);
+            }
+        }
+        DeclarationOp::Set(declaration) => {
+            if let Some(existing) = declarations.columns.get_mut(at) {
+                *existing = declaration;
+            }
+        }
+    }
+    db.commit_write(
+        vec![(
+            catalog::coldecl_key(table),
+            bincode::serialize(&declarations).map_err(|e| Error::Storage(e.to_string()))?,
+        )],
+        vec![],
+    )
+    .await
+}
+
+enum DeclarationOp {
+    Insert(catalog::ColumnDeclaration),
+    Remove,
+    Set(catalog::ColumnDeclaration),
+}
+
 async fn alter_add_column(
     db: &Session,
     def: &mut TableDef,
@@ -2939,6 +3275,7 @@ async fn alter_add_column(
         )));
     }
     let ty = map_type(&col.data_type)?;
+    let declared_type = declaration_from_data_type(&col.data_type)?;
     let options = col
         .options
         .iter()
@@ -2989,6 +3326,9 @@ async fn alter_add_column(
             ))
         })?,
     };
+    if db.strict_sql_mode() {
+        check_declared_character_length(&declared_type, &default, &col.name.value, 1)?;
+    }
     ensure_col_meta(def);
     let new_column = def.schema.columns.len();
     def.schema.columns.push(ColumnDef {
@@ -3067,6 +3407,13 @@ async fn alter_add_column(
         &def.name,
         def.schema.columns.len().saturating_sub(1),
         WidthOp::Insert(declared_int_bits(&col.data_type)),
+    )
+    .await?;
+    adjust_declarations(
+        db,
+        &def.name,
+        def.schema.columns.len().saturating_sub(1),
+        DeclarationOp::Insert(declared_type),
     )
     .await?;
     Ok(())
@@ -3167,6 +3514,7 @@ async fn alter_drop_column(db: &Session, def: &mut TableDef, name: &str) -> Resu
     puts.push(bump_wcount(db, &def.name).await?);
     db.commit_write(puts, deletes).await?;
     adjust_widths(db, &def.name, idx, WidthOp::Remove).await?;
+    adjust_declarations(db, &def.name, idx, DeclarationOp::Remove).await?;
     Ok(())
 }
 
@@ -3270,6 +3618,16 @@ async fn alter_rename_table(db: &Session, def: &mut TableDef, new: &str) -> Resu
         wcount_key,
         stats_key,
         partmeta_key,
+    ] {
+        let old_key = key(&old);
+        if let Some(value) = db.get(old_key.clone()).await? {
+            deletes.push(old_key);
+            puts.push((key(new), value));
+        }
+    }
+    for key in [
+        catalog::colwidth_key as fn(&str) -> Vec<u8>,
+        catalog::coldecl_key,
     ] {
         let old_key = key(&old);
         if let Some(value) = db.get(old_key.clone()).await? {
@@ -4489,29 +4847,46 @@ async fn check_widths_batch(
     def: &TableDef,
     batch: &[(Vec<u8>, Vec<Value>)],
 ) -> Result<()> {
-    let Some(widths) = catalog::load_widths(db, &def.name).await? else {
+    if let Some(widths) = catalog::load_widths(db, &def.name).await? {
+        for (_, row) in batch {
+            for (i, bits) in widths.bits.iter().enumerate() {
+                let (Some(bits), Some(value), Some(column)) =
+                    (*bits, row.get(i), def.schema.columns.get(i))
+                else {
+                    continue;
+                };
+                let unsigned = matches!(column.ty, ColumnType::UInt);
+                let n: i128 = match value {
+                    Value::Int(v) => *v as i128,
+                    Value::UInt(v) => *v as i128,
+                    _ => continue,
+                };
+                let (lo, hi) = int_bounds(bits, unsigned);
+                if n < lo || n > hi {
+                    return Err(Error::OutOfRange(format!(
+                        "value {n} is out of range for column '{}'",
+                        column.name
+                    )));
+                }
+            }
+        }
+    }
+
+    // In strict SQL mode, MySQL rejects over-long character input rather than
+    // silently truncating it. A sidecar is absent for pre-existing catalogs,
+    // so those tables deliberately preserve their historical behaviour.
+    if !db.strict_sql_mode() {
+        return Ok(());
+    }
+    let Some(declarations) = catalog::load_declarations(db, &def.name).await? else {
         return Ok(());
     };
-    for (_, row) in batch {
-        for (i, bits) in widths.bits.iter().enumerate() {
-            let (Some(bits), Some(value), Some(column)) =
-                (*bits, row.get(i), def.schema.columns.get(i))
-            else {
+    for (row_number, (_, row)) in batch.iter().enumerate() {
+        for (i, declaration) in declarations.columns.iter().enumerate() {
+            let (Some(value), Some(column)) = (row.get(i), def.schema.columns.get(i)) else {
                 continue;
             };
-            let unsigned = matches!(column.ty, ColumnType::UInt);
-            let n: i128 = match value {
-                Value::Int(v) => *v as i128,
-                Value::UInt(v) => *v as i128,
-                _ => continue,
-            };
-            let (lo, hi) = int_bounds(bits, unsigned);
-            if n < lo || n > hi {
-                return Err(Error::OutOfRange(format!(
-                    "value {n} is out of range for column '{}'",
-                    column.name
-                )));
-            }
+            check_declared_character_length(declaration, value, &column.name, row_number + 1)?;
         }
     }
     Ok(())
@@ -11676,9 +12051,9 @@ pub async fn update(
             old_key.clone()
         };
 
-        if check_uniq || check_fk {
-            uniq_batch.push((new_key.clone(), new_row.clone()));
-        }
+        // Width constraints apply even to a table with no keys or foreign
+        // keys, so retain every updated row for the common validation pass.
+        uniq_batch.push((new_key.clone(), new_row.clone()));
 
         // Index maintenance: drop old entries, write new ones. Deletes are
         // applied before puts, so unchanged index entries survive.
@@ -12366,6 +12741,11 @@ async fn multi_update(
     let mut deletes: Vec<Vec<u8>> = Vec::new();
     for (qual, rowsmap) in &updated {
         let info = &targets[qual];
+        let batch = rowsmap
+            .iter()
+            .map(|(key, (_, new_base))| (key.clone(), new_base.clone()))
+            .collect::<Vec<_>>();
+        check_widths_batch(db, &info.def, &batch).await?;
         for (pk_key, (old_base, new_base)) in rowsmap {
             let new_pk: Vec<Value> = info
                 .def
@@ -19831,6 +20211,7 @@ async fn table_delete_keys(db: &Session, name: &str) -> Result<Vec<Vec<u8>>> {
         autoinc_key(name),
         temp_owner_key(name),
         catalog::colwidth_key(name),
+        catalog::coldecl_key(name),
     ];
     for prefix in [
         data_prefix(name),
