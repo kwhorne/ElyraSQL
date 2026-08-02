@@ -26,16 +26,13 @@ const TOPN_CAP: usize = 1_000_000;
 
 /// The external-sort spill budget in rows, from `ELYRASQL_SORT_MAX_ROWS`
 /// (default 1,000,000). Rows beyond this are spilled to a temp file.
+/// Reads the env variable on every call so tests can reconfigure the budget.
 pub fn sort_max_rows() -> usize {
-    use std::sync::OnceLock;
-    static N: OnceLock<usize> = OnceLock::new();
-    *N.get_or_init(|| {
-        std::env::var("ELYRASQL_SORT_MAX_ROWS")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .filter(|n| *n > 0)
-            .unwrap_or(1_000_000)
-    })
+    std::env::var("ELYRASQL_SORT_MAX_ROWS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(1_000_000)
 }
 
 /// Compare two precomputed key vectors under per-key asc/desc flags and text
@@ -487,6 +484,8 @@ mod admission_tests {
 #[cfg(test)]
 mod spill_tests {
     use super::*;
+    use std::fs;
+    use std::io::Write;
 
     fn ints(n: usize) -> Vec<i64> {
         let mut state = 99u64;
@@ -549,6 +548,51 @@ mod spill_tests {
         assert_eq!(out.len(), 20);
         assert_eq!(out[0], vec![Value::Int(0)]);
         assert_eq!(out[19], vec![Value::Int(19)]);
+    }
+
+    /// `temp_path()` must return a writable path under the system temp
+    /// directory. The scratch Docker image bundles no `/tmp` unless it is
+    /// explicitly copied into the runtime stage, so this test documents the
+    /// invariant that the spill infrastructure depends on. If `temp_dir()` is
+    /// missing or unwritable this test fails, which is by design.
+    #[test]
+    fn temp_path_is_writable_in_temp_dir() {
+        assert!(
+            std::env::temp_dir().exists(),
+            "temp_dir must exist and be readable"
+        );
+        let p = temp_path();
+        assert!(
+            p.starts_with(std::env::temp_dir()),
+            "temp_path must live under temp_dir"
+        );
+        let mut f = File::create(&p).expect("must be able to create a temp file");
+        f.write_all(b"hello").unwrap();
+        f.flush().unwrap();
+        drop(f);
+        let _ = fs::remove_file(&p);
+    }
+
+    /// The Sorter respects the `ELYRASQL_SORT_MAX_ROWS` spill budget: when the
+    /// in-memory buffer fills, it spills a run to disk and clears the buffer,
+    /// keeping peak memory bounded.
+    #[test]
+    fn sorter_spills_when_buffer_exceeds_budget() {
+        std::env::set_var("ELYRASQL_SORT_MAX_ROWS", "10");
+        let budget = sort_max_rows();
+        assert_eq!(budget, 10);
+
+        let mut s = Sorter::new(vec![true], vec![Collation::Ci], 0, None, budget);
+
+        for i in 0..25i64 {
+            s.push(vec![Value::Int(i)], vec![Value::Int(i)]).unwrap();
+        }
+
+        assert!(s.buffer.len() <= 10, "buffer must not exceed the spill budget");
+        assert!(!s.runs.is_empty(), "spill should have created at least one run");
+
+        let rows = s.finish().unwrap();
+        assert_eq!(rows.len(), 25, "finish must return every pushed row");
     }
 }
 

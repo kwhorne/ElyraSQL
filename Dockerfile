@@ -11,7 +11,8 @@ RUN apk add --no-cache musl-dev gcc make perl linux-headers
 # Create the non-root user and data dir here so they can be copied into the
 # scratch runtime stage.
 RUN addgroup -S elyrasql && adduser -S -G elyrasql -H elyrasql \
-    && mkdir -p /var/lib/elyrasql && chown elyrasql:elyrasql /var/lib/elyrasql
+    && mkdir -p /var/lib/elyrasql && chown elyrasql:elyrasql /var/lib/elyrasql \
+    && mkdir -m 1777 -p /tmp
 
 WORKDIR /src
 COPY . .
@@ -24,6 +25,7 @@ FROM scratch
 COPY --from=builder /etc/passwd /etc/passwd
 COPY --from=builder /etc/group /etc/group
 COPY --from=builder --chown=elyrasql:elyrasql /var/lib/elyrasql /var/lib/elyrasql
+COPY --from=builder /tmp /tmp
 COPY --from=builder /src/target/release/elyrasql /usr/local/bin/elyrasql
 
 USER elyrasql
