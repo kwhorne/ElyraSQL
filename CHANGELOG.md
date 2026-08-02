@@ -6,6 +6,25 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.9.1] - 2026-08-02
+
+Four fixes for the same underlying blind spot: **rows of the statement being
+executed were invisible to the checks that guard it**. A foreign key looked at
+the table as it stood before the statement, a cascade did the same, and neither
+followed a key that pointed at its own table. Add a fourth, unrelated, that had
+simply never been checked at all — integer width — and the effect was a database
+that accepted schemas and data MySQL refuses, and refused inserts MySQL accepts.
+
+All four were found by differential testing rather than by a report, and each is
+verified against MySQL 8.4 on identical data.
+
+**Three of these tighten validation**, so statements that used to succeed may now
+fail: a value too wide for its column, a duplicate column name, and
+`DELETE FROM t` on a self-referencing table without `ON DELETE CASCADE`. Nothing
+is rewritten on upgrade — a database cannot start rejecting data it already
+holds — and there is no on-disk format change: 1.5.x through 1.9.0 open
+unchanged.
+
 ### Fixed
 
 - **A multi-row `INSERT` could not satisfy a self-referencing foreign key from

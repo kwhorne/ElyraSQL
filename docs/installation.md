@@ -17,6 +17,23 @@ ElyraSQL release builds target **Ubuntu 24.04+** and **Apple Silicon macOS
     done, so an interrupted upgrade simply resumes on the next start. **Take a backup
     first, and note that downgrading to 1.4.x afterwards is not supported.**
 
+!!! info "Upgrading to 1.9.1"
+
+    A patch release, but three of its fixes **tighten validation**, so statements
+    that used to succeed can now fail:
+
+    - a value too wide for its column (`300` into a `TINYINT`) raises 1264
+    - a duplicate column name raises 1060, on `CREATE TABLE` and `ADD COLUMN`
+    - `DELETE FROM t` on a self-referencing table without `ON DELETE CASCADE`
+      raises 1451 instead of deleting the referenced rows
+
+    Each of those matches MySQL, and each was previously accepted silently.
+    Nothing is rewritten on upgrade: **integer widths are only enforced for
+    tables created from 1.9.1 onward**, so an existing database cannot start
+    rejecting data it already holds. A batched `INSERT` into a table with a
+    self-referencing key now works, and a self-referencing `ON DELETE CASCADE`
+    now follows the chain instead of leaving orphans.
+
 !!! danger "Upgrade to 1.9.0 promptly"
 
     1.9.0 fixes two bugs that could return or write the wrong data **with no
@@ -118,8 +135,8 @@ macOS).
 Multi-arch image (`amd64` + `arm64`) on the GitHub Container Registry:
 
 ```bash
-docker pull ghcr.io/kwhorne/elyrasql:1.9.0   # or :latest
-docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.9.0
+docker pull ghcr.io/kwhorne/elyrasql:1.9.1   # or :latest
+docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.9.1
 ```
 
 The image is ~15 MB, runs as a non-root user, stores data in the
