@@ -96,17 +96,23 @@ async fn result_column_metadata_reports_table_flags_over_text_and_binary_protoco
         "CREATE TABLE flagprobe (
             id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
             email VARCHAR(50) NOT NULL,
-            UNIQUE KEY uq_email (email)
+            tenant_id INT NOT NULL,
+            handle VARCHAR(50) NOT NULL,
+            UNIQUE KEY uq_email (email),
+            UNIQUE KEY uq_tenant_handle (tenant_id, handle)
         )",
     )
     .await
     .unwrap();
-    c.query_drop("INSERT INTO flagprobe (email) VALUES ('ada@example.test')")
-        .await
-        .unwrap();
+    c.query_drop(
+        "INSERT INTO flagprobe (email, tenant_id, handle)
+         VALUES ('ada@example.test', 7, 'ada')",
+    )
+    .await
+    .unwrap();
 
     let mut text_result = c
-        .query_iter("SELECT id, email FROM flagprobe")
+        .query_iter("SELECT id, email, tenant_id, handle FROM flagprobe")
         .await
         .unwrap();
     let text_columns = text_result.columns_ref().to_vec();
@@ -134,18 +140,30 @@ async fn result_column_metadata_reports_table_flags_over_text_and_binary_protoco
     assert!(text_columns[1]
         .flags()
         .contains(MySqlColumnFlags::UNIQUE_KEY_FLAG));
+    assert!(!text_columns[2]
+        .flags()
+        .contains(MySqlColumnFlags::UNIQUE_KEY_FLAG));
+    assert!(!text_columns[3]
+        .flags()
+        .contains(MySqlColumnFlags::UNIQUE_KEY_FLAG));
     assert_eq!(text_columns[1].column_length(), 65_535);
-    let text_rows: Vec<(u64, String)> = text_result.collect().await.unwrap();
-    assert_eq!(text_rows, [(1, "ada@example.test".into())]);
+    let text_rows: Vec<(u64, String, i64, String)> = text_result.collect().await.unwrap();
+    assert_eq!(text_rows, [(1, "ada@example.test".into(), 7, "ada".into())]);
 
     let mut binary_result = c
-        .exec_iter("SELECT id, email FROM flagprobe WHERE id = ?", (1_u64,))
+        .exec_iter(
+            "SELECT id, email, tenant_id, handle FROM flagprobe WHERE id = ?",
+            (1_u64,),
+        )
         .await
         .unwrap();
     let binary_columns = binary_result.columns().unwrap().to_vec();
     assert_eq!(binary_columns, text_columns);
-    let binary_rows: Vec<(u64, String)> = binary_result.collect().await.unwrap();
-    assert_eq!(binary_rows, [(1, "ada@example.test".into())]);
+    let binary_rows: Vec<(u64, String, i64, String)> = binary_result.collect().await.unwrap();
+    assert_eq!(
+        binary_rows,
+        [(1, "ada@example.test".into(), 7, "ada".into())]
+    );
 }
 
 #[tokio::test]

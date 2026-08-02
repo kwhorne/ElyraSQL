@@ -147,7 +147,7 @@ impl TableDef {
                     && self
                         .indexes
                         .iter()
-                        .any(|index_def| index_def.unique && index_def.cols.contains(&index)),
+                        .any(|index_def| index_def.unique && index_def.cols == [index]),
                 auto_increment: self
                     .col_meta
                     .get(index)
