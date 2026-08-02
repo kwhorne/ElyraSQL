@@ -416,7 +416,8 @@ pub async fn create_table(
                 }
             }
             TableConstraint::Unique {
-                name: cname,
+                name: constraint_name,
+                index_name,
                 columns: cols,
                 ..
             } => {
@@ -430,15 +431,19 @@ pub async fn create_table(
                         })?;
                     idxs.push(i);
                 }
-                let iname = cname.as_ref().map(|n| n.value.clone()).unwrap_or_else(|| {
-                    format!(
-                        "uniq_{}",
-                        idxs.iter()
-                            .map(|&i| columns[i].name.clone())
-                            .collect::<Vec<_>>()
-                            .join("_")
-                    )
-                });
+                let iname = index_name
+                    .as_ref()
+                    .or(constraint_name.as_ref())
+                    .map(|name| name.value.clone())
+                    .unwrap_or_else(|| {
+                        format!(
+                            "uniq_{}",
+                            idxs.iter()
+                                .map(|&i| columns[i].name.clone())
+                                .collect::<Vec<_>>()
+                                .join("_")
+                        )
+                    });
                 let ucolls: Vec<elyra_core::Collation> =
                     idxs.iter().map(|&i| columns[i].collation).collect();
                 let single = idxs.len() == 1;
