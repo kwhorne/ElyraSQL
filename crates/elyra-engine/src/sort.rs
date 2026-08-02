@@ -588,8 +588,14 @@ mod spill_tests {
             s.push(vec![Value::Int(i)], vec![Value::Int(i)]).unwrap();
         }
 
-        assert!(s.buffer.len() <= 10, "buffer must not exceed the spill budget");
-        assert!(!s.runs.is_empty(), "spill should have created at least one run");
+        assert!(
+            s.buffer.len() <= 10,
+            "buffer must not exceed the spill budget"
+        );
+        assert!(
+            !s.runs.is_empty(),
+            "spill should have created at least one run"
+        );
 
         let rows = s.finish().unwrap();
         assert_eq!(rows.len(), 25, "finish must return every pushed row");
