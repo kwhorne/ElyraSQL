@@ -132,10 +132,10 @@ gaps:
   `LOAD DATA LOCAL INFILE` all work.
 - Vector search and `VEC_DISTANCE(...)` are ElyraSQL extensions (they mirror
   MySQL 9's vector direction but are not identical).
-- **Integer width is advisory.** `TINYINT`, `SMALLINT`, `MEDIUMINT`, `INT` and
-  `BIGINT` are all stored as 64 bits, so a value too wide for its declared
-  column (`300` into a `TINYINT`) is accepted where MySQL raises 1264.
-  `UNSIGNED` *is* enforced, on every width, since 1.8.0. See
+- **Integer storage is always 64-bit**, but the declared width and `UNSIGNED`
+  are both enforced (since 1.10.0 and 1.8.0 respectively), so a value too wide
+  for its column raises 1264 as in MySQL. Tables created by earlier versions
+  have no width recorded and are not retroactively constrained — see
   [data types](sql/data-types.md#integer-widths-and-unsigned).
 - **One database.** `CREATE DATABASE`/`SCHEMA` is refused unless written with
   `IF NOT EXISTS`; see the note under *Laravel / Eloquent* above. `USE <name>`

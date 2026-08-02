@@ -72,8 +72,12 @@ impl Error {
             Error::OutOfRange(_) => 1264,  // ER_WARN_DATA_OUT_OF_RANGE
             Error::Unsupported(_) => 1235, // ER_NOT_SUPPORTED_YET
             Error::Conflict(_) => 1213,    // ER_LOCK_DEADLOCK (serialization failure)
-            Error::Duplicate(_) => 1062,   // ER_DUP_ENTRY
-            Error::ForeignKey(_) => 1452,  // ER_NO_REFERENCED_ROW
+            // A duplicate *key value* and a duplicate *column name* are
+            // different errors to a client: 1062 is retryable-ish data, 1060 is
+            // a schema mistake.
+            Error::Duplicate(m) if m.starts_with("duplicate column name") => 1060,
+            Error::Duplicate(_) => 1062,  // ER_DUP_ENTRY
+            Error::ForeignKey(_) => 1452, // ER_NO_REFERENCED_ROW
             _ => 1105,
         }
     }
@@ -92,6 +96,7 @@ impl Error {
             Error::UnknownTable(_) => b"42S02",
             Error::UnknownColumn(_) => b"42S22",
             Error::OutOfRange(_) => b"22003",
+            Error::Duplicate(m) if m.starts_with("duplicate column name") => b"42S21",
             _ => b"HY000",
         }
     }

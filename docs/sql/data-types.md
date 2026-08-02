@@ -18,29 +18,38 @@
 ## Integer widths and `UNSIGNED`
 
 Every integer width is stored as **64 bits**: `TINYINT`, `SMALLINT`, `MEDIUMINT`,
-`INT` and `BIGINT` are the same type here, and the declared width is *advisory*.
-A value that MySQL would reject as too wide for its column is accepted:
+`INT` and `BIGINT` occupy the same space here. The declared width is still a
+**constraint**, though, and a value too wide for it is refused exactly as MySQL
+refuses it:
 
 ```sql
 CREATE TABLE t (a TINYINT);
-INSERT INTO t VALUES (300);   -- ElyraSQL: stored. MySQL: 1264 Out of range
+INSERT INTO t VALUES (300);   -- ERROR 1264 (22003): value 300 is out of range
 ```
 
-`UNSIGNED` is different: it is a **constraint**, not a width, and it is enforced
-on every integer type. A negative value is refused with MySQL's own error:
+`UNSIGNED` is enforced on every integer type as well. A negative value is
+refused with the same error:
 
 ```sql
 CREATE TABLE t (a INT UNSIGNED);
 INSERT INTO t VALUES (-1);    -- ERROR 1264 (22003): invalid UNSIGNED value: -1
 ```
 
-!!! note "Tables created before 1.8.0"
+!!! note "Tables created by an older version"
 
-    Until 1.8.0 only `BIGINT UNSIGNED` was enforced; the narrower unsigned types
-    were stored as signed. A column created by an older version keeps the type it
-    was created with, so it goes on accepting negatives until the table is
-    recreated (or the column re-declared with `ALTER TABLE ... MODIFY`). Newly
-    created tables get the constraint.
+    Both constraints arrived after the fact, and neither is applied
+    retroactively:
+
+    - Until **1.8.0** only `BIGINT UNSIGNED` was enforced; narrower unsigned
+      types were stored as signed. A column created before then keeps the type it
+      was created with and goes on accepting negatives.
+    - Until **1.10.0** no width was recorded at all. A table created before then
+      has no widths stored, so its columns accept any 64-bit value.
+
+    In both cases the fix applies from the next `CREATE TABLE`, or when the
+    column is re-declared with `ALTER TABLE ... MODIFY`. Nothing is rewritten on
+    upgrade, so an existing database cannot start rejecting data it already
+    holds.
 
 ## Literals and coercion
 

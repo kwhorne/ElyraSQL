@@ -328,6 +328,36 @@ pub fn view_key(name: &str) -> Vec<u8> {
     format!("view::{name}").into_bytes()
 }
 
+/// Declared integer widths for a table's columns, keyed separately from
+/// `TableDef`.
+///
+/// Every integer is stored as 64 bits, but MySQL refuses a value too wide for
+/// the *declared* type, so the declaration has to survive `CREATE TABLE`. It
+/// cannot live on `ColMeta`: `TableDef` is bincode-encoded, bincode is
+/// positional rather than self-describing, and a new field would make every
+/// existing catalog undecodable. A separate key sidesteps that entirely — a
+/// table written before this existed simply has none, and keeps the old
+/// behaviour of accepting any 64-bit value.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ColumnWidths {
+    /// Parallel to `schema.columns`; `None` where the column is not a
+    /// width-constrained integer.
+    pub bits: Vec<Option<u8>>,
+}
+
+pub fn colwidth_key(table: &str) -> Vec<u8> {
+    format!("colwidth::{table}").into_bytes()
+}
+
+/// The declared integer widths of `table`, or `None` when the table predates
+/// this metadata (in which case width is not enforced for it).
+pub async fn load_widths(db: &Session, table: &str) -> Result<Option<ColumnWidths>> {
+    match db.get(colwidth_key(table)).await? {
+        Some(bytes) => Ok(bincode::deserialize(&bytes).ok()),
+        None => Ok(None),
+    }
+}
+
 /// Storage key for a materialized view's defining query (the data itself lives
 /// in a normal table of the same name).
 pub fn matview_key(name: &str) -> Vec<u8> {
