@@ -9,6 +9,8 @@ use elyra_core::{ColumnDef, ColumnType, Error, Result, Schema, Value};
 use elyra_olap::{AggFunc, AggSpec, GroupAggregator};
 use sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, FunctionArguments, SelectItem};
 
+use crate::exec::unqualified_wildcard_indices;
+
 /// An output column: a (grouped) source column, an aggregate result, or a
 /// scalar expression evaluated per group over the group columns + aggregate
 /// results (e.g. `ROUND(SUM(x), 2)`, `SUM(a)/COUNT(*)`, `UPPER(status)`).
@@ -523,7 +525,8 @@ pub fn build_plan(
     for item in projection {
         match item {
             SelectItem::Wildcard(_) => {
-                for (idx, column) in schema.columns.iter().enumerate() {
+                for idx in unqualified_wildcard_indices(schema) {
+                    let column = &schema.columns[idx];
                     out_cols.push(ColumnDef {
                         name: column_name(column).to_owned(),
                         ty: column.ty.clone(),
@@ -594,7 +597,7 @@ pub fn build_plan(
                     name: alias.unwrap_or_else(|| column_name(&schema.columns[idx]).to_owned()),
                     ty: schema.columns[idx].ty.clone(),
                     nullable: schema.columns[idx].nullable,
-                    collation: ci,
+                    collation: schema.columns[idx].collation,
                     qualifier: schema.columns[idx].qualifier.clone(),
                 });
                 plan.push(OutCol::Column(idx));
@@ -628,9 +631,9 @@ pub fn build_plan(
 
     // Evaluation schema for Computed columns: input columns, then one
     // `__agg_i` column per aggregate.
-    let mut eval_cols = schema.columns.clone();
+    let mut eval_schema = schema.clone();
     for (i, t) in agg_types.iter().enumerate() {
-        eval_cols.push(ColumnDef {
+        eval_schema.columns.push(ColumnDef {
             name: format!("__agg_{i}"),
             ty: t.clone(),
             nullable: true,
@@ -651,9 +654,17 @@ pub fn build_plan(
                 .unwrap_or(elyra_core::Collation::Ci)
         })
         .collect();
-    let out_tables = out_cols
+    let out_tables = plan
         .iter()
-        .map(|column| column.qualifier.last().cloned().unwrap_or_default())
+        .zip(&out_cols)
+        .map(|(planned, column)| match planned {
+            OutCol::Column(index) => schema
+                .table_of(*index)
+                .map(str::to_owned)
+                .or_else(|| column.qualifier.last().cloned())
+                .unwrap_or_default(),
+            OutCol::Agg(_) | OutCol::Computed(_) => String::new(),
+        })
         .collect();
     for column in &mut out_cols {
         column.qualifier.clear();
@@ -666,7 +677,7 @@ pub fn build_plan(
         out_schema: Schema::with_tables(out_cols, out_tables),
         arg_exprs,
         input_schema: schema.clone(),
-        eval_schema: Schema::new(eval_cols),
+        eval_schema,
     })
 }
 

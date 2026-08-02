@@ -4225,10 +4225,44 @@ async fn select_inner(
         // A subquery that references one of the join's tables is correlated;
         // evaluate it per joined row.
         let quals = join_qualifiers(db, &select.from);
-        let correlated = raw_filter
+        let qualified_filter_correlated = raw_filter
             .as_ref()
-            .is_some_and(|f| filter_correlated_any(f, &quals))
-            || projection_correlated_any(&select.projection, &quals);
+            .is_some_and(|filter| filter_correlated_any(filter, &quals));
+        let mut resolved_bare_filter = None;
+        let potential_bare_filter = raw_filter
+            .as_ref()
+            .filter(|filter| {
+                !qualified_filter_correlated && expr_has_potential_bare_correlation(filter)
+            })
+            .cloned();
+        let bare_filter_correlated = if let Some(filter) = potential_bare_filter {
+            match resolve_subqueries(db, vindex, filter.clone()).await {
+                Ok(resolved) => {
+                    // The bare names belonged to the subquery's local scope.
+                    // Preserve the one-time resolution rather than executing it
+                    // again for every joined row.
+                    resolved_bare_filter = Some(resolved);
+                    false
+                }
+                Err(error) if bare_unknown_column(&error, &filter).is_some() => true,
+                Err(error) => return Err(error),
+            }
+        } else {
+            false
+        };
+        let correlated = qualified_filter_correlated
+            || bare_filter_correlated
+            || projection_correlated_any(&select.projection, &quals)
+            // A bare name inside a subquery can correlate only after the joined
+            // logical schema exists. This matters for a coalesced USING/NATURAL
+            // key, which is deliberately one bare outer column. Let the
+            // per-row path first try the inner query, then fall back to that
+            // outer schema; ambiguity still propagates as an error. Keep
+            // aggregate/grouped projections on their existing path, where
+            // correlated projection subqueries are not supported.
+            || (group_by.is_empty()
+                && !aggregate::projection_has_aggregate(&select.projection)
+                && projection_has_potential_bare_correlation(&select.projection));
         if correlated {
             return join_correlated_select(
                 db,
@@ -4243,7 +4277,10 @@ async fn select_inner(
             .await;
         }
         let filter = match raw_filter {
-            Some(f) => Some(resolve_subqueries(db, vindex, f).await?),
+            Some(filter) => match resolved_bare_filter {
+                Some(resolved) => Some(resolved),
+                None => Some(resolve_subqueries(db, vindex, filter).await?),
+            },
             None => None,
         };
         // Streaming index nested-loop fast path for
@@ -5163,8 +5200,7 @@ async fn join_select(
         split_and(f, &mut conjuncts);
     }
 
-    let (cols, mut rows) = build_from(db, vindex, &select.from, &conjuncts).await?;
-    let schema = Schema::new(cols);
+    let (schema, mut rows) = build_from(db, vindex, &select.from, &conjuncts).await?;
 
     // WHERE over the joined rows.
     if let Some(f) = &filter {
@@ -6727,6 +6763,15 @@ fn column_table(column: &ColumnDef) -> Option<&str> {
     column.qualifier.last().map(String::as_str)
 }
 
+/// Result-metadata source for one schema column. Logical columns created by a
+/// USING/NATURAL join intentionally have no qualifier (so bare name resolution
+/// sees one key), but retain their selected source separately in `Schema`.
+fn schema_column_table(schema: &Schema, index: usize) -> Option<&str> {
+    schema
+        .table_of(index)
+        .or_else(|| schema.columns.get(index).and_then(column_table))
+}
+
 fn wildcard_column_name<'a>(
     column: &'a ColumnDef,
     qualifier: &ObjectName,
@@ -6915,8 +6960,7 @@ async fn join_correlated_select(
         ));
     }
 
-    let (cols, rows) = build_from(db, vindex, &select.from, &[]).await?;
-    let schema = Schema::new(cols);
+    let (schema, rows) = build_from(db, vindex, &select.from, &[]).await?;
 
     let mut kept: Vec<Vec<Value>> = Vec::new();
     for row in rows {
@@ -6983,10 +7027,15 @@ async fn join_correlated_select(
     for item in &select.projection {
         match item {
             SelectItem::Wildcard(_) => {
-                for (index, column) in schema.columns.iter().enumerate() {
+                for index in unqualified_wildcard_indices(&schema) {
+                    let column = &schema.columns[index];
                     projection.push(Projection::Column(index));
                     let mut column = column.clone();
-                    outtables.push(column_table(&column).unwrap_or_default().to_owned());
+                    outtables.push(
+                        schema_column_table(&schema, index)
+                            .unwrap_or_default()
+                            .to_owned(),
+                    );
                     column.name = column_name(&column).to_owned();
                     column.qualifier.clear();
                     outcols.push(column);
@@ -7002,7 +7051,11 @@ async fn join_correlated_select(
                     if let Some(name) = wildcard_column_name(column, object, unqualified_schema) {
                         projection.push(Projection::Column(index));
                         let mut column = column.clone();
-                        outtables.push(column_table(&column).unwrap_or_default().to_owned());
+                        outtables.push(
+                            schema_column_table(&schema, index)
+                                .unwrap_or_default()
+                                .to_owned(),
+                        );
                         column.name = name.to_owned();
                         column.qualifier.clear();
                         outcols.push(column);
@@ -7028,8 +7081,7 @@ async fn join_correlated_select(
                 // in MySQL, which reports an empty table for computed columns.
                 outtables.push(
                     expr_col_index(expr, &schema)
-                        .and_then(|index| schema.columns.get(index))
-                        .and_then(column_table)
+                        .and_then(|index| schema_column_table(&schema, index))
                         .unwrap_or_default()
                         .to_owned(),
                 );
@@ -7148,7 +7200,7 @@ async fn load_relation(
                 name: format!("{alias}.{}", c.name),
                 ty: c.ty.clone(),
                 nullable: c.nullable,
-                collation: elyra_core::Collation::Ci,
+                collation: c.collation,
                 qualifier: qualifier_parts.clone(),
             })
             .collect();
@@ -7649,7 +7701,7 @@ async fn build_from(
     vindex: &VectorRegistry,
     from: &[TableWithJoins],
     conjuncts: &[Expr],
-) -> Result<(Vec<ColumnDef>, Vec<Vec<Value>>)> {
+) -> Result<(Schema, Vec<Vec<Value>>)> {
     // Cost-based reordering of an explicit INNER-join chain over base tables:
     // build from the smallest tables and always extend along a join predicate,
     // keeping intermediate results small.
@@ -7667,8 +7719,10 @@ async fn build_from(
                 .iter()
                 .all(|j| matches!(j.relation, TableFactor::Table { .. }));
         if !twj.joins.is_empty() && all_inner && all_tables {
-            if let Some(res) = build_inner_join_reordered(db, vindex, twj, conjuncts).await? {
-                return Ok(res);
+            if let Some((columns, rows)) =
+                build_inner_join_reordered(db, vindex, twj, conjuncts).await?
+            {
+                return Ok((Schema::new(columns), rows));
             }
             // Fell back (a predicate wasn't a clean equi-connector): use the
             // sequential left-to-right plan below, which applies each ON at its
@@ -7676,7 +7730,7 @@ async fn build_from(
         }
     }
 
-    let mut cur_cols: Vec<ColumnDef> = Vec::new();
+    let mut cur_schema = Schema::default();
     let mut cur_rows: Vec<Vec<Value>> = Vec::new();
     let mut first = true;
 
@@ -7713,31 +7767,32 @@ async fn build_from(
     for twj in ordered {
         let (bc, mut br) = load_relation(db, vindex, &twj.relation, conjuncts).await?;
         br = apply_pushdown(br, &bc, conjuncts)?;
+        let base_schema = Schema::new(bc);
         if first {
-            cur_cols = bc;
+            cur_schema = base_schema;
             cur_rows = br;
             first = false;
         } else {
             let cancel = db.cancel_token();
             let (c, r) = cpu_bound(|| {
                 combine(
-                    &cur_cols,
+                    &cur_schema,
                     &cur_rows,
-                    &bc,
+                    &base_schema,
                     &br,
                     JoinKind::Inner,
                     None,
                     &cancel,
                 )
             })?;
-            cur_cols = c;
+            cur_schema = c;
             cur_rows = r;
         }
         for join in &twj.joins {
             // Index nested-loop join: when the driving side is small and the
             // partner is indexed on the join key, probe the partner per row
             // instead of materialising it in full.
-            let driving_schema = Schema::new(cur_cols.clone());
+            let driving_schema = cur_schema.clone();
             let (kind, on) = join_kind(&join.join_operator)?;
             let left_outer = kind == JoinKind::Left;
 
@@ -7746,6 +7801,12 @@ async fn build_from(
             let nlj = if stored_table_factor(&join.relation) {
                 let (pdef, pcols) = resolve_table(db, &join.relation).await?;
                 let partner_schema = Schema::new(pcols.clone());
+                if let Some(expression) = on.as_ref() {
+                    validate_join_on_refs(
+                        expression,
+                        &combined_join_schema(&driving_schema, &partner_schema),
+                    )?;
+                }
                 on.as_ref()
                     .filter(|_| matches!(kind, JoinKind::Inner | JoinKind::Left))
                     .and_then(|e| equi_nlj(e, &driving_schema, &partner_schema))
@@ -7783,7 +7844,7 @@ async fn build_from(
                         out.push(combined);
                     }
                 }
-                cur_cols.extend(pcols);
+                cur_schema.columns.extend(pcols);
                 cur_rows = out;
                 continue;
             }
@@ -7791,14 +7852,36 @@ async fn build_from(
             // Fallback: materialise the partner (with pushdown) and hash/nested join.
             let (jc, mut jr) = load_relation(db, vindex, &join.relation, conjuncts).await?;
             jr = apply_pushdown(jr, &jc, conjuncts)?;
+            let partner_schema = Schema::new(jc);
+            let using_keys = resolve_using_keys(&join.join_operator, &cur_schema, &partner_schema)?;
+            let resolved_keys = using_keys
+                .as_ref()
+                .map(|keys| using_key_pairs(keys, &cur_schema, &partner_schema));
+            let condition = resolved_keys
+                .as_deref()
+                .map(JoinCondition::ResolvedKeys)
+                .or_else(|| on.as_ref().map(JoinCondition::On));
             let cancel = db.cancel_token();
-            let (c, r) =
-                cpu_bound(|| combine(&cur_cols, &cur_rows, &jc, &jr, kind, on.as_ref(), &cancel))?;
-            cur_cols = c;
-            cur_rows = r;
+            let (cols, rows) = cpu_bound(|| {
+                combine(
+                    &cur_schema,
+                    &cur_rows,
+                    &partner_schema,
+                    &jr,
+                    kind,
+                    condition,
+                    &cancel,
+                )
+            })?;
+            (cur_schema, cur_rows) = match using_keys {
+                Some(keys) => {
+                    coalesce_using_join(&cur_schema, &partner_schema, cols, rows, kind, &keys)
+                }
+                None => (cols, rows),
+            };
         }
     }
-    Ok((cur_cols, cur_rows))
+    Ok((cur_schema, cur_rows))
 }
 
 /// Estimate how many rows of a table survive the applicable WHERE predicates,
@@ -8304,19 +8387,21 @@ async fn build_inner_join_reordered(
         let idx = remaining.remove(pos);
         let rcols = std::mem::take(&mut loaded[idx].cols);
         let rrows = std::mem::take(&mut loaded[idx].rows);
+        let left_schema = Schema::new(cur_cols);
+        let right_schema = Schema::new(rcols);
         let cancel = db.cancel_token();
         let (c, r) = cpu_bound(|| {
             combine(
-                &cur_cols,
+                &left_schema,
                 &cur_rows,
-                &rcols,
+                &right_schema,
                 &rrows,
                 JoinKind::Inner,
-                Some(&pred),
+                Some(JoinCondition::On(&pred)),
                 &cancel,
             )
         })?;
-        cur_cols = c;
+        cur_cols = c.columns;
         cur_rows = r;
     }
     Ok(Some((cur_cols, cur_rows)))
@@ -8501,6 +8586,249 @@ enum JoinKind {
     Full,
 }
 
+#[derive(Clone, Debug)]
+struct UsingKey {
+    name: String,
+    left: usize,
+    right: usize,
+}
+
+/// Columns exposed by an unqualified `*`, excluding only the operand indexes a
+/// USING/NATURAL join marked as qualified-access-only.
+pub(crate) fn unqualified_wildcard_indices(schema: &Schema) -> Vec<usize> {
+    schema.unqualified_indices().collect()
+}
+
+fn find_logical_column(schema: &Schema, name: &str, side: &str) -> Result<usize> {
+    let matches: Vec<usize> = unqualified_wildcard_indices(schema)
+        .into_iter()
+        .filter(|&index| column_name(&schema.columns[index]).eq_ignore_ascii_case(name))
+        .collect();
+    match matches.as_slice() {
+        [index] => Ok(*index),
+        [] => Err(Error::Catalog(format!(
+            "unknown column '{name}' in {side} relation of USING/NATURAL join"
+        ))),
+        _ => Err(Error::Query(format!(
+            "ambiguous column '{name}' in {side} relation of USING/NATURAL join"
+        ))),
+    }
+}
+
+fn join_constraint(operator: &JoinOperator) -> Option<&JoinConstraint> {
+    match operator {
+        JoinOperator::Inner(constraint)
+        | JoinOperator::LeftOuter(constraint)
+        | JoinOperator::RightOuter(constraint)
+        | JoinOperator::FullOuter(constraint) => Some(constraint),
+        _ => None,
+    }
+}
+
+/// Resolve USING/NATURAL column pairs in MySQL's logical output order. For
+/// INNER/LEFT joins the left operand is first; RIGHT joins behave as if their
+/// operands were swapped, so the right operand determines key and unique-column
+/// order.
+fn resolve_using_keys(
+    operator: &JoinOperator,
+    left: &Schema,
+    right: &Schema,
+) -> Result<Option<Vec<UsingKey>>> {
+    let Some(constraint) = join_constraint(operator) else {
+        return Ok(None);
+    };
+    let requested = match constraint {
+        JoinConstraint::Using(columns) => Some(
+            columns
+                .iter()
+                .map(|column| column.value.clone())
+                .collect::<Vec<_>>(),
+        ),
+        JoinConstraint::Natural => None,
+        JoinConstraint::On(_) | JoinConstraint::None => return Ok(None),
+    };
+
+    if let Some(names) = &requested {
+        let mut seen = std::collections::HashSet::new();
+        for name in names {
+            if !seen.insert(name.to_ascii_lowercase()) {
+                return Err(Error::Query(format!(
+                    "column '{name}' appears more than once in USING"
+                )));
+            }
+            find_logical_column(left, name, "left")?;
+            find_logical_column(right, name, "right")?;
+        }
+    }
+
+    let right_first = matches!(operator, JoinOperator::RightOuter(_));
+    let first = if right_first { right } else { left };
+    let mut names = Vec::new();
+    for index in unqualified_wildcard_indices(first) {
+        let name = column_name(&first.columns[index]);
+        if names
+            .iter()
+            .any(|seen: &String| seen.eq_ignore_ascii_case(name))
+        {
+            continue;
+        }
+        let selected = requested.as_ref().map_or_else(
+            || {
+                let other_schema = if right_first { left } else { right };
+                unqualified_wildcard_indices(other_schema)
+                    .into_iter()
+                    .any(|other| {
+                        column_name(&other_schema.columns[other]).eq_ignore_ascii_case(name)
+                    })
+            },
+            |using| using.iter().any(|column| column.eq_ignore_ascii_case(name)),
+        );
+        if selected {
+            names.push(name.to_owned());
+        }
+    }
+
+    names
+        .into_iter()
+        .map(|name| {
+            Ok(UsingKey {
+                left: find_logical_column(left, &name, "left")?,
+                right: find_logical_column(right, &name, "right")?,
+                name,
+            })
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(Some)
+}
+
+fn column_def_expr(column: &ColumnDef) -> Expr {
+    let mut parts = column
+        .qualifier
+        .iter()
+        .cloned()
+        .map(sqlparser::ast::Ident::new)
+        .collect::<Vec<_>>();
+    parts.push(sqlparser::ast::Ident::new(column_name(column)));
+    match parts.as_slice() {
+        [identifier] => Expr::Identifier(identifier.clone()),
+        _ => Expr::CompoundIdentifier(parts),
+    }
+}
+
+fn using_key_pairs(keys: &[UsingKey], left: &Schema, right: &Schema) -> Vec<(Expr, Expr)> {
+    keys.iter()
+        .map(|key| {
+            (
+                column_def_expr(&left.columns[key.left]),
+                column_def_expr(&right.columns[key.right]),
+            )
+        })
+        .collect()
+}
+
+fn coalesce_using_join(
+    left: &Schema,
+    right: &Schema,
+    physical_schema: Schema,
+    physical_rows: Vec<Vec<Value>>,
+    kind: JoinKind,
+    keys: &[UsingKey],
+) -> (Schema, Vec<Vec<Value>>) {
+    let left_len = left.columns.len();
+    let mut columns = keys
+        .iter()
+        .map(|key| {
+            let source = if kind == JoinKind::Right {
+                &right.columns[key.right]
+            } else {
+                &left.columns[key.left]
+            };
+            let mut column = source.clone();
+            column.name = key.name.clone();
+            column.qualifier.clear();
+            column
+        })
+        .collect::<Vec<_>>();
+    let mut tables = keys
+        .iter()
+        .map(|key| {
+            let (schema, index) = if kind == JoinKind::Right {
+                (right, key.right)
+            } else {
+                (left, key.left)
+            };
+            schema_column_table(schema, index)
+                .unwrap_or_default()
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+
+    let hidden_bare: std::collections::HashSet<usize> = keys
+        .iter()
+        .flat_map(|key| {
+            [
+                (key.left, &left.columns[key.left]),
+                (left_len + key.right, &right.columns[key.right]),
+            ]
+        })
+        .filter_map(|(index, column)| column.qualifier.is_empty().then_some(index))
+        .collect();
+    let physical_order = if kind == JoinKind::Right {
+        (left_len..physical_schema.columns.len())
+            .chain(0..left_len)
+            .collect::<Vec<_>>()
+    } else {
+        (0..physical_schema.columns.len()).collect()
+    };
+    let physical_order = physical_order
+        .into_iter()
+        .filter(|index| !hidden_bare.contains(index))
+        .collect::<Vec<_>>();
+    columns.extend(
+        physical_order
+            .iter()
+            .map(|&index| physical_schema.columns[index].clone()),
+    );
+    tables.extend(physical_order.iter().map(|&index| {
+        schema_column_table(&physical_schema, index)
+            .unwrap_or_default()
+            .to_owned()
+    }));
+
+    let key_physical: std::collections::HashSet<usize> = keys
+        .iter()
+        .flat_map(|key| [key.left, left_len + key.right])
+        .collect();
+    let mut schema = Schema::with_tables(columns, tables);
+    for (output_index, &physical_index) in physical_order.iter().enumerate() {
+        if physical_schema.is_hidden_from_unqualified(physical_index)
+            || key_physical.contains(&physical_index)
+        {
+            schema.hide_from_unqualified(keys.len() + output_index);
+        }
+    }
+    let output_len = schema.columns.len();
+
+    let rows = physical_rows
+        .into_iter()
+        .map(|row| {
+            let mut output = Vec::with_capacity(output_len);
+            output.extend(keys.iter().map(|key| {
+                let left_value = &row[key.left];
+                let right_value = &row[left_len + key.right];
+                match kind {
+                    JoinKind::Right => right_value.clone(),
+                    JoinKind::Full if left_value.is_null() => right_value.clone(),
+                    JoinKind::Inner | JoinKind::Left | JoinKind::Full => left_value.clone(),
+                }
+            }));
+            output.extend(physical_order.iter().map(|&index| row[index].clone()));
+            output
+        })
+        .collect();
+    (schema, rows)
+}
+
 fn join_kind(op: &JoinOperator) -> Result<(JoinKind, Option<Expr>)> {
     let on = |c: &JoinConstraint| match c {
         JoinConstraint::On(e) => Some(e.clone()),
@@ -8520,58 +8848,80 @@ fn join_kind(op: &JoinOperator) -> Result<(JoinKind, Option<Expr>)> {
     })
 }
 
-/// Combine two materialised relations under a join kind. Equi-`ON` INNER/LEFT
-/// use a hash join; everything else (RIGHT/FULL, non-equi) is nested-loop.
+#[derive(Clone, Copy)]
+enum JoinCondition<'a> {
+    On(&'a Expr),
+    ResolvedKeys(&'a [(Expr, Expr)]),
+}
+
+/// Combine two materialised relations under a join kind. Compatible equi-`ON`
+/// and resolved USING/NATURAL keys use a hash join; other conditions use the
+/// general nested-loop evaluator.
 #[allow(clippy::too_many_arguments)]
 fn combine(
-    lcols: &[ColumnDef],
+    lschema: &Schema,
     lrows: &[Vec<Value>],
-    rcols: &[ColumnDef],
+    rschema: &Schema,
     rrows: &[Vec<Value>],
     kind: JoinKind,
-    on: Option<&Expr>,
+    condition: Option<JoinCondition<'_>>,
     cancel: &std::sync::Arc<elyra_core::cancel::QueryCancel>,
-) -> Result<(Vec<ColumnDef>, Vec<Vec<Value>>)> {
-    let mut cols = lcols.to_vec();
-    cols.extend_from_slice(rcols);
-    let lschema = Schema::new(lcols.to_vec());
-    let rschema = Schema::new(rcols.to_vec());
+) -> Result<(Schema, Vec<Vec<Value>>)> {
+    let schema = combined_join_schema(lschema, rschema);
+
+    // Validate analyzable ON references against the actual combined schema
+    // before a hash/merge optimization splits the expression back into its two
+    // inputs. Otherwise a bare name that is valid on the accumulated left side
+    // can bypass the ambiguity introduced by the new right side.
+    if let Some(JoinCondition::On(expression)) = condition {
+        validate_join_on_refs(expression, &schema)?;
+    }
 
     // Hash join for equi INNER/LEFT/RIGHT (cost-based build side). For large
     // INNER equi-joins whose inputs are already sorted on the join key (e.g.
     // clustered primary-key scans), use a streaming merge join instead — no hash
     // table, and the output stays ordered.
+    let inferred_keys = match condition {
+        Some(JoinCondition::On(expression)) => equi_key_pairs(expression, lschema, rschema),
+        Some(JoinCondition::ResolvedKeys(_)) | None => None,
+    };
+    let key_pairs = match condition {
+        Some(JoinCondition::On(_)) => inferred_keys.as_deref(),
+        Some(JoinCondition::ResolvedKeys(keys)) => Some(keys),
+        None => None,
+    };
     if matches!(kind, JoinKind::Inner | JoinKind::Left | JoinKind::Right) {
-        if let Some(e) = on {
-            if let Some((lkey, rkey)) = equi_keys(e, &lschema, &rschema) {
-                const MERGE_MIN: usize = 2048;
-                // The merge join compares keys under the default collation, so
-                // skip it for a `_bin` join key (fall through to the
+        if let Some(keys) = key_pairs
+            .filter(|keys| !keys.is_empty() && hash_key_pairs_compatible(keys, lschema, rschema))
+        {
+            const MERGE_MIN: usize = 2048;
+            if let [(lkey, rkey)] = keys {
+                // The merge join compares keys under the default collation,
+                // so skip it for a `_bin` join key (fall through to the
                 // collation-aware hash join below).
-                let bin_key = join_key_collation(&lkey, &lschema, &rkey, &rschema).is_bin();
+                let bin_key = join_key_collation(lkey, lschema, rkey, rschema).is_bin();
                 if !bin_key
                     && kind == JoinKind::Inner
                     && lrows.len() >= MERGE_MIN
                     && rrows.len() >= MERGE_MIN
                 {
                     if let (Some(lk), Some(rk)) = (
-                        sorted_keyed(lrows, &lschema, &lkey)?,
-                        sorted_keyed(rrows, &rschema, &rkey)?,
+                        sorted_keyed(lrows, lschema, lkey)?,
+                        sorted_keyed(rrows, rschema, rkey)?,
                     ) {
                         if let Some(out) = merge_join_inner(lk, rk) {
-                            return Ok((cols, out));
+                            return Ok((schema, out));
                         }
                     }
                 }
-                let rows = hash_join(lrows, rrows, &lschema, &rschema, &lkey, &rkey, kind, cancel)?;
-                return Ok((cols, rows));
             }
+            let rows = hash_join(lrows, rrows, lschema, rschema, keys, kind, cancel)?;
+            return Ok((schema, rows));
         }
     }
 
-    let schema = Schema::new(cols.clone());
-    let llen = lcols.len();
-    let rlen = rcols.len();
+    let llen = lschema.columns.len();
+    let rlen = rschema.columns.len();
     let mut out = Vec::new();
     let mut right_matched = vec![false; rrows.len()];
 
@@ -8584,13 +8934,20 @@ fn combine(
     for l in lrows {
         let mut matched = false;
         for (ri, r) in rrows.iter().enumerate() {
+            #[cfg(test)]
+            NESTED_JOIN_COMPARISONS.with(|comparisons| comparisons.set(comparisons.get() + 1));
             check.tick()?;
             budget.account(out.len())?;
             let mut combined = l.clone();
             combined.extend_from_slice(r);
             budget.sample(&combined);
-            let keep = match on {
-                Some(e) => predicate::matches(e, &schema, &combined)?,
+            let keep = match condition {
+                Some(JoinCondition::On(expression)) => {
+                    predicate::matches(expression, &schema, &combined)?
+                }
+                Some(JoinCondition::ResolvedKeys(keys)) => {
+                    resolved_key_pairs_match(l, lschema, r, rschema, keys)?
+                }
                 None => true,
             };
             if keep {
@@ -8616,7 +8973,65 @@ fn combine(
             }
         }
     }
-    Ok((cols, out))
+    Ok((schema, out))
+}
+
+/// Physical joined schema with lookup visibility and result metadata preserved.
+fn combined_join_schema(lschema: &Schema, rschema: &Schema) -> Schema {
+    let mut cols = lschema.columns.clone();
+    cols.extend_from_slice(&rschema.columns);
+    let tables = (0..lschema.columns.len())
+        .map(|index| {
+            schema_column_table(lschema, index)
+                .unwrap_or_default()
+                .to_owned()
+        })
+        .chain((0..rschema.columns.len()).map(|index| {
+            schema_column_table(rschema, index)
+                .unwrap_or_default()
+                .to_owned()
+        }))
+        .collect();
+    let mut schema = Schema::with_tables(cols, tables);
+    for index in 0..lschema.columns.len() {
+        if lschema.is_hidden_from_unqualified(index) {
+            schema.hide_from_unqualified(index);
+        }
+    }
+    let left_len = lschema.columns.len();
+    for index in 0..rschema.columns.len() {
+        if rschema.is_hidden_from_unqualified(index) {
+            schema.hide_from_unqualified(left_len + index);
+        }
+    }
+
+    schema
+}
+
+fn resolved_key_pairs_match(
+    left_row: &[Value],
+    left_schema: &Schema,
+    right_row: &[Value],
+    right_schema: &Schema,
+    keys: &[(Expr, Expr)],
+) -> Result<bool> {
+    for (left, right) in keys {
+        let left_value = predicate::eval_row(left, left_schema, left_row)?;
+        let right_value = predicate::eval_row(right, right_schema, right_row)?;
+        let collation = join_key_collation(left, left_schema, right, right_schema);
+        if !left_value
+            .compare_coll(&right_value, collation)
+            .is_some_and(std::cmp::Ordering::is_eq)
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static NESTED_JOIN_COMPARISONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Equi hash join for INNER / LEFT / RIGHT, always emitting `[left.., right..]`.
@@ -8628,8 +9043,7 @@ fn hash_join(
     rrows: &[Vec<Value>],
     lschema: &Schema,
     rschema: &Schema,
-    lkey: &Expr,
-    rkey: &Expr,
+    keys: &[(Expr, Expr)],
     kind: JoinKind,
     cancel: &std::sync::Arc<elyra_core::cancel::QueryCancel>,
 ) -> Result<Vec<Vec<Value>>> {
@@ -8652,20 +9066,25 @@ fn hash_join(
         _ => lrows.len() <= rrows.len(),
     };
     let outer = !matches!(kind, JoinKind::Inner);
-    let coll = join_key_collation(lkey, lschema, rkey, rschema);
+    let collations = keys
+        .iter()
+        .map(|(left, right)| join_key_collation(left, lschema, right, rschema))
+        .collect::<Vec<_>>();
+    let left_keys = keys.iter().map(|(left, _)| left).collect::<Vec<_>>();
+    let right_keys = keys.iter().map(|(_, right)| right).collect::<Vec<_>>();
     let mut out = Vec::new();
 
     if build_left {
         let mut table: HashMap<Vec<u8>, Vec<usize>> = HashMap::new();
         for (i, l) in lrows.iter().enumerate() {
             check.tick()?;
-            if let Some(k) = key_bytes_coll(&predicate::eval_row(lkey, lschema, l)?, coll) {
+            if let Some(k) = composite_key_bytes(l, lschema, &left_keys, &collations)? {
                 table.entry(k).or_default().push(i);
             }
         }
         for r in rrows {
             check.tick()?;
-            let probe = key_bytes_coll(&predicate::eval_row(rkey, rschema, r)?, coll);
+            let probe = composite_key_bytes(r, rschema, &right_keys, &collations)?;
             let mut matched = false;
             if let Some(k) = probe {
                 if let Some(idxs) = table.get(&k) {
@@ -8691,13 +9110,13 @@ fn hash_join(
         let mut table: HashMap<Vec<u8>, Vec<usize>> = HashMap::new();
         for (i, r) in rrows.iter().enumerate() {
             check.tick()?;
-            if let Some(k) = key_bytes_coll(&predicate::eval_row(rkey, rschema, r)?, coll) {
+            if let Some(k) = composite_key_bytes(r, rschema, &right_keys, &collations)? {
                 table.entry(k).or_default().push(i);
             }
         }
         for l in lrows {
             check.tick()?;
-            let probe = key_bytes_coll(&predicate::eval_row(lkey, lschema, l)?, coll);
+            let probe = composite_key_bytes(l, lschema, &left_keys, &collations)?;
             let mut matched = false;
             if let Some(k) = probe {
                 if let Some(idxs) = table.get(&k) {
@@ -8822,6 +9241,24 @@ fn expr_col_index(e: &Expr, schema: &Schema) -> Option<usize> {
     }
 }
 
+fn composite_key_bytes(
+    row: &[Value],
+    schema: &Schema,
+    expressions: &[&Expr],
+    collations: &[elyra_core::Collation],
+) -> Result<Option<Vec<u8>>> {
+    let mut composite = Vec::new();
+    for (expression, &collation) in expressions.iter().zip(collations) {
+        let value = predicate::eval_row(expression, schema, row)?;
+        let Some(bytes) = key_bytes_coll(&value, collation) else {
+            return Ok(None);
+        };
+        composite.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+        composite.extend_from_slice(&bytes);
+    }
+    Ok(Some(composite))
+}
+
 fn key_bytes_coll(v: &Value, coll: elyra_core::Collation) -> Option<Vec<u8>> {
     if v.is_null() {
         None
@@ -8863,6 +9300,55 @@ fn equi_keys(on: &Expr, lschema: &Schema, rschema: &Schema) -> Option<(Expr, Exp
         Some(((**right).clone(), (**left).clone()))
     } else {
         None
+    }
+}
+
+/// Extract every cross-relation equality from a predicate made entirely of
+/// `AND`-connected equi predicates. These become one composite hash key, so a
+/// multi-column USING/NATURAL join does not fall through to a quadratic scan.
+fn equi_key_pairs(on: &Expr, lschema: &Schema, rschema: &Schema) -> Option<Vec<(Expr, Expr)>> {
+    let mut conjuncts = Vec::new();
+    split_and(on, &mut conjuncts);
+    conjuncts
+        .iter()
+        .map(|conjunct| equi_keys(conjunct, lschema, rschema))
+        .collect()
+}
+
+/// Hash only direct-column pairs whose type-tagged keys preserve every equality
+/// that [`Value::compare`] can report. Other pairs retain the general nested
+/// evaluator, including SQL's numeric/text and decimal/integer coercions.
+fn hash_key_pairs_compatible(keys: &[(Expr, Expr)], left: &Schema, right: &Schema) -> bool {
+    keys.iter().all(|(left_key, right_key)| {
+        let Some(left_type) = expr_col_index(left_key, left)
+            .and_then(|index| left.columns.get(index))
+            .map(|column| &column.ty)
+        else {
+            return false;
+        };
+        let Some(right_type) = expr_col_index(right_key, right)
+            .and_then(|index| right.columns.get(index))
+            .map(|column| &column.ty)
+        else {
+            return false;
+        };
+        hash_key_types_compatible(left_type, right_type)
+    })
+}
+
+fn hash_key_types_compatible(left: &ColumnType, right: &ColumnType) -> bool {
+    use ColumnType::{Bool, Bytes, Date, DateTime, Decimal, Int, Json, Text, Time, UInt};
+
+    match (left, right) {
+        (Int | UInt, Int | UInt)
+        | (Bool, Bool)
+        | (Bytes, Bytes)
+        | (Date, Date)
+        | (DateTime, DateTime)
+        | (Time, Time)
+        | (Text | Json, Text | Json) => true,
+        (Decimal(_, left_scale), Decimal(_, right_scale)) => left_scale == right_scale,
+        _ => false,
     }
 }
 
@@ -8931,6 +9417,20 @@ fn collect_refs<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) -> bool {
         }
         _ => false,
     }
+}
+
+fn validate_join_on_refs(expr: &Expr, schema: &Schema) -> Result<()> {
+    let mut references = Vec::new();
+    if !collect_refs(expr, &mut references) {
+        return Ok(());
+    }
+    for reference in references {
+        // Use the expression evaluator's exact identifier rules so niladic
+        // functions and system variables remain valid while unknown or
+        // ambiguous columns still fail before an optimized join path.
+        predicate::eval_row(reference, schema, &[])?;
+    }
+    Ok(())
 }
 
 /// If `filter` is exactly `col = <literal>` (either operand order), return the
@@ -10600,8 +11100,7 @@ async fn multi_update(
     selection: Option<&Expr>,
 ) -> Result<QueryResult> {
     let from = std::slice::from_ref(table);
-    let (cols, rows) = build_from(db, vindex, from, &[]).await?;
-    let schema = Schema::new(cols);
+    let (schema, rows) = build_from(db, vindex, from, &[]).await?;
     let filter = match selection {
         Some(f) => Some(resolve_subqueries(db, vindex, f.clone()).await?),
         None => None,
@@ -10752,8 +11251,7 @@ async fn multi_delete(
     relations: &[TableWithJoins],
 ) -> Result<QueryResult> {
     let source_relations = del.using.as_deref().unwrap_or(relations);
-    let (cols, rows) = build_from(db, vindex, source_relations, &[]).await?;
-    let schema = Schema::new(cols);
+    let (schema, rows) = build_from(db, vindex, source_relations, &[]).await?;
     let filter = match &del.selection {
         Some(f) => Some(resolve_subqueries(db, vindex, f.clone()).await?),
         None => None,
@@ -11094,7 +11592,8 @@ fn project_exprs(
     for item in projection {
         match item {
             SelectItem::Wildcard(_) => {
-                for (i, c) in schema.columns.iter().enumerate() {
+                for i in unqualified_wildcard_indices(schema) {
+                    let c = &schema.columns[i];
                     names.push(column_name(c).to_owned());
                     projs.push(Proj::Col(i));
                 }
@@ -11198,7 +11697,7 @@ fn project_exprs(
         };
         tables.push(
             source_column
-                .and_then(|i| column_table(&schema.columns[i]).or(default_table))
+                .and_then(|index| schema_column_table(schema, index).or(default_table))
                 .unwrap_or_default()
                 .to_owned(),
         );
@@ -12747,6 +13246,55 @@ fn projection_has_subquery(projection: &[sqlparser::ast::SelectItem]) -> bool {
     })
 }
 
+/// Whether a projection subquery contains a bare identifier that may belong to
+/// the joined outer schema. Qualified correlation is detected separately; this
+/// covers logical USING/NATURAL keys while avoiding the per-row path for
+/// obviously uncorrelated forms such as `(SELECT 1)`.
+fn query_has_bare_identifier(query: &SqlQuery) -> bool {
+    let found = std::cell::Cell::new(false);
+    let _ = rewrite_query(query, &|candidate| {
+        if let Expr::Identifier(identifier) = candidate {
+            if !identifier.value.starts_with("@@") {
+                found.set(true);
+            }
+        }
+        None
+    });
+    found.get()
+}
+
+fn expr_has_potential_bare_correlation(expr: &Expr) -> bool {
+    let found = std::cell::Cell::new(false);
+    let _ = map_expr(expr, &|candidate| match candidate {
+        Expr::Subquery(query)
+        | Expr::InSubquery {
+            subquery: query, ..
+        }
+        | Expr::Exists {
+            subquery: query, ..
+        } => {
+            if query_has_bare_identifier(query) {
+                found.set(true);
+            }
+            // The nested query was inspected recursively above.
+            Some(candidate.clone())
+        }
+        _ => None,
+    });
+    found.get()
+}
+
+fn projection_has_potential_bare_correlation(projection: &[sqlparser::ast::SelectItem]) -> bool {
+    use sqlparser::ast::SelectItem;
+
+    projection.iter().any(|item| match item {
+        SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+            expr_has_potential_bare_correlation(expr)
+        }
+        SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => false,
+    })
+}
+
 fn expr_has_subquery(e: &Expr) -> bool {
     let found = std::cell::Cell::new(false);
     let _ = map_expr(e, &|x| {
@@ -13048,7 +13596,7 @@ async fn resolve_subqueries_with_outer(
         match resolve_subqueries(db, vindex, bound.clone()).await {
             Ok(resolved) => return Ok(resolved),
             Err(error) => {
-                let Some(column) = bare_unknown_column(&error).map(str::to_owned) else {
+                let Some(column) = bare_unknown_column(&error, &bound).map(str::to_owned) else {
                     return Err(error);
                 };
                 if rebound
@@ -13077,12 +13625,21 @@ async fn resolve_subqueries_with_outer(
     }
 }
 
-fn bare_unknown_column(error: &Error) -> Option<&str> {
+fn bare_unknown_column<'a>(error: &'a Error, expr: &Expr) -> Option<&'a str> {
     let Error::Catalog(message) = error else {
         return None;
     };
     let column = message.strip_prefix("unknown column: ")?;
-    (!column.contains('.')).then_some(column)
+    let is_bare = std::cell::Cell::new(false);
+    let _ = map_expr(expr, &|candidate| {
+        if let Expr::Identifier(identifier) = candidate {
+            if identifier.value.eq_ignore_ascii_case(column) {
+                is_bare.set(true);
+            }
+        }
+        None
+    });
+    is_bare.get().then_some(column)
 }
 
 async fn sort_rows_with_subqueries(
@@ -16598,5 +17155,63 @@ mod join_key_tests {
         assert_eq!(m.get(long.as_slice()), Some(&2));
         assert_eq!(m.get(b"missing".as_slice()), None);
         assert_eq!(m.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod composite_join_tests {
+    use std::sync::Arc;
+
+    use elyra_core::cancel::QueryCancel;
+    use elyra_core::{ColumnDef, ColumnType, Schema, Value};
+    use sqlparser::ast::{BinaryOperator, Expr};
+
+    use super::{column_def_expr, combine, JoinCondition, JoinKind, NESTED_JOIN_COMPARISONS};
+
+    #[test]
+    fn multi_key_equality_avoids_quadratic_fallback() {
+        let left_columns = [
+            ColumnDef::new("l.id", ColumnType::Int, false).with_qualifier(vec!["l".into()]),
+            ColumnDef::new("l.code", ColumnType::Int, false).with_qualifier(vec!["l".into()]),
+        ];
+        let right_columns = [
+            ColumnDef::new("r.id", ColumnType::Int, false).with_qualifier(vec!["r".into()]),
+            ColumnDef::new("r.code", ColumnType::Int, false).with_qualifier(vec!["r".into()]),
+        ];
+        let left_schema = Schema::new(left_columns.into());
+        let right_schema = Schema::new(right_columns.into());
+        let left_rows = (0..256)
+            .map(|value| vec![Value::Int(value / 4), Value::Int(value % 4)])
+            .collect::<Vec<_>>();
+        let right_rows = left_rows.clone();
+        let equality = |left: usize, right: usize| Expr::BinaryOp {
+            left: Box::new(column_def_expr(&left_schema.columns[left])),
+            op: BinaryOperator::Eq,
+            right: Box::new(column_def_expr(&right_schema.columns[right])),
+        };
+        let predicate = Expr::BinaryOp {
+            left: Box::new(equality(0, 0)),
+            op: BinaryOperator::And,
+            right: Box::new(equality(1, 1)),
+        };
+
+        NESTED_JOIN_COMPARISONS.with(|comparisons| comparisons.set(0));
+        let (_, rows) = combine(
+            &left_schema,
+            &left_rows,
+            &right_schema,
+            &right_rows,
+            JoinKind::Inner,
+            Some(JoinCondition::On(&predicate)),
+            &Arc::new(QueryCancel::new()),
+        )
+        .unwrap();
+        let comparisons = NESTED_JOIN_COMPARISONS.with(std::cell::Cell::get);
+
+        assert_eq!(rows.len(), left_rows.len());
+        assert!(
+            comparisons <= left_rows.len() * 4,
+            "multi-key equality used {comparisons} pairwise comparisons"
+        );
     }
 }
