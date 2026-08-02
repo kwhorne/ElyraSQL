@@ -3974,7 +3974,78 @@ async fn execute_rollup(
     Ok(QueryResult::Rows(RowStream::literal(schema, all_rows)))
 }
 
+// Client SQL is checked before parsing, but stored views compose already-parsed
+// queries and can therefore create nesting that the text-level complexity guard
+// cannot see. Keep that recursion bounded, including cyclic view definitions.
+const MAX_QUERY_NESTING: usize = 64;
+
+tokio::task_local! {
+    static QUERY_NESTING: std::cell::Cell<usize>;
+}
+
+struct QueryNestingGuard;
+
+impl QueryNestingGuard {
+    fn enter() -> Result<Self> {
+        QUERY_NESTING.with(|depth| {
+            let next = depth.get() + 1;
+            if next > MAX_QUERY_NESTING {
+                return Err(Error::Query(format!(
+                    "query nesting exceeds {MAX_QUERY_NESTING} levels"
+                )));
+            }
+            depth.set(next);
+            Ok(Self)
+        })
+    }
+}
+
+impl Drop for QueryNestingGuard {
+    fn drop(&mut self) {
+        let _ = QUERY_NESTING.try_with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
+
 pub async fn select(
+    db: &Session,
+    vindex: &VectorRegistry,
+    query: &SqlQuery,
+) -> Result<QueryResult> {
+    if QUERY_NESTING.try_with(|_| ()).is_ok() {
+        select_with_stack(db, vindex, query).await
+    } else {
+        QUERY_NESTING
+            .scope(
+                std::cell::Cell::new(0),
+                select_with_stack(db, vindex, query),
+            )
+            .await
+    }
+}
+
+async fn select_with_stack(
+    db: &Session,
+    vindex: &VectorRegistry,
+    query: &SqlQuery,
+) -> Result<QueryResult> {
+    // `select_inner` has a large debug-build poll frame. Derived relations call
+    // back into it synchronously while their subquery is ready, so an otherwise
+    // modest stored-view chain can exhaust a Tokio worker's native stack. Grow
+    // only near the guard page; completed segments are released on return.
+    const RED_ZONE: usize = 1024 * 1024;
+    const STACK_SIZE: usize = 2 * 1024 * 1024;
+
+    let _nesting = QueryNestingGuard::enter()?;
+    let mut future = Box::pin(select_inner(db, vindex, query));
+    std::future::poll_fn(move |context| {
+        stacker::maybe_grow(RED_ZONE, STACK_SIZE, || {
+            std::future::Future::poll(future.as_mut(), context)
+        })
+    })
+    .await
+}
+
+async fn select_inner(
     db: &Session,
     vindex: &VectorRegistry,
     query: &SqlQuery,
