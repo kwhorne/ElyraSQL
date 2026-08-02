@@ -186,8 +186,12 @@ pub fn eval_row(expr: &Expr, schema: &Schema, row: &[Value]) -> Result<Value> {
                         )))
                     }
                 }
+                (UnaryOperator::Minus, v) => Ok(v
+                    .as_mysql_f64()
+                    .map(|n| Value::Float(-n))
+                    .unwrap_or(Value::Null)),
                 (UnaryOperator::Plus, v) => Ok(v),
-                (UnaryOperator::PGBitwiseNot, v) => Ok(match v.as_f64() {
+                (UnaryOperator::PGBitwiseNot, v) => Ok(match v.as_mysql_f64() {
                     Some(x) => Value::Int(!(x as i64)),
                     None => Value::Null,
                 }),
@@ -238,7 +242,9 @@ pub fn eval_row(expr: &Expr, schema: &Schema, row: &[Value]) -> Result<Value> {
                     1
                 };
                 let base = eval_row(left, schema, row)?;
-                let n = eval_row(&iv.value, schema, row)?.as_f64().unwrap_or(0.0) as i64;
+                let n = eval_row(&iv.value, schema, row)?
+                    .as_mysql_f64()
+                    .unwrap_or(0.0) as i64;
                 let unit = iv
                     .leading_field
                     .as_ref()
@@ -251,7 +257,9 @@ pub fn eval_row(expr: &Expr, schema: &Schema, row: &[Value]) -> Result<Value> {
                     unreachable!()
                 };
                 let base = eval_row(right, schema, row)?;
-                let n = eval_row(&iv.value, schema, row)?.as_f64().unwrap_or(0.0) as i64;
+                let n = eval_row(&iv.value, schema, row)?
+                    .as_mysql_f64()
+                    .unwrap_or(0.0) as i64;
                 let unit = iv
                     .leading_field
                     .as_ref()
@@ -393,11 +401,11 @@ pub fn eval_row(expr: &Expr, schema: &Schema, row: &[Value]) -> Result<Value> {
             };
             Ok(Value::Text(res))
         }
-        Expr::Ceil { expr, .. } => Ok(match eval_row(expr, schema, row)?.as_f64() {
+        Expr::Ceil { expr, .. } => Ok(match eval_row(expr, schema, row)?.as_mysql_f64() {
             Some(x) => Value::Int(x.ceil() as i64),
             None => Value::Null,
         }),
-        Expr::Floor { expr, .. } => Ok(match eval_row(expr, schema, row)?.as_f64() {
+        Expr::Floor { expr, .. } => Ok(match eval_row(expr, schema, row)?.as_mysql_f64() {
             Some(x) => Value::Int(x.floor() as i64),
             None => Value::Null,
         }),
@@ -713,7 +721,7 @@ fn eval_function(f: &sqlparser::ast::Function, schema: &Schema, row: &[Value]) -
         "timestampadd" if args_exprs.len() == 3 => {
             let unit = unit_name(args_exprs[0]);
             let n = eval_row(args_exprs[1], schema, row)?
-                .as_f64()
+                .as_mysql_f64()
                 .unwrap_or(0.0) as i64;
             let base = eval_row(args_exprs[2], schema, row)?;
             return Ok(apply_interval(base, n, &unit));
@@ -722,7 +730,9 @@ fn eval_function(f: &sqlparser::ast::Function, schema: &Schema, row: &[Value]) -
             let base = eval_row(args_exprs[0], schema, row)?;
             let sub = matches!(name.as_str(), "date_sub" | "subdate");
             if let Expr::Interval(iv) = args_exprs[1] {
-                let n = eval_row(&iv.value, schema, row)?.as_f64().unwrap_or(0.0) as i64;
+                let n = eval_row(&iv.value, schema, row)?
+                    .as_mysql_f64()
+                    .unwrap_or(0.0) as i64;
                 let unit = iv
                     .leading_field
                     .as_ref()
@@ -731,7 +741,7 @@ fn eval_function(f: &sqlparser::ast::Function, schema: &Schema, row: &[Value]) -
                 return Ok(apply_interval(base, if sub { -n } else { n }, &unit));
             }
             let n = eval_row(args_exprs[1], schema, row)?
-                .as_f64()
+                .as_mysql_f64()
                 .unwrap_or(0.0) as i64;
             return Ok(apply_interval(base, if sub { -n } else { n }, "DAY"));
         }
@@ -1091,7 +1101,7 @@ fn sstr(a: &[Value], i: usize) -> Option<String> {
     a.get(i).and_then(wire)
 }
 fn nnum(a: &[Value], i: usize) -> Option<f64> {
-    a.get(i).and_then(|v| v.as_f64())
+    a.get(i).and_then(Value::as_mysql_f64)
 }
 fn str1(a: &[Value], f: impl Fn(String) -> String) -> Value {
     match sstr(a, 0) {
@@ -1146,7 +1156,7 @@ fn eval_scalar(name: &str, a: &[Value]) -> Result<Option<Value>> {
                     Value::DateTime(m) => Value::Int(m / 1_000_000),
                     Value::Null => Value::Null,
                     v => v
-                        .as_f64()
+                        .as_mysql_f64()
                         .map(|n| Value::Int(n as i64))
                         .unwrap_or(Value::Null),
                 }
@@ -1373,7 +1383,7 @@ fn eval_scalar(name: &str, a: &[Value]) -> Result<Option<Value>> {
         "abs" => match a.first() {
             Some(Value::Int(i)) => Value::Int(i.abs()),
             Some(v) => v
-                .as_f64()
+                .as_mysql_f64()
                 .map(|x| Value::Float(x.abs()))
                 .unwrap_or(Value::Null),
             None => Value::Null,
@@ -1493,7 +1503,7 @@ fn eval_scalar(name: &str, a: &[Value]) -> Result<Option<Value>> {
         "char" => {
             let s: String = a
                 .iter()
-                .filter_map(|v| v.as_f64())
+                .filter_map(Value::as_mysql_f64)
                 .filter_map(|n| char::from_u32(n as u32))
                 .collect();
             Value::Text(s)
@@ -2128,7 +2138,7 @@ fn cast_value(v: Value, ty: &sqlparser::ast::DataType) -> Result<Value> {
         || tn.contains("NUMERIC")
         || tn.contains("DEC")
     {
-        v.as_f64().map(Value::Float).unwrap_or(Value::Null)
+        v.as_mysql_f64().map(Value::Float).unwrap_or(Value::Null)
     } else if tn.starts_with("DATETIME") || tn.starts_with("TIMESTAMP") {
         match &v {
             Value::DateTime(_) => v,
@@ -2981,7 +2991,7 @@ fn bitwise(l: Value, op: &BinaryOperator, r: Value) -> Result<Value> {
             Value::UInt(u) => Some(*u),
             Value::Int(i) => Some(*i as u64),
             Value::Bool(b) => Some(*b as u64),
-            _ => v.as_f64().map(|f| f as i64 as u64),
+            _ => v.as_mysql_f64().map(|f| f as i64 as u64),
         }
     };
     let (a, b) = match (to_u64(&l), to_u64(&r)) {
@@ -3168,7 +3178,7 @@ fn cmp_collation(l: &Expr, r: &Expr, schema: &Schema) -> Collation {
 }
 
 fn num(v: &Value) -> Option<f64> {
-    v.as_f64()
+    v.as_mysql_f64()
 }
 
 /// Exact decimal `+`/`-`/`*`. Returns `Ok(None)` (fall back to float) for
@@ -3277,7 +3287,7 @@ fn truthy(v: &Value) -> bool {
         Value::Float(f) => *f != 0.0,
         Value::Decimal(u, _) => *u != 0,
         Value::Null => false,
-        other => other.as_f64().map(|f| f != 0.0).unwrap_or(false),
+        other => other.as_mysql_f64().map(|f| f != 0.0).unwrap_or(false),
     }
 }
 

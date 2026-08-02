@@ -721,7 +721,7 @@ fn truncate_utf8(mut text: String, max_len: Option<usize>) -> String {
 }
 
 fn num(v: &Value) -> Option<f64> {
-    v.as_f64()
+    v.as_mysql_f64()
 }
 
 /// Total order over values (NULL first). Delegates to the shared
