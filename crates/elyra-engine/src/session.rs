@@ -14,7 +14,7 @@ use std::sync::Mutex;
 
 use std::sync::Arc;
 
-use elyra_core::{Error, Result};
+use elyra_core::{Error, Result, Value};
 use elyra_storage::{Db, RangeSnapshot, Snapshot, Validation};
 
 use crate::lockmgr::{LockGuard, LockManager, LockMode};
@@ -119,8 +119,14 @@ pub struct Session {
     db: Db,
     txn: Mutex<Option<TxnState>>,
     isolation: Mutex<Isolation>,
+    transaction_isolation: Mutex<String>,
     database: Mutex<String>,
     strict_sql_mode: std::sync::atomic::AtomicBool,
+    sql_mode: Mutex<String>,
+    autocommit: std::sync::atomic::AtomicBool,
+    foreign_key_checks: std::sync::atomic::AtomicBool,
+    no_auto_value_on_zero: std::sync::atomic::AtomicBool,
+    group_concat_max_len: std::sync::atomic::AtomicUsize,
     /// Nested `CALL` depth (guards against runaway procedure recursion).
     call_depth: std::sync::atomic::AtomicUsize,
     /// Ready-to-run trigger-body SQL queued by the last DML, fired by the engine.
@@ -180,8 +186,14 @@ impl Session {
             db,
             txn: Mutex::new(None),
             isolation: Mutex::new(Isolation::Snapshot),
+            transaction_isolation: Mutex::new("REPEATABLE-READ".into()),
             database: Mutex::new("elyra".into()),
             strict_sql_mode: std::sync::atomic::AtomicBool::new(true),
+            sql_mode: Mutex::new("STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION".into()),
+            autocommit: std::sync::atomic::AtomicBool::new(true),
+            foreign_key_checks: std::sync::atomic::AtomicBool::new(true),
+            no_auto_value_on_zero: std::sync::atomic::AtomicBool::new(false),
+            group_concat_max_len: std::sync::atomic::AtomicUsize::new(1024),
             call_depth: std::sync::atomic::AtomicUsize::new(0),
             pending_triggers: Mutex::new(Vec::new()),
             user_vars: Mutex::new(std::collections::HashMap::new()),
@@ -245,6 +257,81 @@ impl Session {
     pub fn set_strict_sql_mode(&self, strict: bool) {
         self.strict_sql_mode
             .store(strict, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The current session SQL mode list, in the spelling supplied by the
+    /// client. The mode list controls the settings whose behavior ElyraSQL
+    /// implements, rather than being a read-only compatibility string.
+    pub fn sql_mode(&self) -> String {
+        self.sql_mode.lock().unwrap().clone()
+    }
+
+    pub fn set_sql_mode(&self, sql_mode: String) {
+        let upper = sql_mode.to_ascii_uppercase();
+        let has_mode = |mode| upper.split(',').any(|item| item.trim() == mode);
+        self.set_strict_sql_mode(has_mode("STRICT_TRANS_TABLES") || has_mode("STRICT_ALL_TABLES"));
+        self.no_auto_value_on_zero.store(
+            has_mode("NO_AUTO_VALUE_ON_ZERO"),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        *self.sql_mode.lock().unwrap() = sql_mode;
+    }
+
+    pub fn ansi_quotes(&self) -> bool {
+        self.sql_mode
+            .lock()
+            .unwrap()
+            .split(',')
+            .any(|item| item.trim().eq_ignore_ascii_case("ANSI_QUOTES"))
+    }
+
+    pub fn no_auto_value_on_zero(&self) -> bool {
+        self.no_auto_value_on_zero
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn autocommit(&self) -> bool {
+        self.autocommit.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Change autocommit mode. Switching from off to on commits the current
+    /// transaction, matching MySQL's implicit-commit boundary.
+    pub async fn set_autocommit(&self, enabled: bool) -> Result<()> {
+        if enabled && !self.autocommit() {
+            self.commit().await?;
+        }
+        self.autocommit
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Start the transaction that MySQL opens lazily for the first DML after
+    /// `SET autocommit = 0` (and after each COMMIT/ROLLBACK in that mode).
+    pub fn begin_implicit_transaction(&self) -> Result<()> {
+        if !self.autocommit() && !self.in_txn() {
+            self.begin()?;
+        }
+        Ok(())
+    }
+
+    pub fn foreign_key_checks(&self) -> bool {
+        self.foreign_key_checks
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn set_foreign_key_checks(&self, enabled: bool) {
+        self.foreign_key_checks
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn group_concat_max_len(&self) -> usize {
+        self.group_concat_max_len
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn set_group_concat_max_len(&self, max_len: usize) {
+        self.group_concat_max_len
+            .store(max_len.max(4), std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Value returned by `LAST_INSERT_ID()`.
@@ -360,6 +447,57 @@ impl Session {
 
     pub fn set_isolation(&self, level: Isolation) {
         *self.isolation.lock().unwrap() = level;
+        *self.transaction_isolation.lock().unwrap() = match level {
+            Isolation::Snapshot => "REPEATABLE-READ",
+            Isolation::Serializable => "SERIALIZABLE",
+        }
+        .into();
+    }
+
+    pub fn set_transaction_isolation(&self, level: &str) -> Result<()> {
+        let canonical = level.trim().replace(' ', "-").to_ascii_uppercase();
+        let engine_level = match canonical.as_str() {
+            "READ-UNCOMMITTED" | "READ-COMMITTED" | "REPEATABLE-READ" => Isolation::Snapshot,
+            "SERIALIZABLE" => Isolation::Serializable,
+            _ => {
+                return Err(Error::Unsupported(format!(
+                    "unsupported transaction isolation level: {level}"
+                )))
+            }
+        };
+        *self.isolation.lock().unwrap() = engine_level;
+        *self.transaction_isolation.lock().unwrap() = canonical;
+        Ok(())
+    }
+
+    pub fn transaction_isolation(&self) -> String {
+        self.transaction_isolation.lock().unwrap().clone()
+    }
+
+    /// Resolve a system variable in this connection's session scope. Variables
+    /// not managed by the session retain the server's compatibility defaults.
+    pub fn system_var(&self, raw: &str) -> Value {
+        let scoped = raw.trim_start_matches("@@").to_ascii_lowercase();
+        let (scope, name) = match scoped.split_once('.') {
+            Some((scope @ ("session" | "local" | "global"), name)) => (Some(scope), name),
+            _ => (None, scoped.as_str()),
+        };
+        if scope == Some("global") {
+            return match name {
+                "group_concat_max_len" => Value::Int(1024),
+                _ => crate::predicate::system_var(name),
+            };
+        }
+        match name {
+            "autocommit" => Value::Int(i64::from(self.autocommit())),
+            "sql_mode" => Value::Text(self.sql_mode()),
+            "foreign_key_checks" => Value::Int(i64::from(self.foreign_key_checks())),
+            "group_concat_max_len" => {
+                Value::Int(i64::try_from(self.group_concat_max_len()).unwrap_or(i64::MAX))
+            }
+            "tx_isolation" | "transaction_isolation" => Value::Text(self.transaction_isolation()),
+            _ => crate::predicate::system_var(raw),
+        }
     }
 
     pub fn in_txn(&self) -> bool {

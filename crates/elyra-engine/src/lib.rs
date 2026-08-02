@@ -849,22 +849,19 @@ impl Engine {
             .collect::<String>()
             .to_ascii_lowercase();
 
-        // Transaction isolation level (SET [SESSION] TRANSACTION ISOLATION
-        // LEVEL ...) — handled by string match since not all forms parse.
+        // sqlparser does not accept MySQL's `SET SESSION TRANSACTION ...`
+        // spelling, so handle that narrow form before generic parsing.
         if head.starts_with("set") {
-            let lower = trimmed.to_ascii_lowercase();
-            if lower.contains("isolation level") {
-                let level = if lower.contains("serializable") {
-                    Isolation::Serializable
-                } else {
-                    Isolation::Snapshot
-                };
-                sess.set_isolation(level);
+            if let Some(level) = session_transaction_isolation(trimmed) {
+                sess.set_transaction_isolation(&level)?;
                 return Ok(vec![QueryResult::empty_ok()]);
             }
             // SET @user = expr
             let after = trimmed[3..].trim_start();
-            if let Some(rest) = after.strip_prefix('@') {
+            if let Some(rest) = after
+                .strip_prefix('@')
+                .filter(|rest| !rest.starts_with('@'))
+            {
                 if let Some(eq) = rest.find('=') {
                     let name = rest[..eq].trim().to_string();
                     let expr = rest[eq + 1..].trim().trim_end_matches(';');
@@ -1272,6 +1269,20 @@ impl Engine {
         } else {
             Cow::Borrowed(sql)
         };
+        if let Some(rewritten) = rewrite_atat_session_set(&subst_sql) {
+            subst_sql = Cow::Owned(rewritten);
+        }
+        if subst_sql.contains("@@") {
+            subst_sql = Cow::Owned(exec::substitute_system_vars(&subst_sql, |name| {
+                sess.system_var(name)
+            }));
+        }
+        if sess.ansi_quotes() {
+            subst_sql = Cow::Owned(rewrite_ansi_quoted_identifiers(&subst_sql));
+        }
+        if let Some(rewritten) = rewrite_multi_set(&subst_sql) {
+            subst_sql = Cow::Owned(rewritten);
+        }
         // `LOCK IN SHARE MODE` is a synonym for `FOR SHARE` (not parsed by the
         // MySQL dialect on its own).
         if contains_ci(&subst_sql, "lock in share mode") {
@@ -1387,6 +1398,9 @@ impl Engine {
                         )));
                     }
                 }
+            }
+            if statement_starts_implicit_transaction(&stmt) {
+                sess.begin_implicit_transaction()?;
             }
             // Refreshes and the query that consumes them are one atomic unit.
             // Autocommit uses a temporary transaction; an explicit transaction
@@ -1689,7 +1703,18 @@ impl Engine {
                 let name = exec::stored_table_ident(sess, &table_name)?;
                 exec::show_columns(sess, &name).await
             }
-            Statement::SetVariable { .. } => Ok(QueryResult::empty_ok()),
+            Statement::SetVariable {
+                variables, value, ..
+            } => {
+                self.apply_session_variables(sess, variables, value).await?;
+                Ok(QueryResult::empty_ok())
+            }
+            // ElyraSQL always uses utf8mb4, so changing its connection encoding
+            // to that same fixed charset is an honest no-op. This form commonly
+            // shares a comma-separated SET statement with real session settings.
+            Statement::SetNames { .. } | Statement::SetNamesDefault {} => {
+                Ok(QueryResult::empty_ok())
+            }
             Statement::Use(use_expr) => {
                 use sqlparser::ast::Use;
                 let database = match use_expr {
@@ -1737,7 +1762,7 @@ impl Engine {
                 drop_database_result(&sess.database(), if_exists, target.as_deref())
             }
             // Session/introspection queries GUI tools and ORMs fire on connect.
-            Statement::ShowVariables { filter, .. } => exec::show_variables(filter.as_ref()),
+            Statement::ShowVariables { filter, .. } => exec::show_variables(sess, filter.as_ref()),
             Statement::ShowStatus { filter, .. } => exec::show_status(filter.as_ref()),
             Statement::ShowCollation { filter } => exec::show_collation(filter.as_ref()),
             Statement::ShowDatabases { .. } => exec::show_databases(sess),
@@ -1763,24 +1788,51 @@ impl Engine {
         }
     }
 
+    async fn apply_session_variables(
+        &self,
+        sess: &Session,
+        variables: sqlparser::ast::OneOrManyWithParens<sqlparser::ast::ObjectName>,
+        values: Vec<sqlparser::ast::Expr>,
+    ) -> Result<()> {
+        let variables: Vec<_> = variables.into_iter().collect();
+        if variables.len() != values.len() {
+            return Err(Error::Parse(
+                "SET variable and value counts do not match".into(),
+            ));
+        }
+        for (variable, expr) in variables.into_iter().zip(values) {
+            let name = session_variable_name(&variable);
+            let value = set_expression_value(&expr)?;
+            match name.as_str() {
+                "autocommit" => {
+                    sess.set_autocommit(session_bool(&value, "autocommit")?)
+                        .await?
+                }
+                "sql_mode" => sess.set_sql_mode(session_text(value, "sql_mode")?),
+                "foreign_key_checks" => {
+                    sess.set_foreign_key_checks(session_bool(&value, "foreign_key_checks")?)
+                }
+                "group_concat_max_len" => {
+                    sess.set_group_concat_max_len(session_usize(&value, "group_concat_max_len")?)
+                }
+                "transaction_isolation" | "tx_isolation" => {
+                    sess.set_transaction_isolation(&session_text(value, "transaction_isolation")?)?
+                }
+                unsupported => {
+                    return Err(Error::Unsupported(format!(
+                        "session variable is not supported: {unsupported}"
+                    )))
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Handle the well-known session/introspection queries MySQL drivers send.
     fn intercept_session(&self, sql: &str, sess: &Session) -> Option<QueryResult> {
         let t = sql.trim().trim_end_matches(';').trim();
-        let is_set = t
-            .get(..4)
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("set "));
-        if is_set {
-            let lower = t.to_ascii_lowercase();
-            if let Some((_, mode)) = lower.rsplit_once("sql_mode") {
-                let strict =
-                    mode.contains("strict_trans_tables") || mode.contains("strict_all_tables");
-                sess.set_strict_sql_mode(strict);
-            }
-        }
-        // Every intercepted query is short; skip large statements cheaply
-        // (a long `SET ...` is still swallowed).
         if t.len() > 48 {
-            return is_set.then(QueryResult::empty_ok);
+            return None;
         }
         let lower = t.to_ascii_lowercase();
 
@@ -1802,10 +1854,219 @@ impl Engine {
                 ColumnType::Text,
                 Value::Text(sess.database()),
             )),
-            _ if is_set => Some(QueryResult::empty_ok()),
             _ => None,
         }
     }
+}
+
+fn session_variable_name(variable: &sqlparser::ast::ObjectName) -> String {
+    let mut parts = variable
+        .0
+        .iter()
+        .map(|part| part.value.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    if parts
+        .first()
+        .is_some_and(|part| matches!(part.as_str(), "session" | "local"))
+    {
+        parts.remove(0);
+    }
+    parts.join(".")
+}
+
+fn set_expression_value(expr: &sqlparser::ast::Expr) -> Result<Value> {
+    if let sqlparser::ast::Expr::Identifier(identifier) = expr {
+        let value = identifier.value.to_ascii_uppercase();
+        if matches!(value.as_str(), "ON" | "OFF" | "TRUE" | "FALSE") {
+            return Ok(Value::Text(value));
+        }
+    }
+    eval::eval_expr(expr)
+}
+
+fn session_bool(value: &Value, variable: &str) -> Result<bool> {
+    match value {
+        Value::Bool(value) => Ok(*value),
+        Value::Int(0) | Value::UInt(0) => Ok(false),
+        Value::Int(1) | Value::UInt(1) => Ok(true),
+        Value::Text(value) | Value::Json(value)
+            if matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "0" | "off" | "false" | "no"
+            ) =>
+        {
+            Ok(false)
+        }
+        Value::Text(value) | Value::Json(value)
+            if matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "on" | "true" | "yes"
+            ) =>
+        {
+            Ok(true)
+        }
+        _ => Err(Error::Query(format!(
+            "{variable} expects ON/OFF or 0/1, got {value:?}"
+        ))),
+    }
+}
+
+fn session_text(value: Value, variable: &str) -> Result<String> {
+    match value {
+        Value::Null => Ok(String::new()),
+        value @ (Value::Text(_) | Value::Json(_)) => Ok(value.to_wire_string().unwrap_or_default()),
+        other => Err(Error::Query(format!(
+            "{variable} expects a string, got {other:?}"
+        ))),
+    }
+}
+
+fn session_usize(value: &Value, variable: &str) -> Result<usize> {
+    let value = match value {
+        Value::Int(value) if *value >= 0 => *value as u64,
+        Value::UInt(value) => *value,
+        Value::Text(value) | Value::Json(value) => value.trim().parse::<u64>().map_err(|_| {
+            Error::Query(format!(
+                "{variable} expects a non-negative integer, got {value:?}"
+            ))
+        })?,
+        _ => {
+            return Err(Error::Query(format!(
+                "{variable} expects a non-negative integer, got {value:?}"
+            )))
+        }
+    };
+    usize::try_from(value)
+        .map_err(|_| Error::OutOfRange(format!("{variable} is too large: {value}")))
+}
+
+fn session_transaction_isolation(sql: &str) -> Option<String> {
+    let sql = sql.trim().trim_end_matches(';').trim();
+    let mut words = sql.split_ascii_whitespace();
+    if !words.next()?.eq_ignore_ascii_case("set") {
+        return None;
+    }
+    let mut word = words.next()?;
+    if word.eq_ignore_ascii_case("session") || word.eq_ignore_ascii_case("local") {
+        word = words.next()?;
+    }
+    if !word.eq_ignore_ascii_case("transaction")
+        || !words.next()?.eq_ignore_ascii_case("isolation")
+        || !words.next()?.eq_ignore_ascii_case("level")
+    {
+        return None;
+    }
+    let level = words.collect::<Vec<_>>().join(" ");
+    (!level.is_empty()).then_some(level)
+}
+
+fn statement_starts_implicit_transaction(statement: &Statement) -> bool {
+    matches!(
+        statement,
+        Statement::Query(_)
+            | Statement::Insert(_)
+            | Statement::Update { .. }
+            | Statement::Delete(_)
+    )
+}
+
+/// sqlparser accepts one SET assignment at a time, while MySQL accepts a
+/// comma-separated list (including `SET NAMES ..., SESSION sql_mode = ...`).
+/// Split only top-level commas so commas inside mode strings, function calls,
+/// and parenthesized tuple assignments remain intact.
+fn rewrite_multi_set(sql: &str) -> Option<String> {
+    let trimmed = sql.trim().trim_end_matches(';').trim();
+    if !trimmed
+        .get(..3)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("set"))
+    {
+        return None;
+    }
+    let rest = trimmed.get(3..)?;
+    if rest
+        .chars()
+        .next()
+        .is_some_and(|character| !character.is_ascii_whitespace())
+    {
+        return None;
+    }
+    let rest = rest.trim_start();
+    let assignments = split_top_level(rest, ',');
+    (assignments.len() > 1).then(|| {
+        assignments
+            .into_iter()
+            .map(|assignment| format!("SET {}", assignment.trim()))
+            .collect::<Vec<_>>()
+            .join("; ")
+    })
+}
+
+/// Normalize MySQL's `SET @@session.variable = value` spelling to the
+/// `SET SESSION variable = value` form sqlparser accepts. Do this before
+/// system-variable expression substitution so the assignment target remains a
+/// variable rather than becoming its current literal value.
+fn rewrite_atat_session_set(sql: &str) -> Option<String> {
+    let trimmed = sql.trim().trim_end_matches(';').trim();
+    if !trimmed
+        .get(..3)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("set"))
+    {
+        return None;
+    }
+    let rest = trimmed.get(3..)?.trim_start();
+    let after_atat = rest.strip_prefix("@@")?;
+    let variable = if after_atat
+        .get(..8)
+        .is_some_and(|scope| scope.eq_ignore_ascii_case("session."))
+    {
+        after_atat.get(8..)?
+    } else if after_atat
+        .get(..6)
+        .is_some_and(|scope| scope.eq_ignore_ascii_case("local."))
+    {
+        after_atat.get(6..)?
+    } else {
+        after_atat
+    };
+    Some(format!("SET {variable}"))
+}
+
+/// In ANSI_QUOTES mode, MySQL treats double quotes as identifier delimiters.
+/// sqlparser's MySQL dialect does not expose that mode, so normalize those
+/// delimiters to its always-supported backtick form before parsing.
+fn rewrite_ansi_quoted_identifiers(sql: &str) -> String {
+    let chars: Vec<char> = sql.chars().collect();
+    let mut out = String::with_capacity(sql.len());
+    let mut index = 0;
+    while index < chars.len() {
+        match chars[index] {
+            '\'' | '`' => index = exec::copy_quoted_segment(&chars, index, &mut out),
+            '"' => {
+                out.push('`');
+                index += 1;
+                while index < chars.len() {
+                    let character = chars[index];
+                    if character == '"' {
+                        if chars.get(index + 1) == Some(&'"') {
+                            out.push_str("``");
+                            index += 2;
+                            continue;
+                        }
+                        out.push('`');
+                        index += 1;
+                        break;
+                    }
+                    out.push(character);
+                    index += 1;
+                }
+            }
+            character => {
+                out.push(character);
+                index += 1;
+            }
+        }
+    }
+    out
 }
 
 /// Minimum privilege required to run a statement.
@@ -4313,6 +4574,209 @@ mod case_insensitive_search_tests {
             )
             .as_deref(),
             Some(r#"SELECT 0x0F, 0X0abc, 0xAB, X'F', '0xF', "0xF", `0xF`, value0xF"#)
+        );
+    }
+}
+
+#[cfg(test)]
+mod session_set_tests {
+    use super::{Engine, Privilege, QueryResult, Session};
+    use elyra_core::Value;
+
+    async fn execute(engine: &Engine, session: &Session, sql: &str) {
+        engine
+            .execute(sql, Privilege::Admin, session)
+            .await
+            .unwrap();
+    }
+
+    async fn rows(engine: &Engine, session: &Session, sql: &str) -> Vec<Vec<Value>> {
+        let mut results = engine
+            .execute(sql, Privilege::Admin, session)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1, "expected one result for {sql}");
+        let QueryResult::Rows(mut stream) = results.remove(0) else {
+            panic!("expected rows for {sql}");
+        };
+        let mut out = Vec::new();
+        loop {
+            let batch = stream.next_batch(1024).await.unwrap();
+            if batch.is_empty() {
+                return out;
+            }
+            out.extend(batch);
+        }
+    }
+
+    #[tokio::test]
+    async fn session_set_applies_and_reports_the_supported_variables() {
+        let engine = Engine::new(elyra_storage::Db::in_memory().unwrap());
+        let session = engine.session();
+
+        execute(
+            &engine,
+            &session,
+            "SET @@session.sql_mode = 'ANSI_QUOTES,NO_AUTO_VALUE_ON_ZERO'",
+        )
+        .await;
+        assert_eq!(
+            rows(&engine, &session, "SELECT @@session.sql_mode, @@sql_mode",).await,
+            vec![vec![
+                Value::Text("ANSI_QUOTES,NO_AUTO_VALUE_ON_ZERO".into()),
+                Value::Text("ANSI_QUOTES,NO_AUTO_VALUE_ON_ZERO".into()),
+            ]]
+        );
+
+        execute(
+            &engine,
+            &session,
+            "CREATE TABLE session_set_auto (id INT AUTO_INCREMENT PRIMARY KEY)",
+        )
+        .await;
+        execute(&engine, &session, "INSERT INTO session_set_auto VALUES (0)").await;
+        assert_eq!(
+            rows(&engine, &session, "SELECT \"id\" FROM \"session_set_auto\"",).await,
+            vec![vec![Value::Int(0)]]
+        );
+
+        execute(
+            &engine,
+            &session,
+            "CREATE TABLE session_set_parent (id INT PRIMARY KEY)",
+        )
+        .await;
+        execute(
+            &engine,
+            &session,
+            "CREATE TABLE session_set_child (id INT PRIMARY KEY, parent_id INT, \
+             FOREIGN KEY (parent_id) REFERENCES session_set_parent(id))",
+        )
+        .await;
+        execute(&engine, &session, "SET FOREIGN_KEY_CHECKS = 0").await;
+        execute(
+            &engine,
+            &session,
+            "INSERT INTO session_set_child VALUES (1, 99)",
+        )
+        .await;
+        assert_eq!(
+            rows(&engine, &session, "SELECT @@foreign_key_checks").await,
+            vec![vec![Value::Int(0)]]
+        );
+
+        execute(
+            &engine,
+            &session,
+            "CREATE TABLE session_set_concat (id INT PRIMARY KEY, value VARCHAR(4))",
+        )
+        .await;
+        execute(
+            &engine,
+            &session,
+            "INSERT INTO session_set_concat VALUES (1, 'ab'), (2, 'cd'), (3, 'ef')",
+        )
+        .await;
+        execute(&engine, &session, "SET group_concat_max_len = 5").await;
+        assert_eq!(
+            rows(
+                &engine,
+                &session,
+                "SELECT GROUP_CONCAT(value) FROM session_set_concat",
+            )
+            .await,
+            vec![vec![Value::Text("ab,cd".into())]]
+        );
+        assert_eq!(
+            rows(&engine, &session, "SELECT @@group_concat_max_len").await,
+            vec![vec![Value::Int(5)]]
+        );
+
+        execute(
+            &engine,
+            &session,
+            "SET SESSION TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+        )
+        .await;
+        assert_eq!(
+            rows(&engine, &session, "SELECT @@transaction_isolation").await,
+            vec![vec![Value::Text("SERIALIZABLE".into())]]
+        );
+        execute(
+            &engine,
+            &session,
+            "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED",
+        )
+        .await;
+        assert_eq!(
+            rows(&engine, &session, "SELECT @@transaction_isolation").await,
+            vec![vec![Value::Text("READ-COMMITTED".into())]]
+        );
+        assert_eq!(
+            rows(&engine, &session, "SHOW VARIABLES LIKE 'sql_mode'").await,
+            vec![vec![
+                Value::Text("sql_mode".into()),
+                Value::Text("ANSI_QUOTES,NO_AUTO_VALUE_ON_ZERO".into()),
+            ]]
+        );
+    }
+
+    #[tokio::test]
+    async fn autocommit_zero_buffers_writes_until_commit_or_disconnect() {
+        let engine = Engine::new(elyra_storage::Db::in_memory().unwrap());
+        let setup = engine.session();
+        execute(
+            &engine,
+            &setup,
+            "CREATE TABLE session_set_txn (id INT PRIMARY KEY)",
+        )
+        .await;
+
+        let writer = engine.session();
+        let reader = engine.session();
+        execute(&engine, &writer, "SET @@session.autocommit = 0").await;
+        assert_eq!(
+            rows(&engine, &writer, "SELECT @@autocommit").await,
+            vec![vec![Value::Int(0)]]
+        );
+        assert_eq!(
+            rows(&engine, &writer, "SELECT @@global.autocommit").await,
+            vec![vec![Value::Int(1)]]
+        );
+        execute(&engine, &writer, "INSERT INTO session_set_txn VALUES (1)").await;
+        assert_eq!(
+            rows(&engine, &reader, "SELECT COUNT(*) FROM session_set_txn").await,
+            vec![vec![Value::Int(0)]]
+        );
+        execute(&engine, &writer, "COMMIT").await;
+        assert_eq!(
+            rows(&engine, &reader, "SELECT COUNT(*) FROM session_set_txn").await,
+            vec![vec![Value::Int(1)]]
+        );
+
+        execute(&engine, &writer, "INSERT INTO session_set_txn VALUES (2)").await;
+        assert_eq!(
+            rows(&engine, &reader, "SELECT COUNT(*) FROM session_set_txn").await,
+            vec![vec![Value::Int(1)]]
+        );
+        execute(&engine, &writer, "SET autocommit = 1").await;
+        assert_eq!(
+            rows(&engine, &reader, "SELECT COUNT(*) FROM session_set_txn").await,
+            vec![vec![Value::Int(2)]]
+        );
+
+        let abandoned = engine.session();
+        execute(&engine, &abandoned, "SET autocommit = 0").await;
+        execute(
+            &engine,
+            &abandoned,
+            "INSERT INTO session_set_txn VALUES (3)",
+        )
+        .await;
+        drop(abandoned);
+        assert_eq!(
+            rows(&engine, &reader, "SELECT COUNT(*) FROM session_set_txn").await,
+            vec![vec![Value::Int(2)]]
         );
     }
 }

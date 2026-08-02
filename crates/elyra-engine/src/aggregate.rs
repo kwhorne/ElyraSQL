@@ -48,6 +48,16 @@ impl AggPlan {
         )
     }
 
+    /// Capture the per-session GROUP_CONCAT byte cap for all GROUP_CONCAT
+    /// aggregates in this plan.
+    pub fn set_group_concat_max_len(&mut self, max_len: usize) {
+        for aggregate in &mut self.aggs {
+            if aggregate.func == elyra_olap::AggFunc::GroupConcat {
+                aggregate.group_concat_max_len = Some(max_len);
+            }
+        }
+    }
+
     /// The aggregate-argument expressions to append as virtual columns.
     pub fn group_cols(&self) -> &[usize] {
         &self.group_cols
@@ -783,6 +793,7 @@ fn register_agg(
         arg_col: arg,
         distinct,
         separator: agg_separator(f),
+        group_concat_max_len: None,
         facet_top: facet_top_of(f),
         percentile: percentile_of(f),
         order,
@@ -999,8 +1010,10 @@ pub fn run(
     projection: &[SelectItem],
     group_by: &[Expr],
     rows: Vec<Vec<Value>>,
+    group_concat_max_len: usize,
 ) -> Result<(Schema, Vec<Vec<Value>>)> {
-    let plan = build_plan(schema, projection, group_by)?;
+    let mut plan = build_plan(schema, projection, group_by)?;
+    plan.set_group_concat_max_len(group_concat_max_len);
     let mut agg = plan.new_aggregator();
     if plan.arg_exprs().is_empty() {
         for row in &rows {
