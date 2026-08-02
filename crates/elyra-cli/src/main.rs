@@ -324,7 +324,12 @@ async fn run() -> anyhow::Result<()> {
                 replication_listen,
                 read_only: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             };
-            elyra_server::serve(config, engine).await?;
+            tokio::select! {
+                result = elyra_server::serve(config, engine) => result?,
+                _ = tokio::signal::ctrl_c() => {
+                    tracing::info!("received SIGINT, shutting down");
+                }
+            }
         }
         Command::BinlogReplay {
             data,
