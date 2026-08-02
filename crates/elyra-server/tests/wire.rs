@@ -822,6 +822,42 @@ async fn create_database_fails_instead_of_succeeding_as_a_noop() {
     );
 }
 
+/// A read-only user must be able to *connect*. Clients send session setup
+/// before handing control back to the caller -- PyMySQL issues `SET NAMES` from
+/// `connect()` itself -- so a session statement classified as ADMIN does not
+/// merely fail, it makes the account unusable.
+#[tokio::test]
+async fn session_setup_statements_need_no_privilege() {
+    let srv = TestServer::start_with_tiers(&[
+        ("admin", "adminpw", elyra_core::Privilege::Admin),
+        ("reader", "readerpw", elyra_core::Privilege::Read),
+    ])
+    .await;
+
+    let mut c = srv.conn_as("reader", "readerpw").await;
+    for sql in [
+        "SET NAMES utf8mb4",
+        "SET NAMES utf8mb4 COLLATE utf8mb4_general_ci",
+        "SET autocommit=1",
+        "SET SESSION group_concat_max_len=1024",
+        "SET @user_var = 1",
+    ] {
+        c.query_drop(sql)
+            .await
+            .unwrap_or_else(|e| panic!("a read-only session must accept `{sql}`: {e:?}"));
+    }
+
+    // ... while a statement that really does need ADMIN is still refused.
+    let denied = c
+        .query_drop("CREATE TABLE nope (id INT)")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(denied, mysql_async::Error::Server(ref e) if e.message.contains("access denied")),
+        "{denied:?}"
+    );
+}
+
 /// Declared integer width is a constraint, not just documentation: storage is
 /// 64-bit for every integer type, so nothing else stops a `TINYINT` holding 300
 /// (ESQL-56). Widths live in a separate catalog key, so a table created before

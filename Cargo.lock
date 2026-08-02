@@ -415,7 +415,7 @@ dependencies = [
 
 [[package]]
 name = "elyra-cli"
-version = "1.9.1"
+version = "1.9.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -431,7 +431,7 @@ dependencies = [
 
 [[package]]
 name = "elyra-core"
-version = "1.9.1"
+version = "1.9.2"
 dependencies = [
  "bincode",
  "proptest",
@@ -442,7 +442,7 @@ dependencies = [
 
 [[package]]
 name = "elyra-engine"
-version = "1.9.1"
+version = "1.9.2"
 dependencies = [
  "bincode",
  "elyra-core",
@@ -467,7 +467,7 @@ dependencies = [
 
 [[package]]
 name = "elyra-olap"
-version = "1.9.1"
+version = "1.9.2"
 dependencies = [
  "elyra-core",
  "elyra-storage",
@@ -476,7 +476,7 @@ dependencies = [
 
 [[package]]
 name = "elyra-server"
-version = "1.9.1"
+version = "1.9.2"
 dependencies = [
  "async-trait",
  "bincode",
@@ -500,7 +500,7 @@ dependencies = [
 
 [[package]]
 name = "elyra-storage"
-version = "1.9.1"
+version = "1.9.2"
 dependencies = [
  "async-trait",
  "bincode",
@@ -515,7 +515,7 @@ dependencies = [
 
 [[package]]
 name = "elyra-vector"
-version = "1.9.1"
+version = "1.9.2"
 dependencies = [
  "elyra-core",
  "wide",
@@ -523,7 +523,7 @@ dependencies = [
 
 [[package]]
 name = "elyra-wire"
-version = "1.9.1"
+version = "1.9.2"
 dependencies = [
  "async-trait",
  "byteorder",
