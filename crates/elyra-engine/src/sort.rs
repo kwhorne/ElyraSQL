@@ -293,7 +293,16 @@ impl Sorter {
         self.buffer
             .sort_by(|a, b| cmp_keys(&a.0, &b.0, &asc, &colls));
         let path = temp_path();
-        let file = File::create(&path)?;
+        // Read *and* write: the merge phase reads every run back through this
+        // same handle after seeking to 0. `File::create` opens write-only, so
+        // reading from it failed with EBADF ("Bad file descriptor") -- which
+        // meant an unbounded ORDER BY that spilled never worked at all.
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)?;
         // Unlink immediately: the inode lives on via the open handle and is
         // reclaimed by the OS on close or crash, so no temp file is ever
         // orphaned (best-effort; a no-op-until-close on non-Unix).
@@ -472,6 +481,74 @@ mod admission_tests {
     fn zero_limit_admits_nothing() {
         let s = sorter(true, 0, Some(0));
         assert!(!s.admits(&[Value::Int(1)]));
+    }
+}
+
+#[cfg(test)]
+mod spill_tests {
+    use super::*;
+
+    fn ints(n: usize) -> Vec<i64> {
+        let mut state = 99u64;
+        (0..n)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((state >> 33) as i64) % 500
+            })
+            .collect()
+    }
+
+    /// Sorting past the spill budget must produce exactly what an in-memory sort
+    /// of the same rows produces.
+    ///
+    /// Nothing exercised this before: the budget defaults to a million rows, so
+    /// no test or benchmark ever wrote a run file -- and the merge phase read
+    /// runs back through a handle opened by `File::create`, which is write-only,
+    /// so every spilling `ORDER BY` failed with EBADF. A regression here has to
+    /// force a *small* budget, or it tests the in-memory path again.
+    #[test]
+    fn spilled_sort_matches_the_in_memory_sort() {
+        let keys = ints(2000);
+
+        for (asc, offset, limit) in [
+            (true, 0, None),
+            (false, 0, None),
+            (true, 1990, None),
+            (true, 5, Some(20)),
+        ] {
+            // Small budget: 2000 rows over 200 is ten runs to merge.
+            let mut spilling = Sorter::new(vec![asc], vec![Collation::Ci], offset, limit, 200);
+            let mut in_memory =
+                Sorter::new(vec![asc], vec![Collation::Ci], offset, limit, usize::MAX);
+            for (i, k) in keys.iter().enumerate() {
+                let key = vec![Value::Int(*k)];
+                let row = vec![Value::Int(*k), Value::Int(i as i64)];
+                spilling.push(key.clone(), row.clone()).unwrap();
+                in_memory.push(key, row).unwrap();
+            }
+            let spilled = spilling.finish().unwrap();
+            let memory = in_memory.finish().unwrap();
+            assert_eq!(spilled, memory, "asc={asc} offset={offset} limit={limit:?}");
+            assert!(!spilled.is_empty());
+        }
+    }
+
+    /// A single run still has to be read back -- the one-run case skips the
+    /// k-way merge and is easy to get wrong separately.
+    #[test]
+    fn a_single_spilled_run_is_read_back() {
+        let mut sorter = Sorter::new(vec![true], vec![Collation::Ci], 0, None, 10);
+        for i in (0..20).rev() {
+            sorter
+                .push(vec![Value::Int(i)], vec![Value::Int(i)])
+                .unwrap();
+        }
+        let out = sorter.finish().unwrap();
+        assert_eq!(out.len(), 20);
+        assert_eq!(out[0], vec![Value::Int(0)]);
+        assert_eq!(out[19], vec![Value::Int(19)]);
     }
 }
 
