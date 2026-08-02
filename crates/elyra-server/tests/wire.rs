@@ -8584,6 +8584,265 @@ async fn foreign_key_introspection_reports_actions() {
     );
 }
 
+// Rails, Django, and Adminer query these catalog shapes directly. Keep the
+// queries close to the clients so a missing information_schema field fails at
+// the integration boundary rather than as a framework-specific surprise.
+#[tokio::test]
+async fn information_schema_client_metadata_shapes() {
+    type ReferentialConstraintRow = (
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+    );
+    type DjangoConstraintRow = (String, String, Option<String>, Option<String>, String);
+
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop("CREATE TABLE client_catalog_parent (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop(
+        "CREATE TABLE client_catalog_child (
+            id INT PRIMARY KEY,
+            parent_id INT,
+            label TEXT,
+            quantity INT,
+            CONSTRAINT uq_client_catalog_label UNIQUE (label),
+            CONSTRAINT fk_client_catalog_parent
+                FOREIGN KEY (parent_id) REFERENCES client_catalog_parent (id)
+                ON UPDATE CASCADE ON DELETE SET NULL,
+            CHECK (quantity > 0)
+        )",
+    )
+    .await
+    .unwrap();
+    c.query_drop("CREATE PROCEDURE client_catalog_routine() BEGIN SELECT 1; END")
+        .await
+        .unwrap();
+
+    // Rails' MySQL adapter foreign_keys() query.
+    let rails_rows: Vec<(String, String, String, String, String, String)> = c
+        .exec(
+            "SELECT fk.constraint_name, rc.table_name, rc.referenced_table_name,
+                    fk.referenced_column_name, rc.update_rule, rc.delete_rule
+             FROM information_schema.referential_constraints rc
+             JOIN information_schema.key_column_usage fk
+               USING (constraint_schema, constraint_name)
+             WHERE fk.referenced_column_name IS NOT NULL
+               AND fk.table_schema = DATABASE()
+               AND fk.table_name = 'client_catalog_child'
+               AND rc.constraint_schema = DATABASE()
+               AND rc.table_name = 'client_catalog_child'",
+            (),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rails_rows,
+        vec![(
+            "fk_client_catalog_parent".into(),
+            "client_catalog_child".into(),
+            "client_catalog_parent".into(),
+            "id".into(),
+            "CASCADE".into(),
+            "SET NULL".into(),
+        )]
+    );
+
+    let referential: ReferentialConstraintRow = c
+        .query_first(
+            "SELECT constraint_catalog, constraint_schema, constraint_name,
+                    unique_constraint_catalog, unique_constraint_schema,
+                    unique_constraint_name, match_option, update_rule,
+                    delete_rule, table_name, referenced_table_name
+             FROM information_schema.referential_constraints
+             WHERE constraint_name = 'fk_client_catalog_parent'",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        referential,
+        (
+            "def".into(),
+            "elyra".into(),
+            "fk_client_catalog_parent".into(),
+            "def".into(),
+            "elyra".into(),
+            "PRIMARY".into(),
+            "NONE".into(),
+            "CASCADE".into(),
+            "SET NULL".into(),
+            "client_catalog_child".into(),
+            "client_catalog_parent".into(),
+        )
+    );
+
+    // A foreign key can outlive its parent after a DROP TABLE. Introspection
+    // must retain the row and report that the referenced unique key is unknown.
+    c.query_drop("DROP TABLE client_catalog_parent")
+        .await
+        .unwrap();
+    let orphaned: (Option<String>, String, String) = c
+        .query_first(
+            "SELECT unique_constraint_name, table_name, referenced_table_name
+             FROM information_schema.referential_constraints
+             WHERE constraint_name = 'fk_client_catalog_parent'",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        orphaned,
+        (
+            None,
+            "client_catalog_child".into(),
+            "client_catalog_parent".into(),
+        )
+    );
+
+    // Django's MySQL backend joins KEY_COLUMN_USAGE with TABLE_CONSTRAINTS.
+    let django_rows: Vec<DjangoConstraintRow> = c
+        .exec(
+            "SELECT kc.constraint_name, kc.column_name,
+                    kc.referenced_table_name, kc.referenced_column_name,
+                    tc.constraint_type
+             FROM information_schema.key_column_usage AS kc,
+                  information_schema.table_constraints AS tc
+             WHERE kc.table_schema = DATABASE()
+               AND (kc.referenced_table_schema = DATABASE()
+                    OR kc.referenced_table_schema IS NULL)
+               AND tc.table_schema = kc.table_schema
+               AND tc.constraint_name = kc.constraint_name
+               AND tc.constraint_type != 'CHECK'
+               AND kc.table_name = 'client_catalog_child'
+             ORDER BY kc.ordinal_position",
+            (),
+        )
+        .await
+        .unwrap();
+    assert!(django_rows.contains(&(
+        "PRIMARY".into(),
+        "id".into(),
+        None,
+        None,
+        "PRIMARY KEY".into(),
+    )));
+    assert!(django_rows.contains(&(
+        "uq_client_catalog_label".into(),
+        "label".into(),
+        None,
+        None,
+        "UNIQUE".into(),
+    )));
+    assert!(django_rows.contains(&(
+        "fk_client_catalog_parent".into(),
+        "parent_id".into(),
+        Some("client_catalog_parent".into()),
+        Some("id".into()),
+        "FOREIGN KEY".into(),
+    )));
+
+    // Django's check_constraints() query.
+    let django_checks: Vec<(String, String)> = c
+        .exec(
+            "SELECT cc.constraint_name, cc.check_clause
+             FROM information_schema.check_constraints AS cc,
+                  information_schema.table_constraints AS tc
+             WHERE cc.constraint_schema = DATABASE()
+               AND tc.table_schema = cc.constraint_schema
+               AND cc.constraint_name = tc.constraint_name
+               AND tc.constraint_type = 'CHECK'
+               AND tc.table_name = 'client_catalog_child'",
+            (),
+        )
+        .await
+        .unwrap();
+    assert!(django_checks
+        .iter()
+        .any(|(_, clause)| clause == "quantity > 0"));
+
+    // Adminer's fields() query consumes the complete COLUMNS result shape.
+    let mut adminer_columns = c
+        .query_iter(
+            "SELECT * FROM information_schema.columns
+             WHERE table_schema = DATABASE()
+               AND table_name = 'client_catalog_child'
+             ORDER BY ordinal_position",
+        )
+        .await
+        .unwrap();
+    assert!(adminer_columns
+        .columns_ref()
+        .iter()
+        .any(|column| column.name_str().eq_ignore_ascii_case("PRIVILEGES")));
+    let adminer_rows: Vec<mysql_async::Row> = adminer_columns.collect().await.unwrap();
+    let privileges = adminer_rows
+        .iter()
+        .find(|row| row.get::<String, _>("COLUMN_NAME").as_deref() == Some("label"))
+        .and_then(|row| row.get::<String, _>("PRIVILEGES"));
+    assert_eq!(
+        privileges.as_deref(),
+        Some("select,insert,update,references")
+    );
+
+    // Adminer lists routines with DTD_IDENTIFIER. Procedures have no return
+    // type, so the value is the empty type identifier rather than an error.
+    let routines: Vec<(String, String, String, String)> = c
+        .query(
+            "SELECT specific_name, routine_name, routine_type, dtd_identifier
+             FROM information_schema.routines WHERE routine_schema = DATABASE()",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        routines,
+        vec![(
+            "client_catalog_routine".into(),
+            "client_catalog_routine".into(),
+            "PROCEDURE".into(),
+            String::new(),
+        )]
+    );
+
+    // Capability probes need information_schema to describe its own views.
+    let catalog_tables: Vec<String> = c
+        .query(
+            "SELECT table_name FROM information_schema.tables
+             WHERE table_schema = 'information_schema'
+               AND table_name IN (
+                   'REFERENTIAL_CONSTRAINTS', 'TABLE_CONSTRAINTS',
+                   'CHECK_CONSTRAINTS', 'ROUTINES'
+               )",
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog_tables.len(), 4, "{catalog_tables:?}");
+
+    let catalog_columns: Vec<(String, String)> = c
+        .query(
+            "SELECT table_name, column_name FROM information_schema.columns
+             WHERE table_schema = 'information_schema'
+               AND (
+                   (table_name = 'REFERENTIAL_CONSTRAINTS'
+                    AND column_name IN ('TABLE_NAME', 'REFERENCED_TABLE_NAME'))
+                   OR (table_name = 'COLUMNS' AND column_name = 'PRIVILEGES')
+                   OR (table_name = 'ROUTINES' AND column_name = 'DTD_IDENTIFIER')
+               )",
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog_columns.len(), 4, "{catalog_columns:?}");
+}
+
 #[tokio::test]
 async fn authentication_native_password() {
     let srv = TestServer::start_with_auth("root", "s3cret").await;

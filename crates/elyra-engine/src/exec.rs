@@ -1248,6 +1248,31 @@ fn information_schema_view(tf: &TableFactor) -> Option<String> {
     None
 }
 
+/// Virtual relations exposed through the `information_schema` catalog.
+///
+/// Keeping this list next to the provider lets `TABLES` and `COLUMNS` describe
+/// the same capability surface that the planner accepts.
+const INFORMATION_SCHEMA_VIEWS: &[&str] = &[
+    "tables",
+    "columns",
+    "statistics",
+    "key_column_usage",
+    "referential_constraints",
+    "table_constraints",
+    "check_constraints",
+    "column_statistics",
+    "partitions",
+    "engines",
+    "triggers",
+    "routines",
+    "views",
+    "events",
+    "schemata",
+    "collation_character_set_applicability",
+];
+
+const COLUMN_PRIVILEGES: &str = "select,insert,update,references";
+
 /// Whether a table factor names a persisted ElyraSQL table rather than one of
 /// the virtual information_schema/mysql relations. Streaming join plans need a
 /// real [`TableDef`]; virtual relations must use the materialising path, which
@@ -1285,6 +1310,85 @@ fn ref_action_name(action: RefAction) -> &'static str {
         RefAction::Restrict => "RESTRICT",
         RefAction::Cascade => "CASCADE",
         RefAction::SetNull => "SET NULL",
+    }
+}
+
+/// MySQL generates names for unnamed CHECK constraints from the table name and
+/// a one-based ordinal. ElyraSQL stores only their expressions, so derive the
+/// same stable name whenever catalog rows are materialised.
+fn check_constraint_name(table_name: &str, ordinal: usize) -> String {
+    format!("{table_name}_chk_{}", ordinal + 1)
+}
+
+/// The unique key targeted by a foreign key, if the referenced table still has
+/// a matching primary or unique key. Older catalogs may contain a foreign key
+/// that predates this validation, in which case the standard metadata is NULL.
+fn referenced_constraint_name<'a>(
+    definition: &'a TableDef,
+    referenced_columns: &[String],
+) -> Option<&'a str> {
+    let matches_columns = |columns: &[usize]| {
+        columns.len() == referenced_columns.len()
+            && columns
+                .iter()
+                .zip(referenced_columns)
+                .all(|(&index, name)| {
+                    predicate::identifier_eq(&definition.schema.columns[index].name, name)
+                })
+    };
+    if matches_columns(&definition.pk_cols) {
+        Some("PRIMARY")
+    } else {
+        definition
+            .indexes
+            .iter()
+            .find(|index| index.unique && matches_columns(&index.cols))
+            .map(|index| index.name.as_str())
+    }
+}
+
+/// Whether a predicate explicitly requests rows describing the virtual catalog
+/// itself. This keeps existing unscoped catalog queries limited to persisted
+/// tables while allowing clients to probe `TABLE_SCHEMA = 'information_schema'`.
+fn requests_information_schema_rows(expr: &Expr) -> bool {
+    fn table_schema_reference(expr: &Expr) -> bool {
+        match expr {
+            Expr::Identifier(identifier) => identifier.value.eq_ignore_ascii_case("table_schema"),
+            Expr::CompoundIdentifier(parts) => parts
+                .last()
+                .is_some_and(|identifier| identifier.value.eq_ignore_ascii_case("table_schema")),
+            _ => false,
+        }
+    }
+
+    fn information_schema_literal(expr: &Expr) -> bool {
+        matches!(
+            literal_value(expr),
+            Some(Value::Text(value)) if value.eq_ignore_ascii_case("information_schema")
+        )
+    }
+
+    match expr {
+        Expr::Nested(expr) => requests_information_schema_rows(expr),
+        Expr::BinaryOp {
+            left,
+            op: sqlparser::ast::BinaryOperator::And | sqlparser::ast::BinaryOperator::Or,
+            right,
+        } => requests_information_schema_rows(left) || requests_information_schema_rows(right),
+        Expr::BinaryOp {
+            left,
+            op: sqlparser::ast::BinaryOperator::Eq,
+            right,
+        } => {
+            (table_schema_reference(left) && information_schema_literal(right))
+                || (table_schema_reference(right) && information_schema_literal(left))
+        }
+        Expr::InList {
+            expr,
+            list,
+            negated: false,
+        } => table_schema_reference(expr) && list.iter().any(information_schema_literal),
+        _ => false,
     }
 }
 
@@ -1334,6 +1438,7 @@ fn information_schema_schema(view: &str) -> Result<Schema> {
             text("COLUMN_COMMENT"),
             text("GENERATION_EXPRESSION"),
             text("CHARACTER_SET_NAME"),
+            text("PRIVILEGES"),
         ]),
         "statistics" => Schema::new(vec![
             text("TABLE_SCHEMA"),
@@ -1361,10 +1466,32 @@ fn information_schema_schema(view: &str) -> Result<Schema> {
             text("REFERENCED_COLUMN_NAME"),
         ]),
         "referential_constraints" => Schema::new(vec![
+            text("CONSTRAINT_CATALOG"),
             text("CONSTRAINT_SCHEMA"),
             text("CONSTRAINT_NAME"),
+            text("UNIQUE_CONSTRAINT_CATALOG"),
+            text("UNIQUE_CONSTRAINT_SCHEMA"),
+            text("UNIQUE_CONSTRAINT_NAME"),
+            text("MATCH_OPTION"),
             text("UPDATE_RULE"),
             text("DELETE_RULE"),
+            text("TABLE_NAME"),
+            text("REFERENCED_TABLE_NAME"),
+        ]),
+        "table_constraints" => Schema::new(vec![
+            text("CONSTRAINT_CATALOG"),
+            text("CONSTRAINT_SCHEMA"),
+            text("CONSTRAINT_NAME"),
+            text("TABLE_SCHEMA"),
+            text("TABLE_NAME"),
+            text("CONSTRAINT_TYPE"),
+            text("ENFORCED"),
+        ]),
+        "check_constraints" => Schema::new(vec![
+            text("CONSTRAINT_CATALOG"),
+            text("CONSTRAINT_SCHEMA"),
+            text("CONSTRAINT_NAME"),
+            text("CHECK_CLAUSE"),
         ]),
         "column_statistics" => Schema::new(vec![
             text("TABLE_NAME"),
@@ -1445,6 +1572,7 @@ fn information_schema_schema(view: &str) -> Result<Schema> {
             "CHARACTER_SET_CLIENT",
             "COLLATION_CONNECTION",
             "DATABASE_COLLATION",
+            "DTD_IDENTIFIER",
         ]),
         "views" => text_columns(&[
             "TABLE_CATALOG",
@@ -1504,13 +1632,20 @@ fn information_schema_schema(view: &str) -> Result<Schema> {
 }
 
 /// Build the rows of an `information_schema` view (`tables` or `columns`).
-async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec<Value>>)> {
+///
+/// Virtual-catalog rows are only needed for explicit capability probes. Keeping
+/// them scoped avoids changing historical unqualified virtual-view queries.
+async fn information_schema(
+    db: &Session,
+    view: &str,
+    include_catalog_rows: bool,
+) -> Result<(Schema, Vec<Vec<Value>>)> {
     let schema = information_schema_schema(view)?;
     let names = catalog::list_tables(db).await?;
     let database = db.database();
     match view {
         "tables" => {
-            let mut rows = Vec::with_capacity(names.len());
+            let mut rows = Vec::with_capacity(names.len() + INFORMATION_SCHEMA_VIEWS.len());
             for n in names {
                 let def = catalog::load(db, &n).await?;
                 let table_rows = match catalog::load_stats(db, &n).await? {
@@ -1541,6 +1676,23 @@ async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec
                     auto_increment,
                     Value::Text(String::new()),
                 ]);
+            }
+            if include_catalog_rows {
+                rows.extend(INFORMATION_SCHEMA_VIEWS.iter().map(|view| {
+                    vec![
+                        Value::Text("information_schema".into()),
+                        Value::Text(view.to_ascii_uppercase()),
+                        Value::Text("SYSTEM VIEW".into()),
+                        Value::Text("MEMORY".into()),
+                        Value::Int(0),
+                        Value::Int(0),
+                        Value::Int(0),
+                        Value::Text(String::new()),
+                        Value::Text("utf8mb4_0900_ai_ci".into()),
+                        Value::Null,
+                        Value::Text(String::new()),
+                    ]
+                }));
             }
             Ok((schema, rows))
         }
@@ -1583,7 +1735,44 @@ async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec
                             None => Value::Text(String::new()),
                         },
                         charset,
+                        Value::Text(COLUMN_PRIVILEGES.into()),
                     ]);
+                }
+            }
+            if include_catalog_rows {
+                for view in INFORMATION_SCHEMA_VIEWS {
+                    let virtual_schema = information_schema_schema(view)?;
+                    for (ordinal, column) in virtual_schema.columns.iter().enumerate() {
+                        let ty = column.ty.display_name();
+                        let is_text = matches!(column.ty, ColumnType::Text | ColumnType::Json);
+                        let collation = match (is_text, column.collation) {
+                            (true, elyra_core::Collation::Bin) => Value::Text("utf8mb4_bin".into()),
+                            (true, _) => Value::Text("utf8mb4_0900_ai_ci".into()),
+                            (false, _) => Value::Null,
+                        };
+                        let charset = if is_text {
+                            Value::Text("utf8mb4".into())
+                        } else {
+                            Value::Null
+                        };
+                        rows.push(vec![
+                            Value::Text("information_schema".into()),
+                            Value::Text(view.to_ascii_uppercase()),
+                            Value::Text(column.name.clone()),
+                            Value::Int(ordinal as i64 + 1),
+                            Value::Null,
+                            Value::Text(if column.nullable { "YES" } else { "NO" }.into()),
+                            Value::Text(ty.clone()),
+                            Value::Text(ty),
+                            Value::Text(String::new()),
+                            Value::Text(String::new()),
+                            collation,
+                            Value::Text(String::new()),
+                            Value::Text(String::new()),
+                            charset,
+                            Value::Text(COLUMN_PRIVILEGES.into()),
+                        ]);
+                    }
                 }
             }
             Ok((schema, rows))
@@ -1676,12 +1865,85 @@ async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec
             let mut rows = Vec::new();
             for table_name in names {
                 let def = catalog::load(db, &table_name).await?;
-                rows.extend(def.foreign_keys.iter().map(|foreign_key| {
-                    vec![
+                for foreign_key in &def.foreign_keys {
+                    let unique_constraint = match catalog::load(db, &foreign_key.ref_table).await {
+                        Ok(referenced) => {
+                            referenced_constraint_name(&referenced, &foreign_key.ref_columns)
+                                .map(str::to_owned)
+                        }
+                        // A dropped or not-yet-created parent must not make the
+                        // whole metadata view unreadable. Its unique-key fields
+                        // are unknown, but the foreign-key row is still useful.
+                        Err(Error::Catalog(_)) => None,
+                        Err(error) => return Err(error),
+                    };
+                    let unique_catalog = unique_constraint
+                        .as_ref()
+                        .map(|_| Value::Text("def".into()))
+                        .unwrap_or(Value::Null);
+                    let unique_schema = unique_constraint
+                        .as_ref()
+                        .map(|_| Value::Text(database.clone()))
+                        .unwrap_or(Value::Null);
+                    let unique_name = unique_constraint.map(Value::Text).unwrap_or(Value::Null);
+                    rows.push(vec![
+                        Value::Text("def".into()),
                         Value::Text(database.clone()),
                         Value::Text(foreign_key.name.clone()),
+                        unique_catalog,
+                        unique_schema,
+                        unique_name,
+                        Value::Text("NONE".into()),
                         Value::Text(ref_action_name(foreign_key.on_update).into()),
                         Value::Text(ref_action_name(foreign_key.on_delete).into()),
+                        Value::Text(table_name.clone()),
+                        Value::Text(foreign_key.ref_table.clone()),
+                    ]);
+                }
+            }
+            Ok((schema, rows))
+        }
+        "table_constraints" => {
+            let mut rows = Vec::new();
+            for table_name in names {
+                let def = catalog::load(db, &table_name).await?;
+                let mut push = |name: &str, kind: &str| {
+                    rows.push(vec![
+                        Value::Text("def".into()),
+                        Value::Text(database.clone()),
+                        Value::Text(name.into()),
+                        Value::Text(database.clone()),
+                        Value::Text(table_name.clone()),
+                        Value::Text(kind.into()),
+                        Value::Text("YES".into()),
+                    ]);
+                };
+                if def.has_pk() {
+                    push("PRIMARY", "PRIMARY KEY");
+                }
+                for index in def.indexes.iter().filter(|index| index.unique) {
+                    push(&index.name, "UNIQUE");
+                }
+                for foreign_key in &def.foreign_keys {
+                    push(&foreign_key.name, "FOREIGN KEY");
+                }
+                for ordinal in 0..def.checks.len() {
+                    let name = check_constraint_name(&table_name, ordinal);
+                    push(&name, "CHECK");
+                }
+            }
+            Ok((schema, rows))
+        }
+        "check_constraints" => {
+            let mut rows = Vec::new();
+            for table_name in names {
+                let def = catalog::load(db, &table_name).await?;
+                rows.extend(def.checks.iter().enumerate().map(|(ordinal, expression)| {
+                    vec![
+                        Value::Text("def".into()),
+                        Value::Text(database.clone()),
+                        Value::Text(check_constraint_name(&table_name, ordinal)),
+                        Value::Text(expression.clone()),
                     ]
                 }));
             }
@@ -1907,6 +2169,7 @@ async fn information_schema(db: &Session, view: &str) -> Result<(Schema, Vec<Vec
                         Value::Text("utf8mb4".into()),
                         Value::Text("utf8mb4_0900_ai_ci".into()),
                         Value::Text("utf8mb4_0900_ai_ci".into()),
+                        Value::Text(String::new()),
                     ]);
                 }
                 after = batch.last().map(|(k, _)| k.clone());
@@ -4859,7 +5122,11 @@ async fn select_inner(
 
     // information_schema.<view> as a single virtual relation.
     if let Some(view) = information_schema_view(&select.from[0].relation) {
-        let (schema, rows) = information_schema(db, &view).await?;
+        let include_catalog_rows = select
+            .selection
+            .as_ref()
+            .is_some_and(requests_information_schema_rows);
+        let (schema, rows) = information_schema(db, &view, include_catalog_rows).await?;
         let qualifier = wildcard_schema_qualifier(db, &select.from[0].relation)
             .unwrap_or_else(|| ObjectName(vec![Ident::new(view)]));
         let schema = qualify_relation_schema(schema, &qualifier);
@@ -7922,7 +8189,8 @@ async fn load_relation(
 ) -> Result<(Vec<ColumnDef>, Vec<Vec<Value>>)> {
     // information_schema.<view>: synthesize a virtual relation.
     if let Some(view) = information_schema_view(tf) {
-        let (schema, rows) = information_schema(db, &view).await?;
+        let include_catalog_rows = conjuncts.iter().any(requests_information_schema_rows);
+        let (schema, rows) = information_schema(db, &view, include_catalog_rows).await?;
         let qualifier =
             wildcard_schema_qualifier(db, tf).unwrap_or_else(|| ObjectName(vec![Ident::new(view)]));
         return Ok((qualify_relation_schema(schema, &qualifier).columns, rows));
@@ -13952,25 +14220,7 @@ fn virtual_relation_name(name: &ObjectName) -> Option<String> {
 }
 
 fn virtual_relation_supported(name: &str) -> bool {
-    matches!(
-        name,
-        "tables"
-            | "columns"
-            | "statistics"
-            | "key_column_usage"
-            | "referential_constraints"
-            | "column_statistics"
-            | "partitions"
-            | "engines"
-            | "triggers"
-            | "routines"
-            | "views"
-            | "events"
-            | "schemata"
-            | "collation_character_set_applicability"
-            | "mysql.user"
-            | "mysql.db"
-    )
+    INFORMATION_SCHEMA_VIEWS.contains(&name) || matches!(name, "mysql.user" | "mysql.db")
 }
 
 fn collect_expr_subqueries(expr: &Expr) -> Vec<SqlQuery> {
@@ -14734,7 +14984,7 @@ async fn static_factor_schema(
                 }
             }
             if let Some(view) = information_schema_view(factor) {
-                let (schema, _) = information_schema(db, &view).await?;
+                let schema = information_schema_schema(&view)?;
                 return qualify_static_schema(db, schema, factor);
             }
             let table = stored_table_ident(db, name)?;
