@@ -26,38 +26,21 @@ release:
 run +args='serve': release
     ./target/release/elyrasql "$@"
 
-# Run all workspace tests via nextest (faster), falling back to cargo test.
+# Run all workspace tests via nextest (faster). Install with:
+#   cargo install cargo-nextest --locked
 [group('test')]
 test *args:
-    if command -v cargo-nextest >/dev/null 2>&1; then
-        cargo nextest run --workspace --locked "$@"
-    else
-        cargo test --workspace --locked "$@"
-    fi
-
-# Run all workspace tests via nextest (faster).
-[group('test')]
-nextest *args:
     cargo nextest run --workspace --locked "$@"
 
 # Run tests for one workspace crate.
 [group('test')]
 test-crate crate *args:
-    crate="$1"; shift
-    if command -v cargo-nextest >/dev/null 2>&1; then
-        cargo nextest run --locked -p "$crate" "$@"
-    else
-        cargo test --locked -p "$crate" "$@"
-    fi
+    crate="$1"; shift; cargo nextest run --locked -p "$crate" "$@"
 
 # Run the MySQL wire integration tests.
 [group('test')]
 test-wire:
-    if command -v cargo-nextest >/dev/null 2>&1; then
-        cargo nextest run --locked -p elyra-server -E 'test(/wire/)'
-    else
-        cargo test --locked -p elyra-server --test wire
-    fi
+    cargo nextest run --locked -p elyra-server -E 'test(/wire/)'
 
 # Format Rust code.
 [group('quality')]
