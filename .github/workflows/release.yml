@@ -58,6 +58,18 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Generate PGO profile (fail-safe)
+        id: pgo
+        continue-on-error: true
+        env:
+          PGO_DIR: ${{ github.workspace }}/target/pgo
+        run: |
+          rustup component add llvm-tools-preview
+          mkdir -p "$PGO_DIR/training-sql"
+          python3 testbench/sql-dump/generate.py --all --rows 50000 --output-dir "$PGO_DIR/training-sql"
+          ./scripts/pgo-build.sh --profile-only --train-data-dir "$PGO_DIR/train-data"
+          echo "RUSTFLAGS=-Cprofile-use=$PGO_DIR/merged.profdata -Cllvm-args=-pgo-warn-missing-function" >> "$GITHUB_ENV"
+
       - name: Install musl tools
         if: matrix.platform == 'linux'
         # ports.ubuntu.com (the arm64 mirror) has intermittent connectivity from
