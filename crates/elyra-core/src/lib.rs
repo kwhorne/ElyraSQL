@@ -14,7 +14,7 @@ pub mod users;
 pub mod value;
 
 pub use error::{Error, Result};
-pub use types::{Collation, ColumnDef, ColumnType, Schema};
+pub use types::{Collation, ColumnDef, ColumnType, ResultColumnMetadata, Schema};
 pub use value::{canonical_f64_bits, fold, Value};
 
 /// Upper bound (in bytes) on any single length-prefixed frame or record read

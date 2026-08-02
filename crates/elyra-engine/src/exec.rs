@@ -597,6 +597,7 @@ pub async fn create_table(
             nullable,
             collation,
             qualifier: Vec::new(),
+            result_metadata: Default::default(),
         });
         declarations.push(declared_type);
         col_meta.push(meta);
@@ -798,6 +799,7 @@ pub async fn show_tables(db: &Session) -> Result<QueryResult> {
         nullable: false,
         collation: elyra_core::Collation::Ci,
         qualifier: Vec::new(),
+        result_metadata: Default::default(),
     }]);
     let rows = names.into_iter().map(|n| vec![Value::Text(n)]).collect();
     Ok(QueryResult::Rows(RowStream::literal(schema, rows)))
@@ -814,6 +816,7 @@ fn text_schema(names: &[&str]) -> Schema {
                 nullable: true,
                 collation: elyra_core::Collation::Ci,
                 qualifier: Vec::new(),
+                result_metadata: Default::default(),
             })
             .collect(),
     )
@@ -1234,6 +1237,7 @@ pub async fn show_columns(db: &Session, table: &str) -> Result<QueryResult> {
                 nullable: *n == "Default",
                 collation: elyra_core::Collation::Ci,
                 qualifier: Vec::new(),
+                result_metadata: Default::default(),
             })
             .collect(),
     );
@@ -1377,6 +1381,7 @@ pub async fn show_create_table(db: &Session, name: &str) -> Result<QueryResult> 
             nullable: false,
             collation: elyra_core::Collation::Ci,
             qualifier: Vec::new(),
+            result_metadata: Default::default(),
         },
         ColumnDef {
             name: "Create Table".into(),
@@ -1384,6 +1389,7 @@ pub async fn show_create_table(db: &Session, name: &str) -> Result<QueryResult> 
             nullable: false,
             collation: elyra_core::Collation::Ci,
             qualifier: Vec::new(),
+            result_metadata: Default::default(),
         },
     ]);
     let rows = vec![vec![Value::Text(name.to_string()), Value::Text(ddl)]];
@@ -1416,6 +1422,7 @@ pub async fn show_index(db: &Session, name: &str) -> Result<QueryResult> {
                 nullable: true,
                 collation: elyra_core::Collation::Ci,
                 qualifier: Vec::new(),
+                result_metadata: Default::default(),
             })
             .collect(),
     );
@@ -1617,6 +1624,7 @@ fn information_schema_schema(view: &str) -> Result<Schema> {
         nullable: true,
         collation: elyra_core::Collation::Ci,
         qualifier: Vec::new(),
+        result_metadata: Default::default(),
     };
     let int = |name: &str| ColumnDef {
         name: name.to_owned(),
@@ -1624,6 +1632,7 @@ fn information_schema_schema(view: &str) -> Result<Schema> {
         nullable: true,
         collation: elyra_core::Collation::Ci,
         qualifier: Vec::new(),
+        result_metadata: Default::default(),
     };
     let text_columns = |names: &[&str]| Schema::new(names.iter().map(|name| text(name)).collect());
 
@@ -2552,6 +2561,7 @@ async fn create_table_as(
                 nullable: true,
                 collation: elyra_core::Collation::Ci,
                 qualifier: Vec::new(),
+                result_metadata: Default::default(),
             })
             .collect()
     } else {
@@ -2563,6 +2573,7 @@ async fn create_table_as(
                 nullable: true,
                 collation: elyra_core::Collation::Ci,
                 qualifier: Vec::new(),
+                result_metadata: Default::default(),
             });
         }
         v
@@ -3347,6 +3358,7 @@ async fn alter_add_column(
             })
             .unwrap_or_default(),
         qualifier: Vec::new(),
+        result_metadata: Default::default(),
     });
     def.col_meta.push(meta.clone());
     if is_primary {
@@ -5478,6 +5490,7 @@ async fn select_inner(
                 nullable: true,
                 collation: elyra_core::Collation::Ci,
                 qualifier: Vec::new(),
+                result_metadata: Default::default(),
             });
             vals.push(v);
         }
@@ -8476,6 +8489,7 @@ async fn join_correlated_select(
                     nullable: true,
                     collation: elyra_core::Collation::Ci,
                     qualifier: Vec::new(),
+                    result_metadata: Default::default(),
                 });
             }
         }
@@ -8546,6 +8560,7 @@ async fn resolve_table(db: &Session, tf: &TableFactor) -> Result<(TableDef, Vec<
                     // case-sensitive.
                     collation: c.collation,
                     qualifier: qualifier_parts.clone(),
+                    result_metadata: c.result_metadata,
                 })
                 .collect();
             Ok((def, cols))
@@ -13201,14 +13216,19 @@ fn project_exprs(
     let mut cols = Vec::with_capacity(projs.len());
     let mut tables: Vec<String> = Vec::with_capacity(projs.len());
     for (ci, (name, p)) in names.iter().zip(&projs).enumerate() {
-        // Carry the source column's type AND collation through a direct column
-        // projection, so DISTINCT / ORDER BY on a projected `_bin` column stays
-        // case-sensitive. Computed expressions default to Text/Ci.
-        let (ty, collation) = match p {
-            Proj::Col(i) => (schema.columns[*i].ty.clone(), schema.columns[*i].collation),
+        // Carry a direct source column's type, nullability, collation, and
+        // result metadata through projection. Computed expressions default to
+        // Text/Ci and have no source attributes.
+        let (ty, nullable, collation) = match p {
+            Proj::Col(i) => (
+                schema.columns[*i].ty.clone(),
+                schema.columns[*i].nullable,
+                schema.columns[*i].collation,
+            ),
             Proj::Expr(e) => match direct_column(e) {
                 Some(idx) => (
                     schema.columns[idx].ty.clone(),
+                    schema.columns[idx].nullable,
                     schema.columns[idx].collation,
                 ),
                 None => (
@@ -13218,6 +13238,7 @@ fn project_exprs(
                         .find(|v| !v.is_null())
                         .map(infer_val)
                         .unwrap_or(ColumnType::Text),
+                    true,
                     elyra_core::Collation::Ci,
                 ),
             },
@@ -13237,9 +13258,12 @@ fn project_exprs(
         cols.push(ColumnDef {
             name: name.clone(),
             ty,
-            nullable: true,
+            nullable,
             collation,
             qualifier: Vec::new(),
+            result_metadata: source_column
+                .map(|index| schema.columns[index].result_metadata)
+                .unwrap_or_default(),
         });
     }
 
@@ -14042,6 +14066,7 @@ async fn window_select(
             nullable: source.is_none_or(|column| column.nullable),
             collation: source.map_or(elyra_core::Collation::Ci, |column| column.collation),
             qualifier: Vec::new(),
+            result_metadata: source.map_or_else(Default::default, |column| column.result_metadata),
         });
     }
     let out_schema = Schema::with_tables(cols, tables);
@@ -17114,6 +17139,7 @@ async fn correlated_select(
                         nullable: c.nullable,
                         collation: c.collation,
                         qualifier: Vec::new(),
+                        result_metadata: c.result_metadata,
                     });
                 }
             }
@@ -17137,6 +17163,7 @@ async fn correlated_select(
                     nullable: true,
                     collation: elyra_core::Collation::Ci,
                     qualifier: Vec::new(),
+                    result_metadata: Default::default(),
                 });
             }
         }
@@ -18132,6 +18159,7 @@ async fn hybrid_select(
         nullable: true,
         collation: elyra_core::Collation::Ci,
         qualifier: Vec::new(),
+        result_metadata: Default::default(),
     };
     let mut cols: Vec<elyra_core::ColumnDef> = Vec::new();
     let mut plan: Vec<P> = Vec::new();

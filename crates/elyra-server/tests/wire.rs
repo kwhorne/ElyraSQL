@@ -7,6 +7,7 @@
 mod common;
 
 use common::TestServer;
+use mysql_async::consts::{ColumnFlags as MySqlColumnFlags, ColumnType as MySqlColumnType};
 use mysql_async::prelude::*;
 
 type ColumnMetadata = (
@@ -84,6 +85,187 @@ async fn mysql_dump_literals_remain_exact() {
         .is_err());
     let still_connected: i64 = c.query_first("SELECT 1").await.unwrap().unwrap();
     assert_eq!(still_connected, 1);
+}
+
+#[tokio::test]
+async fn result_column_metadata_reports_table_flags_over_text_and_binary_protocols() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop(
+        "CREATE TABLE flagprobe (
+            id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+            email VARCHAR(50) NOT NULL,
+            tenant_id INT NOT NULL,
+            handle VARCHAR(50) NOT NULL,
+            UNIQUE KEY uq_email (email),
+            UNIQUE KEY uq_tenant_handle (tenant_id, handle)
+        )",
+    )
+    .await
+    .unwrap();
+    c.query_drop(
+        "INSERT INTO flagprobe (email, tenant_id, handle)
+         VALUES ('ada@example.test', 7, 'ada')",
+    )
+    .await
+    .unwrap();
+
+    let mut text_result = c
+        .query_iter("SELECT id, email, tenant_id, handle FROM flagprobe")
+        .await
+        .unwrap();
+    let text_columns = text_result.columns_ref().to_vec();
+    assert_eq!(
+        text_columns[0].column_type(),
+        MySqlColumnType::MYSQL_TYPE_LONGLONG
+    );
+    assert_eq!(text_columns[0].column_length(), 20);
+    assert_eq!(text_columns[0].decimals(), 0);
+    assert!(text_columns[0]
+        .flags()
+        .contains(MySqlColumnFlags::NOT_NULL_FLAG));
+    assert!(text_columns[0]
+        .flags()
+        .contains(MySqlColumnFlags::PRI_KEY_FLAG));
+    assert!(text_columns[0]
+        .flags()
+        .contains(MySqlColumnFlags::AUTO_INCREMENT_FLAG));
+    assert!(text_columns[0]
+        .flags()
+        .contains(MySqlColumnFlags::UNSIGNED_FLAG));
+    assert!(text_columns[1]
+        .flags()
+        .contains(MySqlColumnFlags::NOT_NULL_FLAG));
+    assert!(text_columns[1]
+        .flags()
+        .contains(MySqlColumnFlags::UNIQUE_KEY_FLAG));
+    assert!(!text_columns[2]
+        .flags()
+        .contains(MySqlColumnFlags::UNIQUE_KEY_FLAG));
+    assert!(!text_columns[3]
+        .flags()
+        .contains(MySqlColumnFlags::UNIQUE_KEY_FLAG));
+    assert_eq!(text_columns[1].column_length(), 65_535);
+    let text_rows: Vec<(u64, String, i64, String)> = text_result.collect().await.unwrap();
+    assert_eq!(text_rows, [(1, "ada@example.test".into(), 7, "ada".into())]);
+
+    let mut binary_result = c
+        .exec_iter(
+            "SELECT id, email, tenant_id, handle FROM flagprobe WHERE id = ?",
+            (1_u64,),
+        )
+        .await
+        .unwrap();
+    let binary_columns = binary_result.columns().unwrap().to_vec();
+    assert_eq!(binary_columns, text_columns);
+    let binary_rows: Vec<(u64, String, i64, String)> = binary_result.collect().await.unwrap();
+    assert_eq!(
+        binary_rows,
+        [(1, "ada@example.test".into(), 7, "ada".into())]
+    );
+}
+
+#[tokio::test]
+async fn temporal_decimal_and_json_result_metadata_uses_native_mysql_types() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop(
+        "CREATE TABLE wire_types (
+            id INT PRIMARY KEY,
+            d DATE NOT NULL,
+            dt DATETIME NOT NULL,
+            tm TIME NOT NULL,
+            amount DECIMAL(16,2) NOT NULL,
+            payload JSON NOT NULL
+        )",
+    )
+    .await
+    .unwrap();
+    c.query_drop(
+        "INSERT INTO wire_types VALUES
+         (1, '2026-08-02', '2026-08-02 13:45:30', '12:34:56', 42.50, '{\"ok\":true}')",
+    )
+    .await
+    .unwrap();
+
+    let mut text_result = c
+        .query_iter("SELECT d, dt, tm, amount, payload FROM wire_types")
+        .await
+        .unwrap();
+    let text_columns = text_result.columns_ref().to_vec();
+    assert_eq!(
+        text_columns
+            .iter()
+            .map(|column| column.column_type())
+            .collect::<Vec<_>>(),
+        [
+            MySqlColumnType::MYSQL_TYPE_DATE,
+            MySqlColumnType::MYSQL_TYPE_DATETIME,
+            MySqlColumnType::MYSQL_TYPE_TIME,
+            MySqlColumnType::MYSQL_TYPE_NEWDECIMAL,
+            MySqlColumnType::MYSQL_TYPE_JSON,
+        ]
+    );
+    assert_eq!(
+        text_columns
+            .iter()
+            .map(|column| column.column_length())
+            .collect::<Vec<_>>(),
+        [10, 19, 10, 18, u32::MAX]
+    );
+    assert_eq!(
+        text_columns
+            .iter()
+            .map(|column| column.decimals())
+            .collect::<Vec<_>>(),
+        [0, 0, 0, 2, 0]
+    );
+    let text_rows: Vec<(String, String, String, String, String)> =
+        text_result.collect().await.unwrap();
+    assert_eq!(
+        text_rows,
+        [(
+            "2026-08-02".into(),
+            "2026-08-02 13:45:30".into(),
+            "12:34:56".into(),
+            "42.50".into(),
+            "{\"ok\":true}".into(),
+        )]
+    );
+
+    let mut binary_result = c
+        .exec_iter(
+            "SELECT d, dt, tm, amount, payload FROM wire_types WHERE id = ?",
+            (1,),
+        )
+        .await
+        .unwrap();
+    let binary_columns = binary_result.columns().unwrap().to_vec();
+    assert_eq!(binary_columns, text_columns);
+    let binary_rows: Vec<mysql_async::Row> = binary_result.collect().await.unwrap();
+    let row = binary_rows.first().unwrap();
+    assert!(matches!(
+        row.as_ref(0),
+        Some(mysql_async::Value::Date(2026, 8, 2, 0, 0, 0, 0))
+    ));
+    assert!(matches!(
+        row.as_ref(1),
+        Some(mysql_async::Value::Date(2026, 8, 2, 13, 45, 30, 0))
+    ));
+    assert!(matches!(
+        row.as_ref(2),
+        Some(mysql_async::Value::Time(false, 0, 12, 34, 56, 0))
+    ));
+    assert_eq!(
+        row.as_ref(3),
+        Some(&mysql_async::Value::Bytes(b"42.50".to_vec()))
+    );
+    assert_eq!(
+        row.as_ref(4),
+        Some(&mysql_async::Value::Bytes(b"{\"ok\":true}".to_vec()))
+    );
 }
 
 #[tokio::test]
@@ -4043,6 +4225,28 @@ async fn non_strict_sql_mode_coerces_invalid_temporal_text() {
             "00:00:00".into(),
         )
     );
+
+    // The engine retains non-strict zero dates as sentinel text. With native
+    // temporal metadata, a prepared result must encode those sentinels in the
+    // binary temporal form rather than closing the connection or sending a
+    // string value under a DATE/DATETIME descriptor.
+    let binary_rows: Vec<mysql_async::Row> = c
+        .exec("SELECT d, dt, tm FROM temporal_values WHERE id = ?", (1,))
+        .await
+        .unwrap();
+    let binary = binary_rows.first().unwrap();
+    assert!(matches!(
+        binary.as_ref(0),
+        Some(mysql_async::Value::Date(0, 0, 0, 0, 0, 0, 0))
+    ));
+    assert!(matches!(
+        binary.as_ref(1),
+        Some(mysql_async::Value::Date(0, 0, 0, 0, 0, 0, 0))
+    ));
+    assert!(matches!(
+        binary.as_ref(2),
+        Some(mysql_async::Value::Time(false, 0, 0, 0, 0, 0))
+    ));
 
     c.query_drop("SET SESSION sql_mode='STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION'")
         .await

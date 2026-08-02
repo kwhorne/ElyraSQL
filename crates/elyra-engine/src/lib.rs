@@ -82,6 +82,7 @@ impl QueryResult {
             nullable: true,
             collation: elyra_core::Collation::Ci,
             qualifier: Vec::new(),
+            result_metadata: Default::default(),
         }]);
         QueryResult::Rows(RowStream::literal(schema, vec![vec![value]]))
     }
@@ -810,6 +811,7 @@ impl Engine {
                         nullable: true,
                         collation: elyra_core::Collation::Ci,
                         qualifier: Vec::new(),
+                        result_metadata: Default::default(),
                     });
                 }
                 SelectItem::ExprWithAlias { expr, alias } => {
@@ -819,6 +821,7 @@ impl Engine {
                         nullable: true,
                         collation: elyra_core::Collation::Ci,
                         qualifier: Vec::new(),
+                        result_metadata: Default::default(),
                     });
                 }
             }

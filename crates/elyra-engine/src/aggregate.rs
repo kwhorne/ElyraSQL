@@ -567,6 +567,7 @@ pub fn build_plan(
                         nullable: column.nullable,
                         collation: column.collation,
                         qualifier: column.qualifier.clone(),
+                        result_metadata: column.result_metadata,
                     });
                     plan.push(OutCol::Column(idx));
                 }
@@ -595,6 +596,7 @@ pub fn build_plan(
                         } else {
                             column.qualifier.clone()
                         },
+                        result_metadata: column.result_metadata,
                     });
                     plan.push(OutCol::Column(idx));
                 }
@@ -618,6 +620,7 @@ pub fn build_plan(
                 nullable: true,
                 collation: ci,
                 qualifier: Vec::new(),
+                result_metadata: Default::default(),
             });
             plan.push(OutCol::Agg(slot));
             continue;
@@ -633,6 +636,7 @@ pub fn build_plan(
                     nullable: schema.columns[idx].nullable,
                     collation: schema.columns[idx].collation,
                     qualifier: schema.columns[idx].qualifier.clone(),
+                    result_metadata: schema.columns[idx].result_metadata,
                 });
                 plan.push(OutCol::Column(idx));
             } else {
@@ -642,6 +646,7 @@ pub fn build_plan(
                     nullable: true,
                     collation: ci,
                     qualifier: Vec::new(),
+                    result_metadata: Default::default(),
                 });
                 plan.push(OutCol::Computed(Box::new(expr.clone())));
             }
@@ -659,6 +664,7 @@ pub fn build_plan(
             nullable: true,
             collation: ci,
             qualifier: Vec::new(),
+            result_metadata: Default::default(),
         });
         plan.push(OutCol::Computed(Box::new(rewritten)));
     }
@@ -673,6 +679,7 @@ pub fn build_plan(
             nullable: true,
             collation: ci,
             qualifier: Vec::new(),
+            result_metadata: Default::default(),
         });
     }
 

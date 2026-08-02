@@ -6,7 +6,7 @@
 //! * `data::<table>::<key>` → serialized row (`Vec<Value>`)
 
 use crate::session::Session;
-use elyra_core::{Error, Result, Schema};
+use elyra_core::{Error, Result, ResultColumnMetadata, Schema};
 use serde::{Deserialize, Serialize};
 
 /// A secondary index over one or more columns.
@@ -132,6 +132,31 @@ impl TableDef {
         self.col_meta
             .iter()
             .any(|m| m.default.is_some() || m.auto_increment || m.generated.is_some())
+    }
+
+    /// Reconstruct wire-only result metadata from persisted table attributes.
+    ///
+    /// The values themselves are transient because `TableDef` uses positional
+    /// bincode encoding; source-key flags are derived each time a definition is
+    /// decoded instead of changing the catalog format.
+    fn hydrate_result_metadata(&mut self) {
+        let metadata = (0..self.schema.columns.len())
+            .map(|index| ResultColumnMetadata {
+                primary_key: self.pk_cols.contains(&index),
+                unique_key: !self.pk_cols.contains(&index)
+                    && self
+                        .indexes
+                        .iter()
+                        .any(|index_def| index_def.unique && index_def.cols == [index]),
+                auto_increment: self
+                    .col_meta
+                    .get(index)
+                    .is_some_and(|meta| meta.auto_increment),
+            })
+            .collect::<Vec<_>>();
+        for (column, metadata) in self.schema.columns.iter_mut().zip(metadata) {
+            column.result_metadata = metadata;
+        }
     }
 }
 
@@ -480,7 +505,10 @@ impl TableDef {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        bincode::deserialize(bytes).map_err(|e| Error::Catalog(e.to_string()))
+        let mut definition: Self =
+            bincode::deserialize(bytes).map_err(|e| Error::Catalog(e.to_string()))?;
+        definition.hydrate_result_metadata();
+        Ok(definition)
     }
 }
 
