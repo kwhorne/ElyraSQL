@@ -17,6 +17,28 @@ ElyraSQL release builds target **Ubuntu 24.04+** and **Apple Silicon macOS
     done, so an interrupted upgrade simply resumes on the next start. **Take a backup
     first, and note that downgrading to 1.4.x afterwards is not supported.**
 
+!!! info "Upgrading to 1.9.2"
+
+    Two fixes are the reason to upgrade promptly, because both were silent:
+
+    - **`LEFT JOIN ... WHERE nullable IS NULL` returned the rows it should have
+      excluded** when the `ON` had more than one condition. If you have results
+      derived from that anti-join idiom, recompute them.
+    - **`SET autocommit=0` was ignored**, so work committed immediately and
+      `ROLLBACK` did nothing. Anything relying on it for transaction scope had
+      no transaction.
+
+    One change tightens validation: **`CHAR`/`VARCHAR` length limits are now
+    enforced** in strict mode, so a string longer than its declared column is
+    refused (22001) instead of stored. Declared types are only recorded for
+    tables created from 1.9.2 onward, so existing tables are unaffected until
+    recreated.
+
+    Also worth knowing: a spilling `ORDER BY` — one over more than
+    `ELYRASQL_SORT_MAX_ROWS` rows without a `LIMIT` — previously failed with an
+    I/O error and now works. If you worked around that with a larger sort
+    budget, you can put it back.
+
 !!! info "Upgrading to 1.9.1"
 
     A patch release, but three of its fixes **tighten validation**, so statements
@@ -135,8 +157,8 @@ macOS).
 Multi-arch image (`amd64` + `arm64`) on the GitHub Container Registry:
 
 ```bash
-docker pull ghcr.io/kwhorne/elyrasql:1.9.1   # or :latest
-docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.9.1
+docker pull ghcr.io/kwhorne/elyrasql:1.9.2   # or :latest
+docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.9.2
 ```
 
 The image is ~15 MB, runs as a non-root user, stores data in the

@@ -51,6 +51,20 @@ INSERT INTO t VALUES (-1);    -- ERROR 1264 (22003): invalid UNSIGNED value: -1
     upgrade, so an existing database cannot start rejecting data it already
     holds.
 
+## Character length
+
+`CHAR(n)` and `VARCHAR(n)` keep their declared length, and a longer string is
+refused in strict mode rather than stored:
+
+```sql
+CREATE TABLE t (a VARCHAR(32));
+INSERT INTO t VALUES (REPEAT('x', 40));   -- ERROR 1406 (22001): data too long
+```
+
+Like integer widths, this is recorded per table when the table is created, so a
+table created before 1.9.2 has no declared length stored and is not
+retroactively constrained.
+
 ## Literals and coercion
 
 Values are written as string or numeric literals and coerced to the column

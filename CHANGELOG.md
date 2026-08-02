@@ -6,8 +6,40 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
-### Fixed
+## [1.9.2] - 2026-08-02
 
+Eleven contributions, and a theme: **the things we never exercised were the
+things that did not work.** A spilling sort that no test had ever made spill.
+`SET` statements accepted and discarded. Result metadata nothing read back.
+Virtual catalog tables nothing queried. Each was fine right up to the first time
+something real depended on it.
+
+Two return or lose data silently and are the reason to upgrade: an anti-join
+that dropped its `WHERE`, and `SET autocommit=0` that committed anyway.
+
+**Three changes tighten validation**, so statements that used to succeed can now
+fail — a string longer than its `VARCHAR(n)`, and the two error-code corrections
+below. No on-disk format change; 1.5.x through 1.9.1 open unchanged.
+
+### Fixed — wrong or lost data
+
+- **`LEFT JOIN ... WHERE nullable IS NULL` returned the rows it was meant to
+  exclude.** A `WHERE` predicate over the nullable side was pushed beneath the
+  outer join, which changes what NULL-extension means, so the standard
+  anti-join idiom silently returned every row. It needed a compound `ON`
+  (`ON a.id = b.id AND b.k = 'x'`) and the plain execution path — adding
+  `ORDER BY` or `GROUP BY` gave the right answer, so the shape that was wrong
+  was the bare one WordPress and Drupal generate for "rows without this meta
+  key".
+- **`SET autocommit=0` was accepted and discarded, so work committed anyway.**
+  A second connection could see the "uncommitted" rows immediately, and
+  `ROLLBACK` did nothing. An application building a transaction with
+  `autocommit=0` rather than `START TRANSACTION` — which several drivers do by
+  default — had the appearance of a transaction and none of the substance.
+  `sql_mode` (including `ANSI_QUOTES`), `NO_AUTO_VALUE_ON_ZERO`,
+  `FOREIGN_KEY_CHECKS`, isolation level and `group_concat_max_len` were
+  discarded the same way and are now applied, with session values kept
+  independent of the globals.
 - **A spilling `ORDER BY` failed outright with `Bad file descriptor`
   (ESQL-60).** The external merge sort wrote each run through a handle from
   `File::create` — which opens **write-only** — and the merge phase then seeked
@@ -21,6 +53,58 @@ All notable changes to ElyraSQL are documented here. The format is based on
   worked. Run files are now opened read-write, and a unit test forces a small
   budget so the spill path is exercised on every run — including the
   single-run case, which skips the k-way merge.
+- **`SELECT` without `FROM` ignored `WHERE`, `LIMIT` and `OFFSET`.**
+  `SELECT 1 WHERE 1=0` and `SELECT 1 LIMIT 0` both returned a row. MySQL's
+  unsigned all-ones `LIMIT` sentinel with `OFFSET` is also accepted now.
+- **Numeric string coercion was inconsistent per call site.** `'12' + 1` raised
+  1366, `SUM(text_column)` returned `NULL` rather than a total, and
+  `CAST('4.5x' AS DOUBLE)`, `ABS('-3q')` and `ROUND('2.7t')` all returned
+  `NULL`. One shared MySQL-compatible coercion now covers arithmetic, unary
+  numerics, casts, scalar functions, `SUM`/`AVG`, window fallbacks and the OLAP
+  paths, preserving `NULL` while coercing malformed non-NULL strings to zero.
+
+### Fixed — schema and metadata
+
+- **Inline index prefix lengths (`KEY meta_key (meta_key(191))`) are accepted.**
+  This is the DDL WordPress ships, so installation stopped at the first
+  `CREATE TABLE`; it also drove a large cluster of Drupal failures. The prefix
+  is parsed and the index covers the whole column, which is *stricter* than
+  MySQL rather than looser.
+- **Declared column types survive.** `TINYINT(1)`, `VARCHAR(n)`, `CHAR(n)` and
+  exact numeric declarations were collapsed to coarse storage types, so
+  `SHOW COLUMNS` reported `BIGINT` where MySQL reports `tinyint(1)` — the
+  declaration every ORM reads to decide a column is boolean. Type names,
+  widths, character lengths, precision and scale are now kept in a
+  catalog-compatible sidecar and reported through `SHOW COLUMNS`,
+  `SHOW CREATE TABLE` and `information_schema.COLUMNS`, and carried through
+  `LIKE`, CTAS, `ALTER`, rename and drop. **`CHAR`/`VARCHAR` limits are now
+  enforced** in strict mode.
+- **`information_schema` constraint tables are complete.**
+  `TABLE_CONSTRAINTS` and `CHECK_CONSTRAINTS` did not exist — and a missing
+  virtual table raises 1064, which reads as *your SQL is wrong* rather than
+  *this server lacks the table*, so Rails schema dumping, Django introspection
+  and Adminer stopped on valid queries. `REFERENTIAL_CONSTRAINTS` is complete,
+  and `COLUMNS.PRIVILEGES` and `ROUTINES.DTD_IDENTIFIER` are populated.
+- **Result columns carry real metadata.** Every column arrived as
+  `VAR_STRING`, length 1024, with no flags. Native `DATE`, `DATETIME`, `TIME`,
+  `NEWDECIMAL` and `JSON` types are reported now, along with `NOT_NULL`,
+  `PRI_KEY`, `UNIQUE_KEY`, `AUTO_INCREMENT` and `UNSIGNED` flags, per-column
+  lengths and decimal scales — so a typed client stops hydrating dates and
+  decimals as strings. Composite-index members are no longer marked
+  individually unique.
+
+### Changed
+
+- **Nested-loop joins over a simple cross-relation comparison take a fast
+  path**, skipping the row clone and the general predicate evaluator for pairs
+  the condition rejects. The wire suite drops from **73s to 22s in debug**
+  builds (release is unchanged — the optimiser already handled it), which is
+  where CI and contributors spend their time. Anything the shape detector does
+  not recognise falls through to the unchanged evaluator.
+- **63 transitive dependencies removed** by moving `mysql_common` 0.32 → 0.37,
+  including `bindgen`, `clang-sys`, `cmake` and `zstd-sys` — so the build no
+  longer needs a C toolchain for crates we never used.
+- All CI workflows are on `actions/checkout@v7` (Node 24).
 
 ## [1.9.1] - 2026-08-02
 
