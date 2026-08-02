@@ -11,7 +11,7 @@ elyra-core.workspace = true
 elyra-storage.workspace = true
 elyra-vector.workspace = true
 elyra-olap.workspace = true
-sqlparser.workspace = true
+sqlparser = { workspace = true, features = ["visitor"] }
 regex.workspace = true
 # Snowball stemmers (English + many other languages) for full-text search.
 rust-stemmers = "1.2"

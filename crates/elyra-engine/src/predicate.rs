@@ -2934,12 +2934,15 @@ fn cmp(l: &Value, r: &Value, coll: Collation) -> Result<Option<std::cmp::Orderin
 /// Collation of a bare/qualified column reference, if it is one.
 fn expr_collation(e: &Expr, schema: &Schema) -> Option<Collation> {
     let index = match e {
-        Expr::Identifier(id) => resolve_index_parts(std::slice::from_ref(id), schema),
+        Expr::Identifier(identifier) => {
+            resolve_index_parts(std::slice::from_ref(identifier), schema)
+        }
         Expr::CompoundIdentifier(parts) => resolve_index_parts(parts, schema),
         Expr::Nested(inner) => return expr_collation(inner, schema),
         _ => return None,
-    };
-    index.ok().map(|index| schema.columns[index].collation)
+    }
+    .ok()?;
+    schema.columns.get(index).map(|column| column.collation)
 }
 
 /// The comparison collation for two operands: case-sensitive if either is a
