@@ -39,6 +39,17 @@ impl TestServer {
         .await
     }
 
+    /// Start a server with several accounts at different privilege tiers.
+    pub async fn start_with_tiers(users: &[(&str, &str, elyra_core::Privilege)]) -> TestServer {
+        Self::start_inner(Some(
+            users
+                .iter()
+                .map(|(u, p, tier)| (u.to_string(), p.to_string(), *tier))
+                .collect(),
+        ))
+        .await
+    }
+
     async fn start_inner(
         users: Option<Vec<(String, String, elyra_core::Privilege)>>,
     ) -> TestServer {

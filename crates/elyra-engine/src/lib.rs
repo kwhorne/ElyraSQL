@@ -2675,7 +2675,15 @@ fn require_privilege(granted: Privilege, action: PrivilegedAction) -> Result<()>
 
 fn required_privilege(stmt: &Statement) -> Privilege {
     match stmt {
-        Statement::Query(_) | Statement::SetVariable { .. } | Statement::Use(_) => Privilege::Read,
+        // Session-scoped statements need no privilege in MySQL, and clients send
+        // them before the caller gets a say: PyMySQL issues `SET NAMES` from
+        // `connect()`, so classifying it as ADMIN locked every non-admin user
+        // out of the server entirely rather than merely refusing the statement.
+        Statement::Query(_)
+        | Statement::SetVariable { .. }
+        | Statement::SetNames { .. }
+        | Statement::SetNamesDefault {}
+        | Statement::Use(_) => Privilege::Read,
         Statement::Insert(_) | Statement::Update { .. } | Statement::Delete(_) => Privilege::Write,
         Statement::StartTransaction { .. }
         | Statement::Commit { .. }
