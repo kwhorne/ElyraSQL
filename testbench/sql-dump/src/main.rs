@@ -2239,7 +2239,7 @@ tables:
         let generated = generate_dump(&args, &artifacts).unwrap();
         let sql = fs::read_to_string(generated.sql_path).unwrap();
 
-        assert!(sql.contains("`description` TEXT NOT NULL"));
+        assert!(sql.contains("`description` VARCHAR(255) NOT NULL"));
     }
 
     #[test]

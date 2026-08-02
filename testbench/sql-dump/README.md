@@ -140,8 +140,11 @@ All checked-in YAML configurations live directly in `fixtures/`:
   junctions, self-references, uniqueness, JSON, and temporal planners.
 - `03_commerce_graph.yaml` covers money, orders, line items, inventory,
   payments, binary payloads, enums, and relationships.
-- `banking_ledger.yaml`, `car_dealership.yaml`, `cms_kitchensink.yaml`,
-  `everything.yaml`, and `odoo_erp.yaml` provide broader schema shapes.
+- `banking_ledger.yaml`, `car_dealership.yaml`, `cms_kitchensink.yaml`, and
+  `everything.yaml` provide broader schema shapes.
+- `odoo_erp.yaml` is the large-schema breadth fixture: an ERP-shaped graph with
+  315 tables, 3,569 columns, and 1,376 relationships, including 28
+  self-references and multiple foreign-key cycles.
 
 These are static local stress configurations. They have no synchronization or
 refresh workflow.

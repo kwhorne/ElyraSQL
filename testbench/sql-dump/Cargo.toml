@@ -19,6 +19,6 @@ mysql_async = { version = "0.37", default-features = false, features = ["minimal
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
-sql-splitter = { git = "https://github.com/HelgeSverre/sql-splitter", rev = "3949aca8f1ed429434ce998a3ca005486c6f2a04", default-features = false }
+sql-splitter = { version = "=1.18.0", default-features = false }
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "time"] }
