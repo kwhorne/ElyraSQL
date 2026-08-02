@@ -960,6 +960,23 @@ async fn declared_types_survive_catalog_metadata_and_strict_character_limits() {
         }
         other => panic!("expected data-too-long from strict ALTER, got {other:?}"),
     }
+    c.query_drop("CREATE TABLE declared_numeric_width (v INT)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO declared_numeric_width VALUES (123)")
+        .await
+        .unwrap();
+    match c
+        .query_drop("ALTER TABLE declared_numeric_width MODIFY v VARCHAR(2)")
+        .await
+        .unwrap_err()
+    {
+        mysql_async::Error::Server(error) => {
+            assert_eq!(error.code, 1406);
+            assert_eq!(error.state, "22001");
+        }
+        other => panic!("expected data-too-long from coercing strict ALTER, got {other:?}"),
+    }
     for sql in [
         "INSERT INTO declared_widths VALUES (2, 'abcde', 'xy')",
         "INSERT INTO declared_widths VALUES (3, 'abcd', 'xyz')",

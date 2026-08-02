@@ -326,7 +326,10 @@ fn check_declared_character_length(
     if !matches!(declaration.data_type.as_str(), "char" | "varchar") {
         return Ok(());
     }
-    let (Some(maximum), Value::Text(value)) = (declaration.character_maximum_length, value) else {
+    let Some(maximum) = declaration.character_maximum_length else {
+        return Ok(());
+    };
+    let Some(value) = value.to_wire_string() else {
         return Ok(());
     };
     let too_long = usize::try_from(maximum).map_or(true, |maximum| value.chars().count() > maximum);
