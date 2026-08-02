@@ -1,0 +1,1142 @@
+# Car dealership listing stress fixture with CMS, blog, and test-drive telemetry.
+#
+# Stress axis: TEMPORAL CAUSALITY CHAINS + GEO TELEMETRY + CMS/BLOG TREES.
+# A used-and-new car dealership runs an online listing site, a small CMS, and a
+# blog, and tracks test drives with a GPS logger.
+#
+# The interesting narrative this fixture models:
+#   a customer submits a test_drive_request for a listing  (requested_at)
+#     -> only SOME requests turn into an actual test_drive  (relation.children,
+#        mean < 1, so many requests have zero drives; a few reschedule to 2-3)
+#     -> a test_drive is scheduled a few DAYS AFTER the request               (`after`)
+#     -> the drive starts around the scheduled time and runs for a while      (`after`)
+#     -> during the drive a GPS logger emits an ordered stream of positions
+#        (relation.children, monotonic sequence, geo.coordinate_pair bounded to
+#         the dealership's operating region)
+#     -> a drive may (or may not) convert into a sale                          (nullable FK)
+#
+# Exercises: `after` temporal-offset chains, relation.children with sub-1 mean,
+# geo.coordinate_pair, monotonic, hierarchy.tree (cms pages / nav / blog
+# categories / threaded comments), file.metadata, relation.junction_pair,
+# commerce.order_family (a sale = the car + add-ons), relation.polymorphic_pair,
+# generated/default columns, pattern (VIN / stock no / plate), lognormal money.
+#
+# Output targets MySQL. defaults.inference: disabled -> every generated column has
+# an explicit owner. Planner argument shapes follow the documented style.
+
+version: 1
+kind: model
+
+source:
+  dialect: mysql
+  fingerprint_policy: ignore
+
+output:
+  dialect: mysql
+  mode: schema_and_data
+  inserts: insert
+  batch_size: 500
+
+seed: 31415926
+
+defaults:
+  inference: disabled
+
+tables:
+
+  # ---- Reference / people -------------------------------------------------
+  dealerships:
+    rows: { kind: fixed, count: 40 }
+    schema:
+      name: dealerships
+      columns:
+        - { name: id, type: bigint, nullable: false, primary_key: true }
+        - { name: name, type: varchar(160), nullable: false }
+        - { name: code, type: varchar(12), nullable: false, unique: true }
+        - { name: address, type: varchar(200), nullable: false }
+        - { name: city, type: varchar(120), nullable: false }
+        - { name: region, type: varchar(120), nullable: true }
+        - { name: postcode, type: varchar(12), nullable: false }
+        - { name: country, type: char(2), nullable: false }
+        - { name: latitude, type: "decimal(10,7)", nullable: false }
+        - { name: longitude, type: "decimal(10,7)", nullable: false }
+        - { name: phone, type: varchar(32), nullable: true }
+        - { name: email, type: varchar(255), nullable: true }
+        - { name: opened_on, type: date, nullable: true }
+    columns:
+      id: { generator: { kind: sequence, start: 1 } }
+      name: { generator: { kind: company.name } }
+      code:
+        generator: { kind: pattern, mask: "DLR-???##" }
+        modifiers: [{ kind: unique, max_attempts: 32, on_exhaustion: error }]
+      address: { generator: { kind: address.line1 } }
+      city: { generator: { kind: address.city } }
+      region:
+        generator: { kind: address.region }
+        modifiers: [{ kind: null_rate, rate: 0.2 }]
+      postcode: { generator: { kind: address.postcode } }
+      country: { generator: { kind: constant, value: NO } }
+      phone:
+        generator: { kind: phone.number }
+        modifiers: [{ kind: null_rate, rate: 0.1 }]
+      email:
+        generator: { kind: internet.email }
+        modifiers: [{ kind: null_rate, rate: 0.1 }]
+      opened_on:
+        generator: { kind: date }
+        modifiers: [{ kind: null_rate, rate: 0.15 }]
+    planners:
+      - kind: geo.coordinate_pair
+        columns: { latitude: latitude, longitude: longitude }
+        bounds: { min_lat: 57.9, max_lat: 71.2, min_lon: 4.5, max_lon: 31.1 }
+        precision: 7
+
+  staff:
+    rows: { kind: fixed, count: 800 }
+    schema:
+      name: staff
+      columns:
+        - { name: id, type: bigint, nullable: false, primary_key: true }
+        - { name: dealership_id, type: bigint, nullable: false }
+        - { name: name, type: varchar(160), nullable: false }
+        - { name: email, type: varchar(255), nullable: false, unique: true }
+        - { name: phone, type: varchar(32), nullable: true }
+        - { name: role, type: varchar(20), nullable: false }
+        - { name: hired_on, type: date, nullable: false }
+        - { name: active, type: boolean, nullable: false }
+    relationships:
+      - name: staff_dealership
+        columns: [dealership_id]
+        references: { table: dealerships, columns: [id] }
+    columns:
+      id: { generator: { kind: sequence, start: 1 } }
+      dealership_id: { generator: { kind: relation.foreign_key, relationship: staff_dealership } }
+      name: { generator: { kind: person.full_name } }
+      email:
+        generator: { kind: internet.email }
+        modifiers: [{ kind: unique, max_attempts: 64, on_exhaustion: error }]
+      phone:
+        generator: { kind: phone.number }
+        modifiers: [{ kind: null_rate, rate: 0.2 }]
+      role:
+        generator:
+          kind: weighted_choice
+          choices:
+            - { value: sales, weight: 0.6 }
+            - { value: manager, weight: 0.12 }
+            - { value: mechanic, weight: 0.2 }
+            - { value: reception, weight: 0.08 }
+      hired_on: { generator: { kind: date } }
+      active: { generator: { kind: boolean, probability: 0.9 } }
+
+  customers:
+    rows: { kind: fixed, count: 120000 }
+    schema:
+      name: customers
+      columns:
+        - { name: id, type: bigint, nullable: false, primary_key: true }
+        - { name: name, type: varchar(160), nullable: false }
+        - { name: email, type: varchar(255), nullable: false }
+        - { name: phone, type: varchar(32), nullable: true }
+        - { name: city, type: varchar(120), nullable: true }
+        - { name: postcode, type: varchar(12), nullable: true }
+        - { name: country, type: char(2), nullable: false }
+        - { name: source, type: varchar(16), nullable: false }
+        - { name: created_at, type: datetime, nullable: false }
+    columns:
+      id: { generator: { kind: sequence, start: 1 } }
+      name: { generator: { kind: person.full_name } }
+      email: { generator: { kind: internet.email } }
+      phone:
+        generator: { kind: phone.number }
+        modifiers: [{ kind: null_rate, rate: 0.25 }]
+      city:
+        generator: { kind: address.city }
+        modifiers: [{ kind: null_rate, rate: 0.15 }]
+      postcode:
+        generator: { kind: address.postcode }
+        modifiers: [{ kind: null_rate, rate: 0.15 }]
+      country: { generator: { kind: constant, value: NO } }
+      source:
+        generator:
+          kind: weighted_choice
+          choices:
+            - { value: web, weight: 0.55 }
+            - { value: walk_in, weight: 0.2 }
+            - { value: referral, weight: 0.15 }
+            - { value: phone, weight: 0.1 }
+      created_at: { generator: { kind: datetime } }
+
+  vehicle_makes:
+    rows: { kind: fixed, count: 60 }
+    schema:
+      name: vehicle_makes
+      columns:
+        - { name: id, type: bigint, nullable: false, primary_key: true }
+        - { name: name, type: varchar(60), nullable: false, unique: true }
+        - { name: country, type: char(2), nullable: true }
+    columns:
+      id: { generator: { kind: sequence, start: 1 } }
+      name:
+        generator: { kind: choice, values: [Toyota, Volkswagen, Tesla, BMW, Volvo, Audi, Ford, Kia, Hyundai, Peugeot, Skoda, Nissan, Mercedes, Mazda, Polestar] }
+        modifiers: [{ kind: unique, max_attempts: 32, on_exhaustion: widen }]
+      country:
+        generator: { kind: choice, values: [NO, SE, DK, DE, US, JP, KR, FR, CZ] }
+        modifiers: [{ kind: null_rate, rate: 0.2 }]
+
+  vehicle_models:
+    rows: { kind: fixed, count: 900 }
+    schema:
+      name: vehicle_models
+      columns:
+        - { name: id, type: bigint, nullable: false, primary_key: true }
+        - { name: make_id, type: bigint, nullable: false }
+        - { name: name, type: varchar(80), nullable: false }
+        - { name: body_type, type: varchar(20), nullable: false }
+        - { name: segment, type: varchar(20), nullable: true }
+    relationships:
+      - name: model_make
+        columns: [make_id]
+        references: { table: vehicle_makes, columns: [id] }
+    columns:
+      id: { generator: { kind: sequence, start: 1 } }
+      make_id: { generator: { kind: relation.foreign_key, relationship: model_make } }
+      name: { generator: { kind: text.word } }
+      body_type:
+        generator:
+          kind: weighted_choice
+          choices:
+            - { value: hatchback, weight: 0.3 }
+            - { value: suv, weight: 0.3 }
+            - { value: sedan, weight: 0.15 }
+            - { value: estate, weight: 0.15 }
+            - { value: coupe, weight: 0.1 }
+      segment:
+        generator: { kind: choice, values: [A, B, C, D, E, luxury] }
+        modifiers: [{ kind: null_rate, rate: 0.3 }]
+
+  options_catalog:
+    rows: { kind: fixed, count: 120 }
+    schema:
+      name: options_catalog
+      columns:
+        - { name: id, type: bigint, nullable: false, primary_key: true }
+        - { name: name, type: varchar(80), nullable: false, unique: true }
+        - { name: category, type: varchar(16), nullable: false }
+    columns:
+      id: { generator: { kind: sequence, start: 1 } }
+      name:
+        generator: { kind: text.word }
+        modifiers: [{ kind: unique, max_attempts: 32, on_exhaustion: widen }]
+      category:
+        generator: { kind: choice, values: [comfort, safety, tech, exterior, drivetrain] }
+
+  # ---- Listings -----------------------------------------------------------
+  listings:
+    rows: { kind: fixed, count: 200000 }
+    schema:
+      name: listings
+      columns:
+        - { name: id, type: bigint, nullable: false, primary_key: true }
+        - { name: dealership_id, type: bigint, nullable: false }
+        - { name: make_id, type: bigint, nullable: false }
+        - { name: model_id, type: bigint, nullable: false }
+        - { name: stock_number, type: varchar(16), nullable: false, unique: true }
+        - { name: vin, type: char(17), nullable: false, unique: true }
+        - { name: title, type: varchar(200), nullable: false }
+        - { name: slug, type: varchar(220), nullable: false }
+        - { name: year, type: smallint, nullable: false }
+        - { name: price, type: "decimal(12,2)", nullable: false }
+        - { name: mileage_km, type: integer, nullable: false }
+        - { name: fuel, type: varchar(12), nullable: false }
+        - { name: transmission, type: varchar(12), nullable: false }
+        - { name: drivetrain, type: varchar(8), nullable: false }
+        - { name: color, type: varchar(24), nullable: false }
+        - { name: condition, type: varchar(8), nullable: false }
+        - { name: status, type: varchar(12), nullable: false }
+        - { name: description, type: text, nullable: true }
+        - { name: listed_at, type: datetime, nullable: false }
+        - { name: updated_at, type: datetime, nullable: false }
+        - { name: sold_at, type: datetime, nullable: true }
+    relationships:
+      - name: listing_dealership
+        columns: [dealership_id]
+        references: { table: dealerships, columns: [id] }
+      - name: listing_make
+        columns: [make_id]
+        references: { table: vehicle_makes, columns: [id] }
+      - name: listing_model
+        columns: [model_id]
+        references: { table: vehicle_models, columns: [id] }
+    columns:
+      id: { generator: { kind: sequence, start: 1 } }
+      dealership_id: { generator: { kind: relation.foreign_key, relationship: listing_dealership } }
+      make_id: { generator: { kind: relation.foreign_key, relationship: listing_make } }
+      model_id: { generator: { kind: relation.foreign_key, relationship: listing_model } }
+      stock_number:
+        generator: { kind: pattern, mask: "ST######??" }
+        modifiers: [{ kind: unique, max_attempts: 32, on_exhaustion: error }]
+      vin:
+        generator: { kind: pattern, mask: "*****************" }
+        modifiers: [{ kind: unique, max_attempts: 32, on_exhaustion: error }]
+      title: { generator: { kind: text.sentence } }
+      slug:
+        generator:
+          kind: template
+          parts:
+            - { field: stock_number }
+            - "-"
+            - { field: title }
+      year: { generator: { kind: integer, min: 2005, max: 2026 } }
+      price:
+        generator: { kind: lognormal, mu: 12.77, sigma: 0.5, min: 25000, max: 1500000, scale: 2 }
+        modifiers: [{ kind: clamp, min: 25000, max: 1500000 }]
+      mileage_km:
+        generator: { kind: lognormal, mu: 11.29, sigma: 0.8, min: 0, max: 400000 }
+      fuel:
+        generator:
+          kind: weighted_choice
+          choices:
+            - { value: electric, weight: 0.4 }
+            - { value: petrol, weight: 0.25 }
+            - { value: diesel, weight: 0.2 }
+            - { value: hybrid, weight: 0.15 }
+      transmission:
+        generator:
+          kind: weighted_choice
+          choices:
+            - { value: automatic, weight: 0.75 }
+            - { value: manual, weight: 0.25 }
+      drivetrain: { generator: { kind: choice, values: [fwd, rwd, awd] } }
+      color: { generator: { kind: choice, values: [black, white, grey, silver, blue, red, green] } }
+      condition:
+        generator:
+          kind: weighted_choice
+          choices:
+            - { value: used, weight: 0.7 }
+            - { value: new, weight: 0.2 }
+            - { value: demo, weight: 0.1 }
+      status:
+        generator:
+          kind: weighted_choice
+          choices:
+            - { value: available, weight: 0.6 }
+            - { value: reserved, weight: 0.12 }
+            - { value: sold, weight: 0.23 }
+            - { value: withdrawn, weight: 0.05 }
+      description:
+        generator: { kind: text.paragraph }
+        modifiers: [{ kind: null_rate, rate: 0.1 }]
+    planners:
+      - kind: temporal.timestamps
+        columns: { created_at: listed_at, updated_at: updated_at }
+        created: { min: 2021-01-01T00:00:00Z, max: 2026-01-01T00:00:00Z }
+      - kind: temporal.soft_delete
+        columns: { deleted_at: sold_at }
+        deletion_probability: 0.23
+        deleted_range: { min: 2021-01-01T00:00:00Z, max: 2026-01-01T00:00:00Z }
+
+  listing_images:
+    rows:
+      kind: relation.children
+      parent: listings
+      count: 1600000
+      distribution: { kind: histogram, mean: 8, min: 0, max: 40 }
+    schema:
+      name: listing_images
+      columns:
+        - { name: id, type: bigint, nullable: false, primary_key: true }
+        - { name: listing_id, type: bigint, nullable: false }
+        - { name: file_name, type: varchar(255), nullable: false }
+        - { name: extension, type: varchar(8), nullable: false }
+        - { name: mime_type, type: varchar(80), nullable: false }
+        - { name: size_bytes, type: bigint, nullable: false }
+        - { name: checksum, type: char(64), nullable: false }
+        - { name: sort_order, type: integer, nullable: false }
+        - { name: is_primary, type: boolean, nullable: false }
+    relationships:
+      - name: image_listing
+        columns: [listing_id]
+        references: { table: listings, columns: [id] }
+    columns:
+      id: { generator: { kind: sequence, start: 1 } }
+      listing_id: { generator: { kind: relation.foreign_key, relationship: image_listing } }
+      sort_order: { generator: { kind: integer, min: 0, max: 40 } }
+      is_primary: { generator: { kind: boolean, probability: 0.12 } }
+    planners:
+      - kind: file.metadata
+        columns:
+          name: file_name
+          extension: extension
+          mime_type: mime_type
+          size: size_bytes
+          hash: checksum
+        size: { kind: lognormal, min: 40960, max: 8388608 }
+        extensions: [jpg, jpeg, png, webp]
+
+  listing_options:
+    # Junction: listings <-> options_catalog.
+    rows:
+      kind: relation.children
+      parent: listings
+      count: 2000000
+      distribution: { kind: histogram, mean: 10, min: 0, max: 40 }
+    schema:
+      name: listing_options
+      columns:
+        - { name: listing_id, type: bigint, nullable: false, primary_key: true }
+        - { name: option_id, type: bigint, nullable: false, primary_key: true }
+    relationships:
+      - name: lo_listing
+        columns: [listing_id]
+        references: { table: listings, columns: [id] }
+      - name: lo_option
+        columns: [option_id]
+        references: { table: options_catalog, columns: [id] }
+    planners:
+      - kind: relation.junction_pair
+        columns: { left: listing_id, right: option_id }
+        left_relationship: lo_listing
+        right_relationship: lo_option
+
+  price_history:
+    # Price adjustments over the life of a listing (prices typically drift down).
+    rows:
+      kind: relation.children
+      parent: listings
+      count: 600000
+      distribution: { kind: poisson, mean: 3, min: 0, max: 40 }
+    schema:
+      name: price_history
+      columns:
+        - { name: id, type: bigint, nullable: false, primary_key: true }
+        - { name: listing_id, type: bigint, nullable: false }
+        - { name: price, type: "decimal(12,2)", nullable: false }
+        - { name: reason, type: varchar(24), nullable: true }
+        - { name: changed_at, type: datetime, nullable: false }
+    relationships:
+      - name: ph_listing
+        columns: [listing_id]
+        references: { table: listings, columns: [id] }
+    columns:
+      id: { generator: { kind: sequence, start: 1 } }
+      listing_id: { generator: { kind: relation.foreign_key, relationship: ph_listing } }
+      price:
+        generator: { kind: lognormal, mu: 12.77, sigma: 0.5, min: 25000, max: 1500000, scale: 2 }
+      reason:
+        generator:
+          kind: weighted_choice
+          choices:
+            - { value: markdown, weight: 0.6 }
+            - { value: correction, weight: 0.2 }
+            - { value: campaign, weight: 0.2 }
+        modifiers: [{ kind: null_rate, rate: 0.1 }]
+      changed_at: { generator: { kind: datetime } }
+
+  # ---- Test drives: request -> (maybe) drive -> GPS log -------------------
+  test_drive_requests:
+    rows: { kind: fixed, count: 300000 }
+    schema:
+      name: test_drive_requests
+      columns:
+        - { name: id, type: bigint, nullable: false, primary_key: true }
+        - { name: listing_id, type: bigint, nullable: false }
+        - { name: customer_id, type: bigint, nullable: false }
+        - { name: dealership_id, type: bigint, nullable: false }
+        - { name: sales_rep_id, type: bigint, nullable: true }
+        - { name: channel, type: varchar(12), nullable: false }
+        - { name: requested_at, type: datetime, nullable: false }
+        - { name: preferred_at, type: datetime, nullable: true }
+        - { name: status, type: varchar(16), nullable: false }
+        - { name: license_verified, type: boolean, nullable: false }
+        - { name: notes, type: text, nullable: true }
+    relationships:
+      - name: tdr_listing
+        columns: [listing_id]
+        references: { table: listings, columns: [id] }
+      - name: tdr_customer
+        columns: [customer_id]
+        references: { table: customers, columns: [id] }
+      - name: tdr_dealership
+        columns: [dealership_id]
+        references: { table: dealerships, columns: [id] }
+      - name: tdr_rep
+        columns: [sales_rep_id]
+        references: { table: staff, columns: [id] }
+    columns:
+      id: { generator: { kind: sequence, start: 1 } }
+      listing_id: { generator: { kind: relation.foreign_key, relationship: tdr_listing } }
+      customer_id: { generator: { kind: relation.foreign_key, relationship: tdr_customer } }
+      dealership_id: { generator: { kind: relation.foreign_key, relationship: tdr_dealership } }
+      sales_rep_id:
+        generator: { kind: relation.foreign_key, relationship: tdr_rep, null_rate: 0.2 }
+      channel:
+        generator:
+          kind: weighted_choice
+          choices:
+            - { value: web, weight: 0.65 }
+            - { value: phone, weight: 0.2 }
+            - { value: walk_in, weight: 0.15 }
+      requested_at: { generator: { kind: datetime } }
+      # A preferred slot the customer asks for: 0-14 days after the request.
+      preferred_at:
+        generator: { kind: after, source: requested_at, min_seconds: 0, max_seconds: 1209600 }
+        modifiers: [{ kind: null_rate, rate: 0.3 }]
+      status:
+        generator:
+          kind: weighted_choice
+          choices:
+            - { value: pending, weight: 0.18 }
+            - { value: scheduled, weight: 0.22 }
+            - { value: completed, weight: 0.35 }
+            - { value: cancelled, weight: 0.15 }
+            - { value: no_show, weight: 0.10 }
+      license_verified: { generator: { kind: boolean, probability: 0.7 } }
+      notes:
+        generator: { kind: text.sentence }
+        modifiers: [{ kind: null_rate, rate: 0.6 }]
+
+  test_drives:
+    # Only SOME requests become an actual drive (mean < 1), and a few requests get
+    # rescheduled into 2-3 drives. `requested_at` is carried onto the drive so the
+    # schedule can be expressed as an exact offset after the originating request.
+    rows:
+      kind: relation.children
+      parent: test_drive_requests
+      count: 180000
+      distribution: { kind: poisson, mean: 0.6, min: 0, max: 3 }
+    schema:
+      name: test_drives
+      columns:
+        - { name: id, type: bigint, nullable: false, primary_key: true }
+        - { name: request_id, type: bigint, nullable: false }
+        - { name: listing_id, type: bigint, nullable: false }
+        - { name: customer_id, type: bigint, nullable: false }
+        - { name: sales_rep_id, type: bigint, nullable: false }
+        - { name: requested_at, type: datetime, nullable: false }
+        - { name: scheduled_at, type: datetime, nullable: false }
+        - { name: started_at, type: datetime, nullable: false }
+        - { name: ended_at, type: datetime, nullable: false }
+        - { name: duration_minutes, type: integer, nullable: false }
+        - { name: distance_km, type: "decimal(8,2)", nullable: false }
+        - { name: odometer_start, type: integer, nullable: false }
+        - { name: odometer_end, type: integer, nullable: false }
+        - { name: outcome, type: varchar(16), nullable: false }
+        - { name: weather, type: varchar(16), nullable: true }
+    relationships:
+      - name: td_request
+        columns: [request_id]
+        references: { table: test_drive_requests, columns: [id] }
+      - name: td_listing
+        columns: [listing_id]
+        references: { table: listings, columns: [id] }
+      - name: td_customer
+        columns: [customer_id]
+        references: { table: customers, columns: [id] }
+      - name: td_rep
+        columns: [sales_rep_id]
+        references: { table: staff, columns: [id] }
+    columns:
+      id: { generator: { kind: sequence, start: 1 } }
+      request_id: { generator: { kind: relation.foreign_key, relationship: td_request } }
+      listing_id: { generator: { kind: relation.foreign_key, relationship: td_listing } }
+      customer_id: { generator: { kind: relation.foreign_key, relationship: td_customer } }
+      sales_rep_id: { generator: { kind: relation.foreign_key, relationship: td_rep } }
+      requested_at: { generator: { kind: datetime } }
+      # Scheduled 1-21 days AFTER the request.
+      scheduled_at: { generator: { kind: after, source: requested_at, min_seconds: 86400, max_seconds: 1814400 } }
+      # The drive starts within a few hours of the scheduled slot ...
+      started_at: { generator: { kind: after, source: scheduled_at, min_seconds: 0, max_seconds: 14400 } }
+      # ... and ends 10-75 minutes later.
+      ended_at: { generator: { kind: after, source: started_at, min_seconds: 600, max_seconds: 4500 } }
+      duration_minutes: { generator: { kind: integer, min: 10, max: 75 } }
+      distance_km:
+        generator: { kind: lognormal, mu: 2.89, sigma: 0.5, min: 1.0, max: 80.0, scale: 2 }
+      odometer_start: { generator: { kind: integer, min: 0, max: 400000 } }
+      odometer_end: { generator: { kind: integer, min: 0, max: 400100 } }
+      outcome:
+        generator:
+          kind: weighted_choice
+          choices:
+            - { value: interested, weight: 0.4 }
+            - { value: not_interested, weight: 0.3 }
+            - { value: follow_up, weight: 0.2 }
+            - { value: purchased, weight: 0.1 }
+      weather:
+        generator: { kind: choice, values: [clear, cloudy, rain, snow, fog] }
+        modifiers: [{ kind: null_rate, rate: 0.2 }]
+
+  test_drive_gps_logs:
+    # A GPS logger emits an ordered stream of positions during each drive. Points
+    # cluster around the dealership's region; sequence_no orders them monotonically.
+    rows:
+      kind: relation.children
+      parent: test_drives
+      count: 20000000
+      distribution: { kind: poisson, mean: 180, min: 0, max: 3000 }
+    schema:
+      name: test_drive_gps_logs
+      columns:
+        - { name: id, type: bigint, nullable: false, primary_key: true }
+        - { name: test_drive_id, type: bigint, nullable: false }
+        - { name: sequence_no, type: bigint, nullable: false }
+        - { name: recorded_at, type: datetime, nullable: false }
+        - { name: latitude, type: "decimal(10,7)", nullable: false }
+        - { name: longitude, type: "decimal(10,7)", nullable: false }
+        - { name: speed_kmh, type: "decimal(6,2)", nullable: false }
+        - { name: heading_deg, type: smallint, nullable: false }
+        - { name: altitude_m, type: "decimal(7,2)", nullable: true }
+        - { name: accuracy_m, type: "decimal(6,2)", nullable: false }
+        - { name: satellites, type: smallint, nullable: true }
+    relationships:
+      - name: gps_drive
+        columns: [test_drive_id]
+        references: { table: test_drives, columns: [id] }
+    columns:
+      id: { generator: { kind: sequence, start: 1 } }
+      test_drive_id: { generator: { kind: relation.foreign_key, relationship: gps_drive } }
+      sequence_no: { generator: { kind: monotonic, start: 1, step: 1 } }
+      recorded_at: { generator: { kind: datetime } }
+      speed_kmh:
+        generator: { kind: lognormal, mu: 3.8, sigma: 0.5, min: 0.0, max: 130.0, scale: 2 }
+        modifiers: [{ kind: clamp, min: 0.0, max: 130.0 }]
+      heading_deg: { generator: { kind: integer, min: 0, max: 359 } }
+      altitude_m:
+        generator: { kind: normal, mean: 60.0, std: 80.0, min: -5.0, max: 1800.0, scale: 2 }
+        modifiers: [{ kind: null_rate, rate: 0.1 }]
+      accuracy_m: { generator: { kind: lognormal, mu: 2.08, sigma: 0.5, min: 1.0, max: 50.0, scale: 2 } }
+      satellites:
+        generator: { kind: integer, min: 3, max: 22 }
+        modifiers: [{ kind: null_rate, rate: 0.15 }]
+    planners:
+      - kind: geo.coordinate_pair
+        columns: { latitude: latitude, longitude: longitude }
+        # Tight box around one metro area so a route reads as a coherent drive.
+        bounds: { min_lat: 59.80, max_lat: 60.05, min_lon: 10.55, max_lon: 10.95 }
+        precision: 7
+
+  # ---- Sales (car + add-ons as an exact-money order family) ---------------
+  sales:
+    rows: { kind: fixed, count: 60000 }
+    schema:
+      name: sales
+      columns:
+        - { name: id, type: bigint, nullable: false, primary_key: true }
+        - { name: listing_id, type: bigint, nullable: false }
+        - { name: customer_id, type: bigint, nullable: false }
+        - { name: sales_rep_id, type: bigint, nullable: false }
+        - { name: dealership_id, type: bigint, nullable: false }
+        - { name: test_drive_id, type: bigint, nullable: true }
+        - { name: reference, type: varchar(20), nullable: false, unique: true }
+        - { name: currency, type: char(3), nullable: false }
+        - { name: subtotal, type: "decimal(14,2)", nullable: false }
+        - { name: tax_total, type: "decimal(14,2)", nullable: false }
+        - { name: grand_total, type: "decimal(14,2)", nullable: false }
+        - { name: deposit, type: "decimal(12,2)", nullable: false }
+        - { name: payment_method, type: varchar(16), nullable: false }
+        - { name: financed, type: boolean, nullable: false }
+        - { name: closed_at, type: datetime, nullable: false }
+    relationships:
+      - name: sale_listing
+        columns: [listing_id]
+        references: { table: listings, columns: [id] }
+      - name: sale_customer
+        columns: [customer_id]
+        references: { table: customers, columns: [id] }
+      - name: sale_rep
+        columns: [sales_rep_id]
+        references: { table: staff, columns: [id] }
+      - name: sale_dealership
+        columns: [dealership_id]
+        references: { table: dealerships, columns: [id] }
+      # Not every sale came from a test drive (nullable).
+      - name: sale_test_drive
+        columns: [test_drive_id]
+        references: { table: test_drives, columns: [id] }
+    columns:
+      id: { generator: { kind: sequence, start: 1 } }
+      listing_id: { generator: { kind: relation.foreign_key, relationship: sale_listing } }
+      customer_id: { generator: { kind: relation.foreign_key, relationship: sale_customer } }
+      sales_rep_id: { generator: { kind: relation.foreign_key, relationship: sale_rep } }
+      dealership_id: { generator: { kind: relation.foreign_key, relationship: sale_dealership } }
+      test_drive_id:
+        generator: { kind: relation.foreign_key, relationship: sale_test_drive, null_rate: 0.45 }
+      reference:
+        generator: { kind: pattern, mask: "SALE-####-######" }
+        modifiers: [{ kind: unique, max_attempts: 32, on_exhaustion: error }]
+      currency: { generator: { kind: constant, value: NOK } }
+      deposit:
+        generator: { kind: lognormal, mu: 10.3, sigma: 0.6, min: 0, max: 100000, scale: 2 }
+      payment_method:
+        generator:
+          kind: weighted_choice
+          choices:
+            - { value: loan, weight: 0.5 }
+            - { value: cash, weight: 0.25 }
+            - { value: lease, weight: 0.15 }
+            - { value: card, weight: 0.1 }
+      financed: { generator: { kind: boolean, probability: 0.6 } }
+      closed_at: { generator: { kind: datetime } }
+      # subtotal / tax_total / grand_total owned by commerce.order_family.
+    planners:
+      - kind: commerce.order_family
+        children: sale_line_items
+        relationship: sli_sale
+        columns: { subtotal: subtotal, tax: tax_total, total: grand_total }
+        child_columns: { quantity: quantity, unit_price: unit_price, tax: tax_amount, line_total: line_total }
+        currency_scale: 2
+        rounding: largest_remainder
+        tax: { kind: weighted_choice, rates: [0.0, 0.25], weights: [0.15, 0.85] }
+
+  sale_line_items:
+    # The car itself plus optional add-ons (warranty, mats, service plan, ...).
+    # commerce.order_family draws the per-order line count from this distribution
+    # and --verify enforces an EXACT row count, so the line count must be
+    # deterministic: `kind: fixed` emits round(mean) lines per sale (car + 2
+    # add-ons) rather than a stochastic per-order draw.
+    rows:
+      kind: relation.children
+      parent: sales
+      count: 180000
+      distribution: { kind: fixed, mean: 3, min: 1, max: 12 }
+    schema:
+      name: sale_line_items
+      columns:
+        - { name: id, type: bigint, nullable: false, primary_key: true }
+        - { name: sale_id, type: bigint, nullable: false }
+        - { name: item_type, type: varchar(16), nullable: false }
+        - { name: description, type: varchar(200), nullable: false }
+        - { name: quantity, type: integer, nullable: false }
+        - { name: unit_price, type: "decimal(14,2)", nullable: false }
+        - { name: tax_amount, type: "decimal(14,2)", nullable: false }
+        - { name: line_total, type: "decimal(14,2)", nullable: false }
+    relationships:
+      - name: sli_sale
+        columns: [sale_id]
+        references: { table: sales, columns: [id] }
+    columns:
+      id: { generator: { kind: sequence, start: 1 } }
+      sale_id: { generator: { kind: relation.foreign_key, relationship: sli_sale } }
+      item_type:
+        generator:
+          kind: weighted_choice
+          choices:
+            - { value: vehicle, weight: 0.4 }
+            - { value: warranty, weight: 0.2 }
+            - { value: accessory, weight: 0.25 }
+            - { value: service_plan, weight: 0.15 }
+      description: { generator: { kind: commerce.product_name } }
+      # quantity / unit_price / tax_amount / line_total owned by order_family.
+
+  customer_favorites:
+    # Junction: customer <-> listing (saved / shortlisted vehicles).
+    rows:
+      kind: relation.children
+      parent: customers
+      count: 400000
+      distribution: { kind: poisson, mean: 3, min: 0, max: 60 }
+    schema:
+      name: customer_favorites
+      columns:
+        - { name: customer_id, type: bigint, nullable: false, primary_key: true }
+        - { name: listing_id, type: bigint, nullable: false, primary_key: true }
+        - { name: saved_at, type: datetime, nullable: false }
+    relationships:
+      - name: fav_customer
+        columns: [customer_id]
+        references: { table: customers, columns: [id] }
+      - name: fav_listing
+        columns: [listing_id]
+        references: { table: listings, columns: [id] }
+    columns:
+      saved_at: { generator: { kind: datetime } }
+    planners:
+      - kind: relation.junction_pair
+        columns: { left: customer_id, right: listing_id }
+        left_relationship: fav_customer
+        right_relationship: fav_listing
+
+  # ---- CMS ----------------------------------------------------------------
+  cms_pages:
+    rows: { kind: fixed, count: 3000 }
+    schema:
+      name: cms_pages
+      columns:
+        - { name: id, type: bigint, nullable: false, primary_key: true }
+        - { name: parent_id, type: bigint, nullable: true }
+        - { name: author_id, type: bigint, nullable: true }
+        - { name: title, type: varchar(200), nullable: false }
+        - { name: slug, type: varchar(220), nullable: false }
+        - { name: template, type: varchar(40), nullable: false }
+        - { name: content, type: text, nullable: true }
+        - { name: status, type: varchar(12), nullable: false }
+        - { name: depth, type: integer, nullable: false }
+        - { name: published_at, type: datetime, nullable: true }
+        - { name: created_at, type: datetime, nullable: false }
+        - { name: updated_at, type: datetime, nullable: false }
+    relationships:
+      - name: page_parent
+        columns: [parent_id]
+        references: { table: cms_pages, columns: [id] }
+      - name: page_author
+        columns: [author_id]
+        references: { table: staff, columns: [id] }
+    columns:
+      id: { generator: { kind: sequence, start: 1 } }
+      author_id:
+        generator: { kind: relation.foreign_key, relationship: page_author, null_rate: 0.2 }
+      title: { generator: { kind: text.sentence } }
+      slug: { generator: { kind: text.slug } }
+      template: { generator: { kind: choice, values: [default, landing, contact, full_width] } }
+      content:
+        generator: { kind: text.paragraph }
+        modifiers: [{ kind: null_rate, rate: 0.1 }]
+      status:
+        generator:
+          kind: weighted_choice
+          choices:
+            - { value: published, weight: 0.7 }
+            - { value: draft, weight: 0.25 }
+            - { value: archived, weight: 0.05 }
+      published_at:
+        generator: { kind: datetime }
+        modifiers: [{ kind: null_rate, rate: 0.3 }]
+      depth: { generator: { kind: integer, min: 0, max: 4 } }
+    planners:
+      - kind: hierarchy.tree
+        relationship: page_parent
+        columns: { parent: parent_id }
+        root_ratio: 0.2
+        max_depth: 4
+        max_branching: 20
+      - kind: temporal.timestamps
+        columns: { created_at: created_at, updated_at: updated_at }
+        created: { min: 2020-01-01T00:00:00Z, max: 2026-01-01T00:00:00Z }
+
+  cms_page_revisions:
+    rows:
+      kind: relation.children
+      parent: cms_pages
+      count: 15000
+      distribution: { kind: poisson, mean: 5, min: 0, max: 80 }
+    schema:
+      name: cms_page_revisions
+      columns:
+        - { name: id, type: bigint, nullable: false, primary_key: true }
+        - { name: page_id, type: bigint, nullable: false }
+        - { name: revision_no, type: integer, nullable: false }
+        - { name: editor_id, type: bigint, nullable: true }
+        - { name: content, type: text, nullable: false }
+        - { name: created_at, type: datetime, nullable: false }
+    relationships:
+      - name: rev_page
+        columns: [page_id]
+        references: { table: cms_pages, columns: [id] }
+      - name: rev_editor
+        columns: [editor_id]
+        references: { table: staff, columns: [id] }
+    columns:
+      id: { generator: { kind: sequence, start: 1 } }
+      page_id: { generator: { kind: relation.foreign_key, relationship: rev_page } }
+      revision_no: { generator: { kind: sequence, start: 1 } }
+      editor_id:
+        generator: { kind: relation.foreign_key, relationship: rev_editor, null_rate: 0.2 }
+      content: { generator: { kind: text.paragraph } }
+      created_at: { generator: { kind: datetime } }
+
+  navigation_menu_items:
+    rows: { kind: fixed, count: 400 }
+    schema:
+      name: navigation_menu_items
+      columns:
+        - { name: id, type: bigint, nullable: false, primary_key: true }
+        - { name: parent_id, type: bigint, nullable: true }
+        - { name: page_id, type: bigint, nullable: true }
+        - { name: label, type: varchar(80), nullable: false }
+        - { name: url, type: varchar(255), nullable: true }
+        - { name: position, type: integer, nullable: false }
+        - { name: depth, type: integer, nullable: false }
+    relationships:
+      - name: nav_parent
+        columns: [parent_id]
+        references: { table: navigation_menu_items, columns: [id] }
+      - name: nav_page
+        columns: [page_id]
+        references: { table: cms_pages, columns: [id] }
+    columns:
+      id: { generator: { kind: sequence, start: 1 } }
+      page_id:
+        generator: { kind: relation.foreign_key, relationship: nav_page, null_rate: 0.3 }
+      label: { generator: { kind: text.word } }
+      url:
+        generator: { kind: internet.url }
+        modifiers: [{ kind: null_rate, rate: 0.5 }]
+      position: { generator: { kind: integer, min: 0, max: 30 } }
+      depth: { generator: { kind: integer, min: 0, max: 3 } }
+    planners:
+      - kind: hierarchy.tree
+        relationship: nav_parent
+        columns: { parent: parent_id }
+        root_ratio: 0.3
+        max_depth: 3
+        max_branching: 12
+
+  media_assets:
+    rows: { kind: fixed, count: 40000 }
+    schema:
+      name: media_assets
+      columns:
+        - { name: id, type: bigint, nullable: false, primary_key: true }
+        - { name: uploaded_by, type: bigint, nullable: true }
+        - { name: file_name, type: varchar(255), nullable: false }
+        - { name: extension, type: varchar(8), nullable: false }
+        - { name: mime_type, type: varchar(80), nullable: false }
+        - { name: size_bytes, type: bigint, nullable: false }
+        - { name: checksum, type: char(64), nullable: false }
+        - { name: width_px, type: integer, nullable: true }
+        - { name: height_px, type: integer, nullable: true }
+        - { name: alt_text, type: varchar(255), nullable: true }
+        - { name: created_at, type: datetime, nullable: false }
+    relationships:
+      - name: media_uploader
+        columns: [uploaded_by]
+        references: { table: staff, columns: [id] }
+    columns:
+      id: { generator: { kind: sequence, start: 1 } }
+      uploaded_by:
+        generator: { kind: relation.foreign_key, relationship: media_uploader, null_rate: 0.15 }
+      width_px:
+        generator: { kind: integer, min: 320, max: 6000 }
+        modifiers: [{ kind: null_rate, rate: 0.2 }]
+      height_px:
+        generator: { kind: integer, min: 240, max: 4000 }
+        modifiers: [{ kind: null_rate, rate: 0.2 }]
+      alt_text:
+        generator: { kind: text.sentence }
+        modifiers: [{ kind: null_rate, rate: 0.4 }]
+      created_at: { generator: { kind: datetime } }
+    planners:
+      - kind: file.metadata
+        columns:
+          name: file_name
+          extension: extension
+          mime_type: mime_type
+          size: size_bytes
+          hash: checksum
+        size: { kind: lognormal, min: 4096, max: 15728640 }
+        extensions: [jpg, png, webp, svg, pdf, mp4]
+
+  # ---- Blog ---------------------------------------------------------------
+  blog_categories:
+    rows: { kind: fixed, count: 60 }
+    schema:
+      name: blog_categories
+      columns:
+        - { name: id, type: bigint, nullable: false, primary_key: true }
+        - { name: parent_id, type: bigint, nullable: true }
+        - { name: name, type: varchar(80), nullable: false }
+        - { name: slug, type: varchar(100), nullable: false, unique: true }
+        - { name: depth, type: integer, nullable: false }
+    relationships:
+      - name: cat_parent
+        columns: [parent_id]
+        references: { table: blog_categories, columns: [id] }
+    columns:
+      id: { generator: { kind: sequence, start: 1 } }
+      name: { generator: { kind: text.word } }
+      slug:
+        generator: { kind: text.slug }
+        modifiers: [{ kind: unique, max_attempts: 16, on_exhaustion: error }]
+      depth: { generator: { kind: integer, min: 0, max: 3 } }
+    planners:
+      - kind: hierarchy.tree
+        relationship: cat_parent
+        columns: { parent: parent_id }
+        root_ratio: 0.4
+        max_depth: 3
+        max_branching: 8
+
+  blog_posts:
+    rows: { kind: fixed, count: 8000 }
+    schema:
+      name: blog_posts
+      columns:
+        - { name: id, type: bigint, nullable: false, primary_key: true }
+        - { name: category_id, type: bigint, nullable: true }
+        - { name: author_id, type: bigint, nullable: false }
+        - { name: title, type: varchar(200), nullable: false }
+        - { name: slug, type: varchar(220), nullable: false }
+        - { name: excerpt, type: varchar(400), nullable: true }
+        - { name: body, type: text, nullable: false }
+        - { name: status, type: varchar(12), nullable: false, default_sql: "'draft'" }
+        - { name: view_count, type: bigint, nullable: false, default_sql: "0" }
+        - { name: reading_minutes, type: integer, nullable: false }
+        - { name: published_at, type: datetime, nullable: true }
+        - { name: created_at, type: datetime, nullable: false }
+        - { name: updated_at, type: datetime, nullable: false }
+    relationships:
+      - name: post_category
+        columns: [category_id]
+        references: { table: blog_categories, columns: [id] }
+      - name: post_author
+        columns: [author_id]
+        references: { table: staff, columns: [id] }
+    columns:
+      id: { generator: { kind: sequence, start: 1 } }
+      category_id:
+        generator: { kind: relation.foreign_key, relationship: post_category, null_rate: 0.15 }
+      author_id: { generator: { kind: relation.foreign_key, relationship: post_author } }
+      title: { generator: { kind: text.sentence } }
+      slug: { generator: { kind: text.slug } }
+      excerpt:
+        generator: { kind: text.sentence }
+        modifiers:
+          - { kind: truncate, max_length: 400 }
+          - { kind: null_rate, rate: 0.2 }
+      body: { generator: { kind: text.paragraph } }
+      status: { generator: { kind: database_default } }
+      view_count: { generator: { kind: database_default } }
+      reading_minutes: { generator: { kind: integer, min: 1, max: 25 } }
+      published_at:
+        generator: { kind: datetime }
+        modifiers: [{ kind: null_rate, rate: 0.3 }]
+    planners:
+      - kind: temporal.timestamps
+        columns: { created_at: created_at, updated_at: updated_at }
+        created: { min: 2019-01-01T00:00:00Z, max: 2026-01-01T00:00:00Z }
+
+  blog_tags:
+    rows: { kind: fixed, count: 300 }
+    schema:
+      name: blog_tags
+      columns:
+        - { name: id, type: bigint, nullable: false, primary_key: true }
+        - { name: name, type: varchar(60), nullable: false, unique: true }
+        - { name: slug, type: varchar(80), nullable: false, unique: true }
+    columns:
+      id: { generator: { kind: sequence, start: 1 } }
+      name:
+        generator: { kind: text.word }
+        modifiers: [{ kind: unique, max_attempts: 32, on_exhaustion: widen }]
+      slug:
+        generator: { kind: text.slug }
+        modifiers: [{ kind: unique, max_attempts: 32, on_exhaustion: error }]
+
+  blog_post_tag:
+    # Junction: blog_posts <-> blog_tags.
+    rows:
+      kind: relation.children
+      parent: blog_posts
+      count: 30000
+      distribution: { kind: histogram, mean: 4, min: 0, max: 15 }
+    schema:
+      name: blog_post_tag
+      columns:
+        - { name: post_id, type: bigint, nullable: false, primary_key: true }
+        - { name: tag_id, type: bigint, nullable: false, primary_key: true }
+    relationships:
+      - name: bpt_post
+        columns: [post_id]
+        references: { table: blog_posts, columns: [id] }
+      - name: bpt_tag
+        columns: [tag_id]
+        references: { table: blog_tags, columns: [id] }
+    planners:
+      - kind: relation.junction_pair
+        columns: { left: post_id, right: tag_id }
+        left_relationship: bpt_post
+        right_relationship: bpt_tag
+
+  blog_comments:
+    # Threaded (self-referential) comments on blog posts.
+    rows: { kind: fixed, count: 80000 }
+    schema:
+      name: blog_comments
+      columns:
+        - { name: id, type: bigint, nullable: false, primary_key: true }
+        - { name: post_id, type: bigint, nullable: false }
+        - { name: parent_id, type: bigint, nullable: true }
+        - { name: author_name, type: varchar(120), nullable: false }
+        - { name: author_email, type: varchar(255), nullable: true }
+        - { name: body, type: text, nullable: false }
+        - { name: status, type: varchar(12), nullable: false }
+        - { name: depth, type: integer, nullable: false }
+        - { name: created_at, type: datetime, nullable: false }
+    relationships:
+      - name: comment_post
+        columns: [post_id]
+        references: { table: blog_posts, columns: [id] }
+      - name: comment_parent
+        columns: [parent_id]
+        references: { table: blog_comments, columns: [id] }
+    columns:
+      id: { generator: { kind: sequence, start: 1 } }
+      post_id: { generator: { kind: relation.foreign_key, relationship: comment_post } }
+      author_name: { generator: { kind: person.full_name } }
+      author_email:
+        generator: { kind: internet.email }
+        modifiers: [{ kind: null_rate, rate: 0.2 }]
+      body: { generator: { kind: text.paragraph } }
+      status:
+        generator:
+          kind: weighted_choice
+          choices:
+            - { value: approved, weight: 0.75 }
+            - { value: pending, weight: 0.15 }
+            - { value: spam, weight: 0.10 }
+      created_at: { generator: { kind: datetime } }
+      depth: { generator: { kind: integer, min: 0, max: 5 } }
+    planners:
+      - kind: hierarchy.tree
+        relationship: comment_parent
+        columns: { parent: parent_id }
+        root_ratio: 0.7
+        max_depth: 5
+        max_branching: 20
+
+  # ---- Audit --------------------------------------------------------------
+  activity_log:
+    # Polymorphic audit trail across listings / customers / test drives / sales.
+    rows: { kind: fixed, count: 2000000 }
+    schema:
+      name: activity_log
+      columns:
+        - { name: id, type: bigint, nullable: false, primary_key: true }
+        - { name: causer_id, type: bigint, nullable: true }
+        - { name: subject_type, type: varchar(24), nullable: false }
+        - { name: subject_id, type: bigint, nullable: false }
+        - { name: event, type: varchar(24), nullable: false }
+        - { name: properties, type: json, nullable: true }
+        - { name: ip_address, type: varchar(45), nullable: true }
+        - { name: created_at, type: datetime, nullable: false }
+    relationships:
+      - name: activity_causer
+        columns: [causer_id]
+        references: { table: staff, columns: [id] }
+    columns:
+      id: { generator: { kind: sequence, start: 1 } }
+      causer_id:
+        generator: { kind: relation.foreign_key, relationship: activity_causer, null_rate: 0.3 }
+      event:
+        generator:
+          kind: weighted_choice
+          choices:
+            - { value: created, weight: 0.4 }
+            - { value: updated, weight: 0.4 }
+            - { value: deleted, weight: 0.1 }
+            - { value: viewed, weight: 0.1 }
+      properties:
+        generator: { kind: json_value }
+        modifiers: [{ kind: null_rate, rate: 0.3 }]
+      ip_address:
+        generator: { kind: internet.ipv4 }
+        modifiers: [{ kind: null_rate, rate: 0.2 }]
+      created_at: { generator: { kind: datetime } }
+    planners:
+      - kind: relation.polymorphic_pair
+        columns: { type: subject_type, id: subject_id }
+        targets:
+          - { type: listing, table: listings, weight: 0.4 }
+          - { type: customer, table: customers, weight: 0.25 }
+          - { type: test_drive, table: test_drives, weight: 0.2 }
+          - { type: sale, table: sales, weight: 0.15 }

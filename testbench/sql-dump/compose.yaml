@@ -1,0 +1,18 @@
+services:
+  mysql:
+    image: mysql:8.4.11
+    environment:
+      MYSQL_ROOT_PASSWORD: stress-secret
+      MYSQL_DATABASE: stress
+    ports:
+      - "127.0.0.1::3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "MYSQL_PWD=stress-secret mysqladmin ping -h 127.0.0.1 --silent"]
+      interval: 1s
+      timeout: 3s
+      retries: 90
+
+volumes:
+  mysql-data:

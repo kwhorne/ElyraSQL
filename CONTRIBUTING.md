@@ -56,6 +56,33 @@ cargo build --workspace
 cargo test --workspace
 ```
 
+The root `justfile` provides the same checks and common local workflows without
+replacing the underlying Cargo commands:
+
+```bash
+just             # list grouped recipes
+just check       # formatting, Clippy, and workspace tests
+just check-all   # also check docs and the isolated testbench
+just run         # build and run the native release binary
+just docker-run  # build and run the local Docker image
+```
+
+`just` is optional; the documented Cargo, shell, and Docker commands remain the
+source of truth.
+
+### SQL dump correctness stress test
+
+`testbench/sql-dump/` contains a manual differential stress tool that generates
+deterministic MySQL dumps and compares imports between MySQL 8.4 and ElyraSQL.
+It is intentionally excluded from the root Cargo workspace and CI because it is
+a local correctness and investigation tool rather than a product feature or a
+stable benchmark.
+
+Run the default schema comparison with `just stress`, a generated-data run with
+`just stress-data`, or its standalone checks with `just stress-check`.
+See [the testbench guide](testbench/sql-dump/README.md) for prerequisites,
+profiles, artifacts, and raw commands that do not require `just`.
+
 ### End-to-end testing
 
 Many features are best validated against a real MySQL client. Start the server

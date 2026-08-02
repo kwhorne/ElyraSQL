@@ -1,0 +1,24 @@
+[package]
+name = "elyra-sql-dump-testbench"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+publish = false
+
+[workspace]
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+elyra-core = { path = "../../crates/elyra-core" }
+elyra-engine = { path = "../../crates/elyra-engine" }
+elyra-server = { path = "../../crates/elyra-server" }
+elyra-storage = { path = "../../crates/elyra-storage" }
+hex = "0.4"
+mysql_async = { version = "0.37", default-features = false, features = ["minimal"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+sql-splitter = { version = "=1.18.0", default-features = false }
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "time"] }
