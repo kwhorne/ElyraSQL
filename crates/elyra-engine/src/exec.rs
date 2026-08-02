@@ -313,7 +313,7 @@ pub async fn create_table(
                 for ident in cols {
                     let i = columns
                         .iter()
-                        .position(|c| c.name.eq_ignore_ascii_case(&ident.value))
+                        .position(|c| predicate::identifier_eq(&c.name, &ident.value))
                         .ok_or_else(|| {
                             Error::Catalog(format!("unknown primary key column: {}", ident.value))
                         })?;
@@ -330,7 +330,7 @@ pub async fn create_table(
                 for ident in cols {
                     let i = columns
                         .iter()
-                        .position(|c| c.name.eq_ignore_ascii_case(&ident.value))
+                        .position(|c| predicate::identifier_eq(&c.name, &ident.value))
                         .ok_or_else(|| {
                             Error::Catalog(format!("unknown unique column: {}", ident.value))
                         })?;
@@ -367,7 +367,7 @@ pub async fn create_table(
                 for ident in cols {
                     let i = columns
                         .iter()
-                        .position(|column| column.name.eq_ignore_ascii_case(&ident.value))
+                        .position(|column| predicate::identifier_eq(&column.name, &ident.value))
                         .ok_or_else(|| {
                             Error::Catalog(format!("unknown index column: {}", ident.value))
                         })?;
@@ -413,7 +413,7 @@ pub async fn create_table(
                 for ident in cols {
                     let i = columns
                         .iter()
-                        .position(|c| c.name.eq_ignore_ascii_case(&ident.value))
+                        .position(|c| predicate::identifier_eq(&c.name, &ident.value))
                         .ok_or_else(|| {
                             Error::Catalog(format!("unknown foreign key column: {}", ident.value))
                         })?;
@@ -1987,7 +1987,7 @@ pub async fn alter_table(
                     .schema
                     .columns
                     .iter()
-                    .position(|c| c.name.eq_ignore_ascii_case(&old_column_name.value))
+                    .position(|c| predicate::identifier_eq(&c.name, &old_column_name.value))
                     .ok_or_else(|| Error::Catalog(format!("unknown column: {old_column_name}")))?;
                 def.schema.columns[i].name = new_column_name.value.clone();
             }
@@ -2047,7 +2047,7 @@ pub async fn alter_table(
                             .schema
                             .columns
                             .iter()
-                            .position(|c| c.name.eq_ignore_ascii_case(&ident.value))
+                            .position(|c| predicate::identifier_eq(&c.name, &ident.value))
                             .ok_or_else(|| {
                                 Error::Catalog(format!(
                                     "unknown foreign key column: {}",
@@ -2219,7 +2219,7 @@ async fn alter_change_column(
         .schema
         .columns
         .iter()
-        .position(|c| c.name.eq_ignore_ascii_case(old))
+        .position(|c| predicate::identifier_eq(&c.name, old))
         .ok_or_else(|| Error::Catalog(format!("unknown column: {old}")))?;
 
     let new_ty = map_type(data_type)?;
@@ -2313,7 +2313,7 @@ async fn alter_column_op(
         .schema
         .columns
         .iter()
-        .position(|c| c.name.eq_ignore_ascii_case(name))
+        .position(|c| predicate::identifier_eq(&c.name, name))
         .ok_or_else(|| Error::Catalog(format!("unknown column: {name}")))?;
     match op {
         AlterColumnOperation::SetDefault { value } => {
@@ -2521,7 +2521,7 @@ async fn alter_drop_column(db: &Session, def: &mut TableDef, name: &str) -> Resu
         .schema
         .columns
         .iter()
-        .position(|c| c.name.eq_ignore_ascii_case(name))
+        .position(|c| predicate::identifier_eq(&c.name, name))
         .ok_or_else(|| Error::Catalog(format!("unknown column: {name}")))?;
     if def.pk_cols.contains(&idx) {
         return Err(Error::Unsupported(
@@ -2732,7 +2732,7 @@ pub async fn create_fulltext_index(
             def.schema
                 .columns
                 .iter()
-                .position(|d| d.name.eq_ignore_ascii_case(c))
+                .position(|d| predicate::identifier_eq(&d.name, c))
                 .ok_or_else(|| Error::Catalog(format!("unknown column: {c}")))
         })
         .collect::<Result<_>>()?;
@@ -2797,7 +2797,7 @@ pub async fn create_index(db: &Session, ci: CreateIndex) -> Result<QueryResult> 
             .schema
             .columns
             .iter()
-            .position(|c| c.name.eq_ignore_ascii_case(col_name))
+            .position(|c| predicate::identifier_eq(&c.name, col_name))
             .ok_or_else(|| Error::Catalog(format!("unknown column: {col_name}")))?;
         cols.push(col);
         col_names.push(col_name.to_string());
@@ -2971,7 +2971,7 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
                 def.schema
                     .columns
                     .iter()
-                    .position(|col| col.name.eq_ignore_ascii_case(&c.value))
+                    .position(|col| predicate::identifier_eq(&col.name, &c.value))
                     .ok_or_else(|| Error::Catalog(format!("unknown column: {}", c.value)))
             })
             .collect::<Result<_>>()?
@@ -3009,9 +3009,17 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
     let dup_sets: Vec<(usize, Expr)> = match &ins.on {
         Some(sqlparser::ast::OnInsert::DuplicateKeyUpdate(assigns)) => {
             let mut v = Vec::with_capacity(assigns.len());
+            let visible = vec![if let Some(alias) = &ins.table_alias {
+                vec![db.database().to_owned(), alias.value.clone()]
+            } else if ins.table_name.0.len() >= 2 {
+                object_name_parts(&ins.table_name)
+            } else {
+                vec![db.database().to_owned(), name.clone()]
+            }];
             for a in assigns {
                 let col = match &a.target {
                     AssignmentTarget::ColumnName(n) => {
+                        validate_assignment_target_qualifier(n, &visible)?;
                         n.0.last()
                             .map(|i| i.value.clone())
                             .ok_or_else(|| Error::Query("empty assignment target".into()))?
@@ -3026,7 +3034,7 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
                     .schema
                     .columns
                     .iter()
-                    .position(|c| c.name.eq_ignore_ascii_case(&col))
+                    .position(|c| predicate::identifier_eq(&c.name, &col))
                     .ok_or_else(|| Error::Catalog(format!("unknown column: {col}")))?;
                 v.push((idx, a.value.clone()));
             }
@@ -3444,7 +3452,7 @@ fn bind_values(expr: &Expr, insert_row: &[Value], schema: &Schema) -> Expr {
                     if let Some(i) = schema
                         .columns
                         .iter()
-                        .position(|c| c.name.eq_ignore_ascii_case(col))
+                        .position(|c| predicate::identifier_eq(&c.name, col))
                     {
                         return Some(value_to_expr(&insert_row[i]));
                     }
@@ -3675,7 +3683,7 @@ fn substitute_newold(
         let i = schema
             .columns
             .iter()
-            .position(|c| c.name.eq_ignore_ascii_case(col))
+            .position(|c| predicate::identifier_eq(&c.name, col))
             .ok_or_else(|| Error::Query(format!("trigger references unknown column: {col}")))?;
         Ok(value_sql_literal(row.get(i).unwrap_or(&Value::Null)))
     };
@@ -3764,7 +3772,7 @@ fn apply_before_trigger(
         let ci = schema
             .columns
             .iter()
-            .position(|c| c.name.eq_ignore_ascii_case(&col))
+            .position(|c| predicate::identifier_eq(&c.name, &col))
             .ok_or_else(|| Error::Query(format!("unknown column in trigger: {col}")))?;
         let sub = substitute_newold(rest[eq + 1..].trim(), schema, Some(row), old)?;
         let expr = parse_scalar_expr(&sub)?;
@@ -3822,7 +3830,7 @@ fn fk_probe_key(parent: &TableDef, ref_cols: &[String], vals: &[Value]) -> Resul
             && cols
                 .iter()
                 .zip(ref_cols)
-                .all(|(&i, rc)| parent.schema.columns[i].name.eq_ignore_ascii_case(rc))
+                .all(|(&i, rc)| predicate::identifier_eq(&parent.schema.columns[i].name, rc))
     };
     if !parent.pk_cols.is_empty() && name_match(&parent.pk_cols) {
         return Ok(data_key(
@@ -4071,7 +4079,22 @@ async fn select_inner(
         return Box::pin(select(db, vindex, &expanded)).await;
     }
 
+    // Validate database-backed qualifiers before view expansion turns a view
+    // into a derived table and changes the applicable qualifier policy.
+    let qualifier_normalized;
+    let query = if from_has_plain_table(query) {
+        qualifier_normalized = {
+            let mut normalized = query.clone();
+            normalize_query_qualifiers(&mut normalized, &db.database())?;
+            normalized
+        };
+        &qualifier_normalized
+    } else {
+        query
+    };
+
     validate_select_alias_hiding(db, query)?;
+    let query_before_binding = query;
 
     let wildcard_bound = bind_qualified_wildcards(db, query)?;
     let query = wildcard_bound.as_ref().unwrap_or(query);
@@ -4111,7 +4134,10 @@ async fn select_inner(
                 Some(e) => Some(eval_usize(e)?),
                 None => None,
             };
-            let mut inner_q = query.clone();
+            // Re-enter through the pre-binding query. Reusing the expanded
+            // derived form would try to bind an already-bound physical/view
+            // wildcard under query-scoped derived-table rules.
+            let mut inner_q = query_before_binding.clone();
             inner_q.limit = None;
             inner_q.offset = None;
             if let SetExpr::Select(si) = inner_q.body.as_mut() {
@@ -4164,6 +4190,11 @@ async fn select_inner(
         }
     }
 
+    // View expansion and derived-only queries can introduce query-scoped
+    // relations. Normalize again under those final relation policies.
+    let mut normalized_query = query.clone();
+    normalize_query_qualifiers(&mut normalized_query, &db.database())?;
+    let query = &normalized_query;
     let select = match query.body.as_ref() {
         SetExpr::Select(s) => s,
         _ => return Err(Error::Unsupported("only simple SELECT is supported".into())),
@@ -4208,7 +4239,7 @@ async fn select_inner(
         return Box::pin(execute_rollup(
             db,
             vindex,
-            query,
+            query_before_binding,
             &group_by,
             &order_exprs,
             offset,
@@ -5119,7 +5150,7 @@ async fn select_inner(
                 .schema
                 .columns
                 .iter()
-                .position(|c| c.name.eq_ignore_ascii_case(ident))
+                .position(|c| predicate::identifier_eq(&c.name, ident))
                 .ok_or_else(|| Error::Catalog(format!("unknown column: {ident}")))?;
             idxs.push(i);
             let mut col = def.schema.columns[i].clone();
@@ -6531,13 +6562,207 @@ fn join_qualifier_bindings(db: &Session, from: &[TableWithJoins]) -> Vec<(Vec<St
     bindings
 }
 
+#[derive(Clone)]
+enum RelationQualifierPolicy {
+    DatabaseBacked { database: String },
+    QueryScoped,
+}
+
+#[derive(Clone)]
+struct RelationQualifier {
+    canonical: Vec<Ident>,
+    policy: RelationQualifierPolicy,
+}
+
+impl RelationQualifier {
+    fn matches(&self, prefix: &[Ident]) -> bool {
+        let Some(canonical) = self.canonical.last().map(|identifier| &identifier.value) else {
+            return false;
+        };
+        match (&self.policy, prefix) {
+            (_, [alias]) if &alias.value == canonical => true,
+            (RelationQualifierPolicy::DatabaseBacked { database }, [actual_database, alias]) => {
+                &actual_database.value == database && &alias.value == canonical
+            }
+            (RelationQualifierPolicy::QueryScoped, [_, alias]) => &alias.value == canonical,
+            _ => false,
+        }
+    }
+}
+
+fn relation_qualifier(factor: &TableFactor, selected_database: &str) -> Option<RelationQualifier> {
+    match factor {
+        TableFactor::Table { name, alias, .. } => {
+            let table = name.0.last()?.clone();
+            let canonical = alias
+                .as_ref()
+                .map(|alias| alias.name.clone())
+                .unwrap_or(table);
+            let database = name
+                .0
+                .iter()
+                .rev()
+                .nth(1)
+                .map(|identifier| identifier.value.clone())
+                .unwrap_or_else(|| selected_database.to_owned());
+            Some(RelationQualifier {
+                canonical: vec![Ident::new(database.clone()), canonical],
+                policy: RelationQualifierPolicy::DatabaseBacked { database },
+            })
+        }
+        // MySQL accepts a two-part prefix for a derived/CTE column reference.
+        // Qualified wildcards are validated separately and remain alias-only.
+        TableFactor::Derived { alias, .. } => alias.as_ref().map(|alias| RelationQualifier {
+            canonical: vec![Ident::new(selected_database), alias.name.clone()],
+            policy: RelationQualifierPolicy::QueryScoped,
+        }),
+        _ => None,
+    }
+}
+
+fn collect_query_relation_qualifiers(
+    body: &SetExpr,
+    selected_database: &str,
+    qualifiers: &mut Vec<RelationQualifier>,
+) {
+    match body {
+        SetExpr::Select(select) => {
+            for table in &select.from {
+                qualifiers.extend(relation_qualifier(&table.relation, selected_database));
+                qualifiers.extend(
+                    table
+                        .joins
+                        .iter()
+                        .filter_map(|join| relation_qualifier(&join.relation, selected_database)),
+                );
+            }
+        }
+        SetExpr::SetOperation { left, right, .. } => {
+            collect_query_relation_qualifiers(left, selected_database, qualifiers);
+            collect_query_relation_qualifiers(right, selected_database, qualifiers);
+        }
+        // A nested query receives its own visitor scope.
+        SetExpr::Query(_) | SetExpr::Values(_) | SetExpr::Insert(_) | SetExpr::Update(_) => {}
+        SetExpr::Table(_) => {}
+    }
+}
+
+struct QualifierNormalizer<'a> {
+    selected_database: &'a str,
+    scopes: Vec<Vec<RelationQualifier>>,
+}
+
+impl QualifierNormalizer<'_> {
+    fn canonical(&self, prefix: &[Ident]) -> Option<Vec<Ident>> {
+        let relation_name = prefix.last()?;
+        for scope in self.scopes.iter().rev() {
+            let matches = scope
+                .iter()
+                .filter(|relation| relation.matches(prefix))
+                .collect::<Vec<_>>();
+            match matches.as_slice() {
+                [relation] => return Some(relation.canonical.clone()),
+                [_, _, ..] if prefix.len() == 1 => {
+                    let selected = matches
+                        .iter()
+                        .filter(|relation| {
+                            matches!(
+                                &relation.policy,
+                                RelationQualifierPolicy::DatabaseBacked { database }
+                                    if database == self.selected_database
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    if let [relation] = selected.as_slice() {
+                        return Some(relation.canonical.clone());
+                    }
+                    return None;
+                }
+                [_, _, ..] => return None,
+                [] => {}
+            }
+            // The nearest scope that owns this exact relation name also owns
+            // invalid longer forms; do not fall through to an outer scope.
+            if scope.iter().any(|relation| {
+                relation
+                    .canonical
+                    .last()
+                    .is_some_and(|canonical| canonical.value == relation_name.value)
+            }) {
+                return None;
+            }
+        }
+        None
+    }
+
+    fn unknown(reference: &[Ident]) -> ControlFlow<Error> {
+        let reference = reference
+            .iter()
+            .map(|identifier| identifier.value.as_str())
+            .collect::<Vec<_>>()
+            .join(".");
+        ControlFlow::Break(Error::Catalog(format!("unknown column: {reference}")))
+    }
+}
+
+impl VisitorMut for QualifierNormalizer<'_> {
+    type Break = Error;
+
+    fn pre_visit_query(&mut self, query: &mut SqlQuery) -> ControlFlow<Self::Break> {
+        let mut qualifiers = Vec::new();
+        collect_query_relation_qualifiers(&query.body, self.selected_database, &mut qualifiers);
+        self.scopes.push(qualifiers);
+
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_query(&mut self, _query: &mut SqlQuery) -> ControlFlow<Self::Break> {
+        self.scopes.pop();
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Self::Break> {
+        let Expr::CompoundIdentifier(parts) = expr else {
+            return ControlFlow::Continue(());
+        };
+        if parts
+            .first()
+            .is_some_and(|identifier| identifier.value.starts_with("@@"))
+        {
+            return ControlFlow::Continue(());
+        }
+        let Some((column, prefix)) = parts.split_last() else {
+            return ControlFlow::Continue(());
+        };
+        let Some(canonical) = self.canonical(prefix) else {
+            return Self::unknown(parts);
+        };
+        let column = column.clone();
+        parts.clear();
+        parts.extend(canonical);
+        parts.push(column);
+        ControlFlow::Continue(())
+    }
+}
+
+fn normalize_query_qualifiers(query: &mut SqlQuery, selected_database: &str) -> Result<()> {
+    let mut normalizer = QualifierNormalizer {
+        selected_database,
+        scopes: Vec::new(),
+    };
+    match query.visit(&mut normalizer) {
+        ControlFlow::Continue(()) => Ok(()),
+        ControlFlow::Break(error) => Err(error),
+    }
+}
+
 fn object_names_equal(left: &ObjectName, right: &ObjectName) -> bool {
     left.0.len() == right.0.len()
         && left
             .0
             .iter()
             .zip(&right.0)
-            .all(|(left, right)| left.value.eq_ignore_ascii_case(&right.value))
+            .all(|(left, right)| left.value == right.value)
 }
 
 fn canonical_relation_qualifier(
@@ -6572,6 +6797,12 @@ pub(crate) fn wildcard_matches_relation(
     object: &ObjectName,
     relation: &TableFactor,
 ) -> bool {
+    if let TableFactor::Derived {
+        alias: Some(alias), ..
+    } = relation
+    {
+        return matches!(object.0.as_slice(), [qualifier] if qualifier.value == alias.name.value);
+    }
     let Some(canonical) = factor_qualifier_object(db, relation) else {
         return false;
     };
@@ -6579,7 +6810,7 @@ pub(crate) fn wildcard_matches_relation(
         || matches!(
             (object.0.as_slice(), canonical.0.last()),
             ([qualifier], Some(relation_name))
-                if qualifier.value.eq_ignore_ascii_case(&relation_name.value)
+                if qualifier.value == relation_name.value
         )
 }
 
@@ -6607,7 +6838,7 @@ fn hidden_source_qualifier(relation: &TableFactor) -> Option<Vec<String>> {
     let source = object_name_parts(name);
     source
         .last()
-        .is_none_or(|part| !part.eq_ignore_ascii_case(&alias.name.value))
+        .is_none_or(|part| part != &alias.name.value)
         .then_some(source)
 }
 
@@ -6621,17 +6852,13 @@ fn hidden_source_qualifiers(from: &[TableWithJoins]) -> Vec<Vec<String>> {
 }
 
 fn qualifier_components_equal(left: &[String], right: &[String]) -> bool {
-    left.len() == right.len()
-        && left
-            .iter()
-            .zip(right)
-            .all(|(left, right)| left.eq_ignore_ascii_case(right))
+    left == right
 }
 
 fn qualifier_short_names_equal(left: &[String], right: &[String]) -> bool {
     left.last()
         .zip(right.last())
-        .is_some_and(|(left, right)| left.eq_ignore_ascii_case(right))
+        .is_some_and(|(left, right)| left == right)
 }
 
 fn validate_unique_relation_qualifiers(
@@ -6666,12 +6893,42 @@ fn qualifier_is_hidden(
     hidden: &[Vec<String>],
     visible: &[Vec<String>],
 ) -> bool {
-    !visible
+    let visible_exact = visible
         .iter()
-        .any(|source| ident_qualifier_has_source_suffix(reference, source))
-        && hidden
+        .any(|source| ident_qualifier_has_source_suffix(reference, source));
+    let visible_case_mismatch = visible.iter().any(|source| {
+        ident_qualifier_has_source_suffix_case_insensitive(reference, source)
+            && !ident_qualifier_has_source_suffix(reference, source)
+    });
+    !visible_exact
+        && (visible_case_mismatch
+            || hidden
+                .iter()
+                .any(|source| ident_qualifier_has_source_suffix(reference, source)))
+}
+
+fn ident_qualifier_is_visible_source_suffix(reference: &[Ident], source: &[String]) -> bool {
+    !reference.is_empty()
+        && reference.len() <= source.len()
+        && source[source.len() - reference.len()..]
             .iter()
-            .any(|source| ident_qualifier_has_source_suffix(reference, source))
+            .zip(reference)
+            .all(|(source, reference)| source == &reference.value)
+}
+
+fn validate_assignment_target_qualifier(name: &ObjectName, visible: &[Vec<String>]) -> Result<()> {
+    let qualifier = &name.0[..name.0.len().saturating_sub(1)];
+    if qualifier.len() > 2 {
+        return Err(Error::Parse(format!("invalid assignment target: {name}")));
+    }
+    if !qualifier.is_empty()
+        && !visible
+            .iter()
+            .any(|source| ident_qualifier_is_visible_source_suffix(qualifier, source))
+    {
+        return Err(Error::Catalog(format!("unknown column: {name}")));
+    }
+    Ok(())
 }
 
 struct HiddenSourceVisitor<'a> {
@@ -6728,6 +6985,26 @@ fn ident_qualifier_has_source_suffix(reference: &[Ident], source: &[String]) -> 
         && reference[reference.len() - source.len()..]
             .iter()
             .zip(source)
+            .all(|(reference, source)| reference.value == *source);
+    let source_ends_with_reference = reference.len() <= source.len()
+        && source[source.len() - reference.len()..]
+            .iter()
+            .zip(reference)
+            .all(|(source, reference)| source == &reference.value);
+    reference_ends_with_source || source_ends_with_reference
+}
+
+fn ident_qualifier_has_source_suffix_case_insensitive(
+    reference: &[Ident],
+    source: &[String],
+) -> bool {
+    if reference.is_empty() || source.is_empty() {
+        return false;
+    }
+    let reference_ends_with_source = source.len() <= reference.len()
+        && reference[reference.len() - source.len()..]
+            .iter()
+            .zip(source)
             .all(|(reference, source)| reference.value.eq_ignore_ascii_case(source));
     let source_ends_with_reference = reference.len() <= source.len()
         && source[source.len() - reference.len()..]
@@ -6756,9 +7033,6 @@ fn validate_select_alias_hiding(db: &Session, query: &SqlQuery) -> Result<()> {
     };
     let visible = validate_unique_relation_qualifiers(db, &select.from, "SELECT")?;
     let hidden = hidden_source_qualifiers(&select.from);
-    if hidden.is_empty() {
-        return Ok(());
-    }
     validate_ast_alias_hiding(select.as_ref(), &hidden, &visible)?;
     if let Some(order_by) = &query.order_by {
         for order in &order_by.exprs {
@@ -6782,7 +7056,7 @@ fn qualifier_parts_match(stored: &[String], requested: &[Ident]) -> bool {
         && stored[stored.len() - requested.len()..]
             .iter()
             .zip(requested)
-            .all(|(stored, requested)| stored.eq_ignore_ascii_case(&requested.value))
+            .all(|(stored, requested)| stored == &requested.value)
 }
 
 fn column_table(column: &ColumnDef) -> Option<&str> {
@@ -7490,7 +7764,7 @@ fn as_range(
         def.schema
             .columns
             .iter()
-            .position(|c| c.name.eq_ignore_ascii_case(n))
+            .position(|c| predicate::identifier_eq(&c.name, n))
     };
     let coerce_col = |col: usize, v: &Value| {
         let c = &def.schema.columns[col];
@@ -7536,7 +7810,7 @@ fn as_between(def: &TableDef, expr: &Expr) -> Result<Option<(usize, Value, Value
         def.schema
             .columns
             .iter()
-            .position(|c| c.name.eq_ignore_ascii_case(n))
+            .position(|c| predicate::identifier_eq(&c.name, n))
     };
     let Some(col) = ident_name(e).and_then(col_of) else {
         return Ok(None);
@@ -7923,7 +8197,7 @@ fn estimate_filtered_rows(stats: &catalog::TableStats, conjuncts: &[Expr]) -> u6
             if let Some(cs) = stats
                 .columns
                 .iter()
-                .find(|s| s.name.eq_ignore_ascii_case(&col))
+                .find(|s| predicate::identifier_eq(&s.name, &col))
             {
                 if let Some(s) = cs.selectivity(op, &val) {
                     sel *= s.clamp(0.0, 1.0);
@@ -8441,13 +8715,7 @@ async fn build_inner_join_reordered(
 fn relation_aliases(cols: &[ColumnDef]) -> std::collections::HashSet<Vec<String>> {
     cols.iter()
         .filter(|column| !column.qualifier.is_empty())
-        .map(|column| {
-            column
-                .qualifier
-                .iter()
-                .map(|part| part.to_ascii_lowercase())
-                .collect()
-        })
+        .map(|column| column.qualifier.clone())
         .collect()
 }
 
@@ -8456,7 +8724,7 @@ fn qualifier_component_suffix(stored: &[String], reference: &[String]) -> bool {
         && stored[stored.len() - reference.len()..]
             .iter()
             .zip(reference)
-            .all(|(stored, reference)| stored.eq_ignore_ascii_case(reference))
+            .all(|(stored, reference)| stored == reference)
 }
 
 fn relation_aliases_contain(
@@ -8505,13 +8773,8 @@ fn comma_join_chain(
     let quals: Vec<Vec<String>> = from
         .iter()
         .map(|table| {
-            factor_qualifier_object(db, &table.relation).map(|qualifier| {
-                qualifier
-                    .0
-                    .iter()
-                    .map(|part| part.value.to_ascii_lowercase())
-                    .collect()
-            })
+            factor_qualifier_object(db, &table.relation)
+                .map(|qualifier| qualifier.0.iter().map(|part| part.value.clone()).collect())
         })
         .collect::<Option<Vec<_>>>()?;
     let mut conjuncts = Vec::new();
@@ -8569,7 +8832,7 @@ fn expr_qualifier(e: &Expr) -> Option<Vec<String>> {
         Expr::CompoundIdentifier(parts) if parts.len() >= 2 => Some(
             parts[..parts.len() - 1]
                 .iter()
-                .map(|part| part.value.to_ascii_lowercase())
+                .map(|part| part.value.clone())
                 .collect(),
         ),
         _ => None,
@@ -8632,7 +8895,7 @@ pub(crate) fn unqualified_wildcard_indices(schema: &Schema) -> Vec<usize> {
 fn find_logical_column(schema: &Schema, name: &str, side: &str) -> Result<usize> {
     let matches: Vec<usize> = unqualified_wildcard_indices(schema)
         .into_iter()
-        .filter(|&index| column_name(&schema.columns[index]).eq_ignore_ascii_case(name))
+        .filter(|&index| predicate::identifier_eq(column_name(&schema.columns[index]), name))
         .collect();
     match matches.as_slice() {
         [index] => Ok(*index),
@@ -8679,13 +8942,17 @@ fn resolve_using_keys(
     };
 
     if let Some(names) = &requested {
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = Vec::<String>::new();
         for name in names {
-            if !seen.insert(name.to_ascii_lowercase()) {
+            if seen
+                .iter()
+                .any(|existing| predicate::identifier_eq(existing, name))
+            {
                 return Err(Error::Query(format!(
                     "column '{name}' appears more than once in USING"
                 )));
             }
+            seen.push(name.clone());
             find_logical_column(left, name, "left")?;
             find_logical_column(right, name, "right")?;
         }
@@ -8698,7 +8965,7 @@ fn resolve_using_keys(
         let name = column_name(&first.columns[index]);
         if names
             .iter()
-            .any(|seen: &String| seen.eq_ignore_ascii_case(name))
+            .any(|seen: &String| predicate::identifier_eq(seen, name))
         {
             continue;
         }
@@ -8708,10 +8975,14 @@ fn resolve_using_keys(
                 unqualified_wildcard_indices(other_schema)
                     .into_iter()
                     .any(|other| {
-                        column_name(&other_schema.columns[other]).eq_ignore_ascii_case(name)
+                        predicate::identifier_eq(column_name(&other_schema.columns[other]), name)
                     })
             },
-            |using| using.iter().any(|column| column.eq_ignore_ascii_case(name)),
+            |using| {
+                using
+                    .iter()
+                    .any(|column| predicate::identifier_eq(column, name))
+            },
         );
         if selected {
             names.push(name.to_owned());
@@ -9484,7 +9755,7 @@ fn eq_col_literal(def: &TableDef, filter: Option<&Expr>) -> Result<Option<(usize
         .schema
         .columns
         .iter()
-        .position(|c| c.name.eq_ignore_ascii_case(name))
+        .position(|c| predicate::identifier_eq(&c.name, name))
     else {
         return Ok(None);
     };
@@ -9547,7 +9818,7 @@ fn in_list_lookup(def: &TableDef, filter: Option<&Expr>) -> Result<Option<(usize
             .schema
             .columns
             .iter()
-            .position(|c| c.name.eq_ignore_ascii_case(name))
+            .position(|c| predicate::identifier_eq(&c.name, name))
         else {
             continue;
         };
@@ -9642,7 +9913,7 @@ fn order_col_index(def: &TableDef, e: &Expr) -> Option<usize> {
     def.schema
         .columns
         .iter()
-        .position(|c| c.name.eq_ignore_ascii_case(name))
+        .position(|c| predicate::identifier_eq(&c.name, name))
 }
 
 fn order_is_pk_asc_prefix(def: &TableDef, order: &[(Expr, bool)]) -> bool {
@@ -10123,7 +10394,7 @@ fn accelerable(def: &TableDef, filter: Option<&Expr>) -> Result<bool> {
                 def.schema
                     .columns
                     .iter()
-                    .position(|c| c.name.eq_ignore_ascii_case(n))
+                    .position(|c| predicate::identifier_eq(&c.name, n))
             })
             .collect();
         if let Some(mut cidx) = cidx {
@@ -10237,7 +10508,7 @@ async fn collect_matches_inner(
                     def.schema
                         .columns
                         .iter()
-                        .position(|c| c.name.eq_ignore_ascii_case(n))
+                        .position(|c| predicate::identifier_eq(&c.name, n))
                 })
                 .collect();
             if let Some(mut cidx) = cidx {
@@ -10515,10 +10786,9 @@ pub async fn update(
         validate_ast_alias_hiding(&assignment.value, &hidden, &visible)?;
         if let AssignmentTarget::ColumnName(name) = &assignment.target {
             let qualifier = &name.0[..name.0.len().saturating_sub(1)];
+            validate_assignment_target_qualifier(name, &visible)?;
             if qualifier_is_hidden(qualifier, &hidden, &visible) {
-                return Err(Error::Catalog(
-                    "an aliased table must be referenced by its alias".into(),
-                ));
+                return Err(Error::Catalog(format!("unknown column: {name}")));
             }
         }
     }
@@ -10555,7 +10825,7 @@ pub async fn update(
             .schema
             .columns
             .iter()
-            .position(|c| c.name.eq_ignore_ascii_case(&col))
+            .position(|c| predicate::identifier_eq(&c.name, &col))
             .ok_or_else(|| Error::Catalog(format!("unknown column: {col}")))?;
         sets.push((idx, &a.value));
     }
@@ -10829,7 +11099,7 @@ async fn cascade_parent_delete(
                             .schema
                             .columns
                             .iter()
-                            .position(|c| c.name.eq_ignore_ascii_case(rc))
+                            .position(|c| predicate::identifier_eq(&c.name, rc))
                             .map(|i| prow[i].clone())
                     })
                     .collect();
@@ -10913,7 +11183,7 @@ async fn cascade_parent_update(
                     .schema
                     .columns
                     .iter()
-                    .position(|c| c.name.eq_ignore_ascii_case(rc))
+                    .position(|c| predicate::identifier_eq(&c.name, rc))
                     .map(|i| row[i].clone())
             })
             .collect();
@@ -11074,7 +11344,7 @@ async fn collect_targets(
             let qualifier = qualifier
                 .0
                 .iter()
-                .map(|part| part.value.to_ascii_lowercase())
+                .map(|part| part.value.clone())
                 .collect::<Vec<_>>();
             if map
                 .keys()
@@ -11093,7 +11363,7 @@ async fn collect_targets(
                     .iter()
                     .position(|column| {
                         qualifier_components_equal(&column.qualifier, &qualifier)
-                            && column_name(column).eq_ignore_ascii_case(&c.name)
+                            && predicate::identifier_eq(column_name(column), &c.name)
                     })
                     .ok_or_else(|| {
                         Error::Query(format!(
@@ -11140,7 +11410,7 @@ async fn multi_update(
         qualifier
             .0
             .iter()
-            .map(|part| part.value.to_ascii_lowercase())
+            .map(|part| part.value.clone())
             .collect::<Vec<_>>()
     });
 
@@ -11163,7 +11433,7 @@ async fn multi_update(
             (
                 n.0[..n.0.len() - 1]
                     .iter()
-                    .map(|part| part.value.to_ascii_lowercase())
+                    .map(|part| part.value.clone())
                     .collect::<Vec<_>>(),
                 n.0.last().unwrap().value.clone(),
             )
@@ -11187,7 +11457,7 @@ async fn multi_update(
             .schema
             .columns
             .iter()
-            .position(|c| c.name.eq_ignore_ascii_case(&colname))
+            .position(|c| predicate::identifier_eq(&c.name, &colname))
             .ok_or_else(|| Error::Catalog(format!("unknown column: {colname}")))?;
         sets.push(SetOp {
             qual,
@@ -11298,26 +11568,14 @@ async fn multi_delete(
             .iter()
             .map(|table| {
                 factor_qualifier_object(db, &table.relation)
-                    .map(|qualifier| {
-                        qualifier
-                            .0
-                            .iter()
-                            .map(|part| part.value.to_ascii_lowercase())
-                            .collect()
-                    })
+                    .map(|qualifier| qualifier.0.iter().map(|part| part.value.clone()).collect())
                     .ok_or_else(|| Error::Query("no target table for DELETE".into()))
             })
             .collect::<Result<Vec<_>>>()?
     } else {
         del.tables
             .iter()
-            .map(|table| {
-                table
-                    .0
-                    .iter()
-                    .map(|part| part.value.to_ascii_lowercase())
-                    .collect()
-            })
+            .map(|table| table.0.iter().map(|part| part.value.clone()).collect())
             .collect()
     };
     let mut del_quals = requested_quals
@@ -11485,7 +11743,7 @@ fn projected_order_expr(
                     schema
                         .columns
                         .iter()
-                        .filter(|column| column_name(column).eq_ignore_ascii_case(name))
+                        .filter(|column| predicate::identifier_eq(column_name(column), name))
                         .map(source_expr),
                 );
             }
@@ -11496,18 +11754,16 @@ fn projected_order_expr(
                     .all(|column| column.qualifier.is_empty());
                 matches.extend(schema.columns.iter().filter_map(|column| {
                     let column_name = wildcard_column_name(column, object, unqualified_schema)?;
-                    column_name
-                        .eq_ignore_ascii_case(name)
-                        .then(|| source_expr(column))
+                    predicate::identifier_eq(column_name, name).then(|| source_expr(column))
                 }));
             }
             SelectItem::UnnamedExpr(expr) => {
-                if ident_name(expr).is_some_and(|output| output.eq_ignore_ascii_case(name)) {
+                if ident_name(expr).is_some_and(|output| predicate::identifier_eq(output, name)) {
                     matches.push(expr.clone());
                 }
             }
             SelectItem::ExprWithAlias { expr, alias } => {
-                if alias.value.eq_ignore_ascii_case(name) {
+                if predicate::identifier_eq(&alias.value, name) {
                     matches.push(expr.clone());
                 }
             }
@@ -11538,10 +11794,27 @@ fn resolve_order_aliases(
                 }
             }
             if let Some(name) = ident_name(e) {
+                // Only a bare ORDER BY identifier can name a projection alias;
+                // qualified identifiers continue to name source columns.
+                if matches!(e, Expr::Identifier(_)) {
+                    let mut aliases = projection.iter().filter_map(|item| match item {
+                        SelectItem::ExprWithAlias { expr, alias }
+                            if predicate::identifier_eq(&alias.value, name) =>
+                        {
+                            Some(expr)
+                        }
+                        _ => None,
+                    });
+                    if let Some(alias_expr) = aliases.next() {
+                        if aliases.next().is_none() {
+                            return (alias_expr.clone(), *asc);
+                        }
+                    }
+                }
                 let is_column = schema
                     .columns
                     .iter()
-                    .any(|c| c.name.eq_ignore_ascii_case(name));
+                    .any(|c| predicate::identifier_eq(&c.name, name));
                 if !is_column {
                     if let Some(expr) = projected_order_expr(name, projection, schema) {
                         return (expr, *asc);
@@ -11648,11 +11921,8 @@ fn project_exprs(
                 // read. Accept it there rather than refusing valid MySQL.
                 let qualifier = object_name_text(obj);
                 if !matched
-                    && default_table.is_some_and(|table| {
-                        obj.0
-                            .last()
-                            .is_some_and(|part| part.value.eq_ignore_ascii_case(table))
-                    })
+                    && default_table
+                        .is_some_and(|table| obj.0.last().is_some_and(|part| part.value == table))
                 {
                     for (i, c) in schema.columns.iter().enumerate() {
                         names.push(column_name(c).to_owned());
@@ -11858,13 +12128,13 @@ fn projection_exposes_order_expr(
             expr == original
                 || expr == resolved
                 || original_name.is_some_and(|name| {
-                    ident_name(expr).is_some_and(|output| output.eq_ignore_ascii_case(name))
+                    ident_name(expr).is_some_and(|output| predicate::identifier_eq(output, name))
                 })
         }
         SelectItem::ExprWithAlias { expr, alias } => {
             expr == original
                 || expr == resolved
-                || original_name.is_some_and(|name| alias.value.eq_ignore_ascii_case(name))
+                || original_name.is_some_and(|name| predicate::identifier_eq(&alias.value, name))
         }
     })
 }
@@ -13912,9 +14182,9 @@ fn null_propagates_from_qualifier(
     match expr {
         Expr::Identifier(identifier) => recursive_columns
             .iter()
-            .any(|column| column.eq_ignore_ascii_case(&identifier.value)),
+            .any(|column| predicate::identifier_eq(column, &identifier.value)),
         Expr::CompoundIdentifier(parts) => {
-            parts.len() >= 2 && parts[parts.len() - 2].value.eq_ignore_ascii_case(qualifier)
+            parts.len() >= 2 && parts[parts.len() - 2].value == qualifier
         }
         Expr::Nested(inner)
         | Expr::UnaryOp { expr: inner, .. }
@@ -14539,7 +14809,7 @@ fn bind_outer(db: &Session, expr: &Expr, outer: &[String], schema: &Schema, row:
                 schema
                     .columns
                     .iter()
-                    .position(|c| c.name.eq_ignore_ascii_case(col))
+                    .position(|c| predicate::identifier_eq(&c.name, col))
                     .map(|i| value_to_expr(&row[i]))
             } else {
                 None
@@ -14658,7 +14928,7 @@ async fn resolve_subqueries_with_outer(
                 };
                 if rebound
                     .iter()
-                    .any(|name: &String| name.eq_ignore_ascii_case(&column))
+                    .any(|name: &String| predicate::identifier_eq(name, &column))
                 {
                     return Err(error);
                 }
@@ -14670,7 +14940,7 @@ async fn resolve_subqueries_with_outer(
                 let value = value_to_expr(&outer_row[index]);
                 bound = map_expr(&bound, &|candidate| match candidate {
                     Expr::Identifier(identifier)
-                        if identifier.value.eq_ignore_ascii_case(&column) =>
+                        if predicate::identifier_eq(&identifier.value, &column) =>
                     {
                         Some(value.clone())
                     }
@@ -14690,7 +14960,7 @@ fn bare_unknown_column<'a>(error: &'a Error, expr: &Expr) -> Option<&'a str> {
     let is_bare = std::cell::Cell::new(false);
     let _ = map_expr(expr, &|candidate| {
         if let Expr::Identifier(identifier) = candidate {
-            if identifier.value.eq_ignore_ascii_case(column) {
+            if predicate::identifier_eq(&identifier.value, column) {
                 is_bare.set(true);
             }
         }
@@ -15592,7 +15862,7 @@ fn col_of(def: &TableDef, name: &str) -> Option<usize> {
     def.schema
         .columns
         .iter()
-        .position(|c| c.name.eq_ignore_ascii_case(name))
+        .position(|c| predicate::identifier_eq(&c.name, name))
 }
 
 fn parse_vec_free(s: &str) -> Result<Vec<f32>> {
@@ -16689,7 +16959,7 @@ async fn estimate_group_count(
         let Some(cs) = stats
             .columns
             .iter()
-            .find(|c| c.name.eq_ignore_ascii_case(name))
+            .find(|c| predicate::identifier_eq(&c.name, name))
         else {
             return Ok(None);
         };
@@ -16887,7 +17157,7 @@ fn is_col_eq_literal(e: &Expr, schema: &Schema, out: &mut Vec<usize>) -> bool {
         schema
             .columns
             .iter()
-            .position(|c| c.name.eq_ignore_ascii_case(&name))
+            .position(|c| predicate::identifier_eq(&c.name, &name))
     };
     let lit = |x: &Expr| matches!(x, Expr::Value(_));
     if let (Some(ci), true) = (ident(left), lit(right)) {
@@ -17364,7 +17634,7 @@ fn order_output_rows(
         let idx = schema
             .columns
             .iter()
-            .position(|c| c.name.eq_ignore_ascii_case(&name))
+            .position(|c| predicate::identifier_eq(&c.name, &name))
             .ok_or_else(|| {
                 Error::Query(format!("ORDER BY references unknown output column: {name}"))
             })?;

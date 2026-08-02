@@ -370,7 +370,7 @@ fn qualifier_matches(qualifier: &[String], requested: &sqlparser::ast::ObjectNam
         && qualifier[qualifier.len() - requested.0.len()..]
             .iter()
             .zip(&requested.0)
-            .all(|(stored, requested)| stored.eq_ignore_ascii_case(&requested.value))
+            .all(|(stored, requested)| stored == &requested.value)
 }
 
 fn resolve_group_alias<'a>(
@@ -384,7 +384,7 @@ fn resolve_group_alias<'a>(
     let source_column_exists = schema
         .columns
         .iter()
-        .any(|column| column_name(column).eq_ignore_ascii_case(&id.value));
+        .any(|column| crate::predicate::identifier_eq(column_name(column), &id.value));
     if source_column_exists {
         return expr;
     }
@@ -392,7 +392,7 @@ fn resolve_group_alias<'a>(
         .iter()
         .find_map(|item| match item {
             SelectItem::ExprWithAlias { expr, alias }
-                if alias.value.eq_ignore_ascii_case(&id.value) =>
+                if crate::predicate::identifier_eq(&alias.value, &id.value) =>
             {
                 Some(expr)
             }

@@ -403,10 +403,6 @@ impl Engine {
             let Some(granted) = users::column_grants(sess, user, t).await? else {
                 continue; // not column-restricted on this table
             };
-            let granted: std::collections::HashSet<String> = granted
-                .into_iter()
-                .map(|c| c.to_ascii_lowercase())
-                .collect();
             if !simple {
                 return Err(Error::Query(format!(
                     "access denied: column-restricted table '{t}' cannot be used in this query"
@@ -436,7 +432,7 @@ impl Engine {
                 // SELECT * requires every column of the table to be granted.
                 let def = catalog::load(sess, t).await?;
                 for c in &def.schema.columns {
-                    refs.push(c.name.to_ascii_lowercase());
+                    refs.push(c.name.clone());
                 }
             }
             if !ok {
@@ -446,7 +442,10 @@ impl Engine {
                 )));
             }
             for r in &refs {
-                if !granted.contains(r) {
+                if !granted
+                    .iter()
+                    .any(|column| predicate::identifier_eq(column, r))
+                {
                     return Err(Error::Query(format!(
                         "access denied: no SELECT privilege on column '{t}.{r}'"
                     )));
@@ -693,18 +692,17 @@ impl Engine {
                 Err(_) => all_plain = false,
             }
         }
-        let col_by_name =
-            |n: &str| -> Option<ColumnType> {
-                let want = n.rsplit('.').next().unwrap_or(n);
-                for (_, schema) in &relations {
-                    if let Some(c) = schema.columns.iter().find(|c| {
-                        c.name.eq_ignore_ascii_case(n) || c.name.eq_ignore_ascii_case(want)
-                    }) {
-                        return Some(c.ty.clone());
-                    }
+        let col_by_name = |n: &str| -> Option<ColumnType> {
+            let want = n.rsplit('.').next().unwrap_or(n);
+            for (_, schema) in &relations {
+                if let Some(c) = schema.columns.iter().find(|c| {
+                    predicate::identifier_eq(&c.name, n) || predicate::identifier_eq(&c.name, want)
+                }) {
+                    return Some(c.ty.clone());
                 }
-                None
-            };
+            }
+            None
+        };
         // Best-effort result type of a projection expression.
         fn expr_type(e: &Expr, col: &dyn Fn(&str) -> Option<ColumnType>) -> ColumnType {
             use sqlparser::ast::Value as V;
@@ -1933,12 +1931,12 @@ fn collect_col_refs(e: &sqlparser::ast::Expr, out: &mut Vec<String>) -> bool {
     use sqlparser::ast::Expr::*;
     match e {
         Identifier(i) => {
-            out.push(i.value.to_ascii_lowercase());
+            out.push(i.value.clone());
             true
         }
         CompoundIdentifier(parts) => {
             if let Some(last) = parts.last() {
-                out.push(last.value.to_ascii_lowercase());
+                out.push(last.value.clone());
             }
             true
         }

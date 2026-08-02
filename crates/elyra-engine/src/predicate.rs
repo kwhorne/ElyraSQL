@@ -6,6 +6,46 @@
 use elyra_core::{Collation, Error, Result, Schema, Value};
 use sqlparser::ast::{BinaryOperator, Expr, UnaryOperator, Value as SqlValue};
 
+enum IdentifierLowercase {
+    Standard(std::char::ToLowercase),
+    One(std::option::IntoIter<char>),
+}
+
+impl Iterator for IdentifierLowercase {
+    type Item = char;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Standard(chars) => chars.next(),
+            Self::One(chars) => chars.next(),
+        }
+    }
+}
+
+fn identifier_lowercase(character: char) -> IdentifierLowercase {
+    match character {
+        // Match MySQL's identifier folding rather than Rust's combining-dot
+        // expansion for LATIN CAPITAL I WITH DOT ABOVE.
+        '\u{0130}' => IdentifierLowercase::One(Some('i').into_iter()),
+        // MySQL keeps capital sharp S distinct from the older small sharp S.
+        '\u{1E9E}' => IdentifierLowercase::One(Some(character).into_iter()),
+        _ => IdentifierLowercase::Standard(character.to_lowercase()),
+    }
+}
+
+/// Compare column and projection-alias identifiers using MySQL's
+/// case-insensitive identifier rules. Relation qualifiers deliberately do not
+/// use this comparator: their spelling is case-sensitive on MySQL/Linux.
+pub(crate) fn identifier_eq(left: &str, right: &str) -> bool {
+    if left.is_ascii() && right.is_ascii() {
+        left.eq_ignore_ascii_case(right)
+    } else {
+        left.chars()
+            .flat_map(identifier_lowercase)
+            .eq(right.chars().flat_map(identifier_lowercase))
+    }
+}
+
 /// Evaluate `expr` against a row. Column identifiers resolve via `schema`.
 pub fn eval_row(expr: &Expr, schema: &Schema, row: &[Value]) -> Result<Value> {
     match expr {
@@ -20,7 +60,7 @@ pub fn eval_row(expr: &Expr, schema: &Schema, row: &[Value]) -> Result<Value> {
             if !schema
                 .columns
                 .iter()
-                .any(|c| c.name.eq_ignore_ascii_case(&id.value))
+                .any(|c| identifier_eq(&c.name, &id.value))
             {
                 if let Some(v) = niladic_fn(&id.value) {
                     return Ok(v);
@@ -246,7 +286,7 @@ pub fn eval_row(expr: &Expr, schema: &Schema, row: &[Value]) -> Result<Value> {
                 if let Some(i) = schema
                     .columns
                     .iter()
-                    .position(|c| c.name.eq_ignore_ascii_case(&col.value))
+                    .position(|c| identifier_eq(&c.name, &col.value))
                 {
                     if let Some(s) = row.get(i).and_then(|v| v.to_wire_string()) {
                         doc.push(' ');
@@ -2570,7 +2610,7 @@ fn qualifier_matches_parts(qualifier: &[String], reference: &[sqlparser::ast::Id
         && qualifier[qualifier.len() - reference.len()..]
             .iter()
             .zip(reference)
-            .all(|(stored, requested)| stored.eq_ignore_ascii_case(&requested.value))
+            .all(|(stored, requested)| stored == &requested.value)
 }
 
 fn column_name(column: &elyra_core::ColumnDef) -> &str {
@@ -2603,10 +2643,10 @@ pub fn resolve_index_parts(parts: &[sqlparser::ast::Ident], schema: &Schema) -> 
             .filter(|(_, column)| {
                 if has_qualified_columns {
                     !column.qualifier.is_empty()
-                        && column_name(column).eq_ignore_ascii_case(&last.value)
+                        && identifier_eq(column_name(column), &last.value)
                         && qualifier_matches_parts(&column.qualifier, &parts[..parts.len() - 1])
                 } else {
-                    column.name.eq_ignore_ascii_case(&last.value)
+                    identifier_eq(&column.name, &last.value)
                 }
             })
             .map(|(index, _)| index)
@@ -2628,7 +2668,7 @@ pub fn resolve_index_parts(parts: &[sqlparser::ast::Ident], schema: &Schema) -> 
         } else {
             column_name(c)
         };
-        if !schema.is_hidden_from_unqualified(i) && name.eq_ignore_ascii_case(&last.value) {
+        if !schema.is_hidden_from_unqualified(i) && identifier_eq(name, &last.value) {
             n += 1;
             hit = Some(i);
         }
@@ -2658,8 +2698,7 @@ pub fn resolve_index(name: &str, schema: &Schema) -> Result<usize> {
         .iter()
         .enumerate()
         .filter(|(index, column)| {
-            !schema.is_hidden_from_unqualified(*index)
-                && column_name(column).eq_ignore_ascii_case(name)
+            !schema.is_hidden_from_unqualified(*index) && identifier_eq(column_name(column), name)
         })
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
@@ -3145,6 +3184,23 @@ mod resolve_tests {
             0
         );
         assert!(resolve_index_parts(&parts("t.a.b"), &schema).is_err());
+    }
+
+    #[test]
+    fn mysql_identifier_case_folding_is_unicode_aware() {
+        assert!(identifier_eq("Ünicode", "ünicode"));
+        assert!(identifier_eq("K", "k"));
+        assert!(identifier_eq("İ", "i"));
+        assert!(!identifier_eq("ẞ", "ß"));
+
+        let schema = Schema::new(vec![
+            ColumnDef::new("a.Ünicode", ColumnType::Int, true).with_qualifier(vec!["a".into()])
+        ]);
+        assert_eq!(
+            resolve_index_parts(&parts("a.ünicode"), &schema).unwrap(),
+            0
+        );
+        assert!(resolve_index_parts(&parts("A.ünicode"), &schema).is_err());
     }
 
     #[test]
