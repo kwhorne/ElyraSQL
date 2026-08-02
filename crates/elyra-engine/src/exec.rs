@@ -20947,7 +20947,7 @@ mod numeric_evaluation_coercion_tests {
                 "SELECT '3.5tail' + 0, 0 + '3', '3' * 2, -'3tail', \
                         CAST('3.25tail' AS FLOAT), CAST('4.5tail' AS DOUBLE), \
                         ABS('-3.5tail'), ROUND('3.7tail'), SQRT('9tail'), \
-                        UNIX_TIMESTAMP('42.9tail')",
+                        UNIX_TIMESTAMP('1970-01-02 00:00:00')",
             )
             .await,
             vec![vec![
@@ -20960,7 +20960,7 @@ mod numeric_evaluation_coercion_tests {
                 Value::Float(3.5),
                 Value::Int(4),
                 Value::Float(3.0),
-                Value::Int(42),
+                Value::Int(86_400),
             ]]
         );
 

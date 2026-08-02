@@ -1152,13 +1152,14 @@ fn eval_scalar(name: &str, a: &[Value]) -> Result<Option<Value>> {
             if a.is_empty() {
                 Value::Int(now_micros() / 1_000_000)
             } else {
-                match &a[0] {
-                    Value::DateTime(m) => Value::Int(m / 1_000_000),
-                    Value::Null => Value::Null,
-                    v => v
-                        .as_mysql_f64()
-                        .map(|n| Value::Int(n as i64))
-                        .unwrap_or(Value::Null),
+                if a[0].is_null() {
+                    Value::Null
+                } else {
+                    // UNIX_TIMESTAMP interprets its argument as a temporal
+                    // value. A textual datetime must be parsed before numeric
+                    // evaluation; treating its leading year as a number would
+                    // turn `2024-01-02` into `2024` instead of epoch seconds.
+                    Value::Int(to_micros(&a[0]).map_or(0, |micros| micros / 1_000_000))
                 }
             }
         }
