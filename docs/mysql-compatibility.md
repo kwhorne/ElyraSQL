@@ -12,7 +12,7 @@ drivers connect without modification.
 - **Authentication** — `mysql_native_password` by **default** (widest driver
   compatibility), with `caching_sha2_password` available opt-in (see below).
 - **TLS** — clients may negotiate SSL.
-- **Handshake** — reports a MySQL-looking version, e.g. `8.0.12-ElyraSQL-1.9.0`,
+- **Handshake** — reports a MySQL-looking version, e.g. `8.0.12-ElyraSQL-1.9.1`,
   and answers the session/introspection queries clients send on connect
   (`SELECT @@version_comment`, `SELECT VERSION()`, `SET ...`,
   `SHOW VARIABLES/STATUS/COLLATION/DATABASES/TABLE STATUS`, and the
@@ -133,7 +133,7 @@ gaps:
 - Vector search and `VEC_DISTANCE(...)` are ElyraSQL extensions (they mirror
   MySQL 9's vector direction but are not identical).
 - **Integer storage is always 64-bit**, but the declared width and `UNSIGNED`
-  are both enforced (since 1.10.0 and 1.8.0 respectively), so a value too wide
+  are both enforced (since 1.9.1 and 1.8.0 respectively), so a value too wide
   for its column raises 1264 as in MySQL. Tables created by earlier versions
   have no width recorded and are not retroactively constrained — see
   [data types](sql/data-types.md#integer-widths-and-unsigned).

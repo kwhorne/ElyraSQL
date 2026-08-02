@@ -43,7 +43,7 @@ INSERT INTO t VALUES (-1);    -- ERROR 1264 (22003): invalid UNSIGNED value: -1
     - Until **1.8.0** only `BIGINT UNSIGNED` was enforced; narrower unsigned
       types were stored as signed. A column created before then keeps the type it
       was created with and goes on accepting negatives.
-    - Until **1.10.0** no width was recorded at all. A table created before then
+    - Until **1.9.1** no width was recorded at all. A table created before then
       has no widths stored, so its columns accept any 64-bit value.
 
     In both cases the fix applies from the next `CREATE TABLE`, or when the
