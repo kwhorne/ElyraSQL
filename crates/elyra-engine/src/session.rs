@@ -477,13 +477,18 @@ impl Session {
     /// Resolve a system variable in this connection's session scope. Variables
     /// not managed by the session retain the server's compatibility defaults.
     pub fn system_var(&self, raw: &str) -> Value {
-        let name = raw
-            .trim_start_matches("@@")
-            .trim_start_matches("session.")
-            .trim_start_matches("local.")
-            .trim_start_matches("global.")
-            .to_ascii_lowercase();
-        match name.as_str() {
+        let scoped = raw.trim_start_matches("@@").to_ascii_lowercase();
+        let (scope, name) = match scoped.split_once('.') {
+            Some((scope @ ("session" | "local" | "global"), name)) => (Some(scope), name),
+            _ => (None, scoped.as_str()),
+        };
+        if scope == Some("global") {
+            return match name {
+                "group_concat_max_len" => Value::Int(1024),
+                _ => crate::predicate::system_var(name),
+            };
+        }
+        match name {
             "autocommit" => Value::Int(i64::from(self.autocommit())),
             "sql_mode" => Value::Text(self.sql_mode()),
             "foreign_key_checks" => Value::Int(i64::from(self.foreign_key_checks())),

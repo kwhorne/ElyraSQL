@@ -4739,6 +4739,10 @@ mod session_set_tests {
             rows(&engine, &writer, "SELECT @@autocommit").await,
             vec![vec![Value::Int(0)]]
         );
+        assert_eq!(
+            rows(&engine, &writer, "SELECT @@global.autocommit").await,
+            vec![vec![Value::Int(1)]]
+        );
         execute(&engine, &writer, "INSERT INTO session_set_txn VALUES (1)").await;
         assert_eq!(
             rows(&engine, &reader, "SELECT COUNT(*) FROM session_set_txn").await,
