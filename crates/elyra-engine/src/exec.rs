@@ -680,6 +680,7 @@ fn system_variables() -> Vec<(&'static str, String)> {
         ("default_storage_engine", "InnoDB".into()),
         ("event_scheduler", "OFF".into()),
         ("foreign_key_checks", "ON".into()),
+        ("group_concat_max_len", "1024".into()),
         ("have_query_cache", "NO".into()),
         ("hostname", "elyrasql".into()),
         ("init_connect", String::new()),
@@ -696,9 +697,7 @@ fn system_variables() -> Vec<(&'static str, String)> {
         ("protocol_version", "10".into()),
         (
             "sql_mode",
-            "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,\
-             ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION"
-                .into(),
+            "STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION".into(),
         ),
         ("system_time_zone", "UTC".into()),
         ("time_zone", "SYSTEM".into()),
@@ -786,12 +785,25 @@ fn show_filter_pattern(filter: Option<&sqlparser::ast::ShowStatementFilter>) -> 
 }
 
 /// `SHOW [GLOBAL|SESSION] VARIABLES [LIKE ...]`.
-pub fn show_variables(filter: Option<&sqlparser::ast::ShowStatementFilter>) -> Result<QueryResult> {
+pub fn show_variables(
+    db: &Session,
+    filter: Option<&sqlparser::ast::ShowStatementFilter>,
+) -> Result<QueryResult> {
     let pat = show_filter_pattern(filter);
     let rows: Vec<Vec<Value>> = system_variables()
         .into_iter()
         .filter(|(name, _)| pat.as_deref().is_none_or(|p| show_like(name, p)))
-        .map(|(name, val)| vec![Value::Text(name.to_string()), Value::Text(val)])
+        .map(|(name, val)| {
+            let value = match name {
+                "autocommit" => if db.autocommit() { "ON" } else { "OFF" }.into(),
+                "foreign_key_checks" => if db.foreign_key_checks() { "ON" } else { "OFF" }.into(),
+                "group_concat_max_len" => db.group_concat_max_len().to_string(),
+                "sql_mode" => db.sql_mode(),
+                "transaction_isolation" | "tx_isolation" => db.transaction_isolation(),
+                _ => val,
+            };
+            vec![Value::Text(name.to_string()), Value::Text(value)]
+        })
         .collect();
     Ok(QueryResult::Rows(RowStream::literal(
         text_schema(&["Variable_name", "Value"]),
@@ -1996,7 +2008,13 @@ async fn run_virtual_select(
             order_exprs,
             &schema,
         );
-        let (mut osch, orows) = aggregate::run(&schema, &projection, group_by, rows)?;
+        let (mut osch, orows) = aggregate::run(
+            &schema,
+            &projection,
+            group_by,
+            rows,
+            db.group_concat_max_len(),
+        )?;
         let mut orows = apply_having(select.having.as_ref(), &projection, &osch, orows)?;
         order_output_rows(&mut orows, &osch, order_exprs)?;
         truncate_hidden_columns(&mut osch, &mut orows, hidden);
@@ -3452,7 +3470,8 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
             }
             if let Some(ai) = auto_col {
                 let is_zero = matches!(row[ai], Value::Int(0)) || matches!(row[ai], Value::UInt(0));
-                let need = !provided[ai] || row[ai].is_null() || is_zero;
+                let need =
+                    !provided[ai] || row[ai].is_null() || (is_zero && !db.no_auto_value_on_zero());
                 let col = &def.schema.columns[ai];
                 if need {
                     autoinc += 1;
@@ -3523,7 +3542,7 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
     // existence read. This is the bulk-load hot path.
     if !replace && !on_dup && !ignore && has_pk && !db.in_txn() {
         check_widths_batch(db, &def, &built).await?;
-        if !def.foreign_keys.is_empty() {
+        if db.foreign_key_checks() && !def.foreign_keys.is_empty() {
             check_fk_batch(db, &def, &built).await?;
         }
         let mut new_puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(built.len());
@@ -3634,7 +3653,7 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
         check_unique_batch(db, &def, &batch).await?;
     }
     check_widths_batch(db, &def, &batch).await?;
-    if !def.foreign_keys.is_empty() {
+    if db.foreign_key_checks() && !def.foreign_keys.is_empty() {
         check_fk_batch(db, &def, &batch).await?;
     }
 
@@ -3895,7 +3914,42 @@ pub(crate) fn substitute_uvars(
     out
 }
 
-fn copy_quoted_segment(chars: &[char], start: usize, out: &mut String) -> usize {
+/// Replace `@@session` system-variable references with this connection's
+/// current values, leaving quoted segments untouched. The SQL frontend has no
+/// session context, so resolving them before parsing keeps all expression paths
+/// (literal SELECTs, filters, projections, and SET right-hand sides) consistent.
+pub(crate) fn substitute_system_vars(sql: &str, resolve: impl Fn(&str) -> Value) -> String {
+    let cs: Vec<char> = sql.chars().collect();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0;
+    while i < cs.len() {
+        let c = cs[i];
+        if matches!(c, '\'' | '"' | '`') {
+            i = copy_quoted_segment(&cs, i, &mut out);
+            continue;
+        }
+        if c == '@' && cs.get(i + 1) == Some(&'@') {
+            let start = i + 2;
+            let mut end = start;
+            while end < cs.len()
+                && (cs[end].is_ascii_alphanumeric() || matches!(cs[end], '_' | '.'))
+            {
+                end += 1;
+            }
+            if end > start {
+                let name = cs[start..end].iter().collect::<String>();
+                out.push_str(&value_sql_literal(&resolve(&name)));
+                i = end;
+                continue;
+            }
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
+pub(crate) fn copy_quoted_segment(chars: &[char], start: usize, out: &mut String) -> usize {
     let quote = chars[start];
     out.push(quote);
     let mut i = start + 1;
@@ -4942,7 +4996,8 @@ async fn select_inner(
             &def.schema,
         );
         let proj = projection.as_slice();
-        let plan = aggregate::build_plan(&def.schema, proj, &group_by)?;
+        let mut plan = aggregate::build_plan(&def.schema, proj, &group_by)?;
+        plan.set_group_concat_max_len(db.group_concat_max_len());
         // If statistics predict more distinct groups than fit in memory, go
         // straight to the spilling partitioned aggregation instead of running the
         // in-memory pass, hitting the cap, and re-scanning from scratch (which
@@ -5608,6 +5663,7 @@ async fn join_select(
 
     let (schema, rows) = build_from(db, vindex, &select.from, &conjuncts).await?;
     let cancel = db.cancel_token();
+    let group_concat_max_len = db.group_concat_max_len();
     cpu_bound(move || {
         finish_materialized_select(
             select,
@@ -5619,6 +5675,7 @@ async fn join_select(
             offset,
             limit,
             &cancel,
+            group_concat_max_len,
         )
     })
 }
@@ -5637,6 +5694,7 @@ fn finish_materialized_select(
     offset: usize,
     limit: Option<usize>,
     cancel: &std::sync::Arc<elyra_core::cancel::QueryCancel>,
+    group_concat_max_len: usize,
 ) -> Result<QueryResult> {
     // WHERE over the joined rows.
     let mut check = elyra_core::cancel::CancelCheck::new(cancel.clone());
@@ -5661,7 +5719,8 @@ fn finish_materialized_select(
             order_exprs,
             &schema,
         );
-        let (mut osch, orows) = aggregate::run(&schema, &projection, group_by, rows)?;
+        let (mut osch, orows) =
+            aggregate::run(&schema, &projection, group_by, rows, group_concat_max_len)?;
         let mut orows = apply_having(select.having.as_ref(), &projection, &osch, orows)?;
         order_output_rows(&mut orows, &osch, order_exprs)?;
         truncate_hidden_columns(&mut osch, &mut orows, hidden);
@@ -6656,10 +6715,11 @@ async fn streaming_join_aggregate(
     // Build the aggregation plan; if it isn't a plain aggregate/group plan we can
     // stream, fall back to join_select (which is the authoritative path and will
     // reproduce any real error).
-    let plan = match aggregate::build_plan(&schema, &select.projection, group_by) {
+    let mut plan = match aggregate::build_plan(&schema, &select.projection, group_by) {
         Ok(p) => p,
         Err(_) => return Ok(None),
     };
+    plan.set_group_concat_max_len(db.group_concat_max_len());
     let extend = !plan.arg_exprs().is_empty();
 
     let keep = |row: &[Value]| -> Result<bool> {
@@ -7647,7 +7707,13 @@ async fn join_correlated_select(
     }
 
     if aggregating {
-        let (out_schema, out_rows) = aggregate::run(&schema, &select.projection, &group_by, kept)?;
+        let (out_schema, out_rows) = aggregate::run(
+            &schema,
+            &select.projection,
+            &group_by,
+            kept,
+            db.group_concat_max_len(),
+        )?;
         let mut out_rows = apply_having(
             select.having.as_ref(),
             &select.projection,
@@ -11284,7 +11350,7 @@ pub async fn update(
     let mut deletes: Vec<Vec<u8>> = Vec::new();
     let mut fk_parent_changes: Vec<(Vec<Value>, Vec<Value>)> = Vec::new();
     let check_uniq = index::has_unique(&def);
-    let check_fk = !def.foreign_keys.is_empty();
+    let check_fk = db.foreign_key_checks() && !def.foreign_keys.is_empty();
     let mut uniq_batch: Vec<(Vec<u8>, Vec<Value>)> = Vec::new();
     let checks = parse_checks(&def)?;
 
@@ -11365,15 +11431,17 @@ pub async fn update(
     // Parent-side ON UPDATE referential actions for children referencing a
     // changed key (RESTRICT/CASCADE/SET NULL, single level).
     let mut wcounts: Vec<String> = vec![name.clone()];
-    cascade_parent_update(
-        db,
-        &def,
-        &fk_parent_changes,
-        &mut puts,
-        &mut deletes,
-        &mut wcounts,
-    )
-    .await?;
+    if db.foreign_key_checks() {
+        cascade_parent_update(
+            db,
+            &def,
+            &fk_parent_changes,
+            &mut puts,
+            &mut deletes,
+            &mut wcounts,
+        )
+        .await?;
+    }
     for t in wcounts {
         puts.push(bump_wcount(db, &t).await?);
     }
@@ -11461,16 +11529,18 @@ pub async fn delete(
     let mut wcounts: Vec<String> = vec![name.clone()];
 
     // Foreign keys referencing this table: RESTRICT / CASCADE / SET NULL.
-    cascade_parent_delete(
-        db,
-        &def,
-        &matches,
-        &mut puts,
-        &mut deletes,
-        &mut wcounts,
-        None,
-    )
-    .await?;
+    if db.foreign_key_checks() {
+        cascade_parent_delete(
+            db,
+            &def,
+            &matches,
+            &mut puts,
+            &mut deletes,
+            &mut wcounts,
+            None,
+        )
+        .await?;
+    }
 
     let after_del: Vec<catalog::TriggerDef> = catalog::load_triggers(db, &name)
         .await?
@@ -12146,16 +12216,18 @@ async fn multi_delete(
         if matches.is_empty() {
             continue;
         }
-        cascade_parent_delete(
-            db,
-            &info.def,
-            &matches,
-            &mut puts,
-            &mut deletes,
-            &mut wcounts,
-            Some(&scheduled_deletes),
-        )
-        .await?;
+        if db.foreign_key_checks() {
+            cascade_parent_delete(
+                db,
+                &info.def,
+                &matches,
+                &mut puts,
+                &mut deletes,
+                &mut wcounts,
+                Some(&scheduled_deletes),
+            )
+            .await?;
+        }
 
         let after_del = catalog::load_triggers(db, &info.name)
             .await?
@@ -16332,7 +16404,13 @@ async fn correlated_select(
     }
 
     if !group_by.is_empty() || aggregate::projection_has_aggregate(&select.projection) {
-        let (schema, out) = aggregate::run(&def.schema, &select.projection, group_by, matched)?;
+        let (schema, out) = aggregate::run(
+            &def.schema,
+            &select.projection,
+            group_by,
+            matched,
+            db.group_concat_max_len(),
+        )?;
         let mut out = apply_having(select.having.as_ref(), &select.projection, &schema, out)?;
         order_output_rows(&mut out, &schema, order_exprs)?;
         apply_offset_limit(&mut out, offset, limit);
@@ -16905,6 +16983,7 @@ async fn run_derived_query_chain(
             None => None,
         };
         let cancel = db.cancel_token();
+        let group_concat_max_len = db.group_concat_max_len();
         let result = cpu_bound(move || {
             finish_materialized_select(
                 layer.select,
@@ -16916,6 +16995,7 @@ async fn run_derived_query_chain(
                 offset,
                 limit,
                 &cancel,
+                group_concat_max_len,
             )
         })?;
         (schema, rows) = materialize_query_result(result).await?;

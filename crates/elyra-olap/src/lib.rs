@@ -90,6 +90,9 @@ pub struct AggSpec {
     pub distinct: bool,
     /// GROUP_CONCAT separator (default ",").
     pub separator: Option<String>,
+    /// Session `group_concat_max_len` captured when this aggregate plan is
+    /// created. `None` leaves the server default behavior unchanged.
+    pub group_concat_max_len: Option<usize>,
     /// `FACET(col, n)` top-N cap on the number of facet values returned.
     pub facet_top: Option<usize>,
     /// `PERCENTILE(col, p)` fraction in 0..1 (`MEDIAN` = 0.5).
@@ -576,8 +579,8 @@ fn finish(acc: &Acc, spec: &AggSpec) -> Value {
                 // Apply the aggregate's own ORDER BY here rather than while
                 // collecting, so the result is the same whether the rows arrived in
                 // one pass or as merged partial aggregates.
-                if spec.order.is_empty() || acc.concat_keys.len() != acc.concat.len() {
-                    Value::Text(acc.concat.join(sep))
+                let text = if spec.order.is_empty() || acc.concat_keys.len() != acc.concat.len() {
+                    acc.concat.join(sep)
                 } else {
                     let mut idx: Vec<usize> = (0..acc.concat.len()).collect();
                     idx.sort_by(|&x, &y| {
@@ -597,8 +600,9 @@ fn finish(acc: &Acc, spec: &AggSpec) -> Value {
                     });
                     let ordered: Vec<&str> =
                         idx.into_iter().map(|i| acc.concat[i].as_str()).collect();
-                    Value::Text(ordered.join(sep))
-                }
+                    ordered.join(sep)
+                };
+                Value::Text(truncate_utf8(text, spec.group_concat_max_len))
             }
         }
         AggFunc::Facet => {
@@ -699,6 +703,21 @@ fn finish(acc: &Acc, spec: &AggSpec) -> Value {
             u64::MAX
         }),
     }
+}
+
+fn truncate_utf8(mut text: String, max_len: Option<usize>) -> String {
+    let Some(max_len) = max_len else {
+        return text;
+    };
+    if text.len() <= max_len {
+        return text;
+    }
+    let mut end = max_len;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+    text
 }
 
 fn num(v: &Value) -> Option<f64> {
