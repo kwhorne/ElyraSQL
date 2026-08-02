@@ -1140,6 +1140,88 @@ async fn alter_table_rename_index_rekeys_existing_entries() {
 }
 
 #[tokio::test]
+async fn multi_operation_alter_is_statement_atomic() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop(
+        "CREATE TABLE alter_atomic_auto (
+            id INT PRIMARY KEY,
+            payload INT
+        )",
+    )
+    .await
+    .unwrap();
+    assert!(c
+        .query_drop(
+            "ALTER TABLE alter_atomic_auto
+             ADD COLUMN leaked INT DEFAULT 7,
+             ADD INDEX leaked_idx (payload),
+             DROP COLUMN no_such",
+        )
+        .await
+        .is_err());
+    let leaked_columns: i64 = c
+        .query_first(
+            "SELECT COUNT(*) FROM information_schema.columns
+             WHERE table_name = 'alter_atomic_auto'
+               AND column_name = 'leaked'",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(leaked_columns, 0, "failed ALTER leaked an earlier column");
+    let indexes: Vec<String> = c
+        .query("SHOW INDEX FROM alter_atomic_auto")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row: mysql_async::Row| row.get("Key_name").unwrap())
+        .collect();
+    assert!(
+        indexes.iter().all(|name| name != "leaked_idx"),
+        "failed ALTER leaked an earlier index: {indexes:?}"
+    );
+
+    c.query_drop("CREATE TABLE alter_atomic_txn (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop("START TRANSACTION").await.unwrap();
+    c.query_drop("INSERT INTO alter_atomic_txn VALUES (1)")
+        .await
+        .unwrap();
+    assert!(c
+        .query_drop(
+            "ALTER TABLE alter_atomic_txn
+             ADD COLUMN leaked INT DEFAULT 7,
+             DROP COLUMN no_such",
+        )
+        .await
+        .is_err());
+    c.query_drop("COMMIT").await.unwrap();
+
+    let rows: Vec<i64> = c.query("SELECT id FROM alter_atomic_txn").await.unwrap();
+    assert_eq!(
+        rows,
+        [1],
+        "statement rollback discarded prior transaction work"
+    );
+    let leaked_columns: i64 = c
+        .query_first(
+            "SELECT COUNT(*) FROM information_schema.columns
+             WHERE table_name = 'alter_atomic_txn'
+               AND column_name = 'leaked'",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        leaked_columns, 0,
+        "failed ALTER leaked inside a transaction"
+    );
+}
+
+#[tokio::test]
 async fn add_auto_increment_primary_key_backfills_existing_rows() {
     let srv = TestServer::start().await;
     let mut c = srv.conn().await;

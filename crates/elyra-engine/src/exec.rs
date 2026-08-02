@@ -2066,6 +2066,56 @@ pub async fn alter_table(
     name: &ObjectName,
     ops: &[AlterTableOperation],
 ) -> Result<QueryResult> {
+    // ALTER helpers persist catalog, row, and index changes independently. Keep
+    // the whole statement behind a private checkpoint so a later operation
+    // cannot expose changes made by an earlier one.
+    let implicit_transaction = !db.in_txn();
+    if implicit_transaction {
+        db.begin()?;
+    }
+    let checkpoint = match db.transaction_checkpoint() {
+        Ok(checkpoint) => checkpoint,
+        Err(error) => {
+            if implicit_transaction {
+                db.rollback();
+            }
+            return Err(error);
+        }
+    };
+
+    match alter_table_inner(db, name, ops).await {
+        Ok(result) => {
+            if let Err(error) = db.release_transaction_checkpoint(checkpoint) {
+                if implicit_transaction {
+                    db.rollback();
+                }
+                return Err(error);
+            }
+            if implicit_transaction {
+                db.commit().await?;
+            }
+            Ok(result)
+        }
+        Err(error) => {
+            if let Err(rollback_error) = db.rollback_transaction_checkpoint(checkpoint) {
+                if implicit_transaction {
+                    db.rollback();
+                }
+                return Err(rollback_error);
+            }
+            if implicit_transaction {
+                db.rollback();
+            }
+            Err(error)
+        }
+    }
+}
+
+async fn alter_table_inner(
+    db: &Session,
+    name: &ObjectName,
+    ops: &[AlterTableOperation],
+) -> Result<QueryResult> {
     let tname = stored_table_ident(db, name)?;
 
     // Qualifier errors must be discovered before any ALTER operation commits.
