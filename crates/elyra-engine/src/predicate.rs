@@ -612,6 +612,10 @@ fn eval_function(f: &sqlparser::ast::Function, schema: &Schema, row: &[Value]) -
         .last()
         .map(|i| i.value.to_ascii_lowercase())
         .unwrap_or_default();
+    let signature_arity = function_arg_exprs(f)?.len();
+    if scalar_function_supported(&name) {
+        validate_scalar_function_arity(&name, signature_arity)?;
+    }
 
     if name == "json_extract" {
         let args = function_arg_exprs(f)?;
@@ -1658,6 +1662,173 @@ fn eval_scalar(name: &str, a: &[Value]) -> Result<Option<Value>> {
         _ => return Ok(None),
     };
     Ok(Some(out))
+}
+
+/// Whether the scalar evaluator recognises a function name. Static statement
+/// validation uses this without evaluating user data or running a query.
+pub(crate) fn scalar_function_supported(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    if matches!(
+        name.as_str(),
+        "json_extract"
+            | "json_unquote"
+            | "json_array"
+            | "json_object"
+            | "json_quote"
+            | "json_valid"
+            | "json_type"
+            | "json_length"
+            | "json_keys"
+            | "json_contains"
+            | "json_set"
+            | "json_insert"
+            | "json_replace"
+            | "json_remove"
+            | "coalesce"
+            | "isnull"
+            | "strcmp"
+            | "ifnull"
+            | "nvl"
+            | "nullif"
+            | "if"
+            | "timestampdiff"
+            | "timestampadd"
+            | "date_add"
+            | "adddate"
+            | "date_sub"
+            | "subdate"
+            | "vec_distance"
+            | "vec_l2_distance"
+            | "vec_distance_l2"
+            | "vec_cosine_distance"
+            | "vec_distance_cosine"
+            | "vec_inner_product"
+            | "vec_distance_ip"
+            // LN/LOG have an arity-sensitive match in `eval_scalar`; four dummy
+            // arguments below would otherwise make these supported names miss.
+            | "ln"
+            | "log"
+    ) {
+        return true;
+    }
+    let dummy = [Value::Null, Value::Null, Value::Null, Value::Null];
+    matches!(eval_scalar(&name, &dummy), Ok(Some(_)))
+}
+
+/// Validate arities that the scalar dispatcher treats as part of a function's
+/// signature. Other scalar functions intentionally retain their runtime's
+/// lenient argument handling.
+pub(crate) fn validate_scalar_function_arity(name: &str, arity: usize) -> Result<()> {
+    let name = name.to_ascii_lowercase();
+    let valid = match name.as_str() {
+        "curdate" | "current_date" | "uuid" | "version" | "database" | "schema" | "user"
+        | "current_user" | "session_user" | "system_user" | "connection_id" | "row_count"
+        | "found_rows" | "current_role" | "pi" => arity == 0,
+        "now" | "current_timestamp" | "localtime" | "localtimestamp" | "sysdate" | "curtime"
+        | "current_time" | "unix_timestamp" | "last_insert_id" | "rand" => arity <= 1,
+        "year"
+        | "month"
+        | "day"
+        | "dayofmonth"
+        | "hour"
+        | "minute"
+        | "second"
+        | "quarter"
+        | "dayofweek"
+        | "dayofyear"
+        | "weekday"
+        | "date"
+        | "time"
+        | "last_day"
+        | "upper"
+        | "ucase"
+        | "lower"
+        | "lcase"
+        | "length"
+        | "octet_length"
+        | "char_length"
+        | "character_length"
+        | "reverse"
+        | "trim"
+        | "ltrim"
+        | "rtrim"
+        | "space"
+        | "bit_count"
+        | "to_days"
+        | "ascii"
+        | "ord"
+        | "bin"
+        | "oct"
+        | "crc32"
+        | "abs"
+        | "ceil"
+        | "ceiling"
+        | "floor"
+        | "sign"
+        | "sqrt"
+        | "exp"
+        | "ln"
+        | "log"
+        | "log10"
+        | "log2"
+        | "st_x"
+        | "st_y"
+        | "st_astext"
+        | "st_aswkt"
+        | "st_geomfromtext"
+        | "st_geometryfromtext"
+        | "st_pointfromtext"
+        | "st_geomfromwkt"
+        | "radians"
+        | "degrees"
+        | "time_to_sec"
+        | "sec_to_time"
+        | "soundex"
+        | "dayname"
+        | "monthname"
+        | "md5"
+        | "sha"
+        | "sha1"
+        | "hex"
+        | "unhex" => arity == 1,
+        "datediff" | "date_format" | "str_to_date" | "repeat" | "left" | "right" | "instr"
+        | "locate" | "position" | "power" | "pow" | "mod" | "truncate" | "point"
+        | "st_distance" | "regexp_substr" | "sha2" | "find_in_set" | "format" => arity == 2,
+        "week" | "yearweek" | "round" | "from_unixtime" => (1..=2).contains(&arity),
+        "substr" | "substring" | "mid" => (2..=3).contains(&arity),
+        "substring_index" | "conv" | "replace" | "lpad" | "rpad" | "regexp_replace" => arity == 3,
+        "insert" => arity == 4,
+        "field" | "elt" | "concat_ws" | "greatest" | "least" => arity >= 2,
+        "concat" | "char" | "coalesce" => arity >= 1,
+        "json_extract" => arity == 2,
+        "json_unquote" | "json_quote" | "json_valid" | "json_type" => arity == 1,
+        "json_array" => true,
+        "json_object" => arity.is_multiple_of(2),
+        "json_length" | "json_keys" => (1..=2).contains(&arity),
+        "json_contains" => (2..=3).contains(&arity),
+        "json_set" | "json_insert" | "json_replace" => arity >= 3 && arity % 2 == 1,
+        "json_remove" => arity >= 2,
+        "isnull" => arity == 1,
+        "strcmp" | "ifnull" | "nvl" | "nullif" | "date_add" | "adddate" | "date_sub"
+        | "subdate" => arity == 2,
+        "if" | "timestampdiff" | "timestampadd" => arity == 3,
+        "vec_distance"
+        | "vec_l2_distance"
+        | "vec_distance_l2"
+        | "vec_cosine_distance"
+        | "vec_distance_cosine"
+        | "vec_inner_product"
+        | "vec_distance_ip" => arity == 2,
+        _ => true,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(Error::Query(format!(
+            "invalid argument count for {}",
+            name.to_ascii_uppercase()
+        )))
+    }
 }
 
 /// Parse a WKT `POINT(x y)` into its coordinates.
@@ -3063,6 +3234,38 @@ mod decimal_arithmetic_tests {
             &Value::Int(1)
         )
         .is_err());
+    }
+}
+
+#[cfg(test)]
+mod scalar_function_support_tests {
+    use super::{scalar_function_supported, validate_scalar_function_arity};
+
+    #[test]
+    fn mirrors_special_and_arity_sensitive_scalar_dispatch() {
+        for name in [
+            "json_extract",
+            "coalesce",
+            "date_add",
+            "vec_distance",
+            "ln",
+            "log",
+        ] {
+            assert!(scalar_function_supported(name), "{name}");
+        }
+        assert!(!scalar_function_supported("no_such_function"));
+    }
+
+    #[test]
+    fn validates_strict_scalar_arities_without_evaluating_arguments() {
+        assert!(validate_scalar_function_arity("json_extract", 2).is_ok());
+        assert!(validate_scalar_function_arity("json_extract", 1).is_err());
+        assert!(validate_scalar_function_arity("json_object", 4).is_ok());
+        assert!(validate_scalar_function_arity("json_object", 3).is_err());
+        assert!(validate_scalar_function_arity("vec_distance", 2).is_ok());
+        assert!(validate_scalar_function_arity("vec_distance", 3).is_err());
+        assert!(validate_scalar_function_arity("year", 1).is_ok());
+        assert!(validate_scalar_function_arity("year", 0).is_err());
     }
 }
 
