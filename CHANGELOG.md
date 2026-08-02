@@ -6,6 +6,35 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.9.3] - 2026-08-02
+
+A small release: no behaviour changes, no new SQL, nothing to check before
+upgrading. It exists because the change it carries is worth having sooner than
+the next feature release.
+
+### Changed
+
+- **`WHERE` filtering on the streaming join paths takes a fast path.** An
+  `AND`-connected `WHERE` is split at plan time and every simple
+  `col <op> col` comparison resolved to column indices once, instead of
+  resolving each reference twice per row — once for the value and again for the
+  collation, each walk ending in a string comparison. Profiling put
+  `predicate::matches` at 95% of CPU in the streaming aggregate path.
+
+  Measured on this release's tree: the heaviest wire test drops from **14.5s to
+  1.9s** in debug builds and 2.2s to 1.7s in release, and the full wire suite
+  from 22.3s to 17.2s. Together with the nested-loop fast path in 1.9.2 the
+  suite has gone from 73s to 17s in debug, which is the difference between a
+  test run people wait for and one they don't.
+
+  Release-mode gains are smaller, because this removes interpretive overhead the
+  optimiser already handled. Anything the shape detector does not recognise —
+  `OR`, expressions, literals — falls through to the unchanged evaluator; all of
+  those were checked against MySQL 8.4 along with collation-sensitive
+  comparisons and the `LEFT JOIN ... IS NULL` anti-join.
+- The fuzz workflow uses `actions/upload-artifact@v7`, so every artifact action
+  in the repository is on the same major.
+
 ## [1.9.2] - 2026-08-02
 
 Eleven contributions, and a theme: **the things we never exercised were the
