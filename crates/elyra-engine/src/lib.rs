@@ -1302,6 +1302,13 @@ impl Engine {
         if let Some(stripped) = strip_create_table_options(&subst_sql) {
             subst_sql = Cow::Owned(stripped);
         }
+        // sqlparser 0.53 represents inline key parts as bare identifiers and
+        // rejects MySQL's optional `(length)` suffix. ElyraSQL's B-tree index
+        // representation has no prefix-length field, so accept the MySQL DDL
+        // spelling while retaining the existing full-column index behaviour.
+        if let Some(stripped) = strip_index_prefix_lengths(&subst_sql) {
+            subst_sql = Cow::Owned(stripped);
+        }
         // CHANGE/MODIFY parse column options manually in sqlparser 0.53 and
         // omit COLLATE. Rewrite only top-level ALTER TABLE collation clauses to
         // the equivalent CHARACTER SET option, which that parser path retains.
@@ -3626,6 +3633,217 @@ fn strip_create_table_options(sql: &str) -> Option<String> {
     Some(sql[..=close].to_string())
 }
 
+/// Strip MySQL key-part prefix lengths from inline `CREATE TABLE` indexes.
+///
+/// `sqlparser` 0.53 parses an inline key column as an [`Ident`] and therefore
+/// rejects `KEY key_name (column_name(191))`. ElyraSQL currently stores only
+/// full-column index definitions, so this accepts the MySQL syntax without
+/// changing the existing catalog or index-maintenance representation. The
+/// rewrite is deliberately limited to table-level PRIMARY, UNIQUE, KEY, and
+/// INDEX constraints; type widths and expressions elsewhere are left intact.
+fn strip_index_prefix_lengths(sql: &str) -> Option<String> {
+    let statement = sql.trim_start();
+    if !keyword_at(statement.as_bytes(), 0, b"create") {
+        return None;
+    }
+
+    let open = first_unquoted_lparen(sql)?;
+    let before = &sql[..open];
+    if find_top_level_keyword(before, b"table").is_none()
+        || find_top_level_keyword(before, b"as").is_some()
+        || find_top_level_keyword(before, b"select").is_some()
+        || find_top_level_keyword(before, b"like").is_some()
+    {
+        return None;
+    }
+    let close = matching_paren_end(sql, open)? - 1;
+
+    let body = &sql[open + 1..close];
+    let mut changed = false;
+    let body = split_top_level(body, ',')
+        .into_iter()
+        .map(|constraint| {
+            let rewritten = strip_index_prefix_lengths_from_constraint(&constraint);
+            changed |= rewritten.is_some();
+            rewritten.unwrap_or(constraint)
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    changed.then(|| format!("{}{}{}", &sql[..=open], body, &sql[close..]))
+}
+
+/// The first opening parenthesis outside quoted SQL text/identifiers.
+fn first_unquoted_lparen(sql: &str) -> Option<usize> {
+    let bytes = sql.as_bytes();
+    let mut position = 0;
+    while position < bytes.len() {
+        match bytes[position] {
+            b'\'' | b'"' | b'`' => position = quoted_end(bytes, position)?,
+            b'(' => return Some(position),
+            _ => position += 1,
+        }
+    }
+    None
+}
+
+/// Remove `(digits)` directly following top-level key-column identifiers.
+fn strip_index_prefix_lengths_from_constraint(constraint: &str) -> Option<String> {
+    if !is_inline_index_constraint(constraint) {
+        return None;
+    }
+    let open = first_unquoted_lparen(constraint)?;
+    let close = matching_paren_end(constraint, open)? - 1;
+    let columns = &constraint[open + 1..close];
+    let bytes = columns.as_bytes();
+    let mut depth = 0usize;
+    let mut position = 0;
+    let mut copied_through = 0;
+    let mut rewritten = String::with_capacity(constraint.len());
+
+    while position < bytes.len() {
+        match bytes[position] {
+            b'\'' | b'"' => position = quoted_end(bytes, position)?,
+            b'`' if depth == 0 => {
+                let ident_end = quoted_end(bytes, position)?;
+                let prefix_end = index_prefix_length_end(bytes, ident_end);
+                if prefix_end > ident_end {
+                    rewritten.push_str(&columns[copied_through..ident_end]);
+                    copied_through = prefix_end;
+                    position = prefix_end;
+                } else {
+                    position = ident_end;
+                }
+            }
+            b'`' => position = quoted_end(bytes, position)?,
+            b'(' => {
+                depth += 1;
+                position += 1;
+            }
+            b')' => {
+                depth = depth.saturating_sub(1);
+                position += 1;
+            }
+            byte if depth == 0 && is_identifier_start(byte) => {
+                let ident_end = bare_identifier_end(bytes, position);
+                let prefix_end = index_prefix_length_end(bytes, ident_end);
+                if prefix_end > ident_end {
+                    rewritten.push_str(&columns[copied_through..ident_end]);
+                    copied_through = prefix_end;
+                    position = prefix_end;
+                } else {
+                    position = ident_end;
+                }
+            }
+            _ => position += 1,
+        }
+    }
+
+    if copied_through == 0 {
+        return None;
+    }
+    rewritten.push_str(&columns[copied_through..]);
+    Some(format!(
+        "{}{}{}",
+        &constraint[..=open],
+        rewritten,
+        &constraint[close..]
+    ))
+}
+
+fn is_inline_index_constraint(constraint: &str) -> bool {
+    let Some(tokens) = mysql_ddl_tokens(constraint) else {
+        return false;
+    };
+    let mut position = 0;
+    if mysql_keyword(&tokens, position, "constraint") {
+        position += 1;
+        if !matches!(tokens.get(position), Some(Token::Word(_))) {
+            return false;
+        }
+        position += 1;
+    }
+    if mysql_keyword(&tokens, position, "primary") {
+        return mysql_keyword(&tokens, position + 1, "key");
+    }
+    mysql_keyword(&tokens, position, "unique")
+        || mysql_keyword(&tokens, position, "key")
+        || mysql_keyword(&tokens, position, "index")
+}
+
+fn is_identifier_start(byte: u8) -> bool {
+    !byte.is_ascii() || byte.is_ascii_alphabetic() || matches!(byte, b'_' | b'$')
+}
+
+fn bare_identifier_end(bytes: &[u8], mut position: usize) -> usize {
+    while bytes.get(position).is_some_and(|byte| {
+        !byte.is_ascii() || byte.is_ascii_alphanumeric() || matches!(*byte, b'_' | b'$')
+    }) {
+        position += 1;
+    }
+    position
+}
+
+/// Return the byte after a well-formed key-part suffix, or `ident_end` when
+/// the following text is not a `(digits)` prefix length.
+fn index_prefix_length_end(bytes: &[u8], ident_end: usize) -> usize {
+    let mut position = ident_end;
+    while bytes
+        .get(position)
+        .is_some_and(|byte| byte.is_ascii_whitespace())
+    {
+        position += 1;
+    }
+    if bytes.get(position) != Some(&b'(') {
+        return ident_end;
+    }
+    position += 1;
+    while bytes
+        .get(position)
+        .is_some_and(|byte| byte.is_ascii_whitespace())
+    {
+        position += 1;
+    }
+    let digits_start = position;
+    while bytes.get(position).is_some_and(u8::is_ascii_digit) {
+        position += 1;
+    }
+    if position == digits_start {
+        return ident_end;
+    }
+    while bytes
+        .get(position)
+        .is_some_and(|byte| byte.is_ascii_whitespace())
+    {
+        position += 1;
+    }
+    if bytes.get(position) == Some(&b')') {
+        position + 1
+    } else {
+        ident_end
+    }
+}
+
+/// Return the byte after a quoted SQL literal or identifier.
+fn quoted_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let quote = *bytes.get(start)?;
+    let mut position = start + 1;
+    while position < bytes.len() {
+        if bytes[position] == b'\\' {
+            position = (position + 2).min(bytes.len());
+            continue;
+        }
+        if bytes[position] == quote {
+            if bytes.get(position + 1) == Some(&quote) {
+                position += 2;
+                continue;
+            }
+            return Some(position + 1);
+        }
+        position += 1;
+    }
+    None
+}
+
 /// Extract a trailing `LIMIT <n>` from an `UPDATE`/`DELETE` statement when the
 /// parser does not accept that MySQL form.
 fn parse_dml_limit(sql: &str) -> Option<DmlLimit> {
@@ -3918,6 +4136,9 @@ pub fn fuzz_preprocess_parse(sql: &str) {
         s = x;
     }
     if let Some(x) = strip_create_table_options(&s) {
+        s = x;
+    }
+    if let Some(x) = strip_index_prefix_lengths(&s) {
         s = x;
     }
     let _ = parse_update_modifiers(&s);
@@ -4427,9 +4648,15 @@ mod comma_update_tests {
 mod mysql_ddl_compat_tests {
     use super::{
         mysql_show_index_table, parse_mysql_rename, require_privilege,
-        rewrite_alter_column_collations, strip_create_table_options, MysqlRename, PrivilegedAction,
+        rewrite_alter_column_collations, strip_create_table_options, strip_index_prefix_lengths,
+        Engine, MysqlRename, PrivilegedAction,
     };
+    use crate::catalog;
     use elyra_core::Privilege;
+    use elyra_storage::Db;
+    use sqlparser::ast::{Statement, TableConstraint};
+    use sqlparser::dialect::MySqlDialect;
+    use sqlparser::parser::Parser;
 
     #[test]
     fn table_option_stripping_never_touches_a_ctas() {
@@ -4458,6 +4685,91 @@ mod mysql_ddl_compat_tests {
             strip_create_table_options("CREATE TABLE `as_of` (id INT) ROW_FORMAT=DYNAMIC")
                 .as_deref(),
             Some("CREATE TABLE `as_of` (id INT)")
+        );
+    }
+
+    #[test]
+    fn strips_only_inline_index_prefix_lengths() {
+        let sql = "CREATE TABLE `prefixes` (\
+            `id` INT,\
+            `select` VARCHAR(255),\
+            `body` VARCHAR(255),\
+            PRIMARY KEY (`id`(8)),\
+            UNIQUE KEY `uniq_select` (`select` (191)),\
+            KEY `body prefix` (`body`(16), `select`( 12 ))\
+        )";
+        let rewritten = strip_index_prefix_lengths(sql).unwrap();
+        let statements = Parser::parse_sql(&MySqlDialect {}, &rewritten).unwrap();
+        let [Statement::CreateTable(table)] = statements.as_slice() else {
+            panic!("expected CREATE TABLE");
+        };
+
+        assert!(matches!(
+            &table.constraints[0],
+            TableConstraint::PrimaryKey { columns, .. }
+                if columns.iter().map(|column| column.value.as_str()).eq(["id"])
+        ));
+        assert!(matches!(
+            &table.constraints[1],
+            TableConstraint::Unique {
+                index_name: Some(name),
+                columns,
+                ..
+            } if name.value == "uniq_select"
+                && columns.iter().map(|column| column.value.as_str()).eq(["select"])
+        ));
+        assert!(matches!(
+            &table.constraints[2],
+            TableConstraint::Index {
+                name: Some(name),
+                columns,
+                ..
+            } if name.value == "body prefix"
+                && columns.iter().map(|column| column.value.as_str()).eq(["body", "select"])
+        ));
+
+        assert!(strip_index_prefix_lengths(
+            "CREATE TABLE widths (name VARCHAR(191), CHECK (length(name) > 1))"
+        )
+        .is_none());
+        assert!(
+            strip_index_prefix_lengths("CREATE TABLE copy AS SELECT name(191) FROM widths")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn creates_catalog_indexes_from_prefixed_key_parts() {
+        let engine = Engine::new(Db::in_memory().unwrap());
+        let session = engine.session();
+        engine
+            .execute(
+                "CREATE TABLE `prefixes` (\
+                    `id` INT,\
+                    `select` VARCHAR(255),\
+                    `body` VARCHAR(255),\
+                    PRIMARY KEY (`id`(8)),\
+                    UNIQUE KEY `uniq_select` (`select`(191)),\
+                    KEY `body prefix` (`body`(16), `select`(12))\
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+                Privilege::Admin,
+                &session,
+            )
+            .await
+            .unwrap();
+
+        let definition = catalog::load(&session, "prefixes").await.unwrap();
+        assert_eq!(definition.pk_cols, vec![0]);
+        assert_eq!(
+            definition
+                .indexes
+                .iter()
+                .map(|index| (index.name.as_str(), index.cols.as_slice(), index.unique))
+                .collect::<Vec<_>>(),
+            [
+                ("uniq_select", &[1][..], true),
+                ("body prefix", &[2, 1][..], false),
+            ]
         );
     }
 
@@ -4787,6 +5099,7 @@ mod fuzz_props {
         parse_dml_limit, parse_mysql_rename, parse_update_modifiers,
         rewrite_alter_column_collations, rewrite_comma_update, rewrite_insert_set,
         rewrite_odd_0x_literals, split_top_level, strip_create_table_options,
+        strip_index_prefix_lengths,
     };
     use proptest::prelude::*;
 
@@ -4802,6 +5115,7 @@ mod fuzz_props {
             let _ = rewrite_insert_set(&s);
             let _ = rewrite_comma_update(&s);
             let _ = strip_create_table_options(&s);
+            let _ = strip_index_prefix_lengths(&s);
             let _ = parse_dml_limit(&s);
             let _ = parse_update_modifiers(&s);
             let _ = parse_mysql_rename(&s);
@@ -4820,6 +5134,7 @@ mod fuzz_props {
             let _ = rewrite_insert_set(&format!("INSERT IGNORE INTO `t` SET {a}"));
             let _ = rewrite_comma_update(&format!("UPDATE {a} SET x = 1 WHERE y = 2"));
             let _ = strip_create_table_options(&format!("CREATE TABLE t (id INT) {a}"));
+            let _ = strip_index_prefix_lengths(&format!("CREATE TABLE t (KEY i (a(191))) {a}"));
             let _ = rewrite_alter_column_collations(&format!(
                 "ALTER TABLE t CHANGE a b TEXT {a}"
             ));
