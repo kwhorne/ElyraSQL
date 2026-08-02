@@ -769,6 +769,7 @@ async fn show_grants(toks: &[Tok], sess: &Session) -> Result<QueryResult> {
         nullable: false,
         collation: elyra_core::Collation::Ci,
         qualifier: Vec::new(),
+        result_metadata: Default::default(),
     }]);
     let mut rows = Vec::new();
     let emit = |rows: &mut Vec<Vec<Value>>, user: &str, flags: u32| {

@@ -90,6 +90,23 @@ pub struct ColumnDef {
     /// on [`Schema`], this is transient so catalog encoding stays compatible.
     #[serde(skip)]
     pub qualifier: Vec<String>,
+    /// Direct-storage attributes used only when a column is sent in a result
+    /// set. This stays out of catalog encoding so existing databases remain
+    /// readable; the engine reconstructs it from the table definition on load.
+    #[serde(skip)]
+    pub result_metadata: ResultColumnMetadata,
+}
+
+/// Source-key attributes used by the MySQL result-column descriptor.
+///
+/// They deliberately live beside, rather than inside, persisted table schema:
+/// indexes and auto-increment state already describe them in the catalog, and
+/// adding an encoded field would make bincode catalogs incompatible.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ResultColumnMetadata {
+    pub primary_key: bool,
+    pub unique_key: bool,
+    pub auto_increment: bool,
 }
 
 impl ColumnDef {
@@ -101,6 +118,7 @@ impl ColumnDef {
             nullable,
             collation: Collation::Ci,
             qualifier: Vec::new(),
+            result_metadata: ResultColumnMetadata::default(),
         }
     }
 
@@ -198,7 +216,7 @@ impl Schema {
 
 #[cfg(test)]
 mod schema_metadata_tests {
-    use super::{ColumnDef, ColumnType, Schema};
+    use super::{ColumnDef, ColumnType, ResultColumnMetadata, Schema};
 
     fn cols() -> Vec<ColumnDef> {
         vec![
@@ -212,7 +230,16 @@ mod schema_metadata_tests {
         let plain = Schema::new(cols());
         let qualified_columns = cols()
             .into_iter()
-            .map(|column| column.with_qualifier(vec!["elyra".into(), "users".into()]))
+            .enumerate()
+            .map(|(index, mut column)| {
+                column.qualifier = vec!["elyra".into(), "users".into()];
+                column.result_metadata = ResultColumnMetadata {
+                    primary_key: index == 0,
+                    unique_key: index == 1,
+                    auto_increment: index == 0,
+                };
+                column
+            })
             .collect();
         let qualified =
             Schema::with_tables(qualified_columns, vec!["users".into(), "users".into()]);
@@ -228,6 +255,10 @@ mod schema_metadata_tests {
             .columns
             .iter()
             .all(|column| column.qualifier.is_empty()));
+        assert!(decoded
+            .columns
+            .iter()
+            .all(|column| column.result_metadata == ResultColumnMetadata::default()));
     }
 
     #[test]

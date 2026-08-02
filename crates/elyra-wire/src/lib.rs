@@ -75,6 +75,10 @@ pub struct Column {
     ///
     /// Of particular interest are `ColumnFlags::UNSIGNED_FLAG` and `ColumnFlags::NOT_NULL_FLAG`.
     pub colflags: ColumnFlags,
+    /// Maximum display width for this result column.
+    pub column_length: u32,
+    /// Decimal scale advertised by this result column.
+    pub decimals: u8,
 }
 
 /// QueryStatusInfo represents the status of a query.
@@ -799,6 +803,8 @@ where
                                     column: String::from_utf8_lossy(var_with_at).to_string(),
                                     coltype: myc::constants::ColumnType::MYSQL_TYPE_LONG,
                                     colflags: myc::constants::ColumnFlags::UNSIGNED_FLAG,
+                                    column_length: 10,
+                                    decimals: 0,
                                 }];
 
                                 match var {

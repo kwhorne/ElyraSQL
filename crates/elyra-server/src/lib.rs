@@ -4,6 +4,7 @@
 //! One TCP connection = one [`ElyraShim`] over the shared [`Engine`].
 
 use std::collections::HashMap;
+use std::io::{self, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -11,7 +12,7 @@ use std::sync::Arc;
 use elyra_engine::{Engine, QueryResult, Session};
 use elyra_wire::{
     AsyncMysqlIntermediary, AsyncMysqlShim, Column, ColumnFlags, ColumnType, ErrorKind, InitWriter,
-    OkResponse, ParamParser, QueryResultWriter, StatementMetaWriter, StatusFlags,
+    OkResponse, ParamParser, QueryResultWriter, StatementMetaWriter, StatusFlags, ToMysqlValue,
 };
 use tokio::io::AsyncWrite;
 use tokio::net::TcpListener;
@@ -399,13 +400,26 @@ fn stmt_describe_enabled() -> bool {
     })
 }
 
-/// Column flags for a result column: mark `BIGINT UNSIGNED` with UNSIGNED_FLAG so
-/// clients interpret large values (bitwise results, unsigned columns) correctly.
-fn column_flags(ty: &elyra_core::ColumnType) -> ColumnFlags {
-    match ty {
-        elyra_core::ColumnType::UInt => ColumnFlags::UNSIGNED_FLAG,
-        _ => ColumnFlags::empty(),
+/// Column flags for a result column. Key attributes are reconstructed from the
+/// table definition by the engine; expressions retain the empty default.
+fn column_flags(column: &elyra_core::ColumnDef) -> ColumnFlags {
+    let mut flags = ColumnFlags::empty();
+    if !column.nullable {
+        flags |= ColumnFlags::NOT_NULL_FLAG;
     }
+    if column.result_metadata.primary_key {
+        flags |= ColumnFlags::PRI_KEY_FLAG;
+    }
+    if column.result_metadata.unique_key {
+        flags |= ColumnFlags::UNIQUE_KEY_FLAG;
+    }
+    if column.result_metadata.auto_increment {
+        flags |= ColumnFlags::AUTO_INCREMENT_FLAG;
+    }
+    if matches!(column.ty, elyra_core::ColumnType::UInt) {
+        flags |= ColumnFlags::UNSIGNED_FLAG;
+    }
+    flags
 }
 
 fn column_type(ty: &elyra_core::ColumnType) -> ColumnType {
@@ -417,12 +431,52 @@ fn column_type(ty: &elyra_core::ColumnType) -> ColumnType {
         elyra_core::ColumnType::Text => ColumnType::MYSQL_TYPE_VAR_STRING,
         elyra_core::ColumnType::Bytes => ColumnType::MYSQL_TYPE_BLOB,
         elyra_core::ColumnType::Vector(_) => ColumnType::MYSQL_TYPE_VAR_STRING,
-        // Date/time/decimal are sent as their canonical string form.
-        elyra_core::ColumnType::Date => ColumnType::MYSQL_TYPE_VAR_STRING,
-        elyra_core::ColumnType::DateTime => ColumnType::MYSQL_TYPE_VAR_STRING,
-        elyra_core::ColumnType::Decimal(_, _) => ColumnType::MYSQL_TYPE_VAR_STRING,
-        elyra_core::ColumnType::Time => ColumnType::MYSQL_TYPE_VAR_STRING,
-        elyra_core::ColumnType::Json => ColumnType::MYSQL_TYPE_VAR_STRING,
+        elyra_core::ColumnType::Date => ColumnType::MYSQL_TYPE_DATE,
+        elyra_core::ColumnType::DateTime => ColumnType::MYSQL_TYPE_DATETIME,
+        elyra_core::ColumnType::Decimal(_, _) => ColumnType::MYSQL_TYPE_NEWDECIMAL,
+        elyra_core::ColumnType::Time => ColumnType::MYSQL_TYPE_TIME,
+        elyra_core::ColumnType::Json => ColumnType::MYSQL_TYPE_JSON,
+    }
+}
+
+fn column_length(ty: &elyra_core::ColumnType) -> u32 {
+    match ty {
+        elyra_core::ColumnType::Bool => 1,
+        elyra_core::ColumnType::Int | elyra_core::ColumnType::UInt => 20,
+        elyra_core::ColumnType::Float => 22,
+        // The engine does not yet persist VARCHAR/VARBINARY declarations; use
+        // their underlying TEXT/BLOB capacity until declared types are carried
+        // separately.
+        elyra_core::ColumnType::Text | elyra_core::ColumnType::Bytes => 65_535,
+        elyra_core::ColumnType::Vector(dimensions) => {
+            dimensions.saturating_mul(16).saturating_add(2)
+        }
+        elyra_core::ColumnType::Date => 10,
+        elyra_core::ColumnType::DateTime => 19,
+        elyra_core::ColumnType::Decimal(precision, scale) => {
+            u32::from(*precision) + 1 + u32::from(*scale > 0)
+        }
+        elyra_core::ColumnType::Time => 10,
+        elyra_core::ColumnType::Json => u32::MAX,
+    }
+}
+
+fn column_decimals(ty: &elyra_core::ColumnType) -> u8 {
+    match ty {
+        elyra_core::ColumnType::Float => 31,
+        elyra_core::ColumnType::Decimal(_, scale) => *scale,
+        _ => 0,
+    }
+}
+
+fn result_column(table: String, column: &elyra_core::ColumnDef) -> Column {
+    Column {
+        table,
+        column: column.name.clone(),
+        coltype: column_type(&column.ty),
+        colflags: column_flags(column),
+        column_length: column_length(&column.ty),
+        decimals: column_decimals(&column.ty),
     }
 }
 
@@ -550,6 +604,8 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for ElyraShim {
                 column: "?".into(),
                 coltype: ColumnType::MYSQL_TYPE_VAR_STRING,
                 colflags: ColumnFlags::empty(),
+                column_length: 65_535,
+                decimals: 0,
             })
             .collect();
         // Optionally describe result columns statically (no execution) so drivers
@@ -563,11 +619,8 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for ElyraShim {
                     .columns
                     .iter()
                     .enumerate()
-                    .map(|(i, c)| Column {
-                        table: schema.table_of(i).unwrap_or_default().to_string(),
-                        column: c.name.clone(),
-                        coltype: column_type(&c.ty),
-                        colflags: column_flags(&c.ty),
+                    .map(|(i, c)| {
+                        result_column(schema.table_of(i).unwrap_or_default().to_string(), c)
                     })
                     .collect(),
                 None => Vec::new(),
@@ -690,6 +743,8 @@ async fn write_string_rows<W: AsyncWrite + Send + Unpin>(
             column: (*n).to_string(),
             coltype: ColumnType::MYSQL_TYPE_VAR_STRING,
             colflags: ColumnFlags::empty(),
+            column_length: 65_535,
+            decimals: 0,
         })
         .collect();
     let mut rw = results.start(&cols).await?;
@@ -730,11 +785,8 @@ async fn write_outcomes<W: AsyncWrite + Send + Unpin>(
                 .columns
                 .iter()
                 .enumerate()
-                .map(|(i, c)| Column {
-                    table: stream.schema.table_of(i).unwrap_or_default().to_string(),
-                    column: c.name.clone(),
-                    coltype: column_type(&c.ty),
-                    colflags: column_flags(&c.ty),
+                .map(|(i, c)| {
+                    result_column(stream.schema.table_of(i).unwrap_or_default().to_string(), c)
                 })
                 .collect();
 
@@ -802,6 +854,114 @@ async fn write_outcomes<W: AsyncWrite + Send + Unpin>(
     }
 }
 
+/// A temporal result value encoded according to its MySQL binary wire type.
+/// Text result sets retain the engine's existing canonical string rendering.
+#[derive(Debug, Clone, Copy)]
+enum WireTemporal {
+    Date(i32),
+    DateTime(i64),
+    Time(i64),
+    /// A non-strict invalid DATE is retained by the engine as MySQL's zero
+    /// date sentinel rather than as a representable calendar date.
+    ZeroDate,
+    /// A non-strict invalid DATETIME is retained as its zero-date sentinel.
+    ZeroDateTime,
+}
+
+impl WireTemporal {
+    fn text(self) -> String {
+        match self {
+            WireTemporal::Date(days) => elyra_core::datetime::format_date(days),
+            WireTemporal::DateTime(micros) => elyra_core::datetime::format_datetime(micros),
+            WireTemporal::Time(micros) => elyra_core::datetime::format_time(micros),
+            WireTemporal::ZeroDate => "0000-00-00".to_string(),
+            WireTemporal::ZeroDateTime => "0000-00-00 00:00:00".to_string(),
+        }
+    }
+}
+
+impl ToMysqlValue for WireTemporal {
+    fn to_mysql_text<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+        self.text().to_mysql_text(writer)
+    }
+
+    fn to_mysql_bin<W: Write>(&self, writer: &mut W, column: &Column) -> io::Result<()> {
+        match *self {
+            WireTemporal::Date(days) if column.coltype == ColumnType::MYSQL_TYPE_DATE => {
+                let (year, month, day) = date_components(i64::from(days))?;
+                writer.write_all(&[4])?;
+                writer.write_all(&year.to_le_bytes())?;
+                writer.write_all(&[month, day])
+            }
+            WireTemporal::ZeroDate if column.coltype == ColumnType::MYSQL_TYPE_DATE => {
+                writer.write_all(&[4, 0, 0, 0, 0])
+            }
+            WireTemporal::DateTime(micros) if column.coltype == ColumnType::MYSQL_TYPE_DATETIME => {
+                let seconds = micros.div_euclid(1_000_000);
+                let fraction = micros.rem_euclid(1_000_000) as u32;
+                let days = seconds.div_euclid(86_400);
+                let seconds_of_day = seconds.rem_euclid(86_400);
+                let (year, month, day) = date_components(days)?;
+                let hour = u8::try_from(seconds_of_day / 3_600)
+                    .map_err(|_| invalid_temporal_value("hour out of range"))?;
+                let minute = u8::try_from((seconds_of_day % 3_600) / 60)
+                    .map_err(|_| invalid_temporal_value("minute out of range"))?;
+                let second = u8::try_from(seconds_of_day % 60)
+                    .map_err(|_| invalid_temporal_value("second out of range"))?;
+                writer.write_all(&[if fraction == 0 { 7 } else { 11 }])?;
+                writer.write_all(&year.to_le_bytes())?;
+                writer.write_all(&[month, day, hour, minute, second])?;
+                if fraction != 0 {
+                    writer.write_all(&fraction.to_le_bytes())?;
+                }
+                Ok(())
+            }
+            WireTemporal::ZeroDateTime if column.coltype == ColumnType::MYSQL_TYPE_DATETIME => {
+                writer.write_all(&[7, 0, 0, 0, 0, 0, 0, 0])
+            }
+            WireTemporal::Time(micros) if column.coltype == ColumnType::MYSQL_TYPE_TIME => {
+                let negative = micros.is_negative();
+                let magnitude = micros.unsigned_abs();
+                let days = magnitude / 86_400_000_000;
+                let seconds_of_day = (magnitude % 86_400_000_000) / 1_000_000;
+                let fraction = (magnitude % 1_000_000) as u32;
+                let days = u32::try_from(days)
+                    .map_err(|_| invalid_temporal_value("time span out of range"))?;
+                let hour = u8::try_from(seconds_of_day / 3_600)
+                    .map_err(|_| invalid_temporal_value("hour out of range"))?;
+                let minute = u8::try_from((seconds_of_day % 3_600) / 60)
+                    .map_err(|_| invalid_temporal_value("minute out of range"))?;
+                let second = u8::try_from(seconds_of_day % 60)
+                    .map_err(|_| invalid_temporal_value("second out of range"))?;
+                if magnitude == 0 {
+                    return writer.write_all(&[0]);
+                }
+                writer.write_all(&[if fraction == 0 { 8 } else { 12 }])?;
+                writer.write_all(&[u8::from(negative)])?;
+                writer.write_all(&days.to_le_bytes())?;
+                writer.write_all(&[hour, minute, second])?;
+                if fraction != 0 {
+                    writer.write_all(&fraction.to_le_bytes())?;
+                }
+                Ok(())
+            }
+            _ => Err(invalid_temporal_value("value does not match column type")),
+        }
+    }
+}
+
+fn date_components(days: i64) -> io::Result<(u16, u8, u8)> {
+    let (year, month, day) = elyra_core::datetime::civil_from_days(days);
+    let year = u16::try_from(year).map_err(|_| invalid_temporal_value("year out of range"))?;
+    let month = u8::try_from(month).map_err(|_| invalid_temporal_value("month out of range"))?;
+    let day = u8::try_from(day).map_err(|_| invalid_temporal_value("day out of range"))?;
+    Ok((year, month, day))
+}
+
+fn invalid_temporal_value(message: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
 fn write_cell<W: AsyncWrite + Send + Unpin>(
     rw: &mut elyra_wire::RowWriter<'_, W>,
     v: &elyra_core::Value,
@@ -852,15 +1012,28 @@ fn write_cell<W: AsyncWrite + Send + Unpin>(
             Value::Bytes(bytes) => rw.write_col(bytes),
             _ => rw.write_col(v.to_wire_string()),
         },
-        // Text, vectors, date/time, decimal and JSON are all advertised using
-        // string-compatible MySQL wire types.
-        ColumnType::Text
-        | ColumnType::Vector(_)
-        | ColumnType::Date
-        | ColumnType::DateTime
-        | ColumnType::Decimal(_, _)
-        | ColumnType::Time
-        | ColumnType::Json => rw.write_col(v.to_wire_string()),
+        ColumnType::Date => match v {
+            Value::Date(days) => rw.write_col(WireTemporal::Date(*days)),
+            Value::Text(value) if value == "0000-00-00" => rw.write_col(WireTemporal::ZeroDate),
+            _ => Err(incompatible_wire_value(v, ty)),
+        },
+        ColumnType::DateTime => match v {
+            Value::DateTime(micros) => rw.write_col(WireTemporal::DateTime(*micros)),
+            Value::Text(value) if value == "0000-00-00 00:00:00" => {
+                rw.write_col(WireTemporal::ZeroDateTime)
+            }
+            _ => Err(incompatible_wire_value(v, ty)),
+        },
+        ColumnType::Time => match v {
+            Value::Time(micros) => rw.write_col(WireTemporal::Time(*micros)),
+            Value::Text(value) if value == "00:00:00" => rw.write_col(WireTemporal::Time(0)),
+            _ => Err(incompatible_wire_value(v, ty)),
+        },
+        // Decimal and JSON both use length-encoded binary values in the MySQL
+        // binary protocol, just as text/vector result values do.
+        ColumnType::Text | ColumnType::Vector(_) | ColumnType::Decimal(_, _) | ColumnType::Json => {
+            rw.write_col(v.to_wire_string())
+        }
     }
 }
 
