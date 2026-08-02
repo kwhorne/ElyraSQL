@@ -14,7 +14,7 @@ tls = ["dep:tokio-rustls", "dep:pin-project-lite"]
 async-trait = "0.1"
 byteorder = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
-mysql_common = { version = "0.32", features = ["chrono"] }
+mysql_common = "0.37"
 nom = "7"
 pin-project-lite = { version = "0.2", optional = true }
 tokio = { workspace = true, features = ["io-util", "io-std", "net", "rt"] }
