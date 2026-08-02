@@ -6,6 +6,103 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.9.0] - 2026-08-02
+
+**Upgrade promptly.** This release fixes two bugs that could return or write the
+wrong data with no error at all, and one that could take the server down.
+
+Seven contributions from [@HelgeSverre](https://github.com/HelgeSverre), landed
+as a reviewed stack. Every entry below was verified against MySQL 8.4 on
+identical data before merging — in several cases the *table contents afterwards*
+were compared, not just the statement's return code, because the failure mode
+was a successful-looking statement.
+
+The pattern across all seven is the same one 1.8.0 started: these are not
+features we were missing, they are places where we answered confidently and
+wrongly. None of them came from a bug report.
+
+### Fixed — wrong data
+
+- **`NATURAL JOIN` and `JOIN ... USING` executed as cross joins.** The join
+  condition was ignored entirely, so the result was a cartesian product
+  presented as a join — no error, plausible-looking rows, and a row count that
+  only looks wrong if you already know the answer. On two 2-row tables sharing
+  two columns, `SELECT * FROM a NATURAL JOIN b` returned **4 rows where MySQL
+  returns 1**, with the shared columns duplicated in the output. Both forms now
+  match MySQL exactly, including the parts that are easy to get half-right: a
+  `NATURAL JOIN` coalesces every shared column, a `USING (k)` emits the join
+  column once and moves it to the front of the select list, and `SELECT k` after
+  `USING (k)` is unambiguous rather than an error. Collation and coercion are
+  preserved identically on the optimized and fallback join paths, so the fast
+  path cannot disagree with the slow one.
+- **A database qualifier was ignored, so writes aimed elsewhere hit local
+  tables.** `UPDATE nosuchdb.t SET ...` and `DELETE FROM nosuchdb.t` executed
+  against the local `t` and **reported success** — verified by inspecting the
+  table afterwards: the row really was updated and another really was deleted.
+  Reads behaved the same way, in `FROM`, in joins and in subqueries. A migration
+  runner pointed at the wrong environment, a dump replayed with its original
+  `db.table` names, or an ORM with a second connection could all modify data
+  they never addressed. Qualifiers are now validated consistently across SELECT,
+  CTEs, views, DML, DDL, routines, triggers, introspection and prepared
+  statements, and invalid single-table `UPDATE`/`DELETE`/upsert targets are
+  rejected **before any row changes**. `GRANT`/`REVOKE` scopes are parsed
+  structurally at the same time, so a quoted dotted or wildcard-looking table
+  name can no longer redirect a privilege grant.
+- **`UPDATE ... SET unknown_qualifier.col = ...` succeeded without writing
+  anything.** A typo in a column qualifier produced a successful statement that
+  changed nothing — an application would log a save and move on. It is now
+  rejected with MySQL's 1054 before the mutation runs.
+
+### Fixed — crashes and lost objects
+
+- **A chain of nested views could kill the server process.** Around 600 levels
+  of stored views overflowed the native stack and aborted the whole process,
+  taking every other connection with it — reachable by any account that can
+  `CREATE VIEW`. Deep-but-legitimate nesting now grows the stack near the guard
+  page, and a hard `MAX_QUERY_NESTING` bound catches the rest, including cyclic
+  view definitions that no amount of stack can survive. The result is an
+  ordinary query error with the session still usable. Stored views compose
+  *already-parsed* queries, which is why the text-level complexity guard never
+  saw this.
+- **A failed `ALTER TABLE` could leave the table half-changed — or gone.**
+  `ALTER TABLE t ADD COLUMN b INT, DROP COLUMN nosuch` failed *and* added `b`;
+  `ALTER TABLE t ADD COLUMN c INT, RENAME TO nosuchdb.t2` failed *and* renamed
+  the table away, so the next statement got `no such table`. Every `ALTER TABLE`
+  now runs inside a private transaction checkpoint that rolls back catalog,
+  rows, indexes, counters, foreign keys and renames together, while preserving
+  prior work and client savepoints inside an explicit transaction.
+
+### Fixed — queries that should have worked
+
+- **A CTE was invisible from inside a subquery or a set-operation branch**, and
+  reported as `1146 no such table`, which sends you looking in entirely the
+  wrong place. `WITH a AS (...) SELECT ... WHERE id IN (SELECT id FROM a)` and
+  `WITH a AS (...) SELECT * FROM a UNION ALL ...` both work now. CTE rewriting
+  models declaration-point scope, shadowing, forward references and
+  recursive-reference rules explicitly instead of substituting text, bounds
+  expansion depth and width, cleans up failed materialization, and no longer
+  lets a CTE capture a physical table of the same name at the wrong point.
+- **Relation aliases are case-sensitive again.** `SELECT ... FROM t AS T WHERE
+  t.id = 1` was accepted; MySQL rejects it. Column names and output aliases stay
+  case-insensitive, and the lookup is Unicode-aware rather than ASCII-folded.
+
+### Fixed — result metadata
+
+- **A quoted identifier containing a dot was split down the middle.** Result
+  metadata recovered the source table by re-parsing a joined `"table.column"`
+  string, so a column `` `a.b` `` in a table `` `we.ird` `` came back as table
+  `a`, column `b`. Qualifiers are now kept structured through planning and
+  execution rather than flattened into a string and re-split. This corrects the
+  metadata work added in 1.8.0.
+
+### Known gaps
+
+- **`ALTER TABLE ... ADD COLUMN` accepts a name that already exists**, producing
+  a table with two identically named columns where MySQL raises 1060. Found
+  while probing the `ALTER` atomicity fix; it is an input-validation gap rather
+  than an atomicity one and is tracked in ESQL-57.
+- Integer width remains advisory (see 1.8.0); `UNSIGNED` is enforced.
+
 ## [1.8.0] - 2026-08-01
 
 A correctness release, and an unusually direct demonstration of why differential

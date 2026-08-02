@@ -98,6 +98,11 @@ FROM users u LEFT JOIN orders o ON u.id = o.user_id;
   `LEFT JOIN` (columns reordered back). Only the columns the query actually reads
   are decoded and carried through the join, so its cost no longer scales with how
   wide the rows are.
+- **`NATURAL JOIN` and `JOIN ... USING (...)`** follow MySQL's rules: a natural
+  join coalesces every column the two relations share, `USING (k)` emits the
+  join column once and places it first in the select list, and referring to that
+  column unqualified afterwards is unambiguous. (Before 1.9.0 both forms were
+  executed as cross joins.)
 - **Non-equi joins stream too** (since 1.6.0): an `ON` with no equality to hash on
   (`ON a.id < b.id`, a `BETWEEN` band join) pairs every row and applies the
   condition per pair, feeding the same spilling sorter/aggregator — bounded

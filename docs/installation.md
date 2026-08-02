@@ -17,6 +17,27 @@ ElyraSQL release builds target **Ubuntu 24.04+** and **Apple Silicon macOS
     done, so an interrupted upgrade simply resumes on the next start. **Take a backup
     first, and note that downgrading to 1.4.x afterwards is not supported.**
 
+!!! danger "Upgrade to 1.9.0 promptly"
+
+    1.9.0 fixes two bugs that could return or write the wrong data **with no
+    error**, and one that could take the server down. If you are on 1.8.0 or
+    earlier, treat this as more than routine:
+
+    - **`NATURAL JOIN` and `JOIN ... USING` executed as cross joins.** Every
+      such query returned a cartesian product instead of a join. If you have
+      results derived from those shapes, recompute them.
+    - **A database qualifier was ignored**, so `UPDATE otherdb.t ...` and
+      `DELETE FROM otherdb.t ...` modified the *local* table and reported
+      success. Worth auditing if anything in your stack issues qualified writes
+      — a migration runner pointed at the wrong environment, or a dump replayed
+      with its original `db.table` names.
+    - **Nested views could crash the server**, killing every connection.
+
+    No on-disk format change and no migration: a 1.5.x through 1.8.x database
+    opens unchanged. Relation aliases also become case-sensitive again (MySQL's
+    behaviour), so `FROM t AS T WHERE t.id = 1` now errors where it used to be
+    accepted.
+
 !!! info "Upgrading to 1.8.0"
 
     No on-disk format change and no migration: a 1.5.x, 1.6.x or 1.7.x database
@@ -97,8 +118,8 @@ macOS).
 Multi-arch image (`amd64` + `arm64`) on the GitHub Container Registry:
 
 ```bash
-docker pull ghcr.io/kwhorne/elyrasql:1.8.0   # or :latest
-docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.8.0
+docker pull ghcr.io/kwhorne/elyrasql:1.9.0   # or :latest
+docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.9.0
 ```
 
 The image is ~15 MB, runs as a non-root user, stores data in the

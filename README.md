@@ -43,8 +43,8 @@ workload — served over the protocol your stack already knows.
 **[→ Get started in 60 seconds](#quick-start)** &nbsp;·&nbsp;
 **[→ Full documentation](https://elyracode.com/docs/sql-server)**
 
-> **Stable release: v1.8.0.** A broad, MySQL-compatible SQL engine: full
-> DDL/DML, all join types (INNER/LEFT/RIGHT/FULL/CROSS, streamed for large
+> **Stable release: v1.9.0.** A broad, MySQL-compatible SQL engine: full
+> DDL/DML, all join types (INNER/LEFT/RIGHT/FULL/CROSS/NATURAL/USING, streamed for large
 > analytical joins — including non-equi and cross joins, which never buffer the
 > product), subqueries (correlated too), CTEs (incl. `WITH RECURSIVE`),
 > window functions, `GROUP BY ... WITH ROLLUP`, set operations, transactions
@@ -92,7 +92,8 @@ workload — served over the protocol your stack already knows.
 - **DML** — `INSERT` (multi-row, `INSERT ... SELECT`), upserts (`REPLACE`,
   `INSERT IGNORE`, `ON DUPLICATE KEY UPDATE`), `UPDATE`/`DELETE` with subqueries
   and multi-table joins.
-- **Queries** — all join types, `GROUP BY`/`HAVING`, `ORDER BY`/`LIMIT`,
+- **Queries** — all join types (incl. `NATURAL` and `USING`, with MySQL's
+  column-coalescing rules), `GROUP BY`/`HAVING`, `ORDER BY`/`LIMIT`,
   subqueries (uncorrelated **and** correlated, incl. over joins), derived
   tables, CTEs and `WITH RECURSIVE`, window functions with frames, set
   operations (`UNION`/`INTERSECT`/`EXCEPT`).
@@ -179,7 +180,7 @@ mysql -h 127.0.0.1 -P 3307 -u root -p
 SELECT 1;
 SELECT 1 + 1 AS two;
 SELECT 'hei fra ElyraSQL' AS msg;
-SELECT VERSION();   -- 8.0.12-ElyraSQL-1.8.0
+SELECT VERSION();   -- 8.0.12-ElyraSQL-1.9.0
 ```
 
 ## Configuration
@@ -241,7 +242,7 @@ tar xzf elyrasql.tar.gz
 Multi-arch image (amd64 + arm64) on GHCR:
 
 ```bash
-docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.8.0
+docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.9.0
 # with auth + a persistent volume:
 docker run -p 3307:3307 -v elyra:/var/lib/elyrasql \
   -e ELYRASQL_USER=root -e ELYRASQL_PASSWORD=secret \
