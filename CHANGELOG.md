@@ -6,6 +6,22 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **A spilling `ORDER BY` failed outright with `Bad file descriptor`
+  (ESQL-60).** The external merge sort wrote each run through a handle from
+  `File::create` — which opens **write-only** — and the merge phase then seeked
+  that same handle back to 0 and tried to read it, so every sort that exceeded
+  `ELYRASQL_SORT_MAX_ROWS` returned an I/O error instead of rows. Since that
+  budget defaults to a million rows, it took an unbounded `ORDER BY` over a
+  large table to reach, which is why nothing in CI or the benchmarks had ever
+  written a run file: the sweep tops out at 8193 rows and the benchmark's
+  unbounded sort stays in memory at 200k. The memory-bounded `ORDER BY`
+  described in `BENCHMARKS.md` and `docs/performance.md` therefore never
+  worked. Run files are now opened read-write, and a unit test forces a small
+  budget so the spill path is exercised on every run — including the
+  single-run case, which skips the k-way merge.
+
 ## [1.9.1] - 2026-08-02
 
 Four fixes for the same underlying blind spot: **rows of the statement being
