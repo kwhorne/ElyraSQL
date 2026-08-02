@@ -6452,9 +6452,11 @@ async fn streaming_nlj_select(
     let left_outer = kind == JoinKind::Left;
     let want = offset.saturating_add(limit);
 
+    let fast_filter = filter.map(|f| FastFilter::build(f, &schema));
+
     let keep = |row: &[Value]| -> Result<bool> {
-        match filter {
-            Some(f) => predicate::matches(f, &schema, row),
+        match &fast_filter {
+            Some(ff) => ff.matches(row, &schema),
             None => Ok(true),
         }
     };
@@ -7382,9 +7384,11 @@ async fn streaming_join_aggregate(
     plan.set_group_concat_max_len(db.group_concat_max_len());
     let extend = !plan.arg_exprs().is_empty();
 
+    let fast_filter = filter.as_ref().map(|f| FastFilter::build(f, &schema));
+
     let keep = |row: &[Value]| -> Result<bool> {
-        match filter {
-            Some(f) => predicate::matches(f, &schema, row),
+        match &fast_filter {
+            Some(ff) => ff.matches(row, &schema),
             None => Ok(true),
         }
     };
@@ -7544,9 +7548,11 @@ async fn streaming_join_order(
         .collect();
     let asc: Vec<bool> = resolved.iter().map(|(_, a)| *a).collect();
 
+    let fast_filter = filter.map(|f| FastFilter::build(f, &schema));
+
     let keep = |row: &[Value]| -> Result<bool> {
-        match filter {
-            Some(f) => predicate::matches(f, &schema, row),
+        match &fast_filter {
+            Some(ff) => ff.matches(row, &schema),
             None => Ok(true),
         }
     };
@@ -10837,6 +10843,111 @@ fn cross_comparison(on: &Expr, lschema: &Schema, rschema: &Schema) -> Option<Cro
         right_col,
         bin,
         op,
+    })
+}
+
+/// A pre-parsed WHERE filter for the streaming join paths. Splits an
+/// `AND`-connected predicate into individual conjuncts and resolves every
+/// simple `col <op> col` comparison to column indices once, so the per-row
+/// closure avoids the general expression evaluator and its repeated schema
+/// lookups. Conjuncts that cannot be resolved fall through to the general
+/// `predicate::matches` evaluator.
+struct FastFilter {
+    parts: Vec<FastFilterPart>,
+}
+
+enum FastFilterPart {
+    Simple(SimpleConjunct),
+    Complex(Box<Expr>),
+}
+
+struct SimpleConjunct {
+    left: usize,
+    right: usize,
+    op: ComparisonOp,
+    bin: bool,
+}
+
+impl FastFilter {
+    fn build(filter: &Expr, schema: &Schema) -> Self {
+        let mut conjuncts = Vec::new();
+        split_and(filter, &mut conjuncts);
+        let mut parts = Vec::with_capacity(conjuncts.len());
+        for c in conjuncts {
+            match simple_conjunct(&c, schema) {
+                Some(sc) => parts.push(FastFilterPart::Simple(sc)),
+                None => parts.push(FastFilterPart::Complex(Box::new(c))),
+            }
+        }
+        FastFilter { parts }
+    }
+
+    #[inline]
+    fn matches(&self, row: &[Value], schema: &Schema) -> Result<bool> {
+        for p in &self.parts {
+            match p {
+                FastFilterPart::Simple(sc) => {
+                    if !sc.matches_row(row) {
+                        return Ok(false);
+                    }
+                }
+                FastFilterPart::Complex(expr) => {
+                    if !predicate::matches(expr, schema, row)? {
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+        Ok(true)
+    }
+}
+
+impl SimpleConjunct {
+    #[inline]
+    fn matches_row(&self, row: &[Value]) -> bool {
+        if row[self.left].is_null() || row[self.right].is_null() {
+            return false;
+        }
+        let coll = if self.bin {
+            elyra_core::Collation::Bin
+        } else {
+            elyra_core::Collation::Ci
+        };
+        let ordering = row[self.left].compare_coll(&row[self.right], coll);
+        match self.op {
+            ComparisonOp::Eq => ordering == Some(std::cmp::Ordering::Equal),
+            ComparisonOp::NotEq => ordering.is_some_and(|o| o != std::cmp::Ordering::Equal),
+            ComparisonOp::Lt => ordering == Some(std::cmp::Ordering::Less),
+            ComparisonOp::LtEq => ordering.is_some_and(|o| o != std::cmp::Ordering::Greater),
+            ComparisonOp::Gt => ordering == Some(std::cmp::Ordering::Greater),
+            ComparisonOp::GtEq => ordering.is_some_and(|o| o != std::cmp::Ordering::Less),
+        }
+    }
+}
+
+/// Try to resolve a conjunct into a pre-solved column-index comparison.
+fn simple_conjunct(expr: &Expr, schema: &Schema) -> Option<SimpleConjunct> {
+    use sqlparser::ast::BinaryOperator as B;
+    let Expr::BinaryOp { left, op, right } = expr else {
+        return None;
+    };
+    let op = match op {
+        B::Eq => ComparisonOp::Eq,
+        B::NotEq => ComparisonOp::NotEq,
+        B::Lt => ComparisonOp::Lt,
+        B::LtEq => ComparisonOp::LtEq,
+        B::Gt => ComparisonOp::Gt,
+        B::GtEq => ComparisonOp::GtEq,
+        _ => return None,
+    };
+    let li = expr_col_index(left, schema)?;
+    let ri = expr_col_index(right, schema)?;
+    let bin = expr_collation(left, schema).is_bin() || expr_collation(right, schema).is_bin();
+    Some(SimpleConjunct {
+        left: li,
+        right: ri,
+        op,
+        bin,
     })
 }
 
