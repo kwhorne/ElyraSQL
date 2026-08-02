@@ -1652,6 +1652,73 @@ async fn joins() {
     );
 }
 
+/// A WHERE predicate over the nullable side of a LEFT JOIN remains a residual
+/// filter in the simple, ordered, and grouped execution paths.
+#[tokio::test]
+async fn left_join_antijoin_keeps_its_where_predicate() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop("CREATE TABLE lj_posts (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE lj_meta (post_id INT NOT NULL, meta_key VARCHAR(255))")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO lj_posts VALUES (1), (2)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO lj_meta VALUES (1, 'foo'), (2, 'bar')")
+        .await
+        .unwrap();
+
+    for suffix in ["", " ORDER BY p.id", " GROUP BY p.id"] {
+        let sql = format!(
+            "SELECT p.id FROM lj_posts AS p \
+             LEFT JOIN lj_meta AS m ON p.id = m.post_id AND m.meta_key = 'foo' \
+             WHERE m.post_id IS NULL{suffix}"
+        );
+        let rows: Vec<i64> = c.query(sql).await.unwrap();
+        assert_eq!(rows, [2], "{suffix:?}");
+    }
+}
+
+/// A SELECT without FROM still evaluates its WHERE and applies LIMIT/OFFSET.
+#[tokio::test]
+async fn fromless_select_applies_where_limit_and_offset() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    let rows: Vec<i64> = c.query("SELECT 1 AS x WHERE 1 = 0").await.unwrap();
+    assert!(rows.is_empty());
+
+    let rows: Vec<i64> = c.query("SELECT 1 AS x LIMIT 0").await.unwrap();
+    assert!(rows.is_empty());
+
+    let rows: Vec<i64> = c.query("SELECT 1 AS x LIMIT 1 OFFSET 1").await.unwrap();
+    assert!(rows.is_empty());
+}
+
+/// MySQL uses an all-ones unsigned limit to express OFFSET without a bound.
+#[tokio::test]
+async fn mysql_unbounded_limit_sentinel_accepts_offset() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop("CREATE TABLE lim (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO lim VALUES (1), (2), (3), (4), (5)")
+        .await
+        .unwrap();
+
+    let rows: Vec<i64> = c
+        .query("SELECT id FROM lim ORDER BY id LIMIT 18446744073709551615 OFFSET 2")
+        .await
+        .unwrap();
+    assert_eq!(rows, [3, 4, 5]);
+}
+
 /// Native (binary) prepared statements via `exec*` -- exercises
 /// COM_STMT_PREPARE + COM_STMT_EXECUTE with binary parameter binding and
 /// binary result rows. This is the critical wire-protocol path.

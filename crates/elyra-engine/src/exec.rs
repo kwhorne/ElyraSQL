@@ -4743,7 +4743,7 @@ async fn select_inner(
         .await;
     }
 
-    // FROM-less SELECT (e.g. `SELECT 1`, recursive-CTE anchors): one row.
+    // FROM-less SELECT (e.g. `SELECT 1`, recursive-CTE anchors): at most one row.
     if select.from.is_empty() {
         use sqlparser::ast::SelectItem;
         let empty = Schema::new(Vec::new());
@@ -4784,7 +4784,8 @@ async fn select_inner(
             });
             vals.push(v);
         }
-        let rows = if pass { vec![vals] } else { Vec::new() };
+        let mut rows = if pass { vec![vals] } else { Vec::new() };
+        apply_offset_limit(&mut rows, offset, limit);
         return Ok(QueryResult::Rows(RowStream::literal(
             Schema::new(cols),
             rows,
@@ -8377,6 +8378,8 @@ async fn build_from(
     from: &[TableWithJoins],
     conjuncts: &[Expr],
 ) -> Result<(Schema, Vec<Vec<Value>>)> {
+    let pushdown_safe = outer_join_pushdown_safety(from);
+
     // Cost-based reordering of an explicit INNER-join chain over base tables:
     // build from the smallest tables and always extend along a join predicate,
     // keeping intermediate results small.
@@ -8412,13 +8415,13 @@ async fn build_from(
     // Cost-based ordering for a pure comma cross-join (every entry is a plain
     // base table with no explicit JOINs): drive from the smallest analyzed
     // table. This is safe because cross-join + global WHERE is commutative.
-    let ordered: Vec<&TableWithJoins> = if from.len() > 1
+    let ordered: Vec<(usize, &TableWithJoins)> = if from.len() > 1
         && from
             .iter()
             .all(|t| t.joins.is_empty() && stored_table_factor(&t.relation))
     {
-        let mut idx: Vec<(&TableWithJoins, u64)> = Vec::with_capacity(from.len());
-        for t in from {
+        let mut idx: Vec<(usize, &TableWithJoins, u64)> = Vec::with_capacity(from.len());
+        for (ti, t) in from.iter().enumerate() {
             let est = match &t.relation {
                 TableFactor::Table { name, .. } => {
                     let n = name.0.last().map(|i| i.value.clone()).unwrap_or_default();
@@ -8431,17 +8434,18 @@ async fn build_from(
                 }
                 _ => u64::MAX,
             };
-            idx.push((t, est));
+            idx.push((ti, t, est));
         }
-        idx.sort_by_key(|(_, est)| *est);
-        idx.into_iter().map(|(t, _)| t).collect()
+        idx.sort_by_key(|(_, _, est)| *est);
+        idx.into_iter().map(|(ti, t, _)| (ti, t)).collect()
     } else {
-        from.iter().collect()
+        from.iter().enumerate().collect()
     };
 
-    for twj in ordered {
-        let (bc, mut br) = load_relation(db, vindex, &twj.relation, conjuncts).await?;
-        br = apply_pushdown(br, &bc, conjuncts)?;
+    for (ti, twj) in ordered {
+        let base_conjuncts = if pushdown_safe[ti][0] { conjuncts } else { &[] };
+        let (bc, mut br) = load_relation(db, vindex, &twj.relation, base_conjuncts).await?;
+        br = apply_pushdown(br, &bc, base_conjuncts)?;
         let base_schema = Schema::new(bc);
         if first {
             cur_schema = base_schema;
@@ -8463,7 +8467,7 @@ async fn build_from(
             cur_schema = c;
             cur_rows = r;
         }
-        for join in &twj.joins {
+        for (ji, join) in twj.joins.iter().enumerate() {
             // Index nested-loop join: when the driving side is small and the
             // partner is indexed on the join key, probe the partner per row
             // instead of materialising it in full.
@@ -8525,8 +8529,13 @@ async fn build_from(
             }
 
             // Fallback: materialise the partner (with pushdown) and hash/nested join.
-            let (jc, mut jr) = load_relation(db, vindex, &join.relation, conjuncts).await?;
-            jr = apply_pushdown(jr, &jc, conjuncts)?;
+            let partner_conjuncts = if pushdown_safe[ti][ji + 1] {
+                conjuncts
+            } else {
+                &[]
+            };
+            let (jc, mut jr) = load_relation(db, vindex, &join.relation, partner_conjuncts).await?;
+            jr = apply_pushdown(jr, &jc, partner_conjuncts)?;
             let partner_schema = Schema::new(jc);
             let using_keys = resolve_using_keys(&join.join_operator, &cur_schema, &partner_schema)?;
             let resolved_keys = using_keys
@@ -8557,6 +8566,43 @@ async fn build_from(
         }
     }
     Ok((cur_schema, cur_rows))
+}
+
+/// For every base relation and explicit join partner, whether a WHERE predicate
+/// can be applied before the join without hiding rows that the outer join may
+/// NULL-extend.
+fn outer_join_pushdown_safety(from: &[TableWithJoins]) -> Vec<Vec<bool>> {
+    let mut safe: Vec<Vec<bool>> = from
+        .iter()
+        .map(|twj| vec![true; twj.joins.len() + 1])
+        .collect();
+    let mut prior = Vec::new();
+
+    for (ti, twj) in from.iter().enumerate() {
+        prior.push((ti, 0));
+        for (ji, join) in twj.joins.iter().enumerate() {
+            let partner = (ti, ji + 1);
+            match join.join_operator {
+                JoinOperator::LeftOuter(_) => safe[partner.0][partner.1] = false,
+                JoinOperator::RightOuter(_) => {
+                    for &(pti, pji) in &prior {
+                        safe[pti][pji] = false;
+                    }
+                }
+                JoinOperator::FullOuter(_) => {
+                    for &(pti, pji) in &prior {
+                        safe[pti][pji] = false;
+                    }
+                    safe[partner.0][partner.1] = false;
+                }
+                // The executor rejects every remaining sqlparser join kind.
+                _ => {}
+            }
+            prior.push(partner);
+        }
+    }
+
+    safe
 }
 
 /// Estimate how many rows of a table survive the applicable WHERE predicates,
@@ -12154,6 +12200,8 @@ fn ident_name(e: &Expr) -> Option<&str> {
 pub(crate) fn eval_usize(e: &Expr) -> Result<usize> {
     match eval_expr(e)? {
         Value::Int(i) if i >= 0 => Ok(i as usize),
+        Value::UInt(i) => usize::try_from(i)
+            .map_err(|_| Error::Query(format!("expected non-negative integer, got UInt({i})"))),
         other => Err(Error::Query(format!(
             "expected non-negative integer, got {other:?}"
         ))),
