@@ -1,8 +1,9 @@
 # Multi-stage build producing a minimal scratch-based image with a static
 # ElyraSQL binary. The runtime stage is `scratch` (empty) and contains only
-# the statically linked musl binary, CA certificates (needed for outbound
-# HTTPS from ai_embed()), passwd/group entries for the non-root user, and an
-# empty data directory.
+# the statically linked musl binary, passwd/group entries for the non-root
+# user, and an empty data directory. No CA certificate bundle is needed:
+# the HTTPS client (ureq) verifies against webpki-roots compiled into the
+# binary, not the system store.
 FROM rust:1-alpine AS builder
 
 RUN apk add --no-cache musl-dev gcc make perl linux-headers
@@ -22,7 +23,6 @@ FROM scratch
 
 COPY --from=builder /etc/passwd /etc/passwd
 COPY --from=builder /etc/group /etc/group
-COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=builder --chown=elyrasql:elyrasql /var/lib/elyrasql /var/lib/elyrasql
 COPY --from=builder /src/target/release/elyrasql /usr/local/bin/elyrasql
 
