@@ -61,7 +61,7 @@ jobs:
       - name: Install MySQL client (macOS)
         if: matrix.platform == 'macos'
         run: |
-          brew install mysql-client
+          HOMEBREW_NO_AUTO_UPDATE=1 brew install mysql-client
           # mysql-client is keg-only, so it is not linked into /opt/homebrew/bin;
           # put its bin dir on PATH for the PGO training step below.
           echo "/opt/homebrew/opt/mysql-client/bin:$PATH" >> "$GITHUB_ENV"
