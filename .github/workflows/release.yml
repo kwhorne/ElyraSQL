@@ -60,11 +60,16 @@ jobs:
 
       - name: Install MySQL client (macOS)
         if: matrix.platform == 'macos'
+        # Only needed for PGO training, which is itself fail-safe -- so this
+        # must never be able to fail a release on its own.
+        continue-on-error: true
         run: |
           HOMEBREW_NO_AUTO_UPDATE=1 brew install mysql-client
-          # mysql-client is keg-only, so it is not linked into /opt/homebrew/bin;
-          # put its bin dir on PATH for the PGO training step below.
-          echo "/opt/homebrew/opt/mysql-client/bin:$PATH" >> "$GITHUB_ENV"
+          # mysql-client is keg-only, so it is not linked into /opt/homebrew/bin.
+          # $GITHUB_PATH takes one directory per line and prepends it; writing a
+          # whole PATH to $GITHUB_ENV instead fails with "Invalid format",
+          # because $GITHUB_ENV wants KEY=value.
+          echo "/opt/homebrew/opt/mysql-client/bin" >> "$GITHUB_PATH"
 
       - name: Generate PGO profile (fail-safe)
         id: pgo
