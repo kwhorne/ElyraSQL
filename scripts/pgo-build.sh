@@ -22,6 +22,11 @@
 #
 # Env knobs: TRAIN_SQL_DIR (default target/pgo/training-sql),
 #            BENCH_PORT (default 3308), BENCH_ROWS (default 50000), OLAP_ROWS (default 500000).
+#
+# These defaults are the smallest training size at which PGO has been measured
+# to beat a plain dist build. A thinner profile can make the binary SLOWER on
+# unrepresented paths, and nothing detects that at build time — do not shrink
+# them to save time.
 
 set -euo pipefail
 
