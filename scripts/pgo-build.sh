@@ -3,12 +3,14 @@
 # Profile-Guided Optimization build of the `elyrasql` binary.
 #
 # Pipeline: instrument -> train -> merge -> rebuild.
-# Training workloads: pre-generated SQL dumps (schema+data from testbench fixtures)
+# Training workloads: pre-generated SQL dumps (scripts/generate-training-sql.py)
 #   + Python benchmarks (OLTP, OLAP, late materialisation).
 #
-# Training writes to --train-data-dir (default target/pgo/train-data). When
-# benchmarking the rebuilt binary, use a separate data directory so that
-# warm caches from training do not flatter the measurement.
+# Training writes to --train-data-dir (default target/pgo/train-data) and each
+# workload gets a FRESH data directory: an ElyraSQL database is the .edb file
+# PLUS a sibling <file>.edb.vidx directory holding vector indexes, so cleanup
+# must remove both (rm -rf). Leftover data warms vector indexes / caches and
+# flatters any subsequent measurement on the same path (same trap as #58).
 #
 # Modes:
 #   ./scripts/pgo-build.sh              # full pipeline -> target/dist/elyrasql
@@ -85,7 +87,7 @@ fi
 
 # ---- stage 1: instrumented build --------------------------------------------
 
-rm -rf "$PROFRAW_DIR" "$PROFDATA"
+rm -rf "$PROFRAW_DIR" "$PROFDATA" "$TRAIN_DATA_DIR"
 mkdir -p "$PROFRAW_DIR" "$TRAIN_DATA_DIR"
 
 echo "==> [1/4] instrumented build"
@@ -127,8 +129,11 @@ for f in "$TRAIN_SQL_DIR"/*.sql; do
   db="$TRAIN_DATA_DIR/train-$i-$name.edb"
   echo "    [$i] ingesting $name ..."
   start_server "$db"
-  mysql -h 127.0.0.1 -P "$BENCH_PORT" -u root < "$f" || true
+  mysql -h 127.0.0.1 -P "$BENCH_PORT" -u root < "$f" >/dev/null 2>&1 || true
   stop_server
+  # rm -rf, not rm -f: remove the .edb file AND the <file>.edb.vidx sibling
+  # directory (vector index), so the next run starts from a cold data dir.
+  rm -rf "$db" "$db.vidx"
   i=$((i + 1))
 done
 
@@ -140,8 +145,10 @@ python3 bench/benchmark.py --port "$BENCH_PORT" --rows "$BENCH_ROWS" --password 
 python3 bench/olap.py --rows "$OLAP_ROWS" --engines elyra --elyra-port "$BENCH_PORT" --elyra-password "" || true
 python3 bench/latemat.py --port "$BENCH_PORT" --rows "$LATEMAT_ROWS" --password "" --label "ElyraSQL-pgo-train" || true
 stop_server
+# rm -rf: drops the .edb and its .edb.vidx sibling dir (see header comment).
+rm -rf "$db" "$db.vidx"
 
-profraw_count=$(ls "$PROFRAW_DIR"/*.profraw 2>/dev/null | wc -l | tr -d ' ')
+profraw_count=$(find "$PROFRAW_DIR" -maxdepth 1 -name '*.profraw' | wc -l | tr -d ' ')
 echo "    collected $profraw_count .profraw file(s)"
 
 if [[ "$profraw_count" -eq 0 ]]; then
