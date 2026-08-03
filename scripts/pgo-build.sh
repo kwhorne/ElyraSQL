@@ -79,7 +79,7 @@ require_cmd mysql
 
 if [[ ! -d "$TRAIN_SQL_DIR" ]] || [[ -z "$(ls -A "$TRAIN_SQL_DIR"/*.sql 2>/dev/null)" ]]; then
   echo "ERROR: no training SQL dumps found in $TRAIN_SQL_DIR" >&2
-  echo "Generate them with: just stress-data <model> <rows> <batch>" >&2
+  echo "Generate them with: python3 scripts/generate-training-sql.py --all --output-dir $TRAIN_SQL_DIR" >&2
   exit 1
 fi
 
