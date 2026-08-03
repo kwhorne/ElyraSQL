@@ -175,6 +175,10 @@ elyrasql serve --data /tmp/pgo-bench/bench.edb --listen 127.0.0.1:3309 --passwor
 python3 bench/benchmark.py --port 3309 --rows 50000 --password ""
 ```
 
+For a cold A/B comparison of a baseline vs PGO binary (fresh server and
+fresh data directory per run, data deleted afterwards), use
+`scripts/bench-cold.py`.
+
 ## License
 
 By contributing, you agree that your contributions are licensed under the MIT
