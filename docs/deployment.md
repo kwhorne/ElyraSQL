@@ -8,13 +8,42 @@ docker run -d --name elyrasql \
   -v elyra-data:/var/lib/elyrasql \
   -e ELYRASQL_USER=root \
   -e ELYRASQL_PASSWORD=secret \
-  ghcr.io/kwhorne/elyrasql:1.9.3
+  ghcr.io/kwhorne/elyrasql:1.9.4
 ```
 
 - Data persists in the `/var/lib/elyrasql` volume.
 - The container runs as a non-root user and listens on `0.0.0.0:3307`.
 - Configure via `ELYRASQL_*` environment variables (see
   [Configuration](configuration.md)).
+
+### The image has no shell
+
+Since 1.9.4 the image is built `FROM scratch`: it contains the static binary,
+`passwd`/`group` for the non-root user, the data directory, and a writable
+`/tmp` for sort and aggregate spills. That is 13.6 MB with no OS packages, and
+so no OS CVEs to triage — but also no shell, no `mysql` client, no `ls`.
+
+`docker exec <container> sh` will not work. Check liveness over the MySQL
+protocol from outside the container:
+
+```bash
+mysql -h 127.0.0.1 -P 3307 -u root -p"$PASSWORD" -e 'SELECT 1'
+```
+
+In Kubernetes, use a `tcpSocket` probe on 3307 rather than an `exec` probe. In
+Compose, a `healthcheck` must run from another container.
+
+One consequence worth knowing: spill files for large sorts and aggregations go
+to `/tmp` **inside the container**, which is the writable layer, not the data
+volume. A query that spills tens of gigabytes is bounded by container disk, not
+by the volume. Set `TMPDIR` to a path on a mounted volume if that matters:
+
+```bash
+docker run -d -p 3307:3307 \
+  -v elyra-data:/var/lib/elyrasql \
+  -e TMPDIR=/var/lib/elyrasql/tmp \
+  ghcr.io/kwhorne/elyrasql:1.9.4
+```
 
 For TLS, mount the certificate and key and point the env vars at them:
 
@@ -24,7 +53,7 @@ docker run -d -p 3307:3307 \
   -v $PWD/certs:/certs:ro \
   -e ELYRASQL_TLS_CERT=/certs/server.crt \
   -e ELYRASQL_TLS_KEY=/certs/server.key \
-  ghcr.io/kwhorne/elyrasql:1.9.3
+  ghcr.io/kwhorne/elyrasql:1.9.4
 ```
 
 ## systemd (Ubuntu 24.04+)

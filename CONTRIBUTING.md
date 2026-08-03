@@ -125,6 +125,34 @@ PY
 - Fill out the pull request template and link the issue it addresses.
 - Rebase on `main` and ensure CI is green.
 
+## Cutting a release
+
+The release workflow validates that the tag, `Cargo.toml` and the CHANGELOG
+agree, so a mismatch fails before anything is published. Three things it does
+**not** check, and which have each been forgotten at least once:
+
+1. **`SERVER_VERSION`** in `crates/elyra-core/src/lib.rs` — the string clients
+   see from `SELECT VERSION()`. Nothing fails if it lags; the server just
+   misreports itself.
+2. **`testbench/sql-dump/Cargo.lock`**. The testbench is a separate Cargo
+   workspace, so its lockfile records the workspace crate versions and goes
+   stale on every version bump. `scripts/run.sh` invokes `cargo run --locked`,
+   so a stale lock means the nightly SQL dump differential fails before it does
+   any work. Refresh it with:
+
+   ```bash
+   (cd testbench/sql-dump && cargo check --offline)
+   ```
+
+   This went unnoticed from 1.9.1 to 1.9.4 because nothing ran the harness.
+3. **Version strings in prose**: `README.md` (the stable-release line, the
+   `SELECT VERSION()` example and the Docker tags), `docs/installation.md`,
+   `docs/deployment.md`, `docs/mysql-compatibility.md`.
+
+If a release tightens validation or changes anything a working deployment can
+depend on, say so in an upgrade block in `docs/installation.md`. The version
+number alone is not a warning.
+
 ## Reporting security issues
 
 Please do **not** open public issues for vulnerabilities. See

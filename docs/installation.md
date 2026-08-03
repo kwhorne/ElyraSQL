@@ -17,6 +17,39 @@ ElyraSQL release builds target **Ubuntu 24.04+** and **Apple Silicon macOS
     done, so an interrupted upgrade simply resumes on the next start. **Take a backup
     first, and note that downgrading to 1.4.x afterwards is not supported.**
 
+!!! warning "Upgrading to 1.9.4"
+
+    Two changes can affect a working deployment. Neither touches your data.
+
+    **The container image has no shell.** It is now built `FROM scratch` — 22.3 MB
+    down to 13.6 MB, with no OS packages and so no OS CVEs. But `docker exec
+    <container> sh` no longer works, and neither does anything built on it:
+    shell-based health checks, debugging one-liners, init wrappers. Check
+    liveness over the MySQL protocol from outside the container instead:
+
+    ```bash
+    mysql -h 127.0.0.1 -P 3307 -u root -e 'SELECT 1'
+    ```
+
+    If you run the image under an orchestrator with an `exec`-based probe,
+    change the probe before upgrading.
+
+    **Result-column metadata reports different values.** Character columns now
+    advertise their declared width under a utf8mb4 collation, matching MySQL: a
+    `VARCHAR(32)` reports 128 bytes where it previously reported the unbounded
+    text capacity, and clients that divide by the charset width now show 32
+    instead of 21845. This is a fix — the old values were wrong in a way that
+    made every client's length arithmetic wrong — but if you have code asserting
+    on column lengths or collation ids, it will see new numbers. Row data,
+    types and flags are unchanged.
+
+    Tables created before 1.9.1 have no stored width and keep the unbounded
+    value. Nothing needs to be rebuilt.
+
+    Also: **`elyrasql serve` now exits on Ctrl-C.** If you deliberately started
+    it with SIGINT ignored, installing the handler overrides that, and it will
+    exit on a signal it used to survive.
+
 !!! info "Upgrading to 1.9.2"
 
     Two fixes are the reason to upgrade promptly, because both were silent:
@@ -157,8 +190,8 @@ macOS).
 Multi-arch image (`amd64` + `arm64`) on the GitHub Container Registry:
 
 ```bash
-docker pull ghcr.io/kwhorne/elyrasql:1.9.3   # or :latest
-docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.9.3
+docker pull ghcr.io/kwhorne/elyrasql:1.9.4   # or :latest
+docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.9.4
 ```
 
 The image is ~15 MB, runs as a non-root user, stores data in the
