@@ -6,6 +6,28 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **Result columns advertise their declared width and the right collation.**
+  Every character column reported the unbounded `TEXT` capacity under a
+  utf8mb3 collation, so clients computed nonsense widths: PyMySQL reported
+  **21845** for a `VARCHAR(32)` where MySQL 8.4 reports **128**, because it
+  divides the advertised byte length by the charset's bytes per character.
+  `VARBINARY(16)` reported 65535 rather than 16.
+
+  Columns now carry their declared width from the sidecar added in 1.9.1, and
+  the collation is `utf8mb4_0900_ai_ci` on character columns and `binary` on
+  everything else, which is what MySQL sends and what clients key their length
+  arithmetic off. Checked field by field against MySQL 8.4: collations match on
+  all ten types tested, widths on nine.
+
+  The remaining gap is `INT`, reported as `BIGINT`/20 where MySQL says
+  `INT`/11 — the storage type is a 64-bit integer, and changing the advertised
+  type also changes binary-protocol encoding, so it is left alone here.
+
+  Tables written before 1.9.1 have no sidecar and keep the unbounded width;
+  nothing needs to be rebuilt.
+
 ## [1.9.3] - 2026-08-02
 
 A small release: no behaviour changes, no new SQL, nothing to check before

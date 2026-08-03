@@ -146,7 +146,8 @@ async fn result_column_metadata_reports_table_flags_over_text_and_binary_protoco
     assert!(!text_columns[3]
         .flags()
         .contains(MySqlColumnFlags::UNIQUE_KEY_FLAG));
-    assert_eq!(text_columns[1].column_length(), 65_535);
+    // VARCHAR(50) in utf8mb4: MySQL advertises the byte capacity.
+    assert_eq!(text_columns[1].column_length(), 50 * 4);
     let text_rows: Vec<(u64, String, i64, String)> = text_result.collect().await.unwrap();
     assert_eq!(text_rows, [(1, "ada@example.test".into(), 7, "ada".into())]);
 
@@ -11943,4 +11944,89 @@ async fn keys_that_fold_together_collide_instead_of_silently_replacing() {
         .await
         .unwrap();
     assert_eq!(got, Some(1));
+}
+
+/// Result columns advertise the declared width and the right collation.
+///
+/// MySQL reports character columns in *bytes* under the column's charset, so a
+/// `VARCHAR(32)` in utf8mb4 is 128, and clients divide by the charset's
+/// maximum byte length to recover 32. Advertising the unbounded text capacity
+/// with a utf8mb3 collation -- which is what this server did before -- makes
+/// every client compute a nonsense width: PyMySQL reported 21845 for
+/// `VARCHAR(32)` where MySQL 8.4 reports 128.
+///
+/// Every expected value here was read off MySQL 8.4 rather than derived.
+#[tokio::test]
+async fn result_columns_advertise_declared_widths_and_collations() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop(
+        "CREATE TABLE widths (
+            a VARCHAR(32),
+            b CHAR(8),
+            c TEXT,
+            d VARBINARY(16),
+            e BINARY(4),
+            f BLOB,
+            g JSON,
+            h BIGINT UNSIGNED,
+            i DECIMAL(10,2)
+        )",
+    )
+    .await
+    .unwrap();
+
+    let result = c.query_iter("SELECT * FROM widths").await.unwrap();
+    let columns = result.columns_ref().to_vec();
+
+    assert_eq!(
+        columns
+            .iter()
+            .map(|column| column.column_length())
+            .collect::<Vec<_>>(),
+        [
+            32 * 4,     // VARCHAR(32) utf8mb4
+            8 * 4,      // CHAR(8) utf8mb4
+            65_535 * 4, // TEXT utf8mb4
+            16,         // VARBINARY(16) is bytes already
+            4,          // BINARY(4)
+            65_535,     // BLOB
+            u32::MAX,   // JSON
+            20,         // BIGINT UNSIGNED
+            10 + 1 + 1, // DECIMAL(10,2): digits, point, sign
+        ]
+    );
+
+    // utf8mb4_0900_ai_ci on character columns, binary on everything else --
+    // clients key their length arithmetic off this.
+    const UTF8MB4: u16 = 255;
+    const BINARY: u16 = 63;
+    assert_eq!(
+        columns
+            .iter()
+            .map(|column| column.character_set())
+            .collect::<Vec<_>>(),
+        [UTF8MB4, UTF8MB4, UTF8MB4, BINARY, BINARY, BINARY, BINARY, BINARY, BINARY]
+    );
+}
+
+/// A table written before declared types were stored has no width sidecar, and
+/// must keep working: the width falls back to the unbounded capacity rather
+/// than reporting zero or failing.
+#[tokio::test]
+async fn columns_without_a_declared_width_fall_back_to_unbounded() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    // `TEXT` and `BLOB` genuinely have no declared width, which is the same
+    // shape the loader sees for a pre-sidecar catalog.
+    c.query_drop("CREATE TABLE unbounded (t TEXT, b BLOB)")
+        .await
+        .unwrap();
+
+    let result = c.query_iter("SELECT * FROM unbounded").await.unwrap();
+    let columns = result.columns_ref().to_vec();
+    assert_eq!(columns[0].column_length(), 65_535 * 4);
+    assert_eq!(columns[1].column_length(), 65_535);
 }

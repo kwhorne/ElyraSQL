@@ -57,6 +57,13 @@ mod writers;
 // max payload size 2^(24-1)
 pub const U24_MAX: usize = 16_777_215;
 
+/// Collation id for `utf8mb4_0900_ai_ci`, what MySQL 8 advertises on character
+/// result columns.
+pub const UTF8MB4_0900_AI_CI: u16 = 255;
+
+/// Collation id for `binary`, advertised on every non-character column.
+pub const BINARY_COLLATION: u16 = 63;
+
 /// Meta-information abot a single column, used either to describe a prepared statement parameter
 /// or an output column.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,6 +84,11 @@ pub struct Column {
     pub colflags: ColumnFlags,
     /// Maximum display width for this result column.
     pub column_length: u32,
+    /// Collation id advertised for this column. Character columns use
+    /// `UTF8MB4_0900_AI_CI`; everything else uses `BINARY_COLLATION`, which is
+    /// what MySQL does and what clients divide `column_length` by to recover a
+    /// character count.
+    pub charset: u16,
     /// Decimal scale advertised by this result column.
     pub decimals: u8,
 }
@@ -804,6 +816,7 @@ where
                                     coltype: myc::constants::ColumnType::MYSQL_TYPE_LONG,
                                     colflags: myc::constants::ColumnFlags::UNSIGNED_FLAG,
                                     column_length: 10,
+                                    charset: crate::BINARY_COLLATION,
                                     decimals: 0,
                                 }];
 
