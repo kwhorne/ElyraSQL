@@ -1,19 +1,25 @@
-# Multi-stage build producing a small image with a static ElyraSQL binary.
+# Minimal scratch image: static musl binary, passwd/group for the non-root
+# user, a data dir, and a writable /tmp for sort/agg spills. No CA bundle
+# needed — ureq verifies against compiled-in webpki-roots.
 FROM rust:1-alpine AS builder
 
 RUN apk add --no-cache musl-dev gcc make perl linux-headers
 
-WORKDIR /src
-COPY . .
-# Alpine's target is already musl -> the binary is statically linked.
-RUN cargo build --release --locked -p elyra-cli \
-    && strip target/release/elyrasql
-
-FROM alpine:3.24
-
 RUN addgroup -S elyrasql && adduser -S -G elyrasql -H elyrasql \
     && mkdir -p /var/lib/elyrasql && chown elyrasql:elyrasql /var/lib/elyrasql
 
+WORKDIR /src
+COPY . .
+# musl target => static binary; release profile already strips symbols.
+RUN cargo build --release --locked -p elyra-cli
+
+FROM scratch
+
+COPY --from=builder /etc/passwd /etc/passwd
+COPY --from=builder /etc/group /etc/group
+COPY --from=builder --chown=elyrasql:elyrasql /var/lib/elyrasql /var/lib/elyrasql
+# COPY creates the destination 0755 root:root; chown or spills cannot write.
+COPY --from=builder --chown=elyrasql:elyrasql /tmp /tmp
 COPY --from=builder /src/target/release/elyrasql /usr/local/bin/elyrasql
 
 USER elyrasql
