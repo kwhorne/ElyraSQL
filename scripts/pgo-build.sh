@@ -106,9 +106,9 @@ start_server() {
     --password "" \
     &>/tmp/elyra-pgo-server.log &
   ELYSQL_PID=$!
-  for i in $(seq 1 30); do
+  for attempt in $(seq 1 30); do
     if mysql -h 127.0.0.1 -P "$BENCH_PORT" -u root -e "SELECT 1" &>/dev/null; then
-      echo "    server ready after ${i}s"
+      echo "    server ready after ${attempt}s"
       return 0
     fi
     sleep 1
