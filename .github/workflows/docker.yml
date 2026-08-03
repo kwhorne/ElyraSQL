@@ -9,7 +9,48 @@ permissions:
   packages: write
 
 jobs:
+  smoke-test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build image
+        run: docker build -t elyrasql-smoke .
+
+      - name: Run server with a small spill budget
+        run: >
+          docker run -d --name smoke -p 3309:3307
+          -e ELYRASQL_SORT_MAX_ROWS=100
+          -e ELYRASQL_ALLOW_OPEN_AUTH=1
+          elyrasql-smoke
+
+      - name: Wait for the server
+        run: |
+          for i in $(seq 1 60); do
+            if mysql -h 127.0.0.1 -P 3309 -u root -e 'SELECT 1' >/dev/null 2>&1; then
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs smoke
+          exit 1
+
+      - name: Spilling ORDER BY smoke test
+        run: |
+          mysql -h 127.0.0.1 -P 3309 -u root -e 'CREATE TABLE smoke_t (v INT)'
+          values=$(for i in $(seq 1 3000); do printf '(%s),' "$i"; done)
+          mysql -h 127.0.0.1 -P 3309 -u root -e "INSERT INTO smoke_t VALUES ${values%,}"
+          count=$(mysql -h 127.0.0.1 -P 3309 -u root -N -B \
+            -e 'SELECT COUNT(*) FROM (SELECT v FROM smoke_t ORDER BY v) x')
+          echo "spilling ORDER BY returned $count rows"
+          [ "$count" = "3000" ]
+
+      - name: Cleanup
+        if: always()
+        run: docker rm -f smoke
+
   image:
+    needs: smoke-test
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
