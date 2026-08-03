@@ -26,13 +26,16 @@ const TOPN_CAP: usize = 1_000_000;
 
 /// The external-sort spill budget in rows, from `ELYRASQL_SORT_MAX_ROWS`
 /// (default 1,000,000). Rows beyond this are spilled to a temp file.
-/// Reads the env variable on every call so tests can reconfigure the budget.
 pub fn sort_max_rows() -> usize {
-    std::env::var("ELYRASQL_SORT_MAX_ROWS")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|n| *n > 0)
-        .unwrap_or(1_000_000)
+    use std::sync::OnceLock;
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("ELYRASQL_SORT_MAX_ROWS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(1_000_000)
+    })
 }
 
 /// Compare two precomputed key vectors under per-key asc/desc flags and text
@@ -578,9 +581,7 @@ mod spill_tests {
     /// keeping peak memory bounded.
     #[test]
     fn sorter_spills_when_buffer_exceeds_budget() {
-        std::env::set_var("ELYRASQL_SORT_MAX_ROWS", "10");
-        let budget = sort_max_rows();
-        assert_eq!(budget, 10);
+        let budget = 10usize;
 
         let mut s = Sorter::new(vec![true], vec![Collation::Ci], 0, None, budget);
 
