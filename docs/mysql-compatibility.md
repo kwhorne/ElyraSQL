@@ -12,7 +12,7 @@ drivers connect without modification.
 - **Authentication** — `mysql_native_password` by **default** (widest driver
   compatibility), with `caching_sha2_password` available opt-in (see below).
 - **TLS** — clients may negotiate SSL.
-- **Handshake** — reports a MySQL-looking version, e.g. `8.0.12-ElyraSQL-1.9.3`,
+- **Handshake** — reports a MySQL-looking version, e.g. `8.0.12-ElyraSQL-1.9.4`,
   and answers the session/introspection queries clients send on connect
   (`SELECT @@version_comment`, `SELECT VERSION()`, `SET ...`,
   `SHOW VARIABLES/STATUS/COLLATION/DATABASES/TABLE STATUS`, and the
@@ -102,6 +102,40 @@ UCA weights.
 A database created by ElyraSQL before 1.5.0 is migrated automatically on first
 open: text index entries are rebuilt and text primary keys re-keyed, before any
 connection is accepted. Databases whose indexed text is pure ASCII are unaffected.
+
+## Result-column metadata
+
+Result columns carry the collation and declared width MySQL sends, because
+clients use both to compute display widths: a character column advertises its
+limit **in bytes** under its collation, and the client divides by the charset's
+bytes per character. So a `VARCHAR(32)` reports 128, and a driver that knows
+utf8mb4 shows 32.
+
+Measured against MySQL 8.4, on a table declared
+`(a VARCHAR(32), b CHAR(8), c TEXT, d VARBINARY(16), e BINARY(4), f BLOB,
+g JSON, h INT, i BIGINT UNSIGNED, j DECIMAL(10,2))`:
+
+| column | width | collation | type code |
+|---|---:|---:|---|
+| `VARCHAR(32)` | 128 | 255 | matches |
+| `CHAR(8)` | 32 | 255 | `VAR_STRING`, MySQL sends `STRING` |
+| `TEXT` | 262140 | 255 | `VAR_STRING`, MySQL sends `BLOB` |
+| `VARBINARY(16)` | 16 | 63 | `BLOB`, MySQL sends `VAR_STRING` |
+| `BINARY(4)` | 4 | 63 | `BLOB`, MySQL sends `STRING` |
+| `BLOB` | 65535 | 63 | matches |
+| `JSON` | 4294967295 | 63 | matches |
+| `INT` | 20 | 63 | `LONGLONG`, MySQL sends `LONG` (11) |
+| `BIGINT UNSIGNED` | 20 | 63 | matches |
+| `DECIMAL(10,2)` | 12 | 63 | matches |
+
+Widths and collations agree with MySQL everywhere except `INT`, which is stored
+as a 64-bit integer and advertised as such. The type-code differences come from
+collapsing all character types onto one storage type and all binary types onto
+another; drivers decode both correctly, but a client that inspects type codes
+will see `VAR_STRING` where MySQL says `STRING` or `BLOB`.
+
+Tables created before 1.9.1 have no stored declaration and advertise the
+unbounded width for character and binary columns.
 
 ## Differences and gaps
 

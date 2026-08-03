@@ -6,27 +6,94 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.9.4] - 2026-08-03
+
+Seven contributions, and for the first time in a while none of them is a
+correctness bug. This release is about the machinery around the engine: how it
+is built, how it is shipped, and what it tells clients about itself.
+
+Two changes can affect a working deployment, and both are in the upgrade note
+in the installation docs: **the container image no longer has a shell**, and
+**result-column metadata reports different (correct) values.** Neither touches
+your data.
+
 ### Fixed
 
 - **Result columns advertise their declared width and the right collation.**
-  Every character column reported the unbounded `TEXT` capacity under a
-  utf8mb3 collation, so clients computed nonsense widths: PyMySQL reported
-  **21845** for a `VARCHAR(32)` where MySQL 8.4 reports **128**, because it
-  divides the advertised byte length by the charset's bytes per character.
-  `VARBINARY(16)` reported 65535 rather than 16.
+  Every character column reported the unbounded `TEXT` capacity under a utf8mb3
+  collation, so clients computed nonsense widths: PyMySQL reported **21845**
+  for a `VARCHAR(32)` where MySQL 8.4 reports **128**, because it divides the
+  advertised byte length by the charset's bytes per character. `VARBINARY(16)`
+  reported 65535 rather than 16.
 
-  Columns now carry their declared width from the sidecar added in 1.9.1, and
-  the collation is `utf8mb4_0900_ai_ci` on character columns and `binary` on
+  Columns now carry the declared width from the sidecar added in 1.9.1, and the
+  collation is `utf8mb4_0900_ai_ci` on character columns and `binary` on
   everything else, which is what MySQL sends and what clients key their length
-  arithmetic off. Checked field by field against MySQL 8.4: collations match on
-  all ten types tested, widths on nine.
+  arithmetic off. `SHOW VARIABLES` already reported utf8mb4 everywhere; the wire
+  disagreed with it.
 
-  The remaining gap is `INT`, reported as `BIGINT`/20 where MySQL says
-  `INT`/11 — the storage type is a 64-bit integer, and changing the advertised
-  type also changes binary-protocol encoding, so it is left alone here.
+  Checked field by field against MySQL 8.4: collations match on all ten types
+  tested, widths on nine. The remaining gap is `INT`, reported as `BIGINT`/20
+  where MySQL says `INT`/11 — the storage type is a 64-bit integer, and
+  changing the advertised type also changes binary-protocol encoding, so it is
+  left for its own change. The full comparison is in
+  `docs/mysql-compatibility.md`.
 
-  Tables written before 1.9.1 have no sidecar and keep the unbounded width;
-  nothing needs to be rebuilt.
+  Tables written before 1.9.1 have no sidecar and keep the unbounded width.
+  Nothing needs to be rebuilt.
+- **`elyrasql serve` exits on Ctrl-C.** SIGINT was previously ignored, so the
+  only way to stop a foreground server was `SIGTERM` or `SIGKILL`. It is a clean
+  exit rather than a connection drain — in-flight connections are dropped, and
+  `redb` keeps the database consistent regardless. Installing the handler also
+  overrides an inherited `SIG_IGN`: a server started with SIGINT ignored will
+  now exit on it.
+
+### Changed
+
+- **The container image is built `FROM scratch`** instead of Alpine: only the
+  static binary, `passwd`/`group` for the non-root user, the data directory, and
+  a writable `/tmp` for sort and aggregate spills. **22.3 MB → 13.6 MB
+  (−39%)**, and no OS packages means no OS CVEs to triage.
+
+  **There is no shell in the image.** `docker exec <container> sh` and anything
+  built on it — debugging one-liners, shell-based health checks, init wrappers
+  — no longer works; use the MySQL protocol from outside the container. This is
+  the one change here that can break a working deployment. See
+  `docs/deployment.md`, which also covers where spill files now live.
+- **Release binaries are built with fat LTO** via a new `[profile.dist]`.
+  `[profile.release]` stays on thin LTO, so local and CI builds are unaffected.
+  Measured: full scan `COUNT` 2.79 → 1.68 ms, `GROUP BY` 2.21 → 1.76 ms, other
+  workloads within noise; binary 6.7% smaller.
+- **Release binaries are additionally profile-guided (PGO).** The release
+  workflow trains on generated SQL dumps and the benchmark suite, then rebuilds
+  with the merged profile. Measured cold on aarch64, six runs per side with a
+  fresh server and data directory each: **index nested-loop joins −14.6%**
+  (20.6 → 17.6 ms) and **vector index build −4.9%** (985 → 937 ms), with
+  sub-2 ms workloads unchanged. Binary a further 13% smaller.
+
+  The training set is load-bearing: a deliberately thinned one made the same
+  code **32% slower**, because a profile optimises for what it saw and
+  pessimises the rest. The release step therefore verifies a profile was
+  actually produced before using it, and annotates the run when it was not — a
+  release built without a profile is still a supported release, it just is not
+  silently one. Details in `CONTRIBUTING.md`.
+
+  Cost: about 2m45s per target, so roughly 8 minutes added to a three-target
+  release. Nothing on PR builds.
+
+### Internal
+
+- **The SQL dump differential harness runs nightly.** Added in 1.9.1, it found
+  the `DECIMAL`/`UNSIGNED` range gap on its first run and was then never wired
+  into CI — so nobody noticed it had been broken since 1.9.1, because the
+  testbench is a separate Cargo workspace whose lockfile goes stale on every
+  version bump while `run.sh` runs `cargo run --locked`. A tool nobody runs is a
+  tool that quietly stops working. Five schema models now run nightly against
+  MySQL 8.4, comparing full table digests; the release checklist in
+  `CONTRIBUTING.md` now covers the lockfile.
+- **CI runs tests with `cargo-nextest`**: 5m44s → 46s wall for the same tests,
+  because the suite is dominated by wire tests that each stand up a server and
+  wait. Note that nextest does not run doctests; the workspace has none today.
 
 ## [1.9.3] - 2026-08-02
 
