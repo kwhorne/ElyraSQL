@@ -1,0 +1,119 @@
+name: SQL dump differential
+
+# Generates a deterministic MySQL dump from a YAML model, imports every
+# statement into both MySQL 8.4 and an in-process ElyraSQL, then compares
+# schema metadata, row counts and typed contents. This is broader than the
+# hand-written battery in `differential.yml`: the models cover whole schemas
+# (scalar type matrices, relational graphs, commerce) rather than targeted
+# edge cases, and the comparison is on full table digests.
+#
+# It found the DECIMAL/UNSIGNED range gap (ESQL-56) on its first run, so it
+# runs nightly rather than on every push -- each model needs its own MySQL
+# container and a full import.
+#
+# The testbench is a separate Cargo workspace (root `cargo test --workspace`
+# does not build it), which is why it also needs its own lockfile check: that
+# lockfile records the workspace crate versions and goes stale on every
+# release bump.
+
+on:
+  schedule:
+    - cron: "0 2 * * *" # nightly 02:00 UTC, before the other nightlies
+  pull_request:
+    paths:
+      - "testbench/sql-dump/**"
+      - ".github/workflows/sql-dump.yml"
+  workflow_dispatch:
+    inputs:
+      max_rows:
+        description: "Rows per table"
+        default: "2000"
+
+permissions:
+  contents: read
+
+jobs:
+  dump-diff:
+    name: SQL dump vs MySQL 8.4
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # The five models whose generated dump MySQL itself accepts. Three
+        # bundled fixtures are excluded because the *generator* produces a dump
+        # the oracle rejects, which says nothing about ElyraSQL:
+        #   cms_kitchensink  AUTO_INCREMENT column emitted without a key (1075)
+        #   odoo_erp         generated value exceeds its own column width (1406)
+        #   everything       nullable FKs form a cycle, so no parent-before-child
+        #                    ordering exists (generator aborts)
+        # Tracked as testbench bugs; add them back once the generator is fixed.
+        model:
+          - 01_scalar_matrix
+          - 02_relational_graph
+          - 03_commerce_graph
+          - banking_ledger
+          - car_dealership
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            testbench/sql-dump
+
+      # The runner invokes `cargo run --locked`, so a stale testbench lockfile
+      # fails the run outright. Say so in one line instead of leaving a
+      # `--locked` error in the middle of Docker output.
+      - name: Check testbench lockfile is current
+        run: |
+          cd testbench/sql-dump
+          if ! cargo metadata --locked --format-version 1 >/dev/null 2>&1; then
+            echo "::error::testbench/sql-dump/Cargo.lock is stale."
+            echo "::error::Run: (cd testbench/sql-dump && cargo check --offline)"
+            exit 1
+          fi
+
+      - name: Run differential
+        run: |
+          ./testbench/sql-dump/scripts/run.sh \
+            --model "fixtures/${{ matrix.model }}.yaml" \
+            --mode schema-and-data \
+            --max-rows "${{ inputs.max_rows || '2000' }}" \
+            --artifacts "artifacts/ci-${{ matrix.model }}"
+
+      - name: Summarise
+        if: always()
+        run: |
+          REPORT="testbench/sql-dump/artifacts/ci-${{ matrix.model }}/report.json"
+          [ -f "$REPORT" ] || { echo "no report.json produced"; exit 0; }
+          python3 - "$REPORT" >> "$GITHUB_STEP_SUMMARY" <<'PY'
+          import json, sys
+          d = json.load(open(sys.argv[1]))
+          o = d.get("outcome", {})
+          print(f"## {d.get('model')} \u2014 {o.get('status', 'unknown')}")
+          print()
+          print(f"- ElyraSQL `{d.get('elyra_version')}` vs MySQL `{d.get('mysql_version')}`")
+          print(f"- {o.get('table_count', 0)} tables, {o.get('column_count', 0)} columns, "
+                f"{d.get('statements_executed', 0)} statements")
+          if o.get("row_counts"):
+              print(f"- rows: {o['row_counts']}")
+          if o.get("status") != "passed":
+              print()
+              print("```json")
+              print(json.dumps(o, indent=2)[:3000])
+              print("```")
+          PY
+
+      - name: Upload artifacts
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sql-dump-${{ matrix.model }}
+          path: testbench/sql-dump/artifacts/ci-${{ matrix.model }}/
+          retention-days: 14
