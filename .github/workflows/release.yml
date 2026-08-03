@@ -58,6 +58,14 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Install MySQL client (macOS)
+        if: matrix.platform == 'macos'
+        run: |
+          brew install mysql-client
+          # mysql-client is keg-only, so it is not linked into /opt/homebrew/bin;
+          # put its bin dir on PATH for the PGO training step below.
+          echo "/opt/homebrew/opt/mysql-client/bin:$PATH" >> "$GITHUB_ENV"
+
       - name: Generate PGO profile (fail-safe)
         id: pgo
         continue-on-error: true
@@ -66,9 +74,28 @@ jobs:
         run: |
           rustup component add llvm-tools-preview
           mkdir -p "$PGO_DIR/training-sql"
-          python3 testbench/sql-dump/generate.py --all --rows 50000 --output-dir "$PGO_DIR/training-sql"
+          python3 scripts/generate-training-sql.py --all --rows 50000 --output-dir "$PGO_DIR/training-sql"
           ./scripts/pgo-build.sh --profile-only --train-data-dir "$PGO_DIR/train-data"
+          # Fail loudly if training produced no profile: continue-on-error then
+          # turns this into a visible step failure and the warning step below
+          # annotates the run instead of silently shipping a plain dist build.
+          test -s "$PGO_DIR/merged.profdata"
           echo "RUSTFLAGS=-Cprofile-use=$PGO_DIR/merged.profdata -Cllvm-args=-pgo-warn-missing-function" >> "$GITHUB_ENV"
+
+      - name: Warn when PGO was skipped
+        if: steps.pgo.outcome == 'failure'
+        run: |
+          echo "::warning::PGO profile generation failed — releasing plain dist build WITHOUT profile-guided optimization"
+          {
+            echo "## PGO skipped"
+            echo ""
+            echo "Profile generation failed. This release ships a **plain dist build WITHOUT profile-guided optimization**."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Note PGO success
+        if: steps.pgo.outcome == 'success'
+        run: |
+          echo "PGO profile generated and applied to this release build." >> "$GITHUB_STEP_SUMMARY"
 
       - name: Install musl tools
         if: matrix.platform == 'linux'

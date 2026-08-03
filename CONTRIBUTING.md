@@ -135,7 +135,8 @@ Please do **not** open public issues for vulnerabilities. See
 The release workflow includes a fail-safe PGO step that generates a
 `merged.profdata` training profile and feeds it to the linker. If anything
 fails — missing `llvm-tools-preview`, training data not generated, benchmark
-scripts changed — the build falls back to `[profile.dist]` without PGO.
+scripts changed — the step fails visibly and the run is annotated with a
+warning, but the build still falls back to `[profile.dist]` without PGO.
 
 A release built without a valid profile is a supported release. Do not let
 a profiling hiccup block a release.
