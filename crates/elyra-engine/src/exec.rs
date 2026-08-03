@@ -241,6 +241,24 @@ fn declaration_from_data_type(dt: &DataType) -> Result<catalog::ColumnDeclaratio
                 .unwrap_or_else(|| "char".into());
             declaration("char", column_type, maximum, None, None)
         }
+        // Binary strings carry a byte limit, not a character limit, but it is
+        // the same field: `character_maximum_length` is what MySQL's
+        // `information_schema` reports for both, and result-column widths need
+        // it for `VARBINARY(n)` exactly as for `VARCHAR(n)`.
+        DataType::Varbinary(length) => {
+            let maximum = *length;
+            let column_type = maximum
+                .map(|length| format!("varbinary({length})"))
+                .unwrap_or_else(|| "varbinary".into());
+            declaration("varbinary", column_type, maximum, None, None)
+        }
+        DataType::Binary(length) => {
+            let maximum = length.or(Some(1));
+            let column_type = maximum
+                .map(|length| format!("binary({length})"))
+                .unwrap_or_else(|| "binary".into());
+            declaration("binary", column_type, maximum, None, None)
+        }
         DataType::Text => declaration("text", "text", Some(65_535), None, None),
         DataType::TinyText => declaration("tinytext", "tinytext", Some(255), None, None),
         DataType::MediumText => {

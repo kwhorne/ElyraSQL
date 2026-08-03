@@ -123,7 +123,6 @@ where
     W: AsyncWrite + Unpin,
 {
     for c in i {
-        use crate::myc::constants::UTF8_GENERAL_CI;
         w.write_lenenc_str(b"def")?;
         w.write_lenenc_str(b"")?;
         w.write_lenenc_str(c.table.as_bytes())?;
@@ -131,7 +130,7 @@ where
         w.write_lenenc_str(c.column.as_bytes())?;
         w.write_lenenc_str(b"")?;
         w.write_lenenc_int(0xC)?;
-        w.write_u16::<LittleEndian>(UTF8_GENERAL_CI)?;
+        w.write_u16::<LittleEndian>(c.charset)?;
         w.write_u32::<LittleEndian>(c.column_length)?;
         w.write_u8(c.coltype as u8)?;
         w.write_u16::<LittleEndian>(c.colflags.bits())?;

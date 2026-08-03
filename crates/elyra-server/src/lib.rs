@@ -439,15 +439,34 @@ fn column_type(ty: &elyra_core::ColumnType) -> ColumnType {
     }
 }
 
-fn column_length(ty: &elyra_core::ColumnType) -> u32 {
-    match ty {
+/// Bytes per character advertised for text columns. MySQL reports character
+/// columns in bytes under the column's charset, so a `VARCHAR(32)` in utf8mb4
+/// is 128 -- clients divide by the charset's maximum length to recover 32.
+const UTF8MB4_BYTES_PER_CHAR: u32 = 4;
+
+/// Capacity of `TEXT`/`BLOB`, used when no declared width is available.
+const UNBOUNDED_TEXT_BYTES: u32 = 65_535;
+
+/// True for columns MySQL advertises with a character collation rather than
+/// the binary one.
+fn is_character_column(ty: &elyra_core::ColumnType) -> bool {
+    matches!(ty, elyra_core::ColumnType::Text)
+}
+
+fn column_length(column: &elyra_core::ColumnDef) -> u32 {
+    let declared = column.result_metadata.character_max_length;
+    match &column.ty {
         elyra_core::ColumnType::Bool => 1,
         elyra_core::ColumnType::Int | elyra_core::ColumnType::UInt => 20,
         elyra_core::ColumnType::Float => 22,
-        // The engine does not yet persist VARCHAR/VARBINARY declarations; use
-        // their underlying TEXT/BLOB capacity until declared types are carried
-        // separately.
-        elyra_core::ColumnType::Text | elyra_core::ColumnType::Bytes => 65_535,
+        // `CHAR`/`VARCHAR`/`TEXT` all land on `Text`, and `BINARY`/`VARBINARY`/
+        // `BLOB` on `Bytes`; the declared width tells them apart. Without one
+        // -- an unbounded type, or a table written before declared types were
+        // stored -- fall back to the unbounded capacity.
+        elyra_core::ColumnType::Text => declared
+            .unwrap_or(UNBOUNDED_TEXT_BYTES)
+            .saturating_mul(UTF8MB4_BYTES_PER_CHAR),
+        elyra_core::ColumnType::Bytes => declared.unwrap_or(UNBOUNDED_TEXT_BYTES),
         elyra_core::ColumnType::Vector(dimensions) => {
             dimensions.saturating_mul(16).saturating_add(2)
         }
@@ -475,7 +494,12 @@ fn result_column(table: String, column: &elyra_core::ColumnDef) -> Column {
         column: column.name.clone(),
         coltype: column_type(&column.ty),
         colflags: column_flags(column),
-        column_length: column_length(&column.ty),
+        column_length: column_length(column),
+        charset: if is_character_column(&column.ty) {
+            elyra_wire::UTF8MB4_0900_AI_CI
+        } else {
+            elyra_wire::BINARY_COLLATION
+        },
         decimals: column_decimals(&column.ty),
     }
 }
@@ -605,6 +629,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for ElyraShim {
                 coltype: ColumnType::MYSQL_TYPE_VAR_STRING,
                 colflags: ColumnFlags::empty(),
                 column_length: 65_535,
+                charset: elyra_wire::UTF8MB4_0900_AI_CI,
                 decimals: 0,
             })
             .collect();
@@ -744,6 +769,7 @@ async fn write_string_rows<W: AsyncWrite + Send + Unpin>(
             coltype: ColumnType::MYSQL_TYPE_VAR_STRING,
             colflags: ColumnFlags::empty(),
             column_length: 65_535,
+            charset: elyra_wire::UTF8MB4_0900_AI_CI,
             decimals: 0,
         })
         .collect();

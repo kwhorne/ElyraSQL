@@ -107,6 +107,15 @@ pub struct ResultColumnMetadata {
     pub primary_key: bool,
     pub unique_key: bool,
     pub auto_increment: bool,
+    /// Declared character or byte limit, for columns that have one: the `32`
+    /// of `VARCHAR(32)` or `VARBINARY(32)`. `None` for unbounded types
+    /// (`TEXT`, `BLOB`) and for tables written before declared types were
+    /// stored, in which case the wire layer falls back to the unbounded width.
+    ///
+    /// Only used to advertise result-column widths; storage does not consult
+    /// it. Held here rather than in [`ColumnType`] because the storage type is
+    /// bincode-encoded into the catalog by position.
+    pub character_max_length: Option<u32>,
 }
 
 impl ColumnDef {
@@ -237,6 +246,7 @@ mod schema_metadata_tests {
                     primary_key: index == 0,
                     unique_key: index == 1,
                     auto_increment: index == 0,
+                    character_max_length: Some(64),
                 };
                 column
             })

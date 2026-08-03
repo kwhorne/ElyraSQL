@@ -152,6 +152,9 @@ impl TableDef {
                     .col_meta
                     .get(index)
                     .is_some_and(|meta| meta.auto_increment),
+                // Filled in by `load` from the declared-type sidecar, which is
+                // a separate storage key and so not reachable from here.
+                character_max_length: None,
             })
             .collect::<Vec<_>>();
         for (column, metadata) in self.schema.columns.iter_mut().zip(metadata) {
@@ -606,10 +609,25 @@ pub async fn load(db: &Session, table: &str) -> Result<TableDef> {
             }
         }
     }
-    let def = match db.get(catalog_key(table)).await? {
+    let mut def = match db.get(catalog_key(table)).await? {
         Some(bytes) => TableDef::decode(&bytes)?,
         None => return Err(Error::Catalog(format!("no such table: {table}"))),
     };
+    // Declared widths live in their own key, so they are merged in here rather
+    // than in `TableDef::decode`. The result is cached with the definition, so
+    // this costs one extra read per cache miss, not per query.
+    if let Some(declarations) = load_declarations(db, table).await? {
+        for (column, declaration) in def
+            .schema
+            .columns
+            .iter_mut()
+            .zip(declarations.columns.iter())
+        {
+            column.result_metadata.character_max_length = declaration
+                .character_maximum_length
+                .and_then(|length| u32::try_from(length).ok());
+        }
+    }
     if !db.in_txn() {
         catalog_cache()
             .write()
