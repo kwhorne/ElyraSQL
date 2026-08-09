@@ -84,8 +84,9 @@ exact search.
   the query falls back to **exact** search, which is always correct.
 
 !!! tip
-    Build the index once your vectors are loaded. The first query after a
-    change pays a one-time rebuild cost; subsequent queries are cached.
+    Build the index once your vectors are loaded. The first query builds and
+    caches the graph; after later writes, the first query pays a one-time
+    reconciliation scan and subsequent queries reuse the reconciled graph.
 
 ## Hybrid search (full-text + vector, fused)
 

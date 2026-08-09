@@ -855,8 +855,168 @@ fn explain_first_table(stmt: &sqlparser::ast::Statement) -> Option<String> {
     None
 }
 
-/// `EXPLAIN <statement>` — a best-effort, MySQL-shaped plan row (names the first
-/// base table and its estimated row count). Not a full optimizer trace.
+struct ExplainAccess {
+    kind: &'static str,
+    possible_keys: Option<String>,
+    key: Option<String>,
+    rows: String,
+    extra: String,
+}
+
+#[derive(Default)]
+struct ExplainFeatureVisitor {
+    incremental_window: bool,
+}
+
+impl Visitor for ExplainFeatureVisitor {
+    type Break = ();
+
+    fn pre_visit_expr(&mut self, expression: &Expr) -> ControlFlow<Self::Break> {
+        if let Expr::Function(function) = expression {
+            self.incremental_window |= function.over.is_some()
+                && window_aggregate_is_incremental(&function_name(function));
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+async fn explain_first_access(
+    db: &Session,
+    stmt: &sqlparser::ast::Statement,
+    table: &str,
+    rows_estimate: String,
+) -> Result<ExplainAccess> {
+    use sqlparser::ast::{SetExpr, Statement};
+    let select = match stmt {
+        Statement::Query(query) => match query.body.as_ref() {
+            SetExpr::Select(select) => Some(select.as_ref()),
+            _ => None,
+        },
+        _ => None,
+    };
+    let selection = select.and_then(|select| select.selection.as_ref());
+    let def = match catalog::load(db, table).await {
+        Ok(def) => def,
+        Err(Error::Catalog(_)) => {
+            return Ok(ExplainAccess {
+                kind: "ALL",
+                possible_keys: None,
+                key: None,
+                rows: rows_estimate,
+                extra: selection.map_or_else(String::new, |_| "Using where".into()),
+            });
+        }
+        Err(error) => return Err(error),
+    };
+    let mut feature_extra = Vec::new();
+    if let (Some(filter), Some(from)) = (selection, select.and_then(|select| select.from.first())) {
+        let outer = factor_qualifier_object(db, &from.relation)
+            .map(|qualifier| object_name_parts(&qualifier))
+            .unwrap_or_else(|| vec![table.to_string()]);
+        if correlated_exists_membership_eligible(db, filter, &def, &outer).await? {
+            feature_extra.push("Using semi-join membership");
+        }
+    }
+    if select.is_some_and(|select| select.distinct.is_some()) {
+        feature_extra.push("Distinct (spill-capable)");
+    }
+    if let Some(select) = select {
+        let mut visitor = ExplainFeatureVisitor::default();
+        let _ = select.visit(&mut visitor);
+        if visitor.incremental_window {
+            feature_extra.push("Incremental window aggregate");
+        }
+    }
+    let decorate = |mut access: ExplainAccess| {
+        if !feature_extra.is_empty() {
+            if !access.extra.is_empty() {
+                access.extra.push_str("; ");
+            }
+            access.extra.push_str(&feature_extra.join("; "));
+        }
+        access
+    };
+    if def.has_pk() && key_eq_values(&def, selection, &def.pk_cols)?.is_some() {
+        return Ok(decorate(ExplainAccess {
+            kind: "const",
+            possible_keys: Some("PRIMARY".into()),
+            key: Some("PRIMARY".into()),
+            rows: "1".into(),
+            extra: "Using where".into(),
+        }));
+    }
+    for index in &def.indexes {
+        if !index.vector && key_eq_values(&def, selection, &index.cols)?.is_some() {
+            return Ok(decorate(ExplainAccess {
+                kind: "ref",
+                possible_keys: Some(index.name.clone()),
+                key: Some(index.name.clone()),
+                rows: "1".into(),
+                extra: "Using index condition; Using where".into(),
+            }));
+        }
+    }
+    if let Some(range) = composite_range_bounds(&def, selection)? {
+        return Ok(decorate(ExplainAccess {
+            kind: "range",
+            possible_keys: Some(range.index.name.clone()),
+            key: Some(range.index.name.clone()),
+            rows: rows_estimate,
+            extra: "Using index condition; Using where".into(),
+        }));
+    }
+    if let Some(range) = range_bounds(&def, selection)? {
+        let key = if def.pk_cols == [range.col] {
+            "PRIMARY".to_string()
+        } else {
+            index::index_on(&def, range.col)
+                .map(|index| index.name.clone())
+                .unwrap_or_default()
+        };
+        return Ok(decorate(ExplainAccess {
+            kind: "range",
+            possible_keys: Some(key.clone()),
+            key: Some(key),
+            rows: rows_estimate,
+            extra: "Using index condition; Using where".into(),
+        }));
+    }
+    Ok(decorate(ExplainAccess {
+        kind: "ALL",
+        possible_keys: None,
+        key: None,
+        rows: rows_estimate,
+        extra: selection.map_or_else(String::new, |_| "Using where".into()),
+    }))
+}
+
+fn explain_row(table: Option<String>, access: ExplainAccess, extra: Option<&str>) -> Vec<Value> {
+    let mut access_extra = access.extra;
+    if let Some(extra) = extra {
+        if !access_extra.is_empty() {
+            access_extra.push_str("; ");
+        }
+        access_extra.push_str(extra);
+    }
+    vec![
+        Value::Text("1".into()),
+        Value::Text("SIMPLE".into()),
+        table.map(Value::Text).unwrap_or(Value::Null),
+        Value::Null,
+        Value::Text(access.kind.into()),
+        access.possible_keys.map(Value::Text).unwrap_or(Value::Null),
+        access.key.map(Value::Text).unwrap_or(Value::Null),
+        Value::Null,
+        Value::Null,
+        Value::Text(access.rows),
+        Value::Text("100.00".into()),
+        Value::Text(access_extra),
+    ]
+}
+
+/// `EXPLAIN <statement>` — a MySQL-shaped summary of access paths that the
+/// executor can prove it will use. It remains a compact trace rather than a
+/// full cost model.
 pub async fn explain(db: &Session, stmt: &sqlparser::ast::Statement) -> Result<QueryResult> {
     let schema = text_schema(&[
         "id",
@@ -872,7 +1032,25 @@ pub async fn explain(db: &Session, stmt: &sqlparser::ast::Statement) -> Result<Q
         "filtered",
         "Extra",
     ]);
-    let table = explain_first_table(stmt);
+    let select = match stmt {
+        sqlparser::ast::Statement::Query(query) => match query.body.as_ref() {
+            SetExpr::Select(select) => Some(select.as_ref()),
+            _ => None,
+        },
+        _ => None,
+    };
+    let indexed_join = match select {
+        Some(select) => match guaranteed_indexed_join_access(db, select).await {
+            Ok(access) => access,
+            Err(Error::Catalog(_) | Error::UnknownDatabase(_)) => None,
+            Err(error) => return Err(error),
+        },
+        None => None,
+    };
+    let table = indexed_join
+        .as_ref()
+        .map(|join| join.driver_table.clone())
+        .or_else(|| explain_first_table(stmt));
     let rows_est = match &table {
         Some(t) => catalog::load_stats(db, t)
             .await?
@@ -880,21 +1058,35 @@ pub async fn explain(db: &Session, stmt: &sqlparser::ast::Statement) -> Result<Q
             .unwrap_or_else(|| "0".into()),
         None => "0".into(),
     };
-    let row = vec![
-        Value::Text("1".into()),
-        Value::Text("SIMPLE".into()),
-        table.clone().map(Value::Text).unwrap_or(Value::Null),
-        Value::Null,
-        Value::Text(if table.is_some() { "ALL" } else { "" }.into()),
-        Value::Null,
-        Value::Null,
-        Value::Null,
-        Value::Null,
-        Value::Text(rows_est),
-        Value::Text("100.00".into()),
-        Value::Text(String::new()),
-    ];
-    Ok(QueryResult::Rows(RowStream::literal(schema, vec![row])))
+    let access = match table.as_deref() {
+        Some(table) => explain_first_access(db, stmt, table, rows_est).await?,
+        None => ExplainAccess {
+            kind: "",
+            possible_keys: None,
+            key: None,
+            rows: rows_est,
+            extra: String::new(),
+        },
+    };
+    let mut rows = vec![explain_row(table, access, None)];
+    if let Some(join) = indexed_join {
+        let partner_rows = catalog::load_stats(db, &join.partner_table)
+            .await?
+            .map(|stats| stats.rows.to_string())
+            .unwrap_or_else(|| "0".into());
+        rows.push(explain_row(
+            Some(join.partner_table),
+            ExplainAccess {
+                kind: join.access_type,
+                possible_keys: Some(join.index_name.clone()),
+                key: Some(join.index_name),
+                rows: partner_rows,
+                extra: "Using index condition".into(),
+            },
+            Some("Indexed nested-loop join"),
+        ));
+    }
+    Ok(QueryResult::Rows(RowStream::literal(schema, rows)))
 }
 
 /// MySQL-compatible system variables reported by `SHOW VARIABLES`. ElyraSQL
@@ -2694,6 +2886,10 @@ pub async fn alter_table(
     if implicit_transaction {
         db.begin()?;
     }
+    // ALTER helpers that rewrite a table scan a snapshot before staging new
+    // keys. Validate those scanned ranges at commit so a concurrent write
+    // cannot survive in an obsolete row/key layout.
+    db.require_serializable_validation()?;
     let checkpoint = match db.transaction_checkpoint() {
         Ok(checkpoint) => checkpoint,
         Err(error) => {
@@ -2885,30 +3081,28 @@ async fn alter_table_inner(
                     });
                     continue;
                 }
-                let (idx_name, columns, unique) =
-                    match tc {
-                        TC::Index { name, columns, .. } => (name.clone(), columns.clone(), false),
-                        TC::Unique {
-                            name,
-                            index_name,
-                            columns,
-                            ..
-                        } => (
-                            name.clone().or_else(|| index_name.clone()),
-                            columns.clone(),
-                            true,
-                        ),
-                        TC::PrimaryKey { .. } => return Err(Error::Unsupported(
-                            "ALTER TABLE ADD PRIMARY KEY on an existing table is not supported; \
-                             declare the primary key in CREATE TABLE"
-                                .into(),
-                        )),
-                        other => {
-                            return Err(Error::Unsupported(format!(
-                                "ALTER ADD constraint not supported: {other}"
-                            )))
-                        }
-                    };
+                let (idx_name, columns, unique) = match tc {
+                    TC::Index { name, columns, .. } => (name.clone(), columns.clone(), false),
+                    TC::Unique {
+                        name,
+                        index_name,
+                        columns,
+                        ..
+                    } => (
+                        name.clone().or_else(|| index_name.clone()),
+                        columns.clone(),
+                        true,
+                    ),
+                    TC::PrimaryKey { columns, .. } => {
+                        alter_add_primary_key(db, &mut def, columns).await?;
+                        continue;
+                    }
+                    other => {
+                        return Err(Error::Unsupported(format!(
+                            "ALTER ADD constraint not supported: {other}"
+                        )))
+                    }
+                };
                 let ci = CreateIndex {
                     name: idx_name.map(|i| ObjectName(vec![i])),
                     table_name: name.clone(),
@@ -2946,6 +3140,101 @@ async fn alter_table_inner(
             .await?;
     }
     Ok(QueryResult::Affected(0))
+}
+
+/// Add a clustered primary key to a rowid table, re-keying every stored row and
+/// rebuilding secondary-index entries against the new clustered keys.
+async fn alter_add_primary_key(db: &Session, def: &mut TableDef, columns: &[Ident]) -> Result<()> {
+    if def.has_pk() {
+        return Err(Error::Query("multiple primary keys are not allowed".into()));
+    }
+    if columns.is_empty() {
+        return Err(Error::Query(
+            "ALTER TABLE ADD PRIMARY KEY requires at least one column".into(),
+        ));
+    }
+
+    let mut pk_cols = Vec::with_capacity(columns.len());
+    for column in columns {
+        let index = def
+            .schema
+            .columns
+            .iter()
+            .position(|candidate| predicate::identifier_eq(&candidate.name, &column.value))
+            .ok_or_else(|| Error::Catalog(format!("unknown column: {column}")))?;
+        if pk_cols.contains(&index) {
+            return Err(Error::Query(format!(
+                "duplicate column '{}' in primary key",
+                column.value
+            )));
+        }
+        pk_cols.push(index);
+    }
+
+    let old_def = def.clone();
+    let rows = collect_all_encoded_rows(db, &old_def).await?;
+    def.pk_cols = pk_cols;
+    for &column in &def.pk_cols {
+        def.schema.columns[column].nullable = false;
+    }
+
+    let mut puts = vec![(catalog_key(&def.name), def.encode()?)];
+    let mut deletes = Vec::new();
+    let mut clustered_keys = std::collections::HashSet::with_capacity(rows.len());
+    let pk_collations = def.pk_collations();
+    let clustered_prefix = data_prefix(&def.name);
+
+    for (old_key, encoded_row, row) in rows {
+        if def.pk_cols.iter().any(|&column| row[column].is_null()) {
+            return Err(Error::Query(
+                "primary key columns cannot contain NULL".into(),
+            ));
+        }
+        let clustered = keyenc::encode_columns_coll(&row, &def.pk_cols, &pk_collations)?;
+        if !clustered_keys.insert(clustered.clone()) {
+            return Err(Error::Duplicate("duplicate primary key".into()));
+        }
+        let mut new_key = clustered_prefix.clone();
+        new_key.extend_from_slice(&clustered);
+        deletes.extend(index::entry_keys_for_row(&old_def, &row, &old_key)?);
+        if new_key != old_key {
+            deletes.push(old_key);
+        }
+        puts.push((new_key.clone(), encoded_row));
+        puts.extend(index::entries_for_row(def, &row, &new_key)?);
+    }
+
+    deletes.push(rowid_key(&def.name));
+    puts.push(bump_wcount(db, &def.name).await?);
+    db.commit_write(puts, deletes).await
+}
+
+/// Read a table once while retaining the original encoded row bytes. Table
+/// reclustering changes keys, not row payloads, so reusing these bytes avoids a
+/// full-table serialization pass while still decoding once for key/index work.
+async fn collect_all_encoded_rows(
+    db: &Session,
+    def: &TableDef,
+) -> Result<Vec<(Vec<u8>, Vec<u8>, Vec<Value>)>> {
+    let prefix = data_prefix(&def.name);
+    let mut cursor = None;
+    let mut rows = Vec::new();
+    loop {
+        let batch = db.scan_batch(prefix.clone(), cursor.clone(), 4096).await?;
+        if batch.is_empty() {
+            break;
+        }
+        let last = batch.len() < 4096;
+        cursor = batch.last().map(|(key, _)| key.clone());
+        for (key, encoded) in batch {
+            let row = rowdec::decode_row(&encoded)?;
+            rows.push((key, encoded, row));
+        }
+        if last {
+            break;
+        }
+    }
+    Ok(rows)
 }
 
 fn ensure_col_meta(def: &mut TableDef) {
@@ -4016,6 +4305,7 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
     let on_dup = !dup_sets.is_empty();
     let has_pk = def.has_pk();
     let pk_colls = def.pk_collations();
+    let clustered_prefix = data_prefix(&name);
 
     // Load rowid counter once for tables without a PK.
     let mut next_rowid = if has_pk {
@@ -4179,11 +4469,15 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
         check_row(&def, &checks, &row)?;
 
         let key = if has_pk {
-            let pk_vals: Vec<Value> = def.pk_cols.iter().map(|&i| row[i].clone()).collect();
-            data_key(&name, &keyenc::encode_key_coll(&pk_vals, &pk_colls)?)
+            let encoded = keyenc::encode_columns_coll(&row, &def.pk_cols, &pk_colls)?;
+            let mut key = clustered_prefix.clone();
+            key.extend_from_slice(&encoded);
+            key
         } else {
             next_rowid += 1;
-            data_key(&name, &keyenc::encode_rowid(next_rowid))
+            let mut key = clustered_prefix.clone();
+            key.extend_from_slice(&keyenc::encode_rowid(next_rowid));
+            key
         };
         built.push((key, row));
     }
@@ -4219,6 +4513,11 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
         if auto_col.is_some() {
             aux_puts.push((autoinc_key(&name), autoinc.to_le_bytes().to_vec()));
         }
+        // redb's B-tree writer benefits materially from monotonic key order.
+        // These sets have order-independent semantics: every `new` key must be
+        // unique and auxiliary index/counter keys contain no competing writes.
+        new_puts.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        aux_puts.sort_unstable_by(|left, right| left.0.cmp(&right.0));
         let affected = built.len() as u64;
         db.raw_db()
             .commit_insert(new_puts, aux_puts, Vec::new())
@@ -5242,34 +5541,12 @@ async fn select_inner(
                 si.distinct = None;
             }
             let res = Box::pin(select(db, vindex, &inner_q)).await?;
-            let QueryResult::Rows(mut stream) = res else {
+            let QueryResult::Rows(stream) = res else {
                 return Ok(res);
             };
-            let schema = stream.schema.clone();
-            let colls: Vec<elyra_core::Collation> =
-                schema.columns.iter().map(|c| c.collation).collect();
-            let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
-            let mut out: Vec<Vec<Value>> = Vec::new();
-            let cap = distinct_max();
-            loop {
-                let batch = stream.next_batch(8192).await?;
-                if batch.is_empty() {
-                    break;
-                }
-                for row in batch {
-                    if seen.insert(Value::row_collation_key_coll(&row, &colls)) {
-                        out.push(row);
-                        if out.len() > cap {
-                            return Err(Error::Query(format!(
-                                "SELECT DISTINCT exceeded {cap} distinct rows; narrow the query \
-                                 or raise ELYRASQL_DISTINCT_MAX"
-                            )));
-                        }
-                    }
-                }
-            }
-            apply_offset_limit(&mut out, d_offset, d_limit);
-            return Ok(QueryResult::Rows(RowStream::literal(schema, out)));
+            return Ok(QueryResult::Rows(
+                distinct_rows(stream, d_offset, d_limit, distinct_max(), db.cancel_token()).await?,
+            ));
         }
     }
 
@@ -8772,33 +9049,153 @@ struct RangeQuery {
     hi: Option<(Value, bool)>,
 }
 
+/// An equality-constrained leading prefix followed by a range on the next
+/// column of a composite secondary index.
+struct CompositeRangeQuery<'a> {
+    index: &'a IndexDef,
+    prefix: Vec<Value>,
+    lo: Option<(Value, bool)>,
+    hi: Option<(Value, bool)>,
+}
+
+type RangeBound = Option<(Value, bool)>;
+type ColumnBounds = (RangeBound, RangeBound);
+type EqualityConstraints = std::collections::HashMap<usize, Value>;
+type RangeConstraints = std::collections::HashMap<usize, ColumnBounds>;
+
+fn merge_lower_bound(
+    current: &mut Option<(Value, bool)>,
+    candidate: (Value, bool),
+    collation: elyra_core::Collation,
+) {
+    let replace = match current {
+        None => true,
+        Some((value, inclusive)) => match candidate.0.compare_coll(value, collation) {
+            Some(std::cmp::Ordering::Greater) => true,
+            Some(std::cmp::Ordering::Equal) => *inclusive && !candidate.1,
+            _ => false,
+        },
+    };
+    if replace {
+        *current = Some(candidate);
+    }
+}
+
+fn merge_upper_bound(
+    current: &mut Option<(Value, bool)>,
+    candidate: (Value, bool),
+    collation: elyra_core::Collation,
+) {
+    let replace = match current {
+        None => true,
+        Some((value, inclusive)) => match candidate.0.compare_coll(value, collation) {
+            Some(std::cmp::Ordering::Less) => true,
+            Some(std::cmp::Ordering::Equal) => *inclusive && !candidate.1,
+            _ => false,
+        },
+    };
+    if replace {
+        *current = Some(candidate);
+    }
+}
+
+fn predicate_constraints(
+    def: &TableDef,
+    filter: Option<&Expr>,
+) -> Result<(EqualityConstraints, RangeConstraints)> {
+    use sqlparser::ast::BinaryOperator::*;
+    use std::collections::HashMap;
+    let mut equalities = HashMap::new();
+    let mut ranges: RangeConstraints = HashMap::new();
+    let Some(filter) = filter else {
+        return Ok((equalities, ranges));
+    };
+    let mut conjuncts = Vec::new();
+    split_and(filter, &mut conjuncts);
+    for conjunct in &conjuncts {
+        if let Some((col, value)) = eq_col_literal(def, Some(conjunct))? {
+            equalities.entry(col).or_insert(value);
+        }
+        if let Some((col, op, value)) = as_range(def, conjunct)? {
+            let bounds = ranges.entry(col).or_default();
+            let collation = def.collation_of(col);
+            match op {
+                Gt => merge_lower_bound(&mut bounds.0, (value, false), collation),
+                GtEq => merge_lower_bound(&mut bounds.0, (value, true), collation),
+                Lt => merge_upper_bound(&mut bounds.1, (value, false), collation),
+                LtEq => merge_upper_bound(&mut bounds.1, (value, true), collation),
+                _ => {}
+            }
+        } else if let Some((col, lo, hi)) = as_between(def, conjunct)? {
+            let bounds = ranges.entry(col).or_default();
+            let collation = def.collation_of(col);
+            merge_lower_bound(&mut bounds.0, (lo, true), collation);
+            merge_upper_bound(&mut bounds.1, (hi, true), collation);
+        }
+    }
+    Ok((equalities, ranges))
+}
+
+fn composite_range_bounds<'a>(
+    def: &'a TableDef,
+    filter: Option<&Expr>,
+) -> Result<Option<CompositeRangeQuery<'a>>> {
+    let (equalities, ranges) = predicate_constraints(def, filter)?;
+    for index in &def.indexes {
+        if index.vector || index.fulltext || index.cols.len() < 2 {
+            continue;
+        }
+        let prefix_len = index
+            .cols
+            .iter()
+            .take_while(|col| equalities.contains_key(col))
+            .count();
+        if prefix_len == 0 || prefix_len >= index.cols.len() {
+            continue;
+        }
+        let range_col = index.cols[prefix_len];
+        let Some((lo, hi)) = ranges.get(&range_col) else {
+            continue;
+        };
+        // Composite entries are omitted when *any* indexed component is NULL.
+        // The equality and range predicates themselves reject NULL in their
+        // columns, but a nullable trailing component could omit an otherwise
+        // qualifying row and make this scan incomplete.
+        if index.cols[prefix_len + 1..]
+            .iter()
+            .any(|&col| def.schema.columns[col].nullable)
+        {
+            continue;
+        }
+        let prefix = index.cols[..prefix_len]
+            .iter()
+            .map(|col| equalities[col].clone())
+            .collect::<Vec<_>>();
+        if keyenc::encode_key_coll(&prefix, &index.col_collations).is_err()
+            || lo.as_ref().is_some_and(|(value, _)| {
+                keyenc::encode_coll(value, def.collation_of(range_col)).is_err()
+            })
+            || hi.as_ref().is_some_and(|(value, _)| {
+                keyenc::encode_coll(value, def.collation_of(range_col)).is_err()
+            })
+        {
+            continue;
+        }
+        return Ok(Some(CompositeRangeQuery {
+            index,
+            prefix,
+            lo: lo.clone(),
+            hi: hi.clone(),
+        }));
+    }
+    Ok(None)
+}
+
 /// Detect a range over a PK/indexed column from the filter's AND-conjuncts
 /// (`col >|>=|<|<= lit`, `col BETWEEN a AND b`). Only columns with
 /// order-encodable bound values qualify.
 fn range_bounds(def: &TableDef, filter: Option<&Expr>) -> Result<Option<RangeQuery>> {
-    use std::collections::HashMap;
-    let Some(f) = filter else { return Ok(None) };
-    let mut conj = Vec::new();
-    split_and(f, &mut conj);
-
-    type Bounds = (Option<(Value, bool)>, Option<(Value, bool)>);
-    let mut map: HashMap<usize, Bounds> = HashMap::new();
-
-    for c in &conj {
-        if let Some((col, op, val)) = as_range(def, c)? {
-            let e = map.entry(col).or_default();
-            use sqlparser::ast::BinaryOperator::*;
-            match op {
-                Gt => e.0 = Some((val, false)),
-                GtEq => e.0 = Some((val, true)),
-                Lt => e.1 = Some((val, false)),
-                LtEq => e.1 = Some((val, true)),
-                _ => {}
-            }
-        } else if let Some((col, lo, hi)) = as_between(def, c)? {
-            map.insert(col, (Some((lo, true)), Some((hi, true))));
-        }
-    }
+    let (_, map) = predicate_constraints(def, filter)?;
 
     for (col, (lo, hi)) in map {
         if lo.is_none() && hi.is_none() {
@@ -9118,6 +9515,35 @@ async fn index_range(
                 k,
                 bincode::deserialize(&b).map_err(|e| Error::Storage(e.to_string()))?,
             ));
+        }
+    }
+    Ok(Some(out))
+}
+
+async fn composite_index_range(
+    db: &Session,
+    def: &TableDef,
+    query: &CompositeRangeQuery<'_>,
+    budget: Option<usize>,
+) -> Result<Option<Vec<(Vec<u8>, Vec<Value>)>>> {
+    let lo = query
+        .lo
+        .as_ref()
+        .map(|(value, inclusive)| (value, *inclusive));
+    let hi = query
+        .hi
+        .as_ref()
+        .map(|(value, inclusive)| (value, *inclusive));
+    let data_keys =
+        index::lookup_prefix_range(db, &def.name, query.index, &query.prefix, lo, hi).await?;
+    if budget.is_some_and(|budget| data_keys.len() > budget) {
+        return Ok(None);
+    }
+    let blobs = db.multi_get(data_keys.clone()).await?;
+    let mut out = Vec::with_capacity(data_keys.len());
+    for (key, blob) in data_keys.into_iter().zip(blobs) {
+        if let Some(blob) = blob {
+            out.push((key, rowdec::decode_row(&blob)?));
         }
     }
     Ok(Some(out))
@@ -9673,6 +10099,7 @@ pub fn parse_load_data(sql: &str) -> Result<LoadSpec> {
 
 /// Turn file `content` into batched `INSERT` statements per the load spec.
 pub fn build_load_inserts(spec: &LoadSpec, content: &str, batch: usize) -> Vec<String> {
+    let batch = batch.max(1);
     let mut stmts = Vec::new();
     let col_list = if spec.cols.is_empty() {
         String::new()
@@ -9692,7 +10119,7 @@ pub fn build_load_inserts(spec: &LoadSpec, content: &str, batch: usize) -> Vec<S
         .filter(|l| !l.is_empty())
         .peekable();
     while rows_iter.peek().is_some() {
-        let mut tuples: Vec<String> = Vec::with_capacity(batch);
+        let mut tuples: Vec<String> = Vec::with_capacity(batch.min(50_000));
         for line in rows_iter.by_ref().take(batch) {
             let fields = line.split(spec.field_term.as_str()).map(|f| {
                 let f = match spec.enclosed {
@@ -9719,9 +10146,158 @@ pub fn build_load_inserts(spec: &LoadSpec, content: &str, batch: usize) -> Vec<S
     stmts
 }
 
+#[cfg(test)]
+mod load_data_tests {
+    use super::{build_load_inserts, LoadSpec};
+
+    fn spec() -> LoadSpec {
+        LoadSpec {
+            path: String::new(),
+            table: "items".into(),
+            cols: vec!["id".into(), "label".into()],
+            field_term: "\t".into(),
+            enclosed: None,
+            line_term: "\n".into(),
+            ignore: 0,
+        }
+    }
+
+    #[test]
+    fn load_builder_honors_bulk_boundaries_and_zero_batch() {
+        let content = "1\tone\n2\ttwo\n3\tthree\n";
+        let statements = build_load_inserts(&spec(), content, 2);
+        assert_eq!(statements.len(), 2);
+        assert!(statements[0].contains("(\'1\', \'one\'), (\'2\', \'two\')"));
+        assert!(statements[1].contains("(\'3\', \'three\')"));
+
+        let zero_batch = build_load_inserts(&spec(), content, 0);
+        assert_eq!(zero_batch.len(), 3);
+    }
+}
+
 /// Execute an all-INNER join chain over base tables in a cost-based order.
 /// Loads each table (with predicate pushdown), then greedily joins starting from
 /// the smallest, always extending along an available equi-join predicate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct GuaranteedIndexedJoinAccess {
+    pub driver_table: String,
+    pub partner_table: String,
+    pub index_name: String,
+    pub access_type: &'static str,
+}
+
+async fn stored_base_table_name(db: &Session, factor: &TableFactor) -> Result<Option<String>> {
+    let TableFactor::Table { name, .. } = factor else {
+        return Ok(None);
+    };
+    let table = match stored_table_ident(db, name) {
+        Ok(table) => table,
+        Err(Error::Catalog(_) | Error::UnknownDatabase(_)) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    Ok(catalog::exists(db, &table).await?.then_some(table))
+}
+
+/// Report the subset of selective joins that is guaranteed to use delayed
+/// indexed probes: a two-table INNER equi-join with exactly one indexable local
+/// predicate, that predicate being a point lookup on the driver's single-column
+/// primary key.  The PK lookup guarantees at most one driving row, so execution
+/// cannot cross [`NLJ_MAX_DRIVING`] and fall back to materialising the partner.
+///
+/// This is deliberately narrower than the optimizer.  It is suitable for
+/// truthful EXPLAIN metadata without reading table rows or changing session
+/// state; plans outside the guaranteed subset simply return `None`.
+pub(crate) async fn guaranteed_indexed_join_access(
+    db: &Session,
+    select: &Select,
+) -> Result<Option<GuaranteedIndexedJoinAccess>> {
+    if select.from.len() != 1 {
+        return Ok(None);
+    }
+    let twj = &select.from[0];
+    if twj.joins.len() != 1
+        || !stored_table_factor(&twj.relation)
+        || !stored_table_factor(&twj.joins[0].relation)
+    {
+        return Ok(None);
+    }
+    if stored_base_table_name(db, &twj.relation).await?.is_none()
+        || stored_base_table_name(db, &twj.joins[0].relation)
+            .await?
+            .is_none()
+    {
+        return Ok(None);
+    }
+    let (kind, on) = join_kind(&twj.joins[0].join_operator)?;
+    if kind != JoinKind::Inner {
+        return Ok(None);
+    }
+    let Some(on) = on else { return Ok(None) };
+    if !matches!(
+        on,
+        Expr::BinaryOp {
+            op: sqlparser::ast::BinaryOperator::Eq,
+            ..
+        }
+    ) {
+        return Ok(None);
+    }
+
+    let (left_def, left_cols) = resolve_table(db, &twj.relation).await?;
+    let (right_def, right_cols) = resolve_table(db, &twj.joins[0].relation).await?;
+    let mut conjuncts = Vec::new();
+    if let Some(filter) = &select.selection {
+        split_and(filter, &mut conjuncts);
+    }
+    let left_schema = Schema::new(left_cols.clone());
+    let right_schema = Schema::new(right_cols.clone());
+    let pk_point = |def: &TableDef, schema: &Schema| -> Result<bool> {
+        let mut found = false;
+        for conjunct in &conjuncts {
+            if !refs_in_schema(conjunct, schema) {
+                continue;
+            }
+            if let Some((column, _)) = eq_col_literal(def, Some(conjunct))? {
+                if def.pk_cols == [column] {
+                    found = true;
+                } else if index::index_on(def, column).is_some() {
+                    // Both sides would be optimizer candidates; without reading
+                    // rows we cannot guarantee which one becomes the driver.
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(found)
+    };
+    let left_point = pk_point(&left_def, &left_schema)?;
+    let right_point = pk_point(&right_def, &right_schema)?;
+    let (driver_schema, partner_schema, driver_table, partner_def) = match (left_point, right_point)
+    {
+        (true, false) => (left_schema, right_schema, left_def.name.clone(), right_def),
+        (false, true) => (right_schema, left_schema, right_def.name.clone(), left_def),
+        _ => return Ok(None),
+    };
+    let Some((_, partner_col)) = equi_nlj(&on, &driver_schema, &partner_schema) else {
+        return Ok(None);
+    };
+    if partner_def.pk_cols == [partner_col] {
+        return Ok(Some(GuaranteedIndexedJoinAccess {
+            driver_table,
+            partner_table: partner_def.name,
+            index_name: "PRIMARY".into(),
+            access_type: "eq_ref",
+        }));
+    }
+    Ok(
+        index::index_on(&partner_def, partner_col).map(|idx| GuaranteedIndexedJoinAccess {
+            driver_table,
+            partner_table: partner_def.name.clone(),
+            index_name: idx.name.clone(),
+            access_type: "ref",
+        }),
+    )
+}
+
 async fn build_inner_join_reordered(
     db: &Session,
     vindex: &VectorRegistry,
@@ -9755,28 +10331,51 @@ async fn build_inner_join_reordered(
     if on_preds.len() + 1 < relations.len() {
         return Ok(None);
     }
+    for relation in &relations {
+        if stored_base_table_name(db, relation).await?.is_none() {
+            return Ok(None);
+        }
+    }
 
-    // Load each relation (materialize + pushdown) and estimate its size.
-    struct Loaded {
+    // Resolve and estimate each relation without reading its rows.  In particular,
+    // do not eagerly scan a large future partner: once a selective relation has
+    // become the driver we may be able to probe that partner's index directly.
+    struct Candidate<'a> {
+        relation: &'a TableFactor,
+        def: TableDef,
         cols: Vec<ColumnDef>,
-        rows: Vec<Vec<Value>>,
         est: u64,
+        accelerable: bool,
     }
-    let mut loaded: Vec<Loaded> = Vec::with_capacity(relations.len());
+    let mut candidates: Vec<Candidate<'_>> = Vec::with_capacity(relations.len());
     for rel in &relations {
-        let (cols, mut rows) = load_relation(db, vindex, rel, conjuncts).await?;
-        rows = apply_pushdown(rows, &cols, conjuncts)?;
-        // Prefer the actual loaded size (already filtered) as the cost estimate.
-        let est = rows.len() as u64;
-        loaded.push(Loaded { cols, rows, est });
+        let (def, cols) = resolve_table(db, rel).await?;
+        let schema = Schema::new(cols.clone());
+        let accelerable = conjuncts
+            .iter()
+            .any(|c| refs_in_schema(c, &schema) && is_accelerable(&def, c).unwrap_or(false));
+        let est = catalog::load_stats(db, &def.name)
+            .await?
+            .map(|stats| estimate_filtered_rows(&stats, conjuncts))
+            .unwrap_or(u64::MAX);
+        candidates.push(Candidate {
+            relation: rel,
+            def,
+            cols,
+            est,
+            accelerable,
+        });
     }
 
-    // Start from the smallest relation.
-    let mut remaining: Vec<usize> = (0..loaded.len()).collect();
-    remaining.sort_by_key(|&i| loaded[i].est);
+    // Prefer a relation with an indexable local predicate even before ANALYZE has
+    // produced statistics.  Loading it is itself an index lookup and gives the
+    // exact (usually tiny) driving cardinality.
+    let mut remaining: Vec<usize> = (0..candidates.len()).collect();
+    remaining.sort_by_key(|&i| (!candidates[i].accelerable, candidates[i].est));
     let start = remaining.remove(0);
-    let mut cur_cols = std::mem::take(&mut loaded[start].cols);
-    let mut cur_rows = std::mem::take(&mut loaded[start].rows);
+    let (mut cur_cols, mut cur_rows) =
+        load_relation(db, vindex, candidates[start].relation, conjuncts).await?;
+    cur_rows = apply_pushdown(cur_rows, &cur_cols, conjuncts)?;
 
     while !remaining.is_empty() {
         // Among the remaining tables, pick the smallest one connected to what
@@ -9788,15 +10387,15 @@ async fn build_inner_join_reordered(
         let mut best: Option<(usize, Expr)> = None; // (pos in remaining, connecting pred)
         let mut best_est = u64::MAX;
         for (pos, &i) in remaining.iter().enumerate() {
-            let t_aliases = relation_aliases(&loaded[i].cols);
+            let t_aliases = relation_aliases(&candidates[i].cols);
             for pred in &on_preds {
                 if let Some((lq, rq)) = equi_qualifiers(pred) {
                     let connects = (relation_aliases_contain(&cur_aliases, &lq)
                         && relation_aliases_contain(&t_aliases, &rq))
                         || (relation_aliases_contain(&cur_aliases, &rq)
                             && relation_aliases_contain(&t_aliases, &lq));
-                    if connects && loaded[i].est < best_est {
-                        best_est = loaded[i].est;
+                    if connects && candidates[i].est < best_est {
+                        best_est = candidates[i].est;
                         best = Some((pos, pred.clone()));
                         break;
                     }
@@ -9807,9 +10406,46 @@ async fn build_inner_join_reordered(
             return Ok(None);
         };
         let idx = remaining.remove(pos);
-        let rcols = std::mem::take(&mut loaded[idx].cols);
-        let rrows = std::mem::take(&mut loaded[idx].rows);
+        let candidate = &candidates[idx];
         let left_schema = Schema::new(cur_cols);
+        let right_schema = Schema::new(candidate.cols.clone());
+
+        // A selective driver plus an indexed equality on the next table is the
+        // key case: fetch only matching partner rows instead of scanning and
+        // hashing the complete partner.  Partner-local WHERE predicates remain
+        // pushdowns, and the full WHERE is still evaluated after the join.
+        if cur_rows.len() <= NLJ_MAX_DRIVING {
+            if let Some((driving_key, partner_col)) = equi_nlj(&pred, &left_schema, &right_schema) {
+                if candidate.def.pk_cols == [partner_col]
+                    || index::index_on(&candidate.def, partner_col).is_some()
+                {
+                    let mut out = Vec::new();
+                    let mut check = db.cancel_check();
+                    for left in &cur_rows {
+                        check.tick()?;
+                        let key = predicate::eval_row(&driving_key, &left_schema, left)?;
+                        if key.is_null() {
+                            continue;
+                        }
+                        let matches =
+                            lookup_rows_by_eq(db, &candidate.def, partner_col, &key).await?;
+                        for partner in apply_pushdown(matches, &candidate.cols, conjuncts)? {
+                            let mut combined = Vec::with_capacity(left.len() + partner.len());
+                            combined.extend_from_slice(left);
+                            combined.extend(partner);
+                            out.push(combined);
+                        }
+                    }
+                    cur_cols = left_schema.columns;
+                    cur_cols.extend(candidate.cols.clone());
+                    cur_rows = out;
+                    continue;
+                }
+            }
+        }
+
+        let (rcols, mut rrows) = load_relation(db, vindex, candidate.relation, conjuncts).await?;
+        rrows = apply_pushdown(rrows, &rcols, conjuncts)?;
         let right_schema = Schema::new(rcols);
         let cancel = db.cancel_token();
         let (c, r) = cpu_bound(|| {
@@ -11499,10 +12135,370 @@ fn in_subquery_max() -> usize {
     env_usize("ELYRASQL_IN_SUBQUERY_MAX", 1_000_000)
 }
 
-/// Max distinct rows `SELECT DISTINCT` may buffer (`ELYRASQL_DISTINCT_MAX`,
-/// default 5,000,000) before erroring fail-safe rather than risking OOM.
+/// Max distinct rows `SELECT DISTINCT` keeps in its in-memory fast path
+/// (`ELYRASQL_DISTINCT_MAX`, default 5,000,000) before spilling to disk.
 fn distinct_max() -> usize {
     env_usize("ELYRASQL_DISTINCT_MAX", 5_000_000)
+}
+
+/// Deduplicate a projected stream while preserving the first representative of
+/// each collation-aware value and the inner query's row order.
+///
+/// Small results stay on the hash-set fast path. Once `memory_rows` distinct
+/// values have accumulated, the retained representatives and all later input
+/// are externally sorted by value and ordinal using the independent ORDER BY
+/// memory budget. The first ordinal in each value group is then sorted back
+/// into input order. Bounded results stay literal; unbounded results are written
+/// directly to the frame format consumed by [`RowStream::spill`].
+async fn distinct_rows(
+    mut input: RowStream,
+    offset: usize,
+    limit: Option<usize>,
+    memory_rows: usize,
+    cancel: std::sync::Arc<elyra_core::cancel::QueryCancel>,
+) -> Result<RowStream> {
+    use std::io::{BufWriter, Write};
+
+    let schema = input.schema.clone();
+    let collations: Vec<elyra_core::Collation> = schema
+        .columns
+        .iter()
+        .map(|column| column.collation)
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    let mut resident: Vec<(u64, Vec<Value>)> = Vec::new();
+    let mut value_sorter = None;
+    let mut ordinal = 0u64;
+    let mut check = elyra_core::cancel::CancelCheck::new(cancel);
+    check.tick_now()?;
+
+    loop {
+        let batch = input.next_batch(8192).await?;
+        if batch.is_empty() {
+            break;
+        }
+        for row in batch {
+            check.tick()?;
+            if let Some(sorter) = &mut value_sorter {
+                push_distinct_candidate(sorter, row, ordinal, &collations)?;
+            } else {
+                let key = Value::row_collation_key_coll(&row, &collations);
+                if seen.insert(key) {
+                    resident.push((ordinal, row));
+                    if resident.len() > memory_rows.max(1) {
+                        let mut sorter = crate::sort::Sorter::new(
+                            vec![true, true],
+                            vec![elyra_core::Collation::Bin; 2],
+                            0,
+                            None,
+                            crate::sort::sort_max_rows(),
+                        );
+                        for (resident_ordinal, resident_row) in resident.drain(..) {
+                            push_distinct_candidate(
+                                &mut sorter,
+                                resident_row,
+                                resident_ordinal,
+                                &collations,
+                            )?;
+                        }
+                        seen.clear();
+                        seen.shrink_to_fit();
+                        value_sorter = Some(sorter);
+                    }
+                }
+            }
+            ordinal = ordinal.checked_add(1).ok_or_else(|| {
+                Error::Query("SELECT DISTINCT input row ordinal overflowed".into())
+            })?;
+        }
+    }
+
+    let Some(mut value_sorter) = value_sorter else {
+        let mut rows = resident.into_iter().map(|(_, row)| row).collect();
+        apply_offset_limit(&mut rows, offset, limit);
+        return Ok(RowStream::literal(schema, rows));
+    };
+
+    let mut order_sorter = crate::sort::Sorter::new(
+        vec![true],
+        vec![elyra_core::Collation::Bin],
+        offset,
+        limit,
+        crate::sort::sort_max_rows(),
+    );
+    let mut previous_key = None;
+    value_sorter.finish_with(|mut candidate| {
+        check.tick()?;
+        let candidate_ordinal = candidate
+            .pop()
+            .ok_or_else(|| Error::Storage("DISTINCT spill row missing ordinal".into()))?;
+        let key = Value::row_collation_key_coll(&candidate, &collations);
+        if previous_key.as_ref() != Some(&key) {
+            previous_key = Some(key);
+            order_sorter.push(vec![candidate_ordinal], candidate)?;
+        }
+        Ok(())
+    })?;
+
+    if limit.is_some_and(|limit| limit <= crate::sort::sort_max_rows()) {
+        let rows = order_sorter.finish()?;
+        return Ok(RowStream::literal(schema, rows));
+    }
+
+    let (path, file) = create_distinct_spill()?;
+    let mut writer = BufWriter::new(file);
+    let mut numeric_types = crate::stream::NumericTypeReconciler::new(schema.columns.len());
+    let write_result = order_sorter.finish_with(|row| {
+        check.tick()?;
+        numeric_types.observe(&row);
+        let frame = bincode::serialize(&row).map_err(|error| Error::Storage(error.to_string()))?;
+        if frame.len() > elyra_core::max_frame_bytes() || frame.len() > u32::MAX as usize {
+            return Err(Error::Storage("DISTINCT spill row frame too large".into()));
+        }
+        writer.write_all(&(frame.len() as u32).to_le_bytes())?;
+        writer.write_all(&frame)?;
+        Ok(())
+    });
+    if let Err(error) = write_result {
+        drop(writer);
+        let _ = std::fs::remove_file(&path);
+        return Err(error);
+    }
+    if let Err(error) = writer.flush() {
+        drop(writer);
+        let _ = std::fs::remove_file(&path);
+        return Err(Error::Io(error));
+    }
+    let file = match writer.into_inner() {
+        Ok(file) => file,
+        Err(error) => {
+            let error = error.into_error();
+            let _ = std::fs::remove_file(&path);
+            return Err(Error::Io(error));
+        }
+    };
+    let mut schema = schema;
+    numeric_types.reconcile(&mut schema);
+    RowStream::spill(schema, path, file)
+}
+
+fn push_distinct_candidate(
+    sorter: &mut crate::sort::Sorter,
+    row: Vec<Value>,
+    ordinal: u64,
+    collations: &[elyra_core::Collation],
+) -> Result<()> {
+    let keys = vec![
+        Value::Bytes(Value::row_collation_key_coll(&row, collations)),
+        Value::UInt(ordinal),
+    ];
+    let mut candidate = row;
+    candidate.push(Value::UInt(ordinal));
+    sorter.push(keys, candidate)
+}
+
+fn create_distinct_spill() -> Result<(std::path::PathBuf, std::fs::File)> {
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    loop {
+        let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "elyrasql-sort-{}-distinct-{sequence}.tmp",
+            std::process::id()
+        ));
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => return Ok((path, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(Error::Io(error)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod distinct_spill_tests {
+    use super::*;
+
+    async fn collect(mut stream: RowStream) -> Vec<Vec<Value>> {
+        let mut rows = Vec::new();
+        loop {
+            let batch = stream.next_batch(2).await.unwrap();
+            if batch.is_empty() {
+                return rows;
+            }
+            rows.extend(batch);
+        }
+    }
+
+    fn text_stream(values: &[&str]) -> RowStream {
+        let schema = Schema::new(vec![ColumnDef::new("v", ColumnType::Text, false)]);
+        let rows = values
+            .iter()
+            .map(|value| vec![Value::Text((*value).into())])
+            .collect();
+        RowStream::literal(schema, rows)
+    }
+
+    #[tokio::test]
+    async fn spilled_distinct_preserves_first_representative_and_input_order() {
+        let stream = distinct_rows(
+            text_stream(&["z", "A", "z", "b", "a", "c", "B"]),
+            0,
+            None,
+            2,
+            std::sync::Arc::new(elyra_core::cancel::QueryCancel::new()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            collect(stream).await,
+            vec![
+                vec![Value::Text("z".into())],
+                vec![Value::Text("A".into())],
+                vec![Value::Text("b".into())],
+                vec![Value::Text("c".into())],
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn spilled_distinct_applies_offset_and_limit_after_deduplication() {
+        let stream = distinct_rows(
+            text_stream(&["z", "A", "z", "b", "a", "c", "B"]),
+            1,
+            Some(2),
+            2,
+            std::sync::Arc::new(elyra_core::cancel::QueryCancel::new()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            collect(stream).await,
+            vec![vec![Value::Text("A".into())], vec![Value::Text("b".into())]]
+        );
+    }
+
+    #[tokio::test]
+    async fn spilled_distinct_groups_by_the_canonical_key_not_sort_equality() {
+        let schema = Schema::new(vec![ColumnDef::new("v", ColumnType::Float, false)]);
+        let input = RowStream::literal(
+            schema,
+            vec![
+                vec![Value::Int(1)],
+                vec![Value::Float(1.0)],
+                vec![Value::Int(1)],
+            ],
+        );
+        let stream = distinct_rows(
+            input,
+            0,
+            None,
+            1,
+            std::sync::Arc::new(elyra_core::cancel::QueryCancel::new()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stream.schema.columns[0].ty, ColumnType::Float);
+        assert_eq!(
+            collect(stream).await,
+            vec![vec![Value::Int(1)], vec![Value::Float(1.0)]]
+        );
+    }
+
+    #[tokio::test]
+    async fn thresholds_zero_and_one_match_in_memory_for_mixed_rows() {
+        let mut ci = ColumnDef::new("ci", ColumnType::Text, true);
+        ci.collation = elyra_core::Collation::Ci;
+        let mut bin = ColumnDef::new("bin", ColumnType::Text, true);
+        bin.collation = elyra_core::Collation::Bin;
+        let schema = Schema::new(vec![ci, bin, ColumnDef::new("n", ColumnType::Float, true)]);
+        let rows = vec![
+            vec![
+                Value::Text("A".into()),
+                Value::Text("x".into()),
+                Value::Int(1),
+            ],
+            vec![
+                Value::Text("a".into()),
+                Value::Text("x".into()),
+                Value::Int(1),
+            ],
+            vec![
+                Value::Text("a".into()),
+                Value::Text("X".into()),
+                Value::Int(1),
+            ],
+            vec![Value::Null, Value::Null, Value::Decimal(100, 2)],
+            vec![Value::Null, Value::Null, Value::Decimal(100, 2)],
+            vec![
+                Value::Text("b".into()),
+                Value::Text("x".into()),
+                Value::Float(1.0),
+            ],
+        ];
+
+        let expected = collect(
+            distinct_rows(
+                RowStream::literal(schema.clone(), rows.clone()),
+                1,
+                Some(3),
+                usize::MAX,
+                std::sync::Arc::new(elyra_core::cancel::QueryCancel::new()),
+            )
+            .await
+            .unwrap(),
+        )
+        .await;
+        for threshold in [0, 1] {
+            let actual = collect(
+                distinct_rows(
+                    RowStream::literal(schema.clone(), rows.clone()),
+                    1,
+                    Some(3),
+                    threshold,
+                    std::sync::Arc::new(elyra_core::cancel::QueryCancel::new()),
+                )
+                .await
+                .unwrap(),
+            )
+            .await;
+            assert_eq!(actual, expected, "threshold={threshold}");
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_distinct_preserves_schema_and_limit_zero_is_empty() {
+        let schema = Schema::new(vec![ColumnDef::new("v", ColumnType::Float, true)]);
+        let stream = distinct_rows(
+            RowStream::literal(schema, Vec::new()),
+            usize::MAX,
+            Some(0),
+            0,
+            std::sync::Arc::new(elyra_core::cancel::QueryCancel::new()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stream.schema.columns[0].ty, ColumnType::Float);
+        assert!(collect(stream).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn distinct_observes_preexisting_cancellation() {
+        let cancel = std::sync::Arc::new(elyra_core::cancel::QueryCancel::new());
+        cancel.cancel();
+        let error = match distinct_rows(text_stream(&["a", "b"]), 0, None, 1, cancel).await {
+            Ok(_) => panic!("cancelled DISTINCT unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("query cancelled"));
+    }
 }
 
 /// Max rows a **materialising** join may buffer (`ELYRASQL_JOIN_MAX_ROWS`, default
@@ -11786,7 +12782,7 @@ fn accelerable(def: &TableDef, filter: Option<&Expr>) -> Result<bool> {
     if in_list_lookup(def, filter)?.is_some() {
         return Ok(true);
     }
-    Ok(range_bounds(def, filter)?.is_some())
+    Ok(composite_range_bounds(def, filter)?.is_some() || range_bounds(def, filter)?.is_some())
 }
 
 /// Collect `(storage_key, row)` for every row matching `filter`, up to
@@ -12018,8 +13014,28 @@ async fn collect_matches_inner(
         }
     }
 
-    // Range fast path: `col > x` / `BETWEEN` on a PK or indexed column uses an
-    // ordered range scan, then re-applies the full filter.
+    // Composite secondary-index range: equality on a non-empty leading prefix,
+    // then a range on the immediately following column.
+    if let Some(query) = composite_range_bounds(def, filter)? {
+        let budget = index_range_budget(db, def).await?;
+        if let Some(candidates) = composite_index_range(db, def, &query, budget).await? {
+            for (key, row) in candidates {
+                if recheck(&row)? {
+                    out.push((key, row));
+                    if limit.is_some_and(|limit| out.len() >= limit) {
+                        return Ok(Some(out));
+                    }
+                }
+            }
+            return Ok(Some(out));
+        }
+        if bail_on_wide_range {
+            return Ok(None);
+        }
+    }
+
+    // Range fast path: `col > x` / `BETWEEN` on a PK or single-column index
+    // uses an ordered range scan, then re-applies the full filter.
     if let Some(rq) = range_bounds(def, filter)? {
         // A clustered (primary-key) range is a sequential read, so it is always
         // worth taking. A *secondary* index range pays a random fetch per row, so it
@@ -14615,18 +15631,18 @@ fn compute_partition(
             let count_star = name == "count" && args.is_empty();
             let arg0 = args.first().copied();
             let n = idxs.len();
+            let aggregate = WindowAggregate::new(name, count_star, arg0, rows, schema, idxs)?;
 
             match frame_mode(frame, ordered)? {
                 FrameMode::Rows => {
                     let f = frame.expect("rows frame present");
                     for (p, &i) in idxs.iter().enumerate() {
                         let (lo, hi) = rows_bounds(f, p, n, schema, rows, idxs)?;
-                        let members: &[usize] = if lo <= hi { &idxs[lo..=hi] } else { &[] };
-                        result[i] = window_agg(name, count_star, members, arg0, rows, schema)?;
+                        result[i] = aggregate.evaluate(lo, hi, idxs, rows, schema)?;
                     }
                 }
                 FrameMode::Whole => {
-                    let agg = window_agg(name, count_star, idxs, arg0, rows, schema)?;
+                    let agg = aggregate.evaluate(0, n.saturating_sub(1), idxs, rows, schema)?;
                     for &i in idxs {
                         result[i] = agg.clone();
                     }
@@ -14639,11 +15655,67 @@ fn compute_partition(
                         while q < n && order_key(idxs[q])? == key {
                             q += 1;
                         }
-                        let agg = window_agg(name, count_star, &idxs[0..q], arg0, rows, schema)?;
+                        let agg = aggregate.evaluate(0, q - 1, idxs, rows, schema)?;
                         for &i in &idxs[p..q] {
                             result[i] = agg.clone();
                         }
                         p = q;
+                    }
+                }
+                FrameMode::Range => {
+                    let f = frame.expect("range frame present");
+                    if order.len() != 1 {
+                        return Err(Error::Unsupported(
+                            "RANGE offset frames require exactly one numeric ORDER BY expression"
+                                .into(),
+                        ));
+                    }
+                    let keys: Vec<Value> = idxs
+                        .iter()
+                        .map(|&i| predicate::eval_row(&order[0].0, schema, &rows[i]))
+                        .collect::<Result<_>>()?;
+                    let numeric_keys = keys
+                        .iter()
+                        .map(|key| {
+                            if key.is_null() {
+                                Ok(None)
+                            } else {
+                                RangeNumeric::from_value(key).map(Some)
+                            }
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    let (peer_lows, peer_highs) = peer_bounds(&keys);
+                    let start_offset = frame_offset_value(&f.start_bound, schema, rows, idxs)?;
+                    let end_offset = f
+                        .end_bound
+                        .as_ref()
+                        .map(|bound| frame_offset_value(bound, schema, rows, idxs))
+                        .transpose()?
+                        .flatten();
+                    let bounds = WindowRangeBounds {
+                        frame: f,
+                        keys: &keys,
+                        numeric_keys: &numeric_keys,
+                        peer_lows: &peer_lows,
+                        peer_highs: &peer_highs,
+                        ascending: order[0].1,
+                        start_offset: start_offset.as_ref(),
+                        end_offset: end_offset.as_ref(),
+                    };
+                    for (p, &i) in idxs.iter().enumerate() {
+                        let (lo, hi) = window_range_bounds(&bounds, p)?;
+                        result[i] = aggregate.evaluate(lo, hi, idxs, rows, schema)?;
+                    }
+                }
+                FrameMode::Groups => {
+                    let f = frame.expect("groups frame present");
+                    let keys: Vec<Vec<Value>> =
+                        idxs.iter().map(|&i| order_key(i)).collect::<Result<_>>()?;
+                    let (group_starts, row_groups) = peer_groups(&keys);
+                    for (p, &i) in idxs.iter().enumerate() {
+                        let (lo, hi) =
+                            groups_bounds(f, row_groups[p], &group_starts, n, schema, rows, idxs)?;
+                        result[i] = aggregate.evaluate(lo, hi, idxs, rows, schema)?;
                     }
                 }
             }
@@ -14729,6 +15801,8 @@ enum FrameMode {
     Rows,
     Whole,
     PeerRunning,
+    Range,
+    Groups,
 }
 
 /// Decide how to evaluate a framed aggregate. Explicit `ROWS` frames use
@@ -14754,16 +15828,385 @@ fn frame_mode(frame: Option<&sqlparser::ast::WindowFrame>, ordered: bool) -> Res
                 Ok(FrameMode::Whole)
             } else if running && ordered {
                 Ok(FrameMode::PeerRunning)
-            } else if !ordered {
+            } else if running {
                 Ok(FrameMode::Whole)
+            } else if matches!(f.units, U::Range) {
+                if ordered {
+                    Ok(FrameMode::Range)
+                } else {
+                    Err(Error::Unsupported(
+                        "RANGE offset frames require exactly one numeric ORDER BY expression"
+                            .into(),
+                    ))
+                }
             } else {
-                Err(Error::Unsupported(
-                    "only RANGE UNBOUNDED PRECEDING .. CURRENT ROW / UNBOUNDED FOLLOWING frames are supported"
-                        .into(),
-                ))
+                Ok(FrameMode::Groups)
             }
         }
     }
+}
+
+fn frame_offset_value(
+    bound: &sqlparser::ast::WindowFrameBound,
+    schema: &Schema,
+    rows: &[Vec<Value>],
+    idxs: &[usize],
+) -> Result<Option<Value>> {
+    use sqlparser::ast::WindowFrameBound as B;
+    use sqlparser::ast::{Visit, Visitor};
+    use std::ops::ControlFlow;
+
+    struct NonConstantFinder;
+    impl Visitor for NonConstantFinder {
+        type Break = ();
+
+        fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
+            if matches!(
+                expr,
+                Expr::Identifier(_)
+                    | Expr::CompoundIdentifier(_)
+                    | Expr::Function(_)
+                    | Expr::Subquery(_)
+                    | Expr::Exists { .. }
+            ) {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        }
+    }
+
+    let expr = match bound {
+        B::Preceding(Some(expr)) | B::Following(Some(expr)) => expr,
+        _ => return Ok(None),
+    };
+    if expr.visit(&mut NonConstantFinder).is_break() {
+        return Err(Error::Query(
+            "window frame offsets must be constant expressions".into(),
+        ));
+    }
+    let value = predicate::eval_row(expr, schema, &rows[idxs[0]])?;
+    Ok(Some(value))
+}
+
+#[derive(Clone, Copy)]
+struct FixedNumeric {
+    raw: i128,
+    scale: u8,
+}
+
+#[derive(Clone, Copy)]
+enum RangeNumeric {
+    Fixed(FixedNumeric),
+    Float(f64),
+}
+
+impl RangeNumeric {
+    fn from_value(value: &Value) -> Result<Self> {
+        match value {
+            Value::Int(value) => Ok(Self::Fixed(FixedNumeric {
+                raw: i128::from(*value),
+                scale: 0,
+            })),
+            Value::UInt(value) => Ok(Self::Fixed(FixedNumeric {
+                raw: i128::from(*value),
+                scale: 0,
+            })),
+            Value::Decimal(raw, scale) => Ok(Self::Fixed(FixedNumeric {
+                raw: *raw,
+                scale: *scale,
+            })),
+            Value::Float(value) if value.is_finite() => Ok(Self::Float(*value)),
+            _ => Err(Error::Unsupported(
+                "RANGE offset frames require numeric ORDER BY values and offsets; temporal offsets are not supported"
+                    .into(),
+            )),
+        }
+    }
+
+    fn non_negative(self) -> bool {
+        match self {
+            Self::Fixed(value) => value.raw >= 0,
+            Self::Float(value) => value >= 0.0,
+        }
+    }
+
+    fn shifted(self, offset: Self, add: bool) -> Result<Self> {
+        match (self, offset) {
+            (Self::Fixed(left), Self::Fixed(right)) => {
+                let scale = left.scale.max(right.scale);
+                let left = scale_fixed(left, scale)?;
+                let right = scale_fixed(right, scale)?;
+                let raw = if add {
+                    left.checked_add(right)
+                } else {
+                    left.checked_sub(right)
+                }
+                .ok_or_else(|| Error::Unsupported("RANGE numeric boundary overflow".into()))?;
+                Ok(Self::Fixed(FixedNumeric { raw, scale }))
+            }
+            (Self::Float(left), Self::Float(right)) => Ok(Self::Float(if add {
+                left + right
+            } else {
+                left - right
+            })),
+            (Self::Float(left), Self::Fixed(right)) => {
+                let divisor = 10f64.powi(i32::from(right.scale));
+                Ok(Self::Float(if add {
+                    left + right.raw as f64 / divisor
+                } else {
+                    left - right.raw as f64 / divisor
+                }))
+            }
+            (Self::Fixed(_), Self::Float(_)) => Err(Error::Unsupported(
+                "floating RANGE offsets are not supported for exact integer or DECIMAL ordering keys"
+                    .into(),
+            )),
+        }
+    }
+
+    fn compare(self, other: Self) -> Result<std::cmp::Ordering> {
+        match (self, other) {
+            (Self::Fixed(left), Self::Fixed(right)) => {
+                let scale = left.scale.max(right.scale);
+                Ok(scale_fixed(left, scale)?.cmp(&scale_fixed(right, scale)?))
+            }
+            (Self::Float(left), Self::Float(right)) => Ok(left.total_cmp(&right)),
+            (Self::Float(left), Self::Fixed(right)) => {
+                Ok(left.total_cmp(&(right.raw as f64 / 10f64.powi(i32::from(right.scale)))))
+            }
+            (Self::Fixed(_), Self::Float(_)) => Err(Error::Unsupported(
+                "mixed floating and exact RANGE ordering values are not supported".into(),
+            )),
+        }
+    }
+}
+
+fn scale_fixed(value: FixedNumeric, scale: u8) -> Result<i128> {
+    let factor = 10_i128
+        .checked_pow(u32::from(scale - value.scale))
+        .ok_or_else(|| Error::Unsupported("RANGE decimal scale overflow".into()))?;
+    value
+        .raw
+        .checked_mul(factor)
+        .ok_or_else(|| Error::Unsupported("RANGE decimal value overflow".into()))
+}
+
+#[derive(Clone, Copy)]
+struct WindowRangeBounds<'a> {
+    frame: &'a sqlparser::ast::WindowFrame,
+    keys: &'a [Value],
+    numeric_keys: &'a [Option<RangeNumeric>],
+    peer_lows: &'a [usize],
+    peer_highs: &'a [usize],
+    ascending: bool,
+    start_offset: Option<&'a Value>,
+    end_offset: Option<&'a Value>,
+}
+
+fn window_range_bounds(bounds: &WindowRangeBounds<'_>, p: usize) -> Result<(usize, usize)> {
+    use sqlparser::ast::WindowFrameBound as B;
+    let WindowRangeBounds {
+        frame,
+        keys,
+        numeric_keys,
+        peer_lows,
+        peer_highs,
+        ascending,
+        start_offset,
+        end_offset,
+    } = *bounds;
+    for offset in [start_offset, end_offset].into_iter().flatten() {
+        if !RangeNumeric::from_value(offset)?.non_negative() {
+            return Err(Error::Query(
+                "window frame offsets must be non-negative numeric constants".into(),
+            ));
+        }
+    }
+    let current = &keys[p];
+    if current.is_null() {
+        let (peer_lo, peer_hi) = (peer_lows[p], peer_highs[p]);
+        let null_boundary = |bound: &B, start: bool| match bound {
+            B::Preceding(None) => 0,
+            B::Following(None) => keys.len().saturating_sub(1),
+            B::CurrentRow | B::Preceding(Some(_)) | B::Following(Some(_)) => {
+                if start {
+                    peer_lo
+                } else {
+                    peer_hi
+                }
+            }
+        };
+        return Ok((
+            null_boundary(&frame.start_bound, true),
+            null_boundary(frame.end_bound.as_ref().unwrap_or(&B::CurrentRow), false),
+        ));
+    }
+    let current = RangeNumeric::from_value(current)?;
+    let boundary = |bound: &B, offset: Option<&Value>, start: bool| -> Result<usize> {
+        match bound {
+            B::Preceding(None) => Ok(0),
+            B::Following(None) => Ok(keys.len().saturating_sub(1)),
+            B::CurrentRow => Ok(if start { peer_lows[p] } else { peer_highs[p] }),
+            B::Preceding(Some(_)) | B::Following(Some(_)) => {
+                let offset = RangeNumeric::from_value(
+                    offset.ok_or_else(|| Error::Query("window frame offset is missing".into()))?,
+                )?;
+                let add = matches!(bound, B::Following(_)) == ascending;
+                let target = current.shifted(offset, add)?;
+                if start {
+                    range_lower_bound(numeric_keys, target, ascending)
+                } else {
+                    range_upper_bound(numeric_keys, target, ascending)
+                }
+            }
+        }
+    };
+    let lo = boundary(&frame.start_bound, start_offset, true)?;
+    let hi = boundary(
+        frame.end_bound.as_ref().unwrap_or(&B::CurrentRow),
+        end_offset,
+        false,
+    )?;
+    if hi == usize::MAX {
+        return Ok((1, 0));
+    }
+    Ok((lo, hi))
+}
+
+fn peer_bounds<T: PartialEq>(keys: &[T]) -> (Vec<usize>, Vec<usize>) {
+    let mut lows = vec![0; keys.len()];
+    let mut highs = vec![0; keys.len()];
+    let mut start = 0;
+    while start < keys.len() {
+        let mut end = start + 1;
+        while end < keys.len() && keys[end] == keys[start] {
+            end += 1;
+        }
+        for position in start..end {
+            lows[position] = start;
+            highs[position] = end - 1;
+        }
+        start = end;
+    }
+    (lows, highs)
+}
+
+fn range_lower_bound(
+    keys: &[Option<RangeNumeric>],
+    target: RangeNumeric,
+    ascending: bool,
+) -> Result<usize> {
+    let mut lo = 0;
+    let mut hi = keys.len();
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let before = match keys[mid] {
+            None => ascending,
+            Some(value) => {
+                let ordering = value.compare(target)?;
+                if ascending {
+                    ordering.is_lt()
+                } else {
+                    ordering.is_gt()
+                }
+            }
+        };
+        if before {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    Ok(lo)
+}
+
+fn range_upper_bound(
+    keys: &[Option<RangeNumeric>],
+    target: RangeNumeric,
+    ascending: bool,
+) -> Result<usize> {
+    let mut lo = 0;
+    let mut hi = keys.len();
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let after = match keys[mid] {
+            None => !ascending,
+            Some(value) => {
+                let ordering = value.compare(target)?;
+                if ascending {
+                    ordering.is_gt()
+                } else {
+                    ordering.is_lt()
+                }
+            }
+        };
+        if after {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    Ok(lo.checked_sub(1).unwrap_or(usize::MAX))
+}
+
+fn peer_groups<T: PartialEq>(keys: &[T]) -> (Vec<usize>, Vec<usize>) {
+    let mut starts = Vec::new();
+    let mut row_groups = Vec::with_capacity(keys.len());
+    for (p, key) in keys.iter().enumerate() {
+        if p == 0 || key != &keys[p - 1] {
+            starts.push(p);
+        }
+        row_groups.push(starts.len() - 1);
+    }
+    (starts, row_groups)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn groups_bounds(
+    frame: &sqlparser::ast::WindowFrame,
+    group: usize,
+    starts: &[usize],
+    row_count: usize,
+    schema: &Schema,
+    rows: &[Vec<Value>],
+    idxs: &[usize],
+) -> Result<(usize, usize)> {
+    use sqlparser::ast::WindowFrameBound as B;
+    let group_count = starts.len();
+    let boundary_group = |bound: &B| -> Result<isize> {
+        let offset = match frame_offset_value(bound, schema, rows, idxs)? {
+            None => Some(0),
+            Some(Value::Int(value)) => isize::try_from(value).ok().filter(|v| *v >= 0),
+            Some(Value::UInt(value)) => isize::try_from(value).ok(),
+            Some(Value::Decimal(raw, scale)) => {
+                let divisor = 10_i128.checked_pow(u32::from(scale));
+                divisor
+                    .filter(|divisor| raw >= 0 && raw % divisor == 0)
+                    .and_then(|divisor| isize::try_from(raw / divisor).ok())
+            }
+            Some(_) => None,
+        }
+        .ok_or_else(|| {
+            Error::Query("GROUPS frame offsets must be exact non-negative integers".into())
+        })?;
+        Ok(match bound {
+            B::Preceding(None) => 0,
+            B::Following(None) => group_count as isize - 1,
+            B::CurrentRow => group as isize,
+            B::Preceding(Some(_)) => (group as isize).checked_sub(offset).unwrap_or(isize::MIN),
+            B::Following(Some(_)) => (group as isize).checked_add(offset).unwrap_or(isize::MAX),
+        })
+    };
+    let lo_group = boundary_group(&frame.start_bound)?.max(0) as usize;
+    let hi_group = boundary_group(frame.end_bound.as_ref().unwrap_or(&B::CurrentRow))?
+        .min(group_count as isize - 1);
+    if hi_group < 0 || lo_group as isize > hi_group || lo_group >= group_count {
+        return Ok((1, 0));
+    }
+    let hi_group = hi_group as usize;
+    let hi = starts.get(hi_group + 1).copied().unwrap_or(row_count) - 1;
+    Ok((starts[lo_group], hi))
 }
 
 /// Physical `[lo, hi]` bounds (inclusive, clamped) for a `ROWS` frame at sorted
@@ -14801,6 +16244,168 @@ fn rows_bounds(
 fn const_isize(e: &Expr, schema: &Schema, rows: &[Vec<Value>], idxs: &[usize]) -> Result<isize> {
     let v = predicate::eval_row(e, schema, &rows[idxs[0]])?;
     Ok(v.as_mysql_f64().unwrap_or(0.0) as isize)
+}
+
+struct WindowAggregate<'a> {
+    name: &'a str,
+    count_star: bool,
+    arg: Option<&'a Expr>,
+    values: Vec<Value>,
+    non_null_count: Vec<usize>,
+    numeric_count: Vec<usize>,
+    non_integer_count: Vec<usize>,
+    sums: Vec<f64>,
+}
+
+fn window_aggregate_is_incremental(name: &str) -> bool {
+    matches!(name, "sum" | "count" | "avg")
+}
+
+impl<'a> WindowAggregate<'a> {
+    fn new(
+        name: &'a str,
+        count_star: bool,
+        arg: Option<&'a Expr>,
+        rows: &[Vec<Value>],
+        schema: &Schema,
+        idxs: &[usize],
+    ) -> Result<Self> {
+        let values = match arg {
+            Some(expr) => idxs
+                .iter()
+                .map(|&index| predicate::eval_row(expr, schema, &rows[index]))
+                .collect::<Result<Vec<_>>>()?,
+            None => vec![Value::Null; idxs.len()],
+        };
+        let mut non_null_count = Vec::with_capacity(values.len() + 1);
+        let mut numeric_count = Vec::with_capacity(values.len() + 1);
+        let mut non_integer_count = Vec::with_capacity(values.len() + 1);
+        let mut sums = Vec::with_capacity(values.len() + 1);
+        non_null_count.push(0);
+        numeric_count.push(0);
+        non_integer_count.push(0);
+        sums.push(0.0);
+        for value in &values {
+            non_null_count.push(
+                non_null_count.last().copied().unwrap_or_default() + usize::from(!value.is_null()),
+            );
+            numeric_count.push(
+                numeric_count.last().copied().unwrap_or_default()
+                    + usize::from(value.as_mysql_f64().is_some()),
+            );
+            non_integer_count.push(
+                non_integer_count.last().copied().unwrap_or_default()
+                    + usize::from(!matches!(value, Value::Int(_) | Value::Null)),
+            );
+            sums.push(
+                sums.last().copied().unwrap_or_default() + value.as_mysql_f64().unwrap_or(0.0),
+            );
+        }
+        Ok(Self {
+            name,
+            count_star,
+            arg,
+            values,
+            non_null_count,
+            numeric_count,
+            non_integer_count,
+            sums,
+        })
+    }
+
+    fn evaluate(
+        &self,
+        lo: usize,
+        hi: usize,
+        idxs: &[usize],
+        rows: &[Vec<Value>],
+        schema: &Schema,
+    ) -> Result<Value> {
+        if lo > hi || lo >= self.values.len() {
+            return Ok(if self.name == "count" {
+                Value::Int(0)
+            } else {
+                Value::Null
+            });
+        }
+        let end = hi.min(self.values.len() - 1) + 1;
+        let len = end - lo;
+        if self.count_star {
+            return Ok(Value::Int(len as i64));
+        }
+        if !window_aggregate_is_incremental(self.name) {
+            return window_agg(self.name, false, &idxs[lo..end], self.arg, rows, schema);
+        }
+        match self.name {
+            "count" => Ok(Value::Int(
+                (self.non_null_count[end] - self.non_null_count[lo]) as i64,
+            )),
+            "sum" | "avg" => {
+                let count = self.numeric_count[end] - self.numeric_count[lo];
+                if count == 0 {
+                    return Ok(Value::Null);
+                }
+                let sum = self.sums[end] - self.sums[lo];
+                if self.name == "avg" {
+                    Ok(Value::Float(sum / count as f64))
+                } else if self.non_integer_count[end] == self.non_integer_count[lo] {
+                    Ok(Value::Int(sum as i64))
+                } else {
+                    Ok(Value::Float(sum))
+                }
+            }
+            _ => unreachable!("incremental window aggregate helper and dispatcher diverged"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod window_incremental_tests {
+    use super::*;
+
+    fn fixture() -> (Schema, Vec<Vec<Value>>, Expr, Vec<usize>) {
+        let schema = Schema::new(vec![ColumnDef::new("v", ColumnType::Int, true)]);
+        let rows = vec![
+            vec![Value::Int(2)],
+            vec![Value::Null],
+            vec![Value::Int(5)],
+            vec![Value::Int(-1)],
+        ];
+        let expression = Expr::Identifier(Ident::new("v"));
+        (schema, rows, expression, vec![0, 1, 2, 3])
+    }
+
+    #[test]
+    fn prefix_aggregates_preserve_null_and_empty_frame_semantics() {
+        let (schema, rows, expression, idxs) = fixture();
+        let sum =
+            WindowAggregate::new("sum", false, Some(&expression), &rows, &schema, &idxs).unwrap();
+        let count =
+            WindowAggregate::new("count", false, Some(&expression), &rows, &schema, &idxs).unwrap();
+        let avg =
+            WindowAggregate::new("avg", false, Some(&expression), &rows, &schema, &idxs).unwrap();
+
+        assert_eq!(
+            sum.evaluate(1, 3, &idxs, &rows, &schema).unwrap(),
+            Value::Int(4)
+        );
+        assert_eq!(
+            count.evaluate(1, 3, &idxs, &rows, &schema).unwrap(),
+            Value::Int(2)
+        );
+        assert_eq!(
+            avg.evaluate(1, 3, &idxs, &rows, &schema).unwrap(),
+            Value::Float(2.0)
+        );
+        assert_eq!(
+            sum.evaluate(2, 1, &idxs, &rows, &schema).unwrap(),
+            Value::Null
+        );
+        assert_eq!(
+            count.evaluate(2, 1, &idxs, &rows, &schema).unwrap(),
+            Value::Int(0)
+        );
+    }
 }
 
 /// Aggregate `name` over the given member rows (evaluating `arg` per row).
@@ -17308,10 +18913,21 @@ async fn correlated_select(
     let all = scan_rows(db, def, None).await?;
     let mut matched: Vec<Vec<Value>> = Vec::new();
 
+    // A deliberately narrow semi/anti-join rewrite for the most common
+    // correlated shape. Anything that cannot be proven equivalent keeps the
+    // general per-row subquery path below.
+    let decorrelated = prepare_correlated_exists(db, corr_filter, def, outer).await?;
+
     for row in all {
-        let bound = bind_outer(db, corr_filter, outer, &def.schema, &row);
-        let resolved = resolve_subqueries_with_outer(db, vindex, bound, &def.schema, &row).await?;
-        if predicate::matches(&resolved, &def.schema, &row)? {
+        let matches = if let Some(plan) = &decorrelated {
+            plan.matches(&def.schema, &row)?
+        } else {
+            let bound = bind_outer(db, corr_filter, outer, &def.schema, &row);
+            let resolved =
+                resolve_subqueries_with_outer(db, vindex, bound, &def.schema, &row).await?;
+            predicate::matches(&resolved, &def.schema, &row)?
+        };
+        if matches {
             matched.push(row);
         }
     }
@@ -17425,6 +19041,293 @@ async fn correlated_select(
         Schema::new(cols),
         out_rows,
     )))
+}
+
+struct CorrelatedExistsPlan {
+    outer_column: usize,
+    inner_keys: std::collections::HashSet<Vec<u8>>,
+    collation: elyra_core::Collation,
+    negated: bool,
+    residual: Option<Expr>,
+}
+
+impl CorrelatedExistsPlan {
+    fn matches(&self, schema: &Schema, outer_row: &[Value]) -> Result<bool> {
+        let member = key_bytes_coll(&outer_row[self.outer_column], self.collation)
+            .is_some_and(|key| self.inner_keys.contains(&key));
+        if member == self.negated {
+            return Ok(false);
+        }
+        self.residual.as_ref().map_or(Ok(true), |residual| {
+            predicate::matches(residual, schema, outer_row)
+        })
+    }
+}
+
+/// Build a one-time semantic-key membership set for a safe correlated
+/// `EXISTS`/`NOT EXISTS` semi-join. The accepted slice is intentionally strict:
+/// one outer-table column equals one column of one plain inner table, with no
+/// other inner clauses or query modifiers. Incompatible types/collations and
+/// oversized inner inputs silently retain the nested-loop implementation.
+async fn prepare_correlated_exists(
+    db: &Session,
+    filter: &Expr,
+    outer_def: &TableDef,
+    outer_qualifier: &[String],
+) -> Result<Option<CorrelatedExistsPlan>> {
+    let Some(shape) =
+        prepare_correlated_exists_shape(db, filter, outer_def, outer_qualifier).await?
+    else {
+        return Ok(None);
+    };
+    let inner_rows = scan_rows(db, &shape.inner_def, None).await?;
+    if inner_rows.len() > in_subquery_max() {
+        return Ok(None);
+    }
+    let inner_keys = inner_rows
+        .iter()
+        .filter_map(|row| key_bytes_coll(&row[shape.inner_column], shape.collation))
+        .collect();
+    Ok(Some(CorrelatedExistsPlan {
+        outer_column: shape.outer_column,
+        inner_keys,
+        collation: shape.collation,
+        negated: shape.negated,
+        residual: shape.residual,
+    }))
+}
+
+struct CorrelatedExistsShape {
+    outer_column: usize,
+    inner_column: usize,
+    inner_def: TableDef,
+    collation: elyra_core::Collation,
+    negated: bool,
+    residual: Option<Expr>,
+}
+
+/// Whether `filter` has the exact correlated semi/anti-membership shape used
+/// by execution. This performs catalog/type analysis only; it does not scan or
+/// execute the inner query, so callers such as `EXPLAIN` can use it safely.
+pub(crate) async fn correlated_exists_membership_eligible(
+    db: &Session,
+    filter: &Expr,
+    outer_def: &TableDef,
+    outer_qualifier: &[String],
+) -> Result<bool> {
+    Ok(
+        prepare_correlated_exists_shape(db, filter, outer_def, outer_qualifier)
+            .await?
+            .is_some(),
+    )
+}
+
+async fn prepare_correlated_exists_shape(
+    db: &Session,
+    filter: &Expr,
+    outer_def: &TableDef,
+    outer_qualifier: &[String],
+) -> Result<Option<CorrelatedExistsShape>> {
+    let mut conjuncts = Vec::new();
+    split_and(filter, &mut conjuncts);
+    let candidates: Vec<&Expr> = conjuncts
+        .iter()
+        .filter(|expr| {
+            matches!(expr, Expr::Exists { subquery, .. } if query_refs_qualifier(subquery, outer_qualifier))
+        })
+        .collect();
+    let [exists] = candidates.as_slice() else {
+        return Ok(None);
+    };
+    let Expr::Exists { subquery, negated } = *exists else {
+        return Ok(None);
+    };
+
+    if subquery.with.is_some()
+        || subquery.order_by.is_some()
+        || subquery.limit.is_some()
+        || !subquery.limit_by.is_empty()
+        || subquery.offset.is_some()
+        || subquery.fetch.is_some()
+        || !subquery.locks.is_empty()
+        || subquery.for_clause.is_some()
+        || subquery.settings.is_some()
+        || subquery.format_clause.is_some()
+    {
+        return Ok(None);
+    }
+    let SetExpr::Select(inner_select) = subquery.body.as_ref() else {
+        return Ok(None);
+    };
+    let sqlparser::ast::GroupByExpr::Expressions(group_by, modifiers) = &inner_select.group_by
+    else {
+        return Ok(None);
+    };
+    if inner_select.distinct.is_some()
+        || inner_select.top.is_some()
+        || inner_select.into.is_some()
+        || !inner_select.lateral_views.is_empty()
+        || inner_select.prewhere.is_some()
+        || !group_by.is_empty()
+        || !modifiers.is_empty()
+        || inner_select.having.is_some()
+        || !inner_select.cluster_by.is_empty()
+        || !inner_select.distribute_by.is_empty()
+        || !inner_select.sort_by.is_empty()
+        || !inner_select.named_window.is_empty()
+        || inner_select.qualify.is_some()
+        || inner_select.value_table_mode.is_some()
+        || inner_select.connect_by.is_some()
+        || inner_select.from.len() != 1
+        || !inner_select.from[0].joins.is_empty()
+        || projection_correlated(&inner_select.projection, outer_qualifier)
+        || aggregate::projection_has_aggregate(&inner_select.projection)
+        || projection_has_window(&inner_select.projection)
+    {
+        return Ok(None);
+    }
+    let TableFactor::Table {
+        name: inner_name,
+        alias: inner_alias,
+        ..
+    } = &inner_select.from[0].relation
+    else {
+        return Ok(None);
+    };
+    let Some(correlation) = inner_select.selection.as_ref() else {
+        return Ok(None);
+    };
+    let Expr::BinaryOp {
+        left,
+        op: sqlparser::ast::BinaryOperator::Eq,
+        right,
+    } = correlation
+    else {
+        return Ok(None);
+    };
+
+    let inner_table = stored_table_ident(db, inner_name)?;
+    let inner_def = catalog::load(db, &inner_table).await?;
+    let inner_qualifier = factor_qualifier_object(db, &inner_select.from[0].relation)
+        .map(|qualifier| object_name_parts(&qualifier))
+        .unwrap_or_else(|| {
+            inner_alias
+                .as_ref()
+                .map(|alias| vec![alias.name.value.clone()])
+                .unwrap_or_else(|| vec![inner_table])
+        });
+    let pair = correlation_column_pair(
+        left,
+        right,
+        outer_qualifier,
+        &outer_def.schema,
+        &inner_qualifier,
+        &inner_def.schema,
+    )
+    .or_else(|| {
+        correlation_column_pair(
+            right,
+            left,
+            outer_qualifier,
+            &outer_def.schema,
+            &inner_qualifier,
+            &inner_def.schema,
+        )
+    });
+    let Some((outer_column, inner_column)) = pair else {
+        return Ok(None);
+    };
+    let outer_column_def = &outer_def.schema.columns[outer_column];
+    let inner_column_def = &inner_def.schema.columns[inner_column];
+    if outer_column_def.ty != inner_column_def.ty
+        || outer_column_def.collation != inner_column_def.collation
+        // SQL NaN equality is false while the grouping/hash key deliberately
+        // canonicalises NaNs. Vector equality likewise has no scalar-key
+        // contract. Keep both on the interpreter path.
+        || matches!(outer_column_def.ty, ColumnType::Float | ColumnType::Vector(_))
+    {
+        return Ok(None);
+    }
+
+    let collation = outer_column_def.collation;
+
+    // The membership predicate is evaluated directly. Normalise the remaining
+    // outer-only conjuncts once so the hot row loop neither clones/maps the AST
+    // nor resolves a subquery. Any residual construct we cannot prove local to
+    // the outer schema keeps the general interpreter path.
+    let residual_conjuncts = conjuncts
+        .iter()
+        .filter(|conjunct| conjunct != exists)
+        .map(|conjunct| normalise_outer_references(conjunct, outer_qualifier))
+        .collect::<Vec<_>>();
+    if residual_conjuncts
+        .iter()
+        .any(|conjunct| expr_has_subquery(conjunct) || !refs_in_schema(conjunct, &outer_def.schema))
+    {
+        return Ok(None);
+    }
+    let residual = residual_conjuncts
+        .into_iter()
+        .reduce(|left, right| Expr::BinaryOp {
+            left: Box::new(left),
+            op: sqlparser::ast::BinaryOperator::And,
+            right: Box::new(right),
+        });
+    Ok(Some(CorrelatedExistsShape {
+        outer_column,
+        inner_column,
+        inner_def,
+        collation,
+        negated: *negated,
+        residual,
+    }))
+}
+
+fn normalise_outer_references(expr: &Expr, outer_qualifier: &[String]) -> Expr {
+    map_expr(expr, &|candidate| match candidate {
+        Expr::CompoundIdentifier(parts)
+            if parts.len() >= 2
+                && qualifier_parts_match(outer_qualifier, &parts[..parts.len() - 1]) =>
+        {
+            parts.last().cloned().map(Expr::Identifier)
+        }
+        _ => None,
+    })
+}
+
+fn correlation_column_pair(
+    outer_expr: &Expr,
+    inner_expr: &Expr,
+    outer_qualifier: &[String],
+    outer_schema: &Schema,
+    inner_qualifier: &[String],
+    inner_schema: &Schema,
+) -> Option<(usize, usize)> {
+    let outer_column = qualified_column_index(outer_expr, outer_qualifier, outer_schema, false)?;
+    let inner_column = qualified_column_index(inner_expr, inner_qualifier, inner_schema, true)?;
+    Some((outer_column, inner_column))
+}
+
+fn qualified_column_index(
+    expr: &Expr,
+    qualifier: &[String],
+    schema: &Schema,
+    allow_bare: bool,
+) -> Option<usize> {
+    let column = match expr {
+        Expr::Nested(inner) => return qualified_column_index(inner, qualifier, schema, allow_bare),
+        Expr::Identifier(identifier) if allow_bare => &identifier.value,
+        Expr::CompoundIdentifier(parts)
+            if parts.len() >= 2 && qualifier_parts_match(qualifier, &parts[..parts.len() - 1]) =>
+        {
+            &parts.last()?.value
+        }
+        _ => return None,
+    };
+    schema
+        .columns
+        .iter()
+        .position(|candidate| predicate::identifier_eq(&candidate.name, column))
 }
 
 /// Rewrite qualified outer column references (`outer.col`) in `expr` to
@@ -18577,10 +20480,12 @@ async fn olap_aggregate(
         if plan.is_count_star_only() {
             if let Some(n) = index_count_eq(db, def, f).await? {
                 let mut agg = plan.new_aggregator();
-                let empty: Vec<Value> = Vec::new();
-                for _ in 0..n {
-                    agg.feed(&empty);
-                }
+                agg.seed_count_star(n);
+                return Ok(agg);
+            }
+            if let Some(n) = index_count_composite_range(db, def, f).await? {
+                let mut agg = plan.new_aggregator();
+                agg.seed_count_star(n);
                 return Ok(agg);
             }
         }
@@ -19852,6 +21757,67 @@ async fn index_count_eq(db: &Session, def: &TableDef, filter: &Expr) -> Result<O
         }
     }
     Ok(None)
+}
+
+/// Count a clean equality-prefix/composite-range predicate directly in the
+/// secondary-index keyspace. Any residual conjunct declines this covering path
+/// so the ordinary executor can fetch rows and recheck it.
+async fn index_count_composite_range(
+    db: &Session,
+    def: &TableDef,
+    filter: &Expr,
+) -> Result<Option<u64>> {
+    let Some(query) = composite_range_bounds(def, Some(filter))? else {
+        return Ok(None);
+    };
+    let range_column = query.index.cols[query.prefix.len()];
+    let prefix_columns = &query.index.cols[..query.prefix.len()];
+    let mut conjuncts = Vec::new();
+    split_and(filter, &mut conjuncts);
+    let mut seen_prefix = std::collections::HashSet::new();
+    for conjunct in &conjuncts {
+        if let Some((column, _)) = eq_col_literal(def, Some(conjunct))? {
+            if prefix_columns.contains(&column) && seen_prefix.insert(column) {
+                continue;
+            }
+            return Ok(None);
+        }
+        if as_range(def, conjunct)?.is_some_and(|(column, _, _)| column == range_column)
+            || as_between(def, conjunct)?.is_some_and(|(column, _, _)| column == range_column)
+        {
+            continue;
+        }
+        return Ok(None);
+    }
+
+    let lo = query
+        .lo
+        .as_ref()
+        .map(|(value, inclusive)| (value, *inclusive));
+    let hi = query
+        .hi
+        .as_ref()
+        .map(|(value, inclusive)| (value, *inclusive));
+    if db.in_txn() {
+        return Ok(Some(
+            index::lookup_prefix_range(db, &def.name, query.index, &query.prefix, lo, hi)
+                .await?
+                .len() as u64,
+        ));
+    }
+    let Some((start, end)) =
+        index::prefix_range_scan_bounds(&def.name, query.index, &query.prefix, lo, hi)?
+    else {
+        return Ok(Some(0));
+    };
+    let count = db
+        .raw_db()
+        .scan_range_fold(start, end, 0u64, |count, _, _| {
+            *count += 1;
+            Ok(())
+        })
+        .await?;
+    Ok(Some(count))
 }
 
 /// Collect the schema column indices referenced by `e` into `out`. Returns

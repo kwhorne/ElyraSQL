@@ -1105,7 +1105,11 @@ impl Engine {
             let content = tokio::fs::read_to_string(&spec.path).await.map_err(|e| {
                 Error::Query(format!("LOAD DATA: cannot read '{}': {e}", spec.path))
             })?;
-            let stmts = exec::build_load_inserts(&spec, &content, 1000);
+            // Keep LOAD DATA on the plain-INSERT writer fast path while
+            // amortising SQL parsing and durable commits over a genuinely
+            // bulk-sized unit. The builder still splits larger files so one
+            // statement cannot grow without bound.
+            let stmts = exec::build_load_inserts(&spec, &content, 50_000);
             let mut total = 0u64;
             for stmt in stmts {
                 for r in Box::pin(self.execute_as(&stmt, privilege, user, sess)).await? {

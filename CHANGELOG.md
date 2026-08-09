@@ -6,8 +6,53 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **Numeric `RANGE` and `GROUPS` window frames.** Aggregate windows now support
+  exact numeric offsets in ascending and descending order, peer groups,
+  partitions, NULL ordering, and empty frames. Integer and decimal boundaries
+  use checked fixed-point arithmetic rather than lossy floating-point
+  conversion; invalid, row-dependent, temporal, and incompatible offsets are
+  rejected explicitly.
+- **Composite secondary-index prefix ranges.** Predicates such as
+  `tenant = ? AND status = ? AND created BETWEEN ? AND ?` can scan the matching
+  left prefix of a composite index. Bounds honor each component's collation,
+  repeated constraints are merged, residual predicates are rechecked, and
+  transactional overlays remain visible. Covered `COUNT(*)` can count index
+  entries without fetching table rows.
+- **`ALTER TABLE ... ADD PRIMARY KEY` for populated tables.** Existing rows and
+  secondary indexes are reclustered atomically, with serializable range
+  validation preventing concurrent inserts from surviving in the old row-id
+  keyspace.
+- **Bounded spill-backed `SELECT DISTINCT`.** Large distinct sets now sort and
+  stream through temporary files instead of requiring the entire result in
+  memory, while preserving SQL collation, mixed-numeric equality, stable first
+  representatives, offsets, limits, cancellation, and result metadata.
+
 ### Changed
 
+- **Correlated `EXISTS` / `NOT EXISTS` can execute as one-time membership
+  plans.** Safe single-table equality correlations are evaluated once with
+  exact type/collation gates and correct NULL anti/semi-join semantics; other
+  shapes retain the general correlated path. `EXPLAIN` reports the optimized
+  plan only when it is guaranteed.
+- **Selective inner joins delay partner-table materialization.** A selective
+  point driver can probe a partner primary or secondary index directly,
+  including transaction-local rows, instead of eagerly scanning every joined
+  table.
+- **Window aggregation is incremental where possible.** `SUM`, `COUNT`, and
+  `AVG` over `RANGE`/`GROUPS` frames use precomputed bounds and prefix state;
+  `MIN` and `MAX` retain their exact fallback while sharing the faster bound
+  planning.
+- **Bulk inserts and table rewrites do less allocation and redundant work.**
+  Index keys encode selected columns without cloning, writes are ordered for
+  the B-tree, unchanged rows reuse their serialized representation, and
+  serializable scans coalesce overlapping validation ranges.
+- **`LOAD DATA INFILE` uses bounded 50,000-row bulk units** to amortize SQL
+  parsing and durable commits. Insert paths cache trigger definitions (including
+  empty sets) with DDL-safe invalidation. On the 50,000-row comparison workload,
+  ordinary 1,000-row batches improved from 1,072 ms to 781 ms, one bulk
+  statement took 541 ms, and server-side `LOAD DATA` took 267 ms.
 - **`ai_embed()` now uses ureq 3.** Two things change for anyone who has
   `ELYRASQL_AI_EMBED_URL` configured. ureq 3 reads `HTTP_PROXY`, `HTTPS_PROXY`
   and `ALL_PROXY` from the environment by default where ureq 2 did not, so the
@@ -21,6 +66,18 @@ All notable changes to ElyraSQL are documented here. The format is based on
   `aws-lc-rs`, so static musl builds and the `FROM scratch` image are
   unaffected. Note that ureq 3 raises the effective MSRV floor to exactly the
   declared 1.88 (via `cookie_store` and `time`).
+
+### Fixed
+
+- Exact `RANGE` boundaries no longer merge distinct integers above `2^53`, and
+  wholly out-of-partition frames return an empty frame instead of indexing with
+  `usize::MAX` and crashing the connection.
+- External sorting now returns no rows for `LIMIT 0` in every spill/top-N mode
+  and reports truncated spill headers or bodies as storage corruption rather
+  than clean EOF or a generic I/O failure.
+- Spill-backed `DISTINCT` groups by its canonical SQL key rather than a broader
+  sort comparison, preventing mixed numeric representations from producing
+  duplicate output.
 
 ### Internal
 

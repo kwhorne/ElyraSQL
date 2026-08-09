@@ -57,6 +57,7 @@ ALTER TABLE users CHANGE COLUMN note remark TEXT;
 ALTER TABLE users ALTER COLUMN status SET DEFAULT 'new';
 ALTER TABLE users ALTER COLUMN status DROP DEFAULT;
 ALTER TABLE users ALTER COLUMN status SET NOT NULL;
+ALTER TABLE users ADD PRIMARY KEY (id);
 ```
 
 - **ADD COLUMN** backfills existing rows with the default (or `NULL`). Adding a
@@ -68,6 +69,12 @@ ALTER TABLE users ALTER COLUMN status SET NOT NULL;
   renames it (`CHANGE`), and resets its options (nullability, default). The
   type of a primary-key column cannot be changed.
 - **ALTER COLUMN** sets or drops a `DEFAULT`, or toggles `NOT NULL`.
+- **ADD PRIMARY KEY** validates existing values, atomically reclusters the
+  table on the new key, and rebuilds its secondary indexes. NULL or duplicate
+  key values reject the whole ALTER without changing the table. The rewrite is
+  buffered as one transaction and is therefore bounded by
+  `ELYRASQL_TXN_MAX_BYTES`; very large tables may need to be copied into a new
+  table instead.
 - Type conversions follow MySQL-style leniency (e.g. `'10'` → `10`, `99` →
   `'99'`).
 - **RENAME TABLE** re-keys the data and rebuilds index entries.

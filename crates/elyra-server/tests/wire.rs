@@ -955,6 +955,106 @@ async fn integer_width_is_enforced_and_survives_alter() {
         .unwrap();
 }
 
+#[tokio::test]
+async fn alter_table_add_primary_key_reclusters_existing_rows_atomically() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop("CREATE TABLE add_pk (tenant INT, id INT, label TEXT, INDEX label_idx(label))")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO add_pk VALUES (2, 1, 'second'), (1, 2, 'third'), (1, 1, 'first')")
+        .await
+        .unwrap();
+    c.query_drop("ALTER TABLE add_pk ADD PRIMARY KEY (tenant, id)")
+        .await
+        .unwrap();
+
+    let rows: Vec<(i64, i64, String)> = c
+        .query("SELECT tenant, id, label FROM add_pk")
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            (1, 1, "first".into()),
+            (1, 2, "third".into()),
+            (2, 1, "second".into()),
+        ]
+    );
+    let indexed: Option<(i64, i64)> = c
+        .query_first("SELECT tenant, id FROM add_pk WHERE label = 'second'")
+        .await
+        .unwrap();
+    assert_eq!(indexed, Some((2, 1)));
+    assert!(c
+        .query_drop("INSERT INTO add_pk VALUES (1, 1, 'duplicate')")
+        .await
+        .is_err());
+
+    for (table, values) in [
+        ("add_pk_duplicate", "(1, 'a'), (1, 'b')"),
+        ("add_pk_null", "(1, 'a'), (NULL, 'b')"),
+    ] {
+        c.query_drop(format!("CREATE TABLE {table} (id INT, label TEXT)"))
+            .await
+            .unwrap();
+        c.query_drop(format!("INSERT INTO {table} VALUES {values}"))
+            .await
+            .unwrap();
+        assert!(c
+            .query_drop(format!("ALTER TABLE {table} ADD PRIMARY KEY (id)"))
+            .await
+            .is_err());
+        let count: Option<i64> = c
+            .query_first(format!("SELECT COUNT(*) FROM {table}"))
+            .await
+            .unwrap();
+        assert_eq!(count, Some(2), "failed ALTER must preserve {table}");
+        c.query_drop(format!("INSERT INTO {table} VALUES (2, 'still rowid')"))
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn alter_add_primary_key_rejects_a_concurrent_post_scan_insert() {
+    let srv = TestServer::start().await;
+    let mut ddl = srv.conn().await;
+    let mut writer = srv.conn().await;
+
+    ddl.query_drop("CREATE TABLE add_pk_race (id INT, label TEXT)")
+        .await
+        .unwrap();
+    ddl.query_drop("INSERT INTO add_pk_race VALUES (1, 'before')")
+        .await
+        .unwrap();
+    ddl.query_drop("START TRANSACTION").await.unwrap();
+    ddl.query_drop("ALTER TABLE add_pk_race ADD PRIMARY KEY (id)")
+        .await
+        .unwrap();
+
+    // This row is committed after the ALTER's recluster scan but before its
+    // transaction commits. Range validation must reject the stale rewrite.
+    writer
+        .query_drop("INSERT INTO add_pk_race VALUES (2, 'raced')")
+        .await
+        .unwrap();
+    assert!(ddl.query_drop("COMMIT").await.is_err());
+
+    let rows: Vec<(i64, String)> = writer
+        .query("SELECT id, label FROM add_pk_race ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![(1, "before".into()), (2, "raced".into())]);
+    // The failed ALTER left the table in rowid mode, so a duplicate id remains
+    // legal and proves no PK metadata escaped the aborted transaction.
+    writer
+        .query_drop("INSERT INTO add_pk_race VALUES (1, 'still rowid')")
+        .await
+        .unwrap();
+}
+
 /// The compact execution schema may store several MySQL declarations in the
 /// same physical type, but schema tooling must still see the declaration the
 /// user wrote and its standard width/precision metadata.
@@ -2361,6 +2461,91 @@ async fn qualified_wildcard() {
         .await
         .unwrap();
     assert_eq!(rows, vec![(1, 1, "post".into())]);
+}
+
+/// A selective predicate on the first relation should leave only a tiny driver,
+/// then probe the joined table's secondary index.  Residual partner predicates
+/// and NULL join keys must retain ordinary INNER JOIN semantics.
+#[tokio::test]
+async fn selective_join_drives_secondary_index_probes() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    c.query_drop("CREATE TABLE sj_users (id BIGINT PRIMARY KEY, name VARCHAR(32))")
+        .await
+        .unwrap();
+    c.query_drop(
+        "CREATE TABLE sj_orders (id BIGINT PRIMARY KEY, user_id BIGINT NULL, active INT, \
+         INDEX orders_user (user_id))",
+    )
+    .await
+    .unwrap();
+    c.query_drop("INSERT INTO sj_users VALUES (1,'one'),(2,'two'),(3,'three')")
+        .await
+        .unwrap();
+    c.query_drop(
+        "INSERT INTO sj_orders VALUES \
+         (10,1,1),(11,1,0),(12,2,1),(13,NULL,1),(14,1,1)",
+    )
+    .await
+    .unwrap();
+
+    let rows: Vec<(String, i64)> = c
+        .query(
+            "SELECT u.name,o.id FROM sj_users u JOIN sj_orders o \
+             ON u.id=o.user_id WHERE u.id=1 AND o.active=1 ORDER BY o.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![("one".into(), 10), ("one".into(), 14)]);
+
+    let plan: Vec<mysql_async::Row> = c
+        .query(
+            "EXPLAIN SELECT u.name,o.id FROM sj_users u JOIN sj_orders o \
+             ON u.id=o.user_id WHERE u.id=1 AND o.active=1",
+        )
+        .await
+        .unwrap();
+    assert_eq!(plan.len(), 2);
+    assert_eq!(
+        plan[0].get::<String, _>("table").as_deref(),
+        Some("sj_users")
+    );
+    assert_eq!(plan[0].get::<String, _>("key").as_deref(), Some("PRIMARY"));
+    assert_eq!(
+        plan[1].get::<String, _>("table").as_deref(),
+        Some("sj_orders")
+    );
+    assert_eq!(
+        plan[1].get::<String, _>("key").as_deref(),
+        Some("orders_user")
+    );
+    assert!(plan[1]
+        .get::<String, _>("Extra")
+        .is_some_and(|extra| extra.contains("Indexed nested-loop join")));
+
+    let rows: Vec<i64> = c
+        .query(
+            "SELECT o.id FROM sj_users u JOIN sj_orders o \
+             ON u.id=o.user_id WHERE u.id=3 ORDER BY o.id",
+        )
+        .await
+        .unwrap();
+    assert!(rows.is_empty());
+
+    c.query_drop("START TRANSACTION").await.unwrap();
+    c.query_drop("INSERT INTO sj_orders VALUES (15,1,1)")
+        .await
+        .unwrap();
+    let rows: Vec<i64> = c
+        .query(
+            "SELECT o.id FROM sj_users u JOIN sj_orders o ON u.id=o.user_id \
+             WHERE u.id=1 AND o.active=1 ORDER BY o.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![10, 14, 15]);
+    c.query_drop("ROLLBACK").await.unwrap();
 }
 
 #[tokio::test]
@@ -11768,6 +11953,155 @@ async fn wide_index_ranges_return_correct_rows() {
     assert_eq!(rows, want);
 }
 
+#[tokio::test]
+async fn composite_index_prefix_ranges_are_exact() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop(
+        "CREATE TABLE composite_ranges (
+            id INT PRIMARY KEY,
+            tenant VARCHAR(8) COLLATE utf8mb4_bin NOT NULL,
+            score INT,
+            active INT NOT NULL,
+            INDEX ix_tenant_score_active (tenant, score, active)
+        )",
+    )
+    .await
+    .unwrap();
+    c.query_drop(
+        "INSERT INTO composite_ranges VALUES
+         (1,'a',10,1),(2,'a',11,1),(3,'a',12,0),(4,'a',13,1),
+         (5,'A',11,1),(6,'b',11,1),(7,'a',NULL,1)",
+    )
+    .await
+    .unwrap();
+
+    // Both endpoint modes, repeated bounds (the strongest wins), binary
+    // collation on the equality prefix, and a residual predicate.
+    let ids: Vec<i64> = c
+        .query(
+            "SELECT id FROM composite_ranges
+             WHERE tenant = 'a' AND score >= 10 AND score > 10
+               AND score <= 13 AND score < 13 AND active = 1
+             ORDER BY id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(ids, vec![2]);
+    let ids: Vec<i64> = c
+        .query(
+            "SELECT id FROM composite_ranges
+             WHERE tenant = 'A' AND score BETWEEN 11 AND 11 ORDER BY id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(ids, vec![5]);
+
+    // COUNT(*) can stay entirely in the composite-index keyspace when every
+    // conjunct is covered. A residual or duplicate equality must retain the
+    // ordinary fetch-and-recheck path.
+    let count: i64 = c
+        .query_first(
+            "SELECT COUNT(*) FROM composite_ranges
+             WHERE tenant = 'a' AND score BETWEEN 10 AND 13",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(count, 4);
+    let residual_count: i64 = c
+        .query_first(
+            "SELECT COUNT(*) FROM composite_ranges
+             WHERE tenant = 'a' AND score BETWEEN 10 AND 13 AND active = 1",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(residual_count, 3);
+
+    // Index maintenance and reads share the transaction snapshot.
+    c.query_drop("BEGIN").await.unwrap();
+    c.query_drop("INSERT INTO composite_ranges VALUES (8,'a',12,1)")
+        .await
+        .unwrap();
+    let ids: Vec<i64> = c
+        .query(
+            "SELECT id FROM composite_ranges
+             WHERE tenant = 'a' AND score >= 12 AND score <= 12 ORDER BY id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(ids, vec![3, 8]);
+    c.query_drop("UPDATE composite_ranges SET score = 20 WHERE id = 2")
+        .await
+        .unwrap();
+    c.query_drop("DELETE FROM composite_ranges WHERE id = 3")
+        .await
+        .unwrap();
+    let ids: Vec<i64> = c
+        .query(
+            "SELECT id FROM composite_ranges
+             WHERE tenant = 'a' AND score BETWEEN 10 AND 13 ORDER BY id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(ids, vec![1, 4, 8]);
+    c.query_drop("ROLLBACK").await.unwrap();
+
+    // Contradictory/repeated prefix and range predicates must never widen the
+    // lookup selected from the first usable composite index.
+    let ids: Vec<i64> = c
+        .query(
+            "SELECT id FROM composite_ranges
+             WHERE tenant = 'a' AND tenant = 'b'
+               AND score >= 10 AND score < 10 ORDER BY id",
+        )
+        .await
+        .unwrap();
+    assert!(ids.is_empty());
+
+    c.query_drop(
+        "CREATE TABLE composite_ci (
+            id INT PRIMARY KEY,
+            tenant VARCHAR(8) COLLATE utf8mb4_0900_ai_ci NOT NULL,
+            score INT NOT NULL,
+            INDEX ix_ci (tenant, score)
+        )",
+    )
+    .await
+    .unwrap();
+    c.query_drop("INSERT INTO composite_ci VALUES (1,'Cafe',10),(2,'CAFÉ',11),(3,'other',10)")
+        .await
+        .unwrap();
+    let ids: Vec<i64> = c
+        .query(
+            "SELECT id FROM composite_ci
+             WHERE tenant = 'café' AND score BETWEEN 10 AND 11 ORDER BY id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(ids, vec![1, 2]);
+
+    // A nullable trailing indexed column makes the composite range unsafe;
+    // falling back must retain rows whose index entry was intentionally omitted.
+    c.query_drop(
+        "CREATE TABLE nullable_tail (
+            id INT PRIMARY KEY, a INT NOT NULL, b INT NOT NULL, tail INT,
+            INDEX ix_ab_tail (a, b, tail)
+        )",
+    )
+    .await
+    .unwrap();
+    c.query_drop("INSERT INTO nullable_tail VALUES (1,7,10,NULL),(2,7,11,1)")
+        .await
+        .unwrap();
+    let ids: Vec<i64> = c
+        .query("SELECT id FROM nullable_tail WHERE a = 7 AND b >= 10 ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(ids, vec![1, 2]);
+}
+
 // `col IN (literals)` on an indexed column is served by index lookups rather than a
 // scan that tests membership per row. The planner may still choose a scan for a wide
 // list, so this pins the *results* across every shape that path has to get right --
@@ -11951,6 +12285,170 @@ async fn window_functions_are_exact() {
     assert_eq!(rows[0].2, 1);
 }
 
+#[tokio::test]
+async fn numeric_range_and_groups_window_frames_are_exact() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop("CREATE TABLE wf (id INT PRIMARY KEY, g INT, k INT, v INT)")
+        .await
+        .unwrap();
+    c.query_drop(
+        "INSERT INTO wf VALUES
+         (1, 1, 1, 10), (2, 1, 2, 20), (3, 1, 2, 30),
+         (4, 1, 4, 40), (5, 1, 7, 50), (6, 2, 2, 60),
+         (7, 2, 5, 70), (8, 2, NULL, 80), (9, 2, NULL, 90)",
+    )
+    .await
+    .unwrap();
+
+    let rows: Vec<(i64, i64)> = c
+        .query(
+            "SELECT id, SUM(v) OVER (
+                 PARTITION BY g ORDER BY k
+                 RANGE BETWEEN 2 PRECEDING AND CURRENT ROW
+             ) FROM wf WHERE g = 1 ORDER BY id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![(1, 10), (2, 60), (3, 60), (4, 90), (5, 50)]);
+
+    let window_plan: mysql_async::Row = c
+        .query_first(
+            "EXPLAIN SELECT SUM(v) OVER (ORDER BY k RANGE BETWEEN 2 PRECEDING \
+             AND CURRENT ROW) FROM wf",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(window_plan
+        .get::<String, _>("Extra")
+        .is_some_and(|extra| extra.contains("Incremental window aggregate")));
+    let distinct_plan: mysql_async::Row = c
+        .query_first("EXPLAIN SELECT DISTINCT g FROM wf")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(distinct_plan
+        .get::<String, _>("Extra")
+        .is_some_and(|extra| extra.contains("Distinct (spill-capable)")));
+
+    let rows: Vec<(i64, i64)> = c
+        .query(
+            "SELECT id, SUM(v) OVER (
+                 ORDER BY k DESC RANGE BETWEEN 2 PRECEDING AND 1 FOLLOWING
+             ) FROM wf WHERE g = 1 ORDER BY id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![(1, 60), (2, 100), (3, 100), (4, 40), (5, 50)]);
+
+    // GROUPS counts peer groups rather than physical rows and accepts a
+    // multi-column ordering key.
+    let rows: Vec<(i64, i64)> = c
+        .query(
+            "SELECT id, COUNT(*) OVER (
+                 ORDER BY k, g
+                 GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING
+             ) FROM wf WHERE g = 1 ORDER BY id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![(1, 3), (2, 4), (3, 4), (4, 4), (5, 2)]);
+
+    // A numeric RANGE offset on a NULL ordering value is its NULL peer group.
+    let rows: Vec<(i64, i64)> = c
+        .query(
+            "SELECT id, COUNT(*) OVER (
+                 ORDER BY k RANGE BETWEEN 3 PRECEDING AND 3 FOLLOWING
+             ) FROM wf WHERE g = 2 ORDER BY id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![(6, 2), (7, 2), (8, 2), (9, 2)]);
+
+    c.query_drop("CREATE TABLE wf_exact (id INT PRIMARY KEY, k BIGINT)")
+        .await
+        .unwrap();
+    c.query_drop(
+        "INSERT INTO wf_exact VALUES
+         (1, 9007199254740992), (2, 9007199254740993)",
+    )
+    .await
+    .unwrap();
+    let rows: Vec<(i64, i64)> = c
+        .query(
+            "SELECT id, COUNT(*) OVER (
+                 ORDER BY k RANGE BETWEEN 0 PRECEDING AND 0 FOLLOWING
+             ) FROM wf_exact ORDER BY id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![(1, 1), (2, 1)]);
+
+    // A valid frame can lie wholly before the partition. Its upper-bound
+    // search must produce an empty frame rather than an out-of-range slice.
+    let rows: Vec<(i64, i64)> = c
+        .query(
+            "SELECT id, COUNT(*) OVER (
+                 ORDER BY k RANGE BETWEEN 20 PRECEDING AND 10 PRECEDING
+             ) FROM wf WHERE g = 1 ORDER BY id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![(1, 0), (2, 0), (3, 0), (4, 0), (5, 0)]);
+
+    let rows: Vec<(i64, i64)> = c
+        .query(
+            "SELECT id, COUNT(*) OVER (
+                 ORDER BY k GROUPS BETWEEN 4 PRECEDING AND 3 PRECEDING
+             ) FROM wf WHERE g = 1 ORDER BY id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![(1, 0), (2, 0), (3, 0), (4, 0), (5, 1)]);
+
+    // DESC ordering and NULL peers exercise the opposite boundary direction.
+    let rows: Vec<(i64, i64)> = c
+        .query(
+            "SELECT id, COUNT(*) OVER (
+                 ORDER BY k DESC RANGE BETWEEN 1 PRECEDING AND CURRENT ROW
+             ) FROM wf WHERE g = 2 ORDER BY id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![(6, 1), (7, 1), (8, 2), (9, 2)]);
+
+    let err = c
+        .query_iter(
+            "SELECT SUM(v) OVER (
+                 ORDER BY k, id RANGE BETWEEN 1 PRECEDING AND CURRENT ROW
+             ) FROM wf",
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("exactly one numeric ORDER BY"));
+
+    let err = c
+        .query_iter(
+            "SELECT SUM(v) OVER (
+                 ORDER BY k RANGE BETWEEN k PRECEDING AND CURRENT ROW
+             ) FROM wf",
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("constant expressions"));
+
+    let err = c
+        .query_iter(
+            "SELECT SUM(v) OVER (
+                 ORDER BY k GROUPS BETWEEN 1.5 PRECEDING AND CURRENT ROW
+             ) FROM wf",
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("exact non-negative integers"));
+}
+
 // Statements containing non-ASCII text must not panic the connection. The keyword
 // sniffers sliced the SQL by byte offset, so a multi-byte character straddling that
 // offset (`SELECT 'æ'='ae'` -- 'æ' spans bytes 8..10, "drop user" is 9 bytes) aborted
@@ -12098,4 +12596,116 @@ async fn columns_without_a_declared_width_fall_back_to_unbounded() {
     let columns = result.columns_ref().to_vec();
     assert_eq!(columns[0].column_length(), 65_535 * 4);
     assert_eq!(columns[1].column_length(), 65_535);
+}
+
+#[tokio::test]
+async fn simple_correlated_exists_and_not_exists_preserve_sql_semantics() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop("CREATE TABLE corr_outer (id INT, enabled INT)")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE corr_inner (outer_id INT)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO corr_outer VALUES (1, 1), (2, 1), (3, 0), (NULL, 1)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO corr_inner VALUES (1), (3), (NULL), (1)")
+        .await
+        .unwrap();
+
+    let exists: Vec<Option<i64>> = c
+        .query(
+            "SELECT o.id FROM corr_outer o
+             WHERE o.enabled = 1
+               AND EXISTS (SELECT 1 FROM corr_inner i WHERE i.outer_id = o.id)
+             ORDER BY o.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(exists, [Some(1)]);
+
+    let plan: mysql_async::Row = c
+        .query_first(
+            "EXPLAIN SELECT o.id FROM corr_outer o WHERE o.enabled = 1 \
+             AND EXISTS (SELECT 1 FROM corr_inner i WHERE i.outer_id = o.id)",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(plan
+        .get::<String, _>("Extra")
+        .is_some_and(|extra| extra.contains("Using semi-join membership")));
+
+    let not_exists: Vec<Option<i64>> = c
+        .query(
+            "SELECT o.id FROM corr_outer o
+             WHERE o.enabled = 1
+               AND NOT EXISTS (SELECT 1 FROM corr_inner i WHERE o.id = i.outer_id)
+             ORDER BY o.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(not_exists, [None, Some(2)]);
+
+    // Aggregate EXISTS has different semantics: COUNT returns one row even
+    // when the correlated WHERE matches nothing, so it must stay on the
+    // general correlated-subquery path rather than membership execution.
+    let aggregate_exists: Vec<Option<i64>> = c
+        .query(
+            "SELECT o.id FROM corr_outer o
+             WHERE o.enabled = 1
+               AND EXISTS (SELECT COUNT(*) FROM corr_inner i WHERE i.outer_id = o.id)
+             ORDER BY o.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(aggregate_exists, [None, Some(1), Some(2)]);
+
+    // An additional uncorrelated subquery in the residual predicate also
+    // deliberately falls back; direct membership only handles outer-local
+    // residual conjuncts.
+    let residual_subquery: Vec<Option<i64>> = c
+        .query(
+            "SELECT o.id FROM corr_outer o
+             WHERE EXISTS (SELECT 1)
+               AND EXISTS (SELECT 1 FROM corr_inner i WHERE i.outer_id = o.id)
+             ORDER BY o.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(residual_subquery, [Some(1), Some(3)]);
+}
+
+#[tokio::test]
+async fn insert_trigger_cache_is_invalidated_by_trigger_ddl() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop("CREATE TABLE trigger_source (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE trigger_audit (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+
+    // The first insert caches the absence of triggers.
+    c.query_drop("INSERT INTO trigger_source VALUES (1)")
+        .await
+        .unwrap();
+    c.query_drop(
+        "CREATE TRIGGER source_audit AFTER INSERT ON trigger_source \
+         FOR EACH ROW INSERT INTO trigger_audit VALUES (NEW.id)",
+    )
+    .await
+    .unwrap();
+    c.query_drop("INSERT INTO trigger_source VALUES (2)")
+        .await
+        .unwrap();
+
+    let audit: Vec<i64> = c
+        .query("SELECT id FROM trigger_audit ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(audit, [2]);
 }

@@ -4,8 +4,8 @@
 //! MySQL-flavoured surface: `VEC_DISTANCE(a, b)` plus distance functions used
 //! in `ORDER BY ... LIMIT k` for approximate nearest-neighbour (ANN) search.
 //!
-//! Milestone status: **planned** (an HNSW index backs `VECTOR` columns).
-//! The distance math below is real and used for exact search / tests today.
+//! An HNSW index backs indexed `VECTOR` columns for approximate nearest-neighbour
+//! search. The distance math below is also used for exact search and tests.
 
 pub mod hnsw;
 pub use hnsw::{Hnsw, HnswParts};
