@@ -1018,6 +1018,77 @@ async fn alter_table_add_primary_key_reclusters_existing_rows_atomically() {
 }
 
 #[tokio::test]
+async fn shadow_primary_key_generation_supports_subsequent_table_operations() {
+    let srv = TestServer::start().await;
+    let mut connection = srv.conn().await;
+
+    connection
+        .query_drop("CREATE TABLE gen_ops (id INT, label TEXT, INDEX label_idx(label))")
+        .await
+        .unwrap();
+    connection
+        .query_drop("INSERT INTO gen_ops VALUES (1, 'one'), (2, 'two'), (3, 'three')")
+        .await
+        .unwrap();
+    connection
+        .query_drop("ALTER TABLE gen_ops ADD PRIMARY KEY (id)")
+        .await
+        .unwrap();
+    connection
+        .query_drop("UPDATE gen_ops SET label = 'second' WHERE id = 2")
+        .await
+        .unwrap();
+    let indexed: Option<i64> = connection
+        .query_first("SELECT id FROM gen_ops WHERE label = 'second'")
+        .await
+        .unwrap();
+    assert_eq!(indexed, Some(2));
+
+    connection
+        .query_drop("DELETE FROM gen_ops WHERE id = 1")
+        .await
+        .unwrap();
+    connection
+        .query_drop("INSERT INTO gen_ops VALUES (4, 'four')")
+        .await
+        .unwrap();
+    connection
+        .query_drop("RENAME TABLE gen_ops TO gen_ops_new")
+        .await
+        .unwrap();
+    let rows: Vec<(i64, String)> = connection
+        .query("SELECT id, label FROM gen_ops_new ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            (2, "second".into()),
+            (3, "three".into()),
+            (4, "four".into()),
+        ]
+    );
+
+    connection
+        .query_drop("ANALYZE TABLE gen_ops_new")
+        .await
+        .unwrap();
+    connection
+        .query_drop("TRUNCATE TABLE gen_ops_new")
+        .await
+        .unwrap();
+    let count: Option<i64> = connection
+        .query_first("SELECT COUNT(*) FROM gen_ops_new")
+        .await
+        .unwrap();
+    assert_eq!(count, Some(0));
+    connection
+        .query_drop("INSERT INTO gen_ops_new VALUES (5, 'after truncate')")
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn alter_add_primary_key_rejects_a_concurrent_post_scan_insert() {
     let srv = TestServer::start().await;
     let mut ddl = srv.conn().await;

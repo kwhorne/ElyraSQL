@@ -22,7 +22,7 @@ use crate::session::Session;
 use elyra_core::{Error, Result, Value};
 use elyra_vector::{Hnsw, HnswParts, Metric};
 
-use crate::catalog::{data_prefix, wcount_key, TableDef};
+use crate::catalog::{wcount_key, TableDef};
 
 /// On-disk vector-index cache (see ESQL-27). The graph is a regenerable cache,
 /// so it lives in a sibling directory `<data>.vidx/` (like `<data>.raftstate`),
@@ -358,7 +358,7 @@ async fn scan_current(
     def: &TableDef,
     col: usize,
 ) -> Result<(usize, Vec<(Vec<u8>, Vec<f32>)>)> {
-    let prefix = data_prefix(&def.name);
+    let prefix = def.data_prefix();
     let mut cursor: Option<Vec<u8>> = None;
     let mut out: Vec<(Vec<u8>, Vec<f32>)> = Vec::new();
     let mut dim = 0usize;
@@ -506,7 +506,7 @@ fn reconcile(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::TableDef;
+    use crate::catalog::{data_prefix, TableDef};
     use crate::lockmgr::LockManager;
     use elyra_core::{ColumnDef, ColumnType, Schema};
     use elyra_storage::Db;
@@ -541,6 +541,7 @@ mod tests {
             col_meta: Vec::new(),
             checks: Vec::new(),
             foreign_keys: Vec::new(),
+            storage_generation: 0,
         }
     }
 

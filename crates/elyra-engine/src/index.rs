@@ -12,7 +12,7 @@
 use crate::session::Session;
 use elyra_core::{Collation, Result, Value};
 
-use crate::catalog::{data_prefix, IndexDef, TableDef};
+use crate::catalog::{IndexDef, TableDef};
 use crate::ft;
 use crate::keyenc;
 
@@ -31,11 +31,12 @@ fn fulltext_entry_keys(
             text.push_str(&s);
         }
     }
-    let clustered = &data_key[data_prefix(&def.name).len()..];
+    let storage_table = def.storage_name();
+    let clustered = &data_key[def.data_prefix().len()..];
     ft::unique_terms(&text)
         .into_iter()
         .map(|term| {
-            let mut k = format!("index::{}::{}::", def.name, idx.name).into_bytes();
+            let mut k = format!("index::{storage_table}::{}::", idx.name).into_bytes();
             k.extend_from_slice(term.as_bytes());
             k.push(0);
             k.extend_from_slice(clustered);
@@ -51,7 +52,7 @@ pub async fn fulltext_lookup(
     index: &str,
     term: &str,
 ) -> Result<Vec<Vec<u8>>> {
-    let mut prefix = format!("index::{table}::{index}::").into_bytes();
+    let mut prefix = index_prefix(table, index);
     prefix.extend_from_slice(term.as_bytes());
     prefix.push(0);
     let mut cursor: Option<Vec<u8>> = None;
@@ -77,7 +78,11 @@ pub async fn fulltext_lookup(
 type Entry = (Vec<u8>, Vec<u8>);
 
 fn index_prefix(table: &str, index: &str) -> Vec<u8> {
-    format!("index::{table}::{index}::").into_bytes()
+    index_prefix_storage(table, index)
+}
+
+fn index_prefix_storage(storage_table: &str, index: &str) -> Vec<u8> {
+    format!("index::{storage_table}::{index}::").into_bytes()
 }
 
 /// Public key prefix covering every entry of a secondary index, for an ordered
@@ -92,16 +97,17 @@ pub fn index_scan_prefix(table: &str, index: &str) -> Vec<u8> {
 /// with the row's data key as value, so walking this prefix yields the NULL rows
 /// ordered by primary key (the stable-pagination tiebreaker for the NULL block).
 pub fn indexnull_scan_prefix(table: &str, index: &str) -> Vec<u8> {
-    format!("indexnull::{table}::{index}::").into_bytes()
+    indexnull_prefix_storage(table, index)
 }
 
-/// Entry key for a NULL-keyed row in a single-column index: the NULL prefix
-/// followed by the row's clustered primary key (so NULLs never collide and are
-/// ordered by PK).
-fn null_entry_key(table: &str, index: &str, data_key: &[u8]) -> Vec<u8> {
-    let mut k = indexnull_scan_prefix(table, index);
-    k.extend_from_slice(&data_key[data_prefix(table).len()..]);
-    k
+fn indexnull_prefix_storage(storage_table: &str, index: &str) -> Vec<u8> {
+    format!("indexnull::{storage_table}::{index}::").into_bytes()
+}
+
+fn null_entry_key_storage(storage_table: &str, index: &str, clustered_key: &[u8]) -> Vec<u8> {
+    let mut key = indexnull_prefix_storage(storage_table, index);
+    key.extend_from_slice(clustered_key);
+    key
 }
 
 /// Prefix for all entries with a given tuple of column values (equality),
@@ -118,21 +124,16 @@ fn value_prefix(
     Ok(k)
 }
 
-fn value_prefix_encoded(table: &str, index: &str, encoded: &[u8]) -> Vec<u8> {
-    let mut key = index_prefix(table, index);
-    key.extend_from_slice(encoded);
-    key.push(0);
-    key
-}
-
-fn entry_key_encoded(
-    table: &str,
+fn entry_key_encoded_storage(
+    storage_table: &str,
     index: &str,
     encoded: &[u8],
     clustered_key: &[u8],
     unique: bool,
 ) -> Vec<u8> {
-    let mut key = value_prefix_encoded(table, index, encoded);
+    let mut key = index_prefix_storage(storage_table, index);
+    key.extend_from_slice(encoded);
+    key.push(0);
     if !unique {
         key.extend_from_slice(clustered_key);
     }
@@ -160,7 +161,8 @@ pub fn partition_entries_for_row(
 ) -> Result<(Vec<Entry>, Vec<Entry>)> {
     let mut nonuniq = Vec::new();
     let mut uniq = Vec::new();
-    let clustered_key = &data_key[b"data::".len() + def.name.len() + b"::".len()..];
+    let storage_table = def.storage_name();
+    let clustered_key = &data_key[def.data_prefix().len()..];
     for idx in &def.indexes {
         if idx.vector {
             continue;
@@ -180,14 +182,20 @@ pub fn partition_entries_for_row(
             // `indexnull::` keyspace (never unique -- NULLs don't collide).
             if idx.indexes_nulls && idx.cols.len() == 1 && row[idx.cols[0]].is_null() {
                 nonuniq.push((
-                    null_entry_key(&def.name, &idx.name, data_key),
+                    null_entry_key_storage(&storage_table, &idx.name, clustered_key),
                     data_key.to_vec(),
                 ));
             }
             continue;
         };
         let entry = (
-            entry_key_encoded(&def.name, &idx.name, &encoded, clustered_key, idx.unique),
+            entry_key_encoded_storage(
+                &storage_table,
+                &idx.name,
+                &encoded,
+                clustered_key,
+                idx.unique,
+            ),
             data_key.to_vec(),
         );
         if idx.unique {
@@ -203,6 +211,7 @@ pub fn partition_entries_for_row(
 /// existence checks on paths that cannot use writer-side collision detection.
 pub fn unique_probe_keys(def: &TableDef, row: &[Value]) -> Result<Vec<Vec<u8>>> {
     let mut out = Vec::new();
+    let storage_table = def.storage_name();
     for idx in &def.indexes {
         if idx.vector || !idx.unique {
             continue;
@@ -214,7 +223,10 @@ pub fn unique_probe_keys(def: &TableDef, row: &[Value]) -> Result<Vec<Vec<u8>>> 
         let Some(encoded) = encoded else {
             continue;
         };
-        out.push(value_prefix_encoded(&def.name, &idx.name, &encoded));
+        let mut key = index_prefix_storage(&storage_table, &idx.name);
+        key.extend_from_slice(&encoded);
+        key.push(0);
+        out.push(key);
     }
     Ok(out)
 }
@@ -232,7 +244,8 @@ pub fn entries_for_row(
     data_key: &[u8],
 ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
     let mut out = Vec::new();
-    let clustered_key = &data_key[b"data::".len() + def.name.len() + b"::".len()..];
+    let storage_table = def.storage_name();
+    let clustered_key = &data_key[def.data_prefix().len()..];
     for idx in &def.indexes {
         if idx.vector {
             continue; // vector indexes are maintained separately
@@ -251,14 +264,20 @@ pub fn entries_for_row(
             // Single-column NULL-indexing (see `partition_entries_for_row`).
             if idx.indexes_nulls && idx.cols.len() == 1 && row[idx.cols[0]].is_null() {
                 out.push((
-                    null_entry_key(&def.name, &idx.name, data_key),
+                    null_entry_key_storage(&storage_table, &idx.name, clustered_key),
                     data_key.to_vec(),
                 ));
             }
             continue;
         };
         out.push((
-            entry_key_encoded(&def.name, &idx.name, &encoded, clustered_key, idx.unique),
+            entry_key_encoded_storage(
+                &storage_table,
+                &idx.name,
+                &encoded,
+                clustered_key,
+                idx.unique,
+            ),
             data_key.to_vec(),
         ));
     }

@@ -780,6 +780,7 @@ pub async fn create_table(
         col_meta,
         checks,
         foreign_keys,
+        storage_generation: 0,
     };
     let widths = catalog::ColumnWidths {
         bits: ct
@@ -2802,6 +2803,7 @@ async fn create_table_as(
         col_meta: Vec::new(),
         checks: Vec::new(),
         foreign_keys: Vec::new(),
+        storage_generation: 0,
     };
     let mut puts = vec![(catalog_key(name), def.encode()?)];
     if let Some(declarations) = declarations.as_ref() {
@@ -2846,14 +2848,13 @@ async fn create_table_as(
 
 /// TRUNCATE TABLE: remove all rows and index entries, reset counters.
 pub async fn truncate(db: &Session, name: &str) -> Result<QueryResult> {
-    if !catalog::exists(db, name).await? {
-        return Err(Error::Catalog(format!("no such table: {name}")));
-    }
+    let def = catalog::load(db, name).await?;
+    let storage_name = def.storage_name();
     let mut deletes = vec![rowid_key(name), autoinc_key(name)];
     for prefix in [
-        data_prefix(name),
-        index_table_prefix(name),
-        indexnull_table_prefix(name),
+        def.data_prefix(),
+        index_table_prefix(&storage_name),
+        indexnull_table_prefix(&storage_name),
     ] {
         let mut cursor: Option<Vec<u8>> = None;
         loop {
@@ -2879,6 +2880,15 @@ pub async fn alter_table(
     name: &ObjectName,
     ops: &[AlterTableOperation],
 ) -> Result<QueryResult> {
+    if !db.in_txn() {
+        if let [AlterTableOperation::AddConstraint(sqlparser::ast::TableConstraint::PrimaryKey {
+            columns,
+            ..
+        })] = ops
+        {
+            return alter_add_primary_key_shadow(db, name, columns).await;
+        }
+    }
     // ALTER helpers persist catalog, row, and index changes independently. Keep
     // the whole statement behind a private checkpoint so a later operation
     // cannot expose changes made by an earlier one.
@@ -2916,6 +2926,214 @@ pub async fn alter_table(
             }
             if implicit_transaction {
                 db.rollback();
+            }
+            Err(error)
+        }
+    }
+}
+
+fn rewrite_batch_rows() -> usize {
+    std::env::var("ELYRASQL_REWRITE_BATCH_ROWS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(100_000)
+        .clamp(1, 100_000)
+}
+
+fn generation_gc_key(table: &str, generation: u64) -> Vec<u8> {
+    format!("meta::generation-gc::{table}::{generation:016x}").into_bytes()
+}
+
+const GENERATION_GC_PREFIX: &[u8] = b"meta::generation-gc::";
+
+fn generation_gc_value(table: &str, generation: u64) -> Result<Vec<u8>> {
+    bincode::serialize(&(table, generation)).map_err(|error| Error::Storage(error.to_string()))
+}
+
+async fn cleanup_generation(db: &elyra_storage::Db, table: &str, generation: u64) -> Result<()> {
+    let prefixes = [
+        catalog::data_prefix_generation(table, generation),
+        catalog::index_table_prefix_generation(table, generation),
+        catalog::indexnull_table_prefix_generation(table, generation),
+    ];
+    for prefix in prefixes {
+        loop {
+            let batch = db.scan_batch(prefix.clone(), None, 4096).await?;
+            if batch.is_empty() {
+                break;
+            }
+            db.commit(Vec::new(), batch.into_iter().map(|(key, _)| key).collect())
+                .await?;
+        }
+    }
+    db.commit(Vec::new(), vec![generation_gc_key(table, generation)])
+        .await
+}
+
+pub(crate) async fn resume_generation_cleanup(db: &elyra_storage::Db) -> Result<()> {
+    let mut cursor = None;
+    loop {
+        let markers = db
+            .scan_batch(GENERATION_GC_PREFIX.to_vec(), cursor.clone(), 256)
+            .await?;
+        if markers.is_empty() {
+            break;
+        }
+        let last = markers.len() < 256;
+        cursor = markers.last().map(|(key, _)| key.clone());
+        for (_, value) in markers {
+            let (table, generation): (String, u64) =
+                bincode::deserialize(&value).map_err(|error| Error::Storage(error.to_string()))?;
+            cleanup_generation(db, &table, generation).await?;
+        }
+        if last {
+            break;
+        }
+    }
+    Ok(())
+}
+
+async fn alter_add_primary_key_shadow(
+    db: &Session,
+    name: &ObjectName,
+    columns: &[Ident],
+) -> Result<QueryResult> {
+    let table = stored_table_ident(db, name)?;
+    db.begin()?;
+    let result = async {
+        let mut definition = catalog::load(db, &table).await?;
+        let old_generation = definition.storage_generation;
+        let new_generation = old_generation
+            .checked_add(1)
+            .ok_or_else(|| Error::Storage("table generation exhausted".into()))?;
+        let old_definition = definition.clone();
+
+        if definition.has_pk() {
+            return Err(Error::Query("multiple primary keys are not allowed".into()));
+        }
+        if columns.is_empty() {
+            return Err(Error::Query(
+                "ALTER TABLE ADD PRIMARY KEY requires at least one column".into(),
+            ));
+        }
+        let mut primary_columns = Vec::with_capacity(columns.len());
+        for column in columns {
+            let index = definition
+                .schema
+                .columns
+                .iter()
+                .position(|candidate| predicate::identifier_eq(&candidate.name, &column.value))
+                .ok_or_else(|| Error::Catalog(format!("unknown column: {column}")))?;
+            if primary_columns.contains(&index) {
+                return Err(Error::Query(format!(
+                    "duplicate column '{}' in primary key",
+                    column.value
+                )));
+            }
+            primary_columns.push(index);
+        }
+        definition.pk_cols = primary_columns;
+        for &column in &definition.pk_cols {
+            definition.schema.columns[column].nullable = false;
+        }
+        definition.storage_generation = new_generation;
+
+        // The table write sequence and catalog value form a compact validation
+        // token for the snapshot used to build the shadow generation.
+        db.lock_keys(&[wcount_key(&table), catalog_key(&table)]);
+
+        // Remove an unreachable generation left by an interrupted earlier
+        // attempt before reusing its generation number.
+        cleanup_generation(&db.raw_db(), &table, new_generation).await?;
+
+        let source_prefix = old_definition.data_prefix();
+        let target_prefix = definition.data_prefix();
+        let primary_collations = definition.pk_collations();
+        let batch_rows = rewrite_batch_rows();
+        let mut cursor = None;
+        let mut cancel = db.cancel_check();
+        let mut pacer = Pacer::new();
+        loop {
+            let batch = db
+                .scan_batch(source_prefix.clone(), cursor.clone(), batch_rows)
+                .await?;
+            if batch.is_empty() {
+                break;
+            }
+            let last = batch.len() < batch_rows;
+            cursor = batch.last().map(|(key, _)| key.clone());
+            let mut new_entries = Vec::new();
+            let mut auxiliary_entries = Vec::new();
+            for (_, encoded_row) in batch {
+                cancel.tick()?;
+                pacer.tick().await;
+                let row = rowdec::decode_row(&encoded_row)?;
+                if definition
+                    .pk_cols
+                    .iter()
+                    .any(|&column| row[column].is_null())
+                {
+                    return Err(Error::Query(
+                        "primary key columns cannot contain NULL".into(),
+                    ));
+                }
+                let clustered =
+                    keyenc::encode_columns_coll(&row, &definition.pk_cols, &primary_collations)?;
+                let mut data_key = target_prefix.clone();
+                data_key.extend_from_slice(&clustered);
+                let (non_unique, unique) =
+                    index::partition_entries_for_row(&definition, &row, &data_key)?;
+                new_entries.push((data_key, encoded_row));
+                new_entries.extend(unique);
+                auxiliary_entries.extend(non_unique);
+            }
+            db.raw_db()
+                .commit_insert(new_entries, auxiliary_entries, Vec::new())
+                .await?;
+            if last {
+                break;
+            }
+        }
+
+        let marker = generation_gc_key(&table, old_generation);
+        db.commit_write(
+            vec![
+                (catalog_key(&table), definition.encode()?),
+                (
+                    catalog::generation_key(&table),
+                    new_generation.to_le_bytes().to_vec(),
+                ),
+                (marker, generation_gc_value(&table, old_generation)?),
+                bump_wcount(db, &table).await?,
+            ],
+            vec![rowid_key(&table)],
+        )
+        .await?;
+        db.commit().await?;
+        Ok((old_generation, new_generation))
+    }
+    .await;
+
+    match result {
+        Ok((old_generation, _new_generation)) => {
+            let cleanup_db = db.raw_db().clone();
+            let cleanup_table = table.clone();
+            tokio::spawn(async move {
+                if let Err(error) =
+                    cleanup_generation(&cleanup_db, &cleanup_table, old_generation).await
+                {
+                    tracing::warn!(%error, table = %cleanup_table, "generation cleanup failed");
+                }
+            });
+            Ok(QueryResult::Affected(0))
+        }
+        Err(error) => {
+            db.rollback();
+            // A failed build never made the target generation reachable.
+            if let Ok(definition) = catalog::load(db, &table).await {
+                if let Some(new_generation) = definition.storage_generation.checked_add(1) {
+                    let _ = cleanup_generation(&db.raw_db(), &table, new_generation).await;
+                }
             }
             Err(error)
         }
@@ -3175,13 +3393,13 @@ async fn alter_add_primary_key(db: &Session, def: &mut TableDef, columns: &[Iden
     let mut deletes = Vec::new();
     let mut clustered_keys = std::collections::HashSet::new();
     let pk_collations = def.pk_collations();
-    let clustered_prefix = data_prefix(&def.name);
+    let clustered_prefix = def.data_prefix();
     let rewrite_budget = db.transaction_write_budget_remaining();
     let mut rewrite_bytes = puts
         .iter()
         .map(|(key, value)| key.len() + value.len())
         .sum();
-    let prefix = data_prefix(&old_def.name);
+    let prefix = old_def.data_prefix();
     let mut cursor = None;
     loop {
         let batch = db.scan_batch(prefix.clone(), cursor.clone(), 4096).await?;
@@ -3708,7 +3926,7 @@ async fn alter_add_column(
                 .map(|&position| row[position].clone())
                 .collect::<Vec<_>>();
             data_key(
-                &def.name,
+                &def.storage_name(),
                 &keyenc::encode_key_coll(&primary_values, &def.pk_collations())?,
             )
         } else {
@@ -3806,7 +4024,7 @@ async fn alter_drop_column(db: &Session, def: &mut TableDef, name: &str) -> Resu
     }
 
     // Rewrite rows without the dropped position.
-    let prefix = data_prefix(&def.name);
+    let prefix = def.data_prefix();
     let mut cursor: Option<Vec<u8>> = None;
     let mut puts = Vec::new();
     loop {
@@ -3863,6 +4081,8 @@ async fn alter_rename_table(db: &Session, def: &mut TableDef, new: &str) -> Resu
         return Err(Error::Catalog(format!("table already exists: {new}")));
     }
     let old = def.name.clone();
+    let old_generation = def.storage_generation;
+    let old_prefix = catalog::data_prefix_generation(&old, old_generation);
     def.name = new.to_string();
     for foreign_key in &mut def.foreign_keys {
         if foreign_key.ref_table.eq_ignore_ascii_case(&old) {
@@ -3874,7 +4094,6 @@ async fn alter_rename_table(db: &Session, def: &mut TableDef, new: &str) -> Resu
     let mut deletes: Vec<Vec<u8>> = Vec::new();
 
     // Re-key all data rows and rebuild their index entries under the new name.
-    let old_prefix = data_prefix(&old);
     let mut cursor: Option<Vec<u8>> = None;
     loop {
         let chunk = db
@@ -3887,7 +4106,8 @@ async fn alter_rename_table(db: &Session, def: &mut TableDef, new: &str) -> Resu
         cursor = chunk.last().map(|(k, _)| k.clone());
         for (old_key, v) in chunk {
             let clustered = &old_key[old_prefix.len()..];
-            let new_key = data_key(new, clustered);
+            let mut new_key = def.data_prefix();
+            new_key.extend_from_slice(clustered);
             let row: Vec<Value> = rowdec::decode_row(&v)?;
             deletes.push(old_key);
             puts.push((new_key.clone(), v));
@@ -3902,8 +4122,8 @@ async fn alter_rename_table(db: &Session, def: &mut TableDef, new: &str) -> Resu
     // the NULL-keyed entries under `indexnull::` (rebuilt under the new name by
     // `entries_for_row` above).
     for old_index_prefix in [
-        format!("index::{old}::").into_bytes(),
-        format!("indexnull::{old}::").into_bytes(),
+        catalog::index_table_prefix_generation(&old, old_generation),
+        catalog::indexnull_table_prefix_generation(&old, old_generation),
     ] {
         let mut cursor: Option<Vec<u8>> = None;
         loop {
@@ -3926,7 +4146,14 @@ async fn alter_rename_table(db: &Session, def: &mut TableDef, new: &str) -> Resu
 
     // Move catalog + table-scoped metadata.
     deletes.push(catalog_key(&old));
+    deletes.push(catalog::generation_key(&old));
     puts.push((catalog_key(new), def.encode()?));
+    if old_generation != 0 {
+        puts.push((
+            catalog::generation_key(new),
+            old_generation.to_le_bytes().to_vec(),
+        ));
+    }
     // MySQL carries referencing foreign keys across a table rename. Update
     // every child catalog in the same write so later DML never probes the old
     // table name.
@@ -4012,7 +4239,7 @@ pub async fn create_fulltext_index(
 
     // Persist the catalog and backfill index entries for existing rows.
     let mut puts: Vec<(Vec<u8>, Vec<u8>)> = vec![(catalog_key(table), def.encode()?)];
-    let prefix = data_prefix(table);
+    let prefix = def.data_prefix();
     let mut cursor: Option<Vec<u8>> = None;
     loop {
         let chunk = db.scan_batch(prefix.clone(), cursor.clone(), 4096).await?;
@@ -4101,7 +4328,7 @@ pub async fn create_index(db: &Session, ci: CreateIndex) -> Result<QueryResult> 
 
     // Persist the new catalog and backfill index entries for existing rows.
     let mut puts: Vec<(Vec<u8>, Vec<u8>)> = vec![(catalog_key(&table), def.encode()?)];
-    let prefix = data_prefix(&table);
+    let prefix = def.data_prefix();
     let mut cursor: Option<Vec<u8>> = None;
     loop {
         let chunk = db.scan_batch(prefix.clone(), cursor.clone(), 4096).await?;
@@ -4182,11 +4409,12 @@ async fn collect_index_entry_keys(
     table: &str,
     index_names: &[&str],
 ) -> Result<Vec<Vec<u8>>> {
+    let storage_table = catalog::load(db, table).await?.storage_name();
     let mut keys = Vec::new();
     for index_name in index_names {
         for prefix in [
-            index::index_scan_prefix(table, index_name),
-            index::indexnull_scan_prefix(table, index_name),
+            index::index_scan_prefix(&storage_table, index_name),
+            index::indexnull_scan_prefix(&storage_table, index_name),
         ] {
             let mut cursor = None;
             loop {
@@ -4320,7 +4548,7 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
     let on_dup = !dup_sets.is_empty();
     let has_pk = def.has_pk();
     let pk_colls = def.pk_collations();
-    let clustered_prefix = data_prefix(&name);
+    let clustered_prefix = def.data_prefix();
 
     // Load rowid counter once for tables without a PK.
     let mut next_rowid = if has_pk {
@@ -5166,13 +5394,18 @@ fn fk_probe_key(parent: &TableDef, ref_cols: &[String], vals: &[Value]) -> Resul
     };
     if !parent.pk_cols.is_empty() && name_match(&parent.pk_cols) {
         return Ok(data_key(
-            &parent.name,
+            &parent.storage_name(),
             &keyenc::encode_key_coll(vals, &parent.pk_collations())?,
         ));
     }
     for idx in &parent.indexes {
         if idx.unique && !idx.vector && name_match(&idx.cols) {
-            return index::unique_probe_key(&parent.name, &idx.name, vals, &idx.col_collations);
+            return index::unique_probe_key(
+                &parent.storage_name(),
+                &idx.name,
+                vals,
+                &idx.col_collations,
+            );
         }
     }
     Err(Error::Query(format!(
@@ -6102,7 +6335,7 @@ async fn select_inner(
             if order_is_pk_asc_prefix(&def, &resolved) && !selective_filter(&def, filter.as_ref())?
             {
                 let need = offset.saturating_add(lim);
-                let prefix = data_prefix(&def.name);
+                let prefix = def.data_prefix();
                 let mut rows: Vec<Vec<Value>> = Vec::with_capacity(need.min(4096));
                 if !db.in_txn() {
                     // Autocommit: iterate clustered order in one read transaction,
@@ -6174,7 +6407,7 @@ async fn select_inner(
                 && !selective_filter(&def, filter.as_ref())?
             {
                 let need = offset.saturating_add(lim);
-                let prefix = data_prefix(&def.name);
+                let prefix = def.data_prefix();
                 let sch = def.schema.clone();
                 let f = filter.clone();
                 // With no residual filter, skip the first `offset` rows without
@@ -6232,7 +6465,7 @@ async fn select_inner(
             if !db.in_txn() && !selective_filter(&def, filter.as_ref())? {
                 if let Some(plan) = secondary_order_plan(&def, &resolved) {
                     let need = offset.saturating_add(lim);
-                    let iprefix = index::index_scan_prefix(&def.name, &plan.index);
+                    let iprefix = index::index_scan_prefix(&def.storage_name(), &plan.index);
                     let has_filter = filter.is_some();
                     let walk_budget = if has_filter {
                         ordered_scan_budget(need)
@@ -6271,7 +6504,7 @@ async fn select_inner(
                     // the NULL prefix comes first (NULLs sort first); for DESC the
                     // value prefix comes first (NULLs last). Both give the exact
                     // MySQL ordering including a PK tiebreaker.
-                    let nprefix = index::indexnull_scan_prefix(&def.name, &plan.index);
+                    let nprefix = index::indexnull_scan_prefix(&def.storage_name(), &plan.index);
                     let run_two = |skip: usize, want: usize| {
                         let sch = def.schema.clone();
                         let f = filter.clone();
@@ -6421,7 +6654,7 @@ async fn select_inner(
             // which merges the MVCC snapshot with the transaction's own overlay,
             // so this is correct in autocommit AND inside a transaction (the old
             // code fell back to a full in-memory sort while in a transaction).
-            let prefix = data_prefix(&def.name);
+            let prefix = def.data_prefix();
             let mut cursor: Option<Vec<u8>> = None;
             let asc: Vec<bool> = resolved.iter().map(|(_, a)| *a).collect();
             let colls: Vec<elyra_core::Collation> = resolved
@@ -6771,7 +7004,7 @@ async fn streaming_nlj_select(
         }
     };
 
-    let prefix = data_prefix(&ddef.name);
+    let prefix = ddef.data_prefix();
     let mut cursor: Option<Vec<u8>> = None;
     let mut out: Vec<Vec<Value>> = Vec::new();
     'outer: loop {
@@ -7269,7 +7502,7 @@ async fn build_join_chain(
                     .collect()
             })
             .filter(|cols| cols.len() * SELECTIVE_COPY_WEIGHT < plen);
-        let prefix = data_prefix(&p.def.name);
+        let prefix = p.def.data_prefix();
         let mut cursor: Option<Vec<u8>> = None;
         let mut decoded: Vec<Value> = Vec::with_capacity(plen);
 
@@ -7707,7 +7940,7 @@ async fn streaming_join_aggregate(
     // the spilling aggregator -- so a large join + GROUP BY is bounded by the
     // group state (which spills), not the join output size.
     let mut sa = SpillAgg::new(&plan);
-    let prefix = data_prefix(&ddef.name);
+    let prefix = ddef.data_prefix();
     let mut cursor: Option<Vec<u8>> = None;
     let selective = chain_is_selective(&steps);
     let mut bufs: Vec<ChainBuf> = (0..steps.len()).map(|_| ChainBuf::default()).collect();
@@ -7877,7 +8110,7 @@ async fn streaming_join_order(
         limit,
         crate::sort::sort_max_rows(),
     );
-    let prefix = data_prefix(&ddef.name);
+    let prefix = ddef.data_prefix();
     let mut cursor: Option<Vec<u8>> = None;
     let mut keybuf: Vec<Value> = Vec::with_capacity(resolved.len());
     let selective = chain_is_selective(&steps);
@@ -8964,7 +9197,7 @@ async fn lookup_rows_by_eq(
     };
     if def.pk_cols == [col] {
         let key = data_key(
-            &def.name,
+            &def.storage_name(),
             &keyenc::encode_coll(value, def.collation_of(col))?,
         );
         return Ok(match db.get(key).await? {
@@ -8973,7 +9206,8 @@ async fn lookup_rows_by_eq(
         });
     }
     if let Some(idx) = index::index_on(def, col) {
-        let dks = index::lookup_eq(db, &def.name, idx, std::slice::from_ref(value)).await?;
+        let dks =
+            index::lookup_eq(db, &def.storage_name(), idx, std::slice::from_ref(value)).await?;
         let blobs = db.multi_get(dks).await?;
         let mut out = Vec::new();
         for b in blobs.into_iter().flatten() {
@@ -8999,7 +9233,7 @@ async fn lookup_keys_by_eq(
 ) -> Result<Vec<Vec<u8>>> {
     if def.pk_cols == [col] {
         let key = data_key(
-            &def.name,
+            &def.storage_name(),
             &keyenc::encode_coll(value, def.collation_of(col))?,
         );
         // The primary key identifies at most one row, but it still has to exist.
@@ -9012,7 +9246,7 @@ async fn lookup_keys_by_eq(
     let Some(idx) = index::index_on(def, col) else {
         return Ok(Vec::new());
     };
-    index::lookup_eq(db, &def.name, idx, std::slice::from_ref(value)).await
+    index::lookup_eq(db, &def.storage_name(), idx, std::slice::from_ref(value)).await
 }
 
 /// If `on` is `A = B` with one operand referencing only the driving side and
@@ -9421,7 +9655,7 @@ async fn table_rows(db: &Session, def: &TableDef) -> Result<u64> {
             return Ok(rows);
         }
     }
-    let rows = db.raw_db().count_prefix(data_prefix(&def.name)).await?;
+    let rows = db.raw_db().count_prefix(def.data_prefix()).await?;
     cache
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -9449,11 +9683,11 @@ async fn clustered_range(
     def: &TableDef,
     rq: &RangeQuery,
 ) -> Result<Vec<(Vec<u8>, Vec<Value>)>> {
-    let prefix = data_prefix(&def.name);
+    let prefix = def.data_prefix();
     let coll = def.pk_collations().first().copied().unwrap_or_default();
     let mut start = match &rq.lo {
         Some((v, incl)) => {
-            let mut b = data_key(&def.name, &keyenc::encode_coll(v, coll)?);
+            let mut b = data_key(&def.storage_name(), &keyenc::encode_coll(v, coll)?);
             if !*incl {
                 b.push(0x00); // strictly after the row with pk == v
             }
@@ -9463,7 +9697,7 @@ async fn clustered_range(
     };
     let end = match &rq.hi {
         Some((v, incl)) => {
-            let mut b = data_key(&def.name, &keyenc::encode_coll(v, coll)?);
+            let mut b = data_key(&def.storage_name(), &keyenc::encode_coll(v, coll)?);
             if *incl {
                 b.push(0x00); // include the row with pk == v
             }
@@ -9516,7 +9750,7 @@ async fn index_range(
 ) -> Result<Option<Vec<(Vec<u8>, Vec<Value>)>>> {
     let lo = rq.lo.as_ref().map(|(v, i)| (v, *i));
     let hi = rq.hi.as_ref().map(|(v, i)| (v, *i));
-    let data_keys = index::lookup_range(db, &def.name, idx, lo, hi).await?;
+    let data_keys = index::lookup_range(db, &def.storage_name(), idx, lo, hi).await?;
     if let Some(b) = budget {
         if data_keys.len() > b {
             return Ok(None);
@@ -9550,7 +9784,8 @@ async fn composite_index_range(
         .as_ref()
         .map(|(value, inclusive)| (value, *inclusive));
     let data_keys =
-        index::lookup_prefix_range(db, &def.name, query.index, &query.prefix, lo, hi).await?;
+        index::lookup_prefix_range(db, &def.storage_name(), query.index, &query.prefix, lo, hi)
+            .await?;
     if budget.is_some_and(|budget| data_keys.len() > budget) {
         return Ok(None);
     }
@@ -12058,7 +12293,7 @@ async fn collect_null_rows(
     want: usize,
     budget: usize,
 ) -> Result<(Vec<Vec<Value>>, bool)> {
-    let prefix = data_prefix(&def.name);
+    let prefix = def.data_prefix();
     let sch = def.schema.clone();
     let f = filter.clone();
     let (rows, _examined, budget_hit) = db
@@ -13039,7 +13274,9 @@ async fn collect_matches_inner(
                             continue;
                         }
                         let stem = crate::ft::stem(&cleaned);
-                        for dk in index::fulltext_lookup(db, &def.name, &idx.name, &stem).await? {
+                        for dk in index::fulltext_lookup(db, &def.storage_name(), &idx.name, &stem)
+                            .await?
+                        {
                             if seen.insert(dk.clone()) {
                                 cand.push(dk);
                             }
@@ -13069,7 +13306,7 @@ async fn collect_matches_inner(
     if def.has_pk() {
         if let Some(vals) = key_eq_values(def, filter, &def.pk_cols)? {
             let key = data_key(
-                &def.name,
+                &def.storage_name(),
                 &keyenc::encode_key_coll(&vals, &def.pk_collations())?,
             );
             if let Some(bytes) = db.get(key.clone()).await? {
@@ -13088,7 +13325,7 @@ async fn collect_matches_inner(
             continue;
         }
         if let Some(vals) = key_eq_values(def, filter, &idx.cols)? {
-            let data_keys = index::lookup_eq(db, &def.name, idx, &vals).await?;
+            let data_keys = index::lookup_eq(db, &def.storage_name(), idx, &vals).await?;
             let blobs = db.multi_get(data_keys.clone()).await?;
             for (data_key, blob) in data_keys.into_iter().zip(blobs) {
                 if let Some(bytes) = blob {
@@ -13212,7 +13449,7 @@ async fn collect_matches_inner(
         }
     }
 
-    let prefix = data_prefix(&def.name);
+    let prefix = def.data_prefix();
     let mut cursor: Option<Vec<u8>> = None;
     loop {
         let chunk = db.scan_batch(prefix.clone(), cursor.clone(), 4096).await?;
@@ -13471,7 +13708,7 @@ pub async fn update(
         let new_key = if def.has_pk() {
             let pk_vals: Vec<Value> = def.pk_cols.iter().map(|&i| new_row[i].clone()).collect();
             data_key(
-                &name,
+                &def.storage_name(),
                 &keyenc::encode_key_coll(&pk_vals, &def.pk_collations())?,
             )
         } else {
@@ -13909,7 +14146,7 @@ async fn lookup_child_rows(
         .iter()
         .find(|ix| !ix.vector && ix.cols == cols)
     {
-        let data_keys = index::lookup_eq(db, &child.name, idx, vals).await?;
+        let data_keys = index::lookup_eq(db, &child.storage_name(), idx, vals).await?;
         let blobs = db.multi_get(data_keys.clone()).await?;
         let mut out = Vec::new();
         for (k, b) in data_keys.into_iter().zip(blobs) {
@@ -14136,7 +14373,7 @@ async fn multi_update(
             let base = extract_base_row(&joined, &info.col_idx);
             let pk_vals: Vec<Value> = info.def.pk_cols.iter().map(|&i| base[i].clone()).collect();
             let pk_key = data_key(
-                &info.name,
+                &info.def.storage_name(),
                 &keyenc::encode_key_coll(&pk_vals, &info.def.pk_collations())?,
             );
             let entry = updated.entry(qual.clone()).or_default();
@@ -14181,7 +14418,7 @@ async fn multi_update(
                 .map(|&i| new_base[i].clone())
                 .collect();
             let new_key = data_key(
-                &info.name,
+                &info.def.storage_name(),
                 &keyenc::encode_key_coll(&new_pk, &info.def.pk_collations())?,
             );
             deletes.extend(index::entry_keys_for_row(&info.def, old_base, pk_key)?);
@@ -14266,7 +14503,7 @@ async fn multi_delete(
             let base = extract_base_row(&joined, &info.col_idx);
             let pk_vals: Vec<Value> = info.def.pk_cols.iter().map(|&i| base[i].clone()).collect();
             let pk_key = data_key(
-                &info.name,
+                &info.def.storage_name(),
                 &keyenc::encode_key_coll(&pk_vals, &info.def.pk_collations())?,
             );
             per_table.entry(q.clone()).or_default().insert(pk_key, base);
@@ -18834,6 +19071,7 @@ async fn create_temp_table(db: &Session, base: &str, schema: &Schema) -> Result<
             col_meta: Vec::new(),
             checks: Vec::new(),
             foreign_keys: Vec::new(),
+            storage_generation: 0,
         }
         .encode()?;
         let owner_number = TEMP_OWNER_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -20462,13 +20700,13 @@ async fn hybrid_select(
         .find(|i| i.fulltext && i.single_col() == Some(text_ci));
     if let Some(idx) = ft_idx {
         for term in &terms {
-            for dk in index::fulltext_lookup(db, &def.name, &idx.name, term).await? {
+            for dk in index::fulltext_lookup(db, &def.storage_name(), &idx.name, term).await? {
                 *ft_score.entry(dk).or_default() += 1;
             }
         }
     } else {
         // No full-text index: scan and score by distinct query-term presence.
-        let prefix = data_prefix(&def.name);
+        let prefix = def.data_prefix();
         let mut cursor: Option<Vec<u8>> = None;
         loop {
             let batch = db.scan_batch(prefix.clone(), cursor.clone(), 4096).await?;
@@ -20667,7 +20905,7 @@ async fn olap_aggregate(
     // keyspace without decoding any rows, in parallel over clustered ranges,
     // and seed the result directly instead of feeding N rows.
     if filter.is_none() && plan.is_count_star_only() && !db.in_txn() {
-        let prefix = data_prefix(&def.name);
+        let prefix = def.data_prefix();
         let raw = db.raw_db();
         let n = match pk_split_ranges(&raw, def, &prefix, agg_workers()).await? {
             Some(ranges) => {
@@ -20921,7 +21159,7 @@ async fn scan_columnar_scalar(
     specs: &[(elyra_olap::AggFunc, Option<usize>, bool)],
 ) -> Result<Vec<Value>> {
     let ncols = def.schema.columns.len();
-    let prefix = data_prefix(&def.name);
+    let prefix = def.data_prefix();
     let raw = db.raw_db();
     let workers = agg_workers();
     if workers > 1 {
@@ -21265,7 +21503,7 @@ async fn scan_columnar_group(
     explicit_ranges: Option<Vec<(Vec<u8>, Vec<u8>)>>,
 ) -> Result<Option<Vec<(Vec<Value>, Vec<Value>)>>> {
     let ncols = def.schema.columns.len();
-    let prefix = data_prefix(&def.name);
+    let prefix = def.data_prefix();
     let raw = db.raw_db();
     let workers = agg_workers();
     // Work units: explicit (zone-map surviving) ranges if given, otherwise the
@@ -21333,7 +21571,7 @@ async fn get_or_build_zonemap(
         return Ok(Some(zm));
     }
     let raw = db.raw_db();
-    let prefix = data_prefix(&def.name);
+    let prefix = def.data_prefix();
     let upper = prefix_successor(&prefix);
     let mut check = db.cancel_check();
     let b = raw
@@ -21406,7 +21644,7 @@ async fn build_cached_table(
     e0: u64,
 ) -> Result<Option<colcache::CachedTable>> {
     let budget = colcache::budget_bytes();
-    let prefix = data_prefix(&def.name);
+    let prefix = def.data_prefix();
     let raw = db.raw_db();
     struct Acc {
         blobs: Vec<Vec<u8>>,
@@ -21525,7 +21763,7 @@ async fn scan_aggregate_fast(
     filter: Option<Expr>,
     plan: &AggPlan,
 ) -> Result<GroupAggregator> {
-    let prefix = data_prefix(&def.name);
+    let prefix = def.data_prefix();
     let schema = def.schema.clone();
     let needed = agg_needed_mask(&schema, filter.as_ref(), plan);
     let ncols = schema.columns.len();
@@ -21870,7 +22108,7 @@ async fn partitioned_aggregate(
     let extend = !plan.arg_exprs().is_empty();
     let mut sa = SpillAgg::new(plan);
     let mut fedbuf: Vec<Value> = Vec::new();
-    let prefix = data_prefix(&def.name);
+    let prefix = def.data_prefix();
     // In autocommit, pin one snapshot so this multi-batch scan reads a single
     // consistent view (concurrent commits are all-or-nothing across the whole
     // aggregate). In a transaction the session snapshot+overlay is already
@@ -21974,7 +22212,7 @@ async fn index_count_eq(db: &Session, def: &TableDef, filter: &Expr) -> Result<O
     if def.has_pk() && same_set(&def.pk_cols) {
         if let Some(vals) = key_eq_values(def, Some(filter), &def.pk_cols)? {
             let key = data_key(
-                &def.name,
+                &def.storage_name(),
                 &keyenc::encode_key_coll(&vals, &def.pk_collations())?,
             );
             return Ok(Some(u64::from(db.get(key).await?.is_some())));
@@ -21986,7 +22224,7 @@ async fn index_count_eq(db: &Session, def: &TableDef, filter: &Expr) -> Result<O
         }
         if same_set(&idx.cols) {
             if let Some(vals) = key_eq_values(def, Some(filter), &idx.cols)? {
-                let keys = index::lookup_eq(db, &def.name, idx, &vals).await?;
+                let keys = index::lookup_eq(db, &def.storage_name(), idx, &vals).await?;
                 return Ok(Some(keys.len() as u64));
             }
         }
@@ -22035,13 +22273,13 @@ async fn index_count_composite_range(
         .map(|(value, inclusive)| (value, *inclusive));
     if db.in_txn() {
         return Ok(Some(
-            index::lookup_prefix_range(db, &def.name, query.index, &query.prefix, lo, hi)
+            index::lookup_prefix_range(db, &def.storage_name(), query.index, &query.prefix, lo, hi)
                 .await?
                 .len() as u64,
         ));
     }
     let Some((start, end)) =
-        index::prefix_range_scan_bounds(&def.name, query.index, &query.prefix, lo, hi)?
+        index::prefix_range_scan_bounds(&def.storage_name(), query.index, &query.prefix, lo, hi)?
     else {
         return Ok(Some(0));
     };
@@ -22272,7 +22510,7 @@ async fn parallel_aggregate(
             .map(|n| n.get())
             .unwrap_or(4)
     };
-    let prefix = data_prefix(&def.name);
+    let prefix = def.data_prefix();
     let schema = def.schema.clone();
     // Only decode the columns this aggregation actually reads (filter + group +
     // aggregate arguments); everything else is skipped in place. `None` = a
@@ -22555,7 +22793,7 @@ pub async fn analyze_table(db: &Session, name: &str) -> Result<QueryResult> {
     let mut seen: Vec<u64> = vec![0; ncols];
     let mut rng: u64 = 0x9E37_79B9_7F4A_7C15;
 
-    let prefix = data_prefix(name);
+    let prefix = def.data_prefix();
     let mut cursor: Option<Vec<u8>> = None;
     let mut rows = 0u64;
     loop {
@@ -22686,6 +22924,8 @@ pub async fn drop_table(db: &Session, name: &str, if_exists: bool) -> Result<Que
 /// Collect every key owned by a table. Keeping this shared with temporary CTE
 /// cleanup ensures ordinary DROP also clears any internal ownership marker.
 async fn table_delete_keys(db: &Session, name: &str) -> Result<Vec<Vec<u8>>> {
+    let definition = catalog::load(db, name).await?;
+    let storage_name = definition.storage_name();
     // Collect the table's data and index keys in batches.
     let mut deletes = vec![
         catalog_key(name),
@@ -22694,11 +22934,12 @@ async fn table_delete_keys(db: &Session, name: &str) -> Result<Vec<Vec<u8>>> {
         temp_owner_key(name),
         catalog::colwidth_key(name),
         catalog::coldecl_key(name),
+        catalog::generation_key(name),
     ];
     for prefix in [
-        data_prefix(name),
-        index_table_prefix(name),
-        indexnull_table_prefix(name),
+        definition.data_prefix(),
+        index_table_prefix(&storage_name),
+        indexnull_table_prefix(&storage_name),
     ] {
         let mut cursor: Option<Vec<u8>> = None;
         loop {
@@ -22978,6 +23219,47 @@ fn parse_vector(s: &str, dim: u32) -> Result<Vec<f32>> {
         )));
     }
     Ok(vals)
+}
+
+#[cfg(test)]
+mod generation_cleanup_tests {
+    use super::{generation_gc_key, generation_gc_value, resume_generation_cleanup};
+    use crate::catalog;
+    use elyra_storage::Db;
+
+    #[tokio::test]
+    async fn startup_cleanup_reclaims_every_stale_generation_keyspace() {
+        let db = Db::in_memory().unwrap();
+        let table = "table::with::separators";
+        let generation = 7;
+        let stale_keys = [
+            catalog::data_prefix_generation(table, generation),
+            catalog::index_table_prefix_generation(table, generation),
+            catalog::indexnull_table_prefix_generation(table, generation),
+        ]
+        .map(|mut prefix| {
+            prefix.extend_from_slice(b"entry");
+            prefix
+        });
+        let marker = generation_gc_key(table, generation);
+        let mut puts = stale_keys
+            .iter()
+            .cloned()
+            .map(|key| (key, b"value".to_vec()))
+            .collect::<Vec<_>>();
+        puts.push((
+            marker.clone(),
+            generation_gc_value(table, generation).unwrap(),
+        ));
+        db.commit(puts, Vec::new()).await.unwrap();
+
+        resume_generation_cleanup(&db).await.unwrap();
+
+        for key in stale_keys {
+            assert_eq!(db.get(key).await.unwrap(), None);
+        }
+        assert_eq!(db.get(marker).await.unwrap(), None);
+    }
 }
 
 #[cfg(test)]
@@ -24213,6 +24495,7 @@ mod plan_tests {
             col_meta: Vec::new(),
             checks: Vec::new(),
             foreign_keys: Vec::new(),
+            storage_generation: 0,
         }
     }
 

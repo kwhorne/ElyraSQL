@@ -88,8 +88,8 @@ pub async fn migrate(db: &Session) -> Result<()> {
         // from the previous folding behind. Deleted in batches for the same reason
         // the rows are: a large table must not be held in memory.
         for p in [
-            catalog::index_table_prefix(table),
-            catalog::indexnull_table_prefix(table),
+            catalog::index_table_prefix_generation(table, def.storage_generation),
+            catalog::indexnull_table_prefix_generation(table, def.storage_generation),
         ] {
             let mut cur: Option<Vec<u8>> = None;
             loop {
@@ -109,7 +109,7 @@ pub async fn migrate(db: &Session) -> Result<()> {
             }
         }
 
-        let prefix = catalog::data_prefix(table);
+        let prefix = def.data_prefix();
         let mut puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         let mut dels: Vec<Vec<u8>> = Vec::new();
         let mut cursor: Option<Vec<u8>> = None;
@@ -144,7 +144,7 @@ pub async fn migrate(db: &Session) -> Result<()> {
                         .map(|&c| row.get(c).cloned().unwrap_or(Value::Null))
                         .collect();
                     let encoded = crate::keyenc::encode_key_coll(&vals, &def.pk_collations())?;
-                    let newk = catalog::data_key(table, &encoded);
+                    let newk = def.data_key(&encoded);
                     if newk != k {
                         // Either another re-keyed row already claimed these bytes, or a
                         // row that needs no re-keying is already sitting on them (`ae`
