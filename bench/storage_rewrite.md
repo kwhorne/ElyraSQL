@@ -68,30 +68,69 @@ memory further, but its extra durable commits made the 500,000-row workload
 slightly slower than baseline. The 100,000-row default was the best measured
 latency/memory balance.
 
-Matched release builds, full durability, one secondary index, three samples per
-cell:
+Matched release builds, full durability, one secondary index, five samples per
+cell. The baseline is commit `c7cdebc`, immediately before the shadow-generation
+work, and the comparison uses fresh server processes on the same Apple Silicon
+host:
 
-| Rows | Baseline median | Shadow median | Change | Baseline RSS growth | Shadow RSS growth |
+| Rows | Baseline median / p95 | Shadow median / p95 | Change | Baseline RSS growth | Shadow RSS growth |
 |---:|---:|---:|---:|---:|---:|
-| 20,000 | 202.51 ms | 89.60 ms | 55.8% faster | 14.9 MiB | 5.8 MiB |
-| 100,000 | 1,157.44 ms | 456.04 ms | 60.6% faster | 45.1 MiB | 46.9 MiB |
-| 500,000 | 6,362.16 ms | 4,037.35 ms | 36.5% faster | 304.8 MiB | 201.6 MiB |
+| 20,000 | 203.01 / 206.95 ms | 100.57 / 126.58 ms | 50.5% faster | 6.6 MiB | 5.5 MiB |
+| 100,000 | 1,219.81 / 1,545.40 ms | 525.75 / 736.08 ms | 56.9% faster | 44.8 MiB | 24.3 MiB |
+| 500,000 | 6,287.03 / 6,809.33 ms | 3,930.00 / 6,086.40 ms | 37.5% faster | 269.7 MiB | 148.6 MiB |
 
 RSS is sampled from the server every 10 ms during the foreground ALTER and is
 reported as growth from immediately before that ALTER. It excludes deferred
-old-generation cleanup. Absolute median peaks were 99.1/73.7 MiB, 347.3/259.9
-MiB, and 1,226.0/708.9 MiB for baseline/shadow respectively, though allocator
-retention makes the per-operation growth the more useful comparison.
+old-generation cleanup. Absolute median peaks were 118.2/91.6 MiB,
+382.6/280.5 MiB, and 1,374.3/739.5 MiB for baseline/shadow respectively, though
+allocator retention makes the per-operation growth the more useful comparison.
 
 The improvement comes from replacing one full-table validated mutation set
 with bounded generation-build commits and a small validated cutover. The cost
 is temporary disk space for both generations and extra total I/O while the old
 generation is reclaimed.
 
-## MySQL comparison
+## Native MySQL comparison
 
-The prior native MySQL 8.0.33 measurement for the same 20,000-row, one-index
-operation was 45.34 ms. ElyraSQL improved from 202.51 ms (4.47x MySQL) to 89.60
-ms (1.98x MySQL). A local MySQL 8.4 Docker run remains excluded because the
-available image was amd64-emulated on an arm64 host; its 383-802 ms results
-measured emulation overhead rather than native engine performance.
+The same five-sample workload was also run against native MySQL 8.0.33 on the
+same host. This is an engine comparison, not a claim of identical DDL semantics
+or durability implementation.
+
+| Rows | MySQL median / p95 | ElyraSQL baseline / MySQL | ElyraSQL shadow / MySQL |
+|---:|---:|---:|---:|
+| 20,000 | 40.05 / 47.58 ms | 5.07x | 2.51x |
+| 100,000 | 127.17 / 135.26 ms | 9.59x | 4.13x |
+| 500,000 | 563.86 / 699.20 ms | 11.15x | 6.97x |
+
+The shadow rewrite closes roughly half the 20,000- and 100,000-row latency gap,
+but MySQL remains substantially faster, especially as the table grows.
+
+## Crash and sustained-load campaign
+
+`storage_rewrite_stress.py` drives valid and invalid rewrites concurrently with
+indexed reads, account transfers, and an atomic commit oracle. Its aggressive
+mode adds randomized `SIGKILL`, `SIGSTOP` followed by `SIGKILL`, and repeated
+kills during startup recovery. The five-minute campaign used:
+
+```sh
+python3 bench/storage_rewrite_stress.py \
+  --data /tmp/elyra-shadow-chaos.edb \
+  --log /tmp/elyra-shadow-chaos.log \
+  --duration 300 --crash-min-ms 50 --crash-max-ms 300 \
+  --crash-long-probability 0.15 --crash-long-max-ms 5000 \
+  --startup-crash-probability 0.5 --max-startup-crashes 2 \
+  --stop-before-kill-probability 0.25 --restart-attempts 3
+```
+
+It completed 327 forced crashes, including 237 additional recovery-time kills
+and 90 stop-then-kill cycles. All 327 successful restarts passed the durable
+invariants. Concurrent work included 1,272,209 indexed reads, 28,610 transfers,
+7,184 atomic epochs, and 48 completed shadow rewrites. Peak RSS was 253.9 MiB
+and the database peaked at 289.6 MiB.
+
+An earlier run exposed one transient redb 2.6.3 startup panic after repeatedly
+killing recovery (`assertion failed: !self.needs_recovery`). The preserved file
+opened successfully on the next launch and no persistent corruption was found.
+The retry-capable campaign records such startup failures rather than hiding
+them. Torn-sector, reordered-write, and individual I/O-failure testing still
+requires a lower-level fault-injection interface that redb does not expose.

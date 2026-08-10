@@ -34,6 +34,7 @@ class Campaign:
         self.errors = []
         self.samples = []
         self.started_at = None
+        self.crash_lock = threading.Lock()
 
     def record(self, name, started):
         elapsed_ms = (time.perf_counter() - started) * 1000
@@ -61,7 +62,7 @@ class Campaign:
             write_timeout=30,
         )
 
-    def start_server(self):
+    def spawn_server(self):
         with self.server_lock:
             log = open(self.args.log, "ab", buffering=0)
             self.server = subprocess.Popen(
@@ -77,28 +78,67 @@ class Campaign:
                 stderr=subprocess.STDOUT,
             )
             self.server_generation += 1
-        for _ in range(100):
-            if self.server.poll() is not None:
-                raise RuntimeError(f"server exited with {self.server.returncode}")
-            try:
-                connection = self.connect()
-                connection.close()
-                return
-            except pymysql.MySQLError:
+
+    def start_server(self):
+        last_error = None
+        for attempt in range(self.args.restart_attempts):
+            self.spawn_server()
+            for _ in range(100):
+                if self.server.poll() is not None:
+                    last_error = RuntimeError(f"server exited with {self.server.returncode}")
+                    self.server.wait(timeout=10)
+                    self.expected_error("startup_open_failures")
+                    break
+                try:
+                    connection = self.connect()
+                    connection.close()
+                    return
+                except pymysql.MySQLError:
+                    time.sleep(0.05)
+            else:
+                last_error = RuntimeError("server did not accept connections")
+                with self.server_lock:
+                    process = self.server
+                if process.poll() is None:
+                    process.kill()
+                process.wait(timeout=10)
+                self.expected_error("startup_open_failures")
+            if attempt + 1 < self.args.restart_attempts:
                 time.sleep(0.05)
-        raise RuntimeError("server did not accept connections")
+        raise last_error
 
     def crash_and_restart(self):
-        with self.server_lock:
-            process = self.server
-        if process and process.poll() is None:
-            os.kill(process.pid, signal.SIGKILL)
-            process.wait(timeout=10)
-            self.expected_error("forced_crashes")
-        time.sleep(0.15)
-        self.start_server()
-        self.verify_durable_invariants("post-crash")
-        self.expected_error("successful_restarts")
+        with self.crash_lock:
+            with self.server_lock:
+                process = self.server
+            if process and process.poll() is None:
+                if random.random() < self.args.stop_before_kill_probability:
+                    os.kill(process.pid, signal.SIGSTOP)
+                    time.sleep(random.uniform(0.001, 0.05))
+                    self.expected_error("stop_then_kill_crashes")
+                os.kill(process.pid, signal.SIGKILL)
+                process.wait(timeout=10)
+                self.expected_error("forced_crashes")
+            time.sleep(random.uniform(0.001, 0.05))
+
+            startup_crashes = 0
+            while (
+                startup_crashes < self.args.max_startup_crashes
+                and random.random() < self.args.startup_crash_probability
+            ):
+                self.spawn_server()
+                time.sleep(random.uniform(0.001, 0.05))
+                with self.server_lock:
+                    startup_process = self.server
+                if startup_process.poll() is None:
+                    os.kill(startup_process.pid, signal.SIGKILL)
+                startup_process.wait(timeout=10)
+                startup_crashes += 1
+                self.expected_error("startup_recovery_crashes")
+
+            self.start_server()
+            self.verify_durable_invariants("post-crash")
+            self.expected_error("successful_restarts")
 
     def stop_server(self):
         with self.server_lock:
@@ -117,6 +157,8 @@ class Campaign:
         cursor = connection.cursor()
         cursor.execute("DROP TABLE IF EXISTS stress_accounts")
         cursor.execute("DROP TABLE IF EXISTS stress_sentinel")
+        cursor.execute("DROP TABLE IF EXISTS stress_atomic")
+        cursor.execute("DROP TABLE IF EXISTS stress_atomic_meta")
         cursor.execute(
             "CREATE TABLE stress_accounts "
             "(id BIGINT PRIMARY KEY, balance BIGINT, INDEX balance_idx(balance))"
@@ -134,6 +176,13 @@ class Campaign:
                 for row in range(start, start + 1000)
             )
             cursor.execute(f"INSERT INTO stress_sentinel VALUES {values}")
+        cursor.execute(
+            "CREATE TABLE stress_atomic (epoch BIGINT PRIMARY KEY, checksum BIGINT)"
+        )
+        cursor.execute(
+            "CREATE TABLE stress_atomic_meta (id BIGINT PRIMARY KEY, committed_epoch BIGINT)"
+        )
+        cursor.execute("INSERT INTO stress_atomic_meta VALUES (1,0)")
         cursor.close()
         connection.close()
         self.verify_durable_invariants("setup")
@@ -141,6 +190,7 @@ class Campaign:
     def verify_durable_invariants(self, where):
         connection = self.connect()
         cursor = connection.cursor()
+        connection.begin()
         cursor.execute("SELECT COUNT(*), SUM(balance) FROM stress_accounts")
         count, balance = cursor.fetchone()
         if (count, balance) != (1000, 1_000_000):
@@ -164,6 +214,17 @@ class Campaign:
         scanned = cursor.fetchone()[0]
         if indexed != scanned:
             raise AssertionError(f"index mismatch for grp {group}: {indexed} != {scanned}")
+        cursor.execute("SELECT committed_epoch FROM stress_atomic_meta WHERE id=1")
+        epoch = cursor.fetchone()[0]
+        cursor.execute(
+            "SELECT COUNT(*), COALESCE(SUM(checksum),0), COALESCE(MAX(epoch),0) "
+            "FROM stress_atomic"
+        )
+        atomic = tuple(map(int, cursor.fetchone()))
+        expected_atomic = (epoch, epoch * (epoch + 1) // 2 * 31 + epoch * 7, epoch)
+        if atomic != expected_atomic:
+            raise AssertionError(f"atomicity oracle {atomic} != {expected_atomic}")
+        connection.commit()
         cursor.close()
         connection.close()
         self.expected_error(f"invariant_checks_{where}")
@@ -236,6 +297,32 @@ class Campaign:
             self.expected_error("online_index_cross_checks")
         cursor.close()
         self.record("indexed_reads", started)
+
+    def atomic_epoch(self, connection):
+        started = time.perf_counter()
+        cursor = connection.cursor()
+        try:
+            connection.begin()
+            cursor.execute("SELECT committed_epoch FROM stress_atomic_meta WHERE id=1")
+            epoch = cursor.fetchone()[0] + 1
+            cursor.execute(
+                "INSERT INTO stress_atomic VALUES (%s,%s)", (epoch, epoch * 31 + 7)
+            )
+            cursor.execute(
+                "UPDATE stress_atomic_meta SET committed_epoch=%s WHERE id=1", (epoch,)
+            )
+            connection.commit()
+            self.record("atomic_epochs", started)
+        except pymysql.MySQLError as error:
+            if is_connection_error(error):
+                raise
+            connection.rollback()
+            if error.args and error.args[0] == 1213:
+                self.expected_error("atomic_epoch_conflicts")
+            else:
+                raise
+        finally:
+            cursor.close()
 
     def rewrite_loop(self):
         cycle = 0
@@ -367,6 +454,21 @@ class Campaign:
                     pass
             time.sleep(1)
 
+    def random_crash_loop(self):
+        while not self.stop.is_set() and time.monotonic() < self.deadline:
+            if random.random() < self.args.crash_long_probability:
+                delay_ms = random.uniform(self.args.crash_max_ms, self.args.crash_long_max_ms)
+            else:
+                delay_ms = random.uniform(self.args.crash_min_ms, self.args.crash_max_ms)
+            delay = delay_ms / 1000
+            if self.stop.wait(delay):
+                return
+            try:
+                self.crash_and_restart()
+            except Exception as error:
+                self.fail("random-crash-recovery", error)
+                return
+
     def run(self):
         self.started_at = time.monotonic()
         self.start_server()
@@ -388,6 +490,11 @@ class Campaign:
             for worker in range(3)
         ]
         threads += [
+            threading.Thread(
+                target=self.reconnecting_worker,
+                args=("atomic-epoch", self.atomic_epoch),
+                daemon=True,
+            ),
             threading.Thread(target=self.rewrite_loop, daemon=True),
             threading.Thread(target=self.invalid_rewrite_loop, daemon=True),
             threading.Thread(target=self.monitor, daemon=True),
@@ -395,16 +502,21 @@ class Campaign:
         for thread in threads:
             thread.start()
 
-        crash_at = [self.args.duration / 3, self.args.duration * 2 / 3]
-        started = time.monotonic()
-        for offset in crash_at:
-            while not self.stop.is_set() and time.monotonic() - started < offset:
-                time.sleep(0.1)
-            if not self.stop.is_set():
-                try:
-                    self.crash_and_restart()
-                except Exception as error:
-                    self.fail("crash-recovery", error)
+        if self.args.crash_max_ms > 0:
+            crash_thread = threading.Thread(target=self.random_crash_loop, daemon=True)
+            threads.append(crash_thread)
+            crash_thread.start()
+        else:
+            crash_at = [self.args.duration / 3, self.args.duration * 2 / 3]
+            started = time.monotonic()
+            for offset in crash_at:
+                while not self.stop.is_set() and time.monotonic() - started < offset:
+                    time.sleep(0.1)
+                if not self.stop.is_set():
+                    try:
+                        self.crash_and_restart()
+                    except Exception as error:
+                        self.fail("crash-recovery", error)
         while not self.stop.is_set() and time.monotonic() < self.deadline:
             time.sleep(0.1)
         self.stop.set()
@@ -471,7 +583,28 @@ def main():
     parser.add_argument("--log", required=True)
     parser.add_argument("--port", type=int, default=33327)
     parser.add_argument("--duration", type=int, default=300)
+    parser.add_argument("--crash-min-ms", type=int, default=0)
+    parser.add_argument("--crash-max-ms", type=int, default=0)
+    parser.add_argument("--crash-long-probability", type=float, default=0.0)
+    parser.add_argument("--crash-long-max-ms", type=int, default=5000)
+    parser.add_argument("--startup-crash-probability", type=float, default=0.0)
+    parser.add_argument("--max-startup-crashes", type=int, default=2)
+    parser.add_argument("--stop-before-kill-probability", type=float, default=0.0)
+    parser.add_argument("--restart-attempts", type=int, default=1)
     args = parser.parse_args()
+    if args.crash_min_ms < 0 or args.crash_max_ms < args.crash_min_ms:
+        parser.error("crash interval must satisfy 0 <= min <= max")
+    if args.crash_long_max_ms < args.crash_max_ms:
+        parser.error("--crash-long-max-ms must be at least --crash-max-ms")
+    if args.restart_attempts <= 0:
+        parser.error("--restart-attempts must be positive")
+    for name in (
+        "crash_long_probability",
+        "startup_crash_probability",
+        "stop_before_kill_probability",
+    ):
+        if not 0 <= getattr(args, name) <= 1:
+            parser.error(f"--{name.replace('_', '-')} must be between 0 and 1")
     campaign = Campaign(args)
     try:
         raise SystemExit(campaign.run())
