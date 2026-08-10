@@ -74,3 +74,43 @@ This removes the full-table delete/reinsert set from the atomic commit and also
 addresses the rewrite's peak-memory problem. It requires a storage-format and
 replication design, so it should be implemented separately with migration,
 crash-recovery, snapshot, binlog, and cluster coverage.
+
+## Shadow-generation prototype
+
+`crates/elyra-storage/examples/rewrite_strategy.rs` models that design directly
+on redb. The atomic strategy materializes and commits the complete old/new
+mutation set. The shadow strategy builds a new physical generation in bounded
+commits, atomically writes a generation pointer, and reclaims the old generation
+in bounded commits. Run each strategy in a separate process so `/usr/bin/time`
+can capture its maximum resident set:
+
+```sh
+cargo build --release -p elyra-storage --example rewrite_strategy
+/usr/bin/time -l target/release/examples/rewrite_strategy \
+  atomic /tmp/atomic.edb 200000 1 20000
+/usr/bin/time -l target/release/examples/rewrite_strategy \
+  shadow /tmp/shadow.edb 200000 1 20000
+```
+
+Matched sequential results at 200,000 rows and one secondary index, with full
+durability:
+
+| Strategy | Batch | Foreground | Atomic cutover | Cleanup | Max RSS |
+|---|---:|---:|---:|---:|---:|
+| Modeled atomic rewrite | all rows | 1,788.68 ms | 1,418.77 ms | — | 352.8 MB |
+| Shadow generation | 20,000 | 1,330.62 ms | 5.66 ms | 1,030.95 ms | 229.8 MB |
+| Shadow generation | 50,000 | 1,327.57 ms | 4.68 ms | 857.08 ms | 298.5 MB |
+
+Compared with the modeled current strategy, the 20,000-row batch is 25.6%
+faster before returning, reduces maximum RSS by 34.9%, and shortens the atomic
+cutover about 251x. A 50,000-row batch has similar foreground time but trades
+away much of the memory reduction.
+
+The prototype also exposes the costs that a production design must manage:
+
+- Build plus cleanup performs more total storage work than the current rewrite;
+  cleanup only improves latency when it is safely deferred and rate-limited.
+- Both generations coexist until cleanup, temporarily increasing disk usage.
+- Concurrent writes need a delta-capture or brief write barrier before the
+  generation switch; the prototype intentionally measures storage mechanics,
+  not that coordination protocol.
