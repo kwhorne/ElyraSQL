@@ -1089,6 +1089,78 @@ async fn shadow_primary_key_generation_supports_subsequent_table_operations() {
 }
 
 #[tokio::test]
+async fn recreated_table_does_not_reuse_a_generation_being_cleaned() {
+    let srv = TestServer::start().await;
+    let mut connection = srv.conn().await;
+
+    connection
+        .query_drop("CREATE TABLE generation_reuse (id INT, payload TEXT)")
+        .await
+        .unwrap();
+    for start in (0..20_000).step_by(1_000) {
+        let values = (start..start + 1_000)
+            .map(|id| format!("({id},'old-{id}')"))
+            .collect::<Vec<_>>()
+            .join(",");
+        connection
+            .query_drop(format!("INSERT INTO generation_reuse VALUES {values}"))
+            .await
+            .unwrap();
+    }
+    connection
+        .query_drop("ALTER TABLE generation_reuse ADD PRIMARY KEY (id)")
+        .await
+        .unwrap();
+
+    // The ALTER returns while its old physical generation is reclaimed. DROP
+    // and CREATE must retain a generation watermark so this new table cannot
+    // be placed back into the keyspace that cleanup is still deleting.
+    connection
+        .query_drop("DROP TABLE generation_reuse")
+        .await
+        .unwrap();
+    connection
+        .query_drop("CREATE TABLE generation_reuse (id INT PRIMARY KEY, payload TEXT)")
+        .await
+        .unwrap();
+    connection
+        .query_drop("INSERT INTO generation_reuse VALUES (1,'new')")
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let rows: Vec<(i64, String)> = connection
+        .query("SELECT id, payload FROM generation_reuse")
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![(1, "new".into())]);
+
+    // RENAME must also honor a watermark left by an earlier table that used
+    // the destination name.
+    connection
+        .query_drop("DROP TABLE generation_reuse")
+        .await
+        .unwrap();
+    connection
+        .query_drop("CREATE TABLE generation_source (id INT PRIMARY KEY, payload TEXT)")
+        .await
+        .unwrap();
+    connection
+        .query_drop("INSERT INTO generation_source VALUES (2,'renamed')")
+        .await
+        .unwrap();
+    connection
+        .query_drop("RENAME TABLE generation_source TO generation_reuse")
+        .await
+        .unwrap();
+    let renamed: Vec<(i64, String)> = connection
+        .query("SELECT id, payload FROM generation_reuse")
+        .await
+        .unwrap();
+    assert_eq!(renamed, vec![(2, "renamed".into())]);
+}
+
+#[tokio::test]
 async fn alter_add_primary_key_rejects_a_concurrent_post_scan_insert() {
     let srv = TestServer::start().await;
     let mut ddl = srv.conn().await;

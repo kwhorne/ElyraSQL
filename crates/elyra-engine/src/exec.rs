@@ -4083,7 +4083,15 @@ async fn alter_rename_table(db: &Session, def: &mut TableDef, new: &str) -> Resu
     let old = def.name.clone();
     let old_generation = def.storage_generation;
     let old_prefix = catalog::data_prefix_generation(&old, old_generation);
+    let target_generation = db
+        .get(catalog::generation_key(new))
+        .await?
+        .and_then(|bytes| bytes.as_slice().try_into().ok())
+        .map(u64::from_le_bytes)
+        .unwrap_or(0)
+        .max(old_generation);
     def.name = new.to_string();
+    def.storage_generation = target_generation;
     for foreign_key in &mut def.foreign_keys {
         if foreign_key.ref_table.eq_ignore_ascii_case(&old) {
             foreign_key.ref_table = new.to_string();
@@ -4146,12 +4154,20 @@ async fn alter_rename_table(db: &Session, def: &mut TableDef, new: &str) -> Resu
 
     // Move catalog + table-scoped metadata.
     deletes.push(catalog_key(&old));
-    deletes.push(catalog::generation_key(&old));
-    puts.push((catalog_key(new), def.encode()?));
+    // Retain the old name's watermark. A deferred cleanup may still be
+    // deleting an earlier generation, so a later CREATE with this name must
+    // not reuse that physical keyspace.
     if old_generation != 0 {
         puts.push((
-            catalog::generation_key(new),
+            catalog::generation_key(&old),
             old_generation.to_le_bytes().to_vec(),
+        ));
+    }
+    puts.push((catalog_key(new), def.encode()?));
+    if target_generation != 0 {
+        puts.push((
+            catalog::generation_key(new),
+            target_generation.to_le_bytes().to_vec(),
         ));
     }
     // MySQL carries referencing foreign keys across a table rename. Update
@@ -22927,6 +22943,9 @@ async fn table_delete_keys(db: &Session, name: &str) -> Result<Vec<Vec<u8>>> {
     let definition = catalog::load(db, name).await?;
     let storage_name = definition.storage_name();
     // Collect the table's data and index keys in batches.
+    // The generation watermark deliberately survives DROP. Deferred cleanup
+    // for this logical name may still be running, and a recreated table must
+    // use a keyspace newer than anything cleanup can target.
     let mut deletes = vec![
         catalog_key(name),
         rowid_key(name),
@@ -22934,7 +22953,6 @@ async fn table_delete_keys(db: &Session, name: &str) -> Result<Vec<Vec<u8>>> {
         temp_owner_key(name),
         catalog::colwidth_key(name),
         catalog::coldecl_key(name),
-        catalog::generation_key(name),
     ];
     for prefix in [
         definition.data_prefix(),
