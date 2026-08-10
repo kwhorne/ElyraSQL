@@ -2890,23 +2890,20 @@ pub async fn alter_table(
     // keys. Validate those scanned ranges at commit so a concurrent write
     // cannot survive in an obsolete row/key layout.
     db.require_serializable_validation()?;
-    let checkpoint = match db.transaction_checkpoint() {
-        Ok(checkpoint) => checkpoint,
-        Err(error) => {
-            if implicit_transaction {
-                db.rollback();
-            }
-            return Err(error);
-        }
+    // An implicit ALTER owns its whole transaction, so an error can discard it
+    // directly. Checkpoint logging would clone every rewritten key solely to
+    // support a partial rollback that can never be needed. Explicit user
+    // transactions still need a checkpoint to preserve earlier statements.
+    let checkpoint = if implicit_transaction {
+        None
+    } else {
+        Some(db.transaction_checkpoint()?)
     };
 
     match alter_table_inner(db, name, ops).await {
         Ok(result) => {
-            if let Err(error) = db.release_transaction_checkpoint(checkpoint) {
-                if implicit_transaction {
-                    db.rollback();
-                }
-                return Err(error);
+            if let Some(checkpoint) = checkpoint {
+                db.release_transaction_checkpoint(checkpoint)?;
             }
             if implicit_transaction {
                 db.commit().await?;
@@ -2914,11 +2911,8 @@ pub async fn alter_table(
             Ok(result)
         }
         Err(error) => {
-            if let Err(rollback_error) = db.rollback_transaction_checkpoint(checkpoint) {
-                if implicit_transaction {
-                    db.rollback();
-                }
-                return Err(rollback_error);
+            if let Some(checkpoint) = checkpoint {
+                db.rollback_transaction_checkpoint(checkpoint)?;
             }
             if implicit_transaction {
                 db.rollback();
@@ -3172,7 +3166,6 @@ async fn alter_add_primary_key(db: &Session, def: &mut TableDef, columns: &[Iden
     }
 
     let old_def = def.clone();
-    let rows = collect_all_encoded_rows(db, &old_def).await?;
     def.pk_cols = pk_cols;
     for &column in &def.pk_cols {
         def.schema.columns[column].nullable = false;
@@ -3180,45 +3173,16 @@ async fn alter_add_primary_key(db: &Session, def: &mut TableDef, columns: &[Iden
 
     let mut puts = vec![(catalog_key(&def.name), def.encode()?)];
     let mut deletes = Vec::new();
-    let mut clustered_keys = std::collections::HashSet::with_capacity(rows.len());
+    let mut clustered_keys = std::collections::HashSet::new();
     let pk_collations = def.pk_collations();
     let clustered_prefix = data_prefix(&def.name);
-
-    for (old_key, encoded_row, row) in rows {
-        if def.pk_cols.iter().any(|&column| row[column].is_null()) {
-            return Err(Error::Query(
-                "primary key columns cannot contain NULL".into(),
-            ));
-        }
-        let clustered = keyenc::encode_columns_coll(&row, &def.pk_cols, &pk_collations)?;
-        if !clustered_keys.insert(clustered.clone()) {
-            return Err(Error::Duplicate("duplicate primary key".into()));
-        }
-        let mut new_key = clustered_prefix.clone();
-        new_key.extend_from_slice(&clustered);
-        deletes.extend(index::entry_keys_for_row(&old_def, &row, &old_key)?);
-        if new_key != old_key {
-            deletes.push(old_key);
-        }
-        puts.push((new_key.clone(), encoded_row));
-        puts.extend(index::entries_for_row(def, &row, &new_key)?);
-    }
-
-    deletes.push(rowid_key(&def.name));
-    puts.push(bump_wcount(db, &def.name).await?);
-    db.commit_write(puts, deletes).await
-}
-
-/// Read a table once while retaining the original encoded row bytes. Table
-/// reclustering changes keys, not row payloads, so reusing these bytes avoids a
-/// full-table serialization pass while still decoding once for key/index work.
-async fn collect_all_encoded_rows(
-    db: &Session,
-    def: &TableDef,
-) -> Result<Vec<(Vec<u8>, Vec<u8>, Vec<Value>)>> {
-    let prefix = data_prefix(&def.name);
+    let rewrite_budget = db.transaction_write_budget_remaining();
+    let mut rewrite_bytes = puts
+        .iter()
+        .map(|(key, value)| key.len() + value.len())
+        .sum();
+    let prefix = data_prefix(&old_def.name);
     let mut cursor = None;
-    let mut rows = Vec::new();
     loop {
         let batch = db.scan_batch(prefix.clone(), cursor.clone(), 4096).await?;
         if batch.is_empty() {
@@ -3226,15 +3190,66 @@ async fn collect_all_encoded_rows(
         }
         let last = batch.len() < 4096;
         cursor = batch.last().map(|(key, _)| key.clone());
-        for (key, encoded) in batch {
-            let row = rowdec::decode_row(&encoded)?;
-            rows.push((key, encoded, row));
+        for (old_key, encoded_row) in batch {
+            let row = rowdec::decode_row(&encoded_row)?;
+            if def.pk_cols.iter().any(|&column| row[column].is_null()) {
+                return Err(Error::Query(
+                    "primary key columns cannot contain NULL".into(),
+                ));
+            }
+            let clustered = keyenc::encode_columns_coll(&row, &def.pk_cols, &pk_collations)?;
+            if !clustered_keys.insert(clustered.clone()) {
+                return Err(Error::Duplicate("duplicate primary key".into()));
+            }
+            let mut new_key = clustered_prefix.clone();
+            new_key.extend_from_slice(&clustered);
+            let mut row_deletes = index::entry_keys_for_row(&old_def, &row, &old_key)?;
+            if new_key != old_key {
+                row_deletes.push(old_key);
+            }
+            let mut row_puts = vec![(new_key.clone(), encoded_row)];
+            row_puts.extend(index::entries_for_row(def, &row, &new_key)?);
+            let additional = clustered.len()
+                + row_deletes.iter().map(Vec::len).sum::<usize>()
+                + row_puts
+                    .iter()
+                    .map(|(key, value)| key.len() + value.len())
+                    .sum::<usize>();
+            rewrite_bytes = reserve_alter_rewrite_bytes(rewrite_bytes, additional, rewrite_budget)?;
+            deletes.extend(row_deletes);
+            puts.extend(row_puts);
         }
         if last {
             break;
         }
     }
-    Ok(rows)
+
+    deletes.push(rowid_key(&def.name));
+    puts.push(bump_wcount(db, &def.name).await?);
+    db.commit_write(puts, deletes).await
+}
+
+fn reserve_alter_rewrite_bytes(current: usize, additional: usize, budget: usize) -> Result<usize> {
+    let total = current.saturating_add(additional);
+    if total > budget {
+        return Err(Error::Query(format!(
+            "ALTER TABLE rewrite exceeded {budget} bytes; raise \
+             ELYRASQL_TXN_MAX_BYTES to allow a larger rewrite"
+        )));
+    }
+    Ok(total)
+}
+
+#[cfg(test)]
+mod alter_rewrite_budget_tests {
+    use super::reserve_alter_rewrite_bytes;
+
+    #[test]
+    fn rejects_before_the_rewrite_buffer_exceeds_its_budget() {
+        assert_eq!(reserve_alter_rewrite_bytes(60, 40, 100).unwrap(), 100);
+        let error = reserve_alter_rewrite_bytes(60, 41, 100).unwrap_err();
+        assert!(error.to_string().contains("rewrite exceeded 100 bytes"));
+    }
 }
 
 fn ensure_col_meta(def: &mut TableDef) {
@@ -12141,6 +12156,53 @@ fn distinct_max() -> usize {
     env_usize("ELYRASQL_DISTINCT_MAX", 5_000_000)
 }
 
+/// Approximate byte budget for the in-memory DISTINCT fast path. Row-count
+/// limits alone are unsafe for wide projections.
+fn distinct_max_bytes() -> usize {
+    env_usize("ELYRASQL_DISTINCT_MAX_BYTES", 256 << 20)
+}
+
+fn distinct_resident_exceeds(
+    rows: usize,
+    bytes: usize,
+    row_limit: usize,
+    byte_limit: usize,
+) -> bool {
+    rows > row_limit.max(1) || bytes > byte_limit
+}
+
+async fn run_distinct_blocking<F, T>(context: &'static str, work: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|error| Error::Storage(format!("DISTINCT {context} worker failed: {error}")))?
+}
+
+fn distinct_row_key(
+    row: &[Value],
+    schema: &Schema,
+    collations: &[elyra_core::Collation],
+) -> Vec<u8> {
+    let mut key = Vec::with_capacity(row.len() * 9);
+    for (index, value) in row.iter().enumerate() {
+        let collation = collations.get(index).copied().unwrap_or_default();
+        if matches!(
+            schema.columns.get(index).map(|column| &column.ty),
+            Some(ColumnType::Float)
+        ) {
+            if let Some(number) = value.as_mysql_f64() {
+                Value::Float(number).push_collation_key_coll(&mut key, collation);
+                continue;
+            }
+        }
+        value.push_collation_key_coll(&mut key, collation);
+    }
+    key
+}
+
 /// Deduplicate a projected stream while preserving the first representative of
 /// each collation-aware value and the inner query's row order.
 ///
@@ -12167,9 +12229,10 @@ async fn distinct_rows(
         .collect();
     let mut seen = std::collections::HashSet::new();
     let mut resident: Vec<(u64, Vec<Value>)> = Vec::new();
+    let mut resident_bytes = 0usize;
     let mut value_sorter = None;
     let mut ordinal = 0u64;
-    let mut check = elyra_core::cancel::CancelCheck::new(cancel);
+    let mut check = elyra_core::cancel::CancelCheck::new(cancel.clone());
     check.tick_now()?;
 
     loop {
@@ -12177,15 +12240,51 @@ async fn distinct_rows(
         if batch.is_empty() {
             break;
         }
+        if let Some(mut sorter) = value_sorter.take() {
+            let batch_len = u64::try_from(batch.len())
+                .map_err(|_| Error::Query("SELECT DISTINCT batch is too large".into()))?;
+            let start_ordinal = ordinal;
+            ordinal = ordinal.checked_add(batch_len).ok_or_else(|| {
+                Error::Query("SELECT DISTINCT input row ordinal overflowed".into())
+            })?;
+            let collations = collations.clone();
+            let distinct_schema = schema.clone();
+            let blocking_cancel = cancel.clone();
+            sorter = run_distinct_blocking("spill", move || -> Result<crate::sort::Sorter> {
+                let mut check = elyra_core::cancel::CancelCheck::new(blocking_cancel);
+                for (position, row) in batch.into_iter().enumerate() {
+                    check.tick()?;
+                    push_distinct_candidate(
+                        &mut sorter,
+                        row,
+                        start_ordinal + position as u64,
+                        &distinct_schema,
+                        &collations,
+                    )?;
+                }
+                Ok(sorter)
+            })
+            .await?;
+            value_sorter = Some(sorter);
+            continue;
+        }
         for row in batch {
             check.tick()?;
             if let Some(sorter) = &mut value_sorter {
-                push_distinct_candidate(sorter, row, ordinal, &collations)?;
+                push_distinct_candidate(sorter, row, ordinal, &schema, &collations)?;
             } else {
-                let key = Value::row_collation_key_coll(&row, &collations);
+                let key = distinct_row_key(&row, &schema, &collations);
+                let key_len = key.len();
                 if seen.insert(key) {
+                    resident_bytes = resident_bytes
+                        .saturating_add(key_len.saturating_add(estimated_row_bytes(&row)));
                     resident.push((ordinal, row));
-                    if resident.len() > memory_rows.max(1) {
+                    if distinct_resident_exceeds(
+                        resident.len(),
+                        resident_bytes,
+                        memory_rows,
+                        distinct_max_bytes(),
+                    ) {
                         let mut sorter = crate::sort::Sorter::new(
                             vec![true, true],
                             vec![elyra_core::Collation::Bin; 2],
@@ -12198,11 +12297,13 @@ async fn distinct_rows(
                                 &mut sorter,
                                 resident_row,
                                 resident_ordinal,
+                                &schema,
                                 &collations,
                             )?;
                         }
                         seen.clear();
                         seen.shrink_to_fit();
+                        resident_bytes = 0;
                         value_sorter = Some(sorter);
                     }
                 }
@@ -12219,64 +12320,79 @@ async fn distinct_rows(
         return Ok(RowStream::literal(schema, rows));
     };
 
-    let mut order_sorter = crate::sort::Sorter::new(
-        vec![true],
-        vec![elyra_core::Collation::Bin],
-        offset,
-        limit,
-        crate::sort::sort_max_rows(),
-    );
-    let mut previous_key = None;
-    value_sorter.finish_with(|mut candidate| {
-        check.tick()?;
-        let candidate_ordinal = candidate
-            .pop()
-            .ok_or_else(|| Error::Storage("DISTINCT spill row missing ordinal".into()))?;
-        let key = Value::row_collation_key_coll(&candidate, &collations);
-        if previous_key.as_ref() != Some(&key) {
-            previous_key = Some(key);
-            order_sorter.push(vec![candidate_ordinal], candidate)?;
-        }
-        Ok(())
-    })?;
+    let blocking_cancel = cancel.clone();
+    let distinct_schema = schema.clone();
+    let order_sorter = run_distinct_blocking("merge", move || -> Result<crate::sort::Sorter> {
+        let mut check = elyra_core::cancel::CancelCheck::new(blocking_cancel);
+        let mut order_sorter = crate::sort::Sorter::new(
+            vec![true],
+            vec![elyra_core::Collation::Bin],
+            offset,
+            limit,
+            crate::sort::sort_max_rows(),
+        );
+        let mut previous_key = None;
+        value_sorter.finish_with(|mut candidate| {
+            check.tick()?;
+            let candidate_ordinal = candidate
+                .pop()
+                .ok_or_else(|| Error::Storage("DISTINCT spill row missing ordinal".into()))?;
+            let key = distinct_row_key(&candidate, &distinct_schema, &collations);
+            if previous_key.as_ref() != Some(&key) {
+                previous_key = Some(key);
+                order_sorter.push(vec![candidate_ordinal], candidate)?;
+            }
+            Ok(())
+        })?;
+        Ok(order_sorter)
+    })
+    .await?;
 
     if limit.is_some_and(|limit| limit <= crate::sort::sort_max_rows()) {
-        let rows = order_sorter.finish()?;
+        let rows = run_distinct_blocking("order", move || {
+            let mut order_sorter = order_sorter;
+            order_sorter.finish()
+        })
+        .await?;
         return Ok(RowStream::literal(schema, rows));
     }
 
-    let (path, file) = create_distinct_spill()?;
-    let mut writer = BufWriter::new(file);
-    let mut numeric_types = crate::stream::NumericTypeReconciler::new(schema.columns.len());
-    let write_result = order_sorter.finish_with(|row| {
-        check.tick()?;
-        numeric_types.observe(&row);
-        let frame = bincode::serialize(&row).map_err(|error| Error::Storage(error.to_string()))?;
-        if frame.len() > elyra_core::max_frame_bytes() || frame.len() > u32::MAX as usize {
-            return Err(Error::Storage("DISTINCT spill row frame too large".into()));
+    let columns = schema.columns.len();
+    let (path, file, numeric_types) = run_distinct_blocking("output", move || {
+        let (path, file) = create_distinct_spill()?;
+        let mut writer = BufWriter::new(file);
+        let mut numeric_types = crate::stream::NumericTypeReconciler::new(columns);
+        let mut order_sorter = order_sorter;
+        let mut check = elyra_core::cancel::CancelCheck::new(cancel);
+        let write_result = order_sorter.finish_with(|row| {
+            check.tick()?;
+            numeric_types.observe(&row);
+            let frame =
+                bincode::serialize(&row).map_err(|error| Error::Storage(error.to_string()))?;
+            if frame.len() > elyra_core::max_frame_bytes() || frame.len() > u32::MAX as usize {
+                return Err(Error::Storage("DISTINCT spill row frame too large".into()));
+            }
+            writer.write_all(&(frame.len() as u32).to_le_bytes())?;
+            writer.write_all(&frame)?;
+            Ok(())
+        });
+        if let Err(error) = write_result {
+            drop(writer);
+            let _ = std::fs::remove_file(&path);
+            return Err(error);
         }
-        writer.write_all(&(frame.len() as u32).to_le_bytes())?;
-        writer.write_all(&frame)?;
-        Ok(())
-    });
-    if let Err(error) = write_result {
-        drop(writer);
-        let _ = std::fs::remove_file(&path);
-        return Err(error);
-    }
-    if let Err(error) = writer.flush() {
-        drop(writer);
-        let _ = std::fs::remove_file(&path);
-        return Err(Error::Io(error));
-    }
-    let file = match writer.into_inner() {
-        Ok(file) => file,
-        Err(error) => {
-            let error = error.into_error();
+        if let Err(error) = writer.flush() {
+            drop(writer);
             let _ = std::fs::remove_file(&path);
             return Err(Error::Io(error));
         }
-    };
+        let file = writer.into_inner().map_err(|error| {
+            let _ = std::fs::remove_file(&path);
+            Error::Io(error.into_error())
+        })?;
+        Ok((path, file, numeric_types))
+    })
+    .await?;
     let mut schema = schema;
     numeric_types.reconcile(&mut schema);
     RowStream::spill(schema, path, file)
@@ -12286,10 +12402,11 @@ fn push_distinct_candidate(
     sorter: &mut crate::sort::Sorter,
     row: Vec<Value>,
     ordinal: u64,
+    schema: &Schema,
     collations: &[elyra_core::Collation],
 ) -> Result<()> {
     let keys = vec![
-        Value::Bytes(Value::row_collation_key_coll(&row, collations)),
+        Value::Bytes(distinct_row_key(&row, schema, collations)),
         Value::UInt(ordinal),
     ];
     let mut candidate = row;
@@ -12306,12 +12423,14 @@ fn create_distinct_spill() -> Result<(std::path::PathBuf, std::fs::File)> {
             "elyrasql-sort-{}-distinct-{sequence}.tmp",
             std::process::id()
         ));
-        match std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&path)
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create_new(true);
+        #[cfg(unix)]
         {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&path) {
             Ok(file) => return Ok((path, file)),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(Error::Io(error)),
@@ -12322,6 +12441,21 @@ fn create_distinct_spill() -> Result<(std::path::PathBuf, std::fs::File)> {
 #[cfg(test)]
 mod distinct_spill_tests {
     use super::*;
+
+    #[test]
+    fn wide_rows_spill_before_the_row_count_limit() {
+        assert!(distinct_resident_exceeds(2, 101, 1_000, 100));
+        assert!(!distinct_resident_exceeds(2, 100, 1_000, 100));
+    }
+
+    #[tokio::test]
+    async fn spill_work_runs_off_the_async_runtime_thread() {
+        let runtime_thread = std::thread::current().id();
+        let worker_thread = run_distinct_blocking("test", || Ok(std::thread::current().id()))
+            .await
+            .unwrap();
+        assert_ne!(worker_thread, runtime_thread);
+    }
 
     async fn collect(mut stream: RowStream) -> Vec<Vec<Value>> {
         let mut rows = Vec::new();
@@ -12405,11 +12539,20 @@ mod distinct_spill_tests {
         .await
         .unwrap();
 
-        assert_eq!(stream.schema.columns[0].ty, ColumnType::Float);
-        assert_eq!(
-            collect(stream).await,
-            vec![vec![Value::Int(1)], vec![Value::Float(1.0)]]
-        );
+        assert_eq!(stream.schema.columns[0].ty, ColumnType::Int);
+        assert_eq!(collect(stream).await, vec![vec![Value::Int(1)]]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn distinct_spill_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (path, file) = create_distinct_spill().unwrap();
+        let mode = file.metadata().unwrap().permissions().mode() & 0o777;
+        drop(file);
+        let _ = std::fs::remove_file(path);
+        assert_eq!(mode, 0o600);
     }
 
     #[tokio::test]
@@ -16254,7 +16397,47 @@ struct WindowAggregate<'a> {
     non_null_count: Vec<usize>,
     numeric_count: Vec<usize>,
     non_integer_count: Vec<usize>,
-    sums: Vec<f64>,
+    integer_sums: Vec<i128>,
+    numeric_sums: NumericRangeSums,
+}
+
+struct NumericRangeSums {
+    leaf_count: usize,
+    tree: Vec<f64>,
+}
+
+impl NumericRangeSums {
+    fn new(values: &[Value]) -> Self {
+        let leaf_count = values.len().next_power_of_two().max(1);
+        let mut tree = vec![0.0; leaf_count * 2];
+        for (index, value) in values.iter().enumerate() {
+            tree[leaf_count + index] = value.as_mysql_f64().unwrap_or(0.0);
+        }
+        for index in (1..leaf_count).rev() {
+            tree[index] = tree[index * 2] + tree[index * 2 + 1];
+        }
+        Self { leaf_count, tree }
+    }
+
+    fn sum(&self, mut start: usize, mut end: usize) -> f64 {
+        start += self.leaf_count;
+        end += self.leaf_count;
+        let mut left_sum = 0.0;
+        let mut right_sum = 0.0;
+        while start < end {
+            if start % 2 == 1 {
+                left_sum += self.tree[start];
+                start += 1;
+            }
+            if end % 2 == 1 {
+                end -= 1;
+                right_sum += self.tree[end];
+            }
+            start /= 2;
+            end /= 2;
+        }
+        left_sum + right_sum
+    }
 }
 
 fn window_aggregate_is_incremental(name: &str) -> bool {
@@ -16280,11 +16463,11 @@ impl<'a> WindowAggregate<'a> {
         let mut non_null_count = Vec::with_capacity(values.len() + 1);
         let mut numeric_count = Vec::with_capacity(values.len() + 1);
         let mut non_integer_count = Vec::with_capacity(values.len() + 1);
-        let mut sums = Vec::with_capacity(values.len() + 1);
+        let mut integer_sums: Vec<i128> = Vec::with_capacity(values.len() + 1);
         non_null_count.push(0);
         numeric_count.push(0);
         non_integer_count.push(0);
-        sums.push(0.0);
+        integer_sums.push(0);
         for value in &values {
             non_null_count.push(
                 non_null_count.last().copied().unwrap_or_default() + usize::from(!value.is_null()),
@@ -16297,10 +16480,20 @@ impl<'a> WindowAggregate<'a> {
                 non_integer_count.last().copied().unwrap_or_default()
                     + usize::from(!matches!(value, Value::Int(_) | Value::Null)),
             );
-            sums.push(
-                sums.last().copied().unwrap_or_default() + value.as_mysql_f64().unwrap_or(0.0),
+            let integer = match value {
+                Value::Int(value) => i128::from(*value),
+                _ => 0,
+            };
+            integer_sums.push(
+                integer_sums
+                    .last()
+                    .copied()
+                    .unwrap_or_default()
+                    .checked_add(integer)
+                    .ok_or_else(|| Error::Query("window integer sum overflowed".into()))?,
             );
         }
+        let numeric_sums = NumericRangeSums::new(&values);
         Ok(Self {
             name,
             count_star,
@@ -16309,7 +16502,8 @@ impl<'a> WindowAggregate<'a> {
             non_null_count,
             numeric_count,
             non_integer_count,
-            sums,
+            integer_sums,
+            numeric_sums,
         })
     }
 
@@ -16345,13 +16539,21 @@ impl<'a> WindowAggregate<'a> {
                 if count == 0 {
                     return Ok(Value::Null);
                 }
-                let sum = self.sums[end] - self.sums[lo];
+                if self.non_integer_count[end] != self.non_integer_count[lo] {
+                    let sum = self.numeric_sums.sum(lo, end);
+                    return Ok(if self.name == "avg" {
+                        Value::Float(sum / count as f64)
+                    } else {
+                        Value::Float(sum)
+                    });
+                }
+                let integer_sum = self.integer_sums[end] - self.integer_sums[lo];
                 if self.name == "avg" {
-                    Ok(Value::Float(sum / count as f64))
-                } else if self.non_integer_count[end] == self.non_integer_count[lo] {
-                    Ok(Value::Int(sum as i64))
+                    Ok(Value::Float(integer_sum as f64 / count as f64))
                 } else {
-                    Ok(Value::Float(sum))
+                    i64::try_from(integer_sum)
+                        .map(Value::Int)
+                        .map_err(|_| Error::Query("window integer sum overflowed".into()))
                 }
             }
             _ => unreachable!("incremental window aggregate helper and dispatcher diverged"),
@@ -16404,6 +16606,39 @@ mod window_incremental_tests {
         assert_eq!(
             count.evaluate(2, 1, &idxs, &rows, &schema).unwrap(),
             Value::Int(0)
+        );
+    }
+
+    #[test]
+    fn integer_prefix_subtraction_is_exact_above_f64_precision() {
+        let schema = Schema::new(vec![ColumnDef::new("v", ColumnType::Int, false)]);
+        let rows = vec![vec![Value::Int(9_007_199_254_740_992)], vec![Value::Int(1)]];
+        let expression = Expr::Identifier(Ident::new("v"));
+        let idxs = vec![0, 1];
+        let sum =
+            WindowAggregate::new("sum", false, Some(&expression), &rows, &schema, &idxs).unwrap();
+
+        assert_eq!(
+            sum.evaluate(1, 1, &idxs, &rows, &schema).unwrap(),
+            Value::Int(1)
+        );
+    }
+
+    #[test]
+    fn floating_range_sum_avoids_prefix_cancellation() {
+        let schema = Schema::new(vec![ColumnDef::new("v", ColumnType::Float, false)]);
+        let rows = vec![
+            vec![Value::Float(9_007_199_254_740_992.0)],
+            vec![Value::Float(1.0)],
+        ];
+        let expression = Expr::Identifier(Ident::new("v"));
+        let idxs = vec![0, 1];
+        let sum =
+            WindowAggregate::new("sum", false, Some(&expression), &rows, &schema, &idxs).unwrap();
+
+        assert_eq!(
+            sum.evaluate(1, 1, &idxs, &rows, &schema).unwrap(),
+            Value::Float(1.0)
         );
     }
 }

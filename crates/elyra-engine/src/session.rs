@@ -232,6 +232,16 @@ impl Session {
         }
     }
 
+    pub(crate) fn transaction_write_budget_remaining(&self) -> usize {
+        let used = self
+            .txn
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map_or(0, |transaction| transaction.mem);
+        txn_max_bytes().saturating_sub(used)
+    }
+
     pub fn database(&self) -> String {
         self.database.lock().unwrap().clone()
     }
