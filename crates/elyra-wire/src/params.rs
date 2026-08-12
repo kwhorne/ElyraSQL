@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::collections::HashMap;
+use std::io;
 
 use crate::myc;
 use crate::{StatementData, Value};
@@ -42,7 +43,7 @@ impl<'a> ParamParser<'a> {
 
 impl<'a> IntoIterator for ParamParser<'a> {
     type IntoIter = Params<'a>;
-    type Item = ParamValue<'a>;
+    type Item = io::Result<ParamValue<'a>>;
     fn into_iter(self) -> Params<'a> {
         Params {
             params: self.params,
@@ -74,24 +75,32 @@ pub struct ParamValue<'a> {
 }
 
 impl<'a> Iterator for Params<'a> {
-    type Item = ParamValue<'a>;
+    type Item = io::Result<ParamValue<'a>>;
     fn next(&mut self) -> Option<Self::Item> {
         if self.nullmap.is_none() {
             let nullmap_len = (self.params as usize).div_ceil(8);
-            let (nullmap, rest) = self.input.split_at(nullmap_len);
+            let Some((nullmap, rest)) = self.input.split_at_checked(nullmap_len) else {
+                self.col = self.params;
+                return Some(Err(invalid_params("truncated parameter null bitmap")));
+            };
             self.nullmap = Some(nullmap);
             self.input = rest;
 
             if !rest.is_empty() && rest[0] != 0x00 {
-                let (typmap, rest) = rest[1..].split_at(2 * self.params as usize);
+                let type_bytes = 2 * self.params as usize;
+                let Some((typmap, rest)) = rest[1..].split_at_checked(type_bytes) else {
+                    self.col = self.params;
+                    return Some(Err(invalid_params("truncated parameter type map")));
+                };
                 self.bound_types.clear();
                 for i in 0..self.params as usize {
-                    self.bound_types.push((
-                        myc::constants::ColumnType::try_from(typmap[2 * i]).unwrap_or_else(|e| {
-                            panic!("bad column type 0x{:x}: {}", typmap[2 * i], e)
-                        }),
-                        (typmap[2 * i + 1] & 128) != 0,
-                    ));
+                    let Ok(column_type) = myc::constants::ColumnType::try_from(typmap[2 * i])
+                    else {
+                        self.col = self.params;
+                        return Some(Err(invalid_params("invalid parameter column type")));
+                    };
+                    self.bound_types
+                        .push((column_type, (typmap[2 * i + 1] & 128) != 0));
                 }
                 self.input = rest;
             }
@@ -100,7 +109,10 @@ impl<'a> Iterator for Params<'a> {
         if self.col >= self.params {
             return None;
         }
-        let pt = &self.bound_types[self.col as usize];
+        let Some(pt) = self.bound_types.get(self.col as usize) else {
+            self.col = self.params;
+            return Some(Err(invalid_params("parameter types were not supplied")));
+        };
 
         // https://web.archive.org/web/20170404144156/https://dev.mysql.com/doc/internals/en/null-bitmap.html
         // NULL-bitmap-byte = ((field-pos + offset) / 8)
@@ -112,10 +124,10 @@ impl<'a> Iterator for Params<'a> {
             }
             if (nullmap[byte] & 1u8 << (self.col % 8)) != 0 {
                 self.col += 1;
-                return Some(ParamValue {
+                return Some(Ok(ParamValue {
                     value: Value::null(),
                     coltype: pt.0,
-                });
+                }));
             }
         } else {
             unreachable!();
@@ -124,12 +136,20 @@ impl<'a> Iterator for Params<'a> {
         let v = if let Some(data) = self.long_data.get(&self.col) {
             Value::bytes(&data[..])
         } else {
-            Value::parse_from(&mut self.input, pt.0, pt.1).unwrap()
+            let Ok(value) = Value::parse_from(&mut self.input, pt.0, pt.1) else {
+                self.col = self.params;
+                return Some(Err(invalid_params("truncated or invalid parameter value")));
+            };
+            value
         };
         self.col += 1;
-        Some(ParamValue {
+        Some(Ok(ParamValue {
             value: v,
             coltype: pt.0,
-        })
+        }))
     }
+}
+
+fn invalid_params(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message)
 }
