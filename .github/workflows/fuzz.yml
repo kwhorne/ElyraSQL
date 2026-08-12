@@ -11,7 +11,8 @@ on:
     inputs:
       max_total_time:
         description: "Seconds to fuzz"
-        default: "300"
+        type: number
+        default: 300
 
 env:
   CARGO_TERM_COLOR: always
@@ -30,10 +31,15 @@ jobs:
         run: cargo install cargo-fuzz --locked
 
       - name: Run fuzzer
+        env:
+          FUZZ_SECONDS: ${{ github.event.inputs.max_total_time || '300' }}
         run: |
+          case "$FUZZ_SECONDS" in
+            ''|*[!0-9]*) echo "max_total_time must be a positive integer" >&2; exit 2 ;;
+          esac
           cd fuzz
           cargo +nightly fuzz run preprocess -- \
-            -max_total_time=${{ github.event.inputs.max_total_time || '300' }} \
+            -max_total_time="$FUZZ_SECONDS" \
             -rss_limit_mb=4096
 
       - name: Upload crash artifacts
