@@ -285,9 +285,9 @@ where
                 break;
             }
         }
+        db.report_sent(replica_id, snap_lsn);
         send_msg(&mut stream, &ReplMsg::SnapEnd { lsn: snap_lsn }).await?;
     }
-    db.report_sent(replica_id, snap_lsn);
 
     // Stream subsequent write-sets.
     loop {
@@ -297,6 +297,7 @@ where
                     let WriteEvent {
                         lsn, puts, deletes, ..
                     } = &*ev;
+                    db.report_sent(replica_id, *lsn);
                     send_msg(
                         &mut stream,
                         &ReplMsg::Write {
@@ -306,7 +307,6 @@ where
                         },
                     )
                     .await?;
-                    db.report_sent(replica_id, *lsn);
                 }
             }
             Err(RecvError::Lagged(n)) => {
