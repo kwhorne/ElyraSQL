@@ -13,12 +13,32 @@ libfuzzer-sys = "0.4"
 [dependencies.elyra-engine]
 path = "../crates/elyra-engine"
 
+[dependencies.elyra-core]
+path = "../crates/elyra-core"
+
+[dependencies.elyra-wire]
+path = "../crates/elyra-wire"
+
 # Prevent this from being built as part of the main (stable) workspace.
 [workspace]
 
 [[bin]]
 name = "preprocess"
 path = "fuzz_targets/preprocess.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "core_parsers"
+path = "fuzz_targets/core_parsers.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wire_protocol"
+path = "fuzz_targets/wire_protocol.rs"
 test = false
 doc = false
 bench = false

@@ -35,7 +35,7 @@ pub fn parse_date(s: &str) -> Option<i32> {
     let y: i64 = it.next()?.parse().ok()?;
     let m: u32 = it.next()?.parse().ok()?;
     let d: u32 = it.next()?.parse().ok()?;
-    if !(1..=12).contains(&m) || d < 1 {
+    if !(0..=9999).contains(&y) || !(1..=12).contains(&m) || d < 1 {
         return None;
     }
     // Reject a day that doesn't exist in the month (e.g. 2024-02-30, 2023-02-29,
@@ -58,7 +58,7 @@ pub fn parse_date(s: &str) -> Option<i32> {
     if d > dim {
         return None;
     }
-    Some(days_from_civil(y, m, d) as i32)
+    days_from_civil(y, m, d).try_into().ok()
 }
 
 /// Parse `YYYY-MM-DD[ HH:MM:SS[.ffffff]]` into microseconds since epoch.
@@ -69,7 +69,7 @@ pub fn parse_datetime(s: &str) -> Option<i64> {
         None => (s, None),
     };
     let days = parse_date(date_part)? as i64;
-    let mut micros = days * 86_400 * 1_000_000;
+    let mut micros = days.checked_mul(86_400)?.checked_mul(1_000_000)?;
     if let Some(t) = time_part {
         let (hms, frac) = match t.split_once('.') {
             Some((a, b)) => (a, Some(b)),
@@ -79,10 +79,17 @@ pub fn parse_datetime(s: &str) -> Option<i64> {
         let h: i64 = it.next()?.parse().ok()?;
         let mi: i64 = it.next().unwrap_or("0").parse().ok()?;
         let se: i64 = it.next().unwrap_or("0").parse().ok()?;
-        micros += (h * 3600 + mi * 60 + se) * 1_000_000;
+        if !(0..=23).contains(&h) || !(0..=59).contains(&mi) || !(0..=59).contains(&se) {
+            return None;
+        }
+        let seconds = h
+            .checked_mul(3_600)?
+            .checked_add(mi.checked_mul(60)?)?
+            .checked_add(se)?;
+        micros = micros.checked_add(seconds.checked_mul(1_000_000)?)?;
         if let Some(f) = frac {
             let f = format!("{:0<6}", &f[..f.len().min(6)]);
-            micros += f.parse::<i64>().ok()?;
+            micros = micros.checked_add(f.parse::<i64>().ok()?)?;
         }
     }
     Some(micros)
@@ -99,10 +106,22 @@ pub fn parse_time(s: &str) -> Option<i64> {
     let h: i64 = it.next()?.parse().ok()?;
     let mi: i64 = it.next()?.parse().ok()?;
     let se: i64 = it.next().unwrap_or("0").parse().ok()?;
-    let mut micros = (h * 3600 + mi * 60 + se) * 1_000_000;
+    if !(-838..=838).contains(&h) || !(0..=59).contains(&mi) || !(0..=59).contains(&se) {
+        return None;
+    }
+    let seconds = h
+        .checked_mul(3_600)?
+        .checked_add(if h < 0 {
+            mi.checked_mul(-60)?
+        } else {
+            mi.checked_mul(60)?
+        })?
+        .checked_add(if h < 0 { -se } else { se })?;
+    let mut micros = seconds.checked_mul(1_000_000)?;
     if let Some(f) = frac {
         let f = format!("{:0<6}", &f[..f.len().min(6)]);
-        micros += f.parse::<i64>().ok()?;
+        let fraction = f.parse::<i64>().ok()?;
+        micros = micros.checked_add(if h < 0 { -fraction } else { fraction })?;
     }
     Some(micros)
 }
@@ -159,5 +178,13 @@ mod tests {
         let s = "2024-06-15 13:45:30";
         let t = parse_datetime(s).unwrap();
         assert_eq!(format_datetime(t), s);
+    }
+
+    #[test]
+    fn parsers_reject_out_of_range_and_overflowing_values() {
+        assert_eq!(parse_time("11111160:0041111160:0041111116111116"), None);
+        assert_eq!(parse_time("839:00:00"), None);
+        assert_eq!(parse_datetime("2024-01-01 24:00:00"), None);
+        assert_eq!(parse_date("999999999999999999-01-01"), None);
     }
 }
