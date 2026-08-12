@@ -424,6 +424,17 @@ impl Engine {
             if let Some(w) = &select.selection {
                 ok &= collect_col_refs(w, &mut refs);
             }
+            match &select.group_by {
+                sqlparser::ast::GroupByExpr::All(_) => all = true,
+                sqlparser::ast::GroupByExpr::Expressions(expressions, _) => {
+                    for expression in expressions {
+                        ok &= collect_col_refs(expression, &mut refs);
+                    }
+                }
+            }
+            if let Some(having) = &select.having {
+                ok &= collect_col_refs(having, &mut refs);
+            }
             if let Some(ob) = &q.order_by {
                 for o in &ob.exprs {
                     ok &= collect_col_refs(&o.expr, &mut refs);
@@ -1399,7 +1410,17 @@ impl Engine {
             // (full access) and for reads/DDL (handled by the tier/Admin gates).
             let need_bits = required_privset(&stmt);
             if need_bits != 0 && privilege < Privilege::Admin && !user.is_empty() {
-                for t in stmt_targets(&stmt) {
+                let targets = stmt_targets(&stmt);
+                if targets.is_empty() {
+                    let have = users::effective_global_privset(sess, user).await?;
+                    if have & need_bits != need_bits {
+                        let missing = elyra_core::users::privset_to_names(need_bits & !have);
+                        return Err(Error::Query(format!(
+                            "access denied: {missing} command denied to user '{user}'"
+                        )));
+                    }
+                }
+                for t in targets {
                     let have = users::effective_table_privset(sess, user, &t).await?;
                     if have & need_bits != need_bits {
                         let missing = elyra_core::users::privset_to_names(need_bits & !have);
@@ -1508,6 +1529,14 @@ impl Engine {
         sess: &Session,
     ) -> Result<Privilege> {
         let need = required_privilege(stmt);
+        if need <= Privilege::Read && !user.is_empty() {
+            let bits = users::effective_global_privset(sess, user).await?;
+            if bits & elyra_core::users::priv_bits::SELECT == 0 {
+                return Err(Error::Query(format!(
+                    "access denied: SELECT command denied to user '{user}'"
+                )));
+            }
+        }
         // Fast path: the connection's own privilege already satisfies the
         // statement. Roles and per-table grants only ever *add* privileges, so
         // no grant lookup (a storage read on every statement) is needed here.
