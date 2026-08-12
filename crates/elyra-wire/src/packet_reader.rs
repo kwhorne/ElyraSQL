@@ -105,10 +105,14 @@ impl<R: AsyncRead + Unpin> AsyncRead for PacketReader<R> {
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<io::Result<()>> {
         if self.remaining != 0 {
-            buf.put_slice(&self.bytes[self.start..]);
-            self.bytes.clear();
-            self.start = 0;
-            self.remaining = 0;
+            let count = self.remaining.min(buf.remaining());
+            buf.put_slice(&self.bytes[self.start..self.start + count]);
+            self.start += count;
+            self.remaining -= count;
+            if self.remaining == 0 {
+                self.bytes.clear();
+                self.start = 0;
+            }
             std::task::Poll::Ready(Ok(()))
         } else {
             std::pin::Pin::new(&mut self.r).poll_read(cx, buf)
@@ -161,8 +165,18 @@ impl<R: AsyncRead + Unpin> PacketReader<R> {
             self.start = 0;
             let end = self.remaining;
 
+            let limit = crate::max_allowed_packet();
+            if end >= limit {
+                self.bytes.clear();
+                self.remaining = 0;
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "logical MySQL packet exceeds max_allowed_packet",
+                ));
+            }
+
             if self.bytes.len() - end < buffer_size {
-                let new_len = std::cmp::max(buffer_size, end * 2);
+                let new_len = std::cmp::max(buffer_size, end.saturating_mul(2)).min(limit);
                 self.bytes.resize(new_len, 0);
             }
             let read = {

@@ -306,7 +306,7 @@ pub struct IntermediaryOptions {
 /// Budget for one client-facing payload, mirroring MySQL's `max_allowed_packet`
 /// (same default, 64 MiB). Used here to bound parameter data streamed with
 /// `COM_STMT_SEND_LONG_DATA`. Configurable via `ELYRASQL_MAX_ALLOWED_PACKET`.
-fn max_allowed_packet() -> usize {
+pub(crate) fn max_allowed_packet() -> usize {
     use std::sync::OnceLock;
     static CACHE: OnceLock<usize> = OnceLock::new();
     *CACHE.get_or_init(|| {
