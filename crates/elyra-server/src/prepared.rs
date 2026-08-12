@@ -129,9 +129,9 @@ fn quote(bytes: &[u8]) -> String {
     out
 }
 
-/// Walk `sql`, invoking `on_placeholder` for each unquoted `?` and `on_char`
-/// for every other character. Tracks single/double quotes and backticks, with
-/// backslash escapes and doubled-quote escapes inside strings.
+/// Walk `sql`, invoking `on_placeholder` for each executable `?` and `on_char`
+/// for every other character. Strings, quoted identifiers, and MySQL comments
+/// are copied verbatim and never interpreted as parameter markers.
 fn scan(sql: &str, mut emit: impl FnMut(Tok)) {
     #[derive(PartialEq)]
     enum Q {
@@ -139,6 +139,8 @@ fn scan(sql: &str, mut emit: impl FnMut(Tok)) {
         Single,
         Double,
         Back,
+        LineComment,
+        BlockComment,
     }
     let mut state = Q::None;
     let mut escaped = false;
@@ -160,6 +162,20 @@ fn scan(sql: &str, mut emit: impl FnMut(Tok)) {
                     state = Q::Back;
                     emit(Tok::Char(c));
                 }
+                '#' => {
+                    state = Q::LineComment;
+                    emit(Tok::Char(c));
+                }
+                '-' if chars.get(i + 1) == Some(&'-')
+                    && chars.get(i + 2).is_none_or(|next| next.is_whitespace()) =>
+                {
+                    state = Q::LineComment;
+                    emit(Tok::Char(c));
+                }
+                '/' if chars.get(i + 1) == Some(&'*') => {
+                    state = Q::BlockComment;
+                    emit(Tok::Char(c));
+                }
                 '?' => emit(Tok::Placeholder),
                 _ => emit(Tok::Char(c)),
             },
@@ -177,6 +193,18 @@ fn scan(sql: &str, mut emit: impl FnMut(Tok)) {
                     if closes {
                         state = Q::None;
                     }
+                }
+            }
+            Q::LineComment => {
+                emit(Tok::Char(c));
+                if c == '\n' || c == '\r' {
+                    state = Q::None;
+                }
+            }
+            Q::BlockComment => {
+                emit(Tok::Char(c));
+                if c == '/' && i > 0 && chars[i - 1] == '*' {
+                    state = Q::None;
                 }
             }
         }
@@ -212,6 +240,26 @@ mod tests {
     fn placeholder_inside_string_not_bound() {
         let out = bind("SELECT '100%?' , ? FROM t", &["5".into()]).unwrap();
         assert_eq!(out, "SELECT '100%?' , 5 FROM t");
+    }
+
+    #[test]
+    fn placeholders_inside_comments_are_not_bound() {
+        for sql in [
+            "SELECT 1 -- ?\n, ?",
+            "SELECT 1 # ?\n, ?",
+            "SELECT /* ? */ ?",
+        ] {
+            assert_eq!(count_placeholders(sql), 1, "{sql}");
+            let bound = bind(sql, &["7".into()]).expect("bind executable placeholder");
+            assert!(bound.ends_with("7"), "{bound}");
+        }
+    }
+
+    #[test]
+    fn comment_placeholder_cannot_activate_bound_sql() {
+        let sql = "SELECT 1 -- ?";
+        assert_eq!(count_placeholders(sql), 0);
+        assert!(bind(sql, &["'\\nDROP TABLE secrets'".into()]).is_err());
     }
 
     #[test]
