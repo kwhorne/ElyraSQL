@@ -177,16 +177,26 @@ pub async fn column_grants(sess: &Session, user: &str, table: &str) -> Result<Op
         return Ok(None);
     }
     let prefix = elyra_core::users::col_grant_prefix(user, table);
-    let batch = sess.scan_batch(prefix.clone(), None, 4096).await?;
-    if batch.is_empty() {
+    let mut columns = scan_column_grants(sess, &prefix).await?;
+    for role in roles_of(sess, user).await? {
+        let role_prefix = elyra_core::users::col_grant_prefix(&role, table);
+        columns.extend(scan_column_grants(sess, &role_prefix).await?);
+    }
+    if columns.is_empty() {
         return Ok(None);
     }
-    Ok(Some(
-        batch
-            .iter()
-            .map(|(k, _)| String::from_utf8_lossy(&k[prefix.len()..]).into_owned())
-            .collect(),
-    ))
+    columns.sort_unstable();
+    columns.dedup();
+    Ok(Some(columns))
+}
+
+async fn scan_column_grants(sess: &Session, prefix: &[u8]) -> Result<Vec<String>> {
+    Ok(sess
+        .scan_batch(prefix.to_vec(), None, 4096)
+        .await?
+        .iter()
+        .map(|(key, _)| String::from_utf8_lossy(&key[prefix.len()..]).into_owned())
+        .collect())
 }
 
 /// The role names granted (directly) to `user`.
