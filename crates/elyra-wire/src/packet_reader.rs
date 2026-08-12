@@ -253,41 +253,50 @@ impl<'a> Deref for Packet<'a> {
 }
 
 pub(crate) fn packet(i: &[u8]) -> nom::IResult<&[u8], (u8, Packet<'_>)> {
-    nom::combinator::map(
-        nom::sequence::pair(
-            nom::multi::fold_many0(
-                fullpacket,
-                || (0, None),
-                |(seq, pkt): (_, Option<Packet<'_>>), (nseq, p)| {
-                    let pkt = if let Some(mut pkt) = pkt {
-                        assert_eq!(nseq, seq + 1);
-                        pkt.extend(p);
-                        Some(pkt)
-                    } else {
-                        Some(Packet(p, Vec::new()))
-                    };
-                    (nseq, pkt)
-                },
-            ),
-            onepacket,
-        ),
-        move |(full, last)| {
-            let seq = last.0;
-            let pkt = if let Some(mut pkt) = full.1 {
-                assert_eq!(last.0, full.0 + 1);
-                pkt.extend(last.1);
-                pkt
-            } else {
-                Packet(last.1, Vec::new())
-            };
-            (seq, pkt)
-        },
-    )(i)
+    let mut remaining = i;
+    let mut previous_seq = None;
+    let mut assembled: Option<Packet<'_>> = None;
+
+    while remaining.starts_with(&[0xff, 0xff, 0xff]) {
+        let frame_start = remaining;
+        let (rest, (seq, payload)) = fullpacket(remaining)?;
+        if previous_seq.is_some_and(|previous: u8| seq != previous.wrapping_add(1)) {
+            return Err(nom::Err::Failure(nom::error::Error::new(
+                frame_start,
+                nom::error::ErrorKind::Verify,
+            )));
+        }
+        if let Some(packet) = &mut assembled {
+            packet.extend(payload);
+        } else {
+            assembled = Some(Packet(payload, Vec::new()));
+        }
+        previous_seq = Some(seq);
+        remaining = rest;
+    }
+
+    let final_start = remaining;
+    let (remaining, (seq, payload)) = onepacket(remaining)?;
+    if previous_seq.is_some_and(|previous| seq != previous.wrapping_add(1)) {
+        return Err(nom::Err::Failure(nom::error::Error::new(
+            final_start,
+            nom::error::ErrorKind::Verify,
+        )));
+    }
+
+    let packet = if let Some(mut packet) = assembled {
+        packet.extend(payload);
+        packet
+    } else {
+        Packet(payload, Vec::new())
+    };
+    Ok((remaining, (seq, packet)))
 }
 
 #[cfg(test)]
 mod reader_tests {
-    use super::PacketReader;
+    use super::{packet, PacketReader};
+    use crate::U24_MAX;
 
     fn frame(seq: u8, payload: &[u8]) -> Vec<u8> {
         let mut v = Vec::new();
@@ -326,5 +335,27 @@ mod reader_tests {
             r.next_async().await.unwrap().is_none(),
             "expected end of stream"
         );
+    }
+
+    #[test]
+    fn rejects_discontinuous_multi_packet_sequence_without_panicking() {
+        let mut buf = Vec::with_capacity(U24_MAX + 9);
+        buf.extend_from_slice(&[0xff, 0xff, 0xff, 0]);
+        buf.resize(4 + U24_MAX, 0);
+        buf.extend_from_slice(&[1, 0, 0, 2, 0]);
+
+        assert!(packet(&buf).is_err());
+    }
+
+    #[test]
+    fn accepts_wrapped_multi_packet_sequence() {
+        let mut buf = Vec::with_capacity(U24_MAX + 9);
+        buf.extend_from_slice(&[0xff, 0xff, 0xff, u8::MAX]);
+        buf.resize(4 + U24_MAX, 0);
+        buf.extend_from_slice(&[1, 0, 0, 0, 1]);
+
+        let (_, (seq, parsed)) = packet(&buf).expect("wrapped sequence is valid");
+        assert_eq!(seq, 0);
+        assert_eq!(parsed.len(), U24_MAX + 1);
     }
 }

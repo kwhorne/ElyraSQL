@@ -54,6 +54,19 @@ mod tls;
 mod value;
 mod writers;
 
+/// Exercise network-facing protocol parsers with arbitrary input.
+///
+/// This is intentionally a no-result API: fuzzers assert that malformed input
+/// is rejected without panicking or performing unbounded allocation.
+#[doc(hidden)]
+pub fn fuzz_parse_protocol(input: &[u8]) {
+    let _ = commands::client_handshake(input, false);
+    let _ = commands::client_handshake(input, true);
+    let _ = commands::parse(input);
+    let _ = packet_reader::onepacket(input);
+    let _ = packet_reader::packet(input);
+}
+
 // max payload size 2^(24-1)
 pub const U24_MAX: usize = 16_777_215;
 
