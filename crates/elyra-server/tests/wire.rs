@@ -10893,6 +10893,75 @@ async fn prepared_statement_slots_are_reclaimed_on_close() {
     }
 }
 
+#[tokio::test]
+async fn revoked_select_user_connects_but_cannot_read_tables() {
+    let srv = TestServer::start_with_auth("root", "rootpw").await;
+    let mut root = srv.conn_as("root", "rootpw").await;
+    root.query_drop("CREATE TABLE revoked_secrets (id INT PRIMARY KEY, secret TEXT)")
+        .await
+        .unwrap();
+    root.query_drop("INSERT INTO revoked_secrets VALUES (1, 'classified')")
+        .await
+        .unwrap();
+    root.query_drop("CREATE USER revoked_reader IDENTIFIED BY 'passw0rd'")
+        .await
+        .unwrap();
+    root.query_drop("GRANT SELECT ON *.* TO revoked_reader")
+        .await
+        .unwrap();
+    root.query_drop("REVOKE SELECT ON *.* FROM revoked_reader")
+        .await
+        .unwrap();
+
+    let mut reader = srv.conn_as("revoked_reader", "passw0rd").await;
+    let one: i64 = reader.query_first("SELECT 1").await.unwrap().unwrap();
+    assert_eq!(one, 1);
+    assert!(reader
+        .query_drop("SELECT secret FROM revoked_secrets")
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn derived_table_cannot_bypass_column_grants() {
+    let srv = TestServer::start_with_auth("root", "rootpw").await;
+    let mut root = srv.conn_as("root", "rootpw").await;
+    root.query_drop("CREATE TABLE derived_vault (public TEXT, secret TEXT)")
+        .await
+        .unwrap();
+    root.query_drop("INSERT INTO derived_vault VALUES ('hello', 'classified')")
+        .await
+        .unwrap();
+    root.query_drop("CREATE USER derived_limited IDENTIFIED BY 'passw0rd'")
+        .await
+        .unwrap();
+    root.query_drop("GRANT SELECT(public) ON derived_vault TO derived_limited")
+        .await
+        .unwrap();
+
+    let mut limited = srv.conn_as("derived_limited", "passw0rd").await;
+    assert!(limited
+        .query_drop("SELECT secret FROM derived_vault")
+        .await
+        .is_err());
+    assert!(
+        limited
+            .query_drop(
+                "SELECT secret FROM (SELECT secret FROM derived_vault) AS nested_derived_vault",
+            )
+            .await
+            .is_err()
+    );
+    assert!(limited
+        .query_drop("SELECT (SELECT secret FROM derived_vault)")
+        .await
+        .is_err());
+    assert!(limited
+        .query_drop("WITH nested AS (SELECT secret FROM derived_vault) SELECT secret FROM nested")
+        .await
+        .is_err());
+}
+
 // Connections are capped server-wide (MySQL's max_connections), so a slot MUST be
 // returned when a connection ends. Cycling through far more connections than the
 // 151 default would start failing with error 1040 partway through if the permit
