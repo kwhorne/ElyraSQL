@@ -176,25 +176,11 @@ impl Auth {
             return false;
         };
 
-        // Brute-force lockout: reject while an account is temporarily locked.
         let threshold = max_failures();
-        if threshold > 0 {
-            let locked = self
-                .failures
-                .lock()
-                .unwrap()
-                .get(user)
-                .and_then(|f| f.locked_until)
-                .is_some_and(|t| Instant::now() < t);
-            if locked {
-                warn!(user, "authentication rejected: account temporarily locked");
-                return false;
-            }
-        }
-
+        let known = self.lookup(user).is_some();
         let ok = self.verify_raw(user, salt, auth_data);
 
-        if threshold > 0 {
+        if threshold > 0 && known {
             let mut map = self.failures.lock().unwrap();
             if ok {
                 map.remove(user);
@@ -264,24 +250,12 @@ impl Auth {
             return false;
         };
         let threshold = max_failures();
-        if threshold > 0 {
-            let locked = self
-                .failures
-                .lock()
-                .unwrap()
-                .get(user)
-                .and_then(|f| f.locked_until)
-                .is_some_and(|t| Instant::now() < t);
-            if locked {
-                warn!(user, "authentication rejected: account temporarily locked");
-                return false;
-            }
-        }
-        let ok = match self.lookup(user) {
-            Some((stored, _)) => ct_eq(&double_sha1(password), &stored),
+        let account = self.lookup(user);
+        let ok = match &account {
+            Some((stored, _)) => ct_eq(&double_sha1(password), stored),
             None => false,
         };
-        if threshold > 0 {
+        if threshold > 0 && account.is_some() {
             let mut map = self.failures.lock().unwrap();
             if ok {
                 map.remove(user);
