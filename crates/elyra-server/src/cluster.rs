@@ -293,6 +293,20 @@ impl Node {
 
     /// Start the control listener and the election / replication loops.
     pub async fn run(self: Arc<Self>) -> std::io::Result<()> {
+        if crate::listen_is_exposed(&self.cfg.control_listen)
+            && !has_cluster_secret()
+            && !crate::env_flag("ELYRASQL_ALLOW_OPEN_AUTH")
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "refusing to expose Raft control on {} without authentication; set \
+                     ELYRASQL_CLUSTER_SECRET, bind to localhost, or explicitly enable \
+                     ELYRASQL_ALLOW_OPEN_AUTH",
+                    self.cfg.control_listen
+                ),
+            ));
+        }
         let listener = TcpListener::bind(&self.cfg.control_listen).await?;
         let tls = cluster_server_tls()?.map(TlsAcceptor::from);
         info!(id = self.cfg.id, addr = %self.cfg.control_listen, tls = tls.is_some(), "raft control plane listening");
