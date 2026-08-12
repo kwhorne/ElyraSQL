@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use elyra_core::users::{decode_user, user_key, UserRecord, USER_PREFIX};
+use elyra_core::users::{decode_user, role_flag_key, user_key, UserRecord, USER_PREFIX};
 use elyra_core::Privilege;
 use elyra_storage::Db;
 use sha1::{Digest, Sha1};
@@ -125,6 +125,10 @@ impl Auth {
     fn persistent(&self, user: &str) -> Option<UserRecord> {
         let db = self.db.as_ref()?;
         let snap = db.snapshot().ok()?;
+        let role_marker = snap.get(&role_flag_key(user)).ok()?;
+        if role_marker.is_some() {
+            return None;
+        }
         let bytes = snap.get(&user_key(user)).ok()??;
         decode_user(&bytes)
     }
@@ -135,11 +139,13 @@ impl Auth {
             return false;
         };
         let Ok(snap) = db.snapshot() else {
-            return false;
+            // A configured persistent store must never become open authentication
+            // merely because its account catalogue cannot currently be read.
+            return true;
         };
         snap.scan_range(USER_PREFIX, None, 1)
             .map(|rows| rows.iter().any(|(k, _)| k.starts_with(USER_PREFIX)))
-            .unwrap_or(false)
+            .unwrap_or(true)
     }
 
     /// Look up an account's stored digest and privilege from either source.
@@ -416,5 +422,28 @@ mod tests {
     #[test]
     fn salts_differ() {
         assert_ne!(generate_salt(), generate_salt());
+    }
+
+    #[tokio::test]
+    async fn persistent_role_is_not_a_login_account() {
+        let db = Db::in_memory().expect("in-memory database");
+        let role = UserRecord {
+            digest: double_sha1(b""),
+            privilege: Privilege::Admin,
+        };
+        db.commit(
+            vec![
+                (user_key("reporting"), elyra_core::users::encode_user(&role)),
+                (role_flag_key("reporting"), vec![1]),
+            ],
+            vec![],
+        )
+        .await
+        .expect("store role");
+
+        let auth = Auth::open().with_db(db);
+        assert!(!auth.is_open());
+        assert!(!auth.verify(b"reporting", &generate_salt(), b""));
+        assert!(!auth.verify_cleartext(b"reporting", b""));
     }
 }
