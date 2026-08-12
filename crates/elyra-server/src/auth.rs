@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use elyra_core::users::{decode_user, role_flag_key, user_key, UserRecord, USER_PREFIX};
 use elyra_core::Privilege;
@@ -24,25 +24,15 @@ use tracing::warn;
 #[derive(Default)]
 struct FailState {
     fails: u32,
-    locked_until: Option<Instant>,
 }
 
-/// Max consecutive failed logins before an account is temporarily locked
-/// (`ELYRASQL_AUTH_MAX_FAILURES`, 0 = disabled).
+/// Failed-login warning threshold (`ELYRASQL_AUTH_MAX_FAILURES`, 0 = disabled).
+/// Correct credentials are never locked out by unauthenticated traffic.
 fn max_failures() -> u32 {
     std::env::var("ELYRASQL_AUTH_MAX_FAILURES")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(10)
-}
-
-/// Lockout duration in seconds after too many failures
-/// (`ELYRASQL_AUTH_LOCKOUT_SECS`).
-fn lockout_secs() -> u64 {
-    std::env::var("ELYRASQL_AUTH_LOCKOUT_SECS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(60)
 }
 
 /// Credential store. Accounts come from two places: a `bootstrap` map supplied
@@ -53,7 +43,7 @@ fn lockout_secs() -> u64 {
 pub struct Auth {
     bootstrap: HashMap<String, ([u8; 20], Privilege)>,
     db: Option<Db>,
-    /// Per-account failed-login state for brute-force lockout.
+    /// Bounded failed-login state: only known accounts are inserted.
     failures: Mutex<HashMap<String, FailState>>,
     /// RSA keypair for `caching_sha2_password` full auth over a non-TLS channel
     /// (the client encrypts the password with this key). Generated on first use.
@@ -212,14 +202,8 @@ impl Auth {
                 let f = map.entry(user.to_string()).or_default();
                 f.fails += 1;
                 if f.fails >= threshold {
-                    f.locked_until =
-                        Some(Instant::now() + std::time::Duration::from_secs(lockout_secs()));
                     f.fails = 0;
-                    warn!(
-                        user,
-                        lockout_secs = lockout_secs(),
-                        "account locked after too many failed logins"
-                    );
+                    warn!(user, "authentication failure threshold reached");
                 } else {
                     warn!(user, fails = f.fails, "failed login");
                 }
@@ -305,10 +289,8 @@ impl Auth {
                 let f = map.entry(user.to_string()).or_default();
                 f.fails += 1;
                 if f.fails >= threshold {
-                    f.locked_until =
-                        Some(Instant::now() + std::time::Duration::from_secs(lockout_secs()));
                     f.fails = 0;
-                    warn!(user, "account locked after too many failed logins");
+                    warn!(user, "authentication failure threshold reached");
                 } else {
                     warn!(user, fails = f.fails, "failed login");
                 }
