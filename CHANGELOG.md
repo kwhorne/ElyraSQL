@@ -6,6 +6,37 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **`DISTINCT` and `GROUP BY` collapse numerically equal `DECIMAL` values.**
+  In-memory grouping keys rendered `DECIMAL` through its Rust debug
+  representation, so `1.0` and `1.00` -- the same number at different scales,
+  which is exactly what a `UNION` of differently-declared `DECIMAL` columns
+  produces -- keyed differently and survived as two rows:
+
+  ```sql
+  SELECT DISTINCT v FROM (SELECT 1.0 AS v UNION ALL SELECT 1.00 AS v) t;
+  ```
+
+  returned two rows where MySQL returns one, and `GROUP BY v` likewise formed
+  two groups. Keys now canonicalise the scale, exactly and at any `i128`
+  magnitude. On-disk index keys were never affected (they use a separate
+  encoding).
+
+- **A DDL rewrite inside a transaction can no longer exceed
+  `ELYRASQL_TXN_MAX_BYTES`.** The rewrite budget counted only the staged write
+  set while the write path enforces staged writes *plus* the savepoint undo log,
+  so a rewrite sized against the budget could overshoot by the size of that log.
+
+### Changed
+
+- **Documentation: there is no login lockout.** `ELYRASQL_AUTH_LOCKOUT_SECS` was
+  removed with the lockout mechanism, but the configuration and limitations
+  pages still documented both, so the limitations page claimed a brute-force
+  defence the server does not have. `ELYRASQL_AUTH_MAX_FAILURES` remains as a
+  logging threshold only. Rate limiting that cannot itself be used to lock out a
+  valid account is not implemented yet, and is now stated as such.
+
 ### Added
 
 - **Numeric `RANGE` and `GROUPS` window frames.** Aggregate windows now support

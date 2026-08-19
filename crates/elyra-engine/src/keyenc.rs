@@ -60,6 +60,13 @@ fn encode_component(value: &Value, coll: Collation, out: &mut Vec<u8>) -> Result
         Value::DateTime(t) => {
             out.extend_from_slice(&(*t as u64 ^ 0x8000_0000_0000_0000).to_be_bytes())
         }
+        // Only the unscaled integer is encoded, deliberately: every value in a
+        // given DECIMAL column has been coerced to that column's declared
+        // scale before it reaches a key, so unscaled order is the numeric
+        // order and the mapping is injective *within one column*. Keys are
+        // never compared across columns. Should a future path ever index
+        // mixed-scale decimals, this arm has to encode the scale too --
+        // Decimal(10, 1) is 1.0 and Decimal(10, 2) is 0.10.
         Value::Decimal(u, _) => out.extend_from_slice(&(*u as u128 ^ (1u128 << 127)).to_be_bytes()),
         Value::Time(t) => out.extend_from_slice(&(*t as u64 ^ 0x8000_0000_0000_0000).to_be_bytes()),
         Value::Bool(b) => out.push(*b as u8),

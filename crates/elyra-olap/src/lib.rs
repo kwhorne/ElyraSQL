@@ -326,6 +326,13 @@ impl GroupAggregator {
 /// cheaper than formatting each value with `Debug` (hot path for GROUP BY).
 /// Encode the group key into a caller-owned buffer (cleared first), so the hot
 /// path can reuse one allocation and look up existing groups without copying.
+/// Encode the grouping columns of `row` into `out`.
+///
+/// Delegates to [`Value::push_collation_key_coll`] rather than encoding values
+/// here: `DISTINCT` and `COUNT(DISTINCT ...)` key through that same function, so
+/// a second implementation means the two disagree about which values are equal.
+/// They did -- this one had no `UInt` arm and rendered `DECIMAL` through its
+/// debug representation, so `GROUP BY` split groups that `DISTINCT` collapsed.
 fn group_key_into(
     cols: &[usize],
     colls: &[elyra_core::Collation],
@@ -334,41 +341,10 @@ fn group_key_into(
 ) {
     out.clear();
     for (ci, &i) in cols.iter().enumerate() {
-        let is_bin = colls.get(ci).map(|c| c.is_bin()).unwrap_or(false);
+        let coll = colls.get(ci).copied().unwrap_or_default();
         match row.get(i) {
-            None | Some(Value::Null) => out.push(0),
-            Some(Value::Int(v)) => {
-                out.push(1);
-                out.extend_from_slice(&v.to_le_bytes());
-            }
-            Some(Value::Bool(b)) => {
-                out.push(2);
-                out.push(*b as u8);
-            }
-            Some(Value::Float(f)) => {
-                out.push(3);
-                out.extend_from_slice(&elyra_core::canonical_f64_bits(*f).to_le_bytes());
-            }
-            Some(Value::Text(s)) | Some(Value::Json(s)) => {
-                // Case-fold for the default collation; keep exact bytes for `_bin`
-                // so GROUP BY on a binary column distinguishes case.
-                let folded;
-                let bytes: &str = if is_bin {
-                    s
-                } else {
-                    folded = elyra_core::fold(s);
-                    &folded
-                };
-                out.push(4);
-                out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-                out.extend_from_slice(bytes.as_bytes());
-            }
-            Some(other) => {
-                out.push(5);
-                let s = format!("{other:?}");
-                out.extend_from_slice(&(s.len() as u32).to_le_bytes());
-                out.extend_from_slice(s.as_bytes());
-            }
+            Some(value) => value.push_collation_key_coll(out, coll),
+            None => Value::Null.push_collation_key_coll(out, coll),
         }
     }
 }

@@ -212,6 +212,21 @@ impl Value {
                 out.push(6);
                 out.extend_from_slice(&u.to_le_bytes());
             }
+            // DECIMAL keys on its *numeric* value, not its representation:
+            // 1.0 is `Decimal(10, 1)` and 1.00 is `Decimal(100, 2)`, and both
+            // must land in the same GROUP BY group and collapse under DISTINCT.
+            // Stripping trailing zeros gives one canonical (unscaled, scale)
+            // pair per number, so the key stays exact for any i128 magnitude.
+            Value::Decimal(unscaled, scale) => {
+                let (mut unscaled, mut scale) = (*unscaled, *scale);
+                while scale > 0 && unscaled % 10 == 0 {
+                    unscaled /= 10;
+                    scale -= 1;
+                }
+                out.push(7);
+                out.extend_from_slice(&unscaled.to_le_bytes());
+                out.push(scale);
+            }
             other => {
                 out.push(5);
                 let s = format!("{other:?}");
@@ -751,6 +766,35 @@ mod collation_tests {
         assert_ne!(
             Value::Text("5".into()).collation_key(),
             Value::Int(5).collation_key()
+        );
+    }
+
+    #[test]
+    fn decimal_keys_ignore_trailing_zero_scale() {
+        // 1.0 and 1.00 are the same number; DISTINCT and GROUP BY must treat
+        // them as one value even when the scales differ, as they do after a
+        // UNION of differently-declared DECIMAL columns.
+        assert_eq!(
+            Value::Decimal(10, 1).collation_key(),
+            Value::Decimal(100, 2).collation_key()
+        );
+        assert_eq!(
+            Value::Decimal(0, 0).collation_key(),
+            Value::Decimal(0, 4).collation_key()
+        );
+        // Genuinely different numbers keep different keys.
+        assert_ne!(
+            Value::Decimal(10, 1).collation_key(),
+            Value::Decimal(10, 2).collation_key()
+        );
+        assert_ne!(
+            Value::Decimal(1, 0).collation_key(),
+            Value::Decimal(-1, 0).collation_key()
+        );
+        // Exact past 2^53, where keying through an f64 would collapse them.
+        assert_ne!(
+            Value::Decimal(9_007_199_254_740_993, 0).collation_key(),
+            Value::Decimal(9_007_199_254_740_992, 0).collation_key()
         );
     }
 
