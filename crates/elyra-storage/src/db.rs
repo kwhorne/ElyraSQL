@@ -158,7 +158,7 @@ pub struct Db {
     repl_tx: broadcast::Sender<Arc<WriteEvent>>,
     /// Per-replica highest acknowledged LSN (keyed by a registration id), for
     /// quorum/synchronous replication.
-    replicas: Arc<Mutex<HashMap<u64, u64>>>,
+    replicas: Arc<Mutex<HashMap<u64, ReplicaProgress>>>,
     /// Woken whenever a replica advances its ack, so commit barriers re-check.
     ack_notify: Arc<Notify>,
     /// Allocator for replica registration ids.
@@ -175,6 +175,12 @@ pub struct Db {
     /// Optional consensus layer: when installed (cluster mode), the leader
     /// routes mutations through it (Raft) instead of committing locally.
     consensus: Arc<Mutex<Option<Arc<dyn Consensus>>>>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct ReplicaProgress {
+    sent: u64,
+    acknowledged: u64,
 }
 
 impl Db {
@@ -343,7 +349,10 @@ impl Db {
     /// Register a replica for quorum accounting; returns its id.
     pub fn register_replica(&self) -> u64 {
         let id = self.next_replica.fetch_add(1, Ordering::SeqCst);
-        self.replicas.lock().unwrap().insert(id, 0);
+        self.replicas
+            .lock()
+            .unwrap()
+            .insert(id, ReplicaProgress::default());
         self.ack_notify.notify_waiters();
         id
     }
@@ -354,13 +363,23 @@ impl Db {
         self.ack_notify.notify_waiters();
     }
 
-    /// Record that replica `id` has applied up to `lsn`.
+    /// Record the highest LSN actually sent to replica `id`.
+    pub fn report_sent(&self, id: u64, lsn: u64) {
+        if let Some(progress) = self.replicas.lock().unwrap().get_mut(&id) {
+            progress.sent = progress.sent.max(lsn);
+        }
+    }
+
+    /// Record that replica `id` has applied up to `lsn`. Impossible future
+    /// acknowledgements are ignored until that LSN has actually been sent.
     pub fn report_ack(&self, id: u64, lsn: u64) {
         {
             let mut m = self.replicas.lock().unwrap();
-            let e = m.entry(id).or_insert(0);
-            if lsn > *e {
-                *e = lsn;
+            let Some(progress) = m.get_mut(&id) else {
+                return;
+            };
+            if lsn <= progress.sent && lsn > progress.acknowledged {
+                progress.acknowledged = lsn;
             }
         }
         self.ack_notify.notify_waiters();
@@ -376,7 +395,7 @@ impl Db {
             .lock()
             .unwrap()
             .values()
-            .filter(|&&v| v >= target)
+            .filter(|progress| progress.acknowledged >= target)
             .count()
     }
 

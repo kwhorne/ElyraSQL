@@ -25,16 +25,32 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tracing::{info, warn};
 
 /// Server-side TLS for the replication endpoint, from `ELYRASQL_CLUSTER_TLS_CERT`
-/// + `ELYRASQL_CLUSTER_TLS_KEY`. `None` (plaintext) unless both are set.
-pub(crate) fn cluster_server_tls() -> Option<Arc<ServerConfig>> {
-    let cert = std::env::var("ELYRASQL_CLUSTER_TLS_CERT").ok()?;
-    let key = std::env::var("ELYRASQL_CLUSTER_TLS_KEY").ok()?;
-    match crate::load_tls(&cert, &key) {
-        Ok(cfg) => Some(Arc::new(cfg)),
-        Err(e) => {
-            warn!(error = %e, "cluster TLS cert/key failed to load; replication stays plaintext");
-            None
-        }
+/// + `ELYRASQL_CLUSTER_TLS_KEY`. `None` (plaintext) only when neither is set.
+///
+/// Partial or invalid TLS configuration fails closed.
+pub(crate) fn cluster_server_tls() -> std::io::Result<Option<Arc<ServerConfig>>> {
+    let cert = std::env::var("ELYRASQL_CLUSTER_TLS_CERT");
+    let key = std::env::var("ELYRASQL_CLUSTER_TLS_KEY");
+    match (cert, key) {
+        (Err(std::env::VarError::NotPresent), Err(std::env::VarError::NotPresent)) => Ok(None),
+        (Ok(cert), Ok(key)) => crate::load_tls(&cert, &key).map(|cfg| Some(Arc::new(cfg))),
+        (cert, key) => Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "cluster TLS requires both ELYRASQL_CLUSTER_TLS_CERT and \
+                 ELYRASQL_CLUSTER_TLS_KEY (cert: {}, key: {})",
+                env_status(&cert),
+                env_status(&key)
+            ),
+        )),
+    }
+}
+
+fn env_status(value: &Result<String, std::env::VarError>) -> &'static str {
+    match value {
+        Ok(_) => "set",
+        Err(std::env::VarError::NotPresent) => "unset",
+        Err(std::env::VarError::NotUnicode(_)) => "non-Unicode",
     }
 }
 
@@ -75,18 +91,17 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> DuplexStream for T {}
 
 /// Process-wide cached client TLS config for outbound cluster connections
 /// (Raft RPCs reuse this rather than re-parsing the CA on every call). A load
-/// error is logged once and treated as "no TLS" (plaintext), matching the
-/// replica path.
-pub(crate) fn cluster_client_tls_cached() -> Option<(TlsConnector, ServerName<'static>)> {
+/// error is cached and returned on every attempted connection so an explicitly
+/// configured cluster never silently downgrades to plaintext.
+pub(crate) fn cluster_client_tls_cached(
+) -> std::io::Result<Option<(TlsConnector, ServerName<'static>)>> {
     use std::sync::OnceLock;
-    static C: OnceLock<Option<(TlsConnector, ServerName<'static>)>> = OnceLock::new();
-    C.get_or_init(|| {
-        cluster_client_tls().unwrap_or_else(|e| {
-            warn!(error = %e, "cluster client TLS config failed to load; cluster connections stay plaintext");
-            None
-        })
-    })
-    .clone()
+    type CachedTls = Result<Option<(TlsConnector, ServerName<'static>)>, (ErrorKind, String)>;
+    static C: OnceLock<CachedTls> = OnceLock::new();
+    match C.get_or_init(|| cluster_client_tls().map_err(|e| (e.kind(), e.to_string()))) {
+        Ok(tls) => Ok(tls.clone()),
+        Err((kind, message)) => Err(Error::new(*kind, message.clone())),
+    }
 }
 
 /// One framed replication message.
@@ -173,7 +188,7 @@ pub async fn serve_replication(addr: String, db: Db) -> std::io::Result<()> {
     if !crate::cluster::has_cluster_secret() {
         warn!(%addr, "replication endpoint is UNAUTHENTICATED - set ELYRASQL_CLUSTER_SECRET for production");
     }
-    let tls = cluster_server_tls().map(TlsAcceptor::from);
+    let tls = cluster_server_tls()?.map(TlsAcceptor::from);
     let listener = TcpListener::bind(&addr).await?;
     info!(%addr, tls = tls.is_some(), "ElyraSQL replication endpoint listening");
     if tls.is_none() {
@@ -270,6 +285,7 @@ where
                 break;
             }
         }
+        db.report_sent(replica_id, snap_lsn);
         send_msg(&mut stream, &ReplMsg::SnapEnd { lsn: snap_lsn }).await?;
     }
 
@@ -281,6 +297,7 @@ where
                     let WriteEvent {
                         lsn, puts, deletes, ..
                     } = &*ev;
+                    db.report_sent(replica_id, *lsn);
                     send_msg(
                         &mut stream,
                         &ReplMsg::Write {

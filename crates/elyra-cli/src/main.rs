@@ -380,7 +380,6 @@ async fn run() -> anyhow::Result<()> {
             // Route all writes through the Raft log (leader proposes; commit +
             // apply before the client is acknowledged).
             db.set_consensus(node.clone());
-            tokio::spawn(node.clone().run());
             tokio::spawn(elyra_server::cluster::follow_leadership(
                 node.clone(),
                 read_only.clone(),
@@ -396,7 +395,10 @@ async fn run() -> anyhow::Result<()> {
                 replication_listen: Some(replication_listen),
                 read_only,
             };
-            elyra_server::serve(config, engine).await?;
+            tokio::select! {
+                result = node.run() => result?,
+                result = elyra_server::serve(config, engine) => result?,
+            }
         }
         Command::Replica {
             primary,
