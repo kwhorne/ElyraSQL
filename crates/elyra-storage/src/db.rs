@@ -910,7 +910,7 @@ fn apply_job_group(storage: &Arc<Storage>, jobs: Vec<WriteJob>, repl: &mut Repl)
                 let _ = job.ack.send(Ok(()));
             }
         }
-        Err(Error::Duplicate(_)) => {
+        Err(Error::Duplicate(..)) => {
             // A duplicate somewhere in the group: redo each job on its own so
             // only the statement with the duplicate fails.
             for job in jobs {

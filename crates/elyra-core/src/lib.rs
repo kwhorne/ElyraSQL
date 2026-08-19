@@ -13,7 +13,7 @@ pub mod types;
 pub mod users;
 pub mod value;
 
-pub use error::{Error, Result};
+pub use error::{CatalogError, DuplicateError, Error, Result};
 pub use types::{Collation, ColumnDef, ColumnType, ResultColumnMetadata, Schema};
 pub use value::{canonical_f64_bits, fold, Value};
 

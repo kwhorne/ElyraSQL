@@ -4,7 +4,9 @@
 //! Inserts are batched into one group-commit; scans stream.
 
 use crate::session::Session;
-use elyra_core::{ColumnDef, ColumnType, Error, Result, Schema, Value};
+use elyra_core::{
+    CatalogError, ColumnDef, ColumnType, DuplicateError, Error, Result, Schema, Value,
+};
 use sqlparser::ast::{
     AlterColumnOperation, AlterTableOperation, Assignment, AssignmentTarget, CharacterLength,
     ColumnOption, CreateIndex, CreateTable, DataType, Delete, ExactNumberInfo, FromTable, Ident,
@@ -45,7 +47,10 @@ pub(crate) fn stored_table_ident(db: &Session, name: &ObjectName) -> Result<Stri
         [table] => Ok(table.value.clone()),
         [schema, table] if schema.value == db.database() => Ok(table.value.clone()),
         [schema, _] => Err(Error::UnknownDatabase(schema.value.clone())),
-        [] => Err(Error::Catalog("empty table name".into())),
+        [] => Err(Error::Catalog(
+            CatalogError::Missing,
+            "empty table name".into(),
+        )),
         _ => Err(Error::Parse(format!(
             "invalid qualified table name: {name}"
         ))),
@@ -58,7 +63,10 @@ pub(crate) fn selected_database_ident(db: &Session, name: &ObjectName) -> Result
     match name.0.as_slice() {
         [database] if database.value == db.database() => Ok(()),
         [database] => Err(Error::UnknownDatabase(database.value.clone())),
-        [] => Err(Error::Catalog("empty database name".into())),
+        [] => Err(Error::Catalog(
+            CatalogError::Missing,
+            "empty database name".into(),
+        )),
         _ => Err(Error::Parse(format!(
             "invalid qualified database name: {name}"
         ))),
@@ -479,7 +487,10 @@ pub async fn create_table(
         if ct.if_not_exists {
             return Ok(QueryResult::Affected(0));
         }
-        return Err(Error::Catalog(format!("table already exists: {name}")));
+        return Err(Error::Catalog(
+            CatalogError::Exists,
+            format!("table already exists: {name}"),
+        ));
     }
 
     // CREATE TABLE ... LIKE source: copy the structure, no data.
@@ -523,10 +534,10 @@ pub async fn create_table(
             .iter()
             .any(|earlier| predicate::identifier_eq(&earlier.name.value, &col.name.value))
         {
-            return Err(Error::Duplicate(format!(
-                "duplicate column name '{}'",
-                col.name.value
-            )));
+            return Err(Error::Duplicate(
+                DuplicateError::ColumnName,
+                format!("duplicate column name '{}'", col.name.value),
+            ));
         }
         let ty = map_type(&col.data_type)?;
         let declared_type = declaration_from_data_type(&col.data_type)?;
@@ -631,7 +642,10 @@ pub async fn create_table(
                         .iter()
                         .position(|c| predicate::identifier_eq(&c.name, &ident.value))
                         .ok_or_else(|| {
-                            Error::Catalog(format!("unknown primary key column: {}", ident.value))
+                            Error::Catalog(
+                                CatalogError::UnknownColumn,
+                                format!("unknown primary key column: {}", ident.value),
+                            )
                         })?;
                     columns[i].nullable = false;
                     pk_cols.push(i);
@@ -649,7 +663,10 @@ pub async fn create_table(
                         .iter()
                         .position(|c| predicate::identifier_eq(&c.name, &ident.value))
                         .ok_or_else(|| {
-                            Error::Catalog(format!("unknown unique column: {}", ident.value))
+                            Error::Catalog(
+                                CatalogError::UnknownColumn,
+                                format!("unknown unique column: {}", ident.value),
+                            )
                         })?;
                     idxs.push(i);
                 }
@@ -690,7 +707,10 @@ pub async fn create_table(
                         .iter()
                         .position(|column| predicate::identifier_eq(&column.name, &ident.value))
                         .ok_or_else(|| {
-                            Error::Catalog(format!("unknown index column: {}", ident.value))
+                            Error::Catalog(
+                                CatalogError::UnknownColumn,
+                                format!("unknown index column: {}", ident.value),
+                            )
                         })?;
                     idxs.push(i);
                 }
@@ -737,7 +757,10 @@ pub async fn create_table(
                         .iter()
                         .position(|c| predicate::identifier_eq(&c.name, &ident.value))
                         .ok_or_else(|| {
-                            Error::Catalog(format!("unknown foreign key column: {}", ident.value))
+                            Error::Catalog(
+                                CatalogError::UnknownColumn,
+                                format!("unknown foreign key column: {}", ident.value),
+                            )
                         })?;
                     fk_cols.push(i);
                 }
@@ -898,7 +921,7 @@ async fn explain_first_access(
     let selection = select.and_then(|select| select.selection.as_ref());
     let def = match catalog::load(db, table).await {
         Ok(def) => def,
-        Err(Error::Catalog(_)) => {
+        Err(Error::Catalog(..)) => {
             return Ok(ExplainAccess {
                 kind: "ALL",
                 possible_keys: None,
@@ -1043,7 +1066,7 @@ pub async fn explain(db: &Session, stmt: &sqlparser::ast::Statement) -> Result<Q
     let indexed_join = match select {
         Some(select) => match guaranteed_indexed_join_access(db, select).await {
             Ok(access) => access,
-            Err(Error::Catalog(_) | Error::UnknownDatabase(_)) => None,
+            Err(Error::Catalog(..) | Error::UnknownDatabase(_)) => None,
             Err(error) => return Err(error),
         },
         None => None,
@@ -2319,7 +2342,7 @@ async fn information_schema(
                         // A dropped or not-yet-created parent must not make the
                         // whole metadata view unreadable. Its unique-key fields
                         // are unknown, but the foreign-key row is still useful.
-                        Err(Error::Catalog(_)) => None,
+                        Err(Error::Catalog(..)) => None,
                         Err(error) => return Err(error),
                     };
                     let unique_catalog = unique_constraint
@@ -3023,7 +3046,12 @@ async fn alter_add_primary_key_shadow(
                 .columns
                 .iter()
                 .position(|candidate| predicate::identifier_eq(&candidate.name, &column.value))
-                .ok_or_else(|| Error::Catalog(format!("unknown column: {column}")))?;
+                .ok_or_else(|| {
+                    Error::Catalog(
+                        CatalogError::UnknownColumn,
+                        format!("unknown column: {column}"),
+                    )
+                })?;
             if primary_columns.contains(&index) {
                 return Err(Error::Query(format!(
                     "duplicate column '{}' in primary key",
@@ -3186,7 +3214,12 @@ async fn alter_table_inner(
                     .columns
                     .iter()
                     .position(|c| predicate::identifier_eq(&c.name, &old_column_name.value))
-                    .ok_or_else(|| Error::Catalog(format!("unknown column: {old_column_name}")))?;
+                    .ok_or_else(|| {
+                        Error::Catalog(
+                            CatalogError::UnknownColumn,
+                            format!("unknown column: {old_column_name}"),
+                        )
+                    })?;
                 def.schema.columns[i].name = new_column_name.value.clone();
             }
             AlterTableOperation::RenameTable { table_name } => {
@@ -3248,10 +3281,10 @@ async fn alter_table_inner(
                             .iter()
                             .position(|c| predicate::identifier_eq(&c.name, &ident.value))
                             .ok_or_else(|| {
-                                Error::Catalog(format!(
-                                    "unknown foreign key column: {}",
-                                    ident.value
-                                ))
+                                Error::Catalog(
+                                    CatalogError::UnknownColumn,
+                                    format!("unknown foreign key column: {}", ident.value),
+                                )
                             })?;
                         fk_cols.push(i);
                     }
@@ -3373,7 +3406,12 @@ async fn alter_add_primary_key(db: &Session, def: &mut TableDef, columns: &[Iden
             .columns
             .iter()
             .position(|candidate| predicate::identifier_eq(&candidate.name, &column.value))
-            .ok_or_else(|| Error::Catalog(format!("unknown column: {column}")))?;
+            .ok_or_else(|| {
+                Error::Catalog(
+                    CatalogError::UnknownColumn,
+                    format!("unknown column: {column}"),
+                )
+            })?;
         if pk_cols.contains(&index) {
             return Err(Error::Query(format!(
                 "duplicate column '{}' in primary key",
@@ -3417,7 +3455,10 @@ async fn alter_add_primary_key(db: &Session, def: &mut TableDef, columns: &[Iden
             }
             let clustered = keyenc::encode_columns_coll(&row, &def.pk_cols, &pk_collations)?;
             if !clustered_keys.insert(clustered.clone()) {
-                return Err(Error::Duplicate("duplicate primary key".into()));
+                return Err(Error::Duplicate(
+                    DuplicateError::Entry,
+                    "duplicate primary key".into(),
+                ));
             }
             let mut new_key = clustered_prefix.clone();
             new_key.extend_from_slice(&clustered);
@@ -3529,7 +3570,12 @@ async fn alter_change_column(
         .columns
         .iter()
         .position(|c| predicate::identifier_eq(&c.name, old))
-        .ok_or_else(|| Error::Catalog(format!("unknown column: {old}")))?;
+        .ok_or_else(|| {
+            Error::Catalog(
+                CatalogError::UnknownColumn,
+                format!("unknown column: {old}"),
+            )
+        })?;
 
     let new_ty = map_type(data_type)?;
     let declared_type = declaration_from_data_type(data_type)?;
@@ -3628,7 +3674,12 @@ async fn alter_column_op(
         .columns
         .iter()
         .position(|c| predicate::identifier_eq(&c.name, name))
-        .ok_or_else(|| Error::Catalog(format!("unknown column: {name}")))?;
+        .ok_or_else(|| {
+            Error::Catalog(
+                CatalogError::UnknownColumn,
+                format!("unknown column: {name}"),
+            )
+        })?;
     match op {
         AlterColumnOperation::SetDefault { value } => {
             def.col_meta[i].default = Some(value.to_string())
@@ -3820,10 +3871,10 @@ async fn alter_add_column(
         .iter()
         .any(|existing| predicate::identifier_eq(&existing.name, &col.name.value))
     {
-        return Err(Error::Duplicate(format!(
-            "duplicate column name '{}'",
-            col.name.value
-        )));
+        return Err(Error::Duplicate(
+            DuplicateError::ColumnName,
+            format!("duplicate column name '{}'", col.name.value),
+        ));
     }
     let ty = map_type(&col.data_type)?;
     let declared_type = declaration_from_data_type(&col.data_type)?;
@@ -3991,7 +4042,12 @@ async fn alter_drop_column(db: &Session, def: &mut TableDef, name: &str) -> Resu
         .columns
         .iter()
         .position(|c| predicate::identifier_eq(&c.name, name))
-        .ok_or_else(|| Error::Catalog(format!("unknown column: {name}")))?;
+        .ok_or_else(|| {
+            Error::Catalog(
+                CatalogError::UnknownColumn,
+                format!("unknown column: {name}"),
+            )
+        })?;
     if def.pk_cols.contains(&idx) {
         return Err(Error::Unsupported(
             "cannot drop a primary key column".into(),
@@ -4078,7 +4134,10 @@ pub async fn rename_table(db: &Session, old: &str, new: &str) -> Result<QueryRes
 
 async fn alter_rename_table(db: &Session, def: &mut TableDef, new: &str) -> Result<()> {
     if catalog::exists(db, new).await? {
-        return Err(Error::Catalog(format!("table already exists: {new}")));
+        return Err(Error::Catalog(
+            CatalogError::Exists,
+            format!("table already exists: {new}"),
+        ));
     }
     let old = def.name.clone();
     let old_generation = def.storage_generation;
@@ -4230,7 +4289,10 @@ pub async fn create_fulltext_index(
         .iter()
         .any(|i| i.name.eq_ignore_ascii_case(name))
     {
-        return Err(Error::Catalog(format!("index already exists: {name}")));
+        return Err(Error::Catalog(
+            CatalogError::IndexExists,
+            format!("index already exists: {name}"),
+        ));
     }
     let col_idx: Vec<usize> = cols
         .iter()
@@ -4239,7 +4301,9 @@ pub async fn create_fulltext_index(
                 .columns
                 .iter()
                 .position(|d| predicate::identifier_eq(&d.name, c))
-                .ok_or_else(|| Error::Catalog(format!("unknown column: {c}")))
+                .ok_or_else(|| {
+                    Error::Catalog(CatalogError::UnknownColumn, format!("unknown column: {c}"))
+                })
         })
         .collect::<Result<_>>()?;
     def.indexes.push(IndexDef {
@@ -4304,7 +4368,12 @@ pub async fn create_index(db: &Session, ci: CreateIndex) -> Result<QueryResult> 
             .columns
             .iter()
             .position(|c| predicate::identifier_eq(&c.name, col_name))
-            .ok_or_else(|| Error::Catalog(format!("unknown column: {col_name}")))?;
+            .ok_or_else(|| {
+                Error::Catalog(
+                    CatalogError::UnknownColumn,
+                    format!("unknown column: {col_name}"),
+                )
+            })?;
         cols.push(col);
         col_names.push(col_name.to_string());
     }
@@ -4321,7 +4390,10 @@ pub async fn create_index(db: &Session, ci: CreateIndex) -> Result<QueryResult> 
         if ci.if_not_exists {
             return Ok(QueryResult::Affected(0));
         }
-        return Err(Error::Catalog(format!("index already exists: {name}")));
+        return Err(Error::Catalog(
+            CatalogError::IndexExists,
+            format!("index already exists: {name}"),
+        ));
     }
 
     // A vector (HNSW) index is a single VECTOR column; composite must be B-tree.
@@ -4378,13 +4450,21 @@ pub async fn rename_index(
         .iter()
         .any(|index| index.name.eq_ignore_ascii_case(new_name))
     {
-        return Err(Error::Catalog(format!("index already exists: {new_name}")));
+        return Err(Error::Catalog(
+            CatalogError::IndexExists,
+            format!("index already exists: {new_name}"),
+        ));
     }
     let position = def
         .indexes
         .iter()
         .position(|index| index.name.eq_ignore_ascii_case(old_name))
-        .ok_or_else(|| Error::Catalog(format!("unknown index: {old_name}")))?;
+        .ok_or_else(|| {
+            Error::Catalog(
+                CatalogError::UnknownIndex,
+                format!("unknown index: {old_name}"),
+            )
+        })?;
     def.indexes[position].name = new_name.to_string();
     let renamed = def.indexes[position].clone();
 
@@ -4410,7 +4490,9 @@ pub async fn drop_index(db: &Session, table: &str, name: &str) -> Result<QueryRe
         .indexes
         .iter()
         .position(|index| index.name.eq_ignore_ascii_case(name))
-        .ok_or_else(|| Error::Catalog(format!("unknown index: {name}")))?;
+        .ok_or_else(|| {
+            Error::Catalog(CatalogError::UnknownIndex, format!("unknown index: {name}"))
+        })?;
     let removed = def.indexes.remove(position);
 
     let deletes = collect_index_entry_keys(db, table, &[removed.name.as_str()]).await?;
@@ -4457,7 +4539,12 @@ pub async fn drop_foreign_key(db: &Session, table: &str, name: &str) -> Result<Q
         .foreign_keys
         .iter()
         .position(|foreign_key| foreign_key.name.eq_ignore_ascii_case(name))
-        .ok_or_else(|| Error::Catalog(format!("unknown foreign key: {name}")))?;
+        .ok_or_else(|| {
+            Error::Catalog(
+                CatalogError::Missing,
+                format!("unknown foreign key: {name}"),
+            )
+        })?;
     def.foreign_keys.remove(position);
     db.commit_write(vec![(catalog_key(table), def.encode()?)], Vec::new())
         .await?;
@@ -4479,7 +4566,12 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
                     .columns
                     .iter()
                     .position(|col| predicate::identifier_eq(&col.name, &c.value))
-                    .ok_or_else(|| Error::Catalog(format!("unknown column: {}", c.value)))
+                    .ok_or_else(|| {
+                        Error::Catalog(
+                            CatalogError::UnknownColumn,
+                            format!("unknown column: {}", c.value),
+                        )
+                    })
             })
             .collect::<Result<_>>()?
     };
@@ -4521,7 +4613,9 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
                 .as_ref()
                 .cloned()
                 .or_else(|| ins.table_name.0.last().cloned())
-                .ok_or_else(|| Error::Catalog("empty insert target".into()))?;
+                .ok_or_else(|| {
+                    Error::Catalog(CatalogError::Missing, "empty insert target".into())
+                })?;
             let qualifier = canonical_relation_qualifier(db, Some(&ins.table_name), &target);
             let validation_schema = qualify_relation_schema(def.schema.clone(), &qualifier);
             let ctes = std::collections::HashMap::new();
@@ -4829,9 +4923,10 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
                 batch[pos].1 = apply_dup(&previous, &row)?;
                 affected += updated_row_count(&previous, &batch[pos].1);
             } else if !ignore {
-                return Err(Error::Duplicate(format!(
-                    "Duplicate entry for key 'PRIMARY' on '{name}'"
-                )));
+                return Err(Error::Duplicate(
+                    DuplicateError::Entry,
+                    format!("Duplicate entry for key 'PRIMARY' on '{name}'"),
+                ));
             }
             continue;
         }
@@ -4842,9 +4937,10 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
                 if ignore {
                     continue;
                 }
-                return Err(Error::Duplicate(format!(
-                    "Duplicate entry for key 'PRIMARY' on '{name}'"
-                )));
+                return Err(Error::Duplicate(
+                    DuplicateError::Entry,
+                    format!("Duplicate entry for key 'PRIMARY' on '{name}'"),
+                ));
             }
             let old_row: Vec<Value> = rowdec::decode_row(old_enc)?;
             deletes.extend(index::entry_keys_for_row(&def, &old_row, &key)?);
@@ -4981,6 +5077,7 @@ async fn remap_unique_upsert_conflicts(
             match &conflict {
                 Some(existing) if existing != owner => {
                     return Err(Error::Duplicate(
+                        DuplicateError::Entry,
                         "upsert conflicts with more than one unique row".into(),
                     ));
                 }
@@ -5603,7 +5700,10 @@ async fn check_unique_batch(
     let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
     for (pk, _) in &probes {
         if !seen.insert(pk.clone()) {
-            return Err(Error::Duplicate("Duplicate entry for a unique key".into()));
+            return Err(Error::Duplicate(
+                DuplicateError::Entry,
+                "Duplicate entry for a unique key".into(),
+            ));
         }
     }
     // A stored value under the probe key that belongs to a different row.
@@ -5612,7 +5712,10 @@ async fn check_unique_batch(
     for ((_, i), owner) in probes.iter().zip(existing) {
         if let Some(owner_key) = owner {
             if owner_key != batch[*i].0 {
-                return Err(Error::Duplicate("Duplicate entry for a unique key".into()));
+                return Err(Error::Duplicate(
+                    DuplicateError::Entry,
+                    "Duplicate entry for a unique key".into(),
+                ));
             }
         }
     }
@@ -6831,7 +6934,12 @@ async fn select_inner(
                 .columns
                 .iter()
                 .position(|c| predicate::identifier_eq(&c.name, ident))
-                .ok_or_else(|| Error::Catalog(format!("unknown column: {ident}")))?;
+                .ok_or_else(|| {
+                    Error::Catalog(
+                        CatalogError::UnknownColumn,
+                        format!("unknown column: {ident}"),
+                    )
+                })?;
             idxs.push(i);
             let mut col = def.schema.columns[i].clone();
             if let Some(a) = alias {
@@ -8392,7 +8500,10 @@ impl QualifierNormalizer<'_> {
             .map(|identifier| identifier.value.as_str())
             .collect::<Vec<_>>()
             .join(".");
-        ControlFlow::Break(Error::Catalog(format!("unknown column: {reference}")))
+        ControlFlow::Break(Error::Catalog(
+            CatalogError::UnknownColumn,
+            format!("unknown column: {reference}"),
+        ))
     }
 }
 
@@ -8712,6 +8823,7 @@ fn validate_ast_alias_hiding<T: Visit>(
 ) -> Result<()> {
     if ast_uses_hidden_source(ast, hidden, visible) {
         return Err(Error::Catalog(
+            CatalogError::Missing,
             "an aliased table must be referenced by its alias".into(),
         ));
     }
@@ -9138,8 +9250,9 @@ async fn resolve_table(db: &Session, tf: &TableFactor) -> Result<(TableDef, Vec<
         TableFactor::Table { name, .. } => {
             let tname = stored_table_ident(db, name)?;
             let def = catalog::load(db, &tname).await?;
-            let qualifier = factor_qualifier_object(db, tf)
-                .ok_or_else(|| Error::Catalog("empty table qualifier".into()))?;
+            let qualifier = factor_qualifier_object(db, tf).ok_or_else(|| {
+                Error::Catalog(CatalogError::Missing, "empty table qualifier".into())
+            })?;
             let qualifier_parts = qualifier
                 .0
                 .iter()
@@ -10492,7 +10605,7 @@ async fn stored_base_table_name(db: &Session, factor: &TableFactor) -> Result<Op
     };
     let table = match stored_table_ident(db, name) {
         Ok(table) => table,
-        Err(Error::Catalog(_) | Error::UnknownDatabase(_)) => return Ok(None),
+        Err(Error::Catalog(..) | Error::UnknownDatabase(_)) => return Ok(None),
         Err(error) => return Err(error),
     };
     Ok(catalog::exists(db, &table).await?.then_some(table))
@@ -10953,9 +11066,10 @@ fn find_logical_column(schema: &Schema, name: &str, side: &str) -> Result<usize>
         .collect();
     match matches.as_slice() {
         [index] => Ok(*index),
-        [] => Err(Error::Catalog(format!(
-            "unknown column '{name}' in {side} relation of USING/NATURAL join"
-        ))),
+        [] => Err(Error::Catalog(
+            CatalogError::UnknownColumn,
+            format!("unknown column '{name}' in {side} relation of USING/NATURAL join"),
+        )),
         _ => Err(Error::Query(format!(
             "ambiguous column '{name}' in {side} relation of USING/NATURAL join"
         ))),
@@ -13614,7 +13728,7 @@ pub async fn update(
     let name = table_of(db, table)?;
     let def = catalog::load(db, &name).await?;
     let qualifier_object = factor_qualifier_object(db, &table.relation)
-        .ok_or_else(|| Error::Catalog("empty table qualifier".into()))?;
+        .ok_or_else(|| Error::Catalog(CatalogError::Missing, "empty table qualifier".into()))?;
     let qualifier = object_name_parts(&qualifier_object);
     let validation_schema = qualify_relation_schema(def.schema.clone(), &qualifier_object);
     let ctes = std::collections::HashMap::new();
@@ -13856,7 +13970,7 @@ pub async fn delete(
     let name = table_of(db, &relations[0])?;
     let def = catalog::load(db, &name).await?;
     let qualifier_object = factor_qualifier_object(db, &relations[0].relation)
-        .ok_or_else(|| Error::Catalog("empty table qualifier".into()))?;
+        .ok_or_else(|| Error::Catalog(CatalogError::Missing, "empty table qualifier".into()))?;
     let qualifier = object_name_parts(&qualifier_object);
     let validation_schema = qualify_relation_schema(def.schema.clone(), &qualifier_object);
     let ctes = std::collections::HashMap::new();
@@ -14285,8 +14399,9 @@ async fn collect_targets(
     for tf in factors {
         if let TableFactor::Table { name, .. } = tf {
             let tname = stored_table_ident(db, name)?;
-            let qualifier = factor_qualifier_object(db, tf)
-                .ok_or_else(|| Error::Catalog("empty table qualifier".into()))?;
+            let qualifier = factor_qualifier_object(db, tf).ok_or_else(|| {
+                Error::Catalog(CatalogError::Missing, "empty table qualifier".into())
+            })?;
             let qualifier = qualifier
                 .0
                 .iter()
@@ -17267,7 +17382,10 @@ async fn validated_query_relations(
         for relation in relations {
             if let Some(virtual_name) = virtual_relation_name(&relation) {
                 if !virtual_relation_supported(&virtual_name) {
-                    return Err(Error::Catalog(format!("no such table: {relation}")));
+                    return Err(Error::Catalog(
+                        CatalogError::Missing,
+                        format!("no such table: {relation}"),
+                    ));
                 }
                 continue;
             }
@@ -17292,7 +17410,10 @@ async fn validated_query_relations(
                 continue;
             }
             if !catalog::exists(db, &table).await? {
-                return Err(Error::Catalog(format!("no such table: {table}")));
+                return Err(Error::Catalog(
+                    CatalogError::Missing,
+                    format!("no such table: {table}"),
+                ));
             }
             if let Some(sql) = db.get(catalog::matview_key(&table)).await? {
                 let sql = String::from_utf8_lossy(&sql).into_owned();
@@ -17424,7 +17545,7 @@ fn column_reference_resolves(reference: &Expr, schema: &Schema) -> Result<bool> 
     };
     match resolution {
         Ok(_) => Ok(true),
-        Err(Error::Catalog(_)) | Err(Error::UnknownColumn(_)) => Ok(false),
+        Err(Error::Catalog(..)) | Err(Error::UnknownColumn(_)) => Ok(false),
         // A qualified correlated reference can share its bare column name with
         // multiple local relations. No local exact match means it belongs to an
         // outer scope; only an unqualified local ambiguity is terminal here.
@@ -17748,7 +17869,7 @@ async fn validate_expression_column_references(
 
 fn qualify_static_schema(db: &Session, schema: Schema, factor: &TableFactor) -> Result<Schema> {
     let qualifier = factor_qualifier_object(db, factor)
-        .ok_or_else(|| Error::Catalog("empty table qualifier".into()))?;
+        .ok_or_else(|| Error::Catalog(CatalogError::Missing, "empty table qualifier".into()))?;
     Ok(qualify_relation_schema(schema, &qualifier))
 }
 
@@ -18109,12 +18230,16 @@ pub async fn create_view(
 ) -> Result<QueryResult> {
     let name = stored_table_ident(db, name)?;
     if catalog::exists(db, &name).await? {
-        return Err(Error::Catalog(format!(
-            "cannot create view: a table named '{name}' exists"
-        )));
+        return Err(Error::Catalog(
+            CatalogError::Exists,
+            format!("cannot create view: a table named '{name}' exists"),
+        ));
     }
     if !or_replace && catalog::load_view(db, &name).await?.is_some() {
-        return Err(Error::Catalog(format!("view already exists: {name}")));
+        return Err(Error::Catalog(
+            CatalogError::Exists,
+            format!("view already exists: {name}"),
+        ));
     }
     validated_query_relations(db, query, Some(&name)).await?;
     validate_query_columns(db, query).await?;
@@ -18161,7 +18286,10 @@ pub async fn drop_view(db: &Session, name: &str, if_exists: bool) -> Result<Quer
         if if_exists {
             return Ok(QueryResult::Affected(0));
         }
-        return Err(Error::Catalog(format!("no such view: {name}")));
+        return Err(Error::Catalog(
+            CatalogError::Missing,
+            format!("no such view: {name}"),
+        ));
     }
     db.commit_write(vec![], vec![catalog::view_key(name)])
         .await?;
@@ -19998,7 +20126,7 @@ async fn resolve_subqueries_with_outer(
                 }
                 let index = match predicate::resolve_index(&column, outer_schema) {
                     Ok(index) => index,
-                    Err(Error::Catalog(_)) => return Err(error),
+                    Err(Error::Catalog(..)) => return Err(error),
                     Err(error) => return Err(error),
                 };
                 let value = value_to_expr(&outer_row[index]);
@@ -20017,7 +20145,10 @@ async fn resolve_subqueries_with_outer(
 }
 
 fn bare_unknown_column<'a>(error: &'a Error, expr: &Expr) -> Option<&'a str> {
-    let Error::Catalog(message) = error else {
+    // Gated on the kind, so this can no longer fire on an unrelated catalog error
+    // whose message happens to start the same way. Recovering the column *name*
+    // is still textual: the variant carries the kind, not the identifier.
+    let Error::Catalog(CatalogError::UnknownColumn, message) = error else {
         return None;
     };
     let column = message.strip_prefix("unknown column: ")?;
@@ -22834,7 +22965,10 @@ fn equi_height_hist(sample: &mut [Value], buckets: usize) -> Vec<String> {
 
 pub async fn analyze_table(db: &Session, name: &str) -> Result<QueryResult> {
     if !catalog::exists(db, name).await? {
-        return Err(Error::Catalog(format!("no such table: {name}")));
+        return Err(Error::Catalog(
+            CatalogError::Missing,
+            format!("no such table: {name}"),
+        ));
     }
     let def = catalog::load(db, name).await?;
     let ncols = def.schema.columns.len();
@@ -22971,7 +23105,10 @@ pub async fn drop_table(db: &Session, name: &str, if_exists: bool) -> Result<Que
         if if_exists {
             return Ok(QueryResult::Affected(0));
         }
-        return Err(Error::Catalog(format!("no such table: {name}")));
+        return Err(Error::Catalog(
+            CatalogError::Missing,
+            format!("no such table: {name}"),
+        ));
     }
 
     let deletes = table_delete_keys(db, name).await?;

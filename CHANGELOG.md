@@ -8,6 +8,19 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ### Fixed
 
+- **The MySQL error code no longer depends on the wording of the error message.**
+  `Error::Catalog` carried only a string, so the code a client received was
+  recovered by matching prefixes of the human-readable message — five
+  `starts_with` checks and a `contains`. Rewording an error silently changed the
+  code, and clients branch on exactly that: an ORM reports 1146 and 1054 very
+  differently, and a migration tool may treat 1050 as success.
+
+  `Catalog` and `Duplicate` now carry the kind explicitly, so the mapping is a
+  `match` on an enum with no string inspection anywhere. One code changes as a
+  result, which is the fragility itself showing: `CREATE VIEW` over an existing
+  table name reported 1146 (no such table) because its message says "exists"
+  rather than "already exists". MySQL answers 1050, and so do we now.
+
 - **Affected-row counts follow MySQL's changed-row convention.** MySQL reports
   rows *changed*, not rows matched, and upserts carry a specific convention on
   top of that. Every count below was wrong, and the 1-vs-2 distinction is the

@@ -3,7 +3,7 @@
 //! Unlike [`crate::eval`] (literals only), this evaluates expressions that
 //! reference columns, resolved against a row + its schema.
 
-use elyra_core::{Collation, Error, Result, Schema, Value};
+use elyra_core::{CatalogError, Collation, Error, Result, Schema, Value};
 use sqlparser::ast::{BinaryOperator, Expr, UnaryOperator, Value as SqlValue};
 
 enum IdentifierLowercase {
@@ -2813,7 +2813,10 @@ fn column_name(column: &elyra_core::ColumnDef) -> &str {
 /// filters alike.
 pub fn resolve_index_parts(parts: &[sqlparser::ast::Ident], schema: &Schema) -> Result<usize> {
     let Some(last) = parts.last() else {
-        return Err(Error::Catalog("unknown column".into()));
+        return Err(Error::Catalog(
+            CatalogError::UnknownColumn,
+            "unknown column".into(),
+        ));
     };
     if parts.len() >= 2 {
         let has_qualified_columns = schema
@@ -2838,7 +2841,10 @@ pub fn resolve_index_parts(parts: &[sqlparser::ast::Ident], schema: &Schema) -> 
         match hits.as_slice() {
             [index] => return Ok(*index),
             [] if has_qualified_columns => {
-                return Err(Error::Catalog(format!("unknown column: {}", dotted(parts))))
+                return Err(Error::Catalog(
+                    CatalogError::UnknownColumn,
+                    format!("unknown column: {}", dotted(parts)),
+                ))
             }
             [] => {}
             _ => return Err(Error::Query(format!("ambiguous column: {}", dotted(parts)))),
@@ -2859,7 +2865,10 @@ pub fn resolve_index_parts(parts: &[sqlparser::ast::Ident], schema: &Schema) -> 
     }
     match (n, hit) {
         (1, Some(i)) => Ok(i),
-        (0, _) => Err(Error::Catalog(format!("unknown column: {}", dotted(parts)))),
+        (0, _) => Err(Error::Catalog(
+            CatalogError::UnknownColumn,
+            format!("unknown column: {}", dotted(parts)),
+        )),
         _ => Err(Error::Query(format!("ambiguous column: {}", dotted(parts)))),
     }
 }
@@ -2888,7 +2897,10 @@ pub fn resolve_index(name: &str, schema: &Schema) -> Result<usize> {
         .collect::<Vec<_>>();
     match hits.as_slice() {
         [index] => Ok(*index),
-        [] => Err(Error::Catalog(format!("unknown column: {name}"))),
+        [] => Err(Error::Catalog(
+            CatalogError::UnknownColumn,
+            format!("unknown column: {name}"),
+        )),
         _ => Err(Error::Query(format!("ambiguous column: {name}"))),
     }
 }

@@ -6,7 +6,7 @@
 //! * `data::<table>::<key>` → serialized row (`Vec<Value>`)
 
 use crate::session::Session;
-use elyra_core::{Error, Result, ResultColumnMetadata, Schema};
+use elyra_core::{CatalogError, Error, Result, ResultColumnMetadata, Schema};
 use serde::{Deserialize, Serialize};
 
 /// A secondary index over one or more columns.
@@ -575,12 +575,12 @@ pub fn data_key(table: &str, encoded: &[u8]) -> Vec<u8> {
 
 impl TableDef {
     pub fn encode(&self) -> Result<Vec<u8>> {
-        bincode::serialize(self).map_err(|e| Error::Catalog(e.to_string()))
+        bincode::serialize(self).map_err(|e| Error::Catalog(CatalogError::Missing, e.to_string()))
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        let mut definition: Self =
-            bincode::deserialize(bytes).map_err(|e| Error::Catalog(e.to_string()))?;
+        let mut definition: Self = bincode::deserialize(bytes)
+            .map_err(|e| Error::Catalog(CatalogError::Missing, e.to_string()))?;
         definition.hydrate_result_metadata();
         Ok(definition)
     }
@@ -686,7 +686,12 @@ pub async fn load(db: &Session, table: &str) -> Result<TableDef> {
         .into_iter();
     let mut def = match values.next().flatten() {
         Some(bytes) => TableDef::decode(&bytes)?,
-        None => return Err(Error::Catalog(format!("no such table: {table}"))),
+        None => {
+            return Err(Error::Catalog(
+                CatalogError::Missing,
+                format!("no such table: {table}"),
+            ))
+        }
     };
     def.storage_generation = values
         .next()
