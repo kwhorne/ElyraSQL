@@ -147,6 +147,19 @@ fn pid_is_dead(_pid: u32) -> bool {
 struct RunReader {
     r: BufReader<File>,
 }
+
+/// Best-effort path cleanup for runs moved out of `Sorter`, including when
+/// reading or a downstream callback returns an error.
+struct RunPaths(Vec<PathBuf>);
+
+impl Drop for RunPaths {
+    fn drop(&mut self) {
+        for path in &self.0 {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 impl RunReader {
     /// Read back a spilled run from its (already-open, possibly-unlinked) file.
     fn from_file(mut file: File) -> Result<Self> {
@@ -157,11 +170,19 @@ impl RunReader {
     }
     fn next(&mut self) -> Result<Option<(Vec<Value>, Vec<Value>)>> {
         let mut len = [0u8; 4];
-        match self.r.read_exact(&mut len) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-            Err(e) => return Err(Error::Io(e)),
+        match self.r.read(&mut len[..1]) {
+            Ok(0) => return Ok(None),
+            Ok(1) => {}
+            Ok(_) => unreachable!("one-byte read returned more than one byte"),
+            Err(error) => return Err(Error::Io(error)),
         }
+        self.r.read_exact(&mut len[1..]).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::UnexpectedEof {
+                Error::Storage("truncated sort spill record header".into())
+            } else {
+                Error::Io(error)
+            }
+        })?;
         let n = u32::from_le_bytes(len) as usize;
         if n > elyra_core::max_frame_bytes() {
             return Err(Error::Storage(
@@ -169,7 +190,13 @@ impl RunReader {
             ));
         }
         let mut buf = vec![0u8; n];
-        self.r.read_exact(&mut buf)?;
+        self.r.read_exact(&mut buf).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::UnexpectedEof {
+                Error::Storage("truncated sort spill record".into())
+            } else {
+                Error::Io(error)
+            }
+        })?;
         let v = bincode::deserialize(&buf).map_err(|e| Error::Storage(e.to_string()))?;
         Ok(Some(v))
     }
@@ -320,14 +347,29 @@ impl Sorter {
         Ok(())
     }
 
-    /// Finish sorting and return rows in order, with offset/limit applied.
-    pub fn finish(&mut self) -> Result<Vec<Vec<Value>>> {
+    /// Finish sorting, invoking `emit` once for each row in order after applying
+    /// offset and limit.
+    ///
+    /// Unlike [`finish`](Self::finish), this does not accumulate the result in
+    /// memory. This is useful when the next operator writes rows to its own
+    /// bounded-memory representation.
+    pub fn finish_with<F>(&mut self, mut emit: F) -> Result<()>
+    where
+        F: FnMut(Vec<Value>) -> Result<()>,
+    {
+        if self.limit == Some(0) {
+            self.heap.clear();
+            self.buffer.clear();
+            self.runs.clear();
+            return Ok(());
+        }
         if self.topn {
             let mut ranked: Vec<Ranked> = self.heap.drain().collect();
             ranked.sort_by(|a, b| cmp_keys(&a.keys, &b.keys, &self.asc, &self.colls));
-            let rows: Vec<Vec<Value>> = ranked.into_iter().map(|r| r.row).collect();
-            let start = self.offset.min(rows.len());
-            return Ok(rows[start..].to_vec());
+            for ranked in ranked.into_iter().skip(self.offset) {
+                emit(ranked.row)?;
+            }
+            return Ok(());
         }
 
         if self.runs.is_empty() {
@@ -336,14 +378,20 @@ impl Sorter {
             let colls = self.colls.clone();
             let mut buffer = std::mem::take(&mut self.buffer);
             buffer.sort_by(|a, b| cmp_keys(&a.0, &b.0, &asc, &colls));
-            let mut out: Vec<Vec<Value>> = buffer.into_iter().map(|(_, r)| r).collect();
-            if self.offset > 0 {
-                out.drain(0..self.offset.min(out.len()));
+            let rows = buffer.into_iter().map(|(_, row)| row).skip(self.offset);
+            match self.limit {
+                Some(limit) => {
+                    for row in rows.take(limit) {
+                        emit(row)?;
+                    }
+                }
+                None => {
+                    for row in rows {
+                        emit(row)?;
+                    }
+                }
             }
-            if let Some(l) = self.limit {
-                out.truncate(l);
-            }
-            return Ok(out);
+            return Ok(());
         }
 
         // Spill the tail, then k-way merge every run.
@@ -351,7 +399,7 @@ impl Sorter {
             self.spill()?;
         }
         let runs = std::mem::take(&mut self.runs);
-        let paths: Vec<PathBuf> = runs.iter().map(|(p, _)| p.clone()).collect();
+        let _paths = RunPaths(runs.iter().map(|(path, _)| path.clone()).collect());
         let mut readers: Vec<RunReader> = runs
             .into_iter()
             .map(|(_, f)| RunReader::from_file(f))
@@ -361,8 +409,8 @@ impl Sorter {
             heads.push(r.next()?);
         }
 
-        let mut out = Vec::new();
         let mut skipped = 0usize;
+        let mut emitted = 0usize;
         loop {
             // Pick the smallest current head across runs.
             let mut best: Option<usize> = None;
@@ -385,18 +433,26 @@ impl Sorter {
             if skipped < self.offset {
                 skipped += 1;
             } else {
-                out.push(row);
+                emit(row)?;
+                emitted += 1;
                 if let Some(l) = self.limit {
-                    if out.len() >= l {
+                    if emitted >= l {
                         break;
                     }
                 }
             }
         }
-        for p in &paths {
-            let _ = std::fs::remove_file(p);
-        }
-        Ok(out)
+        Ok(())
+    }
+
+    /// Finish sorting and return rows in order, with offset/limit applied.
+    pub fn finish(&mut self) -> Result<Vec<Vec<Value>>> {
+        let mut rows = Vec::new();
+        self.finish_with(|row| {
+            rows.push(row);
+            Ok(())
+        })?;
+        Ok(rows)
     }
 }
 
@@ -600,6 +656,109 @@ mod spill_tests {
 
         let rows = s.finish().unwrap();
         assert_eq!(rows.len(), 25, "finish must return every pushed row");
+    }
+
+    #[test]
+    fn finish_with_streams_sorted_rows() {
+        let mut sorter = Sorter::new(vec![true], vec![Collation::Ci], 1, Some(3), 2);
+        for i in [4, 1, 3, 0, 2] {
+            sorter
+                .push(vec![Value::Int(i)], vec![Value::Int(i)])
+                .unwrap();
+        }
+
+        let mut rows = Vec::new();
+        sorter
+            .finish_with(|row| {
+                rows.push(row);
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int(1)],
+                vec![Value::Int(2)],
+                vec![Value::Int(3)]
+            ]
+        );
+    }
+
+    #[test]
+    fn finish_with_propagates_callback_errors() {
+        let mut sorter = Sorter::new(vec![true], vec![Collation::Ci], 0, None, 2);
+        for i in (0..5).rev() {
+            sorter
+                .push(vec![Value::Int(i)], vec![Value::Int(i)])
+                .unwrap();
+        }
+
+        let err = sorter
+            .finish_with(|row| {
+                if row == vec![Value::Int(2)] {
+                    return Err(Error::Storage("sink failed".into()));
+                }
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("sink failed"));
+    }
+
+    #[test]
+    fn external_finish_with_limit_zero_emits_nothing() {
+        let mut sorter = Sorter::new(vec![true], vec![Collation::Bin], 0, Some(0), 1);
+        // `LIMIT 0` normally selects the top-N path. Force the external branch
+        // to cover the large-offset case where offset + limit exceeds TOPN_CAP.
+        sorter.topn = false;
+        for value in [2, 1, 0] {
+            sorter
+                .push(vec![Value::Int(value)], vec![Value::Int(value)])
+                .unwrap();
+        }
+
+        let mut rows = Vec::new();
+        sorter
+            .finish_with(|row| {
+                rows.push(row);
+                Ok(())
+            })
+            .unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn run_reader_rejects_partial_header_and_body() {
+        let partial_header_path = temp_path();
+        let mut partial_header = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&partial_header_path)
+            .unwrap();
+        partial_header.write_all(&[4, 0]).unwrap();
+        partial_header.flush().unwrap();
+        let mut reader = RunReader::from_file(partial_header).unwrap();
+        let error = reader.next().unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("truncated sort spill record header"));
+        let _ = fs::remove_file(partial_header_path);
+
+        let partial_body_path = temp_path();
+        let mut partial_body = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&partial_body_path)
+            .unwrap();
+        partial_body.write_all(&10u32.to_le_bytes()).unwrap();
+        partial_body.write_all(b"short").unwrap();
+        partial_body.flush().unwrap();
+        let mut reader = RunReader::from_file(partial_body).unwrap();
+        let error = reader.next().unwrap_err();
+        assert!(error.to_string().contains("truncated sort spill record"));
+        let _ = fs::remove_file(partial_body_path);
     }
 }
 

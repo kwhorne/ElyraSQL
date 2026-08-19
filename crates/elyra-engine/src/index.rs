@@ -7,7 +7,7 @@
 //! ```
 //!
 //! `enc(col_values)` is the order-preserving composite encoding of the indexed
-//! columns, so equality and (single-column) range lookups are B-tree scans.
+//! columns, so equality and left-prefix range lookups are B-tree scans.
 
 use crate::session::Session;
 use elyra_core::{Collation, Result, Value};
@@ -118,23 +118,25 @@ fn value_prefix(
     Ok(k)
 }
 
-fn entry_key(
+fn value_prefix_encoded(table: &str, index: &str, encoded: &[u8]) -> Vec<u8> {
+    let mut key = index_prefix(table, index);
+    key.extend_from_slice(encoded);
+    key.push(0);
+    key
+}
+
+fn entry_key_encoded(
     table: &str,
     index: &str,
-    values: &[Value],
-    colls: &[Collation],
-    data_key: &[u8],
+    encoded: &[u8],
+    clustered_key: &[u8],
     unique: bool,
-) -> Result<Vec<u8>> {
-    let mut k = value_prefix(table, index, values, colls)?;
-    // A UNIQUE index keys purely on the indexed values, so two rows with the
-    // same value collide (enforcing uniqueness). A non-unique index appends the
-    // clustered key so rows with equal values coexist.
+) -> Vec<u8> {
+    let mut key = value_prefix_encoded(table, index, encoded);
     if !unique {
-        let clustered = &data_key[data_prefix(table).len()..];
-        k.extend_from_slice(clustered);
+        key.extend_from_slice(clustered_key);
     }
-    Ok(k)
+    key
 }
 
 /// The probe key for a unique index's value tuple (== its entry key). A stored
@@ -158,6 +160,7 @@ pub fn partition_entries_for_row(
 ) -> Result<(Vec<Entry>, Vec<Entry>)> {
     let mut nonuniq = Vec::new();
     let mut uniq = Vec::new();
+    let clustered_key = &data_key[b"data::".len() + def.name.len() + b"::".len()..];
     for idx in &def.indexes {
         if idx.vector {
             continue;
@@ -168,27 +171,23 @@ pub fn partition_entries_for_row(
             }
             continue;
         }
-        let values: Vec<Value> = idx.cols.iter().map(|&c| row[c].clone()).collect();
-        if values.iter().any(|v| v.is_null()) || keyenc::encode_key(&values).is_err() {
+        let has_null = idx.cols.iter().any(|&column| row[column].is_null());
+        let encoded = (!has_null)
+            .then(|| keyenc::encode_columns_coll(row, &idx.cols, &idx.col_collations).ok())
+            .flatten();
+        let Some(encoded) = encoded else {
             // Single-column NULL-indexing: record the NULL-keyed row under the
             // `indexnull::` keyspace (never unique -- NULLs don't collide).
-            if idx.indexes_nulls && idx.cols.len() == 1 && values[0].is_null() {
+            if idx.indexes_nulls && idx.cols.len() == 1 && row[idx.cols[0]].is_null() {
                 nonuniq.push((
                     null_entry_key(&def.name, &idx.name, data_key),
                     data_key.to_vec(),
                 ));
             }
             continue;
-        }
+        };
         let entry = (
-            entry_key(
-                &def.name,
-                &idx.name,
-                &values,
-                &idx.col_collations,
-                data_key,
-                idx.unique,
-            )?,
+            entry_key_encoded(&def.name, &idx.name, &encoded, clustered_key, idx.unique),
             data_key.to_vec(),
         );
         if idx.unique {
@@ -208,16 +207,14 @@ pub fn unique_probe_keys(def: &TableDef, row: &[Value]) -> Result<Vec<Vec<u8>>> 
         if idx.vector || !idx.unique {
             continue;
         }
-        let values: Vec<Value> = idx.cols.iter().map(|&c| row[c].clone()).collect();
-        if values.iter().any(|v| v.is_null()) || keyenc::encode_key(&values).is_err() {
+        let has_null = idx.cols.iter().any(|&column| row[column].is_null());
+        let encoded = (!has_null)
+            .then(|| keyenc::encode_columns_coll(row, &idx.cols, &idx.col_collations).ok())
+            .flatten();
+        let Some(encoded) = encoded else {
             continue;
-        }
-        out.push(unique_probe_key(
-            &def.name,
-            &idx.name,
-            &values,
-            &idx.col_collations,
-        )?);
+        };
+        out.push(value_prefix_encoded(&def.name, &idx.name, &encoded));
     }
     Ok(out)
 }
@@ -235,6 +232,7 @@ pub fn entries_for_row(
     data_key: &[u8],
 ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
     let mut out = Vec::new();
+    let clustered_key = &data_key[b"data::".len() + def.name.len() + b"::".len()..];
     for idx in &def.indexes {
         if idx.vector {
             continue; // vector indexes are maintained separately
@@ -245,26 +243,22 @@ pub fn entries_for_row(
             }
             continue;
         }
-        let values: Vec<Value> = idx.cols.iter().map(|&c| row[c].clone()).collect();
-        if values.iter().any(|v| v.is_null()) || keyenc::encode_key(&values).is_err() {
+        let has_null = idx.cols.iter().any(|&column| row[column].is_null());
+        let encoded = (!has_null)
+            .then(|| keyenc::encode_columns_coll(row, &idx.cols, &idx.col_collations).ok())
+            .flatten();
+        let Some(encoded) = encoded else {
             // Single-column NULL-indexing (see `partition_entries_for_row`).
-            if idx.indexes_nulls && idx.cols.len() == 1 && values[0].is_null() {
+            if idx.indexes_nulls && idx.cols.len() == 1 && row[idx.cols[0]].is_null() {
                 out.push((
                     null_entry_key(&def.name, &idx.name, data_key),
                     data_key.to_vec(),
                 ));
             }
             continue;
-        }
+        };
         out.push((
-            entry_key(
-                &def.name,
-                &idx.name,
-                &values,
-                &idx.col_collations,
-                data_key,
-                idx.unique,
-            )?,
+            entry_key_encoded(&def.name, &idx.name, &encoded, clustered_key, idx.unique),
             data_key.to_vec(),
         ));
     }
@@ -373,6 +367,89 @@ pub async fn lookup_range(
         }
     }
     Ok(keys)
+}
+
+/// Range lookup on the column immediately following an equality-constrained
+/// leading prefix of a composite index. Bounds are `(value, inclusive)`.
+///
+/// `prefix_values` must correspond to the first N indexed columns and the
+/// bounds to column N. Component encodings are self-delimiting, so the encoded
+/// tuple prefix is also an exact byte prefix for every matching index entry.
+pub async fn lookup_prefix_range(
+    db: &Session,
+    table: &str,
+    index: &IndexDef,
+    prefix_values: &[Value],
+    lo: Option<(&Value, bool)>,
+    hi: Option<(&Value, bool)>,
+) -> Result<Vec<Vec<u8>>> {
+    let Some((mut start, end)) = prefix_range_scan_bounds(table, index, prefix_values, lo, hi)?
+    else {
+        return Ok(Vec::new());
+    };
+
+    let mut keys = Vec::new();
+    loop {
+        let batch = db
+            .scan_range(start.clone(), Some(end.clone()), 4096)
+            .await?;
+        if batch.is_empty() {
+            break;
+        }
+        let last = batch.len() < 4096;
+        start = batch
+            .last()
+            .map(|(key, _)| {
+                let mut next = key.clone();
+                next.push(0);
+                next
+            })
+            .expect("a non-empty range batch has a final key");
+        keys.extend(batch.into_iter().map(|(_, data_key)| data_key));
+        if last {
+            break;
+        }
+    }
+    Ok(keys)
+}
+
+pub(crate) fn prefix_range_scan_bounds(
+    table: &str,
+    index: &IndexDef,
+    prefix_values: &[Value],
+    lo: Option<(&Value, bool)>,
+    hi: Option<(&Value, bool)>,
+) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+    let mut equality_prefix = index_prefix(table, &index.name);
+    equality_prefix.extend_from_slice(&keyenc::encode_key_coll(
+        prefix_values,
+        &index.col_collations,
+    )?);
+    let range_collation = index
+        .col_collations
+        .get(prefix_values.len())
+        .copied()
+        .unwrap_or_default();
+
+    let bound_prefix = |value: &Value| -> Result<Vec<u8>> {
+        let mut bound = equality_prefix.clone();
+        bound.extend_from_slice(&keyenc::encode_coll(value, range_collation)?);
+        Ok(bound)
+    };
+    let start = match lo {
+        Some((value, true)) => bound_prefix(value)?,
+        Some((value, false)) => prefix_upper_bound(&bound_prefix(value)?),
+        None => equality_prefix.clone(),
+    };
+    let end = match hi {
+        Some((value, true)) => prefix_upper_bound(&bound_prefix(value)?),
+        Some((value, false)) => bound_prefix(value)?,
+        None => prefix_upper_bound(&equality_prefix),
+    };
+    if start >= end {
+        return Ok(None);
+    }
+    Ok(Some((start, end)))
 }
 
 /// Smallest key strictly greater than every key with `prefix`.

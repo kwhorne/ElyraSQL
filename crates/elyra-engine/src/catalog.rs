@@ -306,12 +306,39 @@ pub fn trigname_key(name: &str) -> Vec<u8> {
 
 /// Load all triggers defined on `table`.
 pub async fn load_triggers(db: &Session, table: &str) -> Result<Vec<TriggerDef>> {
+    let epoch = CATALOG_EPOCH.load(Ordering::Acquire);
+    let cache_key = (db.db_id(), table.to_ascii_lowercase());
+    if !db.in_txn() {
+        if let Some((cached_epoch, triggers)) = trigger_cache().read().unwrap().get(&cache_key) {
+            if *cached_epoch == epoch {
+                return Ok((**triggers).clone());
+            }
+        }
+    }
     let prefix = trigger_prefix(table);
     let batch = db.scan_batch(prefix, None, 4096).await?;
-    Ok(batch
+    let triggers: Vec<TriggerDef> = batch
         .iter()
         .filter_map(|(_, v)| bincode::deserialize(v).ok())
-        .collect())
+        .collect();
+    if !db.in_txn() {
+        trigger_cache()
+            .write()
+            .unwrap()
+            .insert(cache_key, (epoch, std::sync::Arc::new(triggers.clone())));
+    }
+    Ok(triggers)
+}
+
+#[allow(clippy::type_complexity)]
+fn trigger_cache() -> &'static std::sync::RwLock<
+    std::collections::HashMap<(u64, String), (u64, std::sync::Arc<Vec<TriggerDef>>)>,
+> {
+    use std::sync::{OnceLock, RwLock};
+    static CACHE: OnceLock<
+        RwLock<std::collections::HashMap<(u64, String), (u64, std::sync::Arc<Vec<TriggerDef>>)>>,
+    > = OnceLock::new();
+    CACHE.get_or_init(|| RwLock::new(std::collections::HashMap::new()))
 }
 
 /// Find a trigger by name (for DROP TRIGGER) via the name->table index — O(1),

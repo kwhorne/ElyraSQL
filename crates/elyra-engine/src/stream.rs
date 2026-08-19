@@ -5,7 +5,11 @@
 //! `LIMIT`/`OFFSET`, then project — all with bounded memory. The server
 //! drains batches straight to the wire.
 
-use elyra_core::{ColumnType, Result, Schema, Value};
+use std::fs::File;
+use std::io::{BufReader, Read, Seek, SeekFrom};
+use std::path::PathBuf;
+
+use elyra_core::{ColumnType, Error, Result, Schema, Value};
 use elyra_storage::Db;
 use sqlparser::ast::Expr;
 
@@ -26,6 +30,14 @@ enum Source {
     Literal(std::vec::IntoIter<Vec<Value>>),
     /// Bounded-memory clustered scan over a table.
     Scan(Scan),
+    /// Length-prefixed, bincode-encoded rows owned by this stream.
+    Spill(Spill),
+}
+
+struct Spill {
+    reader: BufReader<File>,
+    path: PathBuf,
+    done: bool,
 }
 
 struct Scan {
@@ -55,34 +67,48 @@ pub struct ScanSpec {
 /// narrow `Float`->`Int` when every non-null value is an integer, and widen
 /// `Int`->`Float` when any value is a float/decimal. Non-numeric columns are
 /// left untouched.
-fn reconcile_numeric_types(schema: &mut Schema, rows: &[Vec<Value>]) {
-    for (i, col) in schema.columns.iter_mut().enumerate() {
-        if !matches!(col.ty, ColumnType::Int | ColumnType::Float) {
-            continue;
-        }
-        let mut has_float = false;
-        let mut has_int = false;
-        let mut bail = false;
-        for r in rows {
-            match r.get(i) {
-                Some(Value::Float(_)) | Some(Value::Decimal(..)) => has_float = true,
-                Some(Value::Int(_)) | Some(Value::Bool(_)) => has_int = true,
-                Some(Value::Null) | None => {}
-                Some(_) => {
-                    bail = true;
-                    break;
-                }
-            }
-        }
-        if bail {
-            continue;
-        }
-        if has_float {
-            col.ty = ColumnType::Float;
-        } else if has_int {
-            col.ty = ColumnType::Int;
+pub(crate) struct NumericTypeReconciler {
+    states: Vec<(bool, bool, bool)>,
+}
+
+impl NumericTypeReconciler {
+    pub(crate) fn new(columns: usize) -> Self {
+        Self {
+            states: vec![(false, false, false); columns],
         }
     }
+
+    pub(crate) fn observe(&mut self, row: &[Value]) {
+        for (index, state) in self.states.iter_mut().enumerate() {
+            match row.get(index) {
+                Some(Value::Float(_)) | Some(Value::Decimal(..)) => state.0 = true,
+                Some(Value::Int(_)) | Some(Value::Bool(_)) => state.1 = true,
+                Some(Value::Null) | None => {}
+                Some(_) => state.2 = true,
+            }
+        }
+    }
+
+    pub(crate) fn reconcile(&self, schema: &mut Schema) {
+        for (col, &(has_float, has_int, bail)) in schema.columns.iter_mut().zip(&self.states) {
+            if !matches!(col.ty, ColumnType::Int | ColumnType::Float) || bail {
+                continue;
+            }
+            if has_float {
+                col.ty = ColumnType::Float;
+            } else if has_int {
+                col.ty = ColumnType::Int;
+            }
+        }
+    }
+}
+
+fn reconcile_numeric_types(schema: &mut Schema, rows: &[Vec<Value>]) {
+    let mut reconciler = NumericTypeReconciler::new(schema.columns.len());
+    for row in rows {
+        reconciler.observe(row);
+    }
+    reconciler.reconcile(schema);
 }
 
 impl RowStream {
@@ -116,12 +142,88 @@ impl RowStream {
         }
     }
 
+    /// Build a stream over an already-open spill file.
+    ///
+    /// Rows must be bincode-encoded `Vec<Value>` values, each preceded by a
+    /// little-endian `u32` byte length. The stream owns the handle and removes
+    /// `path` when it is dropped. Callers may unlink the path before calling
+    /// this on platforms that support reading an unlinked open file.
+    pub(crate) fn spill(schema: Schema, path: PathBuf, mut file: File) -> Result<Self> {
+        if let Err(error) = file.seek(SeekFrom::Start(0)) {
+            let _ = std::fs::remove_file(&path);
+            return Err(Error::Io(error));
+        }
+        Ok(Self {
+            schema,
+            src: Source::Spill(Spill {
+                reader: BufReader::new(file),
+                path,
+                done: false,
+            }),
+        })
+    }
+
     /// Fetch the next batch of up to `n` output rows. Empty = exhausted.
     pub async fn next_batch(&mut self, n: usize) -> Result<Vec<Vec<Value>>> {
         match &mut self.src {
             Source::Literal(iter) => Ok(iter.by_ref().take(n).collect()),
             Source::Scan(scan) => scan.next_batch(n).await,
+            Source::Spill(spill) => spill.next_batch(n),
         }
+    }
+}
+
+impl Spill {
+    fn next_batch(&mut self, n: usize) -> Result<Vec<Vec<Value>>> {
+        let mut rows = Vec::with_capacity(n.min(SCAN_CHUNK));
+        while !self.done && rows.len() < n {
+            match self.next_row()? {
+                Some(row) => rows.push(row),
+                None => self.done = true,
+            }
+        }
+        Ok(rows)
+    }
+
+    fn next_row(&mut self) -> Result<Option<Vec<Value>>> {
+        let mut len = [0u8; 4];
+        match self.reader.read(&mut len[..1]) {
+            Ok(0) => return Ok(None),
+            Ok(1) => {}
+            Ok(_) => unreachable!("one-byte read returned more than one byte"),
+            Err(error) => return Err(Error::Io(error)),
+        }
+        self.reader.read_exact(&mut len[1..]).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::UnexpectedEof {
+                Error::Storage("truncated spill row frame header".into())
+            } else {
+                Error::Io(error)
+            }
+        })?;
+
+        let frame_len = u32::from_le_bytes(len) as usize;
+        if frame_len > elyra_core::max_frame_bytes() {
+            return Err(Error::Storage(
+                "spill row frame too large (corrupt?)".into(),
+            ));
+        }
+        let mut frame = vec![0; frame_len];
+        self.reader.read_exact(&mut frame).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::UnexpectedEof {
+                Error::Storage("truncated spill row frame".into())
+            } else {
+                Error::Io(error)
+            }
+        })?;
+        bincode::deserialize(&frame)
+            .map(Some)
+            .map_err(|error| Error::Storage(format!("invalid spill row: {error}")))
+    }
+}
+
+impl Drop for Spill {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
     }
 }
 
@@ -183,5 +285,85 @@ impl Scan {
             .iter()
             .map(|&i| row.get(i).cloned().unwrap_or(Value::Null))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod spill_tests {
+    use super::*;
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn spill_file(frames: &[Vec<u8>]) -> (PathBuf, File) {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "elyrasql-stream-test-{}-{}.tmp",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        for frame in frames {
+            file.write_all(&(frame.len() as u32).to_le_bytes()).unwrap();
+            file.write_all(frame).unwrap();
+        }
+        file.flush().unwrap();
+        (path, file)
+    }
+
+    fn empty_schema() -> Schema {
+        Schema::new(vec![])
+    }
+
+    #[tokio::test]
+    async fn spill_stream_reads_bounded_batches_and_cleans_up() {
+        let expected = [
+            vec![Value::Int(1)],
+            vec![Value::Text("two".into())],
+            vec![Value::Null],
+        ];
+        let frames: Vec<_> = expected
+            .iter()
+            .map(|row| bincode::serialize(row).unwrap())
+            .collect();
+        let (path, file) = spill_file(&frames);
+        let mut stream = RowStream::spill(empty_schema(), path.clone(), file).unwrap();
+
+        assert_eq!(stream.next_batch(2).await.unwrap(), expected[..2]);
+        assert_eq!(stream.next_batch(2).await.unwrap(), expected[2..]);
+        assert!(stream.next_batch(2).await.unwrap().is_empty());
+        assert!(path.exists());
+        drop(stream);
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn spill_stream_rejects_oversized_frames() {
+        let (path, mut file) = spill_file(&[]);
+        let oversized = u32::try_from(elyra_core::max_frame_bytes())
+            .unwrap()
+            .checked_add(1)
+            .unwrap();
+        file.write_all(&oversized.to_le_bytes()).unwrap();
+        file.flush().unwrap();
+        let mut stream = RowStream::spill(empty_schema(), path, file).unwrap();
+        let err = stream.next_batch(1).await.unwrap_err();
+        assert!(err.to_string().contains("too large"));
+    }
+
+    #[tokio::test]
+    async fn spill_stream_rejects_truncated_frames() {
+        let (path, mut file) = spill_file(&[]);
+        file.write_all(&10u32.to_le_bytes()).unwrap();
+        file.write_all(b"short").unwrap();
+        file.flush().unwrap();
+        let mut stream = RowStream::spill(empty_schema(), path, file).unwrap();
+        let err = stream.next_batch(1).await.unwrap_err();
+        assert!(err.to_string().contains("truncated spill row frame"));
     }
 }

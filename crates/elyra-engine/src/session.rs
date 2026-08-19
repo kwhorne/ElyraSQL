@@ -119,6 +119,33 @@ fn rollback_tx_to(tx: &mut TxnState, undo_mark: usize, ranges_len: usize) {
     tx.ranges.truncate(ranges_len);
 }
 
+fn coalesce_ranges(mut ranges: Vec<(Vec<u8>, Option<Vec<u8>>)>) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
+    ranges.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    let mut merged: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        let Some((_, previous_end)) = merged.last_mut() else {
+            merged.push((start, end));
+            continue;
+        };
+        let overlaps = previous_end
+            .as_ref()
+            .is_none_or(|previous_end| start.as_slice() <= previous_end.as_slice());
+        if !overlaps {
+            merged.push((start, end));
+            continue;
+        }
+        match (&*previous_end, end) {
+            (None, _) => {}
+            (_, None) => *previous_end = None,
+            (Some(previous), Some(candidate)) if candidate > *previous => {
+                *previous_end = Some(candidate);
+            }
+            _ => {}
+        }
+    }
+    merged
+}
+
 fn undo_entry_size(entry: &UndoEntry) -> usize {
     entry.key.len() + entry.prev_put.as_ref().map_or(0, Vec::len) + 1
 }
@@ -211,6 +238,16 @@ impl Session {
             row_count: std::sync::atomic::AtomicI64::new(-1),
             cancel: Arc::new(elyra_core::cancel::QueryCancel::new()),
         }
+    }
+
+    pub(crate) fn transaction_write_budget_remaining(&self) -> usize {
+        let used = self
+            .txn
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map_or(0, |transaction| transaction.mem);
+        txn_max_bytes().saturating_sub(used)
     }
 
     pub fn database(&self) -> String {
@@ -628,6 +665,19 @@ impl Session {
         Ok(checkpoint)
     }
 
+    /// Upgrade the active transaction so every subsequently scanned range is
+    /// validated at commit. DDL table rewrites need this even under the default
+    /// snapshot isolation: otherwise a concurrent insert can land in the old
+    /// keyspace after the rewrite's scan and survive the catalog change.
+    pub(crate) fn require_serializable_validation(&self) -> Result<()> {
+        let mut guard = self.txn.lock().unwrap();
+        let transaction = guard
+            .as_mut()
+            .ok_or_else(|| Error::Query("serializable validation outside a transaction".into()))?;
+        transaction.serializable = true;
+        Ok(())
+    }
+
     pub(crate) fn release_transaction_checkpoint(
         &self,
         _checkpoint: TransactionCheckpoint,
@@ -686,13 +736,34 @@ impl Session {
             undo_mem: _,
         } = tx;
 
+        let ranges = if serializable {
+            coalesce_ranges(ranges)
+        } else {
+            ranges
+        };
+
         // Keys to validate = written keys, plus (serializable) read keys.
         // Per-table monotonic counters (`meta::…`) are excluded: they are bumped
         // by every write and would cause false conflicts between transactions on
         // the same table; real row collisions are still caught via data keys.
+        let range_covers = |key: &[u8]| {
+            serializable
+                && ranges.iter().any(|(start, end)| {
+                    start.as_slice() <= key && end.as_ref().is_none_or(|end| key < end.as_slice())
+                })
+        };
         let mut keyset: BTreeSet<Vec<u8>> = BTreeSet::new();
-        keyset.extend(puts.keys().filter(|k| !is_meta(k)).cloned());
-        keyset.extend(deletes.iter().filter(|k| !is_meta(k)).cloned());
+        keyset.extend(
+            puts.keys()
+                .filter(|key| !is_meta(key) && !range_covers(key))
+                .cloned(),
+        );
+        keyset.extend(
+            deletes
+                .iter()
+                .filter(|key| !is_meta(key) && !range_covers(key))
+                .cloned(),
+        );
         keyset.extend(locked.iter().filter(|k| !is_meta(k)).cloned());
         if serializable {
             keyset.extend(reads.iter().filter(|k| !is_meta(k)).cloned());
@@ -900,8 +971,12 @@ impl Session {
         // catalog epoch so cached TableDefs are refreshed. Bumping eagerly (even
         // for a buffered transactional write that may roll back) is safe -- it
         // only forces a re-read, never serves stale schema.
-        if puts.iter().any(|(k, _)| k.starts_with(b"catalog::"))
-            || deletes.iter().any(|k| k.starts_with(b"catalog::"))
+        if puts
+            .iter()
+            .any(|(k, _)| k.starts_with(b"catalog::") || k.starts_with(b"sys::trigger::"))
+            || deletes
+                .iter()
+                .any(|k| k.starts_with(b"catalog::") || k.starts_with(b"sys::trigger::"))
         {
             crate::catalog::bump_epoch();
         }
@@ -1013,4 +1088,48 @@ where
     tokio::task::spawn_blocking(f)
         .await
         .map_err(|e| Error::Storage(format!("snapshot read failed: {e}")))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::coalesce_ranges;
+
+    fn bytes(value: &str) -> Vec<u8> {
+        value.as_bytes().to_vec()
+    }
+
+    #[test]
+    fn coalesces_overlapping_and_adjacent_ranges() {
+        let ranges = vec![
+            (bytes("m"), Some(bytes("p"))),
+            (bytes("a"), Some(bytes("d"))),
+            (bytes("c"), Some(bytes("f"))),
+            (bytes("f"), Some(bytes("h"))),
+            (bytes("n"), Some(bytes("o"))),
+        ];
+
+        assert_eq!(
+            coalesce_ranges(ranges),
+            vec![
+                (bytes("a"), Some(bytes("h"))),
+                (bytes("m"), Some(bytes("p"))),
+            ]
+        );
+    }
+
+    #[test]
+    fn coalescing_preserves_nested_disjoint_and_unbounded_ranges() {
+        let ranges = vec![
+            (bytes("z"), Some(bytes("zz"))),
+            (bytes("b"), Some(bytes("c"))),
+            (bytes("a"), Some(bytes("e"))),
+            (bytes("x"), None),
+            (bytes("y"), Some(bytes("yz"))),
+        ];
+
+        assert_eq!(
+            coalesce_ranges(ranges),
+            vec![(bytes("a"), Some(bytes("e"))), (bytes("x"), None)]
+        );
+    }
 }

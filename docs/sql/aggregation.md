@@ -147,12 +147,14 @@ AVG(v) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING)
 SUM(v) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING)
 ```
 
-`RANGE` supports the whole-partition (`UNBOUNDED PRECEDING AND UNBOUNDED
-FOLLOWING`) and running (`UNBOUNDED PRECEDING AND CURRENT ROW`) forms.
+`RANGE` supports numeric value offsets with one numeric `ORDER BY` expression,
+including ascending and descending order. `GROUPS` supports offsets measured in
+peer groups and may use multiple `ORDER BY` expressions. Temporal `RANGE`
+offsets are not yet supported.
 
 !!! note
-    `RANGE`/`GROUPS` with numeric offsets, frame `EXCLUDE`, and named windows
-    are not supported.
+    Frame `EXCLUDE` is not supported. Named windows, including inheritance with
+    `OVER (window_name ...)`, are supported.
 
 ## The OLAP engine
 

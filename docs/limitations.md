@@ -35,8 +35,8 @@ judge fit before deploying.
   counters); this is a full recompute, not incremental delta maintenance.
 - **Named windows** are supported: `... OVER w ... WINDOW w AS (PARTITION BY ...
   ORDER BY ...)`, including `OVER (w ...)` inheriting a named window.
-- Not yet: `RANGE`/`GROUPS` numeric value-offset frames (only
-  `UNBOUNDED PRECEDING .. CURRENT ROW`/`UNBOUNDED FOLLOWING` for `RANGE`),
+- Numeric value-offset `RANGE` frames and peer-offset `GROUPS` frames are
+  supported. Temporal `RANGE` offsets are not yet supported. Other gaps include
   correlated subqueries combined with aggregation over a join, user-defined
   functions, and events.
 - `INSERT ... SET col = val, ...` (MySQL shorthand) is supported — it is
@@ -68,7 +68,10 @@ judge fit before deploying.
 - Enforced: `PRIMARY KEY`, `UNIQUE`, `NOT NULL`, `CHECK`, and `FOREIGN KEY`.
 - Foreign keys reference a primary key or unique index; both `ON DELETE` and
   `ON UPDATE` `RESTRICT`/`NO ACTION`/`CASCADE`/`SET NULL` are enforced.
-- Not yet: multi-level (recursive) cascades, and deferred constraint checking.
+- Multi-level `ON DELETE` cascades are supported, including self-referencing
+  hierarchies. Delete cascades run to a fixed point with cycle detection and a
+  depth guard. `ON UPDATE` cascades are currently single-level, and deferred
+  constraint checking is not yet supported.
 
 ## Query planning
 
@@ -192,14 +195,17 @@ judge fit before deploying.
   shapes are rare and the materialising path is correct. Left-deep chains of more
   than two tables *do* stream; a join expression the chain builder cannot analyse
   takes the materialising `join_select` path.
-- **`WHERE col IN (SELECT ...)` and `DISTINCT` collection are in-memory** (unlike
-  `ORDER BY`/`GROUP BY`, which spill): the subquery's value list and the distinct
-  set are buffered in RAM. To stay fail-safe rather than OOM, these are **bounded**
-  — an `IN (SELECT ...)` over more than `ELYRASQL_IN_SUBQUERY_MAX` rows (default
-  1,000,000) or a `DISTINCT` over more than `ELYRASQL_DISTINCT_MAX` rows (default
-  5,000,000) errors with a clear message (rewrite `IN (SELECT)` as a `JOIN`/
-  `EXISTS`). True disk-spilling for these is a future step. Correlated subqueries
-  execute as a nested loop (re-run per driving row, `O(N×M)`), not yet decorrelated.
+- **`WHERE col IN (SELECT ...)` collection is in-memory**: the subquery's value
+  list is buffered in RAM. To stay fail-safe rather than OOM, an `IN (SELECT ...)`
+  over more than `ELYRASQL_IN_SUBQUERY_MAX` rows (default 1,000,000) errors with a
+  clear message (rewrite it as a `JOIN`/`EXISTS`). `SELECT DISTINCT` does spill:
+  it keeps up to `ELYRASQL_DISTINCT_MAX` distinct rows in its in-memory fast path
+  (default 5,000,000), then switches to external sorting. A narrow correlated
+  `EXISTS`/`NOT EXISTS` shape is decorrelated into one-time key membership: one
+  plain outer table, a top-level `AND` conjunct, one plain inner table, and one
+  type- and collation-compatible column equality. NULL keys retain SQL
+  semi/anti-join semantics. Other correlated shapes execute as a nested loop
+  (re-run per driving row, `O(N×M)`).
 - Uncommitted transaction writes are buffered in memory (not spilled to disk)
   until `COMMIT`/`ROLLBACK`. To keep this bounded, a transaction that stages more
   than `ELYRASQL_TXN_MAX_BYTES` (default 1 GiB) of writes has its next write
@@ -441,14 +447,16 @@ judge fit before deploying.
   `PDO::ATTR_EMULATE_PREPARES => false` — is fixed). `describe_query` reports an
   exact result-column count at `PREPARE` (enable with `ELYRASQL_STMT_DESCRIBE`)
   for single **and** joined/multi-table SELECTs, so `SELECT *` over a join
-  resolves its columns. Remaining gaps: `SELECT a.*` (qualified wildcard in the
-  projection) and `SELECT *` over `information_schema` are not yet executed.
+  resolves its columns. Qualified wildcards (`SELECT a.*`) and projections over
+  `information_schema` are supported at both prepare and execution time.
   Client-side (emulated) prepared statements remain the widest-compatibility
   default; PyMySQL and sqlx bind client-side and are unaffected.
 - **`LOAD DATA INFILE`** reads a **server-side** file and bulk-inserts it
   (requires ADMIN, like MySQL's `FILE` privilege): `LOAD DATA INFILE '<path>'
   INTO TABLE t [FIELDS TERMINATED BY '...'] [ENCLOSED BY '...'] [LINES
-  TERMINATED BY '...'] [IGNORE n LINES] [(cols)]`, with `\N` for NULL. Client-
+  TERMINATED BY '...'] [IGNORE n LINES] [(cols)]`, with `\N` for NULL. Rows are
+  grouped into bounded 50,000-row insert units to amortize parsing and durable
+  commits without allowing an individual statement to grow indefinitely. Client-
   side `LOAD DATA LOCAL INFILE` (streaming the file over the wire) is not
   supported.
 - Authentication offers `mysql_native_password` (default) and

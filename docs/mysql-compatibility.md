@@ -145,25 +145,25 @@ gaps:
 - Subqueries (`WHERE` + SELECT-list, correlated + uncorrelated, **including over
   joins**), derived tables, CTEs including **`WITH RECURSIVE`**, `HAVING`,
   window functions with **explicit `ROWS` frames** and named windows,
-  `GROUP BY ... WITH ROLLUP` and set operations are supported. Not yet:
-  `RANGE`/`GROUPS` **numeric value-offset** frames (only the `UNBOUNDED`/`CURRENT
-  ROW` forms of `RANGE`).
+  `GROUP BY ... WITH ROLLUP`, set operations, numeric value-offset `RANGE`
+  frames, and peer-offset `GROUPS` frames are supported. Temporal `RANGE`
+  offsets are not yet supported.
 - Views, **materialized views**, row-level triggers, and stored procedures
   (parameters, local and session variables, `IF`/`WHILE`/`LOOP`/`REPEAT`,
   cursors, condition handlers) are supported; user-defined functions and
   scheduled events are not.
 - `ALTER TABLE` supports add/drop/rename/`MODIFY`/`CHANGE` column, rename table,
-  `ADD INDEX`/`KEY`/`UNIQUE` (with backfill) and **`ADD FOREIGN KEY`**;
-  `ADD PRIMARY KEY` on an existing table must instead be declared in
-  `CREATE TABLE`. `SHOW CREATE TABLE` echoes `CHECK` and `FOREIGN KEY`
-  constraints (with their referential actions) since 1.8.0, so its output can be
-  replayed without losing them.
+  `ADD INDEX`/`KEY`/`UNIQUE` (with backfill), **`ADD PRIMARY KEY`** (with an
+  atomic table recluster), and **`ADD FOREIGN KEY`**. `SHOW CREATE TABLE` echoes
+  `CHECK` and `FOREIGN KEY` constraints (with their referential actions) since
+  1.8.0, so its output can be replayed without losing them.
 - A broad scalar function library (string, math, date/time, JSON, `MD5`/`SHA1`/
   `SHA2`, `HEX`/`UNHEX`, `FORMAT`, `FIND_IN_SET`, `FROM_UNIXTIME`, ...),
   statistical and bitwise aggregates (`STDDEV*`, `VAR*`, `BIT_OR`/`AND`/`XOR`),
   `LAST_INSERT_ID()`/`ROW_COUNT()`, `@@`system variables, and `CONVERT()`. The
-  MySQL shorthands `INSERT ... SET`, the `<<`/`>>`/`~` bitwise operators and
-  `LOAD DATA LOCAL INFILE` all work.
+  MySQL shorthands `INSERT ... SET` and the `<<`/`>>`/`~` bitwise operators all
+  work. `LOAD DATA INFILE` reads a server-side file using bounded bulk insert
+  units; client-streamed `LOAD DATA LOCAL INFILE` is not supported.
 - Vector search and `VEC_DISTANCE(...)` are ElyraSQL extensions (they mirror
   MySQL 9's vector direction but are not identical).
 - **Integer storage is always 64-bit**, but the declared width and `UNSIGNED`

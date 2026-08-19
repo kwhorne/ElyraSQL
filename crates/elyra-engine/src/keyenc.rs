@@ -7,16 +7,6 @@
 
 use elyra_core::{fold, Collation, Error, Result, Value};
 
-/// Encode a (possibly composite) key from its component values, in key order.
-/// Text is case-folded (the default case-insensitive collation).
-pub fn encode_key(values: &[Value]) -> Result<Vec<u8>> {
-    let mut out = Vec::with_capacity(values.len() * 8);
-    for v in values {
-        encode_component(v, Collation::Ci, &mut out)?;
-    }
-    Ok(out)
-}
-
 /// Encode a composite key honoring each component's collation (case-sensitive
 /// for `Bin`). `colls` is matched positionally; missing entries default to `Ci`.
 pub fn encode_key_coll(values: &[Value], colls: &[Collation]) -> Result<Vec<u8>> {
@@ -24,6 +14,24 @@ pub fn encode_key_coll(values: &[Value], colls: &[Collation]) -> Result<Vec<u8>>
     for (i, v) in values.iter().enumerate() {
         let c = colls.get(i).copied().unwrap_or(Collation::Ci);
         encode_component(v, c, &mut out)?;
+    }
+    Ok(out)
+}
+
+/// Encode selected columns from a row without first cloning them into a
+/// temporary value vector. `columns` and `colls` are both in key order.
+pub fn encode_columns_coll(
+    row: &[Value],
+    columns: &[usize],
+    colls: &[Collation],
+) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(columns.len() * 8);
+    for (position, &column) in columns.iter().enumerate() {
+        let value = row
+            .get(column)
+            .ok_or_else(|| Error::Storage("key column is outside the stored row".into()))?;
+        let collation = colls.get(position).copied().unwrap_or(Collation::Ci);
+        encode_component(value, collation, &mut out)?;
     }
     Ok(out)
 }
@@ -89,4 +97,24 @@ fn encode_component(value: &Value, coll: Collation, out: &mut Vec<u8>) -> Result
 /// rowids in numeric/insertion order.
 pub fn encode_rowid(rowid: u64) -> [u8; 8] {
     rowid.to_be_bytes()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selected_column_encoding_matches_materialized_tuple_encoding() {
+        let row = vec![
+            Value::Text("ignored".into()),
+            Value::Int(-7),
+            Value::Text("Case".into()),
+        ];
+        let materialized = vec![row[2].clone(), row[1].clone()];
+        let collations = [Collation::Bin, Collation::Ci];
+        assert_eq!(
+            encode_columns_coll(&row, &[2, 1], &collations).unwrap(),
+            encode_key_coll(&materialized, &collations).unwrap()
+        );
+    }
 }

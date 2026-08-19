@@ -33,10 +33,18 @@ ElyraSQL picks an access path automatically:
 |-----------|-------------|------|
 | `pk = <literal>` (all key columns) | clustered point lookup | `O(log n)` |
 | `indexed_col = <literal>` | secondary index | `O(log n + matches)` |
+| equality on a composite-index prefix plus a range on its next column | composite secondary range scan | proportional to matches |
 | `col >/>=/</<= <literal>`, `BETWEEN` on PK/indexed col | ordered range scan | proportional to matches |
 | `ORDER BY <pk prefix> ASC\|DESC LIMIT n` (no filter) | clustered walk (forward/reverse), stop at `n` | `O(offset + n)` |
 | `ORDER BY <indexed col> ASC\|DESC LIMIT n` | ordered index walk (+ NULL block), stop at `n` | `O(offset + n)` |
 | anything else | full table scan (streaming) | `O(n)` |
+
+`EXPLAIN SELECT ...` reports the proven access path and index name. Its `Extra`
+column also identifies guaranteed indexed nested-loop joins, one-time
+`EXISTS`/`NOT EXISTS` membership, incremental window aggregates, and
+spill-capable `DISTINCT`. Plans outside those proven subsets are reported
+conservatively rather than claiming an optimization that may fall back at
+runtime.
 
 Non-accelerated scans **stream** in bounded memory, so they never load the
 whole table at once. When such a scan feeds an `ORDER BY ... LIMIT k`, only the
@@ -153,7 +161,10 @@ WHERE (SELECT COUNT(*) FROM orders o WHERE o.uid = u.id) >= 2;
 !!! note
     Correlated references must be **qualified** with the outer table's
     name/alias (`u.id`) so they are not confused with an inner column. This
-    path materialises the outer rows and runs the subquery per row.
+    path materialises the outer rows. A top-level `EXISTS`/`NOT EXISTS` against
+    one plain inner table with one type- and collation-compatible column
+    equality builds the inner key set once; other correlated shapes run the
+    subquery per outer row.
 
 ### Derived tables
 
