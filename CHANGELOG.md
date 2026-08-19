@@ -6,6 +6,22 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed
+
+- **`ai_embed()` now uses ureq 3.** Two things change for anyone who has
+  `ELYRASQL_AI_EMBED_URL` configured. ureq 3 reads `HTTP_PROXY`, `HTTPS_PROXY`
+  and `ALL_PROXY` from the environment by default where ureq 2 did not, so the
+  proxy is explicitly disabled to preserve the previous behaviour -- the request
+  carries the provider API key in its `Authorization` header, and a proxy
+  variable that happens to be set in the server's environment should not
+  silently reroute it. The response body is also capped at ureq's 10 MiB
+  default; ureq 2's `into_json()` was unbounded.
+
+  TLS is unchanged: rustls with `ring` and bundled webpki roots, no
+  `aws-lc-rs`, so static musl builds and the `FROM scratch` image are
+  unaffected. Note that ureq 3 raises the effective MSRV floor to exactly the
+  declared 1.88 (via `cookie_store` and `time`).
+
 ### Internal
 
 - **Dependabot no longer rewrites the Rust toolchain pins, and no longer groups
