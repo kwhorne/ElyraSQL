@@ -61,6 +61,17 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = true
+# Abort on panic rather than unwinding. A panic in a connection task used to
+# unwind that task alone, leaving the process up -- but if it unwound while
+# holding one of the std::sync::Mutex guards the server keeps (session state,
+# cluster state, the metrics registry), that mutex stayed poisoned for the
+# lifetime of the process and every later lock().unwrap() panicked in turn. The
+# result was a server that still accepted connections and passed a health check
+# while failing every query: the worst failure mode available. Aborting turns
+# that into a clean crash, which is the path the crash-recovery and soak/chaos
+# suites already exercise on every run, and which the shipped systemd unit
+# (Restart=on-failure) and any container restart policy already handle.
+panic = "abort"
 
 [profile.dist]
 inherits = "release"
