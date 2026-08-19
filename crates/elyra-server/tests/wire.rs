@@ -11198,6 +11198,75 @@ async fn string_expansion_is_bounded() {
     }
 }
 
+// MySQL reports *changed* rows, not matched rows, and upserts carry a specific
+// convention on top of that: 1 for an inserted row, 2 for an updated one, 0 when
+// the "update" assigns the values the row already had. The 1-vs-2 distinction is
+// the documented way for a client to tell an insert from an update, so
+// updateOrCreate-style flows read it directly. Every count below was measured
+// against MySQL 8.4 rather than inferred from the manual, which documents only
+// the 1-or-2 pair and not the REPLACE-identical case.
+#[tokio::test]
+async fn affected_rows_follow_mysql_changed_row_counts() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop("CREATE TABLE ar (id INT PRIMARY KEY, n INT)")
+        .await
+        .unwrap();
+
+    macro_rules! affected {
+        ($sql:expr, $want:expr, $why:expr) => {{
+            c.query_drop($sql).await.unwrap();
+            assert_eq!(c.affected_rows(), $want, "{}: {}", $sql, $why);
+        }};
+    }
+
+    // INSERT ... ON DUPLICATE KEY UPDATE.
+    let odku = "INSERT INTO ar VALUES (1,10) ON DUPLICATE KEY UPDATE n=VALUES(n)";
+    affected!(odku, 1, "inserted as a new row");
+    let changed = "INSERT INTO ar VALUES (1,20) ON DUPLICATE KEY UPDATE n=VALUES(n)";
+    affected!(changed, 2, "existing row updated");
+    affected!(changed, 0, "set to the values it already had");
+    affected!(
+        "INSERT INTO ar VALUES (1,30),(2,40) ON DUPLICATE KEY UPDATE n=VALUES(n)",
+        3,
+        "one update plus one insert"
+    );
+    // Two rows of the same statement colliding with each other count the same
+    // way: the first inserts, the second updates it.
+    affected!(
+        "INSERT INTO ar VALUES (5,1),(5,2) ON DUPLICATE KEY UPDATE n=VALUES(n)",
+        3,
+        "same-statement collision"
+    );
+    affected!(
+        "INSERT INTO ar VALUES (7,1),(7,1) ON DUPLICATE KEY UPDATE n=VALUES(n)",
+        1,
+        "same-statement collision that changes nothing"
+    );
+
+    // REPLACE counts the delete plus the insert -- but 1, not 2, when the
+    // replacement is identical, because nothing is deleted.
+    affected!("REPLACE INTO ar VALUES (3,50)", 1, "inserted");
+    affected!("REPLACE INTO ar VALUES (3,60)", 2, "replaced");
+    affected!("REPLACE INTO ar VALUES (3,60)", 1, "identical replacement");
+
+    // Plain DML, for contrast.
+    affected!(
+        "INSERT IGNORE INTO ar VALUES (1,99)",
+        0,
+        "duplicate skipped"
+    );
+    affected!("INSERT INTO ar VALUES (4,70)", 1, "plain insert");
+    affected!("UPDATE ar SET n=71 WHERE id=4", 1, "row changed");
+    affected!(
+        "UPDATE ar SET n=71 WHERE id=4",
+        0,
+        "matched but unchanged is 0, not 1"
+    );
+    affected!("UPDATE ar SET n=1 WHERE id=999", 0, "no match");
+    affected!("DELETE FROM ar WHERE id=4", 1, "deleted");
+}
+
 // Prepared statements are capped server-wide (MySQL's max_prepared_stmt_count),
 // so the slot MUST be returned when a statement is closed. Preparing far more
 // distinct statements than the limit (the driver evicts and closes as it goes)
