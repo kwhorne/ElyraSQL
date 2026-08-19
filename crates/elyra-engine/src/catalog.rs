@@ -73,6 +73,10 @@ pub struct TableDef {
     /// FOREIGN KEY constraints.
     #[serde(default)]
     pub foreign_keys: Vec<ForeignKey>,
+    /// Physical keyspace generation. It lives in a separate catalog key so the
+    /// serialized `TableDef` remains backward compatible.
+    #[serde(skip)]
+    pub storage_generation: u64,
 }
 
 /// A FOREIGN KEY: `columns` in this table reference `ref_columns` of
@@ -99,6 +103,20 @@ pub enum RefAction {
 }
 
 impl TableDef {
+    pub fn storage_name(&self) -> String {
+        storage_name(&self.name, self.storage_generation)
+    }
+
+    pub fn data_prefix(&self) -> Vec<u8> {
+        data_prefix_generation(&self.name, self.storage_generation)
+    }
+
+    pub fn data_key(&self, encoded: &[u8]) -> Vec<u8> {
+        let mut key = self.data_prefix();
+        key.extend_from_slice(encoded);
+        key
+    }
+
     pub fn has_pk(&self) -> bool {
         !self.pk_cols.is_empty()
     }
@@ -172,10 +190,18 @@ pub fn index_table_prefix(table: &str) -> Vec<u8> {
     format!("index::{table}::").into_bytes()
 }
 
+pub fn index_table_prefix_generation(table: &str, generation: u64) -> Vec<u8> {
+    format!("index::{}::", storage_name(table, generation)).into_bytes()
+}
+
 /// Prefix under which all NULL-keyed index entries of a table live (see
 /// [`IndexDef::indexes_nulls`]).
 pub fn indexnull_table_prefix(table: &str) -> Vec<u8> {
     format!("indexnull::{table}::").into_bytes()
+}
+
+pub fn indexnull_table_prefix_generation(table: &str, generation: u64) -> Vec<u8> {
+    format!("indexnull::{}::", storage_name(table, generation)).into_bytes()
 }
 
 pub fn catalog_key(table: &str) -> Vec<u8> {
@@ -517,6 +543,24 @@ pub fn wcount_key(table: &str) -> Vec<u8> {
     format!("meta::wcount::{table}").into_bytes()
 }
 
+pub fn generation_key(table: &str) -> Vec<u8> {
+    format!("meta::generation::{table}").into_bytes()
+}
+
+pub fn storage_name(table: &str, generation: u64) -> String {
+    if generation == 0 {
+        table.to_string()
+    } else {
+        // A leading NUL cannot occur in a SQL identifier, making generated
+        // physical names disjoint from every legacy generation-0 table name.
+        format!("\0generation_{generation:016x}::{table}")
+    }
+}
+
+pub fn data_prefix_generation(table: &str, generation: u64) -> Vec<u8> {
+    format!("data::{}::", storage_name(table, generation)).into_bytes()
+}
+
 /// Prefix under which all rows of a table live.
 pub fn data_prefix(table: &str) -> Vec<u8> {
     format!("data::{table}::").into_bytes()
@@ -636,10 +680,20 @@ pub async fn load(db: &Session, table: &str) -> Result<TableDef> {
             }
         }
     }
-    let mut def = match db.get(catalog_key(table)).await? {
+    let mut values = db
+        .multi_get(vec![catalog_key(table), generation_key(table)])
+        .await?
+        .into_iter();
+    let mut def = match values.next().flatten() {
         Some(bytes) => TableDef::decode(&bytes)?,
         None => return Err(Error::Catalog(format!("no such table: {table}"))),
     };
+    def.storage_generation = values
+        .next()
+        .flatten()
+        .and_then(|bytes| bytes.as_slice().try_into().ok())
+        .map(u64::from_le_bytes)
+        .unwrap_or(0);
     // Declared widths live in their own key, so they are merged in here rather
     // than in `TableDef::decode`. The result is cached with the definition, so
     // this costs one extra read per cache miss, not per query.

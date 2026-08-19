@@ -114,7 +114,8 @@ impl Engine {
     /// Must run before the server accepts connections: no query may observe a
     /// half-migrated keyspace.
     pub async fn migrate_collation(&self) -> elyra_core::Result<()> {
-        crate::collmig::migrate(&self.session()).await
+        crate::collmig::migrate(&self.session()).await?;
+        crate::exec::resume_generation_cleanup(&self.db).await
     }
 
     pub fn session(&self) -> Session {

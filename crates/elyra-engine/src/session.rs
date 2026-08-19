@@ -735,6 +735,12 @@ impl Session {
             mem: _,
             undo_mem: _,
         } = tx;
+        let catalog_changed = puts
+            .keys()
+            .any(|key| key.starts_with(b"catalog::") || key.starts_with(b"sys::trigger::"))
+            || deletes
+                .iter()
+                .any(|key| key.starts_with(b"catalog::") || key.starts_with(b"sys::trigger::"));
 
         let ranges = if serializable {
             coalesce_ranges(ranges)
@@ -764,7 +770,9 @@ impl Session {
                 .filter(|key| !is_meta(key) && !range_covers(key))
                 .cloned(),
         );
-        keyset.extend(locked.iter().filter(|k| !is_meta(k)).cloned());
+        // Explicitly locked keys include table write-sequence metadata used by
+        // shadow rewrites to detect any concurrent table mutation.
+        keyset.extend(locked.iter().cloned());
         if serializable {
             keyset.extend(reads.iter().filter(|k| !is_meta(k)).cloned());
         }
@@ -807,7 +815,8 @@ impl Session {
         let put_vec: Vec<(Vec<u8>, Vec<u8>)> = puts.into_iter().collect();
         let del_vec: Vec<Vec<u8>> = deletes.into_iter().collect();
         // On conflict the transaction is already cleared above -> aborted.
-        self.db
+        let result = self
+            .db
             .commit_validated(
                 Validation {
                     keys: expected,
@@ -816,7 +825,11 @@ impl Session {
                 put_vec,
                 del_vec,
             )
-            .await
+            .await;
+        if result.is_ok() && catalog_changed {
+            crate::catalog::bump_epoch();
+        }
+        result
     }
 
     pub fn rollback(&self) {
@@ -968,16 +981,16 @@ impl Session {
         deletes: Vec<Vec<u8>>,
     ) -> Result<()> {
         // Any write to a `catalog::` key changes a table definition; bump the
-        // catalog epoch so cached TableDefs are refreshed. Bumping eagerly (even
-        // for a buffered transactional write that may roll back) is safe -- it
-        // only forces a re-read, never serves stale schema.
-        if puts
+        // catalog epoch so cached TableDefs are refreshed. Bump eagerly for
+        // transactional visibility and again after a successful storage commit,
+        // closing the window where another session could cache the old schema.
+        let catalog_changed = puts
             .iter()
             .any(|(k, _)| k.starts_with(b"catalog::") || k.starts_with(b"sys::trigger::"))
             || deletes
                 .iter()
-                .any(|k| k.starts_with(b"catalog::") || k.starts_with(b"sys::trigger::"))
-        {
+                .any(|k| k.starts_with(b"catalog::") || k.starts_with(b"sys::trigger::"));
+        if catalog_changed {
             crate::catalog::bump_epoch();
         }
         crate::catalog::note_feature_writes(&puts, &deletes);
@@ -1043,7 +1056,11 @@ impl Session {
                 return Ok(());
             }
         }
-        self.db.commit(puts, deletes).await
+        let result = self.db.commit(puts, deletes).await;
+        if result.is_ok() && catalog_changed {
+            crate::catalog::bump_epoch();
+        }
+        result
     }
 }
 

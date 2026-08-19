@@ -13,7 +13,7 @@ use elyra_core::{ColumnType, Error, Result, Schema, Value};
 use elyra_storage::Db;
 use sqlparser::ast::Expr;
 
-use crate::catalog::{data_prefix, TableDef};
+use crate::catalog::TableDef;
 use crate::predicate;
 
 /// How many storage rows to pull per underlying scan step.
@@ -130,7 +130,7 @@ impl RowStream {
             schema: spec.out_schema,
             src: Source::Scan(Scan {
                 db,
-                prefix: data_prefix(&table.name),
+                prefix: table.data_prefix(),
                 cursor: None,
                 full_schema: table.schema.clone(),
                 projection: spec.projection,
