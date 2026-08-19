@@ -4822,11 +4822,12 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
         // Coalesce with an earlier row in the same statement.
         if let Some(&pos) = pos_of.get(&key) {
             if replace {
-                batch[pos].1 = row;
-                affected += 1;
+                let previous = std::mem::replace(&mut batch[pos].1, row);
+                affected += replaced_row_count(&previous, &batch[pos].1);
             } else if on_dup {
-                batch[pos].1 = apply_dup(&batch[pos].1.clone(), &row)?;
-                affected += 1;
+                let previous = batch[pos].1.clone();
+                batch[pos].1 = apply_dup(&previous, &row)?;
+                affected += updated_row_count(&previous, &batch[pos].1);
             } else if !ignore {
                 return Err(Error::Duplicate(format!(
                     "Duplicate entry for key 'PRIMARY' on '{name}'"
@@ -4852,9 +4853,13 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
             } else {
                 apply_dup(&old_row, &row)?
             };
+            affected += if replace {
+                replaced_row_count(&old_row, &new_row)
+            } else {
+                updated_row_count(&old_row, &new_row)
+            };
             pos_of.insert(key.clone(), batch.len());
             batch.push((key, new_row));
-            affected += 1;
         } else {
             pos_of.insert(key.clone(), batch.len());
             batch.push((key, row));
@@ -4907,6 +4912,35 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
                 .unwrap_or(0)
         },
     })
+}
+
+/// Affected-rows contribution of one `INSERT ... ON DUPLICATE KEY UPDATE` row
+/// that landed on an existing row.
+///
+/// MySQL documents this exactly: 1 if the row was inserted as new, **2** if an
+/// existing row was updated, and **0** if the existing row was set to the values
+/// it already had. The 2 is the attempted insert plus the update, and it is how a
+/// client tells an insert from an update.
+fn updated_row_count(old_row: &[Value], new_row: &[Value]) -> u64 {
+    if old_row == new_row {
+        0
+    } else {
+        2
+    }
+}
+
+/// Affected-rows contribution of one `REPLACE` row that landed on an existing row.
+///
+/// 2 when the stored row actually changed (the delete plus the insert), and 1
+/// when it did not: MySQL reports 1 for a `REPLACE` whose replacement is
+/// identical, because no delete is performed. Measured against MySQL 8.4 rather
+/// than inferred -- the manual documents only the 1-or-2 pair.
+fn replaced_row_count(old_row: &[Value], new_row: &[Value]) -> u64 {
+    if old_row == new_row {
+        1
+    } else {
+        2
+    }
 }
 
 /// Point rows that collide with a unique secondary index at the owning
@@ -13659,7 +13693,12 @@ pub async fn update(
     if let Some(limit) = limit {
         matches.truncate(limit);
     }
-    let affected = matches.len() as u64;
+    // MySQL reports *changed* rows, not matched rows: an UPDATE that assigns a
+    // column the value it already had reports 0. (With CLIENT_FOUND_ROWS a client
+    // asks for matched rows instead, but that capability is not negotiated here,
+    // so the changed-row count is always the right answer. If it is ever
+    // honoured, this and the upsert counts in `insert` become conditional.)
+    let mut affected: u64 = 0;
 
     // Stored generated columns are recomputed after each update.
     let generated: Vec<(usize, Expr)> = if def.has_col_meta() {
@@ -13743,6 +13782,9 @@ pub async fn update(
             deletes.push(old_key);
         }
         let encoded = bincode::serialize(&new_row).map_err(|e| Error::Storage(e.to_string()))?;
+        if new_row != old_row {
+            affected += 1;
+        }
         fk_parent_changes.push((old_row, new_row.clone()));
         puts.push((new_key, encoded));
         puts.extend(new_index_entries);

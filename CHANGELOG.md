@@ -6,6 +6,35 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **Affected-row counts follow MySQL's changed-row convention.** MySQL reports
+  rows *changed*, not rows matched, and upserts carry a specific convention on
+  top of that. Every count below was wrong, and the 1-vs-2 distinction is the
+  documented way a client tells an insert from an update — so
+  `updateOrCreate`-style flows read the wrong answer:
+
+  | statement | was | MySQL |
+  |---|---:|---:|
+  | `INSERT ... ON DUPLICATE KEY UPDATE`, row updated | 1 | 2 |
+  | ... set to the values it already had | 1 | 0 |
+  | ... one insert plus one update in one statement | 2 | 3 |
+  | `REPLACE` replacing an existing row | 1 | 2 |
+  | `UPDATE` that matched a row but changed nothing | 1 | 0 |
+
+  All seventeen shapes in the new regression test were measured against MySQL
+  8.4 rather than read off the manual, which documents only the 1-or-2 pair —
+  not, for instance, that `REPLACE` with an identical replacement reports 1
+  because no delete happens.
+
+- **A boolean used as a number is an integer, not a float.** MySQL has no
+  separate boolean type: a comparison, `!` or `NOT` yields `TINYINT` 0/1, so it
+  belongs on the exact integer path. It was falling through to the float one, so
+  `SELECT TRUE + 1` gave `2.0` where MySQL gives `2` — and likewise
+  `(1 = 1) + 1`, `(2 > 1) + (3 > 2)`, `!0 + 1` and `-!0`. Clients that check the
+  column type, or round-trip the value through a typed language, saw `DOUBLE`
+  where MySQL gives `BIGINT`.
+
 ### Changed
 
 - **Release binaries abort on panic instead of unwinding.** A panic in a

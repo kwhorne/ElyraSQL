@@ -164,6 +164,8 @@ pub fn eval_row(expr: &Expr, schema: &Schema, row: &[Value]) -> Result<Value> {
                 } else {
                     Value::Bool(!truthy(&v))
                 }),
+                // Same reason as in `arith`: `-!0` is -1, not -1.0.
+                (UnaryOperator::Minus, Value::Bool(b)) => Ok(Value::Int(-i64::from(b))),
                 (UnaryOperator::Minus, Value::Int(i)) => {
                     i.checked_neg().map(Value::Int).ok_or_else(|| {
                         Error::OutOfRange(format!("BIGINT value is out of range in '-({i})'"))
@@ -3015,6 +3017,15 @@ fn arith(l: Value, op: &BinaryOperator, r: Value) -> Result<Value> {
     if l.is_null() || r.is_null() {
         return Ok(Value::Null);
     }
+    // A boolean *is* an integer in MySQL, so it must reach the exact integer
+    // path below rather than falling through to the float one: `TRUE + 1` and
+    // `(1 = 1) + 1` are 2, not 2.0. Comparisons and `!`/`NOT` all produce
+    // Bool, so this covers every predicate used as a number.
+    let as_int = |v: Value| match v {
+        Value::Bool(b) => Value::Int(i64::from(b)),
+        other => other,
+    };
+    let (l, r) = (as_int(l), as_int(r));
     // `a DIV b`: integer division truncating toward zero; `/0` is NULL; overflow
     // (i64::MIN DIV -1) is out of range like MySQL.
     if matches!(op, MyIntegerDivide) {
@@ -3229,7 +3240,34 @@ mod decimal_arithmetic_tests {
     use elyra_core::Value;
     use sqlparser::ast::BinaryOperator;
 
-    use super::decimal_arith;
+    use super::{arith, decimal_arith};
+
+    #[test]
+    fn booleans_are_integers_in_arithmetic() {
+        // MySQL has no separate boolean type: a comparison or `!`/`NOT` yields
+        // TINYINT 0/1, so it must stay on the exact integer path. Falling through
+        // to the float path gave `TRUE + 1` = 2.0 where MySQL gives 2.
+        let plus = |l: Value, r: Value| arith(l, &BinaryOperator::Plus, r).unwrap();
+        assert_eq!(plus(Value::Bool(true), Value::Int(1)), Value::Int(2));
+        assert_eq!(plus(Value::Bool(false), Value::Int(1)), Value::Int(1));
+        assert_eq!(plus(Value::Bool(true), Value::Bool(true)), Value::Int(2));
+        assert_eq!(
+            arith(Value::Bool(true), &BinaryOperator::Multiply, Value::Int(3)).unwrap(),
+            Value::Int(3)
+        );
+        assert_eq!(
+            arith(Value::Bool(true), &BinaryOperator::Minus, Value::Int(2)).unwrap(),
+            Value::Int(-1)
+        );
+        // Division stays on the float path for integers too, so a boolean
+        // numerator behaves like Int(1) rather than becoming exact.
+        assert_eq!(
+            arith(Value::Bool(true), &BinaryOperator::Divide, Value::Int(2)).unwrap(),
+            Value::Float(0.5)
+        );
+        // NULL still dominates.
+        assert_eq!(plus(Value::Bool(true), Value::Null), Value::Null);
+    }
 
     #[test]
     fn rejects_decimal_operations_that_exceed_the_representation() {
