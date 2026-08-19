@@ -57,8 +57,7 @@ variable fallback (handy for systemd and containers).
 | `ELYRASQL_PASSWORD_MIN_LEN` | `8` | Minimum password length when the policy is on. |
 | `ELYRASQL_PASSWORD_REQUIRE_MIXED` | `on` | Require mixed character classes when the policy is on. |
 | `ELYRASQL_AUTH_PLUGIN` | `mysql_native_password` | Authentication plugin advertised in the handshake. Set to `caching_sha2_password` for MySQL 8's default plugin: full authentication over TLS (cleartext) or a plaintext connection (RSA-encrypted password); no server-side password change required. `mysql_native_password` (the default) works with every client and is the safe choice. |
-| `ELYRASQL_AUTH_MAX_FAILURES` | `10` | Failed logins before an account is temporarily locked out. |
-| `ELYRASQL_AUTH_LOCKOUT_SECS` | `60` | Lockout duration after too many failed logins. |
+| `ELYRASQL_AUTH_MAX_FAILURES` | `10` | Consecutive failed logins for a known account before a warning is logged (0 disables). Logging only — the account is **not** locked out, because locking on a username lets unauthenticated traffic deny service to a valid user. |
 | `ELYRASQL_CLUSTER_SECRET` | — | Shared secret authenticating cluster/replication connections (challenge-response). Strongly recommended for any multi-node deployment. |
 | `ELYRASQL_FULLTEXT_LANGUAGE` | `english` | Snowball stemming language for `MATCH … AGAINST` and `FULLTEXT` indexes (`english`, `norwegian`, `german`, …, or `none` to disable stemming). Changing it invalidates existing full-text indexes (rebuild them). |
 | `ELYRASQL_AUDIT_LOG` | — | Path to an append-only audit log (tab-separated: timestamp, connection, user, OK/ERR, SQL). |
@@ -118,7 +117,7 @@ elyrasql serve
 
 - **Always** set credentials and **enable TLS** for client traffic — never
   expose an open (no-auth) listener to a network.
-- Keep the password policy and login lockout at their defaults (on).
+- Keep the password policy at its default (on).
 - If your transactions are small, lower `ELYRASQL_MAX_FRAME_MB` (e.g. `64`) for
   tighter denial-of-service defence. Keep it **≥ your largest transaction**
   (`ELYRASQL_TXN_MAX_BYTES`), or replication/binlog replay of that transaction

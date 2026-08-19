@@ -371,10 +371,15 @@ judge fit before deploying.
   PASSWORD`) must satisfy a strength policy: minimum length
   (`ELYRASQL_PASSWORD_MIN_LEN`, default 8) and a letters+digits requirement
   (`ELYRASQL_PASSWORD_REQUIRE_MIXED`, default on); set
-  `ELYRASQL_PASSWORD_POLICY=off` to disable. Repeated failed logins trigger a
-  **temporary account lockout** (`ELYRASQL_AUTH_MAX_FAILURES`, default 10;
-  `ELYRASQL_AUTH_LOCKOUT_SECS`, default 60) to blunt brute-force attacks;
-  failures and lockouts are logged. Two auth plugins are supported:
+  `ELYRASQL_PASSWORD_POLICY=off` to disable. Repeated failed logins for a known
+  account are counted and **logged** once they reach a threshold
+  (`ELYRASQL_AUTH_MAX_FAILURES`, default 10, 0 disables). **There is no account
+  lockout, and no brute-force rate limiting.** Locking a username is itself a
+  denial-of-service vector — anyone who can reach the port could lock out a
+  valid account by failing on purpose — so the earlier lockout was removed
+  rather than kept. Throttling that cannot be abused this way (per-source-address
+  backoff) is not implemented yet; until it is, put the listener behind a
+  network boundary you control. Two auth plugins are supported:
   `mysql_native_password` (default, works with every client) and
   `caching_sha2_password` (MySQL 8's default; opt-in via `ELYRASQL_AUTH_PLUGIN`,
   full authentication over TLS or via an RSA public-key exchange on a plaintext

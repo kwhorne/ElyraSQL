@@ -240,13 +240,18 @@ impl Session {
         }
     }
 
+    /// Bytes still available to a DDL rewrite inside the active transaction.
+    ///
+    /// Must account for the same two pools the write path enforces against
+    /// (`mem + undo_mem`), or a rewrite sized against this budget can push the
+    /// transaction past `ELYRASQL_TXN_MAX_BYTES` by the size of the undo log.
     pub(crate) fn transaction_write_budget_remaining(&self) -> usize {
         let used = self
             .txn
             .lock()
             .unwrap()
             .as_ref()
-            .map_or(0, |transaction| transaction.mem);
+            .map_or(0, |transaction| transaction.mem + transaction.undo_mem);
         txn_max_bytes().saturating_sub(used)
     }
 
