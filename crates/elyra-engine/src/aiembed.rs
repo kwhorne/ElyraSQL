@@ -59,7 +59,9 @@ fn concurrency() -> &'static tokio::sync::Semaphore {
 /// Embed one text into a vector, cached per (model, text).
 pub async fn embed(text: &str) -> Result<Vec<f32>> {
     if text.len() > MAX_EMBED_TEXT_BYTES {
-        return Err(Error::Query("ai_embed input is too large".into()));
+        return Err(Error::Query(format!(
+            "ai_embed input exceeds {MAX_EMBED_TEXT_BYTES} bytes"
+        )));
     }
     let (url, key, model) = config().ok_or_else(|| {
         Error::Query("ai_embed: set ELYRASQL_AI_EMBED_URL (and optionally _KEY, _MODEL)".into())
@@ -119,8 +121,10 @@ pub async fn embed(text: &str) -> Result<Vec<f32>> {
     .map_err(|e| Error::Query(format!("ai_embed task failed: {e}")))??;
     let mut cache = cache().lock().unwrap();
     if cache.len() >= MAX_CACHE_ENTRIES {
-        if let Some(oldest) = cache.keys().next().cloned() {
-            cache.remove(&oldest);
+        // Arbitrary eviction: HashMap iteration order is unspecified. Fine for
+        // a small bound; switch to an IndexMap/VecDeque if FIFO ever matters.
+        if let Some(victim) = cache.keys().next().cloned() {
+            cache.remove(&victim);
         }
     }
     cache.insert(ckey, v.clone());
