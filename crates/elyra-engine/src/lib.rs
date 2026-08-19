@@ -25,6 +25,7 @@ mod rowdec;
 mod sessfn;
 mod session;
 mod sort;
+pub mod sqllex;
 mod stream;
 mod users;
 mod vindex;
@@ -3981,37 +3982,10 @@ fn rewrite_bang(sql: &str) -> Option<String> {
 /// Right-most top-level `!` that is a prefix operator (not part of `!=`), outside
 /// string/quoted contexts.
 fn last_top_level_bang(s: &str) -> Option<usize> {
-    let b = s.as_bytes();
-    let (mut in_s, mut in_d, mut in_b) = (false, false, false);
-    let mut last = None;
-    let mut i = 0;
-    while i < b.len() {
-        let c = b[i];
-        if in_s {
-            if c == b'\'' {
-                in_s = false;
-            }
-        } else if in_d {
-            if c == b'"' {
-                in_d = false;
-            }
-        } else if in_b {
-            if c == b'`' {
-                in_b = false;
-            }
-        } else {
-            match c {
-                b'\'' => in_s = true,
-                b'"' => in_d = true,
-                b'`' => in_b = true,
-                // A `!` not immediately followed by `=` is the prefix operator.
-                b'!' if b.get(i + 1) != Some(&b'=') => last = Some(i),
-                _ => {}
-            }
-        }
-        i += 1;
-    }
-    last
+    crate::sqllex::rfind_top_level(s, |sql, c| {
+        // A `!` not immediately followed by `=` is the prefix operator.
+        c.byte == b'!' && sql.as_bytes().get(c.index + 1) != Some(&b'=')
+    })
 }
 
 fn rewrite_tilde(sql: &str) -> Option<String> {
@@ -4040,36 +4014,7 @@ fn rewrite_tilde(sql: &str) -> Option<String> {
 
 /// Byte offset of the right-most `~` that is outside any string literal.
 fn last_top_level_tilde(s: &str) -> Option<usize> {
-    let b = s.as_bytes();
-    let (mut in_s, mut in_d, mut in_b) = (false, false, false);
-    let mut last = None;
-    let mut i = 0;
-    while i < b.len() {
-        let c = b[i];
-        if in_s {
-            if c == b'\'' {
-                in_s = false;
-            }
-        } else if in_d {
-            if c == b'"' {
-                in_d = false;
-            }
-        } else if in_b {
-            if c == b'`' {
-                in_b = false;
-            }
-        } else {
-            match c {
-                b'\'' => in_s = true,
-                b'"' => in_d = true,
-                b'`' => in_b = true,
-                b'~' => last = Some(i),
-                _ => {}
-            }
-        }
-        i += 1;
-    }
-    last
+    crate::sqllex::rfind_top_level(s, |_, c| c.byte == b'~')
 }
 
 /// End (exclusive) of the unary operand starting at byte `start`, for the safe
@@ -4144,42 +4089,7 @@ fn ident_tail_end(s: &str, mut i: usize) -> Option<usize> {
 /// End (exclusive) of a balanced parenthesised group starting at `start` (`(`),
 /// quote-aware. None if unbalanced.
 fn matching_paren_end(s: &str, start: usize) -> Option<usize> {
-    let b = s.as_bytes();
-    let (mut in_s, mut in_d, mut in_b) = (false, false, false);
-    let mut depth = 0i32;
-    let mut i = start;
-    while i < b.len() {
-        let c = b[i];
-        if in_s {
-            if c == b'\'' {
-                in_s = false;
-            }
-        } else if in_d {
-            if c == b'"' {
-                in_d = false;
-            }
-        } else if in_b {
-            if c == b'`' {
-                in_b = false;
-            }
-        } else {
-            match c {
-                b'\'' => in_s = true,
-                b'"' => in_d = true,
-                b'`' => in_b = true,
-                b'(' => depth += 1,
-                b')' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return Some(i + 1);
-                    }
-                }
-                _ => {}
-            }
-        }
-        i += 1;
-    }
-    None
+    crate::sqllex::matching_paren_end(s, start)
 }
 
 /// Fuzz / property entry point: run the full SQL string-preprocessing chain and
@@ -4235,61 +4145,10 @@ pub fn fuzz_preprocess_parse(sql: &str) {
 
 /// Return true if the ASCII keyword `kw` sits at byte offset `i` in `bytes`
 /// with word boundaries on both sides (case-insensitive).
-fn kw_at(bytes: &[u8], i: usize, kw: &str) -> bool {
-    let k = kw.as_bytes();
-    if i + k.len() > bytes.len() {
-        return false;
-    }
-    if !bytes[i..i + k.len()].eq_ignore_ascii_case(k) {
-        return false;
-    }
-    let boundary = |b: u8| !(b.is_ascii_alphanumeric() || b == b'_');
-    let before_ok = i == 0 || boundary(bytes[i - 1]);
-    let after_ok = i + k.len() == bytes.len() || boundary(bytes[i + k.len()]);
-    before_ok && after_ok
-}
-
 /// Split `s` on top-level occurrences of `sep` (paren depth 0, outside
 /// single/double-quote and backtick strings). Handles doubled-quote escapes.
 fn split_top_level(s: &str, sep: char) -> Vec<String> {
-    let b = s.as_bytes();
-    let (mut in_s, mut in_d, mut in_b) = (false, false, false);
-    let mut depth = 0i32;
-    let mut out = Vec::new();
-    let mut start = 0usize;
-    let mut i = 0usize;
-    while i < b.len() {
-        let c = b[i] as char;
-        if in_s {
-            if c == '\'' {
-                in_s = false;
-            }
-        } else if in_d {
-            if c == '"' {
-                in_d = false;
-            }
-        } else if in_b {
-            if c == '`' {
-                in_b = false;
-            }
-        } else {
-            match c {
-                '\'' => in_s = true,
-                '"' => in_d = true,
-                '`' => in_b = true,
-                '(' => depth += 1,
-                ')' => depth -= 1,
-                _ if depth == 0 && c == sep => {
-                    out.push(s[start..i].to_string());
-                    start = i + 1;
-                }
-                _ => {}
-            }
-        }
-        i += 1;
-    }
-    out.push(s[start..].to_string());
-    out
+    crate::sqllex::split_top_level(s, sep)
 }
 
 /// Rewrite MySQL's `INSERT [options] INTO t SET a = 1, b = 2
@@ -4308,47 +4167,22 @@ fn rewrite_insert_set(sql: &str) -> Option<String> {
     {
         return None;
     }
-    let bytes = sql.as_bytes();
-    let (mut in_s, mut in_d, mut in_b) = (false, false, false);
-    let mut depth = 0i32;
-    let mut i = 0usize;
     let mut set_pos: Option<usize> = None;
-    while i < bytes.len() {
-        let c = bytes[i] as char;
-        if in_s {
-            if c == '\'' {
-                in_s = false;
-            }
-        } else if in_d {
-            if c == '"' {
-                in_d = false;
-            }
-        } else if in_b {
-            if c == '`' {
-                in_b = false;
-            }
-        } else {
-            match c {
-                '\'' => in_s = true,
-                '"' => in_d = true,
-                '`' => in_b = true,
-                '(' => depth += 1,
-                ')' => depth -= 1,
-                _ if depth == 0 => {
-                    // A top-level VALUES/SELECT before SET means this is a normal
-                    // insert; leave it alone.
-                    if kw_at(bytes, i, "VALUES") || kw_at(bytes, i, "SELECT") {
-                        return None;
-                    }
-                    if kw_at(bytes, i, "SET") {
-                        set_pos = Some(i);
-                        break;
-                    }
-                }
-                _ => {}
-            }
+    for c in crate::sqllex::code_bytes(sql) {
+        if c.depth != 0 {
+            continue;
         }
-        i += 1;
+        // A top-level VALUES/SELECT before SET means this is a normal insert;
+        // leave it alone.
+        if crate::sqllex::keyword_at(sql, c.index, "VALUES")
+            || crate::sqllex::keyword_at(sql, c.index, "SELECT")
+        {
+            return None;
+        }
+        if crate::sqllex::keyword_at(sql, c.index, "SET") {
+            set_pos = Some(c.index);
+            break;
+        }
     }
     let set_pos = set_pos?;
     let prefix = sql[..set_pos].trim_end();
@@ -4356,48 +4190,21 @@ fn rewrite_insert_set(sql: &str) -> Option<String> {
     let after = after.trim_end().trim_end_matches(';').trim_end();
 
     // Split off a trailing ON DUPLICATE KEY UPDATE clause (kept verbatim).
-    let ab = after.as_bytes();
-    let (mut s2, mut d2, mut b2) = (false, false, false);
-    let mut dep2 = 0i32;
     let mut odku: Option<usize> = None;
-    let mut j = 0usize;
-    while j < ab.len() {
-        let c = ab[j] as char;
-        if s2 {
-            if c == '\'' {
-                s2 = false;
-            }
-        } else if d2 {
-            if c == '"' {
-                d2 = false;
-            }
-        } else if b2 {
-            if c == '`' {
-                b2 = false;
-            }
-        } else {
-            match c {
-                '\'' => s2 = true,
-                '"' => d2 = true,
-                '`' => b2 = true,
-                '(' => dep2 += 1,
-                ')' => dep2 -= 1,
-                _ if dep2 == 0 && kw_at(ab, j, "ON") => {
-                    // require "ON DUPLICATE" to avoid false positives
-                    let rest = after[j..].trim_start();
-                    if rest
-                        .as_bytes()
-                        .get(..12)
-                        .is_some_and(|b| b.eq_ignore_ascii_case(b"ON DUPLICATE"))
-                    {
-                        odku = Some(j);
-                        break;
-                    }
-                }
-                _ => {}
-            }
+    for c in crate::sqllex::code_bytes(after) {
+        if c.depth != 0 || !crate::sqllex::keyword_at(after, c.index, "ON") {
+            continue;
         }
-        j += 1;
+        // Require "ON DUPLICATE" to avoid false positives.
+        if after[c.index..]
+            .trim_start()
+            .as_bytes()
+            .get(..12)
+            .is_some_and(|b| b.eq_ignore_ascii_case(b"ON DUPLICATE"))
+        {
+            odku = Some(c.index);
+            break;
+        }
     }
     let (assigns, suffix) = match odku {
         Some(k) => (after[..k].trim_end(), Some(after[k..].trim())),
@@ -4452,50 +4259,26 @@ fn rewrite_comma_update(sql: &str) -> Option<String> {
     {
         return None;
     }
-    let bytes = sql.as_bytes();
     let update_end = sql.len() - head.len() + 6; // byte just after "UPDATE"
-    let (mut in_s, mut in_d, mut in_b) = (false, false, false);
-    let mut depth = 0i32;
-    let mut i = update_end;
-    let mut set_pos: Option<usize> = None;
-    let mut comma_positions: Vec<usize> = Vec::new();
-    while i < bytes.len() {
-        let c = bytes[i] as char;
-        if in_s {
-            if c == '\'' {
-                in_s = false;
-            }
-        } else if in_d {
-            if c == '"' {
-                in_d = false;
-            }
-        } else if in_b {
-            if c == '`' {
-                in_b = false;
-            }
-        } else {
-            match c {
-                '\'' => in_s = true,
-                '"' => in_d = true,
-                '`' => in_b = true,
-                '(' => depth += 1,
-                ')' => depth -= 1,
-                ',' if depth == 0 => comma_positions.push(i),
-                _ if depth == 0 && kw_at(bytes, i, "SET") => {
-                    set_pos = Some(i);
-                    break;
-                }
-                _ => {}
-            }
+                                                 // Collect the top-level commas of the table list, stopping at SET. Only
+                                                 // commas before SET join tables; the ones after it separate assignments.
+    let mut list_commas: Vec<usize> = Vec::new();
+    let mut saw_set = false;
+    for c in crate::sqllex::code_bytes(sql) {
+        if c.index < update_end || c.depth != 0 {
+            continue;
         }
-        i += 1;
+        if crate::sqllex::keyword_at(sql, c.index, "SET") {
+            saw_set = true;
+            break;
+        }
+        if c.byte == b',' {
+            list_commas.push(c.index);
+        }
     }
-    let set_pos = set_pos?;
-    // Only commas in the table-list region (before SET) matter.
-    let list_commas: Vec<usize> = comma_positions
-        .into_iter()
-        .filter(|&p| p < set_pos)
-        .collect();
+    if !saw_set {
+        return None;
+    }
     if list_commas.is_empty() {
         return None; // single-table UPDATE
     }

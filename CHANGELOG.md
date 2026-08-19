@@ -6,6 +6,30 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **String literals containing a backslash-escaped quote are no longer
+  mis-parsed by the pre-parser.** Several rewriters run over raw SQL before it
+  reaches the parser, to cover MySQL syntax `sqlparser` does not accept. Each
+  carried its own copy of the quote-tracking walk -- seven copies, none of which
+  understood backslash escapes, which is MySQL's default and what PDO and
+  `mysql_real_escape_string` emit. After `\'` the scanners believed they were
+  back in code, so everything to the end of the literal was treated as
+  rewritable:
+
+  ```sql
+  SELECT 'a\'b!c'                    -- returned a'b(NOT (c)), silently wrong
+  SELECT CONCAT('a\'', '!b')         -- returned a'(NOT (b)), silently wrong
+  INSERT INTO t SET n = 'O\'B, Jr.'  -- rejected with a syntax error
+  ```
+
+  All three are valid MySQL; the first two returned wrong data with no error at
+  all. The seven scanners are replaced by one shared lexer that also understands
+  doubled quotes, backtick identifiers (which take no backslash escape), and
+  `--`, `#` and `/* */` comments -- none of which the old scanners handled
+  either, so a `!`, comma or keyword inside a comment could be rewritten too.
+
+
 ## [1.9.5] - 2026-08-19
 
 Fifteen contributions, and the theme is boundaries: what the wire protocol will
