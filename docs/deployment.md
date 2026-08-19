@@ -89,6 +89,31 @@ Because the storage engine is crash-safe and copy-on-write, you can snapshot the
 file at the filesystem/volume level. For a consistent copy, prefer a moment of
 low write activity or a volume snapshot.
 
+## Restart policy
+
+Release binaries abort on panic rather than unwinding, so **the process must be
+supervised**. A panic is a crash, not a degraded connection.
+
+This is deliberate. Unwinding a single connection task left the process running,
+but if it unwound while holding one of the server's `Mutex` guards, that mutex
+stayed poisoned for the process lifetime and every later query failed — a server
+that answered a health check while serving nothing. Aborting is the same path the
+crash-recovery and soak/chaos suites exercise on every run: the storage engine is
+crash-safe, so a restart recovers with no data loss and no manual step.
+
+`packaging/elyrasql.service` already sets `Restart=on-failure` and
+`RestartSec=2`. Under Docker or an orchestrator, set an equivalent:
+
+```bash
+docker run -d --restart unless-stopped -p 3307:3307 \
+  -v elyra-data:/var/lib/elyrasql \
+  ghcr.io/kwhorne/elyrasql:1.9.5
+```
+
+Kubernetes restarts containers by default. If you run the binary under anything
+that does **not** restart it, a panic becomes an outage that lasts until someone
+notices.
+
 ## Operational notes
 
 - **Concurrency** — reads scale across connections (MVCC snapshots); writes are

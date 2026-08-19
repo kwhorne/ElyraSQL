@@ -6,6 +6,22 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed
+
+- **Release binaries abort on panic instead of unwinding.** A panic in a
+  connection task used to unwind that task alone and leave the process up — but
+  if it unwound while holding one of the `std::sync::Mutex` guards the server
+  keeps (session state, cluster state, the metrics registry), that mutex stayed
+  poisoned for the lifetime of the process and every later `lock().unwrap()`
+  panicked in turn. The result was a server that still accepted connections and
+  passed a health check while failing every query.
+
+  Aborting turns that into a clean crash — the same path the crash-recovery and
+  soak/chaos suites already exercise on every run, against a storage engine that
+  is crash-safe by design. **The process must be supervised**;
+  `packaging/elyrasql.service` already sets `Restart=on-failure`, and
+  `docs/deployment.md` now covers the container and orchestrator equivalents.
+
 ### Fixed
 
 - **String literals containing a backslash-escaped quote are no longer
