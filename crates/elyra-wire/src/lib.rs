@@ -462,7 +462,7 @@ where
             // Client encrypted with a cached public key (no request first).
             match self.shim.caching_sha2_decrypt(&data) {
                 Some(xored) => strip_nul(&unxor(xored)),
-                None => strip_nul(&data),
+                None => return Ok(false),
             }
         };
 
