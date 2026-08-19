@@ -4,13 +4,49 @@ use thiserror::Error;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// What the catalog refused.
+///
+/// Clients branch on the specific MySQL code: an ORM reports "no such table" and
+/// "unknown column" very differently, and a migration tool may treat "already
+/// exists" as success. This used to be recovered by matching prefixes of the
+/// human-readable message, which meant rewording an error silently changed the
+/// code a client saw. The kind is now carried explicitly, so the wire code never
+/// depends on message text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CatalogError {
+    /// The named table, view or materialized view does not exist.
+    /// `ER_NO_SUCH_TABLE`. Also the bucket for catalog refusals with no more
+    /// specific code, which is what the message-matching default did.
+    Missing,
+    /// A table or view of that name is already there. `ER_TABLE_EXISTS_ERROR`.
+    Exists,
+    /// A column named in a key, index or constraint does not exist on the table.
+    /// `ER_BAD_FIELD_ERROR`.
+    UnknownColumn,
+    /// An index of that name is already there. `ER_DUP_KEYNAME`.
+    IndexExists,
+    /// The named index does not exist. `ER_KEY_DOES_NOT_EXIST`.
+    UnknownIndex,
+}
+
+/// Which kind of duplicate was refused. A duplicate *key value* and a duplicate
+/// *column name* are different errors to a client: 1062 is retryable-ish data,
+/// 1060 is a schema mistake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DuplicateError {
+    /// A row collides with an existing key value. `ER_DUP_ENTRY`.
+    Entry,
+    /// A `CREATE`/`ALTER` names the same column twice. `ER_DUP_FIELDNAME`.
+    ColumnName,
+}
+
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("syntax error: {0}")]
     Parse(String),
 
-    #[error("catalog error: {0}")]
-    Catalog(String),
+    #[error("catalog error: {1}")]
+    Catalog(CatalogError, String),
 
     #[error("unknown database: {0}")]
     UnknownDatabase(String),
@@ -30,8 +66,8 @@ pub enum Error {
     #[error("serialization failure: {0}")]
     Conflict(String),
 
-    #[error("duplicate entry: {0}")]
-    Duplicate(String),
+    #[error("duplicate entry: {1}")]
+    Duplicate(DuplicateError, String),
 
     #[error("foreign key constraint: {0}")]
     ForeignKey(String),
@@ -64,7 +100,13 @@ impl Error {
     pub fn mysql_code(&self) -> u16 {
         match self {
             Error::Parse(_) => 1064,
-            Error::Catalog(m) => catalog_code(m),
+            Error::Catalog(kind, _) => match kind {
+                CatalogError::Missing => 1146,       // ER_NO_SUCH_TABLE
+                CatalogError::Exists => 1050,        // ER_TABLE_EXISTS_ERROR
+                CatalogError::UnknownColumn => 1054, // ER_BAD_FIELD_ERROR
+                CatalogError::IndexExists => 1061,   // ER_DUP_KEYNAME
+                CatalogError::UnknownIndex => 1176,  // ER_KEY_DOES_NOT_EXIST
+            },
             Error::UnknownDatabase(_) => 1049, // ER_BAD_DB_ERROR
             Error::UnknownTable(_) => 1109,    // ER_UNKNOWN_TABLE
             Error::UnknownColumn(_) => 1054,   // ER_BAD_FIELD_ERROR
@@ -76,12 +118,9 @@ impl Error {
             Error::DataTooLong(_) => 1406, // ER_DATA_TOO_LONG
             Error::Unsupported(_) => 1235, // ER_NOT_SUPPORTED_YET
             Error::Conflict(_) => 1213,    // ER_LOCK_DEADLOCK (serialization failure)
-            // A duplicate *key value* and a duplicate *column name* are
-            // different errors to a client: 1062 is retryable-ish data, 1060 is
-            // a schema mistake.
-            Error::Duplicate(m) if m.starts_with("duplicate column name") => 1060,
-            Error::Duplicate(_) => 1062,  // ER_DUP_ENTRY
-            Error::ForeignKey(_) => 1452, // ER_NO_REFERENCED_ROW
+            Error::Duplicate(DuplicateError::ColumnName, _) => 1060, // ER_DUP_FIELDNAME
+            Error::Duplicate(DuplicateError::Entry, _) => 1062, // ER_DUP_ENTRY
+            Error::ForeignKey(_) => 1452,  // ER_NO_REFERENCED_ROW
             _ => 1105,
         }
     }
@@ -90,73 +129,75 @@ impl Error {
     pub fn sqlstate(&self) -> &'static [u8; 5] {
         match self {
             Error::Parse(_) => b"42000",
-            Error::Catalog(m) => match catalog_code(m) {
-                1054 => b"42S22", // ER_BAD_FIELD_ERROR
-                1050 => b"42S01", // ER_TABLE_EXISTS_ERROR
-                1061 | 1176 => b"42000",
-                _ => b"42S02", // ER_NO_SUCH_TABLE
+            Error::Catalog(kind, _) => match kind {
+                CatalogError::UnknownColumn => b"42S22",
+                CatalogError::Exists => b"42S01",
+                CatalogError::IndexExists | CatalogError::UnknownIndex => b"42000",
+                CatalogError::Missing => b"42S02",
             },
             Error::UnknownDatabase(_) => b"42000",
             Error::UnknownTable(_) => b"42S02",
             Error::UnknownColumn(_) => b"42S22",
             Error::OutOfRange(_) => b"22003",
             Error::DataTooLong(_) => b"22001",
-            Error::Duplicate(m) if m.starts_with("duplicate column name") => b"42S21",
+            Error::Duplicate(DuplicateError::ColumnName, _) => b"42S21",
             _ => b"HY000",
         }
     }
 }
 
-/// `Catalog` covers everything the catalog can refuse, but clients branch on the
-/// specific code: an ORM reports "no such table" and "unknown column" very
-/// differently, and a migration tool may treat "already exists" as success.
-/// MySQL has distinct codes for each, so answering 1146 for all of them
-/// mislabels most. The variant carries no structure, so the message prefix is
-/// the only discriminator available; anything unrecognised keeps the old bucket.
-fn catalog_code(message: &str) -> u16 {
-    let m = message.trim_start();
-    if m.starts_with("unknown column")
-        || m.starts_with("unknown primary key column")
-        || m.starts_with("unknown unique column")
-        || m.starts_with("unknown index column")
-        || m.starts_with("unknown foreign key column")
-    {
-        return 1054; // ER_BAD_FIELD_ERROR
-    }
-    if m.starts_with("index already exists") {
-        return 1061; // ER_DUP_KEYNAME
-    }
-    if m.starts_with("unknown index") || m.starts_with("no such index") {
-        return 1176; // ER_KEY_DOES_NOT_EXIST
-    }
-    if m.contains("already exists") {
-        return 1050; // ER_TABLE_EXISTS_ERROR
-    }
-    1146 // ER_NO_SUCH_TABLE
-}
-
 #[cfg(test)]
-mod catalog_code_tests {
-    use super::Error;
+mod error_code_tests {
+    use super::{CatalogError, DuplicateError, Error};
+
+    /// The kind-to-code mapping is the wire contract clients branch on: an ORM
+    /// reports 1146 and 1054 very differently, and a migration tool may treat
+    /// 1050 as success. These pairs are the same ones the previous
+    /// message-prefix matcher produced, so this pins the refactor as
+    /// behaviour-preserving as well as pinning the codes.
+    #[test]
+    fn catalog_kinds_map_to_the_code_clients_branch_on() {
+        let of = |kind| Error::Catalog(kind, "message text is irrelevant".into());
+        for (kind, code, state) in [
+            (CatalogError::Missing, 1146u16, b"42S02"),
+            (CatalogError::Exists, 1050, b"42S01"),
+            (CatalogError::UnknownColumn, 1054, b"42S22"),
+            (CatalogError::IndexExists, 1061, b"42000"),
+            (CatalogError::UnknownIndex, 1176, b"42000"),
+        ] {
+            assert_eq!(of(kind).mysql_code(), code, "{kind:?}");
+            assert_eq!(of(kind).sqlstate(), state, "{kind:?}");
+        }
+    }
+
+    /// Rewording an error must not change the code a client sees. That was the
+    /// whole failure mode of deriving it from the message.
+    #[test]
+    fn the_code_does_not_depend_on_the_message() {
+        for message in [
+            "",
+            "no such table: t",
+            "already exists",
+            "unknown column: g",
+        ] {
+            let error = Error::Catalog(CatalogError::Exists, message.into());
+            assert_eq!(error.mysql_code(), 1050, "{message:?}");
+            assert_eq!(error.sqlstate(), b"42S01", "{message:?}");
+        }
+        for message in ["duplicate column name 'a'", "anything at all"] {
+            let error = Error::Duplicate(DuplicateError::Entry, message.into());
+            assert_eq!(error.mysql_code(), 1062, "{message:?}");
+        }
+    }
 
     #[test]
-    fn catalog_errors_map_to_the_code_clients_branch_on() {
-        let code = |m: &str| Error::Catalog(m.into()).mysql_code();
-        assert_eq!(code("unknown column: g"), 1054);
-        assert_eq!(code("unknown index column: g"), 1054);
-        assert_eq!(code("no such table: t"), 1146);
-        assert_eq!(code("no such materialized view: v"), 1146);
-        assert_eq!(code("index already exists: ix"), 1061);
-        assert_eq!(code("table already exists: t"), 1050);
-        assert_eq!(code("unknown index: ix"), 1176);
-        assert_eq!(
-            Error::Catalog("unknown column: g".into()).sqlstate(),
-            b"42S22"
-        );
-        assert_eq!(
-            Error::Catalog("no such table: t".into()).sqlstate(),
-            b"42S02"
-        );
+    fn duplicate_kinds_separate_data_from_schema_mistakes() {
+        let entry = Error::Duplicate(DuplicateError::Entry, "key 'PRIMARY'".into());
+        assert_eq!(entry.mysql_code(), 1062);
+        assert_eq!(entry.sqlstate(), b"HY000");
+        let column = Error::Duplicate(DuplicateError::ColumnName, "'a'".into());
+        assert_eq!(column.mysql_code(), 1060);
+        assert_eq!(column.sqlstate(), b"42S21");
     }
 
     #[test]

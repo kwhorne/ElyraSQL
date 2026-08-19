@@ -34,7 +34,7 @@ mod zonemap;
 pub use session::{Isolation, Session};
 pub use sort::cleanup_stale_tempfiles;
 
-use elyra_core::{ColumnType, Error, Privilege, Result, Schema, Value};
+use elyra_core::{CatalogError, ColumnType, Error, Privilege, Result, Schema, Value};
 use elyra_storage::Db;
 use sqlparser::ast::Statement;
 use sqlparser::dialect::MySqlDialect;
@@ -545,7 +545,10 @@ impl Engine {
         let name = mysql_table_name_fragment(name)?;
         let name = exec::stored_table_ident(sess, &name)?;
         if sess.get(catalog::matview_key(&name)).await?.is_none() {
-            return Err(Error::Catalog(format!("no such materialized view: {name}")));
+            return Err(Error::Catalog(
+                CatalogError::Missing,
+                format!("no such materialized view: {name}"),
+            ));
         }
         Box::pin(self.execute_as(&format!("DROP TABLE `{name}`"), privilege, user, sess)).await?;
         sess.commit_write(
@@ -567,7 +570,12 @@ impl Engine {
     ) -> Result<()> {
         let query = match sess.get(catalog::matview_key(name)).await? {
             Some(b) => String::from_utf8_lossy(&b).into_owned(),
-            None => return Err(Error::Catalog(format!("no such materialized view: {name}"))),
+            None => {
+                return Err(Error::Catalog(
+                    CatalogError::Missing,
+                    format!("no such materialized view: {name}"),
+                ))
+            }
         };
         Box::pin(self.execute_as(&format!("DROP TABLE `{name}`"), privilege, user, sess)).await?;
         Box::pin(self.execute_as(
@@ -1066,9 +1074,12 @@ impl Engine {
                 require_privilege(privilege, PrivilegedAction::AlterPartition)?;
                 let (table, pname) = mysql_alter_partition_target(trimmed, kw)?;
                 let table = exec::stored_table_ident(sess, &table)?;
-                let spec = catalog::load_partspec(sess, &table)
-                    .await?
-                    .ok_or_else(|| Error::Catalog(format!("table '{table}' is not partitioned")))?;
+                let spec = catalog::load_partspec(sess, &table).await?.ok_or_else(|| {
+                    Error::Catalog(
+                        CatalogError::Missing,
+                        format!("table '{table}' is not partitioned"),
+                    )
+                })?;
                 let where_ = exec::partition_where(&spec, &pname).ok_or_else(|| {
                     Error::Query(format!("cannot drop partition '{pname}' (unknown or HASH)"))
                 })?;
@@ -1625,7 +1636,9 @@ impl Engine {
                     .first()
                     .map(|t| exec::stored_table_ident(sess, &t.name))
                     .transpose()?
-                    .ok_or_else(|| Error::Catalog("empty table name".into()))?;
+                    .ok_or_else(|| {
+                        Error::Catalog(CatalogError::Missing, "empty table name".into())
+                    })?;
                 exec::truncate(sess, &name).await
             }
             Statement::CreateView {
@@ -1687,7 +1700,10 @@ impl Engine {
                 if !if_exists {
                     for name in &table_names {
                         if !catalog::exists(sess, name).await? {
-                            return Err(Error::Catalog(format!("no such table: {name}")));
+                            return Err(Error::Catalog(
+                                CatalogError::Missing,
+                                format!("no such table: {name}"),
+                            ));
                         }
                     }
                 }
@@ -1709,7 +1725,10 @@ impl Engine {
                 if !if_exists {
                     for name in &view_names {
                         if catalog::load_view(sess, name).await?.is_none() {
-                            return Err(Error::Catalog(format!("no such view: {name}")));
+                            return Err(Error::Catalog(
+                                CatalogError::Missing,
+                                format!("no such view: {name}"),
+                            ));
                         }
                     }
                 }
@@ -1762,7 +1781,12 @@ impl Engine {
                 let name = show_options
                     .show_in
                     .and_then(|si| si.parent_name)
-                    .ok_or_else(|| Error::Catalog("SHOW COLUMNS requires a table".into()))?;
+                    .ok_or_else(|| {
+                        Error::Catalog(
+                            CatalogError::Missing,
+                            "SHOW COLUMNS requires a table".into(),
+                        )
+                    })?;
                 let name = exec::stored_table_ident(sess, &name)?;
                 exec::show_columns(sess, &name).await
             }
@@ -1786,8 +1810,9 @@ impl Engine {
                 use sqlparser::ast::Use;
                 let database = match use_expr {
                     Use::Database(name) | Use::Schema(name) | Use::Object(name) => {
-                        object_name_last(&name)
-                            .ok_or_else(|| Error::Catalog("empty database name".into()))?
+                        object_name_last(&name).ok_or_else(|| {
+                            Error::Catalog(CatalogError::Missing, "empty database name".into())
+                        })?
                     }
                     Use::Default => "elyra".into(),
                     other => {

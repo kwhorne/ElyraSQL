@@ -20,7 +20,7 @@ pub use db::{Consensus, Db, Validation, WriteEvent, WriteOp};
 use std::path::Path;
 use std::sync::Arc;
 
-use elyra_core::{Error, Result};
+use elyra_core::{DuplicateError, Error, Result};
 use redb::{
     Database, Durability, ReadTransaction, ReadableTable, TableDefinition, WriteTransaction,
 };
@@ -1087,7 +1087,10 @@ impl Storage {
                     .map_err(|e| Error::Storage(e.to_string()))?
                     .is_some();
                 if existed {
-                    return Err(Error::Duplicate("Duplicate entry for key 'PRIMARY'".into()));
+                    return Err(Error::Duplicate(
+                        DuplicateError::Entry,
+                        "Duplicate entry for key 'PRIMARY'".into(),
+                    ));
                 }
             }
             for (k, v) in aux {
