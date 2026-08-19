@@ -6,20 +6,38 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.9.6] - 2026-08-19
+
+Four contributions, and every one of them changes an answer a client reads: the
+value of a string literal, the number of affected rows, the type of a boolean in
+arithmetic, and the error code for a name collision. Two of them were returning
+wrong data with no error at all.
+
+**This is not a patch release.** Three behaviour changes and one operational one
+are in the upgrade note in the installation docs. Nothing touches your data.
+
 ### Fixed
 
-- **The MySQL error code no longer depends on the wording of the error message.**
-  `Error::Catalog` carried only a string, so the code a client received was
-  recovered by matching prefixes of the human-readable message — five
-  `starts_with` checks and a `contains`. Rewording an error silently changed the
-  code, and clients branch on exactly that: an ORM reports 1146 and 1054 very
-  differently, and a migration tool may treat 1050 as success.
+- **String literals containing a backslash-escaped quote are no longer
+  mis-parsed by the pre-parser.** Several rewriters run over raw SQL before it
+  reaches the parser, to cover MySQL syntax `sqlparser` does not accept. Each
+  carried its own copy of the quote-tracking walk -- seven copies, none of which
+  understood backslash escapes, which is MySQL's default and what PDO and
+  `mysql_real_escape_string` emit. After `\'` the scanners believed they were
+  back in code, so everything to the end of the literal was treated as
+  rewritable:
 
-  `Catalog` and `Duplicate` now carry the kind explicitly, so the mapping is a
-  `match` on an enum with no string inspection anywhere. One code changes as a
-  result, which is the fragility itself showing: `CREATE VIEW` over an existing
-  table name reported 1146 (no such table) because its message says "exists"
-  rather than "already exists". MySQL answers 1050, and so do we now.
+  ```sql
+  SELECT 'a\'b!c'                    -- returned a'b(NOT (c)), silently wrong
+  SELECT CONCAT('a\'', '!b')         -- returned a'(NOT (b)), silently wrong
+  INSERT INTO t SET n = 'O\'B, Jr.'  -- rejected with a syntax error
+  ```
+
+  All three are valid MySQL; the first two returned wrong data with no error at
+  all. The seven scanners are replaced by one shared lexer that also understands
+  doubled quotes, backtick identifiers (which take no backslash escape), and
+  `--`, `#` and `/* */` comments -- none of which the old scanners handled
+  either, so a `!`, comma or keyword inside a comment could be rewritten too.
 
 - **Affected-row counts follow MySQL's changed-row convention.** MySQL reports
   rows *changed*, not rows matched, and upserts carry a specific convention on
@@ -48,6 +66,19 @@ All notable changes to ElyraSQL are documented here. The format is based on
   column type, or round-trip the value through a typed language, saw `DOUBLE`
   where MySQL gives `BIGINT`.
 
+- **The MySQL error code no longer depends on the wording of the error message.**
+  `Error::Catalog` carried only a string, so the code a client received was
+  recovered by matching prefixes of the human-readable message — five
+  `starts_with` checks and a `contains`. Rewording an error silently changed the
+  code, and clients branch on exactly that: an ORM reports 1146 and 1054 very
+  differently, and a migration tool may treat 1050 as success.
+
+  `Catalog` and `Duplicate` now carry the kind explicitly, so the mapping is a
+  `match` on an enum with no string inspection anywhere. One code changes as a
+  result, which is the fragility itself showing: `CREATE VIEW` over an existing
+  table name reported 1146 (no such table) because its message says "exists"
+  rather than "already exists". MySQL answers 1050, and so do we now.
+
 ### Changed
 
 - **Release binaries abort on panic instead of unwinding.** A panic in a
@@ -63,30 +94,6 @@ All notable changes to ElyraSQL are documented here. The format is based on
   is crash-safe by design. **The process must be supervised**;
   `packaging/elyrasql.service` already sets `Restart=on-failure`, and
   `docs/deployment.md` now covers the container and orchestrator equivalents.
-
-### Fixed
-
-- **String literals containing a backslash-escaped quote are no longer
-  mis-parsed by the pre-parser.** Several rewriters run over raw SQL before it
-  reaches the parser, to cover MySQL syntax `sqlparser` does not accept. Each
-  carried its own copy of the quote-tracking walk -- seven copies, none of which
-  understood backslash escapes, which is MySQL's default and what PDO and
-  `mysql_real_escape_string` emit. After `\'` the scanners believed they were
-  back in code, so everything to the end of the literal was treated as
-  rewritable:
-
-  ```sql
-  SELECT 'a\'b!c'                    -- returned a'b(NOT (c)), silently wrong
-  SELECT CONCAT('a\'', '!b')         -- returned a'(NOT (b)), silently wrong
-  INSERT INTO t SET n = 'O\'B, Jr.'  -- rejected with a syntax error
-  ```
-
-  All three are valid MySQL; the first two returned wrong data with no error at
-  all. The seven scanners are replaced by one shared lexer that also understands
-  doubled quotes, backtick identifiers (which take no backslash escape), and
-  `--`, `#` and `/* */` comments -- none of which the old scanners handled
-  either, so a `!`, comma or keyword inside a comment could be rewritten too.
-
 
 ## [1.9.5] - 2026-08-19
 

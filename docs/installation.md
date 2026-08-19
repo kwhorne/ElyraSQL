@@ -17,6 +17,46 @@ ElyraSQL release builds target **Ubuntu 24.04+** and **Apple Silicon macOS
     done, so an interrupted upgrade simply resumes on the next start. **Take a backup
     first, and note that downgrading to 1.4.x afterwards is not supported.**
 
+!!! warning "Upgrading to 1.9.6"
+
+    Three changes alter answers your client already reads, and one changes how
+    the process fails. None touches your data.
+
+    **Affected-row counts now match MySQL.** They were wrong in five shapes, and
+    the 1-vs-2 distinction is how a client tells an insert from an update — so
+    `updateOrCreate`-style code was reading the wrong answer and may contain a
+    workaround that now reads the wrong answer in the other direction:
+
+    | statement | was | now (and MySQL) |
+    |---|---:|---:|
+    | `INSERT ... ON DUPLICATE KEY UPDATE`, row updated | 1 | 2 |
+    | ... set to the values it already had | 1 | 0 |
+    | `REPLACE` replacing an existing row | 1 | 2 |
+    | `UPDATE` that matched a row but changed nothing | 1 | 0 |
+
+    **Search your code for anything that compensated for the old counts** before
+    upgrading. Code that treats "affected == 1" as "inserted" will now see 2 for
+    an update, which is the correct signal but the opposite conclusion.
+
+    **A boolean used as a number is now an integer.** `SELECT TRUE + 1` returns
+    `2` as `BIGINT` where it returned `2.0` as `DOUBLE`; likewise `(1 = 1) + 1`
+    and `(2 > 1) + (3 > 2)`. Code asserting on the column type, or round-tripping
+    through a typed language, sees the new type.
+
+    **`CREATE VIEW` over an existing table name now reports 1050**
+    (`ER_TABLE_EXISTS_ERROR`) instead of 1146 (`ER_NO_SUCH_TABLE`). 1146 was
+    simply wrong; a migration tool that treats 1050 as "already done" will now
+    behave correctly here.
+
+    **The server aborts on panic instead of unwinding, so it must be
+    supervised.** A panic is now a crash and a restart rather than a degraded
+    process — which is the point: a panic that unwound while holding an internal
+    lock left the server answering health checks while failing every query. The
+    shipped `packaging/elyrasql.service` already sets `Restart=on-failure`. If
+    you run the container or the binary under anything that does **not** restart
+    it, add a restart policy before upgrading; see
+    [Deployment](deployment.md#restart-policy).
+
 !!! warning "Upgrading to 1.9.5"
 
     Four changes can affect a working deployment. None touches your data.
@@ -222,8 +262,8 @@ macOS).
 Multi-arch image (`amd64` + `arm64`) on the GitHub Container Registry:
 
 ```bash
-docker pull ghcr.io/kwhorne/elyrasql:1.9.5   # or :latest
-docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.9.5
+docker pull ghcr.io/kwhorne/elyrasql:1.9.6   # or :latest
+docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.9.6
 ```
 
 The image is ~15 MB, runs as a non-root user, stores data in the
