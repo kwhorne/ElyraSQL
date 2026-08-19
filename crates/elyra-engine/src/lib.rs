@@ -378,28 +378,47 @@ impl Engine {
         stmt: &Statement,
         sess: &Session,
     ) -> Result<()> {
-        use sqlparser::ast::{SelectItem, SetExpr};
+        use sqlparser::ast::{SelectItem, SetExpr, Visit, Visitor};
+        use std::ops::ControlFlow;
+
+        #[derive(Default)]
+        struct RelationCollector {
+            tables: Vec<String>,
+        }
+
+        impl Visitor for RelationCollector {
+            type Break = ();
+
+            fn pre_visit_relation(
+                &mut self,
+                relation: &sqlparser::ast::ObjectName,
+            ) -> ControlFlow<Self::Break> {
+                if let Some(table) = object_name_last(relation) {
+                    self.tables.push(table);
+                }
+                ControlFlow::Continue(())
+            }
+        }
+
         let Statement::Query(q) = stmt else {
             return Ok(());
         };
         let SetExpr::Select(select) = q.body.as_ref() else {
             return Ok(());
         };
-        // Base tables referenced in FROM.
-        let mut tables: Vec<String> = Vec::new();
-        for twj in &select.from {
-            if let Some(t) = single_base_table(twj) {
-                tables.push(t);
-            }
-            for j in &twj.joins {
-                if let sqlparser::ast::TableFactor::Table { name, .. } = &j.relation {
-                    if let Some(t) = object_name_last(name) {
-                        tables.push(t);
-                    }
-                }
-            }
-        }
-        let simple = select.from.len() == 1 && select.from[0].joins.is_empty() && tables.len() == 1;
+        // Walk the complete query, including derived tables, scalar subqueries,
+        // CTEs, and set-operation arms. Restricted tables are only accepted in
+        // the directly verifiable single-base-table shape below; every complex
+        // occurrence is denied instead of disappearing from authorization.
+        let mut collector = RelationCollector::default();
+        let _ = q.visit(&mut collector);
+        collector.tables.sort_unstable();
+        collector.tables.dedup();
+        let tables = collector.tables;
+        let simple = select.from.len() == 1
+            && select.from[0].joins.is_empty()
+            && single_base_table(&select.from[0]).is_some()
+            && tables.len() == 1;
         for t in &tables {
             let Some(granted) = users::column_grants(sess, user, t).await? else {
                 continue; // not column-restricted on this table
@@ -423,6 +442,17 @@ impl Engine {
             }
             if let Some(w) = &select.selection {
                 ok &= collect_col_refs(w, &mut refs);
+            }
+            match &select.group_by {
+                sqlparser::ast::GroupByExpr::All(_) => all = true,
+                sqlparser::ast::GroupByExpr::Expressions(expressions, _) => {
+                    for expression in expressions {
+                        ok &= collect_col_refs(expression, &mut refs);
+                    }
+                }
+            }
+            if let Some(having) = &select.having {
+                ok &= collect_col_refs(having, &mut refs);
             }
             if let Some(ob) = &q.order_by {
                 for o in &ob.exprs {
@@ -1399,7 +1429,17 @@ impl Engine {
             // (full access) and for reads/DDL (handled by the tier/Admin gates).
             let need_bits = required_privset(&stmt);
             if need_bits != 0 && privilege < Privilege::Admin && !user.is_empty() {
-                for t in stmt_targets(&stmt) {
+                let targets = stmt_targets(&stmt);
+                if targets.is_empty() {
+                    let have = users::effective_global_privset(sess, user).await?;
+                    if have & need_bits != need_bits {
+                        let missing = elyra_core::users::privset_to_names(need_bits & !have);
+                        return Err(Error::Query(format!(
+                            "access denied: {missing} command denied to user '{user}'"
+                        )));
+                    }
+                }
+                for t in targets {
                     let have = users::effective_table_privset(sess, user, &t).await?;
                     if have & need_bits != need_bits {
                         let missing = elyra_core::users::privset_to_names(need_bits & !have);
@@ -1508,6 +1548,17 @@ impl Engine {
         sess: &Session,
     ) -> Result<Privilege> {
         let need = required_privilege(stmt);
+        if need <= Privilege::Read
+            && !user.is_empty()
+            && matches!(stmt, Statement::Query(query) if query_has_from(query))
+        {
+            let bits = users::effective_global_privset(sess, user).await?;
+            if bits & elyra_core::users::priv_bits::SELECT == 0 {
+                return Err(Error::Query(format!(
+                    "access denied: SELECT command denied to user '{user}'"
+                )));
+            }
+        }
         // Fast path: the connection's own privilege already satisfies the
         // statement. Roles and per-table grants only ever *add* privileges, so
         // no grant lookup (a storage read on every statement) is needed here.
