@@ -46,8 +46,23 @@ fn cache() -> &'static Mutex<HashMap<String, Vec<f32>>> {
     C.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+const MAX_EMBED_TEXT_BYTES: usize = 64 * 1024;
+const MAX_EMBED_DIMENSIONS: usize = 65_536;
+const MAX_CACHE_ENTRIES: usize = 256;
+const MAX_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
+
+fn concurrency() -> &'static tokio::sync::Semaphore {
+    static LIMIT: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
+    LIMIT.get_or_init(|| tokio::sync::Semaphore::new(8))
+}
+
 /// Embed one text into a vector, cached per (model, text).
 pub async fn embed(text: &str) -> Result<Vec<f32>> {
+    if text.len() > MAX_EMBED_TEXT_BYTES {
+        return Err(Error::Query(format!(
+            "ai_embed input exceeds {MAX_EMBED_TEXT_BYTES} bytes"
+        )));
+    }
     let (url, key, model) = config().ok_or_else(|| {
         Error::Query("ai_embed: set ELYRASQL_AI_EMBED_URL (and optionally _KEY, _MODEL)".into())
     })?;
@@ -57,6 +72,10 @@ pub async fn embed(text: &str) -> Result<Vec<f32>> {
     }
     let input = text.to_string();
     let model_c = model.clone();
+    let _permit = concurrency()
+        .acquire()
+        .await
+        .map_err(|_| Error::Query("ai_embed concurrency limiter closed".into()))?;
     // ureq is blocking; keep it off the async runtime.
     let v = tokio::task::spawn_blocking(move || -> Result<Vec<f32>> {
         let body = serde_json::json!({ "input": input, "model": model_c });
@@ -65,7 +84,11 @@ pub async fn embed(text: &str) -> Result<Vec<f32>> {
         // variable that happens to be set in the server's environment cannot
         // silently reroute this request -- it carries the provider API key in
         // its Authorization header.
-        let mut req = ureq::post(&url).config().proxy(None).build();
+        let mut req = ureq::post(&url)
+            .config()
+            .proxy(None)
+            .timeout_global(Some(std::time::Duration::from_secs(30)))
+            .build();
         if let Some(k) = &key {
             req = req.header("Authorization", format!("Bearer {k}"));
         }
@@ -73,15 +96,22 @@ pub async fn embed(text: &str) -> Result<Vec<f32>> {
         let mut resp = req
             .send_json(&body)
             .map_err(|e| Error::Query(format!("ai_embed request failed: {e}")))?;
-        // read_json caps the response at ureq's 10 MiB default; ureq 2's
-        // into_json() was unbounded.
+        // Tighter than ureq 3's 10 MiB read_json() default, and an explicit
+        // body-limit error rather than a truncated parse failure.
         let json: serde_json::Value = resp
             .body_mut()
+            .with_config()
+            .limit(MAX_RESPONSE_BYTES)
             .read_json()
             .map_err(|e| Error::Query(format!("ai_embed bad response: {e}")))?;
         let arr = json["data"][0]["embedding"]
             .as_array()
             .ok_or_else(|| Error::Query("ai_embed: no embedding in provider response".into()))?;
+        if arr.len() > MAX_EMBED_DIMENSIONS {
+            return Err(Error::Query(
+                "ai_embed response has too many dimensions".into(),
+            ));
+        }
         Ok(arr
             .iter()
             .filter_map(|x| x.as_f64().map(|f| f as f32))
@@ -89,7 +119,15 @@ pub async fn embed(text: &str) -> Result<Vec<f32>> {
     })
     .await
     .map_err(|e| Error::Query(format!("ai_embed task failed: {e}")))??;
-    cache().lock().unwrap().insert(ckey, v.clone());
+    let mut cache = cache().lock().unwrap();
+    if cache.len() >= MAX_CACHE_ENTRIES {
+        // Arbitrary eviction: HashMap iteration order is unspecified. Fine for
+        // a small bound; switch to an IndexMap/VecDeque if FIFO ever matters.
+        if let Some(victim) = cache.keys().next().cloned() {
+            cache.remove(&victim);
+        }
+    }
+    cache.insert(ckey, v.clone());
     Ok(v)
 }
 

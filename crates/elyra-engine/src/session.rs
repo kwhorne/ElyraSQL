@@ -51,6 +51,8 @@ struct TxnState {
     /// O(changes-since-savepoint) instead of cloning the whole staged write set
     /// per savepoint (which was O(writes x savepoints)).
     undo: Vec<UndoEntry>,
+    /// Bytes retained by undo entries while savepoints/checkpoints are active.
+    undo_mem: usize,
     /// Approximate bytes buffered by `puts` + `deletes`, maintained
     /// incrementally, to bound in-transaction memory (see `txn_max_bytes`).
     mem: usize,
@@ -82,11 +84,13 @@ struct UndoEntry {
 
 fn rollback_tx_to(tx: &mut TxnState, undo_mark: usize, ranges_len: usize) {
     while tx.undo.len() > undo_mark {
+        let entry = tx.undo.pop().expect("undo length checked");
+        tx.undo_mem -= undo_entry_size(&entry);
         let UndoEntry {
             key,
             prev_put,
             prev_deleted,
-        } = tx.undo.pop().unwrap();
+        } = entry;
         if let Some(value) = tx.puts.get(&key) {
             tx.mem -= key.len() + value.len();
         }
@@ -113,6 +117,10 @@ fn rollback_tx_to(tx: &mut TxnState, undo_mark: usize, ranges_len: usize) {
     // and `locked` deliberately remain: they only make conflict validation
     // more conservative, never incorrect.
     tx.ranges.truncate(ranges_len);
+}
+
+fn undo_entry_size(entry: &UndoEntry) -> usize {
+    entry.key.len() + entry.prev_put.as_ref().map_or(0, Vec::len) + 1
 }
 
 pub struct Session {
@@ -537,6 +545,7 @@ impl Session {
             savepoints: Vec::new(),
             checkpoints: 0,
             undo: Vec::new(),
+            undo_mem: 0,
             mem: 0,
         });
         Ok(())
@@ -600,6 +609,7 @@ impl Session {
         // With no savepoints left, the undo log is no longer needed.
         if tx.savepoints.is_empty() && tx.checkpoints == 0 {
             tx.undo = Vec::new();
+            tx.undo_mem = 0;
         }
         Ok(())
     }
@@ -632,6 +642,7 @@ impl Session {
             .ok_or_else(|| Error::Query("no active transaction checkpoint".into()))?;
         if tx.checkpoints == 0 && tx.savepoints.is_empty() {
             tx.undo.clear();
+            tx.undo_mem = 0;
         }
         Ok(())
     }
@@ -652,6 +663,7 @@ impl Session {
         tx.savepoints.truncate(checkpoint.savepoints_len);
         if tx.checkpoints == 0 && tx.savepoints.is_empty() {
             tx.undo.clear();
+            tx.undo_mem = 0;
         }
         Ok(())
     }
@@ -671,6 +683,7 @@ impl Session {
             checkpoints: _,
             undo: _,
             mem: _,
+            undo_mem: _,
         } = tx;
 
         // Keys to validate = written keys, plus (serializable) read keys.
@@ -904,11 +917,17 @@ impl Session {
                 for k in deletes {
                     let klen = k.len();
                     if logging {
-                        tx.undo.push(UndoEntry {
+                        let entry = UndoEntry {
                             prev_put: tx.puts.get(&k).cloned(),
                             prev_deleted: tx.deletes.contains(&k),
                             key: k.clone(),
-                        });
+                        };
+                        let bytes = undo_entry_size(&entry);
+                        if tx.mem + tx.undo_mem + bytes > budget {
+                            return Err(txn_overflow(budget));
+                        }
+                        tx.undo_mem += bytes;
+                        tx.undo.push(entry);
                     }
                     if let Some(old) = tx.puts.remove(&k) {
                         tx.mem -= klen + old.len();
@@ -916,17 +935,23 @@ impl Session {
                     if tx.deletes.insert(k) {
                         tx.mem += klen;
                     }
-                    if tx.mem > budget {
+                    if tx.mem + tx.undo_mem > budget {
                         return Err(txn_overflow(budget));
                     }
                 }
                 for (k, v) in puts {
                     if logging {
-                        tx.undo.push(UndoEntry {
+                        let entry = UndoEntry {
                             prev_put: tx.puts.get(&k).cloned(),
                             prev_deleted: tx.deletes.contains(&k),
                             key: k.clone(),
-                        });
+                        };
+                        let bytes = undo_entry_size(&entry);
+                        if tx.mem + tx.undo_mem + bytes > budget {
+                            return Err(txn_overflow(budget));
+                        }
+                        tx.undo_mem += bytes;
+                        tx.undo.push(entry);
                     }
                     if let Some(old) = tx.puts.get(&k) {
                         tx.mem -= k.len() + old.len();
@@ -936,7 +961,7 @@ impl Session {
                     }
                     tx.mem += k.len() + v.len();
                     tx.puts.insert(k, v);
-                    if tx.mem > budget {
+                    if tx.mem + tx.undo_mem > budget {
                         return Err(txn_overflow(budget));
                     }
                 }
