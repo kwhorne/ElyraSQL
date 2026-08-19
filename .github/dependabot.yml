@@ -6,8 +6,18 @@ updates:
       interval: weekly
     open-pull-requests-limit: 5
     groups:
-      cargo:
+      # Split by update type. In Cargo a 0.x *minor* bump is a breaking change
+      # (0.10 -> 0.11 changes the API), so grouping everything together lets one
+      # breaking bump block every safe one: PR #69 bundled ureq 2->3,
+      # md-5/sha2 0.10->0.11, getrandom 0.2->0.4 and rand 0.8->0.10 with ten
+      # routine updates and failed to compile as a whole. Patches land as one
+      # low-risk PR, API-affecting bumps get their own PR and their own review.
+      cargo-patch:
         patterns: ["*"]
+        update-types: ["patch"]
+      cargo-minor:
+        patterns: ["*"]
+        update-types: ["minor"]
     ignore:
       # These crates define the on-disk format or SQL parsing; a breaking bump
       # needs a deliberate migration (and data-format review), not an automated
@@ -38,9 +48,18 @@ updates:
       - dependency-name: "mysql_common"
         update-types:
           ["version-update:semver-major", "version-update:semver-minor"]
-      # sha1 0.11 pulls the breaking digest 0.11 API used in the (security-
-      # critical) password-hashing path; migrating needs deliberate code changes.
+      # The RustCrypto 0.10 generation (sha1/sha2/md-5) shares one `digest`
+      # dependency. Moving any of them to 0.11 pulls the breaking digest 0.11
+      # API into the hashing paths -- sha1 backs password verification, sha2 and
+      # md-5 back the SHA2()/MD5() SQL functions -- and mixing 0.10 and 0.11 in
+      # one tree duplicates the whole generation. Migrate all three together.
       - dependency-name: "sha1"
+        update-types:
+          ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: "sha2"
+        update-types:
+          ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: "md-5"
         update-types:
           ["version-update:semver-major", "version-update:semver-minor"]
 
@@ -51,6 +70,15 @@ updates:
     groups:
       actions:
         patterns: ["*"]
+    ignore:
+      # `dtolnay/rust-toolchain@1.88.0` pins the *Rust* version, not a version
+      # of the action -- the action publishes a tag per toolchain. Dependabot
+      # reads it as an action version and "upgrades" it to whatever number is
+      # highest, which silently rewrites the MSRV gate in ci.yml and the release
+      # toolchain in release.yml. PR #68 pushed both to a Rust version that does
+      # not exist; only the ci.yml half failed, because release.yml runs on tags.
+      # Toolchain moves are deliberate: edit the pins by hand.
+      - dependency-name: "dtolnay/rust-toolchain"
 
   - package-ecosystem: docker
     directory: "/"
