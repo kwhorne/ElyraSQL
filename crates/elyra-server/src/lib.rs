@@ -672,6 +672,14 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for ElyraShim {
         // `?` placeholders, producing a concrete statement to execute.
         let mut literals: Vec<String> = Vec::with_capacity(stmt.params);
         for p in params {
+            let p = match p {
+                Ok(p) => p,
+                Err(error) => {
+                    return results
+                        .error(ErrorKind::ER_MALFORMED_PACKET, error.to_string().as_bytes())
+                        .await
+                }
+            };
             literals.push(prepared::value_to_literal(p.value.into_inner()));
         }
         let sql = match prepared::bind(&stmt.sql, &literals) {

@@ -54,6 +54,19 @@ mod tls;
 mod value;
 mod writers;
 
+/// Exercise network-facing protocol parsers with arbitrary input.
+///
+/// This is intentionally a no-result API: fuzzers assert that malformed input
+/// is rejected without panicking or performing unbounded allocation.
+#[doc(hidden)]
+pub fn fuzz_parse_protocol(input: &[u8]) {
+    let _ = commands::client_handshake(input, false);
+    let _ = commands::client_handshake(input, true);
+    let _ = commands::parse(input);
+    let _ = packet_reader::onepacket(input);
+    let _ = packet_reader::packet(input);
+}
+
 // max payload size 2^(24-1)
 pub const U24_MAX: usize = 16_777_215;
 
@@ -293,7 +306,7 @@ pub struct IntermediaryOptions {
 /// Budget for one client-facing payload, mirroring MySQL's `max_allowed_packet`
 /// (same default, 64 MiB). Used here to bound parameter data streamed with
 /// `COM_STMT_SEND_LONG_DATA`. Configurable via `ELYRASQL_MAX_ALLOWED_PACKET`.
-fn max_allowed_packet() -> usize {
+pub(crate) fn max_allowed_packet() -> usize {
     use std::sync::OnceLock;
     static CACHE: OnceLock<usize> = OnceLock::new();
     *CACHE.get_or_init(|| {
