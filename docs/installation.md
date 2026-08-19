@@ -17,6 +17,38 @@ ElyraSQL release builds target **Ubuntu 24.04+** and **Apple Silicon macOS
     done, so an interrupted upgrade simply resumes on the next start. **Take a backup
     first, and note that downgrading to 1.4.x afterwards is not supported.**
 
+!!! warning "Upgrading to 1.9.5"
+
+    Four changes can affect a working deployment. None touches your data.
+
+    **A partial cluster TLS configuration now refuses to start.** Setting only
+    one of `ELYRASQL_CLUSTER_TLS_CERT` / `ELYRASQL_CLUSTER_TLS_KEY`, or pointing
+    them at a certificate that cannot be loaded, previously logged a warning and
+    continued **in plaintext**. That is now a startup error. If a node fails to
+    start after upgrading, it was running unencrypted before: fix the pair rather
+    than working around the error.
+
+    **An exposed Raft control plane now requires authentication.** A control
+    listener bound to anything other than loopback refuses to start unless
+    `ELYRASQL_CLUSTER_SECRET` is set. To keep the previous behaviour
+    deliberately, set `ELYRASQL_ALLOW_OPEN_AUTH=1`.
+
+    **`SHOW PROCESSLIST` is scoped.** A non-`Admin` account now sees only its own
+    connections. Monitoring that reads the full process list must connect as an
+    `Admin` account.
+
+    **Slow-query and audit output is redacted.** String literals are replaced with
+    `?` and `CREATE USER` / `ALTER USER` / `SET PASSWORD` statements are elided
+    entirely, so log pipelines that parsed literal values out of these lines will
+    no longer find them. The audit log file is created owner-only (`0600`) on
+    Unix.
+
+    Two smaller behaviour changes worth knowing: `ELYRASQL_AUTH_LOCKOUT_SECS` is
+    no longer read (the account lockout was removed — it let unauthenticated
+    traffic lock out valid accounts), and queries that read a column-restricted
+    table through a subquery, CTE or `GROUP BY` are now correctly refused where
+    the restriction was previously bypassed.
+
 !!! warning "Upgrading to 1.9.4"
 
     Two changes can affect a working deployment. Neither touches your data.
@@ -190,8 +222,8 @@ macOS).
 Multi-arch image (`amd64` + `arm64`) on the GitHub Container Registry:
 
 ```bash
-docker pull ghcr.io/kwhorne/elyrasql:1.9.4   # or :latest
-docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.9.4
+docker pull ghcr.io/kwhorne/elyrasql:1.9.5   # or :latest
+docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.9.5
 ```
 
 The image is ~15 MB, runs as a non-root user, stores data in the
