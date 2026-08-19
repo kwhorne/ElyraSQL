@@ -6,129 +6,140 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.9.5] - 2026-08-19
+
+Fifteen contributions, and the theme is boundaries: what the wire protocol will
+accept, what an unauthorized user can reach, what a replica can claim, and how
+much memory one statement may take. Seven of these close real holes.
+
+**Four changes can stop a working deployment from starting or change what it
+reports.** All four are in the upgrade note in the installation docs. Nothing
+touches your data.
+
 ### Fixed
 
-- **`DISTINCT` and `GROUP BY` collapse numerically equal `DECIMAL` values.**
-  In-memory grouping keys rendered `DECIMAL` through its Rust debug
-  representation, so `1.0` and `1.00` -- the same number at different scales,
-  which is exactly what a `UNION` of differently-declared `DECIMAL` columns
-  produces -- keyed differently and survived as two rows:
+- **Bound parameters could escape their string in a commented placeholder.**
+  A `?` inside a SQL comment was counted as a parameter, so its value was
+  rendered into the comment; a value containing a newline then ended the comment
+  and the remainder became executable SQL. Placeholder scanning is now aware of
+  `--`, `#` and `/* */`.
+
+- **A malformed multi-packet payload could panic the connection.**
+  `PacketReader` copied buffered bytes without checking the destination's
+  remaining capacity, so a large enough buffered leftover panicked instead of
+  filling the buffer. Continuation-packet assembly is also bounded by
+  `ELYRASQL_MAX_ALLOWED_PACKET`, which it was not before: a client could
+  otherwise grow server memory without limit, before authenticating.
+
+- **Column-level grants were not enforced outside the top-level `FROM`.**
+  Derived tables, scalar subqueries, CTEs and set-operation arms bypassed column
+  restrictions entirely, and column references in `GROUP BY`/`HAVING` were not
+  collected, so a restricted column could be read through `GROUP BY secret`.
+  Column grants inherited through a role were also not resolved.
+
+- **A replica could acknowledge a log position it had never been sent**, which
+  satisfied a `--sync-replicas` commit barrier without the write having been
+  replicated — durability the server reported but did not have. Acknowledgements
+  are now clamped to what was actually sent to that replica.
+
+- **Partial or invalid cluster TLS silently ran in plaintext.** Setting only one
+  of `ELYRASQL_CLUSTER_TLS_CERT`/`_KEY`, or pointing them at an unloadable
+  certificate, logged a warning and continued unencrypted — so an operator who
+  had configured TLS did not have it. Both now fail closed.
+
+- **A failed Raft control plane no longer leaves the node running.** Its task
+  was spawned and its error discarded, so a node could serve with a dead
+  consensus loop.
+
+- **`DISTINCT` and `GROUP BY` split numerically equal `DECIMAL` values.**
+  In-memory grouping keys rendered `DECIMAL` through its debug representation,
+  so `1.0` and `1.00` — the same number at different scales, which is what a
+  `UNION` of differently-declared `DECIMAL` columns produces — keyed differently:
 
   ```sql
   SELECT DISTINCT v FROM (SELECT 1.0 AS v UNION ALL SELECT 1.00 AS v) t;
   ```
 
-  returned two rows where MySQL returns one, and `GROUP BY v` likewise formed
-  two groups. Keys now canonicalise the scale, exactly and at any `i128`
-  magnitude. On-disk index keys were never affected (they use a separate
-  encoding).
+  returned two rows where MySQL returns one. Keys now canonicalise the scale,
+  exactly at any `i128` magnitude. `GROUP BY` had a second copy of the same
+  encoding in the analytics kernel and now shares one implementation, which also
+  gives it the `UInt` handling it never had. On-disk index keys use a separate
+  encoding and were never affected.
 
-- **A DDL rewrite inside a transaction can no longer exceed
-  `ELYRASQL_TXN_MAX_BYTES`.** The rewrite budget counted only the staged write
-  set while the write path enforces staged writes *plus* the savepoint undo log,
-  so a rewrite sized against the budget could overshoot by the size of that log.
+- **Exact window `SUM` above 2^53.** Integer window sums accumulated through an
+  `f64`, so consecutive integers past 2^53 could not be represented. Frames
+  containing only integers now sum exactly in `i128`; mixed frames use a range
+  tree, so a frame sum no longer subtracts one prefix from another and cannot
+  lose precision to cancellation. `AVG` divides by the count of numeric values,
+  not the frame width.
 
-### Changed
+- **Date and time parsing could overflow rather than reject.** Out-of-range
+  years, hours, minutes and seconds are validated, and the epoch arithmetic is
+  checked, so a hostile literal produces an error instead of a wrapped value.
 
-- **Documentation: there is no login lockout.** `ELYRASQL_AUTH_LOCKOUT_SECS` was
-  removed with the lockout mechanism, but the configuration and limitations
-  pages still documented both, so the limitations page claimed a brute-force
-  defence the server does not have. `ELYRASQL_AUTH_MAX_FAILURES` remains as a
-  logging threshold only. Rate limiting that cannot itself be used to lock out a
-  valid account is not implemented yet, and is now stated as such.
+- **`ai_embed()` ran before authorization.** Embedding calls were resolved before
+  every statement-level permission check, so a user who could not run the
+  statement could still make the server issue an outbound HTTP request carrying
+  the configured API key. They are now resolved after the gates.
+
+- **A DDL rewrite inside a transaction could exceed `ELYRASQL_TXN_MAX_BYTES`** by
+  the size of the savepoint undo log, because the rewrite budget counted only the
+  staged write set while the write path enforces both.
 
 ### Added
 
-- **Numeric `RANGE` and `GROUPS` window frames.** Aggregate windows now support
-  exact numeric offsets in ascending and descending order, peer groups,
-  partitions, NULL ordering, and empty frames. Integer and decimal boundaries
-  use checked fixed-point arithmetic rather than lossy floating-point
-  conversion; invalid, row-dependent, temporal, and incompatible offsets are
-  rejected explicitly.
-- **Composite secondary-index prefix ranges.** Predicates such as
-  `tenant = ? AND status = ? AND created BETWEEN ? AND ?` can scan the matching
-  left prefix of a composite index. Bounds honor each component's collation,
-  repeated constraints are merged, residual predicates are rechecked, and
-  transactional overlays remain visible. Covered `COUNT(*)` can count index
-  entries without fetching table rows.
-- **`ALTER TABLE ... ADD PRIMARY KEY` for populated tables.** Existing rows and
-  secondary indexes are reclustered atomically, with serializable range
-  validation preventing concurrent inserts from surviving in the old row-id
-  keyspace.
-- **Bounded spill-backed `SELECT DISTINCT`.** Large distinct sets now sort and
-  stream through temporary files instead of requiring the entire result in
-  memory, while preserving SQL collation, mixed-numeric equality, stable first
-  representatives, offsets, limits, cancellation, and result metadata.
+- **`ALTER TABLE ... ADD PRIMARY KEY` on a populated table rewrites in bounded
+  memory**, building an unreachable storage generation in bounded commits and
+  switching a small generation pointer atomically at cutover, then reclaiming the
+  previous generation in the background and resuming interrupted cleanup at
+  startup. 50–57% faster with roughly half the peak RSS on 20k–500k rows.
+  Explicit transactions and multi-statement `ALTER` keep the original
+  single-transaction path, now bounded by `ELYRASQL_TXN_MAX_BYTES`.
+
+- **Scalable execution paths** for composite index ranges, correlated `EXISTS`,
+  selective indexed joins, spill-backed `DISTINCT` (`ELYRASQL_DISTINCT_MAX_BYTES`,
+  byte-bounded and cancellation-aware, with owner-only spill files), incremental
+  window aggregation and bulk loading.
+
+- **Fuzz targets for the wire protocol and the core parsers**, covering the
+  pre-authentication surface that previously had none.
 
 ### Changed
 
-- **Correlated `EXISTS` / `NOT EXISTS` can execute as one-time membership
-  plans.** Safe single-table equality correlations are evaluated once with
-  exact type/collation gates and correct NULL anti/semi-join semantics; other
-  shapes retain the general correlated path. `EXPLAIN` reports the optimized
-  plan only when it is guaranteed.
-- **Selective inner joins delay partner-table materialization.** A selective
-  point driver can probe a partner primary or secondary index directly,
-  including transaction-local rows, instead of eagerly scanning every joined
-  table.
-- **Window aggregation is incremental where possible.** `SUM`, `COUNT`, and
-  `AVG` over `RANGE`/`GROUPS` frames use precomputed bounds and prefix state;
-  `MIN` and `MAX` retain their exact fallback while sharing the faster bound
-  planning.
-- **Bulk inserts and table rewrites do less allocation and redundant work.**
-  Index keys encode selected columns without cloning, writes are ordered for
-  the B-tree, unchanged rows reuse their serialized representation, and
-  serializable scans coalesce overlapping validation ranges.
-- **`LOAD DATA INFILE` uses bounded 50,000-row bulk units** to amortize SQL
-  parsing and durable commits. Insert paths cache trigger definitions (including
-  empty sets) with DDL-safe invalidation. On the 50,000-row comparison workload,
-  ordinary 1,000-row batches improved from 1,072 ms to 781 ms, one bulk
-  statement took 541 ms, and server-side `LOAD DATA` took 267 ms.
-- **`ai_embed()` now uses ureq 3.** Two things change for anyone who has
-  `ELYRASQL_AI_EMBED_URL` configured. ureq 3 reads `HTTP_PROXY`, `HTTPS_PROXY`
-  and `ALL_PROXY` from the environment by default where ureq 2 did not, so the
-  proxy is explicitly disabled to preserve the previous behaviour -- the request
-  carries the provider API key in its `Authorization` header, and a proxy
-  variable that happens to be set in the server's environment should not
-  silently reroute it. The response body is also capped at ureq's 10 MiB
-  default; ureq 2's `into_json()` was unbounded.
+- **`SHOW PROCESSLIST` shows only the caller's own connections** unless the
+  account is `Admin`.
 
-  TLS is unchanged: rustls with `ring` and bundled webpki roots, no
-  `aws-lc-rs`, so static musl builds and the `FROM scratch` image are
-  unaffected. Note that ureq 3 raises the effective MSRV floor to exactly the
-  declared 1.88 (via `cookie_store` and `time`).
+- **Slow-query and audit output is redacted.** String literals are replaced and
+  credential statements (`CREATE USER`, `ALTER USER`, `SET PASSWORD`) are elided
+  entirely; the audit log file is created owner-only on Unix.
 
-### Fixed
+- **There is no login lockout.** Locking an account on repeated failures let
+  unauthenticated traffic deny service to a valid user, so the mechanism was
+  removed rather than kept. `ELYRASQL_AUTH_MAX_FAILURES` remains as a logging
+  threshold; `ELYRASQL_AUTH_LOCKOUT_SECS` is gone. Rate limiting that cannot be
+  abused this way is not implemented yet, and the limitations page now says so
+  instead of documenting a defence that no longer exists.
 
-- Exact `RANGE` boundaries no longer merge distinct integers above `2^53`, and
-  wholly out-of-partition frames return an empty frame instead of indexing with
-  `usize::MAX` and crashing the connection.
-- External sorting now returns no rows for `LIMIT 0` in every spill/top-N mode
-  and reports truncated spill headers or bodies as storage corruption rather
-  than clean EOF or a generic I/O failure.
-- Spill-backed `DISTINCT` groups by its canonical SQL key rather than a broader
-  sort comparison, preventing mixed numeric representations from producing
-  duplicate output.
+- **The Raft control plane refuses to bind to a non-loopback address without
+  authentication.** Set `ELYRASQL_CLUSTER_SECRET`, bind to localhost, or opt out
+  explicitly with `ELYRASQL_ALLOW_OPEN_AUTH`.
+
+- **`ai_embed()` is bounded**: request size, response size, a 30-second timeout,
+  at most eight concurrent calls and a capped cache. Its HTTP client moved to
+  ureq 3; the proxy environment is deliberately not honoured, so an ambient
+  `HTTP_PROXY` cannot reroute a request carrying the provider API key.
 
 ### Internal
 
-- **Dependabot no longer rewrites the Rust toolchain pins, and no longer groups
-  breaking updates with safe ones.** `dtolnay/rust-toolchain@1.88.0` pins the
-  *Rust* version, not a version of the action -- that action publishes one tag
-  per toolchain. Read as an action version, an "upgrade" rewrote both the MSRV
-  gate in `ci.yml` and the release toolchain in `release.yml` to a Rust version
-  that does not exist (#68). Only the `ci.yml` half failed, because
-  `release.yml` runs on tags; merged, it would have dropped MSRV verification
-  and broken the next release build. The action is now ignored and toolchain
-  moves stay manual.
+- **Dependabot no longer rewrites the Rust toolchain pins.**
+  `dtolnay/rust-toolchain@1.88.0` names a Rust version, not an action version, so
+  an automated "upgrade" silently rewrote the MSRV gate and the release
+  toolchain. The cargo group is also split by update type: in Cargo a 0.x minor
+  bump is a breaking change, so one group let a single breaking update block ten
+  safe ones.
 
-  The Cargo group is split into `cargo-patch` and `cargo-minor`. In Cargo a 0.x
-  *minor* bump is a breaking change, so one group let a single breaking update
-  block every safe one: #69 bundled `ureq` 2->3, `md-5`/`sha2` 0.10->0.11,
-  `getrandom` 0.2->0.4 and `rand` 0.8->0.10 with ten routine updates and failed
-  to compile as a whole. `sha2` and `md-5` also join the existing `sha1` rule --
-  all three share one `digest` dependency, and moving any of them alone leaves
-  two RustCrypto generations in the tree.
+- **The manual fuzz workflow validates its duration input** instead of
+  interpolating it into a shell command.
 
 ## [1.9.4] - 2026-08-03
 
