@@ -1409,10 +1409,7 @@ impl Engine {
 
         let mut out = Vec::with_capacity(statements.len());
         for stmt in statements {
-            // Resolve ai_embed('...') calls (embed once, substitute a vector
-            // literal) before anything inspects the statement.
             let mut stmt = stmt;
-            aiembed::resolve_stmt(&mut stmt).await?;
             // Resolve session-backed functions before execution because the
             // stateless evaluator cannot read connection state.
             let database = sess.database();
@@ -1453,6 +1450,9 @@ impl Engine {
                     }
                 }
             }
+            // Outbound embedding calls are side effects and resource consumers;
+            // resolve them only after every statement-level authorization gate.
+            aiembed::resolve_stmt(&mut stmt).await?;
             if statement_starts_implicit_transaction(&stmt) {
                 sess.begin_implicit_transaction()?;
             }

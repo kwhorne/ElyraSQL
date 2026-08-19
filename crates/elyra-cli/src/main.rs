@@ -311,7 +311,8 @@ async fn run() -> anyhow::Result<()> {
                 (Some(cert), Some(key)) => {
                     Some(std::sync::Arc::new(elyra_server::load_tls(&cert, &key)?))
                 }
-                _ => None,
+                (None, None) => None,
+                _ => unreachable!("clap requires --tls-cert and --tls-key together"),
             };
 
             let config = elyra_server::ServerConfig {

@@ -12,9 +12,9 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use elyra_core::users::{decode_user, user_key, UserRecord, USER_PREFIX};
+use elyra_core::users::{decode_user, role_flag_key, user_key, UserRecord, USER_PREFIX};
 use elyra_core::Privilege;
 use elyra_storage::Db;
 use sha1::{Digest, Sha1};
@@ -24,25 +24,15 @@ use tracing::warn;
 #[derive(Default)]
 struct FailState {
     fails: u32,
-    locked_until: Option<Instant>,
 }
 
-/// Max consecutive failed logins before an account is temporarily locked
-/// (`ELYRASQL_AUTH_MAX_FAILURES`, 0 = disabled).
+/// Failed-login warning threshold (`ELYRASQL_AUTH_MAX_FAILURES`, 0 = disabled).
+/// Correct credentials are never locked out by unauthenticated traffic.
 fn max_failures() -> u32 {
     std::env::var("ELYRASQL_AUTH_MAX_FAILURES")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(10)
-}
-
-/// Lockout duration in seconds after too many failures
-/// (`ELYRASQL_AUTH_LOCKOUT_SECS`).
-fn lockout_secs() -> u64 {
-    std::env::var("ELYRASQL_AUTH_LOCKOUT_SECS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(60)
 }
 
 /// Credential store. Accounts come from two places: a `bootstrap` map supplied
@@ -53,7 +43,7 @@ fn lockout_secs() -> u64 {
 pub struct Auth {
     bootstrap: HashMap<String, ([u8; 20], Privilege)>,
     db: Option<Db>,
-    /// Per-account failed-login state for brute-force lockout.
+    /// Bounded failed-login state: only known accounts are inserted.
     failures: Mutex<HashMap<String, FailState>>,
     /// RSA keypair for `caching_sha2_password` full auth over a non-TLS channel
     /// (the client encrypts the password with this key). Generated on first use.
@@ -125,6 +115,10 @@ impl Auth {
     fn persistent(&self, user: &str) -> Option<UserRecord> {
         let db = self.db.as_ref()?;
         let snap = db.snapshot().ok()?;
+        let role_marker = snap.get(&role_flag_key(user)).ok()?;
+        if role_marker.is_some() {
+            return None;
+        }
         let bytes = snap.get(&user_key(user)).ok()??;
         decode_user(&bytes)
     }
@@ -135,11 +129,13 @@ impl Auth {
             return false;
         };
         let Ok(snap) = db.snapshot() else {
-            return false;
+            // A configured persistent store must never become open authentication
+            // merely because its account catalogue cannot currently be read.
+            return true;
         };
         snap.scan_range(USER_PREFIX, None, 1)
             .map(|rows| rows.iter().any(|(k, _)| k.starts_with(USER_PREFIX)))
-            .unwrap_or(false)
+            .unwrap_or(true)
     }
 
     /// Look up an account's stored digest and privilege from either source.
@@ -180,25 +176,11 @@ impl Auth {
             return false;
         };
 
-        // Brute-force lockout: reject while an account is temporarily locked.
         let threshold = max_failures();
-        if threshold > 0 {
-            let locked = self
-                .failures
-                .lock()
-                .unwrap()
-                .get(user)
-                .and_then(|f| f.locked_until)
-                .is_some_and(|t| Instant::now() < t);
-            if locked {
-                warn!(user, "authentication rejected: account temporarily locked");
-                return false;
-            }
-        }
-
+        let known = self.lookup(user).is_some();
         let ok = self.verify_raw(user, salt, auth_data);
 
-        if threshold > 0 {
+        if threshold > 0 && known {
             let mut map = self.failures.lock().unwrap();
             if ok {
                 map.remove(user);
@@ -206,14 +188,8 @@ impl Auth {
                 let f = map.entry(user.to_string()).or_default();
                 f.fails += 1;
                 if f.fails >= threshold {
-                    f.locked_until =
-                        Some(Instant::now() + std::time::Duration::from_secs(lockout_secs()));
                     f.fails = 0;
-                    warn!(
-                        user,
-                        lockout_secs = lockout_secs(),
-                        "account locked after too many failed logins"
-                    );
+                    warn!(user, "authentication failure threshold reached");
                 } else {
                     warn!(user, fails = f.fails, "failed login");
                 }
@@ -274,24 +250,12 @@ impl Auth {
             return false;
         };
         let threshold = max_failures();
-        if threshold > 0 {
-            let locked = self
-                .failures
-                .lock()
-                .unwrap()
-                .get(user)
-                .and_then(|f| f.locked_until)
-                .is_some_and(|t| Instant::now() < t);
-            if locked {
-                warn!(user, "authentication rejected: account temporarily locked");
-                return false;
-            }
-        }
-        let ok = match self.lookup(user) {
-            Some((stored, _)) => ct_eq(&double_sha1(password), &stored),
+        let account = self.lookup(user);
+        let ok = match &account {
+            Some((stored, _)) => ct_eq(&double_sha1(password), stored),
             None => false,
         };
-        if threshold > 0 {
+        if threshold > 0 && account.is_some() {
             let mut map = self.failures.lock().unwrap();
             if ok {
                 map.remove(user);
@@ -299,10 +263,8 @@ impl Auth {
                 let f = map.entry(user.to_string()).or_default();
                 f.fails += 1;
                 if f.fails >= threshold {
-                    f.locked_until =
-                        Some(Instant::now() + std::time::Duration::from_secs(lockout_secs()));
                     f.fails = 0;
-                    warn!(user, "account locked after too many failed logins");
+                    warn!(user, "authentication failure threshold reached");
                 } else {
                     warn!(user, fails = f.fails, "failed login");
                 }
@@ -416,5 +378,28 @@ mod tests {
     #[test]
     fn salts_differ() {
         assert_ne!(generate_salt(), generate_salt());
+    }
+
+    #[tokio::test]
+    async fn persistent_role_is_not_a_login_account() {
+        let db = Db::in_memory().expect("in-memory database");
+        let role = UserRecord {
+            digest: double_sha1(b""),
+            privilege: Privilege::Admin,
+        };
+        db.commit(
+            vec![
+                (user_key("reporting"), elyra_core::users::encode_user(&role)),
+                (role_flag_key("reporting"), vec![1]),
+            ],
+            vec![],
+        )
+        .await
+        .expect("store role");
+
+        let auth = Auth::open().with_db(db);
+        assert!(!auth.is_open());
+        assert!(!auth.verify(b"reporting", &generate_salt(), b""));
+        assert!(!auth.verify_cleartext(b"reporting", b""));
     }
 }
