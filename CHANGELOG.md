@@ -6,6 +6,26 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+### Internal
+
+- **Dependabot no longer rewrites the Rust toolchain pins, and no longer groups
+  breaking updates with safe ones.** `dtolnay/rust-toolchain@1.88.0` pins the
+  *Rust* version, not a version of the action -- that action publishes one tag
+  per toolchain. Read as an action version, an "upgrade" rewrote both the MSRV
+  gate in `ci.yml` and the release toolchain in `release.yml` to a Rust version
+  that does not exist (#68). Only the `ci.yml` half failed, because
+  `release.yml` runs on tags; merged, it would have dropped MSRV verification
+  and broken the next release build. The action is now ignored and toolchain
+  moves stay manual.
+
+  The Cargo group is split into `cargo-patch` and `cargo-minor`. In Cargo a 0.x
+  *minor* bump is a breaking change, so one group let a single breaking update
+  block every safe one: #69 bundled `ureq` 2->3, `md-5`/`sha2` 0.10->0.11,
+  `getrandom` 0.2->0.4 and `rand` 0.8->0.10 with ten routine updates and failed
+  to compile as a whole. `sha2` and `md-5` also join the existing `sha1` rule --
+  all three share one `digest` dependency, and moving any of them alone leaves
+  two RustCrypto generations in the tree.
+
 ## [1.9.4] - 2026-08-03
 
 Seven contributions, and for the first time in a while none of them is a
