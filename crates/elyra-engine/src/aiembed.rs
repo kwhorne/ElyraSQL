@@ -60,15 +60,24 @@ pub async fn embed(text: &str) -> Result<Vec<f32>> {
     // ureq is blocking; keep it off the async runtime.
     let v = tokio::task::spawn_blocking(move || -> Result<Vec<f32>> {
         let body = serde_json::json!({ "input": input, "model": model_c });
-        let mut req = ureq::post(&url).set("Content-Type", "application/json");
+        // ureq 3 reads HTTP_PROXY/HTTPS_PROXY/ALL_PROXY from the environment by
+        // default; ureq 2 did not. Keep the pre-upgrade behaviour, so a proxy
+        // variable that happens to be set in the server's environment cannot
+        // silently reroute this request -- it carries the provider API key in
+        // its Authorization header.
+        let mut req = ureq::post(&url).config().proxy(None).build();
         if let Some(k) = &key {
-            req = req.set("Authorization", &format!("Bearer {k}"));
+            req = req.header("Authorization", format!("Bearer {k}"));
         }
-        let resp = req
-            .send_json(body)
+        // send_json sets Content-Type: application/json itself.
+        let mut resp = req
+            .send_json(&body)
             .map_err(|e| Error::Query(format!("ai_embed request failed: {e}")))?;
+        // read_json caps the response at ureq's 10 MiB default; ureq 2's
+        // into_json() was unbounded.
         let json: serde_json::Value = resp
-            .into_json()
+            .body_mut()
+            .read_json()
             .map_err(|e| Error::Query(format!("ai_embed bad response: {e}")))?;
         let arr = json["data"][0]["embedding"]
             .as_array()
