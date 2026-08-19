@@ -349,11 +349,16 @@ impl ElyraShim {
         let lower = t.to_ascii_lowercase();
         let l = lower.as_str();
         if l == "show processlist" || l == "show full processlist" {
+            let privilege = self.privilege();
             return Some((
                 vec![
                     "Id", "User", "Host", "db", "Command", "Time", "State", "Info",
                 ],
-                self.procs.rows(),
+                self.procs.rows_for(
+                    self.conn_id,
+                    &self.user(),
+                    privilege == elyra_core::Privilege::Admin,
+                ),
             ));
         }
         if l.starts_with("show status")

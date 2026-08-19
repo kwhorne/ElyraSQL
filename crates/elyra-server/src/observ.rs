@@ -97,7 +97,7 @@ impl Metrics {
             self.slow.fetch_add(1, Ordering::Relaxed);
             warn!(
                 duration_ms = elapsed.as_millis() as u64,
-                sql = %truncate(sql, 500),
+                sql = %truncate(&redact_sql(sql), 500),
                 "slow query"
             );
         }
@@ -273,11 +273,12 @@ impl ProcRegistry {
     }
 
     /// Rows for `SHOW PROCESSLIST`: Id, User, Host, db, Command, Time, State, Info.
-    pub fn rows(&self) -> Vec<Vec<String>> {
+    pub fn rows_for(&self, viewer_id: u32, viewer: &str, admin: bool) -> Vec<Vec<String>> {
         let g = self.inner.lock().unwrap();
         let mut ids: Vec<&u32> = g.keys().collect();
         ids.sort();
         ids.into_iter()
+            .filter(|id| admin || **id == viewer_id || g[*id].user == viewer)
             .map(|id| {
                 let e = &g[id];
                 let (command, secs, info) = match &e.current {
@@ -321,10 +322,14 @@ pub struct AuditLog {
 impl AuditLog {
     /// Open (create/append) the audit log at `path`.
     pub fn open(path: &std::path::Path) -> std::io::Result<Self> {
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(path)?;
         Ok(AuditLog {
             file: Mutex::new(file),
         })
@@ -340,7 +345,7 @@ impl AuditLog {
             .unwrap_or(0);
         // Truncate first (at most 2000 chars) so a huge bulk statement is not
         // fully copied just to be trimmed.
-        let flat: String = sql
+        let flat: String = redact_sql(sql)
             .chars()
             .take(2000)
             .map(|c| if c == '\n' || c == '\t' { ' ' } else { c })
@@ -353,13 +358,58 @@ impl AuditLog {
     }
 }
 
+/// Remove literal values before SQL text crosses an observability boundary.
+fn redact_sql(sql: &str) -> String {
+    let lower = sql.trim_start().to_ascii_lowercase();
+    if lower.starts_with("create user")
+        || lower.starts_with("alter user")
+        || lower.starts_with("set password")
+    {
+        return "[REDACTED CREDENTIAL STATEMENT]".into();
+    }
+
+    let mut out = String::with_capacity(sql.len());
+    let mut chars = sql.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '\'' {
+            out.push(ch);
+            continue;
+        }
+        out.push('?');
+        while let Some(inner) = chars.next() {
+            if inner == '\\' {
+                let _ = chars.next();
+            } else if inner == '\'' {
+                if chars.peek() == Some(&'\'') {
+                    let _ = chars.next();
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod truncate_tests {
-    use super::truncate;
+    use super::{redact_sql, truncate};
 
     #[test]
     fn preserves_text_that_fits() {
         assert_eq!(truncate("plain", 5), "plain");
+    }
+
+    #[test]
+    fn redacts_credentials_and_string_literals() {
+        assert_eq!(
+            redact_sql("CREATE USER alice IDENTIFIED BY 'secret'"),
+            "[REDACTED CREDENTIAL STATEMENT]"
+        );
+        assert_eq!(
+            redact_sql("SELECT * FROM t WHERE token = 'secret'"),
+            "SELECT * FROM t WHERE token = ?"
+        );
     }
 
     #[test]
