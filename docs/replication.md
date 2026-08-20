@@ -31,8 +31,14 @@ elyrasql serve \
 elyrasql replica \
   --primary primary-host:7000 \
   --data /var/lib/elyrasql/replica.edb \
-  --listen 0.0.0.0:3307
+  --listen 0.0.0.0:3307 \
+  --auth app:app-password:read
 ```
+
+The replica's MySQL listener **requires accounts**: like `serve`, it refuses to
+start credential-less unless `ELYRASQL_ALLOW_OPEN_AUTH=1` is set explicitly.
+Roles work exactly as on a primary (`admin`/`write`/`read`); replicas reject
+writes at the SQL layer regardless of role.
 
 The replica's `--data` file is **disposable**: it is recreated and
 re-bootstrapped from the primary each time the replica starts. Point read-only

@@ -45,6 +45,12 @@ elyrasql serve \
     when `ELYRASQL_CLUSTER_SECRET` is set, so exposing it on a non-loopback address
     without a secret is refused unless `ELYRASQL_ALLOW_OPEN_AUTH=1` is set.
 
+    A **replica's MySQL listener** is guarded the same way: `elyrasql replica`
+    refuses to start without accounts (`--user`/`--password` or
+    `--auth USER:PASS:ROLE`) unless `ELYRASQL_ALLOW_OPEN_AUTH=1` explicitly
+    opts in — a credential-less replica would hand Admin access to its entire
+    replicated data set to anyone who can reach the port.
+
     **Encrypting replication:** set `ELYRASQL_CLUSTER_TLS_CERT` + `_KEY` on the
     primary and `ELYRASQL_CLUSTER_TLS_CA` on the replica. The replica then verifies
     the primary's certificate (a mismatched cert is rejected — not accept-any), so

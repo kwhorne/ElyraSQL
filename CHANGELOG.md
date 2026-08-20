@@ -69,6 +69,13 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ### Fixed
 
+- **Security: `elyrasql replica` now requires accounts on its MySQL listener.**
+  The replica subcommand had no auth flags at all and always started with open
+  authentication (any username/password logged in as Admin), exposing the full
+  replicated data set to anyone who could reach the port. It now accepts
+  `--user`/`--password`/`--auth USER:PASS:ROLE` exactly like `serve`, and
+  refuses to start credential-less unless `ELYRASQL_ALLOW_OPEN_AUTH=1`
+  explicitly opts in.
 - Exact `RANGE` boundaries no longer merge distinct integers above `2^53`, and
   wholly out-of-partition frames return an empty frame instead of indexing with
   `usize::MAX` and crashing the connection.

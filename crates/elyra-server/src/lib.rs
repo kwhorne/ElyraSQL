@@ -1114,7 +1114,7 @@ pub(crate) fn listen_is_exposed(listen: &str) -> bool {
 }
 
 /// Whether `var` is set to a truthy value (`1`/`true`/`yes`/`on`).
-pub(crate) fn env_flag(var: &str) -> bool {
+pub fn env_flag(var: &str) -> bool {
     matches!(
         std::env::var(var)
             .ok()
