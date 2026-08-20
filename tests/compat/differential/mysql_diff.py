@@ -2,9 +2,19 @@
 """MySQL semantics differential harness.
 
 Runs an identical battery of edge-case queries against ElyraSQL and a reference
-MySQL 8, and reports where they diverge (different rows/NULLs, or one accepts a
-query the other rejects). The reference is the source of truth for MySQL
-semantics, so we don't have to guess.
+MySQL 8, and reports where they diverge. The reference is the source of truth for
+MySQL semantics, so we don't have to guess.
+
+Three things are compared, because two of them were added after divergences got
+through:
+
+* **rows** -- values and NULLs, plus one engine accepting what the other rejects.
+* **result column types** -- the declared type code, not just the value. A
+  boolean in arithmetic used to come back as DOUBLE where MySQL sends BIGINT;
+  every value matched, so the battery passed.
+* **affected rows** -- for the DML battery. `INSERT ... ON DUPLICATE KEY UPDATE`
+  reported 1 where MySQL reports 2, in five shapes across two code paths, and
+  nothing here looked at the count at all.
 
 Usage:
     python3 tests/compat/differential/mysql_diff.py \
@@ -23,17 +33,49 @@ import pymysql
 # ---- comparison ------------------------------------------------------------
 
 def run(conn, sql):
-    """Execute one statement; return ('ok', rows) or ('err', code)."""
+    """Execute one statement; return ('ok', rows, types) or ('err', code, ())."""
     try:
         cur = conn.cursor()
         cur.execute(sql)
         rows = cur.fetchall()
+        types = tuple(c[1] for c in cur.description) if cur.description else ()
         cur.close()
-        return ("ok", rows)
+        return ("ok", rows, types)
+    except pymysql.err.MySQLError as e:
+        return ("err", e.args[0] if e.args else 0, ())
+    except Exception as e:  # driver-level (e.g. lost connection = crash!)
+        return ("crash", str(e)[:60], ())
+
+
+def run_dml(conn, sql):
+    """Execute one DML statement; return ('ok', affected) or ('err', code)."""
+    try:
+        cur = conn.cursor()
+        cur.execute(sql)
+        affected = cur.rowcount
+        cur.close()
+        return ("ok", affected)
     except pymysql.err.MySQLError as e:
         return ("err", e.args[0] if e.args else 0)
-    except Exception as e:  # driver-level (e.g. lost connection = crash!)
+    except Exception as e:
         return ("crash", str(e)[:60])
+
+
+# Type codes that mean the same thing to a client. Integer widths are chosen by
+# the server from the value's range and every driver widens them transparently,
+# and the string/blob family is a wire-encoding detail. Everything else is
+# compared exactly -- notably DOUBLE is *not* folded into the integer family,
+# which is what makes a boolean-as-float regression visible.
+_INT_TYPES = {1, 2, 3, 8, 9}            # TINY SHORT LONG LONGLONG INT24
+_STR_TYPES = {15, 249, 250, 251, 252, 253, 254}  # VARCHAR, BLOB family, STRING
+
+
+def fold_type(code):
+    if code in _INT_TYPES:
+        return "int"
+    if code in _STR_TYPES:
+        return "str"
+    return code
 
 
 def norm(v):
@@ -59,9 +101,28 @@ def nums_close(a, b):
     return abs(a - b) <= 1e-9 * scale
 
 
+def compare_types(a, b):
+    """Return a type divergence description, or None.
+
+    A column whose every value is NULL is skipped: there is no value to type, so
+    the server picks something arbitrary (we send VAR_STRING, MySQL infers the
+    expression's type) and no client can tell the difference.
+    """
+    (sa, va, ta), (sb, vb, tb) = a, b
+    if sa != "ok" or sb != "ok" or len(ta) != len(tb):
+        return None
+    for j, (x, y) in enumerate(zip(ta, tb)):
+        if fold_type(x) == fold_type(y):
+            continue
+        if va and all(row[j] is None for row in va):
+            continue
+        return f"col{j} type {x} vs {y}"
+    return None
+
+
 def compare(a, b):
     """Return a divergence description, or None if they match."""
-    (sa, va), (sb, vb) = a, b
+    (sa, va, _), (sb, vb, _) = a, b
     if sa == "crash" or sb == "crash":
         return f"CRASH/driver error (elyra={a[1] if sa=='crash' else 'ok'}, ref={b[1] if sb=='crash' else 'ok'})"
     if sa != sb:
@@ -121,6 +182,14 @@ CASES = [
     ("arith", "SELECT MOD(1, 0)"),
     ("arith", "SELECT 1 / 0"),
     ("arith", "SELECT 10 / 3"),
+    # A boolean is an integer in MySQL. These all agree on the *value*, so only
+    # the column type distinguishes them -- the shape that went unnoticed until
+    # the type comparison above existed.
+    ("arith", "SELECT TRUE + 1"),
+    ("arith", "SELECT (1 = 1) + 1"),
+    ("arith", "SELECT (2 > 1) + (3 > 2)"),
+    ("arith", "SELECT !1 + 1"),
+    ("arith", "SELECT -!0"),
     ("arith", "SELECT 10 DIV 3"),
     ("arith", "SELECT -10 DIV 3"),
     ("arith", "SELECT 10 % 3"),
@@ -358,6 +427,70 @@ CASES = [
 
 # Known, intentional or tracked divergences: reported but do not fail the build.
 # Each is a deliberate design choice or a documented follow-up, not a regression.
+# DML runs as its own ordered battery: unlike the SELECT cases these are
+# stateful, and the same statement returns a different count the second time --
+# that is exactly the convention being checked. Both engines execute the identical
+# sequence against an identical fixture, and the affected-row count is compared
+# after each step.
+DML_FIXTURES = [
+    "DROP TABLE IF EXISTS ar",
+    "CREATE TABLE ar (id INT PRIMARY KEY, n INT)",
+]
+
+DML_CASES = [
+    # MySQL counts rows *changed*, not matched, and upserts add a convention on
+    # top: 1 inserted, 2 updated, 0 when the update assigns the current values.
+    ("odku", "INSERT INTO ar VALUES (1,10) ON DUPLICATE KEY UPDATE n=VALUES(n)"),
+    ("odku", "INSERT INTO ar VALUES (1,20) ON DUPLICATE KEY UPDATE n=VALUES(n)"),
+    ("odku", "INSERT INTO ar VALUES (1,20) ON DUPLICATE KEY UPDATE n=VALUES(n)"),
+    ("odku", "INSERT INTO ar VALUES (1,30),(2,40) ON DUPLICATE KEY UPDATE n=VALUES(n)"),
+    # Two rows of one statement colliding with each other.
+    ("odku", "INSERT INTO ar VALUES (5,1),(5,2) ON DUPLICATE KEY UPDATE n=VALUES(n)"),
+    ("odku", "INSERT INTO ar VALUES (7,1),(7,1) ON DUPLICATE KEY UPDATE n=VALUES(n)"),
+    ("replace", "REPLACE INTO ar VALUES (3,50)"),
+    ("replace", "REPLACE INTO ar VALUES (3,60)"),
+    ("replace", "REPLACE INTO ar VALUES (3,60)"),
+    ("insert", "INSERT IGNORE INTO ar VALUES (1,99)"),
+    ("insert", "INSERT INTO ar VALUES (4,70)"),
+    ("insert", "INSERT INTO ar VALUES (10,1),(11,2),(12,3)"),
+    ("update", "UPDATE ar SET n=71 WHERE id=4"),
+    ("update", "UPDATE ar SET n=71 WHERE id=4"),
+    ("update", "UPDATE ar SET n=n+1 WHERE id IN (10,11,12)"),
+    ("update", "UPDATE ar SET n=1 WHERE id=999"),
+    ("delete", "DELETE FROM ar WHERE id=12"),
+    ("delete", "DELETE FROM ar WHERE id=999"),
+]
+
+# Result-column types that differ for a known, named reason. Values match in all
+# of these -- only the declared type differs -- so they are tracked here rather
+# than in ALLOWLIST.
+TYPE_ALLOWLIST = {
+    # MySQL evaluates these in exact DECIMAL (NEWDECIMAL, 246) and we use binary
+    # floating point or a widened integer. Same family as `SELECT 10 / 3` in
+    # ALLOWLIST; the values agree, the arithmetic model does not.
+    "SELECT 10 / 3",
+    "SELECT 5.5 % 2",
+    "SELECT ROUND(2.5)",
+    "SELECT ROUND(3.5)",
+    "SELECT ROUND(-2.5)",
+    "SELECT ROUND(1.5)",
+    "SELECT ROUND(1.2345, 2)",
+    "SELECT ROUND(1.2355, 2)",
+    "SELECT TRUNCATE(1.2399, 2)",
+    "SELECT TRUNCATE(-1.999, 0)",
+    "SELECT SUM(n), COUNT(n), COUNT(*), AVG(f) FROM d",
+    "SELECT MIN(a.id), MAX(a.id), SUM(a.id) FROM jn a JOIN jn b ON a.id = b.id",
+    "SELECT id, SUM(id) OVER () FROM d ORDER BY id",
+    "SELECT ROUND(0.5)",
+    "SELECT ROUND(-0.5)",
+    "SELECT MOD(10.5, 3)",
+    # DATE_ADD over a string literal: MySQL hands back a string, we hand back a
+    # typed DATE. Ours is the more useful answer, and the rendered value agrees.
+    "SELECT DATE_ADD('2024-01-31', INTERVAL 1 MONTH)",
+    "SELECT DATE_ADD('2024-01-15', INTERVAL 10 DAY)",
+    "SELECT DATE_SUB('2024-03-01', INTERVAL 1 DAY)",
+}
+
 ALLOWLIST = {
     # Intentional strictness: ElyraSQL does NOT silently coerce a non-numeric
     # string to 0 in implicit arithmetic/comparison (a MySQL foot-gun). Explicit
@@ -413,16 +546,35 @@ def main():
     crashes = []
     for cat, sql in CASES:
         ra, rb = run(elyra, sql), run(ref, sql)
-        diff = compare(ra, rb)
-        if diff:
+        for diff, allow in ((compare(ra, rb), ALLOWLIST),
+                            (compare_types(ra, rb), TYPE_ALLOWLIST)):
+            if not diff:
+                continue
             if "CRASH" in diff:
                 crashes.append((cat, sql, diff))
-            elif sql in ALLOWLIST:
+            elif sql in allow:
                 allowed.append((cat, sql, diff))
             else:
                 divergences.append((cat, sql, diff))
 
-    print(f"\n{'='*74}\nMySQL differential — {len(CASES)} cases\n{'='*74}")
+    # DML: identical ordered sequence on both engines, comparing affected rows.
+    for conn in (elyra, ref):
+        cur = conn.cursor()
+        for f in DML_FIXTURES:
+            cur.execute(f)
+        cur.close()
+    for cat, sql in DML_CASES:
+        (sa, va), (sb, vb) = run_dml(elyra, sql), run_dml(ref, sql)
+        if sa == "crash" or sb == "crash":
+            crashes.append((cat, sql, f"CRASH (elyra={va}, ref={vb})"))
+        elif sa != sb:
+            divergences.append((cat, sql, f"elyra={sa}({va}) vs ref={sb}({vb})"))
+        elif sa == "ok" and va != vb:
+            divergences.append((cat, sql, f"affected rows {va} vs {vb}"))
+
+    total = len(CASES) + len(DML_CASES)
+    print(f"\n{'='*74}\nMySQL differential — {len(CASES)} query + "
+          f"{len(DML_CASES)} DML cases\n{'='*74}")
     if crashes:
         print(f"\n!!! {len(crashes)} CRASH/driver-level divergence(s) !!!")
         for cat, sql, d in crashes:
@@ -439,7 +591,7 @@ def main():
         print("\nNo unexpected divergences.")
     print(f"{'='*74}")
     print(
-        f"pass={len(CASES)-len(divergences)-len(allowed)-len(crashes)} "
+        f"pass={total-len(divergences)-len(allowed)-len(crashes)} "
         f"allow={len(allowed)} diverge={len(divergences)} crash={len(crashes)}"
     )
 

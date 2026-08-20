@@ -1,10 +1,17 @@
 name: MySQL differential
 
 # Runs an identical battery of edge-case queries against ElyraSQL and a real
-# MySQL 8, and fails on any non-allowlisted divergence (different rows/NULLs, or
-# one engine accepting a query the other rejects). This catches MySQL-semantics
-# regressions and new divergences before users hit them. Known intentional/
-# tracked differences are allowlisted in the harness.
+# MySQL 8, and fails on any non-allowlisted divergence. This catches
+# MySQL-semantics regressions before users hit them. Known intentional/tracked
+# differences are allowlisted in the harness.
+#
+# Three things are compared. Rows was the original one; the other two were added
+# after divergences got through it:
+#   rows           values and NULLs, plus one engine accepting what the other rejects
+#   column types   the declared type code -- a boolean in arithmetic came back as
+#                  DOUBLE where MySQL sends BIGINT, and every value matched
+#   affected rows  for the DML battery -- ON DUPLICATE KEY UPDATE reported 1 where
+#                  MySQL reports 2, in five shapes, and nothing looked at the count
 
 on:
   push:
