@@ -69,6 +69,16 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ### Fixed
 
+- **Security: replication authentication is now mutual and mandatory.** A
+  replica applies everything its primary sends, but it never verified the
+  primary's identity: any host accepting TCP connections on the primary's
+  address could impersonate it (no TLS by default) and feed the replica
+  arbitrary data — fabricated tables, tampered rows, corrupted catalog state —
+  which the replica then served to clients. The primary must now prove
+  knowledge of `ELYRASQL_CLUSTER_SECRET` back to the replica before any data
+  flows, and a replica refuses to start without a secret unless
+  `ELYRASQL_ALLOW_OPEN_AUTH=1` explicitly opts in. Primary and replica must be
+  upgraded together (the handshake changed).
 - Exact `RANGE` boundaries no longer merge distinct integers above `2^53`, and
   wholly out-of-partition frames return an empty frame instead of indexing with
   `usize::MAX` and crashing the connection.

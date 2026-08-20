@@ -41,9 +41,15 @@ elyrasql serve \
     `ELYRASQL_ALLOW_OPEN_AUTH=1` to explicitly override. The default
     `127.0.0.1:3307` bind is unaffected, so local development is unchanged.
 
-    The **replication endpoint** is likewise guarded: it is only authenticated
-    when `ELYRASQL_CLUSTER_SECRET` is set, so exposing it on a non-loopback address
-    without a secret is refused unless `ELYRASQL_ALLOW_OPEN_AUTH=1` is set.
+    The **replication endpoint** is likewise guarded, and more strictly: it hands
+    a full copy of the database to every connecting peer, so it is **refused
+    entirely** (any bind address, loopback included) unless
+    `ELYRASQL_CLUSTER_SECRET` is set or `ELYRASQL_ALLOW_OPEN_AUTH=1` explicitly
+    opts in. Replication authentication is **mutual**: the replica proves
+    knowledge of the secret, and the primary must prove it back before the
+    replica applies any snapshot or write-set — a replica refuses to start
+    without a secret (same override applies), so a spoofed primary cannot feed
+    it fabricated data.
 
     **Encrypting replication:** set `ELYRASQL_CLUSTER_TLS_CERT` + `_KEY` on the
     primary and `ELYRASQL_CLUSTER_TLS_CA` on the replica. The replica then verifies

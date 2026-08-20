@@ -970,6 +970,44 @@ pub async fn auth_connect<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpi
     Ok(())
 }
 
+/// Client side of *peer* verification: after proving ourselves, require the
+/// peer to prove knowledge of the shared secret too. Without this step any
+/// host that accepts a TCP connection could impersonate a primary and feed
+/// the replica arbitrary data (the replica applies what its primary sends).
+/// No-op when no cluster secret is configured (explicit open-auth mode).
+pub async fn auth_verify_peer<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    stream: &mut S,
+) -> std::io::Result<()> {
+    let Some(secret) = cluster_secret() else {
+        return Ok(());
+    };
+    let mut nonce = [0u8; 16];
+    getrandom::getrandom(&mut nonce).map_err(|_| Error::other("rng failure"))?;
+    stream.write_all(&nonce).await?;
+    let mut resp = [0u8; 20];
+    stream.read_exact(&mut resp).await?;
+    if !ct_eq(&resp, &response(&secret, &nonce)) {
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            "primary failed cluster authentication",
+        ));
+    }
+    Ok(())
+}
+
+/// Server side of peer verification: answer the client's challenge.
+pub async fn auth_respond_to_peer<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    stream: &mut S,
+) -> std::io::Result<()> {
+    let Some(secret) = cluster_secret() else {
+        return Ok(());
+    };
+    let mut nonce = [0u8; 16];
+    stream.read_exact(&mut nonce).await?;
+    stream.write_all(&response(&secret, &nonce)).await?;
+    Ok(())
+}
+
 /// One-shot request/response RPC to a peer with a short timeout (elections,
 /// membership).
 /// Open a control-plane connection to a peer: plain TCP, or TLS (verifying the
