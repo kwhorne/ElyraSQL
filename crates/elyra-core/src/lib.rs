@@ -15,7 +15,7 @@ pub mod value;
 
 pub use error::{CatalogError, DuplicateError, Error, Result};
 pub use types::{Collation, ColumnDef, ColumnType, ResultColumnMetadata, Schema};
-pub use value::{canonical_f64_bits, fold, Value};
+pub use value::{canonical_f64_bits, div_round_half_away, fold, Value, DIV_SCALE_INCREMENT};
 
 /// Upper bound (in bytes) on any single length-prefixed frame or record read
 /// from the network (cluster/replication), the binlog, or a spill file, before

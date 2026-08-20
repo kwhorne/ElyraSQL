@@ -628,7 +628,10 @@ fn finish(acc: &Acc, spec: &AggSpec) -> Value {
             } else if acc.has_decimal && !acc.float_sum {
                 Value::Decimal(acc.dsum, acc.dscale)
             } else if acc.sum_is_int && acc.sum.fract() == 0.0 {
-                Value::Int(acc.sum as i64)
+                // DECIMAL, not BIGINT: MySQL widens an integer SUM because the
+                // total can exceed the column's range. `dsum` already holds it
+                // exactly at scale 0.
+                Value::Decimal(acc.dsum, acc.dscale)
             } else {
                 Value::Float(acc.sum)
             }
@@ -636,6 +639,23 @@ fn finish(acc: &Acc, spec: &AggSpec) -> Value {
         AggFunc::Avg => {
             if acc.count == 0 {
                 Value::Null
+            } else if !acc.float_sum {
+                // MySQL averages exactly and gives the result the input's scale
+                // plus `div_precision_increment`, the same rule division uses:
+                // AVG over DECIMAL(12,2) has scale 6, and over integers scale 4.
+                // The exact sum is already accumulated for SUM; dividing the
+                // f64 mirror instead would drift on long columns.
+                let scale = acc.dscale.saturating_add(elyra_core::DIV_SCALE_INCREMENT);
+                let shifted = 10i128
+                    .checked_pow(u32::from(elyra_core::DIV_SCALE_INCREMENT))
+                    .and_then(|f| acc.dsum.checked_mul(f))
+                    .and_then(|n| elyra_core::div_round_half_away(n, i128::from(acc.count)));
+                match shifted {
+                    Some(units) => Value::Decimal(units, scale),
+                    // Overflowing the exact path is not a reason to fail the
+                    // query; fall back to the float average.
+                    None => Value::Float(acc.sum / acc.count as f64),
+                }
             } else {
                 Value::Float(acc.sum / acc.count as f64)
             }

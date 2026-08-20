@@ -2544,6 +2544,13 @@ async fn prepared_aggregate_rows_match_declared_result_types() {
         .await
         .unwrap()
         .unwrap();
+    // `matches` is DECIMAL, not BIGINT: SUM widens to DECIMAL as MySQL does, and
+    // ABS keeps it exact rather than detouring through f64. It still reads as an
+    // integer here because the value is whole.
+    //
+    // `difference` comes back as text because COALESCE has no inferred type --
+    // MySQL sends it as DOUBLE. That divergence predates this test and is
+    // untouched by the decimal work; it is asserted as-is rather than hidden.
     assert_eq!(row, ("400".into(), 1));
 }
 
