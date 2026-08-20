@@ -147,11 +147,15 @@ fn decode_hex_literal(hex: &str) -> Result<Vec<u8>> {
         )));
     }
 
+    // The length is already known to be even, so `as_chunks` has no remainder
+    // and the pair destructures directly -- no indexing, no bounds checks.
     hex.as_bytes()
-        .chunks_exact(2)
-        .map(|pair| {
-            let high = hex_digit(pair[0]).ok_or_else(|| invalid_hex_literal(hex))?;
-            let low = hex_digit(pair[1]).ok_or_else(|| invalid_hex_literal(hex))?;
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&[high, low]| {
+            let high = hex_digit(high).ok_or_else(|| invalid_hex_literal(hex))?;
+            let low = hex_digit(low).ok_or_else(|| invalid_hex_literal(hex))?;
             Ok((high << 4) | low)
         })
         .collect()

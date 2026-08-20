@@ -6,6 +6,18 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+### Internal
+
+- **`chunks_exact` with a constant size becomes `slice::as_chunks`.** Rust 1.98's Clippy flags
+  `chunks_exact` where a const-generic chunk size is known, and CI tracks stable,
+  so every pull request started failing the Clippy gate on the day it rolled out.
+  The rewrite is also better code: `as_chunks::<8>()` yields `&[[f32; 8]]`, so the
+  lanes go straight into the vector type and the fallible `try_into().unwrap()`
+  that ran on every iteration of both inner loops is gone. The hex-literal
+  decoder gets the same treatment: its length is already known to be even, so the
+  pair destructures directly with no indexing.
+
+
 ## [1.9.6] - 2026-08-19
 
 Four contributions, and every one of them changes an answer a client reads: the
