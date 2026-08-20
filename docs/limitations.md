@@ -356,9 +356,11 @@ judge fit before deploying.
   value on every node) to require a challenge-response handshake
   (`SHA1(secret‖nonce)`, constant-time) on every Raft control and replication
   connection, so an unauthenticated peer cannot inject fake writes or votes.
-  Password hashes are compared in **constant time**. Exposing the replication
-  endpoint on a non-loopback address **without** a secret is refused unless
-  `ELYRASQL_ALLOW_OPEN_AUTH=1`. The **replication** transport can be **encrypted
+  Password hashes are compared in **constant time**. The replication endpoint
+  **requires** a secret on every bind address (loopback included) — it is
+  refused otherwise unless `ELYRASQL_ALLOW_OPEN_AUTH=1` — because any process
+  that can reach the port receives a full copy of the database. The
+  **replication** transport can be **encrypted
   with TLS**: set `ELYRASQL_CLUSTER_TLS_CERT`/`_KEY` on the primary and
   `ELYRASQL_CLUSTER_TLS_CA` on the replica (which then *verifies* the primary's
   certificate — a wrong/self-signed-mismatch cert is rejected), giving

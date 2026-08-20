@@ -6,6 +6,16 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **Security: the replication endpoint now requires authentication on every bind
+  address, loopback included.** The endpoint hands a full copy of the database
+  to every connecting peer, so an unauthenticated listener let any local
+  process (or SSRF payload) that could open a TCP connection exfiltrate all
+  data. Startup is refused unless `ELYRASQL_CLUSTER_SECRET` is set or
+  `ELYRASQL_ALLOW_OPEN_AUTH=1` explicitly opts in. Non-loopback binds were
+  already refused; this closes the loopback gap.
+
 ## [1.9.8] - 2026-08-21
 
 One contribution, and it changes numbers. Exact `DECIMAL` arithmetic closes the

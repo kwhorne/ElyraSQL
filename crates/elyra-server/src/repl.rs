@@ -169,24 +169,26 @@ async fn recv_msg<R: AsyncRead + Unpin>(r: &mut R) -> std::io::Result<Option<Rep
 
 /// Serve the replication endpoint on the primary.
 pub async fn serve_replication(addr: String, db: Db) -> std::io::Result<()> {
-    // The replication stream exposes the full data set and is only authenticated
-    // when a cluster secret is configured. Refuse to expose it to non-loopback
-    // peers without one, unless explicitly overridden.
-    if crate::listen_is_exposed(&addr)
-        && !crate::cluster::has_cluster_secret()
-        && !crate::env_flag("ELYRASQL_ALLOW_OPEN_AUTH")
-    {
+    // The replication stream hands a full copy of the database to every
+    // connecting peer, so it must never be reachable without authentication:
+    // any local process (or an SSRF payload) that can open a TCP connection to
+    // the port receives every row. Require a cluster secret on every bind,
+    // loopback included, unless explicitly overridden with
+    // ELYRASQL_ALLOW_OPEN_AUTH=1.
+    if !crate::cluster::has_cluster_secret() && !crate::env_flag("ELYRASQL_ALLOW_OPEN_AUTH") {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             format!(
-                "refusing to expose the replication endpoint on {addr} without \
-                 authentication. Set ELYRASQL_CLUSTER_SECRET (shared by primary and \
-                 replicas), bind it to localhost, or set ELYRASQL_ALLOW_OPEN_AUTH=1."
+                "refusing to start the replication endpoint on {addr} without \
+                 authentication: any process that can reach this port receives a \
+                 full copy of the database. Set ELYRASQL_CLUSTER_SECRET (shared \
+                 by primary and replicas), or set ELYRASQL_ALLOW_OPEN_AUTH=1 to \
+                 explicitly accept an unauthenticated replication endpoint."
             ),
         ));
     }
     if !crate::cluster::has_cluster_secret() {
-        warn!(%addr, "replication endpoint is UNAUTHENTICATED - set ELYRASQL_CLUSTER_SECRET for production");
+        warn!(%addr, "replication endpoint is UNAUTHENTICATED (ELYRASQL_ALLOW_OPEN_AUTH=1) - any peer that reaches it receives the full data set");
     }
     let tls = cluster_server_tls()?.map(TlsAcceptor::from);
     let listener = TcpListener::bind(&addr).await?;
@@ -446,5 +448,77 @@ async fn read_applied_lsn(db: &Db) -> u64 {
     match db.get(REPL_LSN_KEY.to_vec()).await {
         Ok(Some(b)) if b.len() == 8 => u64::from_le_bytes(b.try_into().unwrap()),
         _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The guard reads process-global env vars; serialize the tests that touch
+    /// them so parallel test threads cannot observe each other's mutations.
+    /// Async mutex because the guard is held across `.await` points.
+    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    fn set_env(key: &str, value: Option<&str>) {
+        match value {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+    }
+
+    /// Run the endpoint's startup guard and cancel it right after a successful
+    /// bind (the accept loop runs until cancelled).
+    async fn guard(addr: &str) -> std::io::Result<()> {
+        let db = Db::in_memory().map_err(|e| Error::other(e.to_string()))?;
+        let handle = tokio::spawn(serve_replication(addr.to_string(), db));
+        // A bind failure surfaces almost immediately; a success means the
+        // listener is up and we can cancel the accept loop.
+        for _ in 0..50 {
+            if handle.is_finished() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let result = if handle.is_finished() {
+            handle.await.expect("guard task")
+        } else {
+            handle.abort();
+            Ok(())
+        };
+        result.map(|_| ())
+    }
+
+    #[tokio::test]
+    async fn replication_requires_secret_even_on_loopback() {
+        let _env = ENV_LOCK.lock().await;
+        set_env("ELYRASQL_CLUSTER_SECRET", None);
+        set_env("ELYRASQL_ALLOW_OPEN_AUTH", None);
+
+        // The old behaviour allowed an unauthenticated full-database dump on
+        // loopback binds; that must now fail closed.
+        let err = guard("127.0.0.1:0").await.unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+        assert!(err.to_string().contains("ELYRASQL_CLUSTER_SECRET"));
+    }
+
+    #[tokio::test]
+    async fn replication_starts_with_secret_on_loopback() {
+        let _env = ENV_LOCK.lock().await;
+        set_env("ELYRASQL_CLUSTER_SECRET", Some("test-secret"));
+        set_env("ELYRASQL_ALLOW_OPEN_AUTH", None);
+        let res = guard("127.0.0.1:0").await;
+        set_env("ELYRASQL_CLUSTER_SECRET", None);
+        res.expect("secret-configured endpoint must start");
+    }
+
+    #[tokio::test]
+    async fn replication_open_auth_requires_explicit_opt_in() {
+        let _env = ENV_LOCK.lock().await;
+        set_env("ELYRASQL_CLUSTER_SECRET", None);
+        set_env("ELYRASQL_ALLOW_OPEN_AUTH", Some("1"));
+        let res = guard("127.0.0.1:0").await;
+        set_env("ELYRASQL_ALLOW_OPEN_AUTH", None);
+        res.expect("explicit opt-in must allow an unauthenticated endpoint");
     }
 }
