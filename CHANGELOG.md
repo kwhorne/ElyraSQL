@@ -6,7 +6,37 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.9.7] - 2026-08-19
+
+Nothing here changes an answer a client reads, and there is no upgrade note.
+One change widens the MySQL differential harness; the other keeps the build green
+against Rust 1.98's new lints, and touches real code to do it -- behaviour is
+identical, but the SIMD distance kernels and the hex-literal decoder were
+rewritten.
+
 ### Internal
+
+- **The MySQL differential compares result column types and affected rows**, not
+  just returned rows and error codes. Both gaps had let real divergences through
+  to users, found by hand rather than by CI: booleans in arithmetic came back as
+  `DOUBLE` where MySQL sends `BIGINT` (every value matched, so every case
+  passed), and `INSERT ... ON DUPLICATE KEY UPDATE` reported 1 affected row where
+  MySQL reports 2, in five shapes across two code paths, with nothing looking at
+  the count at all. Both were fixed in 1.9.6; this is what stops the next one.
+
+  Column types are compared under an equivalence relation rather than exactly.
+  Integer widths and the string/blob family are folded together — no client can
+  observe those — while `DOUBLE` is deliberately kept distinct from the integer
+  family, which is what makes a boolean-as-float regression visible. Comparing
+  exactly flagged 88 of 210 cases; folding plus skipping all-NULL columns brings
+  that to 19, and those 19 are two named families tracked with their reason.
+
+  DML runs as its own ordered battery, because those cases are stateful by nature:
+  the same statement returns a different count the second time, which is exactly
+  the convention under test.
+
+  Verified by running the new harness against the pre-fix binary, where it reports
+  precisely the twelve divergences it was built to catch and nothing else.
 
 - **`chunks_exact` with a constant size becomes `slice::as_chunks`.** Rust 1.98's Clippy flags
   `chunks_exact` where a const-generic chunk size is known, and CI tracks stable,
@@ -16,7 +46,6 @@ All notable changes to ElyraSQL are documented here. The format is based on
   that ran on every iteration of both inner loops is gone. The hex-literal
   decoder gets the same treatment: its length is already known to be even, so the
   pair destructures directly with no indexing.
-
 
 ## [1.9.6] - 2026-08-19
 

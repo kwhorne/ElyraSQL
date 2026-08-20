@@ -8,7 +8,7 @@ docker run -d --name elyrasql \
   -v elyra-data:/var/lib/elyrasql \
   -e ELYRASQL_USER=root \
   -e ELYRASQL_PASSWORD=secret \
-  ghcr.io/kwhorne/elyrasql:1.9.6
+  ghcr.io/kwhorne/elyrasql:1.9.7
 ```
 
 - Data persists in the `/var/lib/elyrasql` volume.
@@ -42,7 +42,7 @@ by the volume. Set `TMPDIR` to a path on a mounted volume if that matters:
 docker run -d -p 3307:3307 \
   -v elyra-data:/var/lib/elyrasql \
   -e TMPDIR=/var/lib/elyrasql/tmp \
-  ghcr.io/kwhorne/elyrasql:1.9.6
+  ghcr.io/kwhorne/elyrasql:1.9.7
 ```
 
 For TLS, mount the certificate and key and point the env vars at them:
@@ -53,7 +53,7 @@ docker run -d -p 3307:3307 \
   -v $PWD/certs:/certs:ro \
   -e ELYRASQL_TLS_CERT=/certs/server.crt \
   -e ELYRASQL_TLS_KEY=/certs/server.key \
-  ghcr.io/kwhorne/elyrasql:1.9.6
+  ghcr.io/kwhorne/elyrasql:1.9.7
 ```
 
 ## systemd (Ubuntu 24.04+)
@@ -107,7 +107,7 @@ crash-safe, so a restart recovers with no data loss and no manual step.
 ```bash
 docker run -d --restart unless-stopped -p 3307:3307 \
   -v elyra-data:/var/lib/elyrasql \
-  ghcr.io/kwhorne/elyrasql:1.9.6
+  ghcr.io/kwhorne/elyrasql:1.9.7
 ```
 
 Kubernetes restarts containers by default. If you run the binary under anything
