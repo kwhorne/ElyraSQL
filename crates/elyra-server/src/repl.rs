@@ -223,6 +223,10 @@ where
     // Authenticate the replica (no-op unless a cluster secret is configured).
     // Runs over whatever transport `S` is (plain TCP or a TLS stream).
     crate::cluster::auth_accept(&mut stream).await?;
+    // Answer the replica's challenge so it can verify this primary's identity
+    // (no-op without a cluster secret). A replica that cannot verify the peer
+    // must never start applying its data.
+    crate::cluster::auth_respond_to_peer(&mut stream).await?;
     let (mut rd, mut stream) = tokio::io::split(stream);
 
     // First message tells us how far the replica has already caught up.
@@ -372,6 +376,22 @@ async fn incremental_catchup<W: AsyncWrite + Unpin>(
 /// drops; returns only when the primary asks for a clean resync (the caller
 /// should wipe the file and restart).
 pub async fn run_replica(primary: String, db: Db) -> std::io::Result<()> {
+    // Fail closed: a replica applies whatever its "primary" streams to it, so
+    // an unauthenticated connection is one spoofed host (or MITM on the
+    // default plaintext transport) away from full data corruption. Require a
+    // cluster secret unless explicitly overridden.
+    if !crate::cluster::has_cluster_secret() && !crate::env_flag("ELYRASQL_ALLOW_OPEN_AUTH") {
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            format!(
+                "refusing to replicate from {primary} without authentication: \
+                 a replica applies everything its primary sends, so the primary \
+                 must prove its identity. Set ELYRASQL_CLUSTER_SECRET (the same \
+                 value as the primary), or set ELYRASQL_ALLOW_OPEN_AUTH=1 to \
+                 explicitly accept an unauthenticated primary."
+            ),
+        ));
+    }
     // Verify-the-primary TLS, if configured (once; reused each reconnect).
     let client_tls = cluster_client_tls()?;
     if client_tls.is_none() {
@@ -400,7 +420,30 @@ pub async fn run_replica(primary: String, db: Db) -> std::io::Result<()> {
             None => Box::new(tcp),
         };
         info!(%primary, last_lsn, tls = client_tls.is_some(), "connected to primary");
-        crate::cluster::auth_connect(&mut stream).await?;
+        // Mutual authentication: the replica proves knowledge of the secret
+        // (auth_connect), then requires the primary to prove it too. Without
+        // the second step any host accepting connections could impersonate a
+        // primary and feed this replica arbitrary data. Bounded by a timeout
+        // so a peer that stalls mid-handshake cannot hang the reconnect loop.
+        let handshake = async {
+            crate::cluster::auth_connect(&mut stream).await?;
+            crate::cluster::auth_verify_peer(&mut stream).await
+        };
+        match tokio::time::timeout(std::time::Duration::from_secs(5), handshake).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                warn!(%primary, error = %e, "cluster authentication with primary failed; retrying");
+                drop(stream);
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                continue;
+            }
+            Err(_) => {
+                warn!(%primary, "cluster authentication timed out; retrying");
+                drop(stream);
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                continue;
+            }
+        }
         let (mut rd, mut wr) = tokio::io::split(stream);
         send_msg(&mut wr, &ReplMsg::Hello { last_lsn }).await?;
 
@@ -455,9 +498,9 @@ async fn read_applied_lsn(db: &Db) -> u64 {
 mod tests {
     use super::*;
 
-    /// The guard reads process-global env vars; serialize the tests that touch
-    /// them so parallel test threads cannot observe each other's mutations.
-    /// Async mutex because the guard is held across `.await` points.
+    /// The guards and handshake helpers read process-global env vars; serialize
+    /// the tests that touch them so parallel test threads cannot observe each
+    /// other's mutations. Async mutex because the guard is held across `.await`.
     static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     fn set_env(key: &str, value: Option<&str>) {
@@ -520,5 +563,120 @@ mod tests {
         let res = guard("127.0.0.1:0").await;
         set_env("ELYRASQL_ALLOW_OPEN_AUTH", None);
         res.expect("explicit opt-in must allow an unauthenticated endpoint");
+    }
+
+    #[tokio::test]
+    async fn replica_refuses_to_start_without_secret_or_opt_in() {
+        let _env = ENV_LOCK.lock().await;
+        set_env("ELYRASQL_CLUSTER_SECRET", None);
+        set_env("ELYRASQL_ALLOW_OPEN_AUTH", None);
+        let db = Db::in_memory().unwrap();
+        let err = run_replica("127.0.0.1:1".to_string(), db)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+        assert!(err.to_string().contains("ELYRASQL_CLUSTER_SECRET"));
+    }
+
+    /// Both directions of the handshake over one connection, shared secret.
+    #[tokio::test]
+    async fn mutual_handshake_succeeds_with_shared_secret() {
+        let _env = ENV_LOCK.lock().await;
+        set_env("ELYRASQL_CLUSTER_SECRET", Some("shared-test-secret"));
+        let (mut replica_side, mut primary_side) = tokio::io::duplex(1024);
+        let server = tokio::spawn(async move {
+            crate::cluster::auth_accept(&mut primary_side).await?;
+            crate::cluster::auth_respond_to_peer(&mut primary_side).await
+        });
+        let client = async {
+            crate::cluster::auth_connect(&mut replica_side).await?;
+            crate::cluster::auth_verify_peer(&mut replica_side).await
+        };
+        let (server_res, client_res) = tokio::join!(server, client);
+        set_env("ELYRASQL_CLUSTER_SECRET", None);
+        server_res.unwrap().expect("primary side handshake");
+        client_res.expect("replica side handshake");
+    }
+
+    /// A peer that does not know the secret must fail verification. With
+    /// mismatched secrets the impersonator actually trips over its own
+    /// `auth_accept` (it cannot verify the replica's proof) and closes the
+    /// stream; the replica must then observe a failure, never proceed.
+    #[tokio::test]
+    async fn mutual_handshake_rejects_wrong_secret() {
+        let _env = ENV_LOCK.lock().await;
+        set_env("ELYRASQL_CLUSTER_SECRET", Some("correct-secret"));
+        let (mut replica_side, mut primary_side) = tokio::io::duplex(1024);
+        let server = tokio::spawn(async move {
+            set_env("ELYRASQL_CLUSTER_SECRET", Some("wrong-secret"));
+            let r = async {
+                crate::cluster::auth_accept(&mut primary_side).await?;
+                crate::cluster::auth_respond_to_peer(&mut primary_side).await
+            }
+            .await;
+            set_env("ELYRASQL_CLUSTER_SECRET", Some("correct-secret"));
+            r
+        });
+        let client = async {
+            crate::cluster::auth_connect(&mut replica_side).await?;
+            crate::cluster::auth_verify_peer(&mut replica_side).await
+        };
+        let (server_res, client_res) = tokio::join!(server, client);
+        set_env("ELYRASQL_CLUSTER_SECRET", None);
+        // The impersonator cannot verify the replica's proof.
+        assert!(server_res.unwrap().is_err());
+        // The replica must refuse to continue against such a peer.
+        assert!(
+            client_res.is_err(),
+            "replica handshake must fail against a wrong-secret primary"
+        );
+    }
+
+    /// End-to-end: with a shared secret, a real primary/replica pair makes
+    /// progress (snapshot applied); without verification there is no way for
+    /// the replica to distinguish this primary from an impersonator.
+    #[tokio::test]
+    async fn replication_applies_snapshot_with_shared_secret() {
+        let _env = ENV_LOCK.lock().await;
+        set_env("ELYRASQL_CLUSTER_SECRET", Some("e2e-secret"));
+        set_env("ELYRASQL_ALLOW_OPEN_AUTH", None);
+
+        // Reserve a port for the primary's replication endpoint.
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let primary_db = Db::in_memory().unwrap();
+        primary_db
+            .commit(
+                vec![(b"test::key".to_vec(), b"test-value".to_vec())],
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        let srv_db = primary_db.clone();
+        let server = tokio::spawn(serve_replication(format!("127.0.0.1:{port}"), srv_db));
+
+        let replica_db = Db::in_memory().unwrap();
+        let repl_task = tokio::spawn(run_replica(format!("127.0.0.1:{port}"), replica_db.clone()));
+
+        // Wait until the replicated key shows up on the replica.
+        let mut applied = false;
+        for _ in 0..100 {
+            if repl_task.is_finished() {
+                break;
+            }
+            if let Ok(Some(v)) = replica_db.get(b"test::key".to_vec()).await {
+                if v == b"test-value" {
+                    applied = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        repl_task.abort();
+        server.abort();
+        set_env("ELYRASQL_CLUSTER_SECRET", None);
+        assert!(applied, "snapshot key must reach the replica");
     }
 }
