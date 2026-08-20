@@ -47,16 +47,17 @@ pub fn distance(a: &[f32], b: &[f32], metric: Metric) -> Option<f32> {
 fn l2_sq(a: &[f32], b: &[f32]) -> f32 {
     use wide::f32x8;
     let mut acc = f32x8::ZERO;
-    let mut ca = a.chunks_exact(8);
-    let mut cb = b.chunks_exact(8);
-    for (xa, xb) in ca.by_ref().zip(cb.by_ref()) {
-        let va = f32x8::new(xa.try_into().unwrap());
-        let vb = f32x8::new(xb.try_into().unwrap());
-        let d = va - vb;
+    // `as_chunks` hands back `&[[f32; 8]]`, so the lanes go straight into the
+    // vector type -- `chunks_exact` yielded slices that needed a fallible
+    // `try_into().unwrap()` per iteration in the inner loop.
+    let (ca, ra) = a.as_chunks::<8>();
+    let (cb, rb) = b.as_chunks::<8>();
+    for (xa, xb) in ca.iter().zip(cb) {
+        let d = f32x8::new(*xa) - f32x8::new(*xb);
         acc += d * d;
     }
     let mut sum = acc.reduce_add();
-    for (x, y) in ca.remainder().iter().zip(cb.remainder()) {
+    for (x, y) in ra.iter().zip(rb) {
         let d = x - y;
         sum += d * d;
     }
@@ -67,15 +68,13 @@ fn l2_sq(a: &[f32], b: &[f32]) -> f32 {
 fn dot(a: &[f32], b: &[f32]) -> f32 {
     use wide::f32x8;
     let mut acc = f32x8::ZERO;
-    let mut ca = a.chunks_exact(8);
-    let mut cb = b.chunks_exact(8);
-    for (xa, xb) in ca.by_ref().zip(cb.by_ref()) {
-        let va = f32x8::new(xa.try_into().unwrap());
-        let vb = f32x8::new(xb.try_into().unwrap());
-        acc += va * vb;
+    let (ca, ra) = a.as_chunks::<8>();
+    let (cb, rb) = b.as_chunks::<8>();
+    for (xa, xb) in ca.iter().zip(cb) {
+        acc += f32x8::new(*xa) * f32x8::new(*xb);
     }
     let mut sum = acc.reduce_add();
-    for (x, y) in ca.remainder().iter().zip(cb.remainder()) {
+    for (x, y) in ra.iter().zip(rb) {
         sum += x * y;
     }
     sum
