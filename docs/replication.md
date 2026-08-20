@@ -36,7 +36,8 @@ reach the port exfiltrate all data.
 ELYRASQL_CLUSTER_SECRET='<shared-secret>' elyrasql replica \
   --primary primary-host:7000 \
   --data /var/lib/elyrasql/replica.edb \
-  --listen 0.0.0.0:3307
+  --listen 0.0.0.0:3307 \
+  --auth app:app-password:read
 ```
 
 The secret must match the primary's. Authentication is **mutual**: the replica
@@ -44,6 +45,11 @@ proves knowledge of the secret to the primary, and the primary must prove it to
 the replica before the replica applies any data — so a spoofed host cannot feed
 a replica fabricated rows. A replica refuses to start without a secret unless
 `ELYRASQL_ALLOW_OPEN_AUTH=1` is set explicitly.
+
+The replica's MySQL listener **requires accounts**: like `serve`, it refuses to
+start credential-less unless `ELYRASQL_ALLOW_OPEN_AUTH=1` is set explicitly.
+Roles work exactly as on a primary (`admin`/`write`/`read`); replicas reject
+writes at the SQL layer regardless of role.
 
 The replica's `--data` file is **disposable**: it is recreated and
 re-bootstrapped from the primary each time the replica starts. Point read-only

@@ -51,6 +51,12 @@ elyrasql serve \
     without a secret (same override applies), so a spoofed primary cannot feed
     it fabricated data.
 
+    A **replica's MySQL listener** is guarded the same way: `elyrasql replica`
+    refuses to start without accounts (`--user`/`--password` or
+    `--auth USER:PASS:ROLE`) unless `ELYRASQL_ALLOW_OPEN_AUTH=1` explicitly
+    opts in — a credential-less replica would hand Admin access to its entire
+    replicated data set to anyone who can reach the port.
+
     **Encrypting replication:** set `ELYRASQL_CLUSTER_TLS_CERT` + `_KEY` on the
     primary and `ELYRASQL_CLUSTER_TLS_CA` on the replica. The replica then verifies
     the primary's certificate (a mismatched cert is rejected — not accept-any), so
