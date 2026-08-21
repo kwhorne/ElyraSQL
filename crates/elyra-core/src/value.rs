@@ -669,6 +669,39 @@ pub fn parse_decimal(s: &str, target_scale: u8) -> Option<(i128, u8)> {
 
 /// Change a decimal's scale, rounding half away from zero when digits are
 /// discarded. Returns `None` if increasing the scale would overflow `i128`.
+/// Digits MySQL adds to the dividend's scale when dividing DECIMAL
+/// (`div_precision_increment`; the server default is 4).
+pub const DIV_SCALE_INCREMENT: u8 = 4;
+
+/// `numerator / divisor`, rounding half away from zero rather than truncating
+/// toward it — what MySQL does to the last digit it keeps, so `2 / 3` is 0.6667
+/// and not 0.6666.
+///
+/// Shared by the expression evaluator and the aggregation kernel: they must
+/// agree, or `SUM(x) / COUNT(*)` and `AVG(x)` would answer differently.
+pub fn div_round_half_away(numerator: i128, divisor: i128) -> Option<i128> {
+    let quotient = numerator.checked_div(divisor)?;
+    let remainder = numerator.checked_rem(divisor)?;
+    if remainder == 0 {
+        return Some(quotient);
+    }
+    // Compare |remainder| * 2 against |divisor| without overflowing the
+    // doubling: the numerator has already been scaled up by the increment.
+    let rounds_away = match remainder.checked_abs()?.checked_mul(2) {
+        Some(twice) => twice >= divisor.checked_abs()?,
+        None => true, // too large to be under half of anything representable
+    };
+    if !rounds_away {
+        return Some(quotient);
+    }
+    let step = if (numerator < 0) == (divisor < 0) {
+        1
+    } else {
+        -1
+    };
+    quotient.checked_add(step)
+}
+
 pub fn rescale_decimal(units: i128, from_scale: u8, to_scale: u8) -> Option<i128> {
     if from_scale <= to_scale {
         let factor = 10i128.checked_pow((to_scale - from_scale) as u32)?;

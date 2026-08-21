@@ -9635,7 +9635,21 @@ fn range_bounds(def: &TableDef, filter: Option<&Expr>) -> Result<Option<RangeQue
 /// caller must treat the coercion as exact (text/date/enum coercions, which are
 /// value-preserving in a way this check cannot see).
 fn numeric_rounding(original: &Value, coerced: &Value) -> Option<std::cmp::Ordering> {
-    if !matches!(original, Value::Float(_) | Value::Decimal(..)) {
+    let numeric_original = match original {
+        Value::Float(_) | Value::Decimal(..) => true,
+        // A *string* bound against a numeric column is coerced too, and that
+        // coercion rounds: `k > '1.5'` on an INT key became `k > 2`, dropping
+        // row 2, because this returned None and the caller then trusted the
+        // bound as exact. Only treat it as numeric when the column actually
+        // pulled it into a number -- text-to-text coercion is value-preserving
+        // and must keep returning None.
+        Value::Text(_) | Value::Json(_) => matches!(
+            coerced,
+            Value::Int(_) | Value::UInt(_) | Value::Float(_) | Value::Decimal(..)
+        ),
+        _ => false,
+    };
+    if !numeric_original {
         return None;
     }
     coerced.compare(original)
@@ -16808,6 +16822,12 @@ struct WindowAggregate<'a> {
     numeric_count: Vec<usize>,
     non_integer_count: Vec<usize>,
     integer_sums: Vec<i128>,
+    /// Common scale when every non-NULL value is exact (DECIMAL or integer),
+    /// and `None` as soon as one is not. `Some(0)` means plain integers, which
+    /// the integer prefix already handles.
+    exact_scale: Option<u8>,
+    /// Prefix sums of the unscaled units at `exact_scale`.
+    exact_sums: Vec<i128>,
     numeric_sums: NumericRangeSums,
 }
 
@@ -16874,6 +16894,16 @@ impl<'a> WindowAggregate<'a> {
         let mut numeric_count = Vec::with_capacity(values.len() + 1);
         let mut non_integer_count = Vec::with_capacity(values.len() + 1);
         let mut integer_sums: Vec<i128> = Vec::with_capacity(values.len() + 1);
+        // A DECIMAL window sum must stay exact: accumulating through f64 made
+        // SUM(p) OVER () over 10.05 + 20.10 + 0.15 - 5.25 answer
+        // 25.050000000000004 instead of 25.05.
+        let exact_scale = values.iter().try_fold(0u8, |widest, value| match value {
+            Value::Decimal(_, scale) => Some(widest.max(*scale)),
+            Value::Int(_) | Value::Null => Some(widest),
+            _ => None,
+        });
+        let mut exact_sums: Vec<i128> = Vec::with_capacity(values.len() + 1);
+        exact_sums.push(0);
         non_null_count.push(0);
         numeric_count.push(0);
         non_integer_count.push(0);
@@ -16894,6 +16924,23 @@ impl<'a> WindowAggregate<'a> {
                 Value::Int(value) => i128::from(*value),
                 _ => 0,
             };
+            if let Some(scale) = exact_scale {
+                let units = match value {
+                    Value::Decimal(units, s) => 10i128
+                        .checked_pow(u32::from(scale - *s))
+                        .and_then(|f| units.checked_mul(f)),
+                    Value::Int(i) => 10i128
+                        .checked_pow(u32::from(scale))
+                        .and_then(|f| i128::from(*i).checked_mul(f)),
+                    _ => Some(0),
+                };
+                let running = exact_sums.last().copied().unwrap_or_default();
+                exact_sums.push(
+                    units
+                        .and_then(|u| running.checked_add(u))
+                        .ok_or_else(|| Error::OutOfRange("window DECIMAL sum overflowed".into()))?,
+                );
+            }
             integer_sums.push(
                 integer_sums
                     .last()
@@ -16913,6 +16960,8 @@ impl<'a> WindowAggregate<'a> {
             numeric_count,
             non_integer_count,
             integer_sums,
+            exact_scale,
+            exact_sums,
             numeric_sums,
         })
     }
@@ -16949,6 +16998,26 @@ impl<'a> WindowAggregate<'a> {
                 if count == 0 {
                     return Ok(Value::Null);
                 }
+                // Exact DECIMAL frame: keep it exact, and give AVG the
+                // division rule's scale, as the non-window aggregate does.
+                if let Some(scale) = self.exact_scale.filter(|s| *s > 0) {
+                    let units = self.exact_sums[end] - self.exact_sums[lo];
+                    return Ok(if self.name == "avg" {
+                        let scaled = 10i128
+                            .checked_pow(u32::from(elyra_core::DIV_SCALE_INCREMENT))
+                            .and_then(|f| units.checked_mul(f))
+                            .and_then(|n| elyra_core::div_round_half_away(n, count as i128))
+                            .ok_or_else(|| {
+                                Error::OutOfRange("window DECIMAL average overflowed".into())
+                            })?;
+                        Value::Decimal(
+                            scaled,
+                            scale.saturating_add(elyra_core::DIV_SCALE_INCREMENT),
+                        )
+                    } else {
+                        Value::Decimal(units, scale)
+                    });
+                }
                 if self.non_integer_count[end] != self.non_integer_count[lo] {
                     let sum = self.numeric_sums.sum(lo, end);
                     return Ok(if self.name == "avg" {
@@ -16961,9 +17030,10 @@ impl<'a> WindowAggregate<'a> {
                 if self.name == "avg" {
                     Ok(Value::Float(integer_sum as f64 / count as f64))
                 } else {
-                    i64::try_from(integer_sum)
-                        .map(Value::Int)
-                        .map_err(|_| Error::Query("window integer sum overflowed".into()))
+                    // DECIMAL at scale 0, matching the non-window SUM: MySQL
+                    // widens an integer sum rather than risking the column's
+                    // range, so it never needs to fit in an i64.
+                    Ok(Value::Decimal(integer_sum, 0))
                 }
             }
             _ => unreachable!("incremental window aggregate helper and dispatcher diverged"),
@@ -16997,9 +17067,11 @@ mod window_incremental_tests {
         let avg =
             WindowAggregate::new("avg", false, Some(&expression), &rows, &schema, &idxs).unwrap();
 
+        // DECIMAL at scale 0, not BIGINT: MySQL widens an integer SUM because
+        // the total can exceed the column's own range.
         assert_eq!(
             sum.evaluate(1, 3, &idxs, &rows, &schema).unwrap(),
-            Value::Int(4)
+            Value::Decimal(4, 0)
         );
         assert_eq!(
             count.evaluate(1, 3, &idxs, &rows, &schema).unwrap(),
@@ -17028,9 +17100,18 @@ mod window_incremental_tests {
         let sum =
             WindowAggregate::new("sum", false, Some(&expression), &rows, &schema, &idxs).unwrap();
 
+        // The point of the test is the exactness of the prefix subtraction past
+        // 2^53, where an f64 accumulator loses the 1. The result is now reported
+        // as DECIMAL, but it must still be exactly 1.
         assert_eq!(
             sum.evaluate(1, 1, &idxs, &rows, &schema).unwrap(),
-            Value::Int(1)
+            Value::Decimal(1, 0)
+        );
+        // And the whole frame still sums exactly, which is what an f64 could
+        // not do: 9007199254740992 + 1 is not representable there.
+        assert_eq!(
+            sum.evaluate(0, 1, &idxs, &rows, &schema).unwrap(),
+            Value::Decimal(9_007_199_254_740_993, 0)
         );
     }
 

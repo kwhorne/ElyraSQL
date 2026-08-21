@@ -465,25 +465,6 @@ DML_CASES = [
 # of these -- only the declared type differs -- so they are tracked here rather
 # than in ALLOWLIST.
 TYPE_ALLOWLIST = {
-    # MySQL evaluates these in exact DECIMAL (NEWDECIMAL, 246) and we use binary
-    # floating point or a widened integer. Same family as `SELECT 10 / 3` in
-    # ALLOWLIST; the values agree, the arithmetic model does not.
-    "SELECT 10 / 3",
-    "SELECT 5.5 % 2",
-    "SELECT ROUND(2.5)",
-    "SELECT ROUND(3.5)",
-    "SELECT ROUND(-2.5)",
-    "SELECT ROUND(1.5)",
-    "SELECT ROUND(1.2345, 2)",
-    "SELECT ROUND(1.2355, 2)",
-    "SELECT TRUNCATE(1.2399, 2)",
-    "SELECT TRUNCATE(-1.999, 0)",
-    "SELECT SUM(n), COUNT(n), COUNT(*), AVG(f) FROM d",
-    "SELECT MIN(a.id), MAX(a.id), SUM(a.id) FROM jn a JOIN jn b ON a.id = b.id",
-    "SELECT id, SUM(id) OVER () FROM d ORDER BY id",
-    "SELECT ROUND(0.5)",
-    "SELECT ROUND(-0.5)",
-    "SELECT MOD(10.5, 3)",
     # DATE_ADD over a string literal: MySQL hands back a string, we hand back a
     # typed DATE. Ours is the more useful answer, and the rendered value agrees.
     "SELECT DATE_ADD('2024-01-31', INTERVAL 1 MONTH)",
@@ -497,9 +478,6 @@ ALLOWLIST = {
     # CAST(... AS SIGNED) does follow MySQL.
     "SELECT 0 = 'abc'",
     "SELECT 1 + '2abc'",
-    # Benign type/formatting: MySQL renders `int / int` as a scaled DECIMAL; we
-    # return the full-precision DOUBLE (same value).
-    "SELECT 10 / 3",
     # Benign wire-type: a DECIMAL result is sent as text (value identical).
     "SELECT CAST(3.14159 AS DECIMAL(4,2))",
     # Benign wire-type: a TIME result is sent as text (value identical: 01:01:01).

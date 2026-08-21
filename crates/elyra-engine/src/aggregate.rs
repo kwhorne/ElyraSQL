@@ -642,7 +642,7 @@ pub fn build_plan(
             } else {
                 out_cols.push(ColumnDef {
                     name: alias.unwrap_or_else(|| expr.to_string()),
-                    ty: infer_computed_type(expr),
+                    ty: infer_computed_type(expr, schema),
                     nullable: true,
                     collation: ci,
                     qualifier: Vec::new(),
@@ -660,7 +660,7 @@ pub fn build_plan(
             rewrite_aggregates(expr, schema, &mut aggs, &mut arg_exprs, &mut agg_types)?;
         out_cols.push(ColumnDef {
             name: alias.unwrap_or_else(|| expr.to_string()),
-            ty: infer_computed_type(expr),
+            ty: infer_computed_type(expr, schema),
             nullable: true,
             collation: ci,
             qualifier: Vec::new(),
@@ -761,8 +761,13 @@ fn register_agg(
             Some(ci) => (Some(ci), Some(schema.columns[ci].ty.clone())),
             None => {
                 let ci = schema.columns.len() + arg_exprs.len();
+                // An expression argument still has a knowable exactness:
+                // SUM(p * 3) over a DECIMAL column is DECIMAL, and declaring it
+                // Float would send an exactly-computed sum as a DOUBLE.
+                let ty = decimal_scale_of(e, schema)
+                    .map(|scale| ColumnType::Decimal(MAX_DECIMAL_PRECISION, scale));
                 arg_exprs.push(e.clone());
-                (Some(ci), None)
+                (Some(ci), ty)
             }
         },
     };
@@ -771,16 +776,35 @@ fn register_agg(
     }
     let ty = match func {
         AggFunc::CountStar | AggFunc::Count => ColumnType::Int,
-        AggFunc::Avg
-        | AggFunc::StddevPop
-        | AggFunc::StddevSamp
-        | AggFunc::VarPop
-        | AggFunc::VarSamp => ColumnType::Float,
+        // AVG divides, so over an exact input it follows the division rule:
+        // the argument's scale plus `div_precision_increment`.
+        AggFunc::Avg => match arg_ty {
+            Some(ColumnType::Decimal(_, scale)) => ColumnType::Decimal(
+                MAX_DECIMAL_PRECISION,
+                scale.saturating_add(elyra_core::DIV_SCALE_INCREMENT),
+            ),
+            _ => ColumnType::Float,
+        },
+        AggFunc::StddevPop | AggFunc::StddevSamp | AggFunc::VarPop | AggFunc::VarSamp => {
+            ColumnType::Float
+        }
         AggFunc::GroupConcat => ColumnType::Text,
         AggFunc::Facet => ColumnType::Json,
         AggFunc::Percentile => ColumnType::Float,
         AggFunc::BitOr | AggFunc::BitAnd | AggFunc::BitXor => ColumnType::UInt,
-        AggFunc::Sum | AggFunc::Min | AggFunc::Max => arg_ty.unwrap_or(ColumnType::Float),
+        // MySQL widens SUM over any exact input to DECIMAL, because the total
+        // can exceed the column's own range: SUM over INT is DECIMAL, not
+        // BIGINT. MIN and MAX cannot overflow, so they keep the input type.
+        AggFunc::Sum => match arg_ty {
+            Some(ColumnType::Decimal(_, scale)) => {
+                ColumnType::Decimal(MAX_DECIMAL_PRECISION, scale)
+            }
+            Some(ColumnType::Int) | Some(ColumnType::UInt) | Some(ColumnType::Bool) => {
+                ColumnType::Decimal(MAX_DECIMAL_PRECISION, 0)
+            }
+            other => other.unwrap_or(ColumnType::Float),
+        },
+        AggFunc::Min | AggFunc::Max => arg_ty.unwrap_or(ColumnType::Float),
     };
     let mut order = Vec::new();
     for (e, asc) in agg_order(f) {
@@ -955,7 +979,135 @@ fn rewrite_aggregates(
 
 /// Best-effort column type for a computed output column (the runtime `Value`
 /// carries the true type; this only affects result metadata).
-fn infer_computed_type(expr: &Expr) -> ColumnType {
+/// MySQL's maximum DECIMAL precision. Computed columns can widen past their
+/// inputs, and the declared precision only sizes the client's buffer, so
+/// saturating here is safe and keeps the arithmetic below simple.
+const MAX_DECIMAL_PRECISION: u8 = 65;
+
+/// Scale of `expr`'s result if it is DECIMAL, else `None`.
+///
+/// Only the numeric shapes matter: the declared type decides the wire type, so
+/// answering `Float` for `AVG` over a DECIMAL column sends an exact value as a
+/// DOUBLE and the client sees binary rounding on a figure the engine computed
+/// exactly.
+fn decimal_scale_of(expr: &Expr, schema: &Schema) -> Option<u8> {
+    use sqlparser::ast::BinaryOperator::*;
+    match expr {
+        Expr::Nested(e) => decimal_scale_of(e, schema),
+        Expr::UnaryOp {
+            op: sqlparser::ast::UnaryOperator::Plus | sqlparser::ast::UnaryOperator::Minus,
+            expr: e,
+        } => decimal_scale_of(e, schema),
+        // A decimal literal carries its scale in its own text: 1.50 has scale 2.
+        Expr::Value(sqlparser::ast::Value::Number(text, _)) => text
+            .split_once('.')
+            .map(|(_, frac)| frac.len().min(30) as u8),
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
+            let name = match expr {
+                Expr::Identifier(i) => i.value.clone(),
+                Expr::CompoundIdentifier(parts) => parts.last()?.value.clone(),
+                _ => return None,
+            };
+            let column = schema
+                .columns
+                .iter()
+                .find(|c| crate::predicate::identifier_eq(column_name(c), &name))?;
+            match column.ty {
+                ColumnType::Decimal(_, scale) => Some(scale),
+                _ => None,
+            }
+        }
+        Expr::BinaryOp { left, op, right } => {
+            let (ls, rs) = (
+                decimal_scale_of(left, schema),
+                decimal_scale_of(right, schema),
+            );
+            // An integer operand keeps the result exact; anything else (a float,
+            // a string) drops it off the decimal path entirely.
+            let integral = |e: &Expr| matches!(infer_computed_type(e, schema), ColumnType::Int);
+            let scale_of = |side: Option<u8>, e: &Expr| match side {
+                Some(s) => Some(s),
+                None if integral(e) => Some(0),
+                None => None,
+            };
+            let (ls, rs) = (scale_of(ls, left), scale_of(rs, right));
+            if ls.is_none() && rs.is_none() {
+                return None;
+            }
+            let (ls, rs) = (ls?, rs?);
+            match op {
+                Plus | Minus | Modulo => Some(ls.max(rs)),
+                Multiply => Some(ls.saturating_add(rs)),
+                Divide => Some(ls.saturating_add(elyra_core::DIV_SCALE_INCREMENT)),
+                _ => None,
+            }
+        }
+        Expr::Function(f) => {
+            let name = f
+                .name
+                .0
+                .last()
+                .map(|i| i.value.to_ascii_lowercase())
+                .unwrap_or_default();
+            let (first, _) = agg_arg(f);
+            let first = first?;
+            match name.as_str() {
+                // MIN/MAX/ABS pass the argument's exactness through. SUM also
+                // widens an integral argument to DECIMAL, since the total can
+                // exceed the column's own range.
+                "min" | "max" | "abs" => decimal_scale_of(first, schema),
+                "sum" => decimal_scale_of(first, schema).or_else(|| {
+                    matches!(infer_computed_type(first, schema), ColumnType::Int).then_some(0)
+                }),
+                // AVG divides, so it follows the division rule.
+                "avg" => Some(
+                    decimal_scale_of(first, schema)?
+                        .saturating_add(elyra_core::DIV_SCALE_INCREMENT),
+                ),
+                // ROUND/TRUNCATE keep the narrower of the requested digits and
+                // the argument's own scale, and never go below zero.
+                "round" | "truncate" => {
+                    let scale = decimal_scale_of(first, schema)?;
+                    let digits = second_arg_int(f).unwrap_or(0);
+                    Some(digits.clamp(0, i64::from(scale)) as u8)
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The second argument of a call, when it is a plain integer literal — the
+/// digit count of `ROUND(x, 2)`. A non-constant one leaves the scale unknown,
+/// which is fine: the caller then declines the decimal path.
+fn second_arg_int(f: &sqlparser::ast::Function) -> Option<i64> {
+    let FunctionArguments::List(list) = &f.args else {
+        return None;
+    };
+    match list.args.get(1) {
+        Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(
+            sqlparser::ast::Value::Number(text, _),
+        )))) => text.parse().ok(),
+        Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::UnaryOp {
+            op: sqlparser::ast::UnaryOperator::Minus,
+            expr,
+        }))) => match expr.as_ref() {
+            Expr::Value(sqlparser::ast::Value::Number(text, _)) => {
+                text.parse::<i64>().ok().map(|v| -v)
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn infer_computed_type(expr: &Expr, schema: &Schema) -> ColumnType {
+    // An exact-decimal result must be declared as one, or the wire sends it as a
+    // DOUBLE and the client re-introduces the binary rounding the engine avoided.
+    if let Some(scale) = decimal_scale_of(expr, schema) {
+        return ColumnType::Decimal(MAX_DECIMAL_PRECISION, scale);
+    }
     match expr {
         Expr::BinaryOp { op, .. } => {
             use sqlparser::ast::BinaryOperator::*;
@@ -978,11 +1130,46 @@ fn infer_computed_type(expr: &Expr) -> ColumnType {
                 PGBitwiseNot => ColumnType::UInt,
                 PGSquareRoot | PGCubeRoot => ColumnType::Float,
                 Plus | Minus | PGPostfixFactorial | PGPrefixFactorial | PGAbs => {
-                    infer_computed_type(e)
+                    infer_computed_type(e, schema)
                 }
             }
         }
-        Expr::Nested(e) => infer_computed_type(e),
+        Expr::Nested(e) => infer_computed_type(e, schema),
+        // A CASE is as exact as the branch it returns; take the first branch
+        // that says anything definite, which is how the value will be typed too.
+        Expr::Case {
+            results,
+            else_result,
+            ..
+        } => results
+            .iter()
+            .chain(else_result.iter().map(|e| e.as_ref()))
+            .map(|e| infer_computed_type(e, schema))
+            .find(|t| !matches!(t, ColumnType::Text))
+            .unwrap_or(ColumnType::Text),
+        // Numeric literals: an integer one keeps an exact expression exact.
+        Expr::Value(sqlparser::ast::Value::Number(text, _)) => {
+            if text.contains('.') {
+                ColumnType::Float
+            } else {
+                ColumnType::Int
+            }
+        }
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
+            let name = match expr {
+                Expr::Identifier(i) => i.value.clone(),
+                Expr::CompoundIdentifier(parts) => {
+                    parts.last().map(|p| p.value.clone()).unwrap_or_default()
+                }
+                _ => String::new(),
+            };
+            schema
+                .columns
+                .iter()
+                .find(|c| crate::predicate::identifier_eq(column_name(c), &name))
+                .map(|c| c.ty.clone())
+                .unwrap_or(ColumnType::Text)
+        }
         Expr::Function(f) => {
             let n = f
                 .name
@@ -992,11 +1179,15 @@ fn infer_computed_type(expr: &Expr) -> ColumnType {
                 .unwrap_or_default();
             match n.as_str() {
                 "round" | "abs" | "ceil" | "ceiling" | "floor" | "sqrt" | "pow" | "power"
-                | "sum" | "avg" | "count" | "min" | "max" | "truncate" | "mod" => ColumnType::Float,
+                | "sum" | "avg" | "min" | "max" | "truncate" | "mod" => ColumnType::Float,
                 // Functions that return an integer even though their argument is
                 // text. Without this they defaulted to `Text`, so e.g.
                 // `LENGTH(GROUP_CONCAT(s))` came back to the client as the string
                 // "23" instead of the number 23.
+                // COUNT is an integer; `register_agg` already types it that
+                // way, and calling it a float here made `SUM(x) / COUNT(*)`
+                // look inexact and fall off the decimal path.
+                "count" => ColumnType::Int,
                 "length" | "char_length" | "character_length" | "octet_length" | "bit_length"
                 | "instr" | "locate" | "position" | "ascii" | "ord" | "field" | "find_in_set"
                 | "bit_count" | "crc32" | "unix_timestamp" | "to_days" | "datediff" | "day"

@@ -1385,6 +1385,10 @@ fn eval_scalar(name: &str, a: &[Value]) -> Result<Option<Value>> {
         // ---- math ----
         "abs" => match a.first() {
             Some(Value::Int(i)) => Value::Int(i.abs()),
+            // ABS keeps DECIMAL exact, scale and all, as MySQL does. Routing it
+            // through f64 would quietly undo the exactness of whatever produced
+            // the value -- ABS(SUM(x)) being the common shape.
+            Some(Value::Decimal(units, scale)) => Value::Decimal(units.abs(), *scale),
             Some(v) => v
                 .as_mysql_f64()
                 .map(|x| Value::Float(x.abs()))
@@ -1410,41 +1414,69 @@ fn eval_scalar(name: &str, a: &[Value]) -> Result<Option<Value>> {
         "log2" => math1(a, f64::log2),
         "pi" => Value::Float(std::f64::consts::PI),
         "power" | "pow" => math2(a, f64::powf),
-        "mod" => match (nnum(a, 0), nnum(a, 1)) {
-            (Some(x), Some(y)) if y != 0.0 => {
-                if a.iter().all(|v| matches!(v, Value::Int(_))) {
-                    Value::Int((x as i64) % (y as i64))
-                } else {
-                    Value::Float(x % y)
-                }
+        // MOD(a, b) is the `%` operator spelled as a call, so it has to answer
+        // the same thing -- including the exact DECIMAL remainder.
+        "mod" => match (a.first(), a.get(1)) {
+            (Some(x), Some(y)) if !x.is_null() && !y.is_null() => {
+                arith(x.clone(), &BinaryOperator::Modulo, y.clone())?
             }
             _ => Value::Null,
         },
-        "round" => match nnum(a, 0) {
-            Some(x) => {
-                let d = nnum(a, 1).unwrap_or(0.0) as i32;
-                let m = 10f64.powi(d);
-                let r = (x * m).round() / m;
-                if d <= 0 {
-                    Value::Int(r as i64)
-                } else {
-                    Value::Float(r)
+        "round" | "truncate" => {
+            let digits = match name {
+                // ROUND's second argument is optional and defaults to 0;
+                // TRUNCATE requires it.
+                "round" => nnum(a, 1).unwrap_or(0.0),
+                _ => match nnum(a, 1) {
+                    Some(d) => d,
+                    None => return Ok(Some(Value::Null)),
+                },
+            } as i32;
+            let half_away = name == "round";
+            match a.first() {
+                // Exact for DECIMAL and integers, which is what MySQL does.
+                // Going through f64 gets the money cases wrong:
+                // ROUND(1.005, 2) is 1.01, but 1.005 is not representable in
+                // binary and rounds down to 1.00.
+                Some(Value::Decimal(units, scale)) => {
+                    match round_decimal_digits(*units, *scale, digits, half_away) {
+                        Some((u, sc)) => Value::Decimal(u, sc),
+                        None => {
+                            return Err(Error::OutOfRange(
+                                "DECIMAL rounding is out of range".into(),
+                            ))
+                        }
+                    }
                 }
-            }
-            None => Value::Null,
-        },
-        "truncate" => match (nnum(a, 0), nnum(a, 1)) {
-            (Some(x), Some(d)) => {
-                let m = 10f64.powi(d as i32);
-                let r = (x * m).trunc() / m;
-                if (d as i32) <= 0 {
-                    Value::Int(r as i64)
-                } else {
-                    Value::Float(r)
+                Some(Value::Int(i)) => {
+                    match round_decimal_digits(i128::from(*i), 0, digits, half_away) {
+                        // An integer argument stays an integer, whatever the digits.
+                        Some((u, _)) => i64::try_from(u).map(Value::Int).map_err(|_| {
+                            Error::OutOfRange("BIGINT value is out of range".into())
+                        })?,
+                        None => {
+                            return Err(Error::OutOfRange("BIGINT value is out of range".into()))
+                        }
+                    }
                 }
+                _ => match nnum(a, 0) {
+                    Some(x) => {
+                        let m = 10f64.powi(digits);
+                        let r = if half_away {
+                            (x * m).round() / m
+                        } else {
+                            (x * m).trunc() / m
+                        };
+                        if digits <= 0 {
+                            Value::Int(r as i64)
+                        } else {
+                            Value::Float(r)
+                        }
+                    }
+                    None => Value::Null,
+                },
             }
-            _ => Value::Null,
-        },
+        }
         "rand" => Value::Float(rand_f64()),
         "greatest" | "least" => {
             if a.is_empty() || a.iter().any(|v| v.is_null()) {
@@ -3060,8 +3092,11 @@ fn arith(l: Value, op: &BinaryOperator, r: Value) -> Result<Value> {
         }
         return Ok(Value::Int((a / b).trunc() as i64));
     }
-    // Exact DECIMAL arithmetic for +, -, * (division/modulo fall back to float).
-    if matches!(l, Value::Decimal(..)) || matches!(r, Value::Decimal(..)) {
+    // Exact DECIMAL arithmetic. Division routes here even for two integer
+    // operands, because MySQL evaluates `/` in DECIMAL regardless: `10 / 3` is
+    // 3.3333, not a DOUBLE. A float operand still falls through, since
+    // `decimal_arith` declines anything it cannot represent exactly.
+    if matches!(l, Value::Decimal(..)) || matches!(r, Value::Decimal(..)) || matches!(op, Divide) {
         if let Some(v) = decimal_arith(&l, op, &r)? {
             return Ok(v);
         }
@@ -3212,8 +3247,9 @@ fn decimal_arith(l: &Value, op: &BinaryOperator, r: &Value) -> Result<Option<Val
     let to_dec = |v: &Value| -> Option<(i128, u8)> {
         match v {
             Value::Decimal(u, s) => Some((*u, *s)),
-            Value::Int(i) => Some((*i as i128, 0)),
-            Value::Bool(b) => Some((*b as i128, 0)),
+            Value::Int(i) => Some((i128::from(*i), 0)),
+            Value::UInt(u) => Some((i128::from(*u), 0)),
+            Value::Bool(b) => Some((i128::from(*b), 0)),
             _ => None,
         }
     };
@@ -3243,8 +3279,78 @@ fn decimal_arith(l: &Value, op: &BinaryOperator, r: &Value) -> Result<Option<Val
             a.checked_mul(b).ok_or_else(out_of_range)?,
             asc.checked_add(bsc).ok_or_else(out_of_range)?,
         ),
+        // MySQL divides in exact DECIMAL and gives the result the dividend's
+        // scale plus `div_precision_increment` (default 4) -- which is why
+        // `10 / 3` renders as 3.3333 and `7.00 / 2` as 3.500000. Rounding of the
+        // last kept digit is half away from zero: 2 / 3 is 0.6667.
+        Divide => {
+            if b == 0 {
+                return Ok(Some(Value::Null));
+            }
+            let scale = asc
+                .checked_add(elyra_core::DIV_SCALE_INCREMENT)
+                .ok_or_else(out_of_range)?;
+            // value = (a / 10^asc) / (b / 10^bsc), expressed at `scale`:
+            //   units = a * 10^(bsc + increment) / b
+            let shift = 10i128
+                .checked_pow(u32::from(bsc) + u32::from(elyra_core::DIV_SCALE_INCREMENT))
+                .ok_or_else(out_of_range)?;
+            let numerator = a.checked_mul(shift).ok_or_else(out_of_range)?;
+            let units = elyra_core::div_round_half_away(numerator, b).ok_or_else(out_of_range)?;
+            Value::Decimal(units, scale)
+        }
+        // The remainder keeps the wider of the two scales, and takes its sign
+        // from the dividend -- which is what `%` on i128 already does.
+        Modulo => {
+            let sc = asc.max(bsc);
+            let widen = |v: i128, from: u8| {
+                10i128
+                    .checked_pow(u32::from(sc - from))
+                    .and_then(|f| v.checked_mul(f))
+            };
+            let (aa, bb) = (
+                widen(a, asc).ok_or_else(out_of_range)?,
+                widen(b, bsc).ok_or_else(out_of_range)?,
+            );
+            if bb == 0 {
+                return Ok(Some(Value::Null));
+            }
+            Value::Decimal(aa % bb, sc)
+        }
         _ => return Ok(None),
     }))
+}
+
+/// `ROUND`/`TRUNCATE` of a DECIMAL at `digits` places, exactly.
+///
+/// Returns the new (unscaled, scale) pair. MySQL keeps the *narrower* of the
+/// requested digits and the value's own scale -- `ROUND(1.5, 5)` is 1.5, not
+/// 1.50000 -- and a negative `digits` rounds to the left of the point while the
+/// result stays at scale 0: `ROUND(123.456, -1)` is 120.
+fn round_decimal_digits(
+    units: i128,
+    scale: u8,
+    digits: i32,
+    half_away: bool,
+) -> Option<(i128, u8)> {
+    if digits >= i32::from(scale) {
+        return Some((units, scale)); // nothing to drop
+    }
+    let drop = i64::from(i32::from(scale) - digits);
+    let factor = 10i128.checked_pow(u32::try_from(drop).ok()?)?;
+    let quotient = units / factor;
+    let remainder = units % factor;
+    let rounded = if half_away && remainder.abs().checked_mul(2)? >= factor {
+        quotient + if units < 0 { -1 } else { 1 }
+    } else {
+        quotient
+    };
+    if digits >= 0 {
+        return Some((rounded, u8::try_from(digits).ok()?));
+    }
+    // Negative digits: put the zeroed places back and report at scale 0.
+    let restore = 10i128.checked_pow(u32::try_from(-digits).ok()?)?;
+    Some((rounded.checked_mul(restore)?, 0))
 }
 
 #[cfg(test)]
@@ -3253,6 +3359,73 @@ mod decimal_arithmetic_tests {
     use sqlparser::ast::BinaryOperator;
 
     use super::{arith, decimal_arith};
+
+    /// MySQL divides in exact DECIMAL and gives the result the dividend's scale
+    /// plus `div_precision_increment` (4). Every expectation here was measured
+    /// against MySQL 8.4 rather than derived from the manual.
+    #[test]
+    fn division_is_exact_decimal_at_mysqls_scale() {
+        let div = |l: Value, r: Value| arith(l, &BinaryOperator::Divide, r).unwrap();
+        // Integer operands still divide in DECIMAL: 10 / 3 is 3.3333.
+        assert_eq!(div(Value::Int(10), Value::Int(3)), Value::Decimal(33333, 4));
+        // The dividend's own scale carries through: 10.0 / 3 gains four places.
+        assert_eq!(
+            div(Value::Decimal(100, 1), Value::Int(3)),
+            Value::Decimal(333333, 5)
+        );
+        // The last kept digit rounds half away from zero, not toward it.
+        assert_eq!(div(Value::Int(2), Value::Int(3)), Value::Decimal(6667, 4));
+        assert_eq!(div(Value::Int(-2), Value::Int(3)), Value::Decimal(-6667, 4));
+        // Exact quotients keep the declared scale rather than shrinking.
+        assert_eq!(div(Value::Int(1), Value::Int(8)), Value::Decimal(1250, 4));
+        assert_eq!(div(Value::Int(1), Value::Int(0)), Value::Null);
+        // A float operand leaves the exact path entirely.
+        assert_eq!(
+            div(Value::Float(1.0), Value::Int(3)),
+            Value::Float(1.0 / 3.0)
+        );
+    }
+
+    /// The remainder keeps the wider scale and takes the dividend's sign.
+    #[test]
+    fn modulo_keeps_the_wider_scale() {
+        let rem = |l: Value, r: Value| arith(l, &BinaryOperator::Modulo, r).unwrap();
+        assert_eq!(
+            rem(Value::Decimal(55, 1), Value::Int(2)),
+            Value::Decimal(15, 1)
+        );
+        assert_eq!(
+            rem(Value::Decimal(70, 1), Value::Decimal(200, 2)),
+            Value::Decimal(100, 2)
+        );
+        assert_eq!(
+            rem(Value::Decimal(-105, 1), Value::Int(3)),
+            Value::Decimal(-15, 1)
+        );
+        // Two integers stay integral.
+        assert_eq!(rem(Value::Int(7), Value::Int(2)), Value::Int(1));
+        assert_eq!(rem(Value::Decimal(15, 1), Value::Int(0)), Value::Null);
+    }
+
+    /// Rounding a DECIMAL must not detour through f64: 1.005 is not
+    /// representable in binary and rounds *down* there, so ROUND(1.005, 2)
+    /// answered 1.00 where MySQL answers 1.01. That is the money case.
+    #[test]
+    fn decimal_rounding_is_exact() {
+        use super::round_decimal_digits;
+        assert_eq!(round_decimal_digits(1005, 3, 2, true), Some((101, 2)));
+        assert_eq!(round_decimal_digits(25, 1, 0, true), Some((3, 0)));
+        assert_eq!(round_decimal_digits(-25, 1, 0, true), Some((-3, 0)));
+        // Asking for more digits than the value has leaves it alone.
+        assert_eq!(round_decimal_digits(15, 1, 5, true), Some((15, 1)));
+        // Negative digits round to the left of the point and report at scale 0.
+        assert_eq!(round_decimal_digits(123456, 3, -1, true), Some((120, 0)));
+        assert_eq!(round_decimal_digits(125, 0, -1, true), Some((130, 0)));
+        assert_eq!(round_decimal_digits(-125, 0, -1, true), Some((-130, 0)));
+        // TRUNCATE drops the digits instead of rounding them.
+        assert_eq!(round_decimal_digits(1005, 3, 2, false), Some((100, 2)));
+        assert_eq!(round_decimal_digits(-1999, 3, 0, false), Some((-1, 0)));
+    }
 
     #[test]
     fn booleans_are_integers_in_arithmetic() {
@@ -3271,11 +3444,12 @@ mod decimal_arithmetic_tests {
             arith(Value::Bool(true), &BinaryOperator::Minus, Value::Int(2)).unwrap(),
             Value::Int(-1)
         );
-        // Division stays on the float path for integers too, so a boolean
-        // numerator behaves like Int(1) rather than becoming exact.
+        // Division is exact DECIMAL in MySQL even for integer operands, and a
+        // boolean is an integer, so `TRUE / 2` is 0.5000 at the dividend's scale
+        // plus the division increment -- not a DOUBLE.
         assert_eq!(
             arith(Value::Bool(true), &BinaryOperator::Divide, Value::Int(2)).unwrap(),
-            Value::Float(0.5)
+            Value::Decimal(5000, 4)
         );
         // NULL still dominates.
         assert_eq!(plus(Value::Bool(true), Value::Null), Value::Null);

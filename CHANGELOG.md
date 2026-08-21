@@ -6,6 +6,39 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **Exact DECIMAL arithmetic, matching MySQL.** Division, modulo, `ROUND`,
+  `TRUNCATE`, `MOD()`, `AVG` and `SUM` (aggregate and window) evaluated in binary
+  floating point where MySQL evaluates them exactly. The values agreed only while
+  they stayed small and round:
+
+  ```sql
+  SELECT ROUND(1.005, 2);   -- was 1.00, MySQL 1.01
+  SELECT SUM(p) OVER ();    -- was 25.050000000000004, MySQL 25.05
+  ```
+
+  `ROUND(1.005, 2)` is the shape that matters: 1.005 has no exact binary form, so
+  rounding it through `f64` rounds *down*. That is a money column.
+
+  Results now follow MySQL's rules, all measured against 8.4 rather than taken
+  from the manual: division gives the dividend's scale plus
+  `div_precision_increment` (4), so `10 / 3` is `3.3333` and `7.00 / 2` is
+  `3.500000`, rounding the last digit half away from zero; modulo keeps the wider
+  scale; `ROUND`/`TRUNCATE` keep the narrower of the requested digits and the
+  value's own scale, so `ROUND(1.5, 5)` stays `1.5`; `AVG` follows the division
+  rule; and `SUM` widens to `DECIMAL` even over integers, because the total can
+  exceed the column's range. `ABS` keeps its argument exact rather than
+  detouring through `f64`.
+
+- **A string bound on a numeric key no longer drops rows.** `k > '1.5'` on an
+  `INT` primary key coerced the bound to 2 and kept the strict `>`, so row 2 was
+  never returned. Bound coercion already compensated for rounding, but only when
+  the literal was a `FLOAT` or `DECIMAL` — a string one was assumed
+  value-preserving. Pre-existing, and reachable through any scalar subquery whose
+  result is rendered as text.
+
+
 ## [1.9.7] - 2026-08-19
 
 Nothing here changes an answer a client reads, and there is no upgrade note.
