@@ -6,6 +6,17 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.9.8] - 2026-08-21
+
+One contribution, and it changes numbers. Exact `DECIMAL` arithmetic closes the
+largest remaining MySQL-compatibility gap: division, modulo, `ROUND`,
+`TRUNCATE`, `MOD()`, `AVG` and `SUM` all evaluated in binary floating point where
+MySQL evaluates them exactly.
+
+**Results and result types both change**, so there is an upgrade note in the
+installation docs. Nothing touches your data, and every change moves toward
+MySQL rather than away from it.
+
 ### Fixed
 
 - **Exact DECIMAL arithmetic, matching MySQL.** Division, modulo, `ROUND`,
