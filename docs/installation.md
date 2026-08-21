@@ -17,6 +17,47 @@ ElyraSQL release builds target **Ubuntu 24.04+** and **Apple Silicon macOS
     done, so an interrupted upgrade simply resumes on the next start. **Take a backup
     first, and note that downgrading to 1.4.x afterwards is not supported.**
 
+!!! warning "Upgrading to 1.9.8"
+
+    Arithmetic that used to be approximate is now exact. Results and result
+    *types* both change. None of it touches your data, and every change moves
+    toward MySQL — but if you have code that compensated for the old behaviour,
+    that compensation is now wrong.
+
+    **Rounding a decimal gives a different answer at the halfway point.**
+
+    ```sql
+    SELECT ROUND(1.005, 2);   -- was 1.00, now 1.01 (MySQL: 1.01)
+    ```
+
+    1.005 has no exact binary form, so the old path rounded it down. Anything
+    that reconciled against MySQL, a spreadsheet or an accounting system was
+    seeing our answer, not theirs. **If you stored the old results, they do not
+    match what the same query returns now.**
+
+    **Division, `MOD`, `ROUND`, `TRUNCATE`, `AVG` and `SUM` now return
+    `DECIMAL`.** They returned `DOUBLE`, or `BIGINT` for an integer `SUM`.
+    Drivers hand a `DECIMAL` to your language differently — Python gets
+    `decimal.Decimal` where it got `float`, PHP and Go get a string where they
+    got a float. Code that assumes a float from `SUM()` or `AVG()` needs a
+    conversion it did not need before.
+
+    The scales follow MySQL exactly: `10 / 3` is `3.3333` (the dividend's scale
+    plus four), `AVG` over `DECIMAL(12,2)` has scale 6, and `SUM` over an `INT`
+    column is `DECIMAL` because the total can exceed the column's range.
+
+    **A range bound written as a string now returns the rows it should.**
+
+    ```sql
+    SELECT COUNT(*) FROM t WHERE k > '1.5';   -- k INT: was missing row 2
+    ```
+
+    The bound was coerced to 2 while the strict `>` was kept, so row 2 was
+    silently dropped. Any query comparing an indexed numeric column against a
+    string literal — or against a scalar subquery whose result is rendered as
+    text — was affected. Queries that returned too few rows now return the
+    right ones.
+
 !!! warning "Upgrading to 1.9.6"
 
     Three changes alter answers your client already reads, and one changes how
@@ -262,8 +303,8 @@ macOS).
 Multi-arch image (`amd64` + `arm64`) on the GitHub Container Registry:
 
 ```bash
-docker pull ghcr.io/kwhorne/elyrasql:1.9.7   # or :latest
-docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.9.7
+docker pull ghcr.io/kwhorne/elyrasql:1.9.8   # or :latest
+docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.9.8
 ```
 
 The image is ~15 MB, runs as a non-root user, stores data in the
