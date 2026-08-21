@@ -39,7 +39,7 @@ All notable changes to ElyraSQL are documented here. The format is based on
   result is rendered as text.
 
 
-## [1.9.7] - 2026-08-19
+## [1.9.7] - 2026-08-20
 
 Nothing here changes an answer a client reads, and there is no upgrade note.
 One change widens the MySQL differential harness; the other keeps the build green
