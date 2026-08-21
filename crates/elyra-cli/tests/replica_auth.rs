@@ -33,7 +33,10 @@ async fn replica_refuses_credential_less_listener() {
     let data = std::env::temp_dir().join(format!("elyrasql-replauth-a-{}.edb", std::process::id()));
     let _ = std::fs::remove_file(&data);
 
+    // A cluster secret so the *replication* guard is satisfied: this test pins
+    // the MySQL listener's refusal, and must not pass for the other reason.
     let out = replica_cmd(&data, port)
+        .env("ELYRASQL_CLUSTER_SECRET", "test-cluster-secret")
         .env_remove("ELYRASQL_ALLOW_OPEN_AUTH")
         .output()
         .expect("spawn elyrasql replica");
@@ -63,7 +66,13 @@ async fn replica_starts_with_configured_accounts() {
     // The primary at 127.0.0.1:1 is unreachable; run_replica retries in the
     // background while the MySQL listener comes up. That is enough to verify
     // the listener starts (and authenticates) with accounts configured.
+    //
+    // The cluster secret is what a real replica would have: replication
+    // authentication is mutual and mandatory, so `run_replica` refuses to start
+    // without one. This test is about the *MySQL listener's* accounts, so give
+    // it the replication credential it needs to get that far.
     let mut child = replica_cmd(&data, port)
+        .env("ELYRASQL_CLUSTER_SECRET", "test-cluster-secret")
         .args(["--user", "replica_admin", "--password", "sup3rsecret"])
         .spawn()
         .expect("spawn elyrasql replica");
