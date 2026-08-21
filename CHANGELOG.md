@@ -6,6 +6,35 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **Security: `elyrasql replica` now requires accounts on its MySQL listener.**
+  The replica subcommand had no auth flags at all and always started with open
+  authentication (any username/password logged in as Admin), exposing the full
+  replicated data set to anyone who could reach the port. It now accepts
+  `--user`/`--password`/`--auth USER:PASS:ROLE` exactly like `serve`, and
+  refuses to start credential-less unless `ELYRASQL_ALLOW_OPEN_AUTH=1`
+  explicitly opts in.
+
+- **Security: replication authentication is now mutual and mandatory.** A
+  replica applies everything its primary sends, but it never verified the
+  primary's identity: any host accepting TCP connections on the primary's
+  address could impersonate it (no TLS by default) and feed the replica
+  arbitrary data — fabricated tables, tampered rows, corrupted catalog state —
+  which the replica then served to clients. The primary must now prove
+  knowledge of `ELYRASQL_CLUSTER_SECRET` back to the replica before any data
+  flows, and a replica refuses to start without a secret unless
+  `ELYRASQL_ALLOW_OPEN_AUTH=1` explicitly opts in. Primary and replica must be
+  upgraded together (the handshake changed).
+
+- **Security: the replication endpoint now requires authentication on every bind
+  address, loopback included.** The endpoint hands a full copy of the database
+  to every connecting peer, so an unauthenticated listener let any local
+  process (or SSRF payload) that could open a TCP connection exfiltrate all
+  data. Startup is refused unless `ELYRASQL_CLUSTER_SECRET` is set or
+  `ELYRASQL_ALLOW_OPEN_AUTH=1` explicitly opts in. Non-loopback binds were
+  already refused; this closes the loopback gap.
+
 ## [1.9.8] - 2026-08-21
 
 One contribution, and it changes numbers. Exact `DECIMAL` arithmetic closes the

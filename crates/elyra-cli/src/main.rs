@@ -149,6 +149,19 @@ enum Command {
         /// Address to bind the (read-only) MySQL listener to.
         #[arg(long, env = "ELYRASQL_LISTEN", default_value = "127.0.0.1:3307")]
         listen: String,
+
+        /// Require this username to connect (enables authentication).
+        #[arg(long, env = "ELYRASQL_USER")]
+        user: Option<String>,
+
+        /// Password for --user.
+        #[arg(long, env = "ELYRASQL_PASSWORD", default_value = "")]
+        password: String,
+
+        /// Additional user as `user:password:role` (role: admin|write|read).
+        /// Repeatable. Enables authentication.
+        #[arg(long = "auth", value_name = "USER:PASS:ROLE")]
+        auth: Vec<String>,
     },
     /// Back up a database file to a new file (offline; the server must not be
     /// running against --data). For hot backups while serving, use the SQL
@@ -405,7 +418,28 @@ async fn run() -> anyhow::Result<()> {
             primary,
             data,
             listen,
+            user,
+            password,
+            auth,
         } => {
+            // A replica serves replicated (often production) data over its
+            // MySQL port. Refuse the credential-less default: without this,
+            // any process that can reach the port is Admin on that data.
+            let mut entries: Vec<(String, String, elyra_core::Privilege)> = Vec::new();
+            if let Some(u) = user {
+                entries.push((u, password, elyra_core::Privilege::Admin));
+            }
+            for spec in auth {
+                entries.push(parse_auth_spec(&spec)?);
+            }
+            if entries.is_empty() && !elyra_server::env_flag("ELYRASQL_ALLOW_OPEN_AUTH") {
+                anyhow::bail!(
+                    "refusing to start an unauthenticated replica listener. \
+                     Configure accounts (--user/--password or --auth USER:PASS:ROLE), \
+                     or set ELYRASQL_ALLOW_OPEN_AUTH=1 to explicitly accept a \
+                     credential-less replica."
+                );
+            }
             // Fresh local file: a replica re-bootstraps its whole state.
             let _ = std::fs::remove_file(&data);
             tracing::info!(?data, %primary, "starting ElyraSQL replica");
@@ -432,7 +466,14 @@ async fn run() -> anyhow::Result<()> {
                 std::process::exit(75);
             });
 
-            let auth = std::sync::Arc::new(elyra_server::Auth::open().with_db(db));
+            let auth = std::sync::Arc::new(
+                if entries.is_empty() {
+                    elyra_server::Auth::open()
+                } else {
+                    elyra_server::Auth::with_users(entries)
+                }
+                .with_db(db),
+            );
             let config = elyra_server::ServerConfig {
                 listen,
                 auth,
