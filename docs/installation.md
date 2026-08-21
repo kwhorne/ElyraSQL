@@ -17,6 +17,42 @@ ElyraSQL release builds target **Ubuntu 24.04+** and **Apple Silicon macOS
     done, so an interrupted upgrade simply resumes on the next start. **Take a backup
     first, and note that downgrading to 1.4.x afterwards is not supported.**
 
+!!! danger "Upgrading to 1.9.9 — security release"
+
+    **If you run replication, 1.9.8 and earlier expose your data. Upgrade.**
+
+    Connecting to the replication port returned a full copy of the database:
+    no credentials, no handshake, nothing sent by the peer. The guard only
+    covered non-loopback binds, so a primary started with
+    `--replication-listen 127.0.0.1:...` and no cluster secret was readable by
+    any local process — or by anything that could get a TCP connection opened on
+    its behalf.
+
+    Two more, as serious: a replica never checked its primary's identity, so
+    anything answering on the primary's address could feed it fabricated rows —
+    **even with `ELYRASQL_CLUSTER_SECRET` set**, because authentication ran in
+    one direction only. And `elyrasql replica` had no authentication flags at
+    all, so its MySQL listener always accepted any username as `Admin` over
+    replicated production data.
+
+    **The fixes are breaking, deliberately.** After upgrading:
+
+    - **A primary with `--replication-listen` needs `ELYRASQL_CLUSTER_SECRET`.**
+      Without it the endpoint refuses to start and logs why; the server keeps
+      serving, so watch for `replication endpoint stopped` in the log rather
+      than assuming replication is running.
+    - **A replica needs the same secret**, and refuses to start without it.
+    - **Primary and replica must be upgraded together.** The handshake gained a
+      step; a 1.9.9 replica will not accept a 1.9.8 primary.
+    - **A replica needs accounts**: `--user`/`--password`/`--auth USER:PASS:ROLE`,
+      exactly as `serve` takes them.
+
+    `ELYRASQL_ALLOW_OPEN_AUTH=1` opts out of all four, and is the honest way to
+    say "this port is on a network I control". It is not a default.
+
+    If you ran an exposed replication endpoint, rotate anything the data would
+    have revealed. The port left no access log.
+
 !!! warning "Upgrading to 1.9.8"
 
     Arithmetic that used to be approximate is now exact. Results and result
@@ -303,8 +339,8 @@ macOS).
 Multi-arch image (`amd64` + `arm64`) on the GitHub Container Registry:
 
 ```bash
-docker pull ghcr.io/kwhorne/elyrasql:1.9.8   # or :latest
-docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.9.8
+docker pull ghcr.io/kwhorne/elyrasql:1.9.9   # or :latest
+docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.9.9
 ```
 
 The image is ~15 MB, runs as a non-root user, stores data in the

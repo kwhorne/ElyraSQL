@@ -6,6 +6,16 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.9.9] - 2026-08-21
+
+**A security release. Upgrade if you run replication.**
+
+Three independent holes in the replication surface, all reachable in 1.9.8. The
+first needs no credentials and no handshake: connecting to the replication port
+returns a full copy of the database. If you run a primary with
+`--replication-listen`, or a replica, treat this as urgent — and read the upgrade
+note, because the fixes are deliberately breaking.
+
 ### Fixed
 
 - **Security: `elyrasql replica` now requires accounts on its MySQL listener.**
