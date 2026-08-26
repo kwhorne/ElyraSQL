@@ -62,6 +62,7 @@ nav:
       - Transactions: sql/transactions.md
       - Vector Search: sql/vector-search.md
   - Analytics (OLAP): olap.md
+  - Embedded (in-process): embedded.md
   - Security: security.md
   - MySQL Compatibility: mysql-compatibility.md
   - Framework Integration: frameworks.md
