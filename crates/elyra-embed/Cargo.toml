@@ -1,0 +1,20 @@
+[package]
+name = "elyra-embed"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Embedded (in-process) ElyraSQL — MySQL semantics with no server and no socket"
+
+[dependencies]
+elyra-core.workspace = true
+elyra-engine.workspace = true
+elyra-storage.workspace = true
+
+# The engine is async and reads through `spawn_blocking`, so an embedded caller
+# needs a runtime with a blocking pool. This crate owns one so the caller does
+# not have to know that.
+tokio = { workspace = true }

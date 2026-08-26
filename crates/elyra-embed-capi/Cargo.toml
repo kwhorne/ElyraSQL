@@ -1,0 +1,17 @@
+[package]
+name = "elyra-embed-capi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "C ABI for embedded ElyraSQL — the engine as a shared library"
+
+[lib]
+name = "elyrasql"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+elyra-embed.workspace = true

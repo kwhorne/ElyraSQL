@@ -491,6 +491,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "elyra-embed"
+version = "1.9.9"
+dependencies = [
+ "elyra-core",
+ "elyra-engine",
+ "elyra-storage",
+ "tokio",
+]
+
+[[package]]
+name = "elyra-embed-capi"
+version = "1.9.9"
+dependencies = [
+ "elyra-embed",
+]
+
+[[package]]
 name = "elyra-engine"
 version = "1.9.9"
 dependencies = [

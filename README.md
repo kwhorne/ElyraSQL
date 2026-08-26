@@ -125,21 +125,26 @@ See the [documentation site](https://elyracode.com/docs/sql-server) and
 ## Architecture
 
 ```
-              MySQL clients / drivers
-                       │  (MySQL wire protocol)
-              ┌────────▼────────┐
-              │  elyra-server   │   elyra-wire (own MySQL protocol) + tokio
-              └────────┬────────┘
-              ┌────────▼────────┐
-              │  elyra-engine   │   sqlparser (MySQL dialect) → plan → execute
-              └───┬────────┬────┘
-      ┌───────────▼──┐  ┌──▼───────────┐  ┌──────────────┐
-      │ elyra-storage│  │  elyra-olap  │  │ elyra-vector │
-      │ single file  │  │  analytics   │  │  ANN / HNSW  │
-      │ ACID (redb)  │  │  (columnar)  │  │              │
-      └──────────────┘  └──────────────┘  └──────────────┘
+    MySQL clients / drivers          your process (Rust / C / PHP / Python)
+              │  MySQL wire protocol             │  in-process, no socket
+     ┌────────▼────────┐                ┌────────▼─────────┐
+     │  elyra-server   │                │   elyra-embed    │
+     │ elyra-wire+tokio│                │ elyra-embed-capi │
+     └────────┬────────┘                └────────┬─────────┘
+              └───────────────┬──────────────────┘
+                     ┌────────▼────────┐
+                     │  elyra-engine   │  sqlparser (MySQL dialect) → plan → execute
+                     └───┬────────┬────┘
+         ┌───────────────▼──┐  ┌──▼───────────┐  ┌──────────────┐
+         │  elyra-storage   │  │  elyra-olap  │  │ elyra-vector │
+         │  single file     │  │  analytics   │  │  ANN / HNSW  │
+         │  ACID (redb)     │  │  (columnar)  │  │              │
+         └──────────────────┘  └──────────────┘  └──────────────┘
                     all share  ▲  elyra-core (types, values, errors)
 ```
+
+Both entry points run the same engine, over the same file format. The server
+adds the network; embedded mode removes it.
 
 Crates:
 
@@ -153,6 +158,8 @@ Crates:
 | `elyra-wire`    | First-party MySQL wire protocol (handshake, auth, TLS)      |
 | `elyra-server`  | Connection handling, auth verification, prepared statements |
 | `elyra-cli`     | `elyrasql` binary (serve + admin)                          |
+| `elyra-embed`   | The engine as an in-process library (no server, no socket) |
+| `elyra-embed-capi` | C ABI over `elyra-embed`, for hosts with an FFI         |
 
 Third-party engines are internal dependencies only — nothing user-facing
 (APIs, errors, CLI, wire handshake) exposes their names. Everything is
@@ -182,6 +189,34 @@ SELECT 1 + 1 AS two;
 SELECT 'hei fra ElyraSQL' AS msg;
 SELECT VERSION();   -- 8.0.12-ElyraSQL-1.9.9
 ```
+
+## Embedded (no server)
+
+The engine also runs as a library inside your own process, against the same
+file format — useful for test suites, CLI tools and single-tenant apps.
+
+```rust
+use elyra_embed::{Database, Value};
+
+let db = Database::temporary()?;          // deleted when it drops
+let conn = db.connect();
+
+conn.execute("CREATE TABLE users (id INT PRIMARY KEY AUTO_INCREMENT, name TEXT)")?;
+conn.execute("INSERT INTO users (name) VALUES ('Ada')")?;
+
+let rows = conn.query("SELECT name FROM users")?;
+assert_eq!(rows.get(0, "name"), Some(&Value::Text("Ada".into())));
+```
+
+C, and anything with an FFI, goes through `elyra-embed-capi`:
+
+```bash
+cargo build -p elyra-embed-capi --release
+cc app.c -I crates/elyra-embed-capi/include -L target/release -lelyrasql -o app
+```
+
+See the [embedded guide](docs/embedded.md) for the one-writer rule, the blocking
+contract and what a server still gives you that in-process does not.
 
 ## Configuration
 

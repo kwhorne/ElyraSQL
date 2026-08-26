@@ -4,6 +4,8 @@ members = [
     "crates/elyra-core",
     "crates/elyra-storage",
     "crates/elyra-engine",
+    "crates/elyra-embed",
+    "crates/elyra-embed-capi",
     "crates/elyra-olap",
     "crates/elyra-vector",
     "crates/elyra-wire",
@@ -29,6 +31,8 @@ description = "ElyraSQL — a robust server SQL database written in Rust"
 elyra-core = { path = "crates/elyra-core" }
 elyra-storage = { path = "crates/elyra-storage" }
 elyra-engine = { path = "crates/elyra-engine" }
+elyra-embed = { path = "crates/elyra-embed" }
+elyra-embed-capi = { path = "crates/elyra-embed-capi" }
 elyra-olap = { path = "crates/elyra-olap" }
 elyra-vector = { path = "crates/elyra-vector" }
 elyra-server = { path = "crates/elyra-server" }

@@ -6,6 +6,40 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **Embedded mode: the engine as an in-process library.** `elyra-embed` opens an
+  `.edb` file directly — no server, no socket, no wire protocol — and
+  `elyra-embed-capi` exposes the same API over a C ABI for hosts that reach Rust
+  through an FFI.
+
+  ```rust
+  let db = Database::temporary()?;        // deleted when it drops
+  let conn = db.connect();
+  conn.execute("INSERT INTO users (name) VALUES ('Ada')")?;
+  ```
+
+  The SQL semantics are identical to the server's because it is the same engine:
+  `elyra-engine` already depended on storage and nothing above it, so this adds a
+  second entry point rather than a second implementation. Verified in both
+  directions against the released 1.9.9 image — a file written in-process is
+  served and queried over the MySQL protocol, and a row the server wrote reads
+  back in-process, with the same values.
+
+  The facade owns a Tokio runtime and blocks, so callers need none of their own.
+  Calling it from inside an async context returns an error instead of the panic
+  `block_on` would otherwise raise.
+
+- **A database file can be reopened immediately after closing.** The storage
+  writer runs on a detached thread that holds the storage handle — and so the
+  file lock — until it observes its job queue close, with nothing synchronising
+  that back to whoever dropped the handle. A server opens its file once per
+  process and never sees this; opening and closing the same file in a loop, which
+  is what an embedded test suite does, hit it constantly. `Database::open` now
+  waits the window out (`Config::lock_wait`, 2s by default) while still failing
+  on a genuinely concurrent open. The underlying handle lifecycle is unchanged
+  and still cannot be awaited deterministically (#110).
+
 ## [1.9.9] - 2026-08-21
 
 **A security release. Upgrade if you run replication.**
