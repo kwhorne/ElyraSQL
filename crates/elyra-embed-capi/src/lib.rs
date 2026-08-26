@@ -114,10 +114,7 @@ pub unsafe extern "C" fn elyra_db_open(path: *const c_char, out: *mut *mut Elyra
         Ok(p) => PathBuf::from(p),
         Err(code) => return code,
     };
-    match Database::open(path)
-        .map_err(set_error)
-        .and_then(wrap_db)
-    {
+    match Database::open(path).map_err(set_error).and_then(wrap_db) {
         Ok(ptr) => {
             *out = ptr;
             ELYRA_OK
@@ -136,10 +133,7 @@ pub unsafe extern "C" fn elyra_db_open_temporary(out: *mut *mut ElyraDb) -> c_in
     if out.is_null() {
         return set_error("out must not be null");
     }
-    match Database::temporary()
-        .map_err(set_error)
-        .and_then(wrap_db)
-    {
+    match Database::temporary().map_err(set_error).and_then(wrap_db) {
         Ok(ptr) => {
             *out = ptr;
             ELYRA_OK

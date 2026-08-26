@@ -38,7 +38,7 @@ All notable changes to ElyraSQL are documented here. The format is based on
   is what an embedded test suite does, hit it constantly. `Database::open` now
   waits the window out (`Config::lock_wait`, 2s by default) while still failing
   on a genuinely concurrent open. The underlying handle lifecycle is unchanged
-  and still cannot be awaited deterministically.
+  and still cannot be awaited deterministically (#110).
 
 ## [1.9.9] - 2026-08-21
 

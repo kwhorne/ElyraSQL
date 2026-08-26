@@ -66,6 +66,9 @@ pub use elyra_core::{Collation, ColumnDef, ColumnType, Error, Privilege, Result,
 ///
 /// Retrying converts that race into a wait. It does not paper over a genuine
 /// conflict: two handles really held at once still fail, just after this long.
+///
+/// A deterministic close at the storage layer would remove the need for this
+/// entirely; tracked in <https://github.com/kwhorne/ElyraSQL/issues/110>.
 pub const DEFAULT_LOCK_WAIT: Duration = Duration::from_secs(2);
 
 /// Rows pulled from a stream per step while materialising a result set. Matches
@@ -455,7 +458,8 @@ fn open_locked(path: &Path, binlog: Option<PathBuf>, lock_wait: Option<Duration>
 /// it reaches us as an opaque string inside [`Error::Storage`]. Distinguishing it
 /// structurally would mean a storage-level error kind, which is the same change
 /// that would let a caller wait for the writer thread deterministically and make
-/// this retry unnecessary in the first place.
+/// this retry unnecessary in the first place — see
+/// <https://github.com/kwhorne/ElyraSQL/issues/110>.
 fn is_lock_conflict(e: &Error) -> bool {
     matches!(e, Error::Storage(msg) if msg.contains("Cannot acquire lock"))
 }
