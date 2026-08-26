@@ -17,7 +17,7 @@ ElyraSQL release builds target **Ubuntu 24.04+** and **Apple Silicon macOS
     done, so an interrupted upgrade simply resumes on the next start. **Take a backup
     first, and note that downgrading to 1.4.x afterwards is not supported.**
 
-!!! danger "Upgrading to 1.9.9 — security release"
+!!! danger "Upgrading to 1.9.9 or later — security release"
 
     **If you run replication, 1.9.8 and earlier expose your data. Upgrade.**
 
@@ -43,7 +43,7 @@ ElyraSQL release builds target **Ubuntu 24.04+** and **Apple Silicon macOS
       than assuming replication is running.
     - **A replica needs the same secret**, and refuses to start without it.
     - **Primary and replica must be upgraded together.** The handshake gained a
-      step; a 1.9.9 replica will not accept a 1.9.8 primary.
+      step; a 1.9.9-or-later replica will not accept a 1.9.8 primary.
     - **A replica needs accounts**: `--user`/`--password`/`--auth USER:PASS:ROLE`,
       exactly as `serve` takes them.
 
@@ -339,8 +339,8 @@ macOS).
 Multi-arch image (`amd64` + `arm64`) on the GitHub Container Registry:
 
 ```bash
-docker pull ghcr.io/kwhorne/elyrasql:1.9.9   # or :latest
-docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.9.9
+docker pull ghcr.io/kwhorne/elyrasql:1.10.0   # or :latest
+docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.10.0
 ```
 
 The image is ~15 MB, runs as a non-root user, stores data in the

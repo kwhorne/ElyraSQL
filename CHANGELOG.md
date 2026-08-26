@@ -6,6 +6,17 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.10.0] - 2026-08-26
+
+**ElyraSQL now runs without a server.** The engine opens a database file
+in-process, as a library, with a C ABI for languages that reach Rust through an
+FFI. That is the whole release.
+
+The minor bump is for the new surface, not for changed behaviour: nothing an
+existing client reads is different, there is no on-disk format change, and there
+is no upgrade note. A 1.9.x database opens in 1.10.0 unchanged, and a 1.10.0
+database still opens in 1.9.x.
+
 ### Added
 
 - **Embedded mode: the engine as an in-process library.** `elyra-embed` opens an
