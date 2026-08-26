@@ -43,7 +43,7 @@ workload — served over the protocol your stack already knows.
 **[→ Get started in 60 seconds](#quick-start)** &nbsp;·&nbsp;
 **[→ Full documentation](https://elyracode.com/docs/sql-server)**
 
-> **Stable release: v1.9.9.** A broad, MySQL-compatible SQL engine: full
+> **Stable release: v1.10.0.** A broad, MySQL-compatible SQL engine: full
 > DDL/DML, all join types (INNER/LEFT/RIGHT/FULL/CROSS/NATURAL/USING, streamed for large
 > analytical joins — including non-equi and cross joins, which never buffer the
 > product), subqueries (correlated too), CTEs (incl. `WITH RECURSIVE`),
@@ -56,8 +56,9 @@ workload — served over the protocol your stack already knows.
 > `caching_sha2_password` auth, TLS, replication and Raft failover. Correctness
 > is guarded by wire, property, fuzz, crash-recovery and concurrent soak/chaos
 > tests, and by a query battery run differentially against MySQL 8.4 on every
-> pull request. Laravel migrations and Eloquent run unmodified. See the
-> [changelog](CHANGELOG.md).
+> pull request. Laravel migrations and Eloquent run unmodified. The same engine
+> also runs [in-process](docs/embedded.md), as a library, with no server at all.
+> See the [changelog](CHANGELOG.md).
 
 ## Why ElyraSQL
 
@@ -187,7 +188,7 @@ mysql -h 127.0.0.1 -P 3307 -u root -p
 SELECT 1;
 SELECT 1 + 1 AS two;
 SELECT 'hei fra ElyraSQL' AS msg;
-SELECT VERSION();   -- 8.0.12-ElyraSQL-1.9.9
+SELECT VERSION();   -- 8.0.12-ElyraSQL-1.10.0
 ```
 
 ## Embedded (no server)
@@ -277,7 +278,7 @@ tar xzf elyrasql.tar.gz
 Multi-arch image (amd64 + arm64) on GHCR:
 
 ```bash
-docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.9.9
+docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.10.0
 # with auth + a persistent volume:
 docker run -p 3307:3307 -v elyra:/var/lib/elyrasql \
   -e ELYRASQL_USER=root -e ELYRASQL_PASSWORD=secret \
