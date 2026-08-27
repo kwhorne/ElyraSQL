@@ -15,80 +15,9 @@ use elyra_core::{Error, Privilege, Result, Schema, Value};
 
 use crate::predicate;
 use crate::session::Session;
+use crate::sqllex::{tokenize, Tok};
 use crate::stream::RowStream;
 use crate::QueryResult;
-
-/// A single lexical token: a bare word/number, a quoted string, or a symbol.
-#[derive(Debug, Clone, PartialEq)]
-enum Tok {
-    Word(String),
-    Str(String),
-    Sym(char),
-}
-
-impl Tok {
-    /// The textual value of a word or quoted string (symbols yield "").
-    fn text(&self) -> &str {
-        match self {
-            Tok::Word(s) | Tok::Str(s) => s,
-            Tok::Sym(_) => "",
-        }
-    }
-    fn is_word(&self, kw: &str) -> bool {
-        matches!(self, Tok::Word(s) if s.eq_ignore_ascii_case(kw))
-    }
-}
-
-fn tokenize(sql: &str) -> Vec<Tok> {
-    let mut out = Vec::new();
-    let cs: Vec<char> = sql.chars().collect();
-    let mut i = 0;
-    while i < cs.len() {
-        let c = cs[i];
-        if c.is_whitespace() {
-            i += 1;
-        } else if c == '\'' || c == '"' || c == '`' {
-            let quote = c;
-            i += 1;
-            let mut s = String::new();
-            while i < cs.len() {
-                if cs[i] == quote {
-                    // Doubled quote → literal quote.
-                    if i + 1 < cs.len() && cs[i + 1] == quote {
-                        s.push(quote);
-                        i += 2;
-                        continue;
-                    }
-                    i += 1;
-                    break;
-                }
-                s.push(cs[i]);
-                i += 1;
-            }
-            out.push(Tok::Str(s));
-        } else if c == ',' || c == '@' || c == '=' || c == '(' || c == ')' || c == '*' || c == ';' {
-            out.push(Tok::Sym(c));
-            i += 1;
-        } else if c.is_alphanumeric() || c == '_' || c == '.' || c == '$' || c == '%' || c == '-' {
-            let mut s = String::new();
-            while i < cs.len()
-                && (cs[i].is_alphanumeric()
-                    || cs[i] == '_'
-                    || cs[i] == '.'
-                    || cs[i] == '$'
-                    || cs[i] == '%'
-                    || cs[i] == '-')
-            {
-                s.push(cs[i]);
-                i += 1;
-            }
-            out.push(Tok::Word(s));
-        } else {
-            i += 1; // skip anything else
-        }
-    }
-    out
-}
 
 /// Read a user specification (`name` or `'name'@'host'`) starting at `i`,
 /// returning the account name and the index after it. The host part is parsed

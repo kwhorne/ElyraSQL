@@ -6,6 +6,35 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **Declarative embedding indexes.** `CREATE EMBEDDING INDEX ... ON t(text) INTO
+  vec USING MODEL '...'` makes the database keep a vector column in step with a
+  text column, so an application stops orchestrating re-embedding:
+
+  ```sql
+  CREATE EMBEDDING INDEX body_ix ON articles(body) INTO embedding
+      USING MODEL 'text-embedding-3-small';
+  INSERT INTO articles (body) VALUES ('data protection law');  -- that is all
+  ```
+
+  What needs embedding is derived from the data — a hash of the `(model, text)`
+  pair against the hash recorded when the vector was written — rather than from a
+  write hook, so bulk loads, restores, binlog replay and replication apply are
+  covered too. Nothing in the `INSERT`/`UPDATE` path changed.
+
+  Writing back runs in a serializable transaction, so an `UPDATE` landing while
+  the provider is being called is never overwritten; the row stays pending and is
+  picked up next sweep. Failures back off exponentially and dead-letter after
+  five attempts, which `SHOW EMBEDDING INDEXES` reports as `Retrying`/`Failed`.
+  Editing the text clears the state. Sweeps are driven by
+  `--embedding-sweep-secs` (30 by default, `0` disables) and do nothing at all
+  while no provider is configured.
+
+  Verified end to end against a real provider (Ollama, `all-minilm`, 384
+  dimensions) over the MySQL protocol: three semantic queries sharing **no words**
+  with their target each ranked it first.
+
 ### Fixed
 
 - **A database file is released when its handle is dropped, not shortly after
@@ -32,6 +61,18 @@ All notable changes to ElyraSQL are documented here. The format is based on
   `Error::Storage` string. `elyra-embed` had to match on the storage engine's
   message text to recognise it, which is the pattern removed from the catalog
   errors in 1.9.6; it now matches on the variant.
+
+- **`ai_embed()` now has a test that speaks HTTP.** The request construction,
+  `Authorization` header and response parsing had no coverage at all — every test
+  stopped at the function boundary. There is now an integration test with a real
+  socket and a real HTTP exchange.
+
+### Internal
+
+- **One statement tokenizer, not two.** `users.rs` carried its own word/string/
+  symbol tokenizer for `GRANT` and `CREATE USER`; embedding-index DDL needs the
+  same one. It moved to `sqllex`, which already exists because seven copies of a
+  SQL scanner were once six too many.
 
 ## [1.10.0] - 2026-08-26
 

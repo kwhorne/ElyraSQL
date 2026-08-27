@@ -68,6 +68,11 @@ enum Command {
         #[arg(long, env = "ELYRASQL_BINLOG")]
         binlog: Option<PathBuf>,
 
+        /// How often to bring `CREATE EMBEDDING INDEX` targets up to date, in
+        /// seconds (0 = never). Idle unless an embeddings provider is configured.
+        #[arg(long, env = "ELYRASQL_EMBEDDING_SWEEP_SECS", default_value_t = 30)]
+        embedding_sweep_secs: u64,
+
         /// Semi-synchronous replication: wait up to this many ms for a replica to
         /// acknowledge each commit before returning (0 = asynchronous).
         #[arg(long, env = "ELYRASQL_SEMI_SYNC_MS", default_value_t = 0)]
@@ -275,6 +280,7 @@ async fn run() -> anyhow::Result<()> {
             audit_log,
             replication_listen,
             binlog,
+            embedding_sweep_secs,
             semi_sync_ms,
             sync_replicas,
             sync_strict,
@@ -304,6 +310,15 @@ async fn run() -> anyhow::Result<()> {
             // Before any connection is accepted, so no query sees a half-migrated
             // keyspace. A database whose indexed text is pure ASCII is untouched.
             engine.migrate_collation().await?;
+
+            // Embedding indexes are kept in step by a periodic sweep. It reads
+            // its work from the data rather than from a write hook, so it also
+            // covers rows that arrived by restore, binlog replay or replication.
+            if embedding_sweep_secs > 0 {
+                engine
+                    .spawn_embedding_sweeper(std::time::Duration::from_secs(embedding_sweep_secs));
+                tracing::debug!(secs = embedding_sweep_secs, "embedding sweeper started");
+            }
 
             let mut entries: Vec<(String, String, elyra_core::Privilege)> = Vec::new();
             if let Some(u) = user {
