@@ -43,7 +43,7 @@ workload — served over the protocol your stack already knows.
 **[→ Get started in 60 seconds](#quick-start)** &nbsp;·&nbsp;
 **[→ Full documentation](https://elyracode.com/docs/sql-server)**
 
-> **Stable release: v1.10.0.** A broad, MySQL-compatible SQL engine: full
+> **Stable release: v1.11.0.** A broad, MySQL-compatible SQL engine: full
 > DDL/DML, all join types (INNER/LEFT/RIGHT/FULL/CROSS/NATURAL/USING, streamed for large
 > analytical joins — including non-equi and cross joins, which never buffer the
 > product), subqueries (correlated too), CTEs (incl. `WITH RECURSIVE`),
@@ -57,8 +57,10 @@ workload — served over the protocol your stack already knows.
 > is guarded by wire, property, fuzz, crash-recovery and concurrent soak/chaos
 > tests, and by a query battery run differentially against MySQL 8.4 on every
 > pull request. Laravel migrations and Eloquent run unmodified. The same engine
-> also runs [in-process](docs/embedded.md), as a library, with no server at all.
-> See the [changelog](CHANGELOG.md).
+> also runs [in-process](docs/embedded.md), as a library, with no server at all,
+> keeps [embeddings in step](docs/sql/vector-search.md) with the text they came
+> from, and [serves a schema to an AI agent](docs/mcp.md) over MCP. See the
+> [changelog](CHANGELOG.md).
 
 ## Why ElyraSQL
 
@@ -188,7 +190,7 @@ mysql -h 127.0.0.1 -P 3307 -u root -p
 SELECT 1;
 SELECT 1 + 1 AS two;
 SELECT 'hei fra ElyraSQL' AS msg;
-SELECT VERSION();   -- 8.0.12-ElyraSQL-1.10.0
+SELECT VERSION();   -- 8.0.12-ElyraSQL-1.11.0
 ```
 
 ## Embedded (no server)
@@ -218,6 +220,20 @@ cc app.c -I crates/elyra-embed-capi/include -L target/release -lelyrasql -o app
 
 See the [embedded guide](docs/embedded.md) for the one-writer rule, the blocking
 contract and what a server still gives you that in-process does not.
+
+## AI agents (MCP)
+
+Point an agent at a database file and it gets schema introspection and SQL —
+no server, no port, no driver:
+
+```bash
+elyrasql mcp --data app.edb
+```
+
+Read-only by default: writes are refused by the engine's privilege check, not by
+scanning the SQL for dangerous keywords. `--allow-writes` permits
+`INSERT`/`UPDATE`/`DELETE` while `DROP TABLE` and `GRANT` stay refused. See the
+[MCP guide](docs/mcp.md).
 
 ## Configuration
 
@@ -278,7 +294,7 @@ tar xzf elyrasql.tar.gz
 Multi-arch image (amd64 + arm64) on GHCR:
 
 ```bash
-docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.10.0
+docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.11.0
 # with auth + a persistent volume:
 docker run -p 3307:3307 -v elyra:/var/lib/elyrasql \
   -e ELYRASQL_USER=root -e ELYRASQL_PASSWORD=secret \

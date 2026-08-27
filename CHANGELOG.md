@@ -6,6 +6,16 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.11.0] - 2026-08-27
+
+**Two ways to reach the database that did not exist before.** An embedding index
+lets the database keep a vector column in step with a text column by itself, and
+`elyrasql mcp` serves a schema and its data to an AI agent over stdio. Two fixes
+under them, one of which lifts a limit MySQL never had.
+
+No on-disk format change and no upgrade steps: a 1.9.x or 1.10.0 database opens
+in 1.11.0 unchanged, and a 1.11.0 database still opens in either.
+
 ### Added
 
 - **`elyrasql mcp`: serve a database to an AI agent.** A Model Context Protocol
@@ -30,6 +40,34 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
   Implemented without a new dependency, and tested by driving the real binary
   over real stdio.
+
+- **Declarative embedding indexes.** `CREATE EMBEDDING INDEX ... ON t(text) INTO
+  vec USING MODEL '...'` makes the database keep a vector column in step with a
+  text column, so an application stops orchestrating re-embedding:
+
+  ```sql
+  CREATE EMBEDDING INDEX body_ix ON articles(body) INTO embedding
+      USING MODEL 'text-embedding-3-small';
+  INSERT INTO articles (body) VALUES ('data protection law');  -- that is all
+  ```
+
+  What needs embedding is derived from the data — a hash of the `(model, text)`
+  pair against the hash recorded when the vector was written — rather than from a
+  write hook, so bulk loads, restores, binlog replay and replication apply are
+  covered too. Nothing in the `INSERT`/`UPDATE` path changed.
+
+  Writing back runs in a serializable transaction, so an `UPDATE` landing while
+  the provider is being called is never overwritten; the row stays pending and is
+  picked up next sweep. Failures back off exponentially and dead-letter after
+  five attempts, which `SHOW EMBEDDING INDEXES` reports as `Retrying`/`Failed`.
+  Editing the text clears the state. Sweeps are driven by
+  `--embedding-sweep-secs` (30 by default, `0` disables) and do nothing at all
+  while no provider is configured.
+
+  Verified end to end against a real provider (Ollama, `all-minilm`, 384
+  dimensions) over the MySQL protocol: three semantic queries sharing **no words**
+  with their target each ranked it first.
+
 
 ### Fixed
 
@@ -64,36 +102,11 @@ All notable changes to ElyraSQL are documented here. The format is based on
   does. A chain past the limit is refused with a parse error rather than
   aborting the process; a server runs 2,000 branches, up from 64.
 
-### Added
-
-- **Declarative embedding indexes.** `CREATE EMBEDDING INDEX ... ON t(text) INTO
-  vec USING MODEL '...'` makes the database keep a vector column in step with a
-  text column, so an application stops orchestrating re-embedding:
-
-  ```sql
-  CREATE EMBEDDING INDEX body_ix ON articles(body) INTO embedding
-      USING MODEL 'text-embedding-3-small';
-  INSERT INTO articles (body) VALUES ('data protection law');  -- that is all
-  ```
-
-  What needs embedding is derived from the data — a hash of the `(model, text)`
-  pair against the hash recorded when the vector was written — rather than from a
-  write hook, so bulk loads, restores, binlog replay and replication apply are
-  covered too. Nothing in the `INSERT`/`UPDATE` path changed.
-
-  Writing back runs in a serializable transaction, so an `UPDATE` landing while
-  the provider is being called is never overwritten; the row stays pending and is
-  picked up next sweep. Failures back off exponentially and dead-letter after
-  five attempts, which `SHOW EMBEDDING INDEXES` reports as `Retrying`/`Failed`.
-  Editing the text clears the state. Sweeps are driven by
-  `--embedding-sweep-secs` (30 by default, `0` disables) and do nothing at all
-  while no provider is configured.
-
-  Verified end to end against a real provider (Ollama, `all-minilm`, 384
-  dimensions) over the MySQL protocol: three semantic queries sharing **no words**
-  with their target each ranked it first.
-
-### Fixed
+  That budget is shared with expression depth, so a statement that combines
+  thousands of operators *and* thousands of set-operation branches can now be
+  refused where only one of the two used to count. Both halves genuinely deepen
+  the same tree, so counting them together is the honest accounting -- but it is
+  the one shape this release accepts less of than 1.10.0 did.
 
 - **A database file is released when its handle is dropped, not shortly after
   (#110).** The storage writer runs on a detached thread that holds the storage
@@ -124,6 +137,7 @@ All notable changes to ElyraSQL are documented here. The format is based on
   `Authorization` header and response parsing had no coverage at all — every test
   stopped at the function boundary. There is now an integration test with a real
   socket and a real HTTP exchange.
+
 
 ### Internal
 
