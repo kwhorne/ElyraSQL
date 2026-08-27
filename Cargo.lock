@@ -498,6 +498,7 @@ dependencies = [
  "elyra-engine",
  "elyra-storage",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

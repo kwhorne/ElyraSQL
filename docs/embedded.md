@@ -47,12 +47,22 @@ time — the same single-writer rule SQLite follows. Within that process, a
 `Database` is shared freely across threads, and each unit of work takes its own
 `connect()` for its own session state.
 
-Opening a file another live handle holds fails immediately. Opening one whose
-handle has just closed waits briefly first: the storage writer runs on a
-detached thread that releases the file lock a moment after the handle is
-dropped, so an immediate reopen would otherwise race it. `Config::lock_wait`
-sets that budget, and `Some(Duration::ZERO)` turns it off for a caller who wants
-to *detect* a conflict rather than wait one out.
+Opening a file another live handle holds fails immediately, with a distinct
+`Error::StorageLocked` rather than a generic storage error, so a caller can act
+on it.
+
+**Closing is deterministic.** The storage writer runs on its own thread and holds
+the file until it observes its job queue close; dropping a `Database` waits for
+that, so reopening the same path immediately afterwards is safe rather than a
+race. This is what lets a test suite open and close the same file in a loop.
+
+A `Connection` that outlives the `Database` it came from keeps the file open —
+the writer cannot exit while any handle survives. The drop reports it and returns
+rather than hanging.
+
+`Config::lock_wait` bounds a retry for the remaining case: a file held by
+*another process* that may be shutting down. `Some(Duration::ZERO)` disables it
+for a caller who wants to *detect* a conflict rather than wait one out.
 
 ## Everything blocks
 

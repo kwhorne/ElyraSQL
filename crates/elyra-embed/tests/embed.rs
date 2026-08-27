@@ -320,11 +320,48 @@ fn a_concurrently_held_file_still_conflicts() {
         ..Config::default()
     };
     let err = Database::open_with(&path, config).unwrap_err();
+    // A distinct variant, not a message to grep: callers branch on this.
     assert!(
-        format!("{err}").contains("Cannot acquire lock"),
+        matches!(err, Error::StorageLocked(_)),
         "expected a lock conflict, got: {err}"
     );
 
     drop(held);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The close is deterministic, not merely retried into working.
+///
+/// With the retry budget set to zero, an immediate reopen has nothing to fall
+/// back on: it succeeds only because dropping the handle waited for the storage
+/// writer to release the file. Before that wait existed, this loop failed on the
+/// second iteration.
+#[test]
+fn reopening_works_with_the_retry_disabled() {
+    let dir = std::env::temp_dir().join(format!("elyra_embed_nowait_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("db.edb");
+    let no_retry = || Config {
+        lock_wait: Some(Duration::ZERO),
+        ..Config::default()
+    };
+
+    for i in 0..5 {
+        let db =
+            Database::open_with(&path, no_retry()).unwrap_or_else(|e| panic!("round {i}: {e}"));
+        let conn = db.connect();
+        if i == 0 {
+            conn.execute("CREATE TABLE t (id INT PRIMARY KEY)").unwrap();
+        }
+        conn.execute(&format!("INSERT INTO t VALUES ({i})"))
+            .unwrap();
+    }
+
+    let db = Database::open_with(&path, no_retry()).unwrap();
+    assert_eq!(
+        db.connect().query("SELECT COUNT(*) FROM t").unwrap().rows[0][0],
+        Value::Int(5)
+    );
+    drop(db);
     std::fs::remove_dir_all(&dir).ok();
 }
