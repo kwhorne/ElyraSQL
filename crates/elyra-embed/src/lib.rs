@@ -41,9 +41,14 @@
 //! # One writer per file
 //!
 //! The database file is locked exclusively, so one process holds it at a time —
-//! the same rule SQLite's single-writer model follows. Opening a file that
-//! another live handle holds fails; opening one whose handle has just closed
-//! waits briefly, for the reason described on [`DEFAULT_LOCK_WAIT`].
+//! the same rule SQLite's single-writer model follows. Opening a file another
+//! live handle holds fails with [`Error::StorageLocked`].
+//!
+//! Closing is deterministic: dropping a [`Database`] waits for the storage
+//! writer to release the file, so reopening the same path immediately afterwards
+//! is safe rather than a race. A [`Connection`] that outlives its `Database`
+//! keeps the file, and the drop reports that rather than hanging — see
+//! [`CLOSE_WAIT`].
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -55,21 +60,23 @@ use tokio::runtime::Runtime;
 
 pub use elyra_core::{Collation, ColumnDef, ColumnType, Error, Privilege, Result, Schema, Value};
 
-/// How long [`Database::open`] retries while the database file is still locked.
+/// How long [`Database::open`] retries while the file is held by *another
+/// process* that may be shutting down.
 ///
-/// The storage writer runs on a detached OS thread that holds the storage handle
-/// (and therefore the file lock) until it observes its job queue close. Nothing
-/// synchronises that back to whoever dropped the handle, so the lock outlives the
-/// [`Database`] by a short, unbounded-in-principle interval. A server opens its
-/// file once per process and never sees this; an embedded caller that opens and
-/// closes the same file — a test suite, above all — sees it constantly.
+/// Within one process no wait is needed: dropping a [`Database`] blocks until the
+/// storage writer has released the file (see [`CLOSE_WAIT`]), so an immediate
+/// reopen of the same path is deterministic rather than a race.
 ///
-/// Retrying converts that race into a wait. It does not paper over a genuine
-/// conflict: two handles really held at once still fail, just after this long.
-///
-/// A deterministic close at the storage layer would remove the need for this
-/// entirely; tracked in <https://github.com/kwhorne/ElyraSQL/issues/110>.
+/// Retrying does not paper over a genuine conflict: a file really held for the
+/// duration still fails, just after this long.
 pub const DEFAULT_LOCK_WAIT: Duration = Duration::from_secs(2);
+
+/// How long dropping a [`Database`] waits for the file to be released.
+///
+/// Exceeding it means a [`Connection`] outlived the `Database` it came from --
+/// the writer cannot exit while any handle survives. That is a caller bug rather
+/// than a slow disk, so it is logged and the drop returns instead of hanging.
+pub const CLOSE_WAIT: Duration = Duration::from_secs(5);
 
 /// Rows pulled from a stream per step while materialising a result set. Matches
 /// the engine's own scan chunk, so a batch boundary never splits a storage read.
@@ -181,8 +188,11 @@ pub struct Config {
 /// call [`Database::connect`] per unit of work that needs its own session state
 /// (current database, transaction, user variables).
 pub struct Database {
-    engine: Engine,
+    /// `Option` only so [`Drop`] can release the engine before waiting for the
+    /// file: the writer cannot exit while a handle on it survives.
+    engine: Option<Engine>,
     rt: Arc<Runtime>,
+    closed: elyra_storage::CloseWaiter,
     path: PathBuf,
     /// Paths to delete on drop, for [`Database::temporary`].
     cleanup: Option<Vec<PathBuf>>,
@@ -211,9 +221,11 @@ impl Database {
         // ASCII is untouched.
         rt.block_on(engine.migrate_collation())?;
 
+        let closed = engine.db().close_waiter();
         Ok(Self {
-            engine,
+            engine: Some(engine),
             rt: Arc::new(rt),
+            closed,
             path,
             cleanup: None,
         })
@@ -254,12 +266,17 @@ impl Database {
     /// grants resolve. Useful for testing an application's own grant model.
     pub fn connect_as(&self, privilege: Privilege, user: &str) -> Connection {
         Connection {
-            engine: self.engine.clone(),
+            engine: self.engine().clone(),
             rt: self.rt.clone(),
-            session: self.engine.session(),
+            session: self.engine().session(),
             privilege,
             user: user.to_string(),
         }
+    }
+
+    /// The engine, which is always present until [`Drop`] takes it.
+    fn engine(&self) -> &Engine {
+        self.engine.as_ref().expect("engine is taken only in Drop")
     }
 
     /// Path of the database file.
@@ -272,7 +289,7 @@ impl Database {
     pub fn backup_to(&self, dest: impl AsRef<Path>) -> Result<u64> {
         reject_ambient_runtime("Database::backup_to")?;
         let dest = dest.as_ref().to_path_buf();
-        self.rt.block_on(self.engine.db().backup_to(dest))
+        self.rt.block_on(self.engine().db().backup_to(dest))
     }
 }
 
@@ -287,6 +304,20 @@ impl std::fmt::Debug for Database {
 
 impl Drop for Database {
     fn drop(&mut self) {
+        // Release the engine first, then wait for the storage writer to finish
+        // and let go of the file. Without the wait, the lock outlives this
+        // handle and an immediate reopen of the same path races the writer's
+        // exit -- which is exactly what a test suite does. It also has to happen
+        // before the temp file below is removed, so the delete cannot land while
+        // the writer still holds it open.
+        self.engine.take();
+        if !self.closed.wait(CLOSE_WAIT) {
+            tracing::warn!(
+                path = %self.path.display(),
+                "database file still held after close; a Connection outlived its Database"
+            );
+        }
+
         let Some(paths) = self.cleanup.take() else {
             return;
         };
@@ -452,16 +483,9 @@ fn open_locked(path: &Path, binlog: Option<PathBuf>, lock_wait: Option<Duration>
     }
 }
 
-/// Whether an open failed because the file lock was held.
-///
-/// Matched on the message because that is all there is: the lock is redb's, and
-/// it reaches us as an opaque string inside [`Error::Storage`]. Distinguishing it
-/// structurally would mean a storage-level error kind, which is the same change
-/// that would let a caller wait for the writer thread deterministically and make
-/// this retry unnecessary in the first place — see
-/// <https://github.com/kwhorne/ElyraSQL/issues/110>.
+/// Whether an open failed because the file was held by another handle.
 fn is_lock_conflict(e: &Error) -> bool {
-    matches!(e, Error::Storage(msg) if msg.contains("Cannot acquire lock"))
+    matches!(e, Error::StorageLocked(_))
 }
 
 fn build_runtime(config: &Config) -> Result<Runtime> {

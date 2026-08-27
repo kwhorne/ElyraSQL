@@ -15,7 +15,7 @@
 
 pub mod binlog;
 mod db;
-pub use db::{Consensus, Db, Validation, WriteEvent, WriteOp};
+pub use db::{CloseWaiter, Consensus, Db, Validation, WriteEvent, WriteOp};
 
 use std::path::Path;
 use std::sync::Arc;
@@ -276,7 +276,14 @@ impl Storage {
     /// Open (or create) the single ElyraSQL database file at `path`.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let pathbuf = path.as_ref().to_path_buf();
-        let db = Database::create(&pathbuf).map_err(|e| Error::Storage(e.to_string()))?;
+        let db = Database::create(&pathbuf).map_err(|e| match e {
+            // redb reports this as its own variant, so the distinction survives
+            // without anyone matching on the message text.
+            redb::DatabaseError::DatabaseAlreadyOpen => {
+                Error::StorageLocked(pathbuf.display().to_string())
+            }
+            other => Error::Storage(other.to_string()),
+        })?;
         // Ensure the KV table exists so first reads don't fail.
         let wtx = db
             .begin_write()

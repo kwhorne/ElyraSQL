@@ -18,3 +18,6 @@ elyra-storage.workspace = true
 # needs a runtime with a blocking pool. This crate owns one so the caller does
 # not have to know that.
 tokio = { workspace = true }
+
+# One warning, on a close that a caller bug made incomplete.
+tracing.workspace = true

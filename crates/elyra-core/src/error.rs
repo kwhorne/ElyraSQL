@@ -60,6 +60,15 @@ pub enum Error {
     #[error("storage error: {0}")]
     Storage(String),
 
+    /// The database file is held by another handle, in this process or another.
+    ///
+    /// Distinct from [`Error::Storage`] because callers act on it: an embedded
+    /// caller waits and retries, a server reports a configuration mistake. It
+    /// used to be indistinguishable without matching on the storage engine's
+    /// message text.
+    #[error("database file is locked by another handle: {0}")]
+    StorageLocked(String),
+
     #[error("query error: {0}")]
     Query(String),
 
@@ -118,6 +127,7 @@ impl Error {
             Error::DataTooLong(_) => 1406, // ER_DATA_TOO_LONG
             Error::Unsupported(_) => 1235, // ER_NOT_SUPPORTED_YET
             Error::Conflict(_) => 1213,    // ER_LOCK_DEADLOCK (serialization failure)
+            Error::StorageLocked(_) => 1015, // ER_CANT_LOCK
             Error::Duplicate(DuplicateError::ColumnName, _) => 1060, // ER_DUP_FIELDNAME
             Error::Duplicate(DuplicateError::Entry, _) => 1062, // ER_DUP_ENTRY
             Error::ForeignKey(_) => 1452,  // ER_NO_REFERENCED_ROW

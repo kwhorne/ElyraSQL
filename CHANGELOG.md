@@ -6,6 +6,33 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **A database file is released when its handle is dropped, not shortly after
+  (#110).** The storage writer runs on a detached thread that holds the storage
+  -- and so the file lock -- until it observes its job queue close, with nothing
+  synchronising that back to whoever dropped the handle. A server opens its file
+  once per process and never noticed; opening and closing the same file in a
+  loop, which is what an embedded test suite does, hit it every time:
+
+  ```
+  storage error: Database already open. Cannot acquire lock.
+  ```
+
+  `Db::close_waiter()` returns a handle that waits for the release, and dropping
+  an `elyra_embed::Database` now uses it. Reopening the same path immediately is
+  deterministic rather than retried into working -- pinned by a test that runs
+  the loop with the retry budget set to zero.
+
+  A handle that cannot be released because a `Connection` outlived its
+  `Database` is reported rather than waited on indefinitely.
+
+- **A held file lock is its own error kind.** `Error::StorageLocked` carries the
+  path and maps to MySQL 1015 (`ER_CANT_LOCK`), where before it was an opaque
+  `Error::Storage` string. `elyra-embed` had to match on the storage engine's
+  message text to recognise it, which is the pattern removed from the catalog
+  errors in 1.9.6; it now matches on the variant.
+
 ## [1.10.0] - 2026-08-26
 
 **ElyraSQL now runs without a server.** The engine opens a database file

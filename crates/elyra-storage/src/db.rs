@@ -145,6 +145,70 @@ struct WriteJob {
     ack: oneshot::Sender<Result<()>>,
 }
 
+/// Set by the writer thread as it exits, after its `Arc<Storage>` is gone.
+#[derive(Default)]
+struct WriterExit {
+    done: std::sync::Mutex<bool>,
+    woken: std::sync::Condvar,
+}
+
+impl WriterExit {
+    fn signal(&self) {
+        *self.done.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        self.woken.notify_all();
+    }
+}
+
+/// Waits for a database file to be fully released.
+///
+/// The writer runs on a detached thread that holds the storage -- and therefore
+/// the file lock -- until it observes its job queue close. Dropping every [`Db`]
+/// clone starts that, but nothing about the drop tells you when it finished, so
+/// an immediate reopen of the same path could race the thread's exit. A server
+/// opens its file once per process and never notices; anything that opens and
+/// closes the same file repeatedly notices constantly.
+///
+/// Take one *before* dropping the last `Db`, then wait on it after:
+///
+/// ```no_run
+/// # fn f(db: elyra_storage::Db) {
+/// let closed = db.close_waiter();
+/// drop(db);
+/// closed.wait(std::time::Duration::from_secs(5));
+/// # }
+/// ```
+pub struct CloseWaiter {
+    exit: Arc<WriterExit>,
+}
+
+impl CloseWaiter {
+    /// Block until the file is released, or `timeout` elapses.
+    ///
+    /// Returns whether it was released. `false` means some `Db` clone is still
+    /// alive -- the writer cannot exit while a sender exists -- which is a
+    /// caller bug rather than a slow disk, and worth reporting as one.
+    pub fn wait(&self, timeout: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut done = self.exit.done.lock().unwrap_or_else(|e| e.into_inner());
+        while !*done {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            let (guard, result) = self
+                .exit
+                .woken
+                .wait_timeout(done, left)
+                .unwrap_or_else(|e| e.into_inner());
+            done = guard;
+            if result.timed_out() && !*done {
+                return false;
+            }
+        }
+        true
+    }
+}
+
 /// Shareable, high-concurrency database handle.
 #[derive(Clone)]
 pub struct Db {
@@ -154,6 +218,9 @@ pub struct Db {
     id: u64,
     storage: Arc<Storage>,
     writer: mpsc::Sender<WriteJob>,
+    /// Signalled once the writer thread has exited and released its handle on
+    /// the storage. See [`Db::close_waiter`].
+    writer_exit: Arc<WriterExit>,
     lsn: Arc<AtomicU64>,
     repl_tx: broadcast::Sender<Arc<WriteEvent>>,
     /// Per-replica highest acknowledged LSN (keyed by a registration id), for
@@ -236,9 +303,17 @@ impl Db {
         // serialising here (and group-committing) is the fast path, not a
         // bottleneck.
         let writer_storage = storage.clone();
+        let writer_exit = Arc::new(WriterExit::default());
+        let exit_signal = writer_exit.clone();
         thread::Builder::new()
             .name("elyra-writer".into())
-            .spawn(move || writer_loop(writer_storage, rx, repl))
+            .spawn(move || {
+                // `writer_storage` is moved in, so it is dropped as this returns
+                // -- before the signal. A waiter that sees the signal therefore
+                // sees a released file, not one about to be released.
+                writer_loop(writer_storage, rx, repl);
+                exit_signal.signal();
+            })
             .map_err(Error::Io)?;
 
         // Relaxed (Eventual) durability: commits return before the fsync for
@@ -269,6 +344,7 @@ impl Db {
             id,
             storage,
             writer: tx,
+            writer_exit,
             lsn,
             repl_tx,
             replicas,
@@ -457,6 +533,15 @@ impl Db {
     /// Subscribe to the stream of committed write-sets (for replication).
     pub fn repl_subscribe(&self) -> broadcast::Receiver<Arc<WriteEvent>> {
         self.repl_tx.subscribe()
+    }
+
+    /// A handle that waits for this database's file to be released.
+    ///
+    /// Take it before dropping the last [`Db`] clone; see [`CloseWaiter`].
+    pub fn close_waiter(&self) -> CloseWaiter {
+        CloseWaiter {
+            exit: self.writer_exit.clone(),
+        }
     }
 
     /// Take an MVCC read snapshot of the current committed state.
@@ -926,5 +1011,97 @@ fn apply_job_group(storage: &Arc<Storage>, jobs: Vec<WriteJob>, repl: &mut Repl)
                 let _ = job.ack.send(Err(Error::Storage(e.to_string())));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod close_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn temp_path(tag: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "elyra_close_{tag}_{}_{}.edb",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        p
+    }
+
+    /// The defect this closes: dropping a `Db` starts the writer's exit but says
+    /// nothing about when it finished, so an immediate reopen raced the thread
+    /// and failed. Opening and closing the same file in a loop -- what an
+    /// embedded test suite does -- hit it every time.
+    #[tokio::test]
+    async fn a_file_reopens_immediately_after_a_waited_close() {
+        let path = temp_path("reopen");
+
+        for round in 0..5u8 {
+            let db = Db::open(&path).expect("open");
+            db.commit(vec![(b"data::t::1".to_vec(), vec![round])], vec![])
+                .await
+                .unwrap();
+            let closed = db.close_waiter();
+            drop(db);
+            assert!(
+                closed.wait(Duration::from_secs(5)),
+                "round {round}: the writer should have released the file"
+            );
+        }
+
+        let db = Db::open(&path).expect("final open");
+        assert_eq!(db.get(b"data::t::1".to_vec()).await.unwrap(), Some(vec![4]));
+        let closed = db.close_waiter();
+        drop(db);
+        closed.wait(Duration::from_secs(5));
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The waiter reports rather than hangs when a clone is still alive: the
+    /// writer cannot exit while any sender exists, and that is a caller bug.
+    #[tokio::test]
+    async fn waiting_while_a_clone_lives_times_out() {
+        let path = temp_path("clone");
+        let db = Db::open(&path).expect("open");
+        let survivor = db.clone();
+
+        let closed = db.close_waiter();
+        drop(db);
+        assert!(
+            !closed.wait(Duration::from_millis(200)),
+            "a live clone keeps the file, so the wait must report failure"
+        );
+
+        drop(survivor);
+        assert!(
+            closed.wait(Duration::from_secs(5)),
+            "and succeed once the last clone is gone"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A second handle to a live file is a distinct, structured error, so a
+    /// caller can act on it without reading the storage engine's message text.
+    #[tokio::test]
+    async fn a_second_handle_reports_storage_locked() {
+        let path = temp_path("locked");
+        let held = Db::open(&path).expect("open");
+
+        match Db::open(&path) {
+            Err(elyra_core::Error::StorageLocked(reported)) => {
+                assert!(reported.contains("elyra_close_locked"), "got {reported}");
+            }
+            Err(other) => panic!("expected StorageLocked, got {other}"),
+            Ok(_) => panic!("a second handle to a live file must not open"),
+        }
+
+        let closed = held.close_waiter();
+        drop(held);
+        closed.wait(Duration::from_secs(5));
+        std::fs::remove_file(&path).ok();
     }
 }
