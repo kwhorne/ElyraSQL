@@ -21,6 +21,10 @@ anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
+# JSON-RPC framing for `elyrasql mcp`.
+serde_json = "1"
+
 [dev-dependencies]
+serde_json = "1"
 mysql_async = { version = "0.37", default-features = false, features = ["minimal"] }
 tokio = { workspace = true }

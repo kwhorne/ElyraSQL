@@ -474,6 +474,7 @@ dependencies = [
  "elyra-server",
  "elyra-storage",
  "mysql_async",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
