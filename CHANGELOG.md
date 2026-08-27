@@ -6,6 +6,39 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **A flat `UNION` chain no longer fails at 65 branches (#112).** Set operations
+  parse left-associatively, so `A UNION B UNION C` is `SetOp(SetOp(A, B), C)`.
+  Execution recursed into that, costing one nesting level per branch until
+  `MAX_QUERY_NESTING` refused the statement:
+
+  ```
+  ERROR 1105 (HY000): query error: query nesting exceeds 64 levels
+  ```
+
+  MySQL 8.4 runs a thousand branches without complaint, and generated SQL emits
+  one branch per entity as a matter of course. This was found by a script that
+  built one `SELECT COUNT(*)` per table: fine at 25 tables, refused at 90.
+
+  A `UNION` chain now runs as a flat list. Uniform chains only -- the walk stops
+  at any branch whose operator or quantifier differs, because
+  `(A UNION B) UNION ALL C` is neither a three-way `ALL` nor a three-way
+  `DISTINCT`, and `INTERSECT`/`EXCEPT` are not associative the way `UNION` is.
+  Both keep the pairwise path and their existing results, checked against MySQL
+  8.4 across fifteen shapes including mixed operators, mixed quantifiers,
+  parenthesised sub-chains, `ORDER BY`/`LIMIT`/`OFFSET`, NULLs and collation.
+
+  The branch queries are also built field by field rather than by cloning the
+  statement, which previously copied the entire chain once per branch --
+  quadratic in the branch count, and the first thing to overflow the stack,
+  about three times sooner than parsing the same statement does.
+
+  Set-operation keywords now count toward the pre-parse depth guard, since
+  parsing and dropping the tree still recurse even though executing it no longer
+  does. A chain past the limit is refused with a parse error rather than
+  aborting the process; a server runs 2,000 branches, up from 64.
+
 ### Added
 
 - **Declarative embedding indexes.** `CREATE EMBEDDING INDEX ... ON t(text) INTO

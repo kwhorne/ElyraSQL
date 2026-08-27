@@ -2899,6 +2899,14 @@ fn is_operator_keyword(k: Keyword) -> bool {
             | Keyword::BETWEEN
             | Keyword::DIV
             | Keyword::MOD
+            // Set operations deepen the AST exactly as an infix operator does:
+            // they parse left-associatively, so `A UNION B UNION C` is
+            // `SetOp(SetOp(A, B), C)`. Execution no longer recurses per branch,
+            // but parsing, cloning and dropping that tree still do, and this
+            // guard is the only thing that runs *before* the parser sees it.
+            | Keyword::UNION
+            | Keyword::INTERSECT
+            | Keyword::EXCEPT
     )
 }
 
@@ -5118,5 +5126,133 @@ mod parse_dml_limit_utf8 {
                 .map(|parsed| (parsed.base_sql, parsed.limit)),
             Some(("UPDATE t SET x=1".into(), 5))
         );
+    }
+}
+
+#[cfg(test)]
+mod set_operation_chain_tests {
+    use super::{guard_sql_complexity, Engine, Privilege, QueryResult};
+    use elyra_core::Value;
+
+    async fn rows(sql: &str) -> Vec<Vec<Value>> {
+        let engine = Engine::new(elyra_storage::Db::in_memory().unwrap());
+        let session = engine.session();
+        let mut results = engine
+            .execute(sql, Privilege::Admin, &session)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+        match results.remove(0) {
+            QueryResult::Rows(mut stream) => {
+                let mut out = Vec::new();
+                loop {
+                    let batch = stream.next_batch(4096).await.unwrap();
+                    if batch.is_empty() {
+                        break;
+                    }
+                    out.extend(batch);
+                }
+                out
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    fn chain(n: usize, op: &str) -> String {
+        (0..n)
+            .map(|i| format!("SELECT {i}"))
+            .collect::<Vec<_>>()
+            .join(op)
+    }
+
+    /// The reported bug: a flat chain died at 65 branches because each one cost
+    /// a level of execution recursion. Branches are independent, so the count is
+    /// not a real limit on the work.
+    #[tokio::test]
+    async fn a_long_flat_union_chain_runs() {
+        // Kept to 200. The depth limit allows far more -- a server runs 2,000 --
+        // but every deep construct is heavier on a debug test thread's stack
+        // than on a server worker's, and that is not specific to set operations:
+        // a 500-deep `1+1+1...` expression, well inside the same limit, behaves
+        // the same way. The large-chain ceiling is verified against a running
+        // server instead, where it belongs.
+        for n in [65usize, 150, 200] {
+            let out = rows(&chain(n, " UNION ALL ")).await;
+            assert_eq!(out.len(), n, "{n} branches");
+            assert_eq!(out[0][0], Value::Int(0));
+            assert_eq!(out[n - 1][0], Value::Int((n - 1) as i64));
+        }
+    }
+
+    /// Flattening dedups once across the whole chain instead of pairwise. Set
+    /// union is associative, so the answer must be identical.
+    #[tokio::test]
+    async fn a_long_distinct_chain_dedups_across_every_branch() {
+        let sql = std::iter::repeat_n("SELECT 7", 200)
+            .collect::<Vec<_>>()
+            .join(" UNION ");
+        let out = rows(&sql).await;
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0][0], Value::Int(7));
+    }
+
+    /// A chain is only flattened while the quantifier is identical all the way
+    /// down. `(A UNION B) UNION ALL C` keeps A's duplicates out but not C's,
+    /// which is neither a three-way ALL nor a three-way DISTINCT. Values checked
+    /// against MySQL 8.4.
+    #[tokio::test]
+    async fn mixed_quantifiers_keep_their_pairwise_meaning() {
+        // (1 UNION 1) -> {1}, then UNION ALL 1 -> [1, 1].
+        let out = rows("SELECT 1 UNION SELECT 1 UNION ALL SELECT 1").await;
+        assert_eq!(out.len(), 2);
+
+        // (1 UNION ALL 1) -> [1, 1], then UNION 2 dedups the lot -> {1, 2}.
+        let out = rows("SELECT 1 UNION ALL SELECT 1 UNION SELECT 2").await;
+        assert_eq!(out.len(), 2);
+    }
+
+    /// INTERSECT and EXCEPT are not associative the way UNION is, so they keep
+    /// the pairwise path. Values checked against MySQL 8.4.
+    #[tokio::test]
+    async fn mixed_operators_are_unaffected() {
+        // `(1 UNION 2) EXCEPT 1` -> {2}: same precedence, left to right.
+        assert_eq!(
+            rows("SELECT 1 UNION SELECT 2 EXCEPT SELECT 1").await.len(),
+            1
+        );
+        // `1 UNION ALL (2 INTERSECT 2)` -> [1, 2]: INTERSECT binds tighter.
+        assert_eq!(
+            rows("SELECT 1 UNION ALL SELECT 2 INTERSECT SELECT 2")
+                .await
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn the_outer_clauses_still_apply_to_the_whole_chain() {
+        let out =
+            rows("SELECT 3 UNION ALL SELECT 1 UNION ALL SELECT 2 ORDER BY 1 DESC LIMIT 2").await;
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0][0], Value::Int(3));
+        assert_eq!(out[1][0], Value::Int(2));
+    }
+
+    /// Execution no longer recurses per branch, but parsing, cloning and
+    /// dropping the tree still do, and only this guard runs before the parser
+    /// sees it. Without it a long enough chain aborts the process rather than
+    /// answering — measured: parsing survives about 10,000 branches and the
+    /// limit here is 2,000.
+    #[test]
+    fn a_chain_past_the_depth_limit_is_refused_before_parsing() {
+        assert!(guard_sql_complexity(&chain(2_001, " UNION ALL ")).is_ok());
+        let refused = guard_sql_complexity(&chain(50_000, " UNION ALL "));
+        assert!(refused.is_err(), "a 50,000-branch chain must be refused");
+        assert!(
+            format!("{}", refused.unwrap_err()).contains("deeply nested"),
+            "and say why"
+        );
+        // The same protection for the other two set operators.
+        assert!(guard_sql_complexity(&chain(50_000, " INTERSECT ")).is_err());
+        assert!(guard_sql_complexity(&chain(50_000, " EXCEPT ")).is_err());
     }
 }
