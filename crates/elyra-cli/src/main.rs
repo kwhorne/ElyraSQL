@@ -1,5 +1,7 @@
 //! `elyrasql` — the ElyraSQL server binary.
 
+mod mcp;
+
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
@@ -193,6 +195,20 @@ enum Command {
         force: bool,
     },
     /// Print version and build information.
+    /// Serve this database to an AI agent over the Model Context Protocol,
+    /// speaking JSON-RPC on stdin/stdout. Read-only unless --allow-writes.
+    ///
+    /// The file is opened in-process, so no server may be running against it.
+    Mcp {
+        /// Path to the database file.
+        #[arg(long, env = "ELYRASQL_DATA", default_value = "elyra.edb")]
+        data: PathBuf,
+
+        /// Let the agent modify data. Off by default, and never grants Admin.
+        #[arg(long)]
+        allow_writes: bool,
+    },
+
     Version,
 }
 
@@ -228,14 +244,29 @@ fn main() -> anyhow::Result<()> {
 }
 
 async fn run() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .init();
-
     let cli = Cli::parse();
+
+    // `mcp` owns stdout for the protocol, so its logs go to stderr. Parsing
+    // before the subscriber is set up is what makes that decidable.
+    let filter =
+        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
+    if matches!(cli.command, Command::Mcp { .. }) {
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(std::io::stderr)
+            .init();
+    } else {
+        tracing_subscriber::fmt().with_env_filter(filter).init();
+    }
+
     match cli.command {
+        Command::Mcp { data, allow_writes } => {
+            tracing::info!(?data, allow_writes, "starting MCP server on stdio");
+            let db = Db::open(&data)?;
+            let engine = Engine::new(db);
+            engine.migrate_collation().await?;
+            mcp::Server::new(engine, allow_writes).run().await?;
+        }
         Command::Version => {
             println!(
                 "{} {}",

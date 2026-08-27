@@ -6,6 +6,31 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **`elyrasql mcp`: serve a database to an AI agent.** A Model Context Protocol
+  server over stdio, so an agent can introspect the schema and run SQL with no
+  server, port or driver involved:
+
+  ```bash
+  elyrasql mcp --data app.edb
+  ```
+
+  Three tools -- `list_tables`, `describe_table`, `query` -- returning JSON
+  rather than rendered tables, with `DECIMAL` kept as a string so its scale
+  survives a model reading prices.
+
+  **Read-only by default.** Writes are refused by the engine's privilege check
+  rather than by looking for dangerous keywords in the SQL, which is the only way
+  to refuse them reliably. `--allow-writes` grants `Write`, never `Admin`:
+  `INSERT`/`UPDATE`/`DELETE` become possible while `DROP TABLE`, schema changes
+  and `GRANT` stay refused. Results are truncated at 200 rows by default and
+  always say when they were, since a model that cannot tell a partial answer from
+  a complete one will reason from the partial one.
+
+  Implemented without a new dependency, and tested by driving the real binary
+  over real stdio.
+
 ### Fixed
 
 - **A flat `UNION` chain no longer fails at 65 branches (#112).** Set operations
