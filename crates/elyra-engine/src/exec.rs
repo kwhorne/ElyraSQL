@@ -20313,6 +20313,50 @@ async fn run_subquery_capped(
 
 /// Execute a top-level set operation (`UNION`/`INTERSECT`/`EXCEPT`), applying
 /// the outer query's `ORDER BY` and `LIMIT`/`OFFSET` to the combined result.
+/// The branches of a left-associative `UNION` chain, in source order.
+///
+/// `A UNION B UNION C` parses as `SetOp(SetOp(A, B), C)`, so the chain is found
+/// by walking the left spine. Walking stops at anything that is not a `UNION`
+/// with an **identical** quantifier, and that branch becomes the head of the
+/// list — so a mixed chain still runs, just with the uniform prefix flattened
+/// and the rest handled recursively as before.
+///
+/// The quantifier has to match exactly rather than merely agree on distinctness.
+/// `(A UNION B) UNION ALL C` keeps `A`'s duplicates out but not `C`'s, which is
+/// not the same as either a three-way `ALL` or a three-way `DISTINCT`; and
+/// `BY NAME` changes how columns are matched, not just how rows are deduped.
+///
+/// Always returns at least two branches, since the caller has already matched a
+/// `SetOperation`.
+fn flatten_union_chain<'a>(
+    body: &'a SetExpr,
+    quantifier: &sqlparser::ast::SetQuantifier,
+) -> Vec<&'a SetExpr> {
+    use sqlparser::ast::SetOperator;
+
+    let mut branches = Vec::new();
+    let mut cursor = body;
+    loop {
+        match cursor {
+            SetExpr::SetOperation {
+                op: SetOperator::Union,
+                set_quantifier,
+                left,
+                right,
+            } if set_quantifier == quantifier => {
+                branches.push(right.as_ref());
+                cursor = left.as_ref();
+            }
+            head => {
+                branches.push(head);
+                break;
+            }
+        }
+    }
+    branches.reverse();
+    branches
+}
+
 async fn execute_set_query(
     db: &Session,
     vindex: &VectorRegistry,
@@ -20329,18 +20373,33 @@ async fn execute_set_query(
         return Err(Error::Unsupported("expected a set operation".into()));
     };
 
-    let wrap = |b: &SetExpr| -> SqlQuery {
-        let mut q = query.clone();
-        q.body = Box::new(b.clone());
-        q.with = None;
-        q.order_by = None;
-        q.limit = None;
-        q.offset = None;
-        q
+    // A per-branch query, built by naming every field rather than cloning
+    // `query`. `query.body` *is* the whole chain, so cloning it -- once per
+    // branch, as this used to -- is both quadratic in the branch count and
+    // recursive to its depth: cloning is what overflowed the stack first,
+    // roughly three times sooner than parsing the same statement does. Listing
+    // the fields keeps the chain out of the copy entirely; a field added to
+    // `Query` upstream breaks the build here, which is the right place to
+    // decide about it.
+    //
+    // `with`, `order_by`, `limit` and `offset` belong to the whole set
+    // operation and are applied to the combined result below, so a branch must
+    // not carry them.
+    let branch_query = |b: &SetExpr| -> SqlQuery {
+        SqlQuery {
+            with: None,
+            body: Box::new(b.clone()),
+            order_by: None,
+            limit: None,
+            limit_by: query.limit_by.clone(),
+            offset: None,
+            fetch: query.fetch.clone(),
+            locks: query.locks.clone(),
+            for_clause: query.for_clause.clone(),
+            settings: query.settings.clone(),
+            format_clause: query.format_clause.clone(),
+        }
     };
-
-    let (schema, mut left_rows) = run_subquery_schema(db, vindex, &wrap(left)).await?;
-    let right_rows = run_subquery(db, vindex, &wrap(right)).await?;
 
     let all = matches!(
         set_quantifier,
@@ -20349,39 +20408,73 @@ async fn execute_set_query(
     let key = |r: &[Value]| -> Vec<u8> { Value::row_collation_key(r) };
 
     let mut out: Vec<Vec<Value>> = Vec::new();
-    match op {
-        SetOperator::Union => {
-            if all {
-                out = left_rows;
-                out.extend(right_rows);
-            } else {
-                let mut seen = std::collections::HashSet::new();
-                for r in left_rows.into_iter().chain(right_rows) {
+    let schema;
+
+    // A `UNION` chain is run as a flat list rather than recursively. Set
+    // operations parse left-associatively, so `A UNION B UNION C` is
+    // `SetOp(SetOp(A, B), C)`: recursing into it costs one nesting level per
+    // branch (65 of them exhausted `MAX_QUERY_NESTING`) and re-cloned the whole
+    // left subtree at every level, which is quadratic in the branch count.
+    // Neither is a real limit on the work -- the branches are independent.
+    if matches!(op, SetOperator::Union) {
+        let branches = flatten_union_chain(query.body.as_ref(), set_quantifier);
+        let (first_schema, first_rows) =
+            run_subquery_schema(db, vindex, &branch_query(branches[0])).await?;
+        schema = first_schema;
+
+        if all {
+            out = first_rows;
+            for branch in &branches[1..] {
+                out.extend(run_subquery(db, vindex, &branch_query(branch)).await?);
+            }
+        } else {
+            // One dedup across every branch. Equivalent to the nested pairwise
+            // form: set union is associative, and every branch here shares the
+            // same quantifier.
+            let mut seen = std::collections::HashSet::new();
+            for r in first_rows {
+                if seen.insert(key(&r)) {
+                    out.push(r);
+                }
+            }
+            for branch in &branches[1..] {
+                for r in run_subquery(db, vindex, &branch_query(branch)).await? {
                     if seen.insert(key(&r)) {
                         out.push(r);
                     }
                 }
             }
         }
-        SetOperator::Intersect => {
-            let rset: std::collections::HashSet<Vec<u8>> =
-                right_rows.iter().map(|r| key(r)).collect();
-            let mut seen = std::collections::HashSet::new();
-            for r in left_rows {
-                let k = key(&r);
-                if rset.contains(&k) && (all || seen.insert(k)) {
-                    out.push(r);
+    } else {
+        // INTERSECT and EXCEPT stay pairwise and recursive. Neither is
+        // associative the way UNION is -- `A EXCEPT B EXCEPT C` is not a
+        // three-way operation -- so flattening them would change results.
+        let (pair_schema, mut left_rows) =
+            run_subquery_schema(db, vindex, &branch_query(left)).await?;
+        let right_rows = run_subquery(db, vindex, &branch_query(right)).await?;
+        schema = pair_schema;
+        match op {
+            SetOperator::Union => unreachable!("handled above"),
+            SetOperator::Intersect => {
+                let rset: std::collections::HashSet<Vec<u8>> =
+                    right_rows.iter().map(|r| key(r)).collect();
+                let mut seen = std::collections::HashSet::new();
+                for r in left_rows {
+                    let k = key(&r);
+                    if rset.contains(&k) && (all || seen.insert(k)) {
+                        out.push(r);
+                    }
                 }
             }
-        }
-        SetOperator::Except => {
-            let rset: std::collections::HashSet<Vec<u8>> =
-                right_rows.iter().map(|r| key(r)).collect();
-            let mut seen = std::collections::HashSet::new();
-            for r in std::mem::take(&mut left_rows) {
-                let k = key(&r);
-                if !rset.contains(&k) && (all || seen.insert(k)) {
-                    out.push(r);
+            SetOperator::Except => {
+                let rset: std::collections::HashSet<Vec<u8>> =
+                    right_rows.iter().map(|r| key(r)).collect();
+                let mut seen = std::collections::HashSet::new();
+                for r in std::mem::take(&mut left_rows) {
+                    let k = key(&r);
+                    if !rset.contains(&k) && (all || seen.insert(k)) {
+                        out.push(r);
+                    }
                 }
             }
         }
