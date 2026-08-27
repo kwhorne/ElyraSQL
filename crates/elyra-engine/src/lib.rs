@@ -13,6 +13,7 @@ mod catalog;
 mod colcache;
 pub mod collmig;
 mod cpred;
+pub mod embedix;
 mod eval;
 mod exec;
 mod ft;
@@ -121,6 +122,57 @@ impl Engine {
 
     pub fn session(&self) -> Session {
         Session::new(self.db.clone(), self.locks.clone())
+    }
+
+    /// Bring every declared embedding index up to date once, and wait for it.
+    ///
+    /// `Ok(None)` when no embeddings provider is configured. This is the
+    /// synchronous counterpart to [`Engine::spawn_embedding_sweeper`], for a
+    /// caller that wants the work done before it continues -- an embedded
+    /// application, a test, an operator filling in a backlog by hand.
+    pub async fn sweep_embeddings(&self) -> elyra_core::Result<Option<embedix::SweepReport>> {
+        let embedder = embedix::live_embedder();
+        embedix::sweep_all(&self.session(), &embedder).await
+    }
+
+    /// Keep every declared embedding index in step, sweeping on `interval`.
+    ///
+    /// The sweep derives what needs work from the data itself, so it catches
+    /// every path that writes rows -- ordinary DML, bulk loads, restores, binlog
+    /// replay, replication apply -- rather than only the ones a write hook would
+    /// see. It is a no-op while no embeddings provider is configured.
+    ///
+    /// The returned handle owns the task: dropping it does not stop the loop,
+    /// so a caller that needs shutdown should `abort()` it.
+    pub fn spawn_embedding_sweeper(
+        &self,
+        interval: std::time::Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        let engine = self.clone();
+        tokio::spawn(async move {
+            let embedder = embedix::live_embedder();
+            loop {
+                tokio::time::sleep(interval).await;
+                let session = engine.session();
+                match embedix::sweep_all(&session, &embedder).await {
+                    Ok(None) => {}
+                    Ok(Some(report)) => {
+                        if report.embedded > 0 || report.failed > 0 {
+                            tracing::info!(
+                                embedded = report.embedded,
+                                failed = report.failed,
+                                conflicted = report.conflicted,
+                                deferred = report.deferred,
+                                "embedding sweep"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "embedding sweep failed");
+                    }
+                }
+            }
+        })
     }
 
     /// The underlying database handle (used for replication).
@@ -1306,6 +1358,11 @@ impl Engine {
         // executed here, not by the SQL frontend.
         if users::is_user_stmt(trimmed) {
             return Ok(vec![users::execute(sql, sess, privilege).await?]);
+        }
+
+        // Embedding-index DDL: also parsed here, for the same reason.
+        if embedix::is_embedding_stmt(trimmed) {
+            return Ok(vec![embedix::execute(sql, sess, privilege).await?]);
         }
 
         if let Some(r) = self.intercept_session(sql, sess) {

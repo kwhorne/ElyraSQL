@@ -41,6 +41,15 @@ fn config() -> Option<(String, Option<String>, String)> {
     Some((url, key, model))
 }
 
+/// Whether an embeddings provider is configured at all.
+///
+/// Callers that would otherwise treat "no provider" as a per-row failure need
+/// to tell the two apart: a missing `ELYRASQL_AI_EMBED_URL` is a deployment
+/// state, not a bad row, and must not consume retry budget.
+pub fn is_configured() -> bool {
+    config().is_some()
+}
+
 fn cache() -> &'static Mutex<HashMap<String, Vec<f32>>> {
     static C: OnceLock<Mutex<HashMap<String, Vec<f32>>>> = OnceLock::new();
     C.get_or_init(|| Mutex::new(HashMap::new()))
@@ -58,14 +67,23 @@ fn concurrency() -> &'static tokio::sync::Semaphore {
 
 /// Embed one text into a vector, cached per (model, text).
 pub async fn embed(text: &str) -> Result<Vec<f32>> {
+    embed_with(text, None).await
+}
+
+/// [`embed`], with an explicit model that overrides the server default.
+///
+/// An embedding index stores the model it was declared with, so rows keep being
+/// embedded the same way even if the server's default moves.
+pub async fn embed_with(text: &str, model_override: Option<&str>) -> Result<Vec<f32>> {
     if text.len() > MAX_EMBED_TEXT_BYTES {
         return Err(Error::Query(format!(
             "ai_embed input exceeds {MAX_EMBED_TEXT_BYTES} bytes"
         )));
     }
-    let (url, key, model) = config().ok_or_else(|| {
+    let (url, key, default_model) = config().ok_or_else(|| {
         Error::Query("ai_embed: set ELYRASQL_AI_EMBED_URL (and optionally _KEY, _MODEL)".into())
     })?;
+    let model = model_override.map(str::to_string).unwrap_or(default_model);
     let ckey = format!("{model}\u{0}{text}");
     if let Some(v) = cache().lock().unwrap().get(&ckey) {
         return Ok(v.clone());

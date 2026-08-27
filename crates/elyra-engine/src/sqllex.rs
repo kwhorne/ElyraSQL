@@ -257,6 +257,90 @@ pub fn matching_paren_end(sql: &str, start: usize) -> Option<usize> {
     None
 }
 
+// --- Statement tokens -------------------------------------------------------
+//
+// A second, coarser level than the byte scanner above: a whole statement as a
+// stream of words, quoted strings and symbols. Statements that the SQL frontend
+// never sees are parsed from this -- user management (`GRANT`, `CREATE USER`)
+// and embedding indexes -- so it lives here rather than in either of them, for
+// the same reason the byte scanner does: one copy, not one per caller.
+//
+// Quoting is simpler than [`code_bytes`] deliberately. These statements are
+// short, hand-written DDL, and the only escape MySQL requires in them is a
+// doubled quote. A backslash is an ordinary character.
+
+/// A single lexical token: a bare word/number, a quoted string, or a symbol.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Tok {
+    Word(String),
+    Str(String),
+    Sym(char),
+}
+
+impl Tok {
+    /// The textual value of a word or quoted string (symbols yield "").
+    pub(crate) fn text(&self) -> &str {
+        match self {
+            Tok::Word(s) | Tok::Str(s) => s,
+            Tok::Sym(_) => "",
+        }
+    }
+    pub(crate) fn is_word(&self, kw: &str) -> bool {
+        matches!(self, Tok::Word(s) if s.eq_ignore_ascii_case(kw))
+    }
+}
+
+pub(crate) fn tokenize(sql: &str) -> Vec<Tok> {
+    let mut out = Vec::new();
+    let cs: Vec<char> = sql.chars().collect();
+    let mut i = 0;
+    while i < cs.len() {
+        let c = cs[i];
+        if c.is_whitespace() {
+            i += 1;
+        } else if c == '\'' || c == '"' || c == '`' {
+            let quote = c;
+            i += 1;
+            let mut s = String::new();
+            while i < cs.len() {
+                if cs[i] == quote {
+                    // Doubled quote → literal quote.
+                    if i + 1 < cs.len() && cs[i + 1] == quote {
+                        s.push(quote);
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                s.push(cs[i]);
+                i += 1;
+            }
+            out.push(Tok::Str(s));
+        } else if c == ',' || c == '@' || c == '=' || c == '(' || c == ')' || c == '*' || c == ';' {
+            out.push(Tok::Sym(c));
+            i += 1;
+        } else if c.is_alphanumeric() || c == '_' || c == '.' || c == '$' || c == '%' || c == '-' {
+            let mut s = String::new();
+            while i < cs.len()
+                && (cs[i].is_alphanumeric()
+                    || cs[i] == '_'
+                    || cs[i] == '.'
+                    || cs[i] == '$'
+                    || cs[i] == '%'
+                    || cs[i] == '-')
+            {
+                s.push(cs[i]);
+                i += 1;
+            }
+            out.push(Tok::Word(s));
+        } else {
+            i += 1; // skip anything else
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
