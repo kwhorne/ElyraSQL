@@ -12928,3 +12928,109 @@ async fn insert_trigger_cache_is_invalidated_by_trigger_ddl() {
         .unwrap();
     assert_eq!(audit, [2]);
 }
+
+/// The binary protocol sends BLOBs and strings alike as bytes. Rendering a bound
+/// parameter through a `String` replaced every non-UTF-8 byte with U+FFFD and
+/// raised no error: seven bytes in, fifteen back. Every driver that uses
+/// server-side prepared statements for binary data was affected.
+#[tokio::test]
+async fn binary_blob_survives_a_prepared_statement_byte_for_byte() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop("CREATE TABLE blobs (id INT PRIMARY KEY, b BLOB, note TEXT)")
+        .await
+        .unwrap();
+
+    // A NUL, a lone continuation byte, 0xFF/0xFE, a quote, a backslash, and a
+    // truncated multi-byte lead byte: none of it is valid UTF-8 as a whole.
+    let payload: Vec<u8> = vec![0x00, 0x80, 0xFF, 0xFE, 0x27, 0x5C, 0xC3];
+    c.exec_drop(
+        "INSERT INTO blobs VALUES (?, ?, ?)",
+        (1i32, payload.clone(), "it's \\ text"),
+    )
+    .await
+    .unwrap();
+
+    let back: Option<(Vec<u8>, String)> = c
+        .query_first("SELECT b, note FROM blobs WHERE id = 1")
+        .await
+        .unwrap();
+    let (blob, note) = back.expect("row");
+    assert_eq!(blob, payload, "binary parameter must round-trip exactly");
+    // And a text parameter alongside it still takes the quoted path, with its
+    // escaping intact.
+    assert_eq!(note, "it's \\ text");
+
+    // The same bytes bound in a WHERE clause must match the stored row.
+    let hit: Option<i32> = c
+        .exec_first("SELECT id FROM blobs WHERE b = ?", (payload,))
+        .await
+        .unwrap();
+    assert_eq!(
+        hit,
+        Some(1),
+        "a binary parameter must compare equal to itself"
+    );
+}
+
+/// A procedure body that cannot be parsed must be refused when it is created,
+/// by the person who wrote it -- not stored, and not first discovered by
+/// whoever calls it. Before this, the body was parsed only at CALL, where a
+/// cursor declared without a name hit an `unwrap()` and, under the release
+/// profile's `panic = "abort"`, took the whole server down.
+#[tokio::test]
+async fn a_malformed_procedure_body_is_refused_at_create_and_the_server_survives() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    let err = c
+        .query_drop("CREATE PROCEDURE p_bad() BEGIN DECLARE  cursor FOR SELECT 1; END")
+        .await
+        .expect_err("a nameless cursor must be rejected");
+    assert!(
+        err.to_string().contains("cursor name"),
+        "unexpected error: {err}"
+    );
+
+    // Nothing was stored, and the connection -- and the server -- are fine.
+    let missing = c.query_drop("CALL p_bad()").await.expect_err("not created");
+    assert!(missing.to_string().contains("does not exist"), "{missing}");
+    let one: i64 = c.query_first("SELECT 1").await.unwrap().unwrap();
+    assert_eq!(one, 1);
+
+    // A well-formed cursor still works end to end: every fetched row lands in
+    // a table the caller can count afterwards.
+    c.query_drop("CREATE TABLE nums (n INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE seen (n INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO nums VALUES (1), (2), (3)")
+        .await
+        .unwrap();
+    c.query_drop(
+        "CREATE PROCEDURE p_ok() BEGIN \
+           DECLARE done INT DEFAULT 0; \
+           DECLARE v INT; \
+           DECLARE cur CURSOR FOR SELECT n FROM nums ORDER BY n; \
+           DECLARE CONTINUE HANDLER FOR NOT FOUND SET done = 1; \
+           OPEN cur; \
+           read_loop: LOOP \
+             FETCH cur INTO v; \
+             IF done = 1 THEN LEAVE read_loop; END IF; \
+             INSERT INTO seen VALUES (v); \
+           END LOOP; \
+           CLOSE cur; \
+         END",
+    )
+    .await
+    .unwrap();
+    c.query_drop("CALL p_ok()").await.unwrap();
+    let seen: i64 = c
+        .query_first("SELECT COUNT(*) FROM seen")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(seen, 3, "the cursor should have visited every row");
+}

@@ -6,6 +6,41 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **Security: binary data bound through a prepared statement is stored exactly.**
+  A parameter that was not valid UTF-8 -- an image, a hash, ciphertext, anything a
+  driver sends as bytes over the binary protocol -- was rendered into SQL text
+  through `from_utf8_lossy`, which replaced every invalid byte with U+FFFD and
+  raised no error. Seven bytes went in, fifteen came back:
+
+  ```
+  sent: 00 80 ff fe 27 5c c3
+  got:  00 ef bf bd ef bf bd ef bf bd 27 5c ef bf bd
+  ```
+
+  Every client using server-side prepared statements for BLOB columns was
+  affected (PDO without emulated prepares, Go `database/sql`, JDBC with
+  `useServerPrepStmts`, Python connectors with `prepared=True`), silently. Bytes
+  that are not valid UTF-8 are now rendered as a hex literal, `x'..'`, which is
+  what the engine already uses to spell `Value::Bytes` as SQL. Text parameters
+  keep the quoted form, so comparison under a case-insensitive collation is
+  unchanged. Data already written through the old path is corrupted on disk and
+  must be re-inserted.
+
+- **Security: a stored procedure with a nameless cursor no longer aborts the
+  server.** `DECLARE  CURSOR FOR ...` (no cursor name) hit an `unwrap()` in the
+  body parser. Under the release profile's `panic = "abort"` that is not a
+  failed statement but the whole process, for every client. Worse, the body was
+  parsed only at `CALL`, so an admin's typo was stored, survived restarts, and
+  detonated for whoever called it -- a restart loop.
+
+  The parser now returns an error, and a procedure body is parsed at `CREATE
+  PROCEDURE`, so a body that cannot be parsed is refused with the statement in
+  front of the person who wrote it. Two property tests now feed the body parser
+  arbitrary and keyword-shaped input and require that it never panics, the same
+  invariant the SQL preprocessors already carry.
+
 ## [1.11.0] - 2026-08-27
 
 **Two ways to reach the database that did not exist before.** An embedding index

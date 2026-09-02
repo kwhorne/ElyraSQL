@@ -113,9 +113,25 @@ fn time_literal(b: &[u8]) -> String {
     }
 }
 
-/// Quote and escape a byte string as a SQL single-quoted literal.
+/// Render a byte-string parameter as a SQL literal.
+///
+/// Text becomes a single-quoted literal. Anything that is not valid UTF-8 becomes
+/// a hex literal (`x'..'`), which the engine decodes back to the exact bytes.
+///
+/// The binary protocol sends strings and BLOBs the same way -- as bytes -- so a
+/// driver binding an image, a hash or ciphertext arrives here too. Rendering
+/// those through a `String` (as `from_utf8_lossy` did) replaced every non-UTF-8
+/// byte with U+FFFD, silently: seven bytes went in, fifteen came back, and no
+/// error was raised anywhere. Hex is what the engine itself uses to render
+/// `Value::Bytes` as SQL, so the two paths agree.
+///
+/// Valid UTF-8 keeps the quoted form on purpose: `x'..'` is a *binary* string
+/// in MySQL, and turning every text parameter into one would change how
+/// `WHERE name = ?` compares under a case-insensitive collation.
 fn quote(bytes: &[u8]) -> String {
-    let s = String::from_utf8_lossy(bytes);
+    let Ok(s) = std::str::from_utf8(bytes) else {
+        return hex_literal(bytes);
+    };
     let mut out = String::with_capacity(s.len() + 2);
     out.push('\'');
     for c in s.chars() {
@@ -124,6 +140,17 @@ fn quote(bytes: &[u8]) -> String {
             '\\' => out.push_str("\\\\"),
             _ => out.push(c),
         }
+    }
+    out.push('\'');
+    out
+}
+
+/// `x'0A1B..'` -- the SQL spelling of exact bytes.
+fn hex_literal(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2 + 3);
+    out.push_str("x'");
+    for b in bytes {
+        out.push_str(&format!("{b:02x}"));
     }
     out.push('\'');
     out
@@ -227,6 +254,17 @@ mod tests {
             count_placeholders("SELECT `we?rd`, a FROM t WHERE a = ?"),
             1
         );
+    }
+
+    #[test]
+    /// Bytes that are not UTF-8 must survive exactly. Through a `String` they
+    /// did not: each invalid byte became U+FFFD.
+    fn non_utf8_bytes_become_a_hex_literal() {
+        assert_eq!(quote(&[0x00, 0x80, 0xff, 0xfe, 0x27]), "x'0080fffe27'");
+        // Valid UTF-8 keeps the text form, with its escaping.
+        assert_eq!(quote(b"it's"), "'it''s'");
+        assert_eq!(quote(b"a\\b"), "'a\\\\b'");
+        assert_eq!(quote("æøå".as_bytes()), "'æøå'");
     }
 
     #[test]
