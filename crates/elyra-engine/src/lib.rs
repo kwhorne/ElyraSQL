@@ -1278,6 +1278,11 @@ impl Engine {
         if head.starts_with("create procedure") || head.starts_with("create or replace procedure") {
             require_privilege(privilege, PrivilegedAction::CreateProcedure)?;
             let (_, def) = parse_create_procedure(trimmed)?;
+            // Parse the body now, not first at CALL. A body that cannot be
+            // parsed should fail for the person who wrote it, with the statement
+            // in front of them -- not for whoever calls the procedure later,
+            // after it has been stored and has survived a restart.
+            proc::parse(&def.body)?;
             let procedure = mysql_named_object(trimmed, "procedure")?;
             let name = exec::stored_table_ident(sess, &procedure)?;
             let enc = bincode::serialize(&def).map_err(|e| Error::Storage(e.to_string()))?;
@@ -5063,6 +5068,32 @@ mod fuzz_props {
             let _ = rewrite_odd_0x_literals(&s);
             let _ = split_top_level(&s, ',');
             let _ = split_top_level(&s, '=');
+        }
+
+        /// The stored-procedure body parser is hand-written over raw text and
+        /// runs on whatever an admin typed. Under `panic = "abort"` a panic in it
+        /// is not a failed statement but a dead server, so it must return an
+        /// error for every input, including ones with multi-byte characters
+        /// where the ASCII keyword offsets would otherwise slice mid-char.
+        #[test]
+        fn proc_parse_never_panics(s in "(?s).{0,160}") {
+            let _ = super::proc::parse(&s);
+        }
+
+        /// Bias toward the statement forms the body parser dispatches on, so the
+        /// branches past each keyword check are exercised with hostile tails.
+        #[test]
+        fn proc_parse_targeted_shapes_never_panic(a in "(?s).{0,50}") {
+            for head in [
+                "DECLARE ", "DECLARE  cursor ", "DECLARE x CURSOR ", "DECLARE CONTINUE HANDLER FOR ",
+                "DECLARE EXIT HANDLER FOR SQLSTATE ", "OPEN ", "CLOSE ", "FETCH ", "SET ",
+                "IF ", "WHILE ", "LOOP ", "REPEAT ", "LEAVE ", "ITERATE ", "RETURN ",
+                "SELECT ", "INSERT INTO t VALUES (",
+            ] {
+                let _ = super::proc::parse(&format!("{head}{a};"));
+                let _ = super::proc::parse(&format!("{head}{a} cursor {a};"));
+                let _ = super::proc::parse(&format!("BEGIN {head}{a}; END"));
+            }
         }
 
         /// Bias toward the shapes the rewriters actually rewrite so the code

@@ -427,8 +427,22 @@ fn parse_block(parts: &[String], i: &mut usize, terminators: &[&str]) -> Result<
         } else if kw_at(&part, "declare ") && low.contains(" cursor ") {
             // DECLARE <name> CURSOR FOR <select>
             let rest = part[8..].trim();
-            let cpos = rest.to_ascii_lowercase().find(" cursor ").unwrap();
+            // The `contains` above ran on the whole part; after trimming
+            // `DECLARE ` off, a cursor with no name -- `DECLARE  CURSOR FOR` --
+            // has nothing left in front of the keyword, and the search fails. It
+            // used to unwrap here, which under `panic = "abort"` took the whole
+            // server down for one typo in a stored procedure.
+            let Some(cpos) = rest.to_ascii_lowercase().find(" cursor ") else {
+                return Err(elyra_core::Error::Parse(
+                    "DECLARE ... CURSOR needs a cursor name".into(),
+                ));
+            };
             let name = rest[..cpos].trim().to_string();
+            if name.is_empty() {
+                return Err(elyra_core::Error::Parse(
+                    "DECLARE ... CURSOR needs a cursor name".into(),
+                ));
+            }
             let after = rest[cpos + " cursor ".len()..].trim();
             let query = match after.to_ascii_lowercase().strip_prefix("for ") {
                 Some(_) => after[4..].trim().to_string(),
@@ -580,4 +594,34 @@ fn parse_while(
     }
     *i += 1; // consume END WHILE
     Ok(ProcStmt::While { label, cond, body })
+}
+
+#[cfg(test)]
+mod cursor_parse_tests {
+    use super::parse;
+
+    /// A cursor with no name used to `unwrap()` a failed `find`, which under the
+    /// release profile's `panic = "abort"` killed the whole server -- and since
+    /// the body was only parsed at `CALL`, an admin's typo detonated later, for
+    /// whoever called it, on every restart.
+    #[test]
+    fn a_cursor_without_a_name_is_an_error_not_a_panic() {
+        for body in [
+            "DECLARE  cursor FOR SELECT 1;",
+            "declare  CURSOR for select 1;",
+            "DECLARE \t cursor FOR SELECT 1;",
+        ] {
+            let err = parse(body).expect_err(body);
+            assert!(
+                err.to_string().contains("cursor name"),
+                "{body}: unexpected error {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_named_cursor_still_parses() {
+        let stmts = parse("DECLARE cur CURSOR FOR SELECT 1;").unwrap();
+        assert_eq!(stmts.len(), 1);
+    }
 }
