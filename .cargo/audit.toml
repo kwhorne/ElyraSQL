@@ -28,4 +28,16 @@ ignore = [
     "RUSTSEC-2026-0173", # proc-macro-error2 unmaintained
     # Transitive via tokio-rustls 0.25; leaves with the rustls 0.23 upgrade.
     "RUSTSEC-2025-0134", # rustls-pemfile unmaintained
+
+    # --- Test-only (dev-dependencies of the MySQL test client, never shipped) ---
+    # lru 0.18.1: potential use-after-free if `LruCache::pop()` panics mid-way.
+    # Pulled in only by mysql_async, the client our wire tests connect with; it
+    # is not in the `elyrasql` binary. Leaves when mysql_async bumps lru.
+    "RUSTSEC-2026-0253", # lru unsound (dev-only)
 ]
+
+# Two *yanked* crates also appear in `cargo audit` output and cannot be ignored
+# per crate (yanked is a separate check from advisories). Both are transitive
+# through mysql_async, a dev-dependency, and are not in the shipped binary:
+#   chacha20 0.10.1, spin 0.9.8
+# Reviewed 2026-09-02. Re-check whenever mysql_async is updated.

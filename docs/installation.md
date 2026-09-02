@@ -17,6 +17,35 @@ ElyraSQL release builds target **Ubuntu 24.04+** and **Apple Silicon macOS
     done, so an interrupted upgrade simply resumes on the next start. **Take a backup
     first, and note that downgrading to 1.4.x afterwards is not supported.**
 
+!!! danger "Upgrading to 1.11.1 — binary data written through prepared statements"
+
+    **If any application inserted BLOB or binary data using server-side prepared
+    statements on 1.9.x through 1.11.0, that data is corrupted on disk.**
+
+    A parameter that was not valid UTF-8 — an image, a hash, ciphertext,
+    compressed content, anything a driver sends as bytes over the binary
+    protocol — was rendered into SQL through a lossy text conversion. Every byte
+    that was not valid UTF-8 was replaced with U+FFFD (`EF BF BD`), and no error
+    was raised: seven bytes went in, fifteen came back. Drivers that use
+    server-side prepared statements for binary columns include PDO without
+    emulated prepares, Go `database/sql`, JDBC with `useServerPrepStmts`, and
+    Python connectors with `prepared=True`. Text parameters and anything sent as
+    plain SQL were never affected.
+
+    1.11.1 fixes the path. It cannot repair the rows: the original bytes are
+    gone. After upgrading:
+
+    - **Identify BLOB/VARBINARY columns written through `?` parameters.** A
+      corrupted value contains the three-byte sequence `EF BF BD` where the
+      original had a byte that was not valid UTF-8;
+      `SELECT COUNT(*) FROM t WHERE HEX(col) LIKE '%EFBFBD%'` finds candidates
+      (a genuine U+FFFD in the source data is the only false positive).
+    - **Re-insert them from the source** — the file store, the upstream system,
+      a backup taken before the data was written through ElyraSQL.
+    - Values that were valid UTF-8 as a whole, such as ASCII, are intact.
+
+    No on-disk format change; a 1.11.0 database opens in 1.11.1 unchanged.
+
 !!! danger "Upgrading to 1.9.9 or later — security release"
 
     **If you run replication, 1.9.8 and earlier expose your data. Upgrade.**
@@ -339,8 +368,8 @@ macOS).
 Multi-arch image (`amd64` + `arm64`) on the GitHub Container Registry:
 
 ```bash
-docker pull ghcr.io/kwhorne/elyrasql:1.11.0   # or :latest
-docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.11.0
+docker pull ghcr.io/kwhorne/elyrasql:1.11.1   # or :latest
+docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.11.1
 ```
 
 The image is ~15 MB, runs as a non-root user, stores data in the

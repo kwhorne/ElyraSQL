@@ -6,6 +6,19 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.11.1] - 2026-09-02
+
+**A security release. Upgrade, and read the note if you store binary data.**
+
+Two defects, both confirmed against a running server before being fixed. The
+first corrupted data silently: binary parameters bound through prepared
+statements lost every byte that was not valid UTF-8, with no error. The second
+let one malformed stored procedure abort the whole server, for every client, on
+every restart. Nothing else changes; a 1.11.0 database opens in 1.11.1 unchanged.
+
+The fix for the first cannot repair rows already written. `docs/installation.md`
+says how to find them.
+
 ### Fixed
 
 - **Security: binary data bound through a prepared statement is stored exactly.**
@@ -40,6 +53,15 @@ All notable changes to ElyraSQL are documented here. The format is based on
   front of the person who wrote it. Two property tests now feed the body parser
   arbitrary and keyword-shaped input and require that it never panics, the same
   invariant the SQL preprocessors already carry.
+
+### Internal
+
+- **`cargo audit` is honest again.** It passed with four warnings nobody saw,
+  because CI fails only on vulnerabilities. `mysql_async` (the test client) was
+  on a yanked release and is bumped to 0.37.1; the three that remain -- one
+  unsound advisory and two yanked crates, all transitive through that same
+  dev-dependency and none in the shipped binary -- are now documented in
+  `.cargo/audit.toml` with the same reasoning the rest of the allowlist carries.
 
 ## [1.11.0] - 2026-08-27
 
