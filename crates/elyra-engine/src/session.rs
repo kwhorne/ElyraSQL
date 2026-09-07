@@ -158,6 +158,10 @@ pub struct Session {
     database: Mutex<String>,
     strict_sql_mode: std::sync::atomic::AtomicBool,
     sql_mode: Mutex<String>,
+    /// `@@session.time_zone`, as the client spelled it. ElyraSQL evaluates every
+    /// temporal function in UTC, so only spellings that *mean* UTC are accepted;
+    /// see [`Session::set_time_zone`].
+    time_zone: Mutex<String>,
     autocommit: std::sync::atomic::AtomicBool,
     foreign_key_checks: std::sync::atomic::AtomicBool,
     no_auto_value_on_zero: std::sync::atomic::AtomicBool,
@@ -225,6 +229,7 @@ impl Session {
             database: Mutex::new("elyra".into()),
             strict_sql_mode: std::sync::atomic::AtomicBool::new(true),
             sql_mode: Mutex::new("STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION".into()),
+            time_zone: Mutex::new("SYSTEM".into()),
             autocommit: std::sync::atomic::AtomicBool::new(true),
             foreign_key_checks: std::sync::atomic::AtomicBool::new(true),
             no_auto_value_on_zero: std::sync::atomic::AtomicBool::new(false),
@@ -317,14 +322,33 @@ impl Session {
     }
 
     pub fn set_sql_mode(&self, sql_mode: String) {
-        let upper = sql_mode.to_ascii_uppercase();
-        let has_mode = |mode| upper.split(',').any(|item| item.trim() == mode);
+        // A mode list is a set. `CONCAT(@@sql_mode, ',NO_ENGINE_SUBSTITUTION')`
+        // -- which sqlx runs on every connection -- would otherwise store the
+        // flag twice, and `SELECT @@sql_mode` would return a string MySQL never
+        // produces. Deduplicate case-insensitively, first spelling wins, empty
+        // items (a leading comma on an empty mode) dropped. The client's order is
+        // kept; MySQL canonicalises to its own internal order, which is a
+        // cosmetic difference this does not try to close.
+        let mut seen: Vec<String> = Vec::new();
+        let mut kept: Vec<&str> = Vec::new();
+        for item in sql_mode.split(',') {
+            let item = item.trim();
+            if item.is_empty() {
+                continue;
+            }
+            let key = item.to_ascii_uppercase();
+            if !seen.contains(&key) {
+                seen.push(key);
+                kept.push(item);
+            }
+        }
+        let has_mode = |mode: &str| seen.iter().any(|item| item == mode);
         self.set_strict_sql_mode(has_mode("STRICT_TRANS_TABLES") || has_mode("STRICT_ALL_TABLES"));
         self.no_auto_value_on_zero.store(
             has_mode("NO_AUTO_VALUE_ON_ZERO"),
             std::sync::atomic::Ordering::Relaxed,
         );
-        *self.sql_mode.lock().unwrap() = sql_mode;
+        *self.sql_mode.lock().unwrap() = kept.join(",");
     }
 
     pub fn ansi_quotes(&self) -> bool {
@@ -333,6 +357,45 @@ impl Session {
             .unwrap()
             .split(',')
             .any(|item| item.trim().eq_ignore_ascii_case("ANSI_QUOTES"))
+    }
+
+    /// The session time zone as the client set it (`SYSTEM` until changed).
+    pub fn time_zone(&self) -> String {
+        self.time_zone.lock().unwrap().clone()
+    }
+
+    /// Set the session time zone.
+    ///
+    /// Drivers set this on connect -- sqlx sends `time_zone='+00:00'` on every
+    /// new connection, before the application's first query -- so refusing it
+    /// outright made a whole ecosystem unable to connect. ElyraSQL evaluates
+    /// `NOW()` and friends in UTC (`@@system_time_zone` is `UTC`), so every
+    /// spelling that means UTC is accepted and honoured exactly: `SYSTEM`,
+    /// `UTC`, and a zero offset in any of MySQL's forms.
+    ///
+    /// A non-zero offset is refused with a reason rather than stored, because
+    /// storing it and then returning UTC from `NOW()` would be a lie the client
+    /// has no way to detect. Honouring offsets is a separate piece of work
+    /// across every temporal function.
+    pub fn set_time_zone(&self, zone: &str) -> Result<()> {
+        let trimmed = zone.trim();
+        let upper = trimmed.to_ascii_uppercase();
+        let means_utc = matches!(upper.as_str(), "SYSTEM" | "UTC" | "GMT" | "Z")
+            || parse_utc_offset_minutes(trimmed) == Some(0);
+        if !means_utc {
+            let why = if parse_utc_offset_minutes(trimmed).is_some() {
+                "ElyraSQL evaluates temporal functions in UTC; only +00:00 (or SYSTEM/UTC) is supported"
+            } else {
+                "not a recognised time zone; use +00:00, SYSTEM or UTC"
+            };
+            return Err(Error::Unsupported(format!(
+                "time_zone = {trimmed:?}: {why}"
+            )));
+        }
+        // Keep the client's spelling: a driver that sets '+00:00' expects to
+        // read '+00:00' back, not a canonicalised synonym.
+        *self.time_zone.lock().unwrap() = trimmed.to_string();
+        Ok(())
     }
 
     pub fn no_auto_value_on_zero(&self) -> bool {
@@ -546,6 +609,7 @@ impl Session {
                 Value::Int(i64::try_from(self.group_concat_max_len()).unwrap_or(i64::MAX))
             }
             "tx_isolation" | "transaction_isolation" => Value::Text(self.transaction_isolation()),
+            "time_zone" => Value::Text(self.time_zone()),
             _ => crate::predicate::system_var(raw),
         }
     }
@@ -1153,5 +1217,100 @@ mod tests {
             coalesce_ranges(ranges),
             vec![(bytes("a"), Some(bytes("e"))), (bytes("x"), None)]
         );
+    }
+}
+
+/// Parse MySQL's `[+-]HH:MM` time-zone offset to signed minutes.
+///
+/// MySQL accepts hours with one or two digits and bounds the range to
+/// ±14:00. Anything else is not an offset (it may still be a named zone).
+fn parse_utc_offset_minutes(zone: &str) -> Option<i32> {
+    let (sign, rest) = match zone.as_bytes().first()? {
+        b'+' => (1, &zone[1..]),
+        b'-' => (-1, &zone[1..]),
+        _ => return None,
+    };
+    let (hours, minutes) = rest.split_once(':')?;
+    if hours.is_empty() || hours.len() > 2 || minutes.len() != 2 {
+        return None;
+    }
+    let hours: i32 = hours.parse().ok()?;
+    let minutes: i32 = minutes.parse().ok()?;
+    if hours > 14 || minutes > 59 || (hours == 14 && minutes > 0) {
+        return None;
+    }
+    Some(sign * (hours * 60 + minutes))
+}
+
+#[cfg(test)]
+mod sql_mode_tests {
+    use super::Session;
+
+    fn session() -> Session {
+        let db = elyra_storage::Db::in_memory().unwrap();
+        Session::new(db, std::sync::Arc::new(crate::lockmgr::LockManager::new()))
+    }
+
+    /// A mode list is a set: appending a flag that is already present must not
+    /// store it twice. This is exactly what sqlx's connect statement does.
+    #[test]
+    fn appending_an_existing_mode_does_not_duplicate_it() {
+        let s = session();
+        s.set_sql_mode(
+            "STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION,PIPES_AS_CONCAT,NO_ENGINE_SUBSTITUTION"
+                .into(),
+        );
+        assert_eq!(
+            s.sql_mode(),
+            "STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION,PIPES_AS_CONCAT"
+        );
+    }
+
+    #[test]
+    fn dedup_is_case_insensitive_and_keeps_the_first_spelling() {
+        let s = session();
+        s.set_sql_mode("ansi_quotes, ANSI_QUOTES ,Ansi_Quotes".into());
+        assert_eq!(s.sql_mode(), "ansi_quotes");
+        assert!(s.ansi_quotes(), "the flag must still be recognised");
+    }
+
+    #[test]
+    fn empty_items_are_dropped() {
+        // `CONCAT('', ',STRICT_TRANS_TABLES')` on an empty starting mode.
+        let s = session();
+        s.set_sql_mode(",STRICT_TRANS_TABLES,,".into());
+        assert_eq!(s.sql_mode(), "STRICT_TRANS_TABLES");
+        assert!(s.strict_sql_mode());
+        s.set_sql_mode(String::new());
+        assert_eq!(s.sql_mode(), "");
+        assert!(!s.strict_sql_mode());
+    }
+}
+
+#[cfg(test)]
+mod time_zone_tests {
+    use super::parse_utc_offset_minutes;
+
+    #[test]
+    fn offsets_parse_the_way_mysql_spells_them() {
+        assert_eq!(parse_utc_offset_minutes("+00:00"), Some(0));
+        assert_eq!(parse_utc_offset_minutes("-00:00"), Some(0));
+        assert_eq!(parse_utc_offset_minutes("+0:00"), Some(0));
+        assert_eq!(parse_utc_offset_minutes("+02:00"), Some(120));
+        assert_eq!(parse_utc_offset_minutes("-05:30"), Some(-330));
+        assert_eq!(
+            parse_utc_offset_minutes("+14:00"),
+            Some(840),
+            "MySQL's upper bound"
+        );
+    }
+
+    #[test]
+    fn non_offsets_are_not_offsets() {
+        for bad in [
+            "+14:01", "+15:00", "+2", "02:00", "UTC", "SYSTEM", "+ab:cd", "+00:60", "",
+        ] {
+            assert_eq!(parse_utc_offset_minutes(bad), None, "{bad:?}");
+        }
     }
 }

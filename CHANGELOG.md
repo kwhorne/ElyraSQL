@@ -6,6 +6,43 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **sqlx (Rust) can connect.** sqlx-mysql runs one statement on every new
+  connection, before the application's first query:
+
+  ```sql
+  SET sql_mode=(SELECT CONCAT(@@sql_mode, ',PIPES_AS_CONCAT,NO_ENGINE_SUBSTITUTION')),time_zone='+00:00'
+  ```
+
+  Both halves were refused with error 1235 -- a scalar subquery was not a valid
+  `SET` value, and `time_zone` was not a recognised session variable -- so **no
+  sqlx application could connect at all**, including anything generic over
+  `AnyPool`, which cannot turn the statement off. `docs/frameworks.md` had said
+  sqlx works out of the box; it did not, and now does.
+
+  A `(SELECT ...)` in a `SET` value now runs as a query and must return exactly
+  one row and one column, as in MySQL. `time_zone` is a session variable, echoed
+  by `@@time_zone`/`@@session.time_zone` while `@@global.time_zone` stays
+  `SYSTEM`, exactly as MySQL 8.4 reports it. Only spellings that mean UTC are
+  accepted (`+00:00`, `SYSTEM`, `UTC`): ElyraSQL already evaluates every temporal
+  function in UTC, so `+00:00` is honoured exactly -- which is what sqlx's
+  `chrono`/`time` types assume. A non-zero offset is refused with a reason rather
+  than stored and silently not honoured (#125). Two neighbouring gaps surfaced
+  by the same measurement are tracked separately: `UTC_TIMESTAMP()` and
+  `CONVERT_TZ()` are not implemented (#123), and `||` is not a concatenation
+  operator even with `PIPES_AS_CONCAT` set (#124).
+
+  Reported from Grove, where the convert tool could not reach ElyraSQL through
+  sqlx's `Any` driver.
+
+- **`@@sql_mode` is a set, not a list with duplicates.** `SET sql_mode =
+  CONCAT(@@sql_mode, ',NO_ENGINE_SUBSTITUTION')` stored the flag twice when it
+  was already present, returning a string MySQL never produces. Now
+  deduplicated case-insensitively with the first spelling kept and empty items
+  dropped. The client's order is preserved; MySQL's canonical ordering is a
+  cosmetic difference this does not close.
+
 ## [1.11.1] - 2026-09-02
 
 **A security release. Upgrade, and read the note if you store binary data.**

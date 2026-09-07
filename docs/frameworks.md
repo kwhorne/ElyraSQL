@@ -130,12 +130,35 @@ options; use `NAME = "elyra"`.
 
 ## Rust
 
-**sqlx** (MySQL) works out of the box (it binds client-side):
+**sqlx** (MySQL) connects with a plain URL and no options:
 
 ```rust
 let pool = sqlx::mysql::MySqlPoolOptions::new()
     .connect("mysql://root:@127.0.0.1:3307/elyra").await?;
 ```
+
+sqlx runs one statement on every new connection before anything the application
+asks for:
+
+```sql
+SET sql_mode=(SELECT CONCAT(@@sql_mode, ',PIPES_AS_CONCAT,NO_ENGINE_SUBSTITUTION')),time_zone='+00:00'
+```
+
+Both halves are accepted since 1.11.2. Before that, each was refused with error
+1235 and **no sqlx application could connect at all** — the failure arrived
+before the first real query. The `Any` driver and anything generic over
+`AnyPool` were affected too, since they cannot turn the statement off.
+
+Two things to know about what that statement does here:
+
+- `time_zone='+00:00'` is honoured exactly: ElyraSQL evaluates `NOW()` and the
+  other temporal functions in UTC (`@@system_time_zone` is `UTC`), which is what
+  sqlx's `chrono`/`time` types assume. **Only spellings that mean UTC are
+  accepted** — `+00:00`, `SYSTEM`, `UTC`. A non-zero offset is refused with a
+  reason rather than stored, because storing it while `NOW()` kept returning UTC
+  would be a lie the client could not detect.
+- `PIPES_AS_CONCAT` is accepted into the mode string, but `||` is not yet a
+  concatenation operator here — use `CONCAT()`. sqlx itself never relies on it.
 
 Set `ELYRASQL_STMT_DESCRIBE=on` on the server if a driver needs prepared-result
 columns resolved by name at prepare time (sqlx benefits from this).
