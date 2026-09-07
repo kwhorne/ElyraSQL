@@ -13034,3 +13034,55 @@ async fn a_malformed_procedure_body_is_refused_at_create_and_the_server_survives
         .unwrap();
     assert_eq!(seen, 3, "the cursor should have visited every row");
 }
+
+/// sqlx-mysql runs this on every new connection before the application's first
+/// statement. Refusing either half meant no sqlx application could connect at
+/// all -- the failure arrived before the first real query, with nothing the
+/// application had written anywhere in sight.
+#[tokio::test]
+async fn sqlx_connection_setup_is_accepted_over_the_wire() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    // Verbatim from sqlx-mysql 0.9.0, src/options/connect.rs.
+    c.query_drop(
+        "SET sql_mode=(SELECT CONCAT(@@sql_mode, ',PIPES_AS_CONCAT,NO_ENGINE_SUBSTITUTION')),\
+         time_zone='+00:00'",
+    )
+    .await
+    .expect("sqlx's first statement");
+    c.query_drop("SET NAMES utf8mb4 COLLATE utf8mb4_unicode_ci")
+        .await
+        .expect("sqlx's second statement");
+
+    let (mode, tz, global_tz): (String, String, String) = c
+        .query_first("SELECT @@sql_mode, @@session.time_zone, @@global.time_zone")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(mode.contains("PIPES_AS_CONCAT"), "{mode}");
+    assert!(
+        mode.contains("STRICT_TRANS_TABLES"),
+        "prior mode kept: {mode}"
+    );
+    assert_eq!(tz, "+00:00");
+    assert_eq!(global_tz, "SYSTEM");
+
+    // And the connection is usable for ordinary work afterwards.
+    c.query_drop("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
+        .await
+        .unwrap();
+    c.exec_drop("INSERT INTO t VALUES (?, ?)", (1i32, "ok"))
+        .await
+        .unwrap();
+    let v: Option<String> = c
+        .exec_first("SELECT v FROM t WHERE id = ?", (1i32,))
+        .await
+        .unwrap();
+    assert_eq!(v.as_deref(), Some("ok"));
+
+    // A second connection starts clean: the setting was session-scoped.
+    let mut other = srv.conn().await;
+    let tz2: Option<String> = other.query_first("SELECT @@time_zone").await.unwrap();
+    assert_eq!(tz2.as_deref(), Some("SYSTEM"));
+}

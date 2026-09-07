@@ -171,6 +171,19 @@ gaps:
   for its column raises 1264 as in MySQL. Tables created by earlier versions
   have no width recorded and are not retroactively constrained — see
   [data types](sql/data-types.md#integer-widths-and-unsigned).
+- **Session variables.** `SET` accepts `sql_mode`, `autocommit`,
+  `foreign_key_checks`, `group_concat_max_len`, `transaction_isolation` and
+  `time_zone`, in the `SET x`, `SET SESSION x` and `SET @@session.x` spellings,
+  with a comma-separated list and with a scalar subquery as the value
+  (`SET sql_mode=(SELECT CONCAT(@@sql_mode, ',...'))`, which is how sqlx opens a
+  connection). Other variables are refused with error 1235 rather than silently
+  ignored. `time_zone` accepts only spellings that mean UTC (`+00:00`, `SYSTEM`,
+  `UTC`): every temporal function evaluates in UTC, and a non-zero offset is
+  refused with a reason rather than stored and not honoured (#125).
+  `UTC_TIMESTAMP()` and `CONVERT_TZ()` are not yet implemented (#123), `||` is
+  not a concatenation operator even when `PIPES_AS_CONCAT` is set — use
+  `CONCAT()` (#124) — and `@@sql_mode` keeps the client's flag order rather than
+  MySQL's canonical one.
 - **One database.** `CREATE DATABASE`/`SCHEMA` is refused unless written with
   `IF NOT EXISTS`; see the note under *Laravel / Eloquent* above. `USE <name>`
   is accepted and changes what the catalog reports, but does not give a separate

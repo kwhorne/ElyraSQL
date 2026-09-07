@@ -1956,7 +1956,17 @@ impl Engine {
         }
         for (variable, expr) in variables.into_iter().zip(values) {
             let name = session_variable_name(&variable);
-            let value = set_expression_value(&expr)?;
+            let value = match scalar_subquery(&expr) {
+                // `SET sql_mode = (SELECT CONCAT(@@sql_mode, ',...'))` is how
+                // sqlx opens every connection. The scalar evaluator has no
+                // notion of a query, so this ran the whole statement into
+                // "expression not supported in WHERE" -- and with it, every
+                // sqlx application, before its first real query. A subquery
+                // in this position is a query like any other: run it, and
+                // require the one row and one column MySQL requires.
+                Some(query) => self.set_value_from_query(sess, query).await?,
+                None => set_expression_value(&expr)?,
+            };
             match name.as_str() {
                 "autocommit" => {
                     sess.set_autocommit(session_bool(&value, "autocommit")?)
@@ -1972,6 +1982,7 @@ impl Engine {
                 "transaction_isolation" | "tx_isolation" => {
                     sess.set_transaction_isolation(&session_text(value, "transaction_isolation")?)?
                 }
+                "time_zone" => sess.set_time_zone(&session_text(value, "time_zone")?)?,
                 unsupported => {
                     return Err(Error::Unsupported(format!(
                         "session variable is not supported: {unsupported}"
@@ -2010,6 +2021,54 @@ impl Engine {
             )),
             _ => None,
         }
+    }
+}
+
+/// The query inside `(SELECT ...)` when a SET value is a scalar subquery.
+fn scalar_subquery(expr: &sqlparser::ast::Expr) -> Option<&sqlparser::ast::Query> {
+    match expr {
+        sqlparser::ast::Expr::Subquery(query) => Some(query),
+        sqlparser::ast::Expr::Nested(inner) => scalar_subquery(inner),
+        _ => None,
+    }
+}
+
+impl Engine {
+    /// Run a scalar subquery used as a SET value and return its single cell.
+    async fn set_value_from_query(
+        &self,
+        sess: &Session,
+        query: &sqlparser::ast::Query,
+    ) -> Result<Value> {
+        let result = exec::select(sess, &self.vindex, query).await?;
+        let QueryResult::Rows(mut stream) = result else {
+            return Err(Error::Query(
+                "subquery in SET must return a result set".into(),
+            ));
+        };
+        // Pull two so a second row is detected without draining a large result.
+        let mut rows = stream.next_batch(2).await?;
+        if rows.len() != 1 {
+            // MySQL: ER_SUBQUERY_NO_1_ROW for many, and NULL for none. A SET
+            // value of NULL is almost never what a caller meant, so both are
+            // reported rather than silently assigning nothing.
+            return Err(Error::Query(format!(
+                "subquery in SET must return exactly one row, got {}",
+                if rows.is_empty() {
+                    "none".to_string()
+                } else {
+                    "more than one".to_string()
+                }
+            )));
+        }
+        let mut row = rows.remove(0);
+        if row.len() != 1 {
+            return Err(Error::Query(format!(
+                "subquery in SET must return exactly one column, got {}",
+                row.len()
+            )));
+        }
+        Ok(row.remove(0))
     }
 }
 
@@ -5285,5 +5344,200 @@ mod set_operation_chain_tests {
         // The same protection for the other two set operators.
         assert!(guard_sql_complexity(&chain(50_000, " INTERSECT ")).is_err());
         assert!(guard_sql_complexity(&chain(50_000, " EXCEPT ")).is_err());
+    }
+}
+
+#[cfg(test)]
+mod sqlx_session_setup_tests {
+    use super::{Engine, Privilege, QueryResult};
+    use elyra_core::Value;
+
+    /// Exactly what sqlx-mysql 0.9 runs on every new connection, before the
+    /// application's first statement.
+    const SQLX_CONNECT: &str = "SET sql_mode=(SELECT CONCAT(@@sql_mode, \
+        ',PIPES_AS_CONCAT,NO_ENGINE_SUBSTITUTION')),time_zone='+00:00'";
+
+    async fn engine() -> (Engine, crate::Session) {
+        let engine = Engine::new(elyra_storage::Db::in_memory().unwrap());
+        let session = engine.session();
+        (engine, session)
+    }
+
+    async fn run(engine: &Engine, session: &crate::Session, sql: &str) -> elyra_core::Result<()> {
+        engine
+            .execute(sql, Privilege::Admin, session)
+            .await
+            .map(|_| ())
+    }
+
+    async fn row(engine: &Engine, session: &crate::Session, sql: &str) -> Vec<Value> {
+        let mut results = engine
+            .execute(sql, Privilege::Admin, session)
+            .await
+            .unwrap();
+        match results.remove(0) {
+            QueryResult::Rows(mut stream) => stream.next_batch(2).await.unwrap().remove(0),
+            _ => panic!("expected rows"),
+        }
+    }
+
+    fn text(v: &Value) -> String {
+        v.to_wire_string().unwrap_or_default()
+    }
+
+    /// The whole sqlx handshake, as one statement, must succeed and take effect.
+    #[tokio::test]
+    async fn the_sqlx_connect_statement_succeeds() {
+        let (engine, session) = engine().await;
+        run(&engine, &session, SQLX_CONNECT).await.unwrap();
+
+        let r = row(
+            &engine,
+            &session,
+            "SELECT @@sql_mode, @@time_zone, @@session.time_zone, @@global.time_zone",
+        )
+        .await;
+        let mode = text(&r[0]);
+        assert!(mode.contains("PIPES_AS_CONCAT"), "{mode}");
+        assert!(mode.contains("NO_ENGINE_SUBSTITUTION"), "{mode}");
+        assert!(
+            mode.contains("STRICT_TRANS_TABLES"),
+            "the prior mode is kept: {mode}"
+        );
+        // sqlx appends NO_ENGINE_SUBSTITUTION to a mode that already has it;
+        // the result is a set, not a list with a duplicate.
+        assert_eq!(mode.matches("NO_ENGINE_SUBSTITUTION").count(), 1, "{mode}");
+        assert_eq!(text(&r[1]), "+00:00");
+        assert_eq!(text(&r[2]), "+00:00");
+        // Session-scoped, exactly as MySQL reports it.
+        assert_eq!(text(&r[3]), "SYSTEM");
+    }
+
+    #[tokio::test]
+    async fn a_scalar_subquery_is_a_valid_set_value() {
+        let (engine, session) = engine().await;
+        run(&engine, &session, "SET sql_mode = (SELECT 'ANSI_QUOTES')")
+            .await
+            .unwrap();
+        assert_eq!(
+            text(&row(&engine, &session, "SELECT @@sql_mode").await[0]),
+            "ANSI_QUOTES"
+        );
+        // Any expression, not just a literal.
+        run(
+            &engine,
+            &session,
+            "SET group_concat_max_len = (SELECT 1000 + 24)",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            row(&engine, &session, "SELECT @@group_concat_max_len").await[0],
+            Value::Int(1024)
+        );
+    }
+
+    /// MySQL requires exactly one row and one column; both violations must be
+    /// errors, never a panic or a silent NULL assignment.
+    #[tokio::test]
+    async fn a_subquery_that_is_not_scalar_is_refused() {
+        let (engine, session) = engine().await;
+        run(&engine, &session, "CREATE TABLE modes (m TEXT)")
+            .await
+            .unwrap();
+        run(&engine, &session, "INSERT INTO modes VALUES ('A'), ('B')")
+            .await
+            .unwrap();
+
+        let many = run(&engine, &session, "SET sql_mode = (SELECT m FROM modes)").await;
+        assert!(many.unwrap_err().to_string().contains("exactly one row"));
+
+        let none = run(
+            &engine,
+            &session,
+            "SET sql_mode = (SELECT m FROM modes WHERE m = 'zz')",
+        )
+        .await;
+        assert!(none.unwrap_err().to_string().contains("exactly one row"));
+
+        let wide = run(&engine, &session, "SET sql_mode = (SELECT 'A', 'B')").await;
+        assert!(wide.unwrap_err().to_string().contains("exactly one column"));
+
+        // And the variable is untouched by any of them.
+        assert_eq!(
+            text(&row(&engine, &session, "SELECT @@sql_mode").await[0]),
+            "STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION"
+        );
+    }
+
+    /// Every spelling of "UTC" is accepted and echoed as written; the engine
+    /// already evaluates temporal functions in UTC, so these are all honest.
+    #[tokio::test]
+    async fn utc_time_zones_are_accepted_and_echoed_verbatim() {
+        let (engine, session) = engine().await;
+        for zone in ["+00:00", "-00:00", "+0:00", "UTC", "utc", "SYSTEM", "GMT"] {
+            run(&engine, &session, &format!("SET time_zone = '{zone}'"))
+                .await
+                .unwrap_or_else(|e| panic!("{zone}: {e}"));
+            assert_eq!(
+                text(&row(&engine, &session, "SELECT @@time_zone").await[0]),
+                zone
+            );
+        }
+        // The @@session. and SESSION spellings reach the same variable.
+        run(&engine, &session, "SET @@session.time_zone = '+00:00'")
+            .await
+            .unwrap();
+        run(&engine, &session, "SET SESSION time_zone = 'SYSTEM'")
+            .await
+            .unwrap();
+        assert_eq!(
+            text(&row(&engine, &session, "SELECT @@session.time_zone").await[0]),
+            "SYSTEM"
+        );
+    }
+
+    /// A non-zero offset is refused with a reason. Storing it while `NOW()`
+    /// keeps returning UTC would be a lie the client cannot detect.
+    #[tokio::test]
+    async fn non_utc_offsets_are_refused_with_a_reason() {
+        let (engine, session) = engine().await;
+        for zone in ["+02:00", "-05:30", "+14:00"] {
+            let err = run(&engine, &session, &format!("SET time_zone = '{zone}'"))
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("UTC"), "{zone}: {err}");
+            assert!(
+                err.contains("+00:00"),
+                "{zone}: the message should say what works: {err}"
+            );
+        }
+        let err = run(&engine, &session, "SET time_zone = 'Europe/Oslo'")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a recognised time zone"), "{err}");
+        // Refused means unchanged.
+        assert_eq!(
+            text(&row(&engine, &session, "SELECT @@time_zone").await[0]),
+            "SYSTEM"
+        );
+    }
+
+    /// Sessions do not leak into each other.
+    #[tokio::test]
+    async fn time_zone_is_per_session() {
+        let (engine, a) = engine().await;
+        let b = engine.session();
+        run(&engine, &a, "SET time_zone = '+00:00'").await.unwrap();
+        assert_eq!(
+            text(&row(&engine, &a, "SELECT @@time_zone").await[0]),
+            "+00:00"
+        );
+        assert_eq!(
+            text(&row(&engine, &b, "SELECT @@time_zone").await[0]),
+            "SYSTEM"
+        );
     }
 }
