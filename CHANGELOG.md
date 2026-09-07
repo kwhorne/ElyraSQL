@@ -6,6 +6,15 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.11.2] - 2026-09-07
+
+**Rust applications can connect.** sqlx opens every connection with a statement
+ElyraSQL refused -- a scalar subquery as a `SET` value, and `time_zone` as a
+session variable -- so no sqlx application got as far as its first query. Both
+are accepted now, and a duplicated `@@sql_mode` flag the same statement produced
+is fixed alongside. Nothing else changes; no on-disk format change and no
+upgrade steps. A 1.11.1 database opens in 1.11.2 unchanged.
+
 ### Fixed
 
 - **sqlx (Rust) can connect.** sqlx-mysql runs one statement on every new
