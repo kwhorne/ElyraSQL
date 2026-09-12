@@ -153,10 +153,11 @@ Two things to know about what that statement does here:
 
 - `time_zone='+00:00'` is honoured exactly: ElyraSQL evaluates `NOW()` and the
   other temporal functions in UTC (`@@system_time_zone` is `UTC`), which is what
-  sqlx's `chrono`/`time` types assume. **Only spellings that mean UTC are
-  accepted** — `+00:00`, `SYSTEM`, `UTC`. A non-zero offset is refused with a
-  reason rather than stored, because storing it while `NOW()` kept returning UTC
-  would be a lie the client could not detect.
+  sqlx's `chrono`/`time` types assume. A **numeric offset** (`+HH:MM` within
+  `±14:00`) is honoured too: the local now-family follows it, the `UTC_*` forms
+  and an absolute `UNIX_TIMESTAMP()` stay in UTC. A **named zone**
+  (`Europe/Oslo`) is still refused, needing a zone table with DST rules a fixed
+  offset cannot express.
 - `PIPES_AS_CONCAT` is honoured: with it set, `||` concatenates; without it,
   `||` is logical OR, as in MySQL.
 

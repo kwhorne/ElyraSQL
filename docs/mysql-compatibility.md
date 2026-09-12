@@ -177,19 +177,25 @@ gaps:
   with a comma-separated list and with a scalar subquery as the value
   (`SET sql_mode=(SELECT CONCAT(@@sql_mode, ',...'))`, which is how sqlx opens a
   connection). Other variables are refused with error 1235 rather than silently
-  ignored. `time_zone` accepts only spellings that mean UTC (`+00:00`, `SYSTEM`,
-  `UTC`): every temporal function evaluates in UTC, and a non-zero offset is
-  refused with a reason rather than stored and not honoured (#125).
-  `UTC_TIMESTAMP()`/`UTC_DATE()`/`UTC_TIME()` return the current UTC instant, and
-  `CONVERT_TZ()` shifts by a fixed offset (`+HH:MM`, `SYSTEM`, `UTC`); a named
-  zone (`Europe/Oslo`) returns NULL, needing time-zone tables this build does not
-  carry. `||` follows MySQL: logical OR by default, string concatenation under
+  ignored. `time_zone` accepts UTC (`+00:00`, `SYSTEM`, `UTC`) and any numeric
+  offset in `[+-]HH:MM` form within `±14:00` (#125): the local now-family
+  (`NOW`, `CURRENT_TIMESTAMP`, `LOCALTIME`/`LOCALTIMESTAMP`, `CURDATE`, `CURTIME`)
+  reads in the session zone, the `UTC_*` forms stay in UTC, and
+  `FROM_UNIXTIME`/`UNIX_TIMESTAMP(dt)` interpret their value in the session zone
+  (`UNIX_TIMESTAMP()` with no argument is an absolute instant). A named zone
+  (`Europe/Oslo`) is refused, needing a zone table with DST rules a fixed offset
+  cannot express; converting stored `TIMESTAMP` columns on read is tracked
+  separately. `UTC_TIMESTAMP()`/`UTC_DATE()`/`UTC_TIME()` return the current UTC
+  instant, and `CONVERT_TZ()` shifts by a fixed offset (`+HH:MM`, `SYSTEM`,
+  `UTC`); a named zone returns NULL there, as MySQL does with no time-zone tables
+  loaded. `||` follows MySQL: logical OR by default, string concatenation under
   `PIPES_AS_CONCAT`. `@@sql_mode` keeps the client's flag order rather than
   MySQL's canonical one.
 - **`NOW()` is frozen per statement.** `NOW()`, `CURRENT_TIMESTAMP`,
   `LOCALTIME`/`LOCALTIMESTAMP`, `CURDATE`, `CURTIME` and the `UTC_*` forms return
   one instant captured at statement start -- so two reads agree and an `INSERT`
-  with several of them is consistent, as in MySQL. `SYSDATE()` is the exception:
+  with several of them is consistent, as in MySQL. The local forms carry the
+  session offset (above); the `UTC_*` forms do not. `SYSDATE()` is the exception:
   it reads the clock when it runs.
 - **One database.** `CREATE DATABASE`/`SCHEMA` is refused unless written with
   `IF NOT EXISTS`; see the note under *Laravel / Eloquent* above. `USE <name>`

@@ -1495,6 +1495,9 @@ impl Engine {
                 &database,
                 // One instant per statement, so every NOW()-family read agrees.
                 predicate::wall_micros(),
+                // The session offset: the local now-family and
+                // UNIX_TIMESTAMP/FROM_UNIXTIME are resolved against it.
+                sess.time_zone_offset_minutes(),
             );
             // `||` means logical OR by default and string concatenation under
             // PIPES_AS_CONCAT (MySQL). sqlparser parses it as one operator either
@@ -5519,27 +5522,35 @@ mod sqlx_session_setup_tests {
         );
     }
 
-    /// A non-zero offset is refused with a reason. Storing it while `NOW()`
-    /// keeps returning UTC would be a lie the client cannot detect.
+    /// A numeric offset is accepted, stored and echoed verbatim: the now-family
+    /// and UNIX_TIMESTAMP/FROM_UNIXTIME honour it (see the sessfn pre-pass).
     #[tokio::test]
-    async fn non_utc_offsets_are_refused_with_a_reason() {
+    async fn numeric_offsets_are_accepted_and_echoed_verbatim() {
         let (engine, session) = engine().await;
-        for zone in ["+02:00", "-05:30", "+14:00"] {
-            let err = run(&engine, &session, &format!("SET time_zone = '{zone}'"))
+        for zone in ["+02:00", "-05:30", "+14:00", "+0:00"] {
+            run(&engine, &session, &format!("SET time_zone = '{zone}'"))
+                .await
+                .unwrap_or_else(|e| panic!("{zone}: {e}"));
+            assert_eq!(
+                text(&row(&engine, &session, "SELECT @@time_zone").await[0]),
+                zone
+            );
+        }
+    }
+
+    /// A named zone is still refused: resolving it needs a zone table with DST
+    /// rules a fixed offset cannot express. An out-of-range offset is not an
+    /// offset either. Refused means the variable is unchanged.
+    #[tokio::test]
+    async fn named_zones_and_out_of_range_offsets_are_refused() {
+        let (engine, session) = engine().await;
+        for bad in ["Europe/Oslo", "+15:00", "PST", "banana"] {
+            let err = run(&engine, &session, &format!("SET time_zone = '{bad}'"))
                 .await
                 .unwrap_err()
                 .to_string();
-            assert!(err.contains("UTC"), "{zone}: {err}");
-            assert!(
-                err.contains("+00:00"),
-                "{zone}: the message should say what works: {err}"
-            );
+            assert!(err.contains("not a recognised time zone"), "{bad}: {err}");
         }
-        let err = run(&engine, &session, "SET time_zone = 'Europe/Oslo'")
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("not a recognised time zone"), "{err}");
         // Refused means unchanged.
         assert_eq!(
             text(&row(&engine, &session, "SELECT @@time_zone").await[0]),
@@ -5561,6 +5572,92 @@ mod sqlx_session_setup_tests {
             text(&row(&engine, &b, "SELECT @@time_zone").await[0]),
             "SYSTEM"
         );
+    }
+
+    /// The local now-family follows the session offset while the `UTC_*` forms
+    /// stay in UTC. Both are frozen to the same instant within one statement, so
+    /// the difference is exact and independent of the wall clock. MySQL 8.4 with
+    /// `time_zone='+02:00'` gives `TIMESTAMPDIFF(HOUR, UTC_TIMESTAMP(), NOW())`
+    /// = 2 and `TIMESTAMPDIFF(MINUTE, UTC_TIME(), CURTIME())` = 120.
+    #[tokio::test]
+    async fn the_local_now_family_follows_the_session_offset() {
+        let (engine, session) = engine().await;
+        run(&engine, &session, "SET time_zone = '+02:00'")
+            .await
+            .unwrap();
+        let r = row(
+            &engine,
+            &session,
+            "SELECT TIMESTAMPDIFF(HOUR, UTC_TIMESTAMP(), NOW()),                     TIMESTAMPDIFF(MINUTE, UTC_TIME(), CURTIME()),                     DATEDIFF(CURDATE(), UTC_DATE())",
+        )
+        .await;
+        assert_eq!(text(&r[0]), "2");
+        assert_eq!(text(&r[1]), "120");
+        // Same UTC day at +02:00 around midday, so the date does not shift.
+        assert_eq!(text(&r[2]), "0");
+
+        // A negative offset shifts the other way.
+        run(&engine, &session, "SET time_zone = '-05:30'")
+            .await
+            .unwrap();
+        let r = row(
+            &engine,
+            &session,
+            "SELECT TIMESTAMPDIFF(MINUTE, UTC_TIMESTAMP(), NOW())",
+        )
+        .await;
+        assert_eq!(text(&r[0]), "-330");
+    }
+
+    /// FROM_UNIXTIME renders epoch seconds in the session zone, and
+    /// UNIX_TIMESTAMP reads its argument as a session-zone datetime. These are
+    /// deterministic (no wall clock), matching the MySQL 8.4 oracle:
+    /// `FROM_UNIXTIME(0)` = `1970-01-01 02:00:00` and
+    /// `UNIX_TIMESTAMP('1970-01-01 02:00:00')` = 0 at `+02:00`.
+    #[tokio::test]
+    async fn unix_time_functions_honour_the_session_offset() {
+        let (engine, session) = engine().await;
+
+        run(&engine, &session, "SET time_zone = '+02:00'")
+            .await
+            .unwrap();
+        let r = row(
+            &engine,
+            &session,
+            "SELECT FROM_UNIXTIME(0), UNIX_TIMESTAMP('1970-01-01 02:00:00'),                     FROM_UNIXTIME(0, '%Y-%m-%d %H:%i:%s')",
+        )
+        .await;
+        assert_eq!(text(&r[0]), "1970-01-01 02:00:00");
+        assert_eq!(text(&r[1]), "0");
+        assert_eq!(text(&r[2]), "1970-01-01 02:00:00");
+
+        // A round-trip holds: UNIX_TIMESTAMP(FROM_UNIXTIME(n)) == n.
+        let r = row(
+            &engine,
+            &session,
+            "SELECT UNIX_TIMESTAMP(FROM_UNIXTIME(1700000000))",
+        )
+        .await;
+        assert_eq!(text(&r[0]), "1700000000");
+
+        run(&engine, &session, "SET time_zone = '-05:30'")
+            .await
+            .unwrap();
+        let r = row(
+            &engine,
+            &session,
+            "SELECT FROM_UNIXTIME(0), UNIX_TIMESTAMP('1969-12-31 18:30:00')",
+        )
+        .await;
+        assert_eq!(text(&r[0]), "1969-12-31 18:30:00");
+        assert_eq!(text(&r[1]), "0");
+
+        // Back at UTC, no wrapping: the classic epoch reads straight through.
+        run(&engine, &session, "SET time_zone = '+00:00'")
+            .await
+            .unwrap();
+        let r = row(&engine, &session, "SELECT FROM_UNIXTIME(0)").await;
+        assert_eq!(text(&r[0]), "1970-01-01 00:00:00");
     }
 }
 

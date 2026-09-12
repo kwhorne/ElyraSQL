@@ -467,6 +467,27 @@ CASES = [
     ("groupexpr", "SELECT n DIV 5 AS k, COUNT(*) FROM d GROUP BY n DIV 5 ORDER BY k"),
     ("groupexpr", "SELECT ABS(n) AS a, COUNT(*) FROM d GROUP BY ABS(n) ORDER BY a"),
     ("groupexpr", "SELECT UPPER(s) AS u, COUNT(*) FROM d GROUP BY UPPER(s) ORDER BY u"),
+    # Session time-zone offset. The connection persists across cases, so the SET
+    # takes effect for the block that follows and is reset to UTC at the end.
+    # These must come last: they change session state the now-family reads.
+    #   - The local now-family follows the offset; the UTC_* forms do not, so
+    #     their difference within one (frozen) statement is exactly the offset --
+    #     deterministic regardless of the wall clock.
+    #   - FROM_UNIXTIME renders epoch seconds in the session zone and
+    #     UNIX_TIMESTAMP reads its argument as a session-zone datetime.
+    ("tzset", "SET time_zone='+02:00'"),
+    ("tzoffset", "SELECT TIMESTAMPDIFF(HOUR, UTC_TIMESTAMP(), NOW())"),
+    ("tzoffset", "SELECT TIMESTAMPDIFF(MINUTE, UTC_TIME(), CURTIME())"),
+    ("tzoffset", "SELECT FROM_UNIXTIME(0)"),
+    ("tzoffset", "SELECT FROM_UNIXTIME(0, '%Y-%m-%d %H:%i:%s')"),
+    ("tzoffset", "SELECT UNIX_TIMESTAMP('1970-01-01 02:00:00')"),
+    ("tzoffset", "SELECT UNIX_TIMESTAMP(FROM_UNIXTIME(1700000000))"),
+    # A negative half-hour offset, then reset to UTC for the DML section.
+    ("tzset", "SET time_zone='-05:30'"),
+    ("tzoffset", "SELECT TIMESTAMPDIFF(MINUTE, UTC_TIMESTAMP(), NOW())"),
+    ("tzoffset", "SELECT FROM_UNIXTIME(0)"),
+    ("tzoffset", "SELECT UNIX_TIMESTAMP('1969-12-31 18:30:00')"),
+    ("tzset", "SET time_zone='+00:00'"),
 ]
 
 

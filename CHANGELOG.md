@@ -39,6 +39,18 @@ All notable changes to ElyraSQL are documented here. The format is based on
   carry -- as MySQL does with none loaded. Offset arithmetic checked against
   MySQL 8.4.
 
+- **Session time-zone offsets are honoured (#125).** `SET time_zone` used to
+  reject every non-UTC value, so a client that set `+02:00` was refused and
+  `NOW()` was UTC-only. A numeric offset (`[+-]HH:MM`, within `±14:00`) is now
+  accepted and applied: the local now-family (`NOW`, `CURRENT_TIMESTAMP`,
+  `LOCALTIME`/`LOCALTIMESTAMP`, `CURDATE`, `CURTIME`) reads in the session zone,
+  the `UTC_*` forms stay in UTC, and `FROM_UNIXTIME(n)`/`UNIX_TIMESTAMP(dt)`
+  interpret their value in the session zone (via `CONVERT_TZ`), while
+  `UNIX_TIMESTAMP()` with no argument stays an absolute instant. A named zone
+  (`Europe/Oslo`) is still refused -- it needs a zone table with the DST rules a
+  fixed offset cannot express. Converting stored `TIMESTAMP` columns on read is
+  tracked separately. Every offset checked against MySQL 8.4.
+
 ### Added
 
 - **`GROUPING()`.** A `WITH ROLLUP` subtotal row and a group whose key is
