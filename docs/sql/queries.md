@@ -46,6 +46,22 @@ spill-capable `DISTINCT`. Plans outside those proven subsets are reported
 conservatively rather than claiming an optimization that may fall back at
 runtime.
 
+For a grouped or aggregating query, `Extra` also names which of the
+[analytics engine's](../olap.md) paths will run:
+
+| `Extra` | Path |
+|---|---|
+| `Aggregate: columnar scalar` | No `GROUP BY`, no `WHERE`, two or more numeric aggregates: columns are extracted to arrays and reduced in tight loops. |
+| `Aggregate: columnar group, zone maps` | One numeric group column and numeric aggregates; `WHERE` compiled to the fast predicate. `, columnar cache` when the whole-column cache serves it. |
+| `Aggregate: parallel streaming (spills past N groups)` | The general path: batches aggregated on worker threads and merged. Spills to disk if the group count exceeds the cap at run time. |
+| `Aggregate: partitioned, spilling (N estimated groups > cap)` | Statistics predict more groups than fit in memory, so the spilling path is chosen up front. |
+| `Rollup: N aggregation passes` | `WITH ROLLUP`: one pass per grouping prefix. |
+| `Aggregate: materialised over join` | Aggregation over a join or derived table takes the materialised path. |
+
+The classification calls the same plan checks execution does, so it can only
+disagree with what runs if the dispatch order changes. What it cannot see is a
+runtime fallback, which the wording says.
+
 Non-accelerated scans **stream** in bounded memory, so they never load the
 whole table at once. When such a scan feeds an `ORDER BY ... LIMIT k`, only the
 filter and sort-key columns are decoded to test a row against the top-N heap; the
