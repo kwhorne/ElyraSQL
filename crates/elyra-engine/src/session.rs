@@ -374,32 +374,40 @@ impl Session {
         self.time_zone.lock().unwrap().clone()
     }
 
+    /// The session offset from UTC in minutes: `0` for `SYSTEM`, `UTC`, `GMT`,
+    /// `Z` and any zero offset, else the stored numeric offset. Named zones
+    /// never reach here -- [`Session::set_time_zone`] refuses them -- so an
+    /// unparseable value can only be a stale zero and maps to `0`.
+    pub fn time_zone_offset_minutes(&self) -> i32 {
+        let zone = self.time_zone.lock().unwrap();
+        let upper = zone.to_ascii_uppercase();
+        if matches!(upper.as_str(), "SYSTEM" | "UTC" | "GMT" | "Z") {
+            0
+        } else {
+            parse_utc_offset_minutes(&zone).unwrap_or(0)
+        }
+    }
+
     /// Set the session time zone.
     ///
     /// Drivers set this on connect -- sqlx sends `time_zone='+00:00'` on every
     /// new connection, before the application's first query -- so refusing it
-    /// outright made a whole ecosystem unable to connect. ElyraSQL evaluates
-    /// `NOW()` and friends in UTC (`@@system_time_zone` is `UTC`), so every
-    /// spelling that means UTC is accepted and honoured exactly: `SYSTEM`,
-    /// `UTC`, and a zero offset in any of MySQL's forms.
+    /// outright made a whole ecosystem unable to connect. ElyraSQL accepts every
+    /// spelling of UTC (`SYSTEM`, `UTC`, `GMT`, `Z`, a zero offset) and any
+    /// numeric offset in MySQL's `[+-]HH:MM` form within `±14:00`; the
+    /// now-family and `UNIX_TIMESTAMP`/`FROM_UNIXTIME` honour it.
     ///
-    /// A non-zero offset is refused with a reason rather than stored, because
-    /// storing it and then returning UTC from `NOW()` would be a lie the client
-    /// has no way to detect. Honouring offsets is a separate piece of work
-    /// across every temporal function.
+    /// Named zones (`Europe/Oslo`) are still refused: they need a zone table to
+    /// resolve, including the DST rules a fixed offset cannot express.
     pub fn set_time_zone(&self, zone: &str) -> Result<()> {
         let trimmed = zone.trim();
         let upper = trimmed.to_ascii_uppercase();
-        let means_utc = matches!(upper.as_str(), "SYSTEM" | "UTC" | "GMT" | "Z")
-            || parse_utc_offset_minutes(trimmed) == Some(0);
-        if !means_utc {
-            let why = if parse_utc_offset_minutes(trimmed).is_some() {
-                "ElyraSQL evaluates temporal functions in UTC; only +00:00 (or SYSTEM/UTC) is supported"
-            } else {
-                "not a recognised time zone; use +00:00, SYSTEM or UTC"
-            };
+        let recognised = matches!(upper.as_str(), "SYSTEM" | "UTC" | "GMT" | "Z")
+            || parse_utc_offset_minutes(trimmed).is_some();
+        if !recognised {
             return Err(Error::Unsupported(format!(
-                "time_zone = {trimmed:?}: {why}"
+                "time_zone = {trimmed:?}: not a recognised time zone; \
+                 use a numeric offset like +02:00, or SYSTEM/UTC"
             )));
         }
         // Keep the client's spelling: a driver that sets '+00:00' expects to

@@ -47,6 +47,35 @@ Units: `MICROSECOND`, `SECOND`, `MINUTE`, `HOUR`, `DAY`, `WEEK`, `MONTH`,
 `TIMESTAMPADD` and as a bare `d + INTERVAL n UNIT` / `d - INTERVAL n UNIT`
 operator.
 
+### Time zones
+
+| Function | Result |
+|----------|--------|
+| `UTC_TIMESTAMP()`, `UTC_DATE()`, `UTC_TIME()` | the current UTC instant |
+| `CONVERT_TZ(dt, from, to)` | `dt` shifted by the offset difference |
+| `FROM_UNIXTIME(n[, fmt])` | epoch seconds as a session-zone DATETIME (or formatted string) |
+
+The server's system zone is UTC. The session zone is set with
+`SET time_zone = '<value>'`, which accepts UTC (`+00:00`, `SYSTEM`, `UTC`) and
+any numeric offset in `[+-]HH:MM` form within `±14:00`:
+
+```sql
+SET time_zone = '+02:00';
+SELECT NOW();                              -- UTC + 2 hours
+SELECT UTC_TIMESTAMP();                    -- still UTC
+SELECT FROM_UNIXTIME(0);                   -- 1970-01-01 02:00:00
+SELECT UNIX_TIMESTAMP('1970-01-01 02:00:00');  -- 0
+SELECT UNIX_TIMESTAMP();                   -- absolute epoch, offset-independent
+```
+
+The local now-family (`NOW`, `CURRENT_TIMESTAMP`, `LOCALTIME`/`LOCALTIMESTAMP`,
+`CURDATE`, `CURTIME`) and the interpreting forms `FROM_UNIXTIME(n)` and
+`UNIX_TIMESTAMP(dt)` read in the session zone; the `UTC_*` forms and a niladic
+`UNIX_TIMESTAMP()` stay in UTC. `CONVERT_TZ` takes fixed offsets (`+HH:MM`,
+`SYSTEM`, `UTC`); a named zone (`Europe/Oslo`) returns NULL and, when set as the
+session zone, is refused -- resolving one needs a zone table with DST rules a
+fixed offset cannot express.
+
 ## String
 
 `CONCAT`, `CONCAT_WS`, `UPPER`/`UCASE`, `LOWER`/`LCASE`, `LENGTH`/`CHAR_LENGTH`,
