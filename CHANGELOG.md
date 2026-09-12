@@ -8,6 +8,21 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ### Fixed
 
+- **The expression-depth limit now follows the caller's stack (#116).** A deeply
+  nested expression (`1+1+1...`, a huge `OR` chain, nested functions) is refused
+  before parsing so it cannot overflow the stack, but the fixed limit (2000) was
+  calibrated to a server worker's stack. On a smaller one -- an `elyra-embed`
+  host thread, or a unit-test harness thread, both supported since 1.10.0 -- a
+  statement well inside the limit could still overflow and abort the whole
+  process (`panic = "abort"`), because the evaluator's frame is large (~18 KiB
+  per level in debug). The **expression-nesting** ceiling is now the smaller of
+  `ELYRASQL_MAX_EXPR_DEPTH` and what the calling thread's stack can actually hold,
+  so a too-deep expression is refused with a clean *too deeply nested* error
+  instead. The server's 16 MiB worker stacks keep the full ceiling; only a small
+  caller sees a lower one. Set-operation (`UNION`/`INTERSECT`/`EXCEPT`) chains --
+  executed iteratively, not recursed per branch -- stay bounded by the configured
+  ceiling regardless of stack, so their behaviour is unchanged.
+
 - **`SET @var` inside a stored procedure reaches the session (#120).** A user
   variable assigned in a procedure body landed in the procedure's local scope
   and was discarded when `CALL` returned, so `CREATE PROCEDURE p() BEGIN SET

@@ -165,10 +165,13 @@ statement cannot exhaust the worker-thread stack and abort the process:
   boolean/bitwise chains (`1+1+1...`, huge `OR` chains), parentheses and function
   nesting, JSON `->`/`->>` chains, and postfix subscript/call chains
   (`x[0][0]...`) — are rejected with a normal SQL error *before* parsing, so they
-  can never build a deep AST that overflows the stack. Configurable via
-  `ELYRASQL_MAX_EXPR_DEPTH` (default 2000, clamped 64..5000). Wide-but-shallow
-  queries (long `IN` lists, large multi-row `INSERT`s, multi-statement batches)
-  are unaffected.
+  can never build a deep AST that overflows the stack. The ceiling is
+  `ELYRASQL_MAX_EXPR_DEPTH` (default 2000, clamped 64..5000); the effective
+  expression-nesting limit is the smaller of it and what the calling thread's
+  stack can hold, so a deep expression is refused rather than aborting the
+  process on a small stack (an `elyra-embed` host thread or a test thread — the
+  16 MiB server workers keep the full ceiling). Wide-but-shallow queries (long
+  `IN` lists, large multi-row `INSERT`s, multi-statement batches) are unaffected.
 - **JSON nesting.** JSON documents are parsed to a maximum nesting depth of 200
   (both on write and when read by JSON functions); a deeper document is treated as
   invalid JSON rather than crashing.
