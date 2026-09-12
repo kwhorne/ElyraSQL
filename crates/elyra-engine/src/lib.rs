@@ -2978,10 +2978,11 @@ fn required_privset(stmt: &Statement) -> u32 {
 /// We reject such input *before* parsing so the pathological AST is never built.
 const DEFAULT_MAX_EXPR_DEPTH: usize = 2000;
 
-/// Effective expression-depth limit: `ELYRASQL_MAX_EXPR_DEPTH` if set, clamped to
-/// a safe range (never high enough to reintroduce the stack-overflow), else the
-/// default. Cached after first read.
-fn max_expr_depth() -> usize {
+/// The configured depth ceiling: `ELYRASQL_MAX_EXPR_DEPTH` if set (clamped),
+/// else the default. Cached. This is the most the guard will ever allow,
+/// whatever the stack; the effective limits are the smaller of this and what the
+/// current thread's stack can hold (see [`depth_limits`]).
+fn configured_max_expr_depth() -> usize {
     use std::sync::OnceLock;
     static LIMIT: OnceLock<usize> = OnceLock::new();
     *LIMIT.get_or_init(|| {
@@ -2991,6 +2992,75 @@ fn max_expr_depth() -> usize {
             .map(|v| v.clamp(64, 5000))
             .unwrap_or(DEFAULT_MAX_EXPR_DEPTH)
     })
+}
+
+/// The two depth ceilings for the statement about to be parsed, each the smaller
+/// of the configured ceiling and what the current thread's stack can hold.
+///
+/// The old single fixed limit was calibrated to a server worker's stack; on a
+/// smaller stack (an `elyra-embed` host thread, or a unit-test harness thread) a
+/// statement well inside it could still overflow and abort the whole process
+/// (`panic = "abort"`). Deriving the limit from the stack that is actually
+/// present turns that abort into a clean "too deeply nested" error.
+///
+/// Two kinds of depth cost very differently and so get separate ceilings:
+///
+/// - **Expression nesting** (`1+1+1...`, nested parens/functions, boolean
+///   chains) is evaluated by [`crate::predicate::eval_row`], whose frame is
+///   huge -- measured at ~18 KiB in debug, ~720 B in release. This is the acute
+///   overflow: ~90 levels exhaust a 2 MiB debug stack, so this ceiling is the one
+///   derived from the current thread's remaining stack.
+/// - **Total AST depth**, which also counts `UNION`/`INTERSECT`/`EXCEPT` chains,
+///   is kept at the configured ceiling. Set-operation execution is iterative (it
+///   does not recurse per branch), so a chain is shallow to evaluate; its
+///   behaviour is unchanged, and large chains are exercised against a running
+///   server, where a worker's stack is generous, rather than in-process.
+fn depth_limits() -> DepthLimits {
+    // Per recursion level of the evaluator, over the measured frame, with
+    // headroom. A debug build's frames are ~25x a release build's.
+    const EXPR_FRAME: usize = if cfg!(debug_assertions) {
+        24 * 1024
+    } else {
+        2 * 1024
+    };
+    // Overhead on the stack when the evaluator runs but not here at the guard
+    // (the async execution frames between the two), plus a safety margin.
+    const RESERVE: usize = 384 * 1024;
+    let configured = configured_max_expr_depth();
+    let expr = match stacker::remaining_stack() {
+        Some(remaining) => configured.min(remaining.saturating_sub(RESERVE) / EXPR_FRAME),
+        None => configured,
+    };
+    DepthLimits {
+        expr,
+        total: configured,
+        configured,
+    }
+}
+
+/// The depth ceilings in force for one statement (see [`depth_limits`]).
+struct DepthLimits {
+    /// Ceiling on expression nesting (the evaluator's recursion), derived from
+    /// the current thread's stack.
+    expr: usize,
+    /// Ceiling on total AST depth, including set-operation chains: the configured
+    /// ceiling, unchanged.
+    total: usize,
+    /// The configured ceiling, for phrasing the error when the stack is smaller.
+    configured: usize,
+}
+
+/// The set-operation keywords, which deepen the AST for parsing/walking but,
+/// unlike an expression operator, are executed iteratively rather than recursed
+/// into per branch -- so they count toward the total-depth ceiling, not the
+/// (much tighter) expression-nesting one.
+fn is_setop_keyword(k: Keyword) -> bool {
+    matches!(k, Keyword::UNION | Keyword::INTERSECT | Keyword::EXCEPT)
+}
+
+/// Is this a set-operation token (a `UNION`/`INTERSECT`/`EXCEPT` word)?
+fn is_setop_token(tok: &Token) -> bool {
+    matches!(tok, Token::Word(w) if is_setop_keyword(w.keyword))
 }
 
 /// Is this a keyword that acts as an infix/prefix operator (and so extends an
@@ -3030,7 +3100,7 @@ fn is_operator_keyword(k: Keyword) -> bool {
 /// the worker thread's stack, which in Rust triggers `abort()` -- killing the
 /// whole server process, not just the connection. This runs on the flat token
 /// stream (no recursion, safe to drop) and estimates the maximum AST depth with a
-/// small bracket-aware state machine, rejecting anything over [`max_expr_depth`]
+/// small bracket-aware state machine, rejecting anything over the stack-derived limits (see [`depth_limits`])
 /// with a normal SQL error so the connection survives and other clients are
 /// unaffected. If tokenizing fails we return `Ok(())` and let the parser produce
 /// the real syntax error.
@@ -3064,65 +3134,115 @@ pub fn guard_sql_complexity(sql: &str) -> Result<()> {
         Ok(t) => t,
         Err(_) => return Ok(()),
     };
-    let limit = max_expr_depth();
-    // Per bracket level: (base_depth at which this level is rooted, chain length
-    // accumulated so far at this level). Depth at a point = base + chain.
-    let mut stack: Vec<(usize, usize)> = vec![(0, 0)];
-    let mut max_depth = 0usize;
-    macro_rules! bump {
-        ($d:expr) => {{
-            let d = $d;
-            if d > max_depth {
-                max_depth = d;
-                if max_depth > limit {
-                    return Err(Error::Parse(format!(
-                        "expression too deeply nested (depth limit {limit}); simplify the query"
-                    )));
-                }
+    let limits = depth_limits();
+    // Two parallel bracket-depth machines over the flat token stream. `total`
+    // counts every deepening token (set operations included) and bounds the
+    // parser/walker recursion; `expr` excludes set operations -- a `UNION` starts
+    // a fresh expression on its right, evaluated independently -- and bounds the
+    // evaluator's much deeper recursion. Each level is (base, chain): depth at a
+    // point is base + chain.
+    let mut total: Vec<(usize, usize)> = vec![(0, 0)];
+    let mut expr: Vec<(usize, usize)> = vec![(0, 0)];
+    let mut max_total = 0usize;
+    let mut max_expr = 0usize;
+    macro_rules! check {
+        () => {{
+            if max_total > limits.total || max_expr > limits.expr {
+                let (limit, over) = if max_expr > limits.expr {
+                    (limits.expr, "expression nesting")
+                } else {
+                    (limits.total, "set-operation chain")
+                };
+                // When the stack, not the configured ceiling, is the binding
+                // limit, say so: the caller is on a small stack (an embedded
+                // host or a test-harness thread) and the alternative to this
+                // clean error would be a process-aborting stack overflow.
+                let hint = if limit < limits.configured {
+                    "; this connection has a small stack, so run the engine on a \
+                     larger one or simplify the query"
+                } else {
+                    "; simplify the query"
+                };
+                return Err(Error::Parse(format!(
+                    "expression too deeply nested ({over} limit {limit}){hint}"
+                )));
             }
         }};
     }
     for tok in &tokens {
+        if is_setop_token(tok) {
+            // Set operations deepen the whole AST (parser/walker) but reset the
+            // expression chain: the branch on their right is a fresh expression.
+            let t = total.last_mut().unwrap();
+            t.1 += 1;
+            max_total = max_total.max(t.0 + t.1);
+            if let Some(e) = expr.last_mut() {
+                e.1 = 0;
+            }
+            check!();
+            continue;
+        }
         if is_deepening_token(tok) {
-            let top = stack.last_mut().unwrap();
-            top.1 += 1;
-            bump!(top.0 + top.1);
+            let t = total.last_mut().unwrap();
+            t.1 += 1;
+            max_total = max_total.max(t.0 + t.1);
+            let e = expr.last_mut().unwrap();
+            e.1 += 1;
+            max_expr = max_expr.max(e.0 + e.1);
+            check!();
             continue;
         }
         match tok {
             // Opening a group/subscript/call roots a sub-expression one level
             // deeper (catches `((((...))))`, `f(f(f(...)))`, deep subqueries).
             Token::LParen | Token::LBracket => {
-                let top = *stack.last().unwrap();
-                let base = top.0 + top.1 + 1;
-                bump!(base);
-                stack.push((base, 0));
+                let t = *total.last().unwrap();
+                let tb = t.0 + t.1 + 1;
+                max_total = max_total.max(tb);
+                total.push((tb, 0));
+                let e = *expr.last().unwrap();
+                let eb = e.0 + e.1 + 1;
+                max_expr = max_expr.max(eb);
+                expr.push((eb, 0));
+                check!();
             }
             // Closing returns to the parent, and the group/subscript/call becomes
             // one more operand in the parent's chain. Incrementing here is what
             // catches token-balanced *postfix* chains that never accumulate an open
             // bracket depth, e.g. `x[0][0][0]...` or `f(a)(b)...`.
             Token::RParen | Token::RBracket => {
-                if stack.len() > 1 {
-                    stack.pop();
+                if total.len() > 1 {
+                    total.pop();
                 }
-                let top = stack.last_mut().unwrap();
-                top.1 += 1;
-                bump!(top.0 + top.1);
+                if expr.len() > 1 {
+                    expr.pop();
+                }
+                let t = total.last_mut().unwrap();
+                t.1 += 1;
+                max_total = max_total.max(t.0 + t.1);
+                let e = expr.last_mut().unwrap();
+                e.1 += 1;
+                max_expr = max_expr.max(e.0 + e.1);
+                check!();
             }
             // A comma starts a fresh element (list item / argument) at this level,
             // so a long-but-shallow list (`IN (...)`, multi-row `VALUES`) doesn't
             // accumulate depth.
             Token::Comma => {
-                if let Some(top) = stack.last_mut() {
-                    top.1 = 0;
+                if let Some(t) = total.last_mut() {
+                    t.1 = 0;
+                }
+                if let Some(e) = expr.last_mut() {
+                    e.1 = 0;
                 }
             }
             // A statement separator resets to a fresh context, so a multi-statement
             // batch of shallow statements isn't summed into a false rejection.
             Token::SemiColon => {
-                stack.clear();
-                stack.push((0, 0));
+                total.clear();
+                total.push((0, 0));
+                expr.clear();
+                expr.push((0, 0));
             }
             _ => {}
         }
@@ -4610,6 +4730,137 @@ mod insert_set_tests {
 }
 
 #[cfg(test)]
+mod deep_statement_small_stack_tests {
+    //! A deep statement on a small caller stack must fail with a clean error,
+    //! never a process-aborting stack overflow (#116). The depth ceilings are
+    //! derived from the thread's actual remaining stack, so the guard refuses a
+    //! statement the stack could not evaluate. These run the real engine on a
+    //! small thread; if the calibration were too loose, they would SIGABRT the
+    //! test binary instead of failing an assertion.
+    use super::{Engine, Privilege};
+
+    fn on_small_stack<R: Send + 'static>(kib: usize, f: impl FnOnce() -> R + Send + 'static) -> R {
+        std::thread::Builder::new()
+            .stack_size(kib * 1024)
+            .spawn(f)
+            .unwrap()
+            .join()
+            .unwrap()
+    }
+
+    fn block_on<R>(fut: impl std::future::Future<Output = R>) -> R {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(fut)
+    }
+
+    /// A shallow query runs; a deep expression is refused. Neither aborts the
+    /// 1 MiB thread, and the refusal is monotonic in depth (one crossover).
+    #[test]
+    fn a_deep_expression_is_refused_not_aborted_on_a_small_stack() {
+        let outcomes = on_small_stack(1024, || {
+            block_on(async {
+                let engine = Engine::new(elyra_storage::Db::in_memory().unwrap());
+                let session = engine.session();
+                let mut out = Vec::new();
+                for depth in [1usize, 5, 10, 25, 50, 100, 200, 400, 800, 1600] {
+                    let sql = format!("SELECT 1{}", "+1".repeat(depth));
+                    let ok = engine
+                        .execute(&sql, Privilege::Admin, &session)
+                        .await
+                        .is_ok();
+                    out.push((depth, ok));
+                }
+                out
+            })
+        });
+        assert!(outcomes[0].1, "depth 1 should run: {outcomes:?}");
+        assert!(
+            !outcomes.last().unwrap().1,
+            "depth 1600 should be refused: {outcomes:?}"
+        );
+        let first_refused = outcomes.iter().position(|(_, ok)| !ok).unwrap();
+        assert!(
+            outcomes[first_refused..].iter().all(|(_, ok)| !*ok),
+            "refusal must be monotonic in depth: {outcomes:?}"
+        );
+    }
+
+    /// The refusal is the guard's clean error, not a panic, and names the cause.
+    #[test]
+    fn the_refusal_is_a_clean_error() {
+        let msg = on_small_stack(1024, || {
+            block_on(async {
+                let engine = Engine::new(elyra_storage::Db::in_memory().unwrap());
+                let session = engine.session();
+                let sql = format!("SELECT 1{}", "+1".repeat(1600));
+                match engine.execute(&sql, Privilege::Admin, &session).await {
+                    Ok(_) => None,
+                    Err(e) => Some(e.to_string()),
+                }
+            })
+        });
+        let msg = msg.expect("depth 1600 should be refused on a 1 MiB stack");
+        assert!(msg.contains("too deeply nested"), "{msg}");
+    }
+
+    /// A long `UNION ALL` chain -- deep in total AST but shallow to evaluate --
+    /// runs on a stack where a much shallower expression is refused: set-operation
+    /// depth is bounded far more loosely than expression nesting, matching how it
+    /// executes (iteratively, not recursed per branch). Both on the same 2 MiB
+    /// thread, so the contrast is real.
+    #[test]
+    fn a_union_chain_outlives_a_shallower_expression_on_the_same_stack() {
+        let (union_ok, expr_ok) = on_small_stack(2048, || {
+            block_on(async {
+                let engine = Engine::new(elyra_storage::Db::in_memory().unwrap());
+                let session = engine.session();
+                // 100-branch UNION ALL: total depth 99, but each branch is a
+                // trivial expression (bounded by the configured ceiling, not the
+                // stack, and well inside what the stack holds).
+                let mut union = String::from("SELECT 0");
+                for i in 1..100 {
+                    union.push_str(&format!(" UNION ALL SELECT {i}"));
+                }
+                let union_ok = engine
+                    .execute(&union, Privilege::Admin, &session)
+                    .await
+                    .is_ok();
+                // A 200-deep arithmetic expression is far shallower in the AST
+                // but recurses the evaluator 200 frames deep -- refused here.
+                let expr = format!("SELECT 1{}", "+1".repeat(200));
+                let expr_ok = engine
+                    .execute(&expr, Privilege::Admin, &session)
+                    .await
+                    .is_ok();
+                (union_ok, expr_ok)
+            })
+        });
+        assert!(union_ok, "a 100-branch UNION should run on a 2 MiB stack");
+        assert!(!expr_ok, "a 200-deep expression should be refused there");
+    }
+
+    /// The limit follows the stack: a deep expression refused on a small stack
+    /// runs on a generous one.
+    #[test]
+    fn a_generous_stack_runs_what_a_small_one_refuses() {
+        let ok = on_small_stack(32 * 1024, || {
+            block_on(async {
+                let engine = Engine::new(elyra_storage::Db::in_memory().unwrap());
+                let session = engine.session();
+                let sql = format!("SELECT 1{}", "+1".repeat(400));
+                engine
+                    .execute(&sql, Privilege::Admin, &session)
+                    .await
+                    .is_ok()
+            })
+        });
+        assert!(ok, "a 400-deep expression should run on a 32 MiB stack");
+    }
+}
+
+#[cfg(test)]
 mod complexity_guard_tests {
     use super::guard_sql_complexity;
 
@@ -4658,8 +4909,11 @@ mod complexity_guard_tests {
             .collect::<Vec<_>>()
             .join(",");
         guard_sql_complexity(&format!("INSERT INTO t VALUES {rows}")).unwrap();
-        // A moderate chain under the limit is fine.
-        guard_sql_complexity(&format!("SELECT 1{}", "+1".repeat(500))).unwrap();
+        // A moderate expression chain is fine. (The ceiling is now derived from
+        // the current thread's stack -- a small test-harness thread allows far
+        // less than a server worker -- so this stays well clear of it; the
+        // stack-calibrated refusal is covered in deep_statement_small_stack_tests.)
+        guard_sql_complexity(&format!("SELECT 1{}", "+1".repeat(30))).unwrap();
         // A batch of many shallow statements must not be summed into a rejection.
         let batch = "SELECT 1+1; ".repeat(3000);
         guard_sql_complexity(&batch).unwrap();
