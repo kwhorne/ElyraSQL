@@ -1493,6 +1493,8 @@ impl Engine {
                 sess.last_insert_id(),
                 sess.row_count(),
                 &database,
+                // One instant per statement, so every NOW()-family read agrees.
+                predicate::wall_micros(),
             );
             // `||` means logical OR by default and string concatenation under
             // PIPES_AS_CONCAT (MySQL). sqlparser parses it as one operator either

@@ -176,6 +176,12 @@ FIXTURES = [
 CASES = [
     # arithmetic / numeric
     ("arith", "SELECT 1 + 1"),
+    # NOW() and its family are frozen per statement, so these equalities hold on
+    # both engines. (SYSDATE() stays live and is excluded -- its default second
+    # precision on MySQL vs microseconds here is a separate matter.)
+    ("now", "SELECT NOW() = NOW()"),
+    ("now", "SELECT NOW() = CURRENT_TIMESTAMP()"),
+    ("now", "SELECT CURDATE() = CURDATE()"),
     # `||` is logical OR in the default sql_mode (MySQL). Its concatenation
     # meaning under PIPES_AS_CONCAT needs a session SET that the one-statement-
     # per-execute harness cannot express here; it is covered by engine tests and
