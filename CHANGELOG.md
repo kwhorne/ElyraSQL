@@ -6,6 +6,16 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **`||` honours `PIPES_AS_CONCAT` (#124).** It was rejected outright ("operator
+  not supported"). It now follows MySQL: logical `OR` in the default mode, string
+  concatenation (NULL-propagating, like `CONCAT`) when `PIPES_AS_CONCAT` is set --
+  which sqlx sets on every connection, so the flag was visible in `@@sql_mode`
+  while the operator did nothing. Resolved per statement from the session mode,
+  so it toggles live and is per session. Every shape checked against MySQL 8.4,
+  in both modes.
+
 ### Added
 
 - **`GROUPING()`.** A `WITH ROLLUP` subtotal row and a group whose key is

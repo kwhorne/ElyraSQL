@@ -157,8 +157,8 @@ Two things to know about what that statement does here:
   accepted** — `+00:00`, `SYSTEM`, `UTC`. A non-zero offset is refused with a
   reason rather than stored, because storing it while `NOW()` kept returning UTC
   would be a lie the client could not detect.
-- `PIPES_AS_CONCAT` is accepted into the mode string, but `||` is not yet a
-  concatenation operator here — use `CONCAT()`. sqlx itself never relies on it.
+- `PIPES_AS_CONCAT` is honoured: with it set, `||` concatenates; without it,
+  `||` is logical OR, as in MySQL.
 
 Set `ELYRASQL_STMT_DESCRIBE=on` on the server if a driver needs prepared-result
 columns resolved by name at prepare time (sqlx benefits from this).
