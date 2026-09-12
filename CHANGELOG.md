@@ -6,6 +6,8 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.11.3] - 2026-09-12
+
 ### Fixed
 
 - **The expression-depth limit now follows the caller's stack (#116).** A deeply
