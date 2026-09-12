@@ -8,6 +8,18 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ### Fixed
 
+- **`SET @var` inside a stored procedure reaches the session (#120).** A user
+  variable assigned in a procedure body landed in the procedure's local scope
+  and was discarded when `CALL` returned, so `CREATE PROCEDURE p() BEGIN SET
+  @total = 6; END; CALL p(); SELECT @total` answered *unknown column* instead of
+  `6`. `@`-names now write to the session (as MySQL does, wherever they are
+  assigned) while bare names stay procedure locals, and a body reads `@`-vars
+  from the session too -- so an accumulator loop over `@total` works and a body
+  sees a `@var` the caller set. A local and a session variable of the same name
+  no longer collide. Verified against MySQL 8.4, with a new stored-procedure
+  section in the differential harness (its statement forms were uncovered
+  before).
+
 - **`NOW()` is frozen per statement.** Each call read the clock fresh, so
   `SELECT NOW() = NOW()` was `0`, and `INSERT ... VALUES (NOW(), NOW())` stored
   two different timestamps -- an ORM setting `created_at` and `updated_at`

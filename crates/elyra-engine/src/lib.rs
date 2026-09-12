@@ -194,7 +194,7 @@ impl Engine {
         use proc::{Flow, ProcStmt};
         const MAX_LOOP: u64 = 10_000_000;
         let cond = |c: &str, env: &std::collections::HashMap<String, Value>| -> Result<bool> {
-            Ok(truthy(&exec::eval_scalar(&exec::substitute_vars(c, env))?))
+            Ok(truthy(&exec::eval_scalar(&subst_proc(c, env, sess))?))
         };
         // How a loop body's escape signal is handled by a loop with `label`.
         enum Act {
@@ -214,14 +214,22 @@ impl Engine {
             match stmt {
                 ProcStmt::Declare { name, default } => {
                     let v = match default {
-                        Some(e) => exec::eval_scalar(&exec::substitute_vars(e, env))?,
+                        Some(e) => exec::eval_scalar(&subst_proc(e, env, sess))?,
                         None => Value::Null,
                     };
                     env.insert(name.to_ascii_lowercase(), v);
                 }
                 ProcStmt::Set { name, expr } => {
-                    let v = exec::eval_scalar(&exec::substitute_vars(expr, env))?;
-                    env.insert(name.to_ascii_lowercase(), v);
+                    let v = exec::eval_scalar(&subst_proc(expr, env, sess))?;
+                    // A `@user` variable belongs to the session and outlives the
+                    // CALL (as in MySQL); a bare name is a procedure local. `@@`
+                    // system variables are left to the dispatcher, unchanged.
+                    match name.strip_prefix('@') {
+                        Some(uvar) if !uvar.starts_with('@') => sess.set_user_var(uvar, v),
+                        _ => {
+                            env.insert(name.to_ascii_lowercase(), v);
+                        }
+                    }
                 }
                 ProcStmt::Leave(l) => return Ok(Flow::Leave(l.clone())),
                 ProcStmt::Iterate(l) => return Ok(Flow::Iterate(l.clone())),
@@ -2317,6 +2325,21 @@ fn truthy(v: &Value) -> bool {
         Value::Float(f) => *f != 0.0,
         other => other.as_f64().map(|n| n != 0.0).unwrap_or(true),
     }
+}
+
+/// Resolve both variable kinds in a procedure-body expression: session
+/// `@user` variables from the session (`@x` -> its value, unset -> NULL), then
+/// procedure-local `DECLARE`d names and parameters from `env`. The two token
+/// shapes are disjoint (`@name` vs a bare identifier), and `@@system` variables
+/// are left for the dispatcher. This is what lets a body read a `@var` the
+/// caller set and accumulate into one across loop iterations. The condition and
+/// SET/DECLARE right-hand sides evaluate directly (not via `execute_as`, which
+/// resolves `@vars` itself), so they need this pre-pass.
+fn subst_proc(sql: &str, env: &std::collections::HashMap<String, Value>, sess: &Session) -> String {
+    exec::substitute_vars(
+        &exec::substitute_uvars(sql, &sess.user_vars_snapshot()),
+        env,
+    )
 }
 
 fn object_name_last(name: &sqlparser::ast::ObjectName) -> Option<String> {
@@ -5240,6 +5263,114 @@ mod parse_dml_limit_utf8 {
             parse_dml_limit("UPDATE t SET x=1 LIMIT 5")
                 .map(|parsed| (parsed.base_sql, parsed.limit)),
             Some(("UPDATE t SET x=1".into(), 5))
+        );
+    }
+}
+
+#[cfg(test)]
+mod stored_procedure_user_var_tests {
+    //! `SET @var` inside a procedure body reaches the session's user variables
+    //! (#120). Every expected value here is one MySQL 8.4 produced.
+    use super::{Engine, Privilege, QueryResult, Session};
+    use elyra_core::Value;
+
+    async fn engine() -> (Engine, Session) {
+        let engine = Engine::new(elyra_storage::Db::in_memory().unwrap());
+        let session = engine.session();
+        (engine, session)
+    }
+
+    async fn execute(engine: &Engine, session: &Session, sql: &str) {
+        engine
+            .execute(sql, Privilege::Admin, session)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}\n  -> {e}"));
+    }
+
+    async fn scalar(engine: &Engine, session: &Session, sql: &str) -> Value {
+        let mut results = engine
+            .execute(sql, Privilege::Admin, session)
+            .await
+            .unwrap();
+        let QueryResult::Rows(mut stream) = results.remove(0) else {
+            panic!("expected rows for {sql}");
+        };
+        stream.next_batch(1).await.unwrap().remove(0).remove(0)
+    }
+
+    /// The issue's repro: a `@var` set in the body is visible to the caller
+    /// afterwards. MySQL returns 6.
+    #[tokio::test]
+    async fn a_user_var_set_in_the_body_reaches_the_session() {
+        let (engine, s) = engine().await;
+        execute(
+            &engine,
+            &s,
+            "CREATE PROCEDURE p() BEGIN SET @total = 6; END",
+        )
+        .await;
+        execute(&engine, &s, "CALL p()").await;
+        assert_eq!(scalar(&engine, &s, "SELECT @total").await, Value::Int(6));
+    }
+
+    /// A loop that reads and writes the same `@var` accumulates across
+    /// iterations -- the body must *see* the session value it just wrote.
+    /// MySQL: 0+1+2+3+4 = 10.
+    #[tokio::test]
+    async fn a_body_reads_back_the_user_var_it_writes() {
+        let (engine, s) = engine().await;
+        execute(
+            &engine,
+            &s,
+            "CREATE PROCEDURE p_acc() BEGIN \
+               DECLARE i INT DEFAULT 0; \
+               SET @total = 0; \
+               WHILE i < 5 DO SET @total = @total + i; SET i = i + 1; END WHILE; \
+             END",
+        )
+        .await;
+        execute(&engine, &s, "CALL p_acc()").await;
+        assert_eq!(scalar(&engine, &s, "SELECT @total").await, Value::Int(10));
+    }
+
+    /// A body reads a `@var` the caller set before the CALL. MySQL: 4*10 = 40.
+    #[tokio::test]
+    async fn a_body_reads_a_user_var_the_caller_set() {
+        let (engine, s) = engine().await;
+        execute(
+            &engine,
+            &s,
+            "CREATE PROCEDURE p_rc() BEGIN SET @out = @base * 10; END",
+        )
+        .await;
+        execute(&engine, &s, "SET @base = 4").await;
+        execute(&engine, &s, "CALL p_rc()").await;
+        assert_eq!(scalar(&engine, &s, "SELECT @out").await, Value::Int(40));
+    }
+
+    /// A local `total` and a session `@total` are distinct: assigning one does
+    /// not touch the other. MySQL: `@total` = 7, `@localseen` = 100 (the local's
+    /// value), proving `SET total = ...` and `SET @total = ...` hit different
+    /// homes.
+    #[tokio::test]
+    async fn a_local_and_a_user_var_of_the_same_name_do_not_collide() {
+        let (engine, s) = engine().await;
+        execute(
+            &engine,
+            &s,
+            "CREATE PROCEDURE p_local() BEGIN \
+               DECLARE total INT DEFAULT 99; \
+               SET @total = 7; \
+               SET total = total + 1; \
+               SET @localseen = total; \
+             END",
+        )
+        .await;
+        execute(&engine, &s, "CALL p_local()").await;
+        assert_eq!(scalar(&engine, &s, "SELECT @total").await, Value::Int(7));
+        assert_eq!(
+            scalar(&engine, &s, "SELECT @localseen").await,
+            Value::Int(100)
         );
     }
 }
