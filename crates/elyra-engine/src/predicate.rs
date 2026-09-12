@@ -994,6 +994,40 @@ pub fn system_var(raw: &str) -> Value {
     }
 }
 
+/// Minutes east of UTC for a CONVERT_TZ zone argument, or `None` for a value
+/// this build cannot interpret as a fixed offset (a named zone, or NULL).
+///
+/// The engine is UTC, so `SYSTEM`/`UTC`/`GMT` are zero; `[+-]HH:MM` is parsed
+/// and bounded to MySQL's +-14:00. Named zones (`Europe/Oslo`) need tzdata and
+/// yield `None`, which makes CONVERT_TZ return NULL, matching MySQL with no
+/// time-zone tables loaded.
+fn tz_offset_minutes(v: &Value) -> Option<i32> {
+    if v.is_null() {
+        return None;
+    }
+    let raw = v.to_wire_string()?;
+    let zone = raw.trim();
+    let upper = zone.to_ascii_uppercase();
+    if matches!(upper.as_str(), "SYSTEM" | "UTC" | "GMT" | "Z") {
+        return Some(0);
+    }
+    let (sign, rest) = match zone.as_bytes().first()? {
+        b'+' => (1, &zone[1..]),
+        b'-' => (-1, &zone[1..]),
+        _ => return None,
+    };
+    let (hours, minutes) = rest.split_once(':')?;
+    if hours.is_empty() || hours.len() > 2 || minutes.len() != 2 {
+        return None;
+    }
+    let h: i32 = hours.parse().ok()?;
+    let m: i32 = minutes.parse().ok()?;
+    if h > 14 || m > 59 || (h == 14 && m > 0) {
+        return None;
+    }
+    Some(sign * (h * 60 + m))
+}
+
 fn now_micros() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1150,6 +1184,29 @@ fn eval_scalar(name: &str, a: &[Value]) -> Result<Option<Value>> {
         }
         "curdate" | "current_date" => Value::Date(now_micros().div_euclid(86_400_000_000) as i32),
         "curtime" | "current_time" => Value::Time(now_micros().rem_euclid(86_400_000_000)),
+        // The engine evaluates every temporal function in UTC (@@system_time_zone
+        // is UTC), so the UTC_* forms are the local ones. `UTC_TIMESTAMP` was the
+        // one temporal function whose implementation was already present under
+        // another name.
+        "utc_timestamp" => Value::DateTime(now_micros()),
+        "utc_date" => Value::Date(now_micros().div_euclid(86_400_000_000) as i32),
+        "utc_time" => Value::Time(now_micros().rem_euclid(86_400_000_000)),
+        // CONVERT_TZ(dt, from_tz, to_tz): shift by (to - from). Offsets only
+        // (+HH:MM / -HH:MM / SYSTEM / UTC / GMT); a named zone needs tzdata this
+        // build does not carry, so it returns NULL -- as MySQL does when its
+        // time-zone tables are not loaded. NULL in any argument is NULL.
+        "convert_tz" => {
+            match (
+                to_micros(&a[0]),
+                tz_offset_minutes(&a[1]),
+                tz_offset_minutes(&a[2]),
+            ) {
+                (Some(m), Some(from), Some(to)) if !a[0].is_null() => {
+                    Value::DateTime(m + (to - from) as i64 * 60_000_000)
+                }
+                _ => Value::Null,
+            }
+        }
         "unix_timestamp" => {
             if a.is_empty() {
                 Value::Int(now_micros() / 1_000_000)
@@ -1771,6 +1828,9 @@ pub(crate) fn validate_scalar_function_arity(name: &str, arity: usize) -> Result
         | "found_rows" | "current_role" | "pi" => arity == 0,
         "now" | "current_timestamp" | "localtime" | "localtimestamp" | "sysdate" | "curtime"
         | "current_time" | "unix_timestamp" | "last_insert_id" | "rand" => arity <= 1,
+        "utc_timestamp" | "utc_time" => arity <= 1,
+        "utc_date" => arity == 0,
+        "convert_tz" => arity == 3,
         "year"
         | "month"
         | "day"
@@ -3663,5 +3723,74 @@ mod resolve_tests {
         assert_eq!(compile_os(), "macOS");
         #[cfg(target_os = "linux")]
         assert_eq!(compile_os(), "Linux");
+    }
+}
+
+#[cfg(test)]
+mod utc_and_convert_tz_tests {
+    use super::eval_scalar;
+    use elyra_core::Value;
+
+    fn call(name: &str, args: &[Value]) -> Value {
+        eval_scalar(name, args).unwrap().unwrap()
+    }
+    fn dt(s: &str) -> Value {
+        Value::DateTime(elyra_core::datetime::parse_datetime(s).unwrap())
+    }
+    fn show(v: Value) -> String {
+        v.to_wire_string().unwrap_or_else(|| "NULL".into())
+    }
+
+    /// CONVERT_TZ shifts by (to - from). Every expected value is MySQL 8.4's.
+    #[tokio::test]
+    async fn convert_tz_shifts_by_the_offset_difference() {
+        let d = dt("2024-01-01 12:00:00");
+        let z = |t: &str| Value::Text(t.into());
+        assert_eq!(
+            show(call("convert_tz", &[d.clone(), z("+00:00"), z("+02:00")])),
+            "2024-01-01 14:00:00"
+        );
+        assert_eq!(
+            show(call("convert_tz", &[d.clone(), z("+02:00"), z("+00:00")])),
+            "2024-01-01 10:00:00"
+        );
+        assert_eq!(
+            show(call("convert_tz", &[d.clone(), z("UTC"), z("+02:00")])),
+            "2024-01-01 14:00:00"
+        );
+        // Fractional seconds are preserved.
+        assert_eq!(
+            show(call(
+                "convert_tz",
+                &[dt("2024-01-01 12:00:00.123456"), z("+00:00"), z("-05:30")]
+            )),
+            "2024-01-01 06:30:00.123456"
+        );
+    }
+
+    #[tokio::test]
+    async fn convert_tz_is_null_for_null_or_a_named_zone() {
+        let d = dt("2024-01-01 12:00:00");
+        let z = |t: &str| Value::Text(t.into());
+        // NULL in any argument.
+        assert!(call("convert_tz", &[Value::Null, z("+00:00"), z("+02:00")]).is_null());
+        assert!(call("convert_tz", &[d.clone(), Value::Null, z("+02:00")]).is_null());
+        // A named zone needs tzdata this build does not carry: NULL, as MySQL
+        // does with no time-zone tables loaded.
+        assert!(call("convert_tz", &[d.clone(), z("+00:00"), z("Europe/Oslo")]).is_null());
+        // An unparseable offset is NULL, not a wrong shift.
+        assert!(call("convert_tz", &[d, z("+00:00"), z("+15:00")]).is_null());
+    }
+
+    /// The engine is UTC, so UTC_* return the same instant as the local forms,
+    /// with the right types.
+    #[tokio::test]
+    async fn utc_functions_have_the_right_types() {
+        assert!(matches!(call("utc_timestamp", &[]), Value::DateTime(_)));
+        assert!(matches!(call("utc_date", &[]), Value::Date(_)));
+        assert!(matches!(call("utc_time", &[]), Value::Time(_)));
+        // UTC_DATE equals CURDATE: both truncate the same UTC clock to a day, so
+        // a sub-second gap between the two reads cannot separate them.
+        assert_eq!(call("utc_date", &[]), call("curdate", &[]));
     }
 }

@@ -185,6 +185,14 @@ CASES = [
     ("pipes", "SELECT 'a' || 'b'"),
     ("pipes", "SELECT NULL || 1"),
     ("pipes", "SELECT 5 || 0"),
+    # CONVERT_TZ with fixed offsets is deterministic and needs no tz tables, so
+    # it compares directly against 8.4. Named zones (Europe/Oslo) depend on the
+    # oracle having tz tables loaded and are covered by engine tests instead.
+    ("convert_tz", "SELECT CONVERT_TZ('2024-01-01 12:00:00','+00:00','+02:00')"),
+    ("convert_tz", "SELECT CONVERT_TZ('2024-06-15 08:30:00','+02:00','+00:00')"),
+    ("convert_tz", "SELECT CONVERT_TZ('2024-01-01 12:00:00.123456','+00:00','-05:30')"),
+    ("convert_tz", "SELECT CONVERT_TZ('2024-01-01 12:00:00','UTC','+05:45')"),
+    ("convert_tz", "SELECT CONVERT_TZ(NULL,'+00:00','+02:00')"),
     # ROLLUP + GROUPING(): a subtotal row and a group whose key is genuinely NULL
     # both show NULL in the key column. Only GROUPING() tells them apart, and it
     # is what a pivot uses to label its margin. `d.s` has a real NULL (row 3) and

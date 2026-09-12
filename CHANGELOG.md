@@ -18,6 +18,18 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ### Added
 
+- **`UTC_TIMESTAMP()`, `UTC_DATE()`, `UTC_TIME()` and `CONVERT_TZ()` (#123).**
+  The engine evaluates every temporal function in UTC (`@@system_time_zone` is
+  `UTC`), so the UTC_* forms were the one temporal function whose value was
+  already present under another name; they now exist. `CONVERT_TZ(dt, from, to)`
+  shifts by the difference of two fixed offsets (`+HH:MM`, `-HH:MM`, `SYSTEM`,
+  `UTC`), preserving fractional seconds and propagating NULL. A named zone
+  (`Europe/Oslo`) returns NULL, needing time-zone tables this build does not
+  carry -- as MySQL does with none loaded. Offset arithmetic checked against
+  MySQL 8.4.
+
+### Added
+
 - **`GROUPING()`.** A `WITH ROLLUP` subtotal row and a group whose key is
   genuinely NULL both show `NULL`, and nothing in the row told them apart -- a
   client had to guess from row position, which is fragile enough that one built
