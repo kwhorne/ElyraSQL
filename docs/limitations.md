@@ -46,9 +46,13 @@ judge fit before deploying.
   rewritten to `UPDATE t1 CROSS JOIN t2 SET ... WHERE ...` (the WHERE supplies
   the join condition) before parsing.
 - `GROUP BY ... WITH ROLLUP` is supported: it adds a subtotal row for each
-  grouping prefix and a grand-total row (dropped group columns are NULL),
-  re-aggregating base rows per level so `AVG`/`MIN`/`MAX` stay correct. `ORDER
-  BY`/`LIMIT` apply to the combined result (NULLs sort first).
+  grouping prefix and a grand-total row (dropped group columns are NULL --
+  everywhere in the projection, so `CONCAT(region, '!')` is NULL on the
+  subtotal row too), re-aggregating base rows per level so `AVG`/`MIN`/`MAX`
+  stay correct. `GROUPING(col, ...)` tells a subtotal row from a group whose
+  key is genuinely NULL, with MySQL's bit layout (leftmost argument most
+  significant), and may appear in the projection, `HAVING` and `ORDER BY`.
+  `ORDER BY`/`LIMIT` apply to the combined result (NULLs sort first).
 - All the bitwise operators are supported: `&`, `|`, `^`, `<<`, `>>`, and unary
   `~`. They compute on 64-bit **unsigned** integers and return `BIGINT UNSIGNED`
   (`Value::UInt`), matching MySQL exactly — e.g. `~5` is `18446744073709551610`

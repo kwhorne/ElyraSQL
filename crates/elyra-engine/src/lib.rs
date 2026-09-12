@@ -5541,3 +5541,388 @@ mod sqlx_session_setup_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod rollup_grouping_and_explain_tests {
+    use super::{Engine, Privilege, QueryResult};
+    use elyra_core::{Error, Value};
+
+    /// The same four rows the MySQL 8.4 oracle was fed, so every expected value
+    /// below is one it produced.
+    async fn fixture() -> (Engine, crate::Session) {
+        let engine = Engine::new(elyra_storage::Db::in_memory().unwrap());
+        let session = engine.session();
+        for sql in [
+            "CREATE TABLE s (id INT PRIMARY KEY, region TEXT, prod TEXT, amt INT)",
+            "INSERT INTO s VALUES (1,'north','a',10),(2,'north','b',20),(3,NULL,'a',5),(4,'south','a',7)",
+        ] {
+            engine.execute(sql, Privilege::Admin, &session).await.unwrap();
+        }
+        (engine, session)
+    }
+
+    /// Rows as the wire would render them: `None` is SQL NULL. Type-agnostic on
+    /// purpose -- `SUM` over INT is a DECIMAL here, as in MySQL.
+    async fn rows(e: &Engine, s: &crate::Session, sql: &str) -> Vec<Vec<Option<String>>> {
+        let (_, rows) = rows_and_names(e, s, sql).await;
+        rows
+    }
+
+    async fn rows_and_names(
+        e: &Engine,
+        s: &crate::Session,
+        sql: &str,
+    ) -> (Vec<String>, Vec<Vec<Option<String>>>) {
+        let mut results = e
+            .execute(sql, Privilege::Admin, s)
+            .await
+            .unwrap_or_else(|err| panic!("{sql}\n  -> {err}"));
+        match results.remove(0) {
+            QueryResult::Rows(mut stream) => {
+                let names = stream
+                    .schema
+                    .columns
+                    .iter()
+                    .map(|c| c.name.clone())
+                    .collect();
+                let mut out = Vec::new();
+                loop {
+                    let batch = stream.next_batch(256).await.unwrap();
+                    if batch.is_empty() {
+                        break;
+                    }
+                    out.extend(
+                        batch
+                            .into_iter()
+                            .map(|r| r.iter().map(Value::to_wire_string).collect()),
+                    );
+                }
+                (names, out)
+            }
+            _ => panic!("expected rows: {sql}"),
+        }
+    }
+
+    async fn err(e: &Engine, s: &crate::Session, sql: &str) -> Error {
+        e.execute(sql, Privilege::Admin, s)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("expected an error: {sql}"))
+    }
+
+    fn r(cells: &[Option<&str>]) -> Vec<Option<String>> {
+        cells.iter().map(|c| c.map(str::to_string)).collect()
+    }
+    const N: Option<&str> = None;
+
+    // ---- GROUPING() --------------------------------------------------------
+
+    /// One bit per argument, leftmost most significant. Every row here is one
+    /// MySQL 8.4 returned for the same statement.
+    #[tokio::test]
+    async fn grouping_bits_match_mysql() {
+        let (e, s) = fixture().await;
+        let got = rows(
+            &e,
+            &s,
+            "SELECT region, prod, SUM(amt), GROUPING(region), GROUPING(prod), GROUPING(region, prod) \
+             FROM s GROUP BY region, prod WITH ROLLUP \
+             ORDER BY GROUPING(region), GROUPING(prod), region, prod",
+        )
+        .await;
+        let want = vec![
+            r(&[N, Some("a"), Some("5"), Some("0"), Some("0"), Some("0")]),
+            r(&[
+                Some("north"),
+                Some("a"),
+                Some("10"),
+                Some("0"),
+                Some("0"),
+                Some("0"),
+            ]),
+            r(&[
+                Some("north"),
+                Some("b"),
+                Some("20"),
+                Some("0"),
+                Some("0"),
+                Some("0"),
+            ]),
+            r(&[
+                Some("south"),
+                Some("a"),
+                Some("7"),
+                Some("0"),
+                Some("0"),
+                Some("0"),
+            ]),
+            r(&[N, N, Some("5"), Some("0"), Some("1"), Some("1")]),
+            r(&[
+                Some("north"),
+                N,
+                Some("30"),
+                Some("0"),
+                Some("1"),
+                Some("1"),
+            ]),
+            r(&[Some("south"), N, Some("7"), Some("0"), Some("1"), Some("1")]),
+            r(&[N, N, Some("42"), Some("1"), Some("1"), Some("3")]),
+        ];
+        assert_eq!(got, want);
+    }
+
+    /// The reason the function exists: the second and fifth rows above both
+    /// show `region = NULL`, and only GROUPING tells the real group from the
+    /// subtotal. This is the pivot-margin shape, in both spellings.
+    #[tokio::test]
+    async fn grouping_inside_if_and_case_labels_the_total_row() {
+        let (e, s) = fixture().await;
+        for label in [
+            "IF(GROUPING(region), 'Total', region)",
+            "CASE WHEN GROUPING(region) = 1 THEN 'Total' ELSE region END",
+        ] {
+            let got = rows(
+                &e,
+                &s,
+                &format!(
+                    "SELECT {label} AS r, SUM(amt) FROM s GROUP BY region WITH ROLLUP \
+                     ORDER BY GROUPING(region), region"
+                ),
+            )
+            .await;
+            assert_eq!(
+                got,
+                vec![
+                    r(&[N, Some("5")]), // the real NULL group stays NULL
+                    r(&[Some("north"), Some("30")]),
+                    r(&[Some("south"), Some("7")]),
+                    r(&[Some("Total"), Some("42")]),
+                ],
+                "{label}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn grouping_in_having_selects_only_the_super_aggregate() {
+        let (e, s) = fixture().await;
+        let got = rows(
+            &e,
+            &s,
+            "SELECT region, SUM(amt) FROM s GROUP BY region WITH ROLLUP HAVING GROUPING(region) = 1",
+        )
+        .await;
+        assert_eq!(got, vec![r(&[N, Some("42")])]);
+    }
+
+    /// Unaliased GROUPING columns are named by the expression as written, not by
+    /// the literal it is rewritten to; aliases are kept. Matches MySQL's naming.
+    #[tokio::test]
+    async fn grouping_column_names_and_type() {
+        let (e, s) = fixture().await;
+        let (names, got) = rows_and_names(
+            &e,
+            &s,
+            "SELECT GROUPING(region), GROUPING(region) AS g, IF(GROUPING(region), 'T', region) \
+             FROM s GROUP BY region WITH ROLLUP ORDER BY GROUPING(region), region LIMIT 1",
+        )
+        .await;
+        assert_eq!(names[0], "GROUPING(region)");
+        assert_eq!(names[1], "g");
+        assert!(names[2].starts_with("IF(GROUPING(region)"), "{}", names[2]);
+        assert_eq!(got[0][0].as_deref(), Some("0"));
+    }
+
+    /// A rolled-away column reads as NULL *everywhere* in the projection, not
+    /// only as a bare item: `CONCAT(NULL, '!')` is NULL on the subtotal row, as
+    /// MySQL's is. Previously only a bare `region` was substituted.
+    #[tokio::test]
+    async fn rolled_up_columns_are_null_inside_expressions_too() {
+        let (e, s) = fixture().await;
+        let got = rows(
+            &e,
+            &s,
+            "SELECT CONCAT(region, '!'), SUM(amt) FROM s GROUP BY region WITH ROLLUP \
+             ORDER BY GROUPING(region), region",
+        )
+        .await;
+        assert_eq!(
+            got,
+            vec![
+                r(&[N, Some("5")]),
+                r(&[Some("north!"), Some("30")]),
+                r(&[Some("south!"), Some("7")]),
+                r(&[N, Some("42")]),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn grouping_misuse_is_reported_as_mysql_does() {
+        let (e, s) = fixture().await;
+        // Without ROLLUP: MySQL 1111, whether or not there is a GROUP BY.
+        for sql in [
+            "SELECT region, SUM(amt), GROUPING(region) FROM s GROUP BY region",
+            "SELECT GROUPING(region) FROM s",
+            "SELECT region FROM s GROUP BY region ORDER BY GROUPING(region)",
+        ] {
+            let error = err(&e, &s, sql).await;
+            assert!(
+                matches!(error, Error::InvalidGroupFunction(_)),
+                "{sql}: {error}"
+            );
+            assert_eq!(error.mysql_code(), 1111, "{sql}");
+        }
+        // Not a group column: MySQL's wording, so a client sees the same text.
+        let error = err(
+            &e,
+            &s,
+            "SELECT region, GROUPING(prod) FROM s GROUP BY region WITH ROLLUP",
+        )
+        .await;
+        assert!(
+            error
+                .to_string()
+                .contains("Argument #1 of GROUPING function is not in GROUP BY"),
+            "{error}"
+        );
+        let error = err(
+            &e,
+            &s,
+            "SELECT GROUPING(1) FROM s GROUP BY region WITH ROLLUP",
+        )
+        .await;
+        assert!(
+            error
+                .to_string()
+                .contains("Incorrect arguments to GROUPING"),
+            "{error}"
+        );
+    }
+
+    // ---- ORDER BY an aliased aggregate --------------------------------------
+
+    /// `COUNT(*) AS c ... ORDER BY COUNT(*)` failed with "unknown output
+    /// column" because the sort resolved by output *name*, and the name was `c`.
+    /// The unaliased and `ORDER BY c` spellings worked, which is why it hid.
+    /// Every expected row is the oracle's.
+    #[tokio::test]
+    async fn order_by_matches_an_aliased_projection_expression() {
+        let (e, s) = fixture().await;
+        let cases: [(&str, Vec<Vec<Option<String>>>); 4] = [
+            (
+                "SELECT region, COUNT(*) AS c FROM s GROUP BY region ORDER BY COUNT(*) DESC, region",
+                vec![r(&[Some("north"), Some("2")]), r(&[N, Some("1")]), r(&[Some("south"), Some("1")])],
+            ),
+            (
+                "SELECT region, SUM(amt) AS total FROM s GROUP BY region ORDER BY SUM(amt) DESC, region",
+                vec![r(&[Some("north"), Some("30")]), r(&[Some("south"), Some("7")]), r(&[N, Some("5")])],
+            ),
+            (
+                "SELECT region, COUNT(*) AS c, SUM(amt) AS t FROM s GROUP BY region \
+                 ORDER BY c DESC, SUM(amt), region",
+                vec![
+                    r(&[Some("north"), Some("2"), Some("30")]),
+                    r(&[N, Some("1"), Some("5")]),
+                    r(&[Some("south"), Some("1"), Some("7")]),
+                ],
+            ),
+            (
+                "SELECT region AS r, COUNT(*) AS c FROM s GROUP BY region ORDER BY region",
+                vec![r(&[N, Some("1")]), r(&[Some("north"), Some("2")]), r(&[Some("south"), Some("1")])],
+            ),
+        ];
+        for (sql, want) in cases {
+            assert_eq!(rows(&e, &s, sql).await, want, "{sql}");
+        }
+    }
+
+    /// The same fix in the rollup path, plus an ORDER BY aggregate that is not
+    /// projected at all -- carried as a hidden column across levels.
+    #[tokio::test]
+    async fn rollup_orders_by_aliased_and_unprojected_aggregates() {
+        let (e, s) = fixture().await;
+        assert_eq!(
+            rows(
+                &e,
+                &s,
+                "SELECT region, COUNT(*) AS c FROM s GROUP BY region WITH ROLLUP \
+                 ORDER BY COUNT(*) DESC, region",
+            )
+            .await,
+            vec![
+                r(&[N, Some("4")]),
+                r(&[Some("north"), Some("2")]),
+                r(&[N, Some("1")]),
+                r(&[Some("south"), Some("1")]),
+            ]
+        );
+        assert_eq!(
+            rows(
+                &e,
+                &s,
+                "SELECT region, GROUPING(region) AS g FROM s GROUP BY region WITH ROLLUP \
+                 ORDER BY COUNT(*) DESC, region",
+            )
+            .await,
+            vec![
+                r(&[N, Some("1")]),
+                r(&[Some("north"), Some("0")]),
+                r(&[N, Some("0")]),
+                r(&[Some("south"), Some("0")]),
+            ]
+        );
+    }
+
+    // ---- EXPLAIN names the aggregation strategy ---------------------------------
+
+    async fn extra(e: &Engine, s: &crate::Session, sql: &str) -> String {
+        let got = rows(e, s, &format!("EXPLAIN {sql}")).await;
+        got[0][11].clone().unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn explain_reports_which_aggregation_path_runs() {
+        let (e, s) = fixture().await;
+        e.execute(
+            "CREATE TABLE t2 (id INT PRIMARY KEY, k INT)",
+            Privilege::Admin,
+            &s,
+        )
+        .await
+        .unwrap();
+
+        let cases = [
+            (
+                "SELECT SUM(amt), AVG(amt) FROM s",
+                "Aggregate: columnar scalar",
+            ),
+            (
+                "SELECT amt, COUNT(*) FROM s GROUP BY amt",
+                "Aggregate: columnar group",
+            ),
+            (
+                "SELECT region, COUNT(*) FROM s GROUP BY region",
+                "Aggregate: parallel streaming",
+            ),
+            (
+                "SELECT region, prod, COUNT(*) FROM s GROUP BY region, prod WITH ROLLUP",
+                "Rollup: 3 aggregation passes",
+            ),
+            (
+                "SELECT s.region, COUNT(*) FROM s JOIN t2 ON t2.id = s.id GROUP BY s.region",
+                "Aggregate: materialised over join",
+            ),
+        ];
+        for (sql, want) in cases {
+            let got = extra(&e, &s, sql).await;
+            assert!(
+                got.contains(want),
+                "{sql}\n  Extra: {got:?}\n  want:  {want:?}"
+            );
+        }
+        // A query that does not aggregate says nothing about aggregation.
+        let plain = extra(&e, &s, "SELECT * FROM s WHERE amt > 5").await;
+        assert!(!plain.contains("Aggregate"), "{plain:?}");
+    }
+}

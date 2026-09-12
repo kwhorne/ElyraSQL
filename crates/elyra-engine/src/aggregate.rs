@@ -1188,6 +1188,8 @@ fn infer_computed_type(expr: &Expr, schema: &Schema) -> ColumnType {
                 // way, and calling it a float here made `SUM(x) / COUNT(*)`
                 // look inexact and fall off the decimal path.
                 "count" => ColumnType::Int,
+                // Rollup level bits; MySQL types it BIGINT.
+                "grouping" => ColumnType::Int,
                 "length" | "char_length" | "character_length" | "octet_length" | "bit_length"
                 | "instr" | "locate" | "position" | "ascii" | "ord" | "field" | "find_in_set"
                 | "bit_count" | "crc32" | "unix_timestamp" | "to_days" | "datediff" | "day"

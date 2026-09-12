@@ -181,3 +181,34 @@ SELECT region, COUNT(*) FROM sales GROUP BY region;
     engine. It gives bounded memory and multi-core scaling; a columnar store
     with spill-to-disk is future work. The engine, strategies, and tuning are
     documented in detail under [Analytics (OLAP)](../olap.md).
+
+## Subtotals: `WITH ROLLUP` and `GROUPING()`
+
+`GROUP BY a, b WITH ROLLUP` returns the groups, then a subtotal row per `a`, then
+a grand total, re-aggregating the base rows at each level so `AVG`, `MIN` and
+`MAX` are exact. A rolled-away column is NULL on those rows -- in the projection
+and inside any expression over it.
+
+That leaves one ambiguity: a subtotal row and a group whose key is genuinely
+NULL both show `NULL`. `GROUPING()` is how a client tells them apart, and how a
+pivot labels its margin:
+
+```sql
+SELECT IF(GROUPING(region), 'Total', region) AS region,
+       SUM(amt),
+       GROUPING(region) AS is_total
+FROM sales
+GROUP BY region WITH ROLLUP
+ORDER BY GROUPING(region), region;
+```
+
+`GROUPING(col)` is 1 on the rows where `col` was rolled away and 0 otherwise.
+With several arguments it is a bit mask, leftmost argument most significant:
+`GROUPING(a, b)` is `2*GROUPING(a) + GROUPING(b)`, so the grand total of a
+two-column rollup reads 3. It may appear in the projection, `HAVING` and
+`ORDER BY`; its arguments must be `GROUP BY` columns, and it is an error (MySQL
+1111) without `WITH ROLLUP`.
+
+`ORDER BY` may name an aggregate by its expression even when the projection
+aliases it -- `COUNT(*) AS c ... ORDER BY COUNT(*)` -- or an aggregate that is
+not projected at all, in both grouped and rollup queries.

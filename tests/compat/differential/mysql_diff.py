@@ -176,6 +176,28 @@ FIXTURES = [
 CASES = [
     # arithmetic / numeric
     ("arith", "SELECT 1 + 1"),
+    # ROLLUP + GROUPING(): a subtotal row and a group whose key is genuinely NULL
+    # both show NULL in the key column. Only GROUPING() tells them apart, and it
+    # is what a pivot uses to label its margin. `d.s` has a real NULL (row 3) and
+    # an empty string (row 4), so both shapes are present. ORDER BY is required:
+    # the harness compares rows in order and ROLLUP output order is not otherwise
+    # defined here.
+    ("rollup", "SELECT s, SUM(n), GROUPING(s) FROM d GROUP BY s WITH ROLLUP ORDER BY GROUPING(s), s"),
+    ("rollup", "SELECT IF(GROUPING(s), 'Total', s), COUNT(*) FROM d GROUP BY s WITH ROLLUP ORDER BY GROUPING(s), s"),
+    ("rollup", "SELECT CASE WHEN GROUPING(s) = 1 THEN 'Total' ELSE s END, COUNT(*) FROM d GROUP BY s WITH ROLLUP ORDER BY GROUPING(s), s"),
+    ("rollup", "SELECT s, n, COUNT(*), GROUPING(s), GROUPING(n), GROUPING(s, n) FROM d GROUP BY s, n WITH ROLLUP ORDER BY GROUPING(s), GROUPING(n), s, n"),
+    ("rollup", "SELECT s, SUM(n) FROM d GROUP BY s WITH ROLLUP HAVING GROUPING(s) = 1"),
+    # A rolled-away column must read as NULL inside an expression too.
+    ("rollup", "SELECT CONCAT(s, '!'), COUNT(*) FROM d GROUP BY s WITH ROLLUP ORDER BY GROUPING(s), s"),
+    # GROUPING without ROLLUP: both sides reject (1111 on MySQL).
+    ("rollup", "SELECT s, GROUPING(s) FROM d GROUP BY s"),
+    # ORDER BY an aggregate that is aliased in the projection. Generated SQL
+    # nearly always aliases, so the failing spelling was the common one.
+    ("orderby", "SELECT s, COUNT(*) AS c FROM d GROUP BY s ORDER BY COUNT(*) DESC, s"),
+    ("orderby", "SELECT s, SUM(n) AS total FROM d GROUP BY s ORDER BY SUM(n) DESC, s"),
+    ("orderby", "SELECT s AS label, COUNT(*) AS c FROM d GROUP BY s ORDER BY s"),
+    ("orderby", "SELECT s, COUNT(*) AS c FROM d GROUP BY s WITH ROLLUP ORDER BY COUNT(*) DESC, s"),
+    ("orderby", "SELECT s FROM d GROUP BY s WITH ROLLUP ORDER BY COUNT(*) DESC, s"),
     ("arith", "SELECT 9223372036854775807 + 1"),
     ("arith", "SELECT 9223372036854775807 * 2"),
     ("arith", "SELECT 1 % 0"),

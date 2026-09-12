@@ -69,6 +69,13 @@ pub enum Error {
     #[error("database file is locked by another handle: {0}")]
     StorageLocked(String),
 
+    /// A group function used where it cannot apply: `GROUPING()` without
+    /// `WITH ROLLUP`, an aggregate nested in an aggregate. MySQL 1111
+    /// (`ER_INVALID_GROUP_FUNC_USE`), which clients branch on distinctly from a
+    /// generic query error.
+    #[error("invalid use of group function: {0}")]
+    InvalidGroupFunction(String),
+
     #[error("query error: {0}")]
     Query(String),
 
@@ -128,6 +135,7 @@ impl Error {
             Error::Unsupported(_) => 1235, // ER_NOT_SUPPORTED_YET
             Error::Conflict(_) => 1213,    // ER_LOCK_DEADLOCK (serialization failure)
             Error::StorageLocked(_) => 1015, // ER_CANT_LOCK
+            Error::InvalidGroupFunction(_) => 1111, // ER_INVALID_GROUP_FUNC_USE
             Error::Duplicate(DuplicateError::ColumnName, _) => 1060, // ER_DUP_FIELDNAME
             Error::Duplicate(DuplicateError::Entry, _) => 1062, // ER_DUP_ENTRY
             Error::ForeignKey(_) => 1452,  // ER_NO_REFERENCED_ROW

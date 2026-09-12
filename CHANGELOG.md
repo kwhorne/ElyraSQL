@@ -6,6 +6,47 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **`GROUPING()`.** A `WITH ROLLUP` subtotal row and a group whose key is
+  genuinely NULL both show `NULL`, and nothing in the row told them apart -- a
+  client had to guess from row position, which is fragile enough that one built
+  on this server offered subtotals only for two grouping columns, where position
+  is unambiguous. `GROUPING(col, ...)` now returns MySQL's bit mask (leftmost
+  argument most significant) in the projection, `HAVING` and `ORDER BY`, so
+  `IF(GROUPING(region), 'Total', region)` labels a pivot margin the way it does
+  on MySQL. Every value is checked against MySQL 8.4; misuse reports MySQL's
+  codes and wording (1111 without `ROLLUP`, "Argument #N ... is not in GROUP
+  BY").
+
+- **`EXPLAIN` names the aggregation path.** A grouped query answered `type=ALL`
+  with an empty `Extra`, identical for the vectorised path and the one that
+  spills to disk -- the server's defining feature was invisible to the client,
+  and a user could not see when a rewrite had pushed a query off the fast path.
+  `Extra` now says `Aggregate: columnar scalar`, `Aggregate: columnar group, zone
+  maps`, `Aggregate: parallel streaming`, `Aggregate: partitioned, spilling`,
+  `Rollup: N aggregation passes`, or `Aggregate: materialised over join`. The
+  classifier calls the same plan checks execution does.
+
+### Fixed
+
+- **`ORDER BY COUNT(*)` works when `COUNT(*)` is aliased in the projection.**
+  Output rows are sorted by output column, and the output column of `COUNT(*) AS
+  c` is `c`, so resolving `ORDER BY COUNT(*)` *by name* failed with "unknown
+  output column" -- while the unaliased and `ORDER BY c` spellings worked, which
+  is why it hid. Generated SQL nearly always aliases, so three of four generated
+  forms failed. The same for `region AS r ... ORDER BY region`. ORDER BY
+  expressions that name a projection item are now resolved to its position,
+  in both the grouped and the rollup path; a rollup `ORDER BY` may also name an
+  aggregate that is not projected.
+
+- **A rolled-away column is NULL inside expressions, not only as a bare item.**
+  `CONCAT(region, '!')` on a subtotal row read the base column instead of NULL.
+  The substitution is now recursive over the projection and `HAVING` (and
+  deliberately not `WHERE`, which filters base rows before aggregation).
+
+- **`docs/olap.md` said `ROLLUP` was not supported.** It has been for some time.
+
 ## [1.11.2] - 2026-09-07
 
 **Rust applications can connect.** sqlx opens every connection with a statement

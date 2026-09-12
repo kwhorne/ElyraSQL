@@ -932,23 +932,43 @@ async fn explain_first_access(
         }
         Err(error) => return Err(error),
     };
-    let mut feature_extra = Vec::new();
+    let mut feature_extra: Vec<String> = Vec::new();
+    if let Some(select) = select {
+        let order_exprs: Vec<(Expr, bool)> = match stmt {
+            Statement::Query(query) => query
+                .order_by
+                .as_ref()
+                .map(|ob| {
+                    ob.exprs
+                        .iter()
+                        .map(|o| (o.expr.clone(), o.asc.unwrap_or(true)))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        if let Some(strategy) =
+            aggregation_strategy(db, &def, select, selection, &order_exprs).await?
+        {
+            feature_extra.push(strategy);
+        }
+    }
     if let (Some(filter), Some(from)) = (selection, select.and_then(|select| select.from.first())) {
         let outer = factor_qualifier_object(db, &from.relation)
             .map(|qualifier| object_name_parts(&qualifier))
             .unwrap_or_else(|| vec![table.to_string()]);
         if correlated_exists_membership_eligible(db, filter, &def, &outer).await? {
-            feature_extra.push("Using semi-join membership");
+            feature_extra.push("Using semi-join membership".into());
         }
     }
     if select.is_some_and(|select| select.distinct.is_some()) {
-        feature_extra.push("Distinct (spill-capable)");
+        feature_extra.push("Distinct (spill-capable)".into());
     }
     if let Some(select) = select {
         let mut visitor = ExplainFeatureVisitor::default();
         let _ = select.visit(&mut visitor);
         if visitor.incremental_window {
-            feature_extra.push("Incremental window aggregate");
+            feature_extra.push("Incremental window aggregate".into());
         }
     }
     let decorate = |mut access: ExplainAccess| {
@@ -5722,6 +5742,163 @@ async fn check_unique_batch(
     Ok(())
 }
 
+/// The arguments of a `GROUPING(...)` call, or `None` for any other expression.
+fn grouping_call_args(expr: &Expr) -> Option<Vec<&Expr>> {
+    let Expr::Function(func) = expr else {
+        return None;
+    };
+    if !func
+        .name
+        .0
+        .last()
+        .is_some_and(|part| part.value.eq_ignore_ascii_case("grouping"))
+    {
+        return None;
+    }
+    let sqlparser::ast::FunctionArguments::List(list) = &func.args else {
+        return Some(Vec::new());
+    };
+    Some(
+        list.args
+            .iter()
+            .filter_map(|arg| match arg {
+                sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(e)) => {
+                    Some(e)
+                }
+                _ => None,
+            })
+            .collect(),
+    )
+}
+
+/// Every `GROUPING(...)` call under `expr`, outermost first.
+fn collect_grouping_calls<'a>(expr: &'a Expr, out: &mut Vec<Vec<&'a Expr>>) {
+    let mut stack: Vec<&'a Expr> = vec![expr];
+    while let Some(e) = stack.pop() {
+        if let Some(args) = grouping_call_args(e) {
+            out.push(args);
+        }
+        push_children(e, &mut stack);
+    }
+}
+
+/// Direct sub-expressions of `e`, for a borrowing walk.
+fn push_children<'a>(e: &'a Expr, stack: &mut Vec<&'a Expr>) {
+    match e {
+        Expr::BinaryOp { left, right, .. } => {
+            stack.push(left);
+            stack.push(right);
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::Nested(expr)
+        | Expr::IsNull(expr)
+        | Expr::IsNotNull(expr)
+        | Expr::Collate { expr, .. }
+        | Expr::Cast { expr, .. } => stack.push(expr),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            stack.push(expr);
+            stack.push(low);
+            stack.push(high);
+        }
+        Expr::InList { expr, list, .. } => {
+            stack.push(expr);
+            stack.extend(list.iter());
+        }
+        Expr::Like { expr, pattern, .. } => {
+            stack.push(expr);
+            stack.push(pattern);
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            results,
+            else_result,
+        } => {
+            if let Some(o) = operand {
+                stack.push(o);
+            }
+            stack.extend(conditions.iter());
+            stack.extend(results.iter());
+            if let Some(el) = else_result {
+                stack.push(el);
+            }
+        }
+        Expr::Function(func) => {
+            if let sqlparser::ast::FunctionArguments::List(list) = &func.args {
+                for arg in &list.args {
+                    if let sqlparser::ast::FunctionArg::Unnamed(
+                        sqlparser::ast::FunctionArgExpr::Expr(a),
+                    ) = arg
+                    {
+                        stack.push(a);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Whether a SELECT (projection, HAVING) or its ORDER BY mentions `GROUPING()`.
+fn mentions_grouping(select: &Select, order_exprs: &[(Expr, bool)]) -> bool {
+    let mut calls = Vec::new();
+    for item in &select.projection {
+        if let sqlparser::ast::SelectItem::UnnamedExpr(e)
+        | sqlparser::ast::SelectItem::ExprWithAlias { expr: e, .. } = item
+        {
+            collect_grouping_calls(e, &mut calls);
+        }
+    }
+    if let Some(h) = &select.having {
+        collect_grouping_calls(h, &mut calls);
+    }
+    for (e, _) in order_exprs {
+        collect_grouping_calls(e, &mut calls);
+    }
+    !calls.is_empty()
+}
+
+/// The value of `GROUPING(args)` at rollup level `k` -- the level that groups
+/// by the first `k` of `group_texts`.
+///
+/// One bit per argument, the leftmost most significant: `GROUPING(a, b)` is
+/// `2*GROUPING(a) + GROUPING(b)`, and a bit is set when that column was rolled
+/// away at this level, i.e. its position in the GROUP BY list is `>= k`. This is
+/// what lets a client tell a subtotal row from a group whose key is genuinely
+/// NULL -- the two are indistinguishable by the row's values alone.
+fn grouping_value(args: &[&Expr], k: usize, group_texts: &[String]) -> Result<i64> {
+    if args.is_empty() {
+        return Err(Error::Query(
+            "Incorrect arguments to GROUPING function".into(),
+        ));
+    }
+    if args.len() > 63 {
+        return Err(Error::Query(
+            "GROUPING function takes at most 63 arguments".into(),
+        ));
+    }
+    let mut value: i64 = 0;
+    for (i, arg) in args.iter().enumerate() {
+        let text = arg.to_string();
+        let Some(pos) = group_texts.iter().position(|g| *g == text) else {
+            return Err(if matches!(arg, Expr::Value(_)) {
+                Error::Query("Incorrect arguments to GROUPING function".into())
+            } else {
+                Error::Query(format!(
+                    "Argument #{} of GROUPING function is not in GROUP BY",
+                    i + 1
+                ))
+            });
+        };
+        if pos >= k {
+            value |= 1 << (args.len() - 1 - i);
+        }
+    }
+    Ok(value)
+}
+
 /// Execute `GROUP BY ... WITH ROLLUP` by running the aggregation once per
 /// grouping prefix -- full detail (all N columns), then N-1, ..., down to the
 /// grand total (0 columns) -- and concatenating. At level k the dropped group
@@ -5739,9 +5916,52 @@ async fn execute_rollup(
     offset: usize,
     limit: Option<usize>,
 ) -> Result<QueryResult> {
-    use sqlparser::ast::{GroupByExpr, SelectItem};
+    use sqlparser::ast::{GroupByExpr, Ident, SelectItem};
     let n = group_by.len();
     let group_texts: Vec<String> = group_by.iter().map(|e| e.to_string()).collect();
+
+    // Validate every GROUPING() call once, up front, against the GROUP BY list:
+    // an argument that is not a group column is an error at any level, and the
+    // per-level rewrite below cannot report one.
+    let base_select = match query.body.as_ref() {
+        SetExpr::Select(s) => s.as_ref(),
+        _ => return Err(Error::Unsupported("ROLLUP requires a SELECT".into())),
+    };
+    {
+        let mut calls = Vec::new();
+        for item in &base_select.projection {
+            if let SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } = item {
+                collect_grouping_calls(e, &mut calls);
+            }
+        }
+        if let Some(h) = &base_select.having {
+            collect_grouping_calls(h, &mut calls);
+        }
+        for (e, _) in order_exprs {
+            collect_grouping_calls(e, &mut calls);
+        }
+        for args in &calls {
+            grouping_value(args, n, &group_texts)?;
+        }
+    }
+
+    // The final sort runs over the concatenated levels, after the per-level
+    // queries are gone. An ORDER BY expression that names a projection item is
+    // resolved to its position; anything else -- `COUNT(*)` when only `region`
+    // is selected, `GROUPING(region)` -- is carried as a hidden projection column
+    // that every level computes (and rewrites) like any other, then dropped.
+    let (mut order_exprs, unmatched) =
+        order_by_output_position(order_exprs, &base_select.projection);
+    let mut hidden_items: Vec<SelectItem> = Vec::new();
+    for i in unmatched {
+        let name = format!("__rollup_order_{}", hidden_items.len());
+        hidden_items.push(SelectItem::ExprWithAlias {
+            expr: order_exprs[i].0.clone(),
+            alias: Ident::new(name.clone()),
+        });
+        order_exprs[i].0 = Expr::Identifier(Ident::new(name));
+    }
+    let hidden = hidden_items.len();
 
     let mut out_schema: Option<Schema> = None;
     let mut all_rows: Vec<Vec<Value>> = Vec::new();
@@ -5755,21 +5975,47 @@ async fn execute_rollup(
         if let SetExpr::Select(s) = lq.body.as_mut() {
             // Group by the first k columns, dropping the ROLLUP modifier.
             s.group_by = GroupByExpr::Expressions(group_by[..k].to_vec(), vec![]);
-            // Replace references to the dropped group columns (positions >= k)
-            // in the projection with NULL, so this level's rows carry NULL there.
-            let dropped = &group_texts[k..];
+            s.projection.extend(hidden_items.iter().cloned());
+
+            // An unaliased projection item that contains GROUPING() would take
+            // its output name from the rewritten expression (`IF(0, ...)`), and
+            // the full-detail level is the one whose schema names the result.
+            // Pin the name to the expression as the client wrote it.
             for item in &mut s.projection {
-                let expr = match item {
-                    SelectItem::UnnamedExpr(e) => Some(e),
-                    SelectItem::ExprWithAlias { expr, .. } => Some(expr),
-                    _ => None,
-                };
-                if let Some(e) = expr {
-                    if dropped.iter().any(|d| d == &e.to_string()) {
-                        *e = Expr::Value(sqlparser::ast::Value::Null);
+                if let SelectItem::UnnamedExpr(e) = item {
+                    let mut calls = Vec::new();
+                    collect_grouping_calls(e, &mut calls);
+                    if !calls.is_empty() {
+                        *item = SelectItem::ExprWithAlias {
+                            alias: Ident::new(e.to_string()),
+                            expr: e.clone(),
+                        };
                     }
                 }
             }
+
+            // At this level the group columns at positions >= k are rolled away.
+            // Two rewrites over the projection and HAVING, innermost first:
+            //  * a reference to a rolled-away column becomes NULL -- everywhere,
+            //    not only as a bare projection item, so `CONCAT(region, '!')`
+            //    reads NULL on the subtotal row exactly as MySQL's does;
+            //  * `GROUPING(...)` becomes the integer its bits spell at this level.
+            let dropped: Vec<String> = group_texts[k..].to_vec();
+            let texts = group_texts.clone();
+            rewrite_projection_and_having(s, &move |e: &Expr| {
+                if let Some(args) = grouping_call_args(e) {
+                    // Validated above; a failure here would be a logic error.
+                    let v = grouping_value(&args, k, &texts).unwrap_or(0);
+                    return Some(Expr::Value(sqlparser::ast::Value::Number(
+                        v.to_string(),
+                        false,
+                    )));
+                }
+                if dropped.iter().any(|d| *d == e.to_string()) {
+                    return Some(Expr::Value(sqlparser::ast::Value::Null));
+                }
+                None
+            });
         }
         let res = Box::pin(select(db, vindex, &lq)).await?;
         if let QueryResult::Rows(mut stream) = res {
@@ -5786,8 +6032,9 @@ async fn execute_rollup(
         }
     }
 
-    let schema = out_schema.unwrap_or_else(|| Schema::new(Vec::new()));
-    order_output_rows(&mut all_rows, &schema, order_exprs)?;
+    let mut schema = out_schema.unwrap_or_else(|| Schema::new(Vec::new()));
+    order_output_rows(&mut all_rows, &schema, &order_exprs)?;
+    truncate_hidden_columns(&mut schema, &mut all_rows, hidden);
     apply_offset_limit(&mut all_rows, offset, limit);
     Ok(QueryResult::Rows(RowStream::literal(schema, all_rows)))
 }
@@ -5823,6 +6070,99 @@ impl Drop for QueryNestingGuard {
     fn drop(&mut self) {
         let _ = QUERY_NESTING.try_with(|depth| depth.set(depth.get().saturating_sub(1)));
     }
+}
+
+/// The aggregation strategy `select` would run with, in the words EXPLAIN
+/// reports in `Extra` -- or `None` when the query does not aggregate.
+///
+/// This is the server's defining feature, and until now EXPLAIN said nothing
+/// about it: a GROUP BY answered `type=ALL` with an empty `Extra`, identical for
+/// the vectorised path and the one that spills to disk. A client could not show
+/// which path a query took, and a user could not tell when a small rewrite had
+/// pushed their query off the fast one.
+///
+/// Mirrors the dispatch in the aggregate branch of `select_inner` step for step,
+/// calling the same plan classifiers it does, so the two can only disagree if
+/// the dispatch *order* changes. What it cannot know is a runtime fallback: the
+/// streaming path spills if the group count exceeds the cap at run time, which
+/// the wording says.
+async fn aggregation_strategy(
+    db: &Session,
+    def: &TableDef,
+    select: &Select,
+    filter: Option<&Expr>,
+    order_exprs: &[(Expr, bool)],
+) -> Result<Option<String>> {
+    let group_by: Vec<Expr> = match &select.group_by {
+        sqlparser::ast::GroupByExpr::Expressions(exprs, _) => exprs.clone(),
+        sqlparser::ast::GroupByExpr::All(_) => return Ok(None),
+    };
+    if group_by.is_empty() && !aggregate::projection_has_aggregate(&select.projection) {
+        return Ok(None);
+    }
+    let rollup = matches!(
+        &select.group_by,
+        sqlparser::ast::GroupByExpr::Expressions(_, mods)
+            if mods.iter().any(|m| matches!(m, sqlparser::ast::GroupByWithModifier::Rollup))
+    );
+    if rollup && !group_by.is_empty() {
+        return Ok(Some(format!(
+            "Rollup: {} aggregation passes",
+            group_by.len() + 1
+        )));
+    }
+    let is_join = select.from.len() > 1
+        || select.from.first().is_some_and(|f| !f.joins.is_empty())
+        || select
+            .from
+            .first()
+            .is_some_and(|f| matches!(f.relation, sqlparser::ast::TableFactor::Derived { .. }));
+    if is_join {
+        return Ok(Some("Aggregate: materialised over join".into()));
+    }
+    if projection_has_window(&select.projection) {
+        return Ok(None);
+    }
+
+    let (projection, _) = aggregate_projection_with_hidden(
+        &select.projection,
+        select.having.as_ref(),
+        order_exprs,
+        &def.schema,
+    );
+    let plan = match aggregate::build_plan(&def.schema, &projection, &group_by) {
+        Ok(plan) => plan,
+        Err(e) => return Ok(Some(format!("Aggregate: row path ({e})"))),
+    };
+    let in_txn = db.in_txn();
+    if filter.is_none()
+        && !in_txn
+        && plan
+            .scalar_agg_plan(&def.schema)
+            .is_some_and(|s| s.len() >= 2)
+    {
+        return Ok(Some("Aggregate: columnar scalar".into()));
+    }
+    let est_groups = estimate_group_count(db, def, plan.group_cols()).await?;
+    let cap = elyra_olap::default_max_groups() as u64;
+    if let Some(g) = est_groups.filter(|g| *g > cap) {
+        return Ok(Some(format!(
+            "Aggregate: partitioned, spilling ({g} estimated groups > {cap})"
+        )));
+    }
+    let columnar_group = !in_txn
+        && plan.columnar_group_plan(&def.schema).is_some()
+        && filter.is_none_or(|f| cpred::compile(f, &def.schema).is_some());
+    if columnar_group {
+        let mut s = String::from("Aggregate: columnar group, zone maps");
+        if colcache::enabled() && filter.is_none() {
+            s.push_str(", columnar cache");
+        }
+        return Ok(Some(s));
+    }
+    Ok(Some(format!(
+        "Aggregate: parallel streaming (spills past {cap} groups)"
+    )))
 }
 
 pub async fn select(
@@ -6010,6 +6350,14 @@ async fn select_inner(
             .collect(),
         None => Vec::new(),
     };
+
+    // GROUPING() only means something on a rollup row. Anywhere else it is
+    // MySQL's 1111, not "unknown function" -- a client keys on the code.
+    if !(rollup && !group_by.is_empty()) && mentions_grouping(select, &order_exprs) {
+        return Err(Error::InvalidGroupFunction(
+            "GROUPING() requires GROUP BY ... WITH ROLLUP".into(),
+        ));
+    }
 
     if rollup && !group_by.is_empty() {
         return Box::pin(execute_rollup(
@@ -6342,6 +6690,8 @@ async fn select_inner(
     }
 
     // Aggregation / grouping path: parallel streaming aggregation (OLAP).
+    // `aggregation_strategy` (below `select_inner`) mirrors this dispatch for
+    // EXPLAIN: a new branch here gets a line there.
     if !group_by.is_empty() || aggregate::projection_has_aggregate(&select.projection) {
         // HAVING and ORDER BY may read grouped values that are not returned.
         // Compute them as hidden output columns, then drop them before returning.
@@ -6432,7 +6782,11 @@ async fn select_inner(
         };
         let (mut schema, mut out_rows) = (schema, out_rows);
         out_rows = apply_having(select.having.as_ref(), proj, &schema, out_rows)?;
-        order_output_rows(&mut out_rows, &schema, &order_exprs)?;
+        // `proj` is the projection plus the hidden HAVING/ORDER BY columns, so
+        // every ORDER BY expression is either positional here or genuinely
+        // unresolvable; the by-name fallback in `order_output_rows` reports it.
+        let (order_positions, _) = order_by_output_position(&order_exprs, proj);
+        order_output_rows(&mut out_rows, &schema, &order_positions)?;
         truncate_hidden_columns(&mut schema, &mut out_rows, hidden);
         apply_offset_limit(&mut out_rows, offset, limit);
         return Ok(QueryResult::Rows(RowStream::literal(schema, out_rows)));
@@ -15206,6 +15560,57 @@ fn aggregate_projection_with_hidden(
     (augmented, hidden)
 }
 
+/// Rewrite ORDER BY so every expression that names an output column does so by
+/// **position**, and report which ones name nothing in the projection.
+///
+/// Output rows are sorted after projection, by output column, and the output
+/// column of `COUNT(*) AS c` is called `c`. Resolving `ORDER BY COUNT(*)` by
+/// *name* therefore failed with "unknown output column" whenever the aggregate
+/// was aliased -- which generated SQL almost always does -- while the unaliased
+/// and `ORDER BY c` spellings worked. Same for `region AS r ... ORDER BY region`.
+/// MySQL accepts all of them. Matching the expression itself and sorting by the
+/// ordinal makes the output name irrelevant.
+///
+/// Returns the rewritten list and the indices of entries that are neither
+/// positional nor matched, so a caller can append those as hidden columns.
+fn order_by_output_position(
+    order: &[(Expr, bool)],
+    projection: &[sqlparser::ast::SelectItem],
+) -> (Vec<(Expr, bool)>, Vec<usize>) {
+    use sqlparser::ast::SelectItem;
+    let mut unmatched = Vec::new();
+    let rewritten = order
+        .iter()
+        .enumerate()
+        .map(|(i, (e, asc))| {
+            if order_ordinal(e).is_some() {
+                return (e.clone(), *asc);
+            }
+            let bare = matches!(e, Expr::Identifier(_))
+                .then(|| ident_name(e))
+                .flatten();
+            let position = projection.iter().position(|item| match item {
+                SelectItem::UnnamedExpr(expr) => expr == e,
+                SelectItem::ExprWithAlias { expr, alias } => {
+                    expr == e || bare.is_some_and(|n| predicate::identifier_eq(&alias.value, n))
+                }
+                _ => false,
+            });
+            match position {
+                Some(pos) => (
+                    Expr::Value(sqlparser::ast::Value::Number((pos + 1).to_string(), false)),
+                    *asc,
+                ),
+                None => {
+                    unmatched.push(i);
+                    (e.clone(), *asc)
+                }
+            }
+        })
+        .collect();
+    (rewritten, unmatched)
+}
+
 fn projection_exposes_order_expr(
     projection: &[sqlparser::ast::SelectItem],
     original: &Expr,
@@ -17795,6 +18200,25 @@ fn validate_function(function: &sqlparser::ast::Function, context: FunctionConte
             )));
         }
         return aggregate::validate_function_arity(&name, arity);
+    }
+    // GROUPING() is rollup syntax, not a scalar function: `execute_rollup`
+    // rewrites it to the integer its bits spell before anything evaluates it.
+    // It is legal exactly where an aggregate is (projection, HAVING, ORDER BY);
+    // whether the query actually has a ROLLUP is checked at dispatch, where the
+    // MySQL 1111 for the missing one is raised.
+    if name == "grouping" {
+        if !context.aggregates {
+            return Err(Error::Query(format!(
+                "GROUPING is not allowed in {}",
+                context.clause
+            )));
+        }
+        if arity == 0 {
+            return Err(Error::Query(
+                "Incorrect arguments to GROUPING function".into(),
+            ));
+        }
+        return Ok(());
     }
     if name == "hybrid" {
         if !context.hybrid {
@@ -20832,7 +21256,70 @@ fn map_expr(expr: &Expr, f: &dyn Fn(&Expr) -> Option<Expr>) -> Expr {
             }
             Expr::Function(func)
         }
+        // `CASE WHEN GROUPING(x) THEN 'Total' ELSE x END` is the other common
+        // pivot spelling next to `IF(...)`; without this arm a rewrite silently
+        // skipped everything inside a CASE.
+        Expr::Case {
+            operand,
+            conditions,
+            results,
+            else_result,
+        } => Expr::Case {
+            operand: operand.as_ref().map(|e| Box::new(map_expr(e, f))),
+            conditions: conditions.iter().map(|e| map_expr(e, f)).collect(),
+            results: results.iter().map(|e| map_expr(e, f)).collect(),
+            else_result: else_result.as_ref().map(|e| Box::new(map_expr(e, f))),
+        },
+        Expr::Cast {
+            kind,
+            expr,
+            data_type,
+            format,
+        } => Expr::Cast {
+            kind: kind.clone(),
+            expr: Box::new(map_expr(expr, f)),
+            data_type: data_type.clone(),
+            format: format.clone(),
+        },
+        Expr::Like {
+            negated,
+            expr,
+            pattern,
+            escape_char,
+            any,
+        } => Expr::Like {
+            negated: *negated,
+            expr: Box::new(map_expr(expr, f)),
+            pattern: Box::new(map_expr(pattern, f)),
+            escape_char: escape_char.clone(),
+            any: *any,
+        },
+        Expr::Collate { expr, collation } => Expr::Collate {
+            expr: Box::new(map_expr(expr, f)),
+            collation: collation.clone(),
+        },
         other => other.clone(),
+    }
+}
+
+/// Apply `f` to the projection and HAVING of a SELECT only.
+///
+/// [`rewrite_select_expressions`] also reaches WHERE, JOIN conditions and GROUP
+/// BY, which is wrong for rollup rewriting: replacing a rolled-up column with
+/// NULL in the WHERE would change which base rows are aggregated, not which
+/// output the subtotal row shows.
+fn rewrite_projection_and_having(select: &mut Select, f: &dyn Fn(&Expr) -> Option<Expr>) {
+    for item in &mut select.projection {
+        match item {
+            sqlparser::ast::SelectItem::UnnamedExpr(e)
+            | sqlparser::ast::SelectItem::ExprWithAlias { expr: e, .. } => {
+                *e = map_expr(e, f);
+            }
+            _ => {}
+        }
+    }
+    if let Some(having) = &mut select.having {
+        *having = map_expr(having, f);
     }
 }
 
