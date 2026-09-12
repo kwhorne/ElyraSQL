@@ -488,6 +488,31 @@ CASES = [
     ("tzoffset", "SELECT FROM_UNIXTIME(0)"),
     ("tzoffset", "SELECT UNIX_TIMESTAMP('1969-12-31 18:30:00')"),
     ("tzset", "SET time_zone='+00:00'"),
+    # Stored-procedure user variables (#120). `SET @x` in a body writes the
+    # session variable, so the caller sees it after CALL; a body reads a `@x`
+    # it (or the caller) set; and a local shadows nothing in the session. No
+    # statement form here was covered before. DROP IF EXISTS keeps the block
+    # idempotent across reruns on the persistent reference.
+    ("proc", "DROP PROCEDURE IF EXISTS pdiff_set"),
+    ("proc", "CREATE PROCEDURE pdiff_set() BEGIN SET @pd_total = 6; END"),
+    ("proc", "CALL pdiff_set()"),
+    ("proc", "SELECT @pd_total"),
+    ("proc", "DROP PROCEDURE IF EXISTS pdiff_acc"),
+    ("proc", "CREATE PROCEDURE pdiff_acc() BEGIN DECLARE i INT DEFAULT 0; "
+             "SET @pd_total = 0; WHILE i < 5 DO SET @pd_total = @pd_total + i; "
+             "SET i = i + 1; END WHILE; END"),
+    ("proc", "CALL pdiff_acc()"),
+    ("proc", "SELECT @pd_total"),
+    ("proc", "SET @pd_base = 4"),
+    ("proc", "DROP PROCEDURE IF EXISTS pdiff_rc"),
+    ("proc", "CREATE PROCEDURE pdiff_rc() BEGIN SET @pd_out = @pd_base * 10; END"),
+    ("proc", "CALL pdiff_rc()"),
+    ("proc", "SELECT @pd_out"),
+    ("proc", "DROP PROCEDURE IF EXISTS pdiff_local"),
+    ("proc", "CREATE PROCEDURE pdiff_local() BEGIN DECLARE total INT DEFAULT 99; "
+             "SET @pd_t2 = 7; SET total = total + 1; SET @pd_seen = total; END"),
+    ("proc", "CALL pdiff_local()"),
+    ("proc", "SELECT @pd_t2, @pd_seen"),
 ]
 
 
