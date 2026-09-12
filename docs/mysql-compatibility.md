@@ -186,6 +186,11 @@ gaps:
   carry. `||` follows MySQL: logical OR by default, string concatenation under
   `PIPES_AS_CONCAT`. `@@sql_mode` keeps the client's flag order rather than
   MySQL's canonical one.
+- **`NOW()` is frozen per statement.** `NOW()`, `CURRENT_TIMESTAMP`,
+  `LOCALTIME`/`LOCALTIMESTAMP`, `CURDATE`, `CURTIME` and the `UTC_*` forms return
+  one instant captured at statement start -- so two reads agree and an `INSERT`
+  with several of them is consistent, as in MySQL. `SYSDATE()` is the exception:
+  it reads the clock when it runs.
 - **One database.** `CREATE DATABASE`/`SCHEMA` is refused unless written with
   `IF NOT EXISTS`; see the note under *Laravel / Eloquent* above. `USE <name>`
   is accepted and changes what the catalog reports, but does not give a separate

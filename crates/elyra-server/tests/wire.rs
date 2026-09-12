@@ -13086,3 +13086,42 @@ async fn sqlx_connection_setup_is_accepted_over_the_wire() {
     let tz2: Option<String> = other.query_first("SELECT @@time_zone").await.unwrap();
     assert_eq!(tz2.as_deref(), Some("SYSTEM"));
 }
+
+/// NOW() and its family are frozen to one instant per statement (MySQL). Before,
+/// each call read the clock fresh, so `NOW() = NOW()` was false and an INSERT
+/// with two NOW() columns stored two different timestamps -- which an ORM that
+/// sets created_at and updated_at together does not expect.
+#[tokio::test]
+async fn now_is_frozen_within_a_statement() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+
+    let same: i64 = c
+        .query_first("SELECT NOW() = NOW()")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(same, 1, "two NOW() reads in one statement must agree");
+    let same2: i64 = c
+        .query_first("SELECT NOW() = CURRENT_TIMESTAMP()")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(same2, 1);
+
+    // Across rows of one INSERT, every NOW() is the same instant.
+    c.query_drop("CREATE TABLE t (id INT PRIMARY KEY, a DATETIME, b DATETIME)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO t VALUES (1, NOW(), NOW()), (2, NOW(), NOW())")
+        .await
+        .unwrap();
+    let per_row: Vec<i64> = c.query("SELECT a = b FROM t ORDER BY id").await.unwrap();
+    assert_eq!(per_row, vec![1, 1], "a and b agree in every row");
+    let cross: i64 = c
+        .query_first("SELECT (SELECT a FROM t WHERE id=1) = (SELECT a FROM t WHERE id=2)")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(cross, 1, "all NOW() in one INSERT are the same instant");
+}

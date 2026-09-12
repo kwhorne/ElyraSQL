@@ -8,6 +8,17 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ### Fixed
 
+- **`NOW()` is frozen per statement.** Each call read the clock fresh, so
+  `SELECT NOW() = NOW()` was `0`, and `INSERT ... VALUES (NOW(), NOW())` stored
+  two different timestamps -- an ORM setting `created_at` and `updated_at`
+  together got mismatched values. The whole family (`NOW`, `CURRENT_TIMESTAMP`,
+  `LOCALTIME`/`LOCALTIMESTAMP`, `CURDATE`, `CURTIME`, `UNIX_TIMESTAMP()` and the
+  `UTC_*` forms) is now resolved to one instant, captured at the start of the
+  statement, across every expression and subquery in it -- matching MySQL. Done
+  in the statement pre-pass (as `LAST_INSERT_ID()` already is), so the value
+  keeps its `DATETIME`/`DATE`/`TIME` type. `SYSDATE()` deliberately stays live,
+  as MySQL leaves it. Verified against MySQL 8.4.
+
 - **`||` honours `PIPES_AS_CONCAT` (#124).** It was rejected outright ("operator
   not supported"). It now follows MySQL: logical `OR` in the default mode, string
   concatenation (NULL-propagating, like `CONCAT`) when `PIPES_AS_CONCAT` is set --

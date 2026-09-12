@@ -1028,11 +1028,21 @@ fn tz_offset_minutes(v: &Value) -> Option<i32> {
     Some(sign * (h * 60 + m))
 }
 
-fn now_micros() -> i64 {
+/// The real wall clock in microseconds since the Unix epoch. `SYSDATE()` reads
+/// it directly; the rest of the now-family is frozen per statement by the
+/// pre-pass in [`crate::sessfn`], which captures this once and substitutes those
+/// calls for typed literals before evaluation.
+pub(crate) fn wall_micros() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_micros() as i64)
         .unwrap_or(0)
+}
+
+/// Fallback for a now-family call the pre-pass did not reach (rare): the live
+/// clock. Normal execution substitutes these before evaluation.
+fn now_micros() -> i64 {
+    wall_micros()
 }
 
 fn wire(v: &Value) -> Option<String> {
@@ -1179,7 +1189,10 @@ fn eval_scalar(name: &str, a: &[Value]) -> Result<Option<Value>> {
     use std::cmp::Ordering;
     let out = match name {
         // ---- date / time ----
-        "now" | "current_timestamp" | "localtime" | "localtimestamp" | "sysdate" => {
+        // SYSDATE() is the exception MySQL makes: it returns the time it is
+        // called, not the statement's frozen time.
+        "sysdate" => Value::DateTime(wall_micros()),
+        "now" | "current_timestamp" | "localtime" | "localtimestamp" => {
             Value::DateTime(now_micros())
         }
         "curdate" | "current_date" => Value::Date(now_micros().div_euclid(86_400_000_000) as i32),
