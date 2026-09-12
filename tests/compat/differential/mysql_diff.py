@@ -176,6 +176,15 @@ FIXTURES = [
 CASES = [
     # arithmetic / numeric
     ("arith", "SELECT 1 + 1"),
+    # `||` is logical OR in the default sql_mode (MySQL). Its concatenation
+    # meaning under PIPES_AS_CONCAT needs a session SET that the one-statement-
+    # per-execute harness cannot express here; it is covered by engine tests and
+    # a live MySQL 8.4 comparison instead.
+    ("pipes", "SELECT 1 || 0"),
+    ("pipes", "SELECT 1 || 1"),
+    ("pipes", "SELECT 'a' || 'b'"),
+    ("pipes", "SELECT NULL || 1"),
+    ("pipes", "SELECT 5 || 0"),
     # ROLLUP + GROUPING(): a subtotal row and a group whose key is genuinely NULL
     # both show NULL in the key column. Only GROUPING() tells them apart, and it
     # is what a pivot uses to label its margin. `d.s` has a real NULL (row 3) and

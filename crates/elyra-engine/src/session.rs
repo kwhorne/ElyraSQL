@@ -359,6 +359,16 @@ impl Session {
             .any(|item| item.trim().eq_ignore_ascii_case("ANSI_QUOTES"))
     }
 
+    /// Whether `PIPES_AS_CONCAT` is set: `||` means string concatenation rather
+    /// than logical OR. sqlx sets it on every connection.
+    pub fn pipes_as_concat(&self) -> bool {
+        self.sql_mode
+            .lock()
+            .unwrap()
+            .split(',')
+            .any(|item| item.trim().eq_ignore_ascii_case("PIPES_AS_CONCAT"))
+    }
+
     /// The session time zone as the client set it (`SYSTEM` until changed).
     pub fn time_zone(&self) -> String {
         self.time_zone.lock().unwrap().clone()

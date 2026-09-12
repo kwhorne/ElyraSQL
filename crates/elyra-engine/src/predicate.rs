@@ -3024,6 +3024,13 @@ fn binary(
         BitwiseAnd | BitwiseOr | BitwiseXor | PGBitwiseShiftLeft | PGBitwiseShiftRight => {
             bitwise(l, op, r)
         }
+        // `||` under PIPES_AS_CONCAT: string concatenation, NULL if either side
+        // is NULL, exactly like CONCAT(). The statement pre-pass rewrites `||`
+        // to `OR` when the mode is off, so reaching here means the mode is on.
+        StringConcat => match (wire(&l), wire(&r)) {
+            (Some(a), Some(b)) => Ok(Value::Text(a + &b)),
+            _ => Ok(Value::Null),
+        },
         _ => Err(Error::Unsupported(format!("operator not supported: {op}"))),
     }
 }

@@ -1494,6 +1494,13 @@ impl Engine {
                 sess.row_count(),
                 &database,
             );
+            // `||` means logical OR by default and string concatenation under
+            // PIPES_AS_CONCAT (MySQL). sqlparser parses it as one operator either
+            // way; the stateless evaluator concatenates it, so when the mode is
+            // off we rewrite it to OR here, where the session mode is known.
+            if !sess.pipes_as_concat() {
+                rewrite_pipes_to_or(&mut stmt);
+            }
             let need = required_privilege(&stmt);
             let effective = self
                 .effective_privilege(privilege, user, &stmt, sess)
@@ -2187,6 +2194,19 @@ fn statement_starts_implicit_transaction(statement: &Statement) -> bool {
 /// comma-separated list (including `SET NAMES ..., SESSION sql_mode = ...`).
 /// Split only top-level commas so commas inside mode strings, function calls,
 /// and parenthesized tuple assignments remain intact.
+/// Rewrite every `||` (`StringConcat`) to logical `OR` in a statement's
+/// expressions. Used when `PIPES_AS_CONCAT` is off, so the evaluator's concat
+/// handling of `StringConcat` is reached only when the mode is on.
+fn rewrite_pipes_to_or(stmt: &mut Statement) {
+    exec::walk_statement_exprs_mut(stmt, &mut |e| {
+        if let sqlparser::ast::Expr::BinaryOp { op, .. } = e {
+            if matches!(op, sqlparser::ast::BinaryOperator::StringConcat) {
+                *op = sqlparser::ast::BinaryOperator::Or;
+            }
+        }
+    });
+}
+
 fn rewrite_multi_set(sql: &str) -> Option<String> {
     let trimmed = sql.trim().trim_end_matches(';').trim();
     if !trimmed
@@ -5924,5 +5944,101 @@ mod rollup_grouping_and_explain_tests {
         // A query that does not aggregate says nothing about aggregation.
         let plain = extra(&e, &s, "SELECT * FROM s WHERE amt > 5").await;
         assert!(!plain.contains("Aggregate"), "{plain:?}");
+    }
+}
+
+#[cfg(test)]
+mod pipes_as_concat_tests {
+    use super::{Engine, Privilege, QueryResult};
+    use elyra_core::Value;
+
+    async fn engine() -> (Engine, crate::Session) {
+        let e = Engine::new(elyra_storage::Db::in_memory().unwrap());
+        let s = e.session();
+        (e, s)
+    }
+
+    async fn scalar(e: &Engine, s: &crate::Session, sql: &str) -> Value {
+        let mut r = e
+            .execute(sql, Privilege::Admin, s)
+            .await
+            .unwrap_or_else(|err| panic!("{sql}: {err}"));
+        match r.remove(0) {
+            QueryResult::Rows(mut st) => st.next_batch(1).await.unwrap().remove(0).remove(0),
+            _ => panic!("expected rows: {sql}"),
+        }
+    }
+    fn txt(v: Value) -> String {
+        v.to_wire_string().unwrap_or_else(|| "NULL".into())
+    }
+
+    /// Every expected value is what MySQL 8.4 returned for the same statement.
+    #[tokio::test]
+    async fn pipe_is_or_by_default() {
+        let (e, s) = engine().await;
+        assert_eq!(txt(scalar(&e, &s, "SELECT 1 || 0").await), "1");
+        assert_eq!(txt(scalar(&e, &s, "SELECT 1 || 1").await), "1");
+        assert_eq!(txt(scalar(&e, &s, "SELECT 'a' || 'b'").await), "0"); // non-numeric strings -> OR of 0,0
+        assert_eq!(txt(scalar(&e, &s, "SELECT NULL || 1").await), "1"); // NULL OR 1 = 1
+        assert_eq!(txt(scalar(&e, &s, "SELECT 5 || 0").await), "1");
+    }
+
+    #[tokio::test]
+    async fn pipe_is_concat_under_pipes_as_concat() {
+        let (e, s) = engine().await;
+        e.execute("SET sql_mode='PIPES_AS_CONCAT'", Privilege::Admin, &s)
+            .await
+            .unwrap();
+        assert_eq!(txt(scalar(&e, &s, "SELECT 1 || 0").await), "10");
+        assert_eq!(txt(scalar(&e, &s, "SELECT 'a' || 'b'").await), "ab");
+        assert_eq!(txt(scalar(&e, &s, "SELECT NULL || 'x'").await), "NULL"); // CONCAT propagates NULL
+        assert_eq!(txt(scalar(&e, &s, "SELECT 1 || 2 || 3").await), "123");
+    }
+
+    /// The mode is read per statement, so toggling it back restores OR without a
+    /// reconnect -- and it is per session.
+    #[tokio::test]
+    async fn the_mode_is_live_and_per_session() {
+        let (e, a) = engine().await;
+        let b = e.session();
+        e.execute("SET sql_mode='PIPES_AS_CONCAT'", Privilege::Admin, &a)
+            .await
+            .unwrap();
+        assert_eq!(txt(scalar(&e, &a, "SELECT 'x' || 'y'").await), "xy");
+        assert_eq!(
+            txt(scalar(&e, &b, "SELECT 'x' || 'y'").await),
+            "0",
+            "other session unaffected"
+        );
+        e.execute("SET sql_mode='STRICT_TRANS_TABLES'", Privilege::Admin, &a)
+            .await
+            .unwrap();
+        assert_eq!(
+            txt(scalar(&e, &a, "SELECT 'x' || 'y'").await),
+            "0",
+            "toggled back to OR"
+        );
+    }
+
+    /// Concat reaches column expressions in projection and WHERE, not just
+    /// literals, so a real query works end to end.
+    #[tokio::test]
+    async fn concat_over_columns_in_projection_and_where() {
+        let (e, s) = engine().await;
+        for sql in [
+            "CREATE TABLE t (id INT PRIMARY KEY, a TEXT, b TEXT)",
+            "INSERT INTO t VALUES (1,'x','y'),(2,'p','q')",
+            "SET sql_mode='PIPES_AS_CONCAT'",
+        ] {
+            e.execute(sql, Privilege::Admin, &s).await.unwrap();
+        }
+        assert_eq!(
+            txt(scalar(&e, &s, "SELECT a || b FROM t ORDER BY id").await),
+            "xy"
+        );
+        assert_eq!(
+            txt(scalar(&e, &s, "SELECT id FROM t WHERE a || b = 'xy'").await),
+            "1"
+        );
     }
 }

@@ -180,10 +180,10 @@ gaps:
   ignored. `time_zone` accepts only spellings that mean UTC (`+00:00`, `SYSTEM`,
   `UTC`): every temporal function evaluates in UTC, and a non-zero offset is
   refused with a reason rather than stored and not honoured (#125).
-  `UTC_TIMESTAMP()` and `CONVERT_TZ()` are not yet implemented (#123), `||` is
-  not a concatenation operator even when `PIPES_AS_CONCAT` is set — use
-  `CONCAT()` (#124) — and `@@sql_mode` keeps the client's flag order rather than
-  MySQL's canonical one.
+  `UTC_TIMESTAMP()` and `CONVERT_TZ()` are not yet implemented (#123), and
+  `@@sql_mode` keeps the client's flag order rather than MySQL's canonical one.
+  `||` follows MySQL: logical OR by default, string concatenation under
+  `PIPES_AS_CONCAT`.
 - **One database.** `CREATE DATABASE`/`SCHEMA` is refused unless written with
   `IF NOT EXISTS`; see the note under *Laravel / Eloquent* above. `USE <name>`
   is accepted and changes what the catalog reports, but does not give a separate

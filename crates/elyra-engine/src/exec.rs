@@ -21302,6 +21302,179 @@ fn map_expr(expr: &Expr, f: &dyn Fn(&Expr) -> Option<Expr>) -> Expr {
     }
 }
 
+/// Apply `f` to every expression node in `e`, top-down (node before children).
+///
+/// Unlike [`map_expr`], this mutates in place and always recurses -- `f` edits a
+/// node and children are still visited -- which is what a whole-tree normalising
+/// pass wants (e.g. rewriting every `||`). Subqueries are followed.
+pub(crate) fn walk_expr_mut(e: &mut Expr, f: &mut dyn FnMut(&mut Expr)) {
+    f(e);
+    match e {
+        Expr::BinaryOp { left, right, .. } => {
+            walk_expr_mut(left, f);
+            walk_expr_mut(right, f);
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::Nested(expr)
+        | Expr::IsNull(expr)
+        | Expr::IsNotNull(expr)
+        | Expr::Collate { expr, .. }
+        | Expr::Cast { expr, .. } => walk_expr_mut(expr, f),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            walk_expr_mut(expr, f);
+            walk_expr_mut(low, f);
+            walk_expr_mut(high, f);
+        }
+        Expr::InList { expr, list, .. } => {
+            walk_expr_mut(expr, f);
+            for item in list {
+                walk_expr_mut(item, f);
+            }
+        }
+        Expr::Like { expr, pattern, .. } => {
+            walk_expr_mut(expr, f);
+            walk_expr_mut(pattern, f);
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            results,
+            else_result,
+        } => {
+            if let Some(o) = operand {
+                walk_expr_mut(o, f);
+            }
+            for c in conditions {
+                walk_expr_mut(c, f);
+            }
+            for r in results {
+                walk_expr_mut(r, f);
+            }
+            if let Some(el) = else_result {
+                walk_expr_mut(el, f);
+            }
+        }
+        Expr::Function(func) => {
+            if let sqlparser::ast::FunctionArguments::List(list) = &mut func.args {
+                for arg in &mut list.args {
+                    if let sqlparser::ast::FunctionArg::Unnamed(
+                        sqlparser::ast::FunctionArgExpr::Expr(a),
+                    ) = arg
+                    {
+                        walk_expr_mut(a, f);
+                    }
+                }
+            }
+        }
+        Expr::Subquery(q) | Expr::InSubquery { subquery: q, .. } => walk_query_exprs_mut(q, f),
+        Expr::Exists { subquery, .. } => walk_query_exprs_mut(subquery, f),
+        _ => {}
+    }
+}
+
+/// Apply `f` to every expression in a query (projection, WHERE, JOIN conditions,
+/// GROUP BY, HAVING, ORDER BY), recursing into set operations and subqueries.
+pub(crate) fn walk_query_exprs_mut(q: &mut SqlQuery, f: &mut dyn FnMut(&mut Expr)) {
+    fn body(b: &mut SetExpr, f: &mut dyn FnMut(&mut Expr)) {
+        match b {
+            SetExpr::Select(select) => {
+                for item in &mut select.projection {
+                    match item {
+                        sqlparser::ast::SelectItem::UnnamedExpr(e)
+                        | sqlparser::ast::SelectItem::ExprWithAlias { expr: e, .. } => {
+                            walk_expr_mut(e, f)
+                        }
+                        _ => {}
+                    }
+                }
+                for twj in &mut select.from {
+                    walk_expr_mut_in_table_factor(&mut twj.relation, f);
+                    for join in &mut twj.joins {
+                        walk_expr_mut_in_table_factor(&mut join.relation, f);
+                        if let sqlparser::ast::JoinOperator::Inner(c)
+                        | sqlparser::ast::JoinOperator::LeftOuter(c)
+                        | sqlparser::ast::JoinOperator::RightOuter(c)
+                        | sqlparser::ast::JoinOperator::FullOuter(c) = &mut join.join_operator
+                        {
+                            if let sqlparser::ast::JoinConstraint::On(e) = c {
+                                walk_expr_mut(e, f);
+                            }
+                        }
+                    }
+                }
+                if let Some(w) = &mut select.selection {
+                    walk_expr_mut(w, f);
+                }
+                if let sqlparser::ast::GroupByExpr::Expressions(exprs, _) = &mut select.group_by {
+                    for e in exprs {
+                        walk_expr_mut(e, f);
+                    }
+                }
+                if let Some(h) = &mut select.having {
+                    walk_expr_mut(h, f);
+                }
+            }
+            SetExpr::Query(inner) => walk_query_exprs_mut(inner, f),
+            SetExpr::SetOperation { left, right, .. } => {
+                body(left, f);
+                body(right, f);
+            }
+            _ => {}
+        }
+    }
+    body(&mut q.body, f);
+    if let Some(order_by) = &mut q.order_by {
+        for o in &mut order_by.exprs {
+            walk_expr_mut(&mut o.expr, f);
+        }
+    }
+}
+
+fn walk_expr_mut_in_table_factor(
+    factor: &mut sqlparser::ast::TableFactor,
+    f: &mut dyn FnMut(&mut Expr),
+) {
+    if let sqlparser::ast::TableFactor::Derived { subquery, .. } = factor {
+        walk_query_exprs_mut(subquery, f);
+    }
+}
+
+/// Apply `f` to every expression in a statement (the shapes that carry evaluated
+/// expressions: `SELECT`, `INSERT ... SELECT`, `UPDATE`, `DELETE`).
+pub(crate) fn walk_statement_exprs_mut(
+    stmt: &mut sqlparser::ast::Statement,
+    f: &mut dyn FnMut(&mut Expr),
+) {
+    match stmt {
+        sqlparser::ast::Statement::Query(q) => walk_query_exprs_mut(q, f),
+        sqlparser::ast::Statement::Insert(ins) => {
+            if let Some(src) = &mut ins.source {
+                walk_query_exprs_mut(src, f);
+            }
+        }
+        sqlparser::ast::Statement::Update {
+            assignments,
+            selection,
+            ..
+        } => {
+            for a in assignments {
+                walk_expr_mut(&mut a.value, f);
+            }
+            if let Some(w) = selection {
+                walk_expr_mut(w, f);
+            }
+        }
+        sqlparser::ast::Statement::Delete(del) => {
+            if let Some(w) = &mut del.selection {
+                walk_expr_mut(w, f);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Apply `f` to the projection and HAVING of a SELECT only.
 ///
 /// [`rewrite_select_expressions`] also reaches WHERE, JOIN conditions and GROUP
