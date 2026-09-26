@@ -6,6 +6,17 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+### Security
+
+- **rustls 0.23.45 (RUSTSEC-2026-0285).** rustls's TLS 1.3 handshake accepted
+  handshake messages across encryption-level boundaries. The server terminates
+  client TLS with rustls (through tokio-rustls), and the engine's outbound
+  embedding calls use it through ureq, so every release from 0.9.9 through
+  1.11.3 shipped an affected version (0.23.41). The advisory was published on
+  2026-09-14, two days after 1.11.3, which is why that release's audit was
+  green. rustls is now 0.23.45 and rustls-webpki 0.103.15, in both lockfiles; no
+  code change.
+
 ## [1.11.3] - 2026-09-12
 
 ### Fixed
