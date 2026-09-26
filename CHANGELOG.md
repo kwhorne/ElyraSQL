@@ -6,6 +6,8 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.11.4] - 2026-09-26
+
 ### Security
 
 - **rustls 0.23.45 (RUSTSEC-2026-0285).** rustls's TLS 1.3 handshake accepted
