@@ -763,9 +763,17 @@ fn register_agg(
                 let ci = schema.columns.len() + arg_exprs.len();
                 // An expression argument still has a knowable exactness:
                 // SUM(p * 3) over a DECIMAL column is DECIMAL, and declaring it
-                // Float would send an exactly-computed sum as a DOUBLE.
-                let ty = decimal_scale_of(e, schema)
-                    .map(|scale| ColumnType::Decimal(MAX_DECIMAL_PRECISION, scale));
+                // Float would send an exactly-computed sum as a DOUBLE. The same
+                // holds for an integer expression: SUM(a * 3) over BIGINT is an
+                // exact DECIMAL in MySQL, and MIN/MAX of it a BIGINT.
+                // Checked first, so MIN/MAX of an integer expression is BIGINT
+                // rather than a scale-0 DECIMAL.
+                let ty = if is_integer_expr(e, schema) {
+                    Some(ColumnType::Int)
+                } else {
+                    decimal_scale_of(e, schema)
+                        .map(|scale| ColumnType::Decimal(MAX_DECIMAL_PRECISION, scale))
+                };
                 arg_exprs.push(e.clone());
                 (Some(ci), ty)
             }
@@ -783,6 +791,13 @@ fn register_agg(
                 MAX_DECIMAL_PRECISION,
                 scale.saturating_add(elyra_core::DIV_SCALE_INCREMENT),
             ),
+            // An integer is exact at scale 0, so its average is DECIMAL at
+            // scale 4, as in MySQL. Declaring it Float threw away the exact
+            // quotient every path computes: 2251799813685256.2500 came back as
+            // 2251799813685256.
+            Some(ColumnType::Int) | Some(ColumnType::UInt) | Some(ColumnType::Bool) => {
+                ColumnType::Decimal(MAX_DECIMAL_PRECISION, elyra_core::DIV_SCALE_INCREMENT)
+            }
             _ => ColumnType::Float,
         },
         AggFunc::StddevPop | AggFunc::StddevSamp | AggFunc::VarPop | AggFunc::VarSamp => {
@@ -990,6 +1005,44 @@ const MAX_DECIMAL_PRECISION: u8 = 65;
 /// answering `Float` for `AVG` over a DECIMAL column sends an exact value as a
 /// DOUBLE and the client sees binary rounding on a figure the engine computed
 /// exactly.
+/// Whether `expr` is exact integer arithmetic: integer columns and literals under
+/// `+`, `-`, `*`, `%` and `DIV`. MySQL types such an expression as `BIGINT`, so
+/// `MIN`/`MAX` over it is `BIGINT` and `SUM`/`AVG` an exact `DECIMAL`.
+fn is_integer_expr(expr: &Expr, schema: &Schema) -> bool {
+    use sqlparser::ast::BinaryOperator::*;
+    match expr {
+        Expr::Nested(e) => is_integer_expr(e, schema),
+        Expr::UnaryOp {
+            op: sqlparser::ast::UnaryOperator::Plus | sqlparser::ast::UnaryOperator::Minus,
+            expr: e,
+        } => is_integer_expr(e, schema),
+        Expr::Value(sqlparser::ast::Value::Number(text, _)) => !text.contains(['.', 'e', 'E']),
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
+            let name = match expr {
+                Expr::Identifier(i) => &i.value,
+                Expr::CompoundIdentifier(parts) => match parts.last() {
+                    Some(p) => &p.value,
+                    None => return false,
+                },
+                _ => return false,
+            };
+            schema
+                .columns
+                .iter()
+                .find(|c| crate::predicate::identifier_eq(column_name(c), name))
+                .is_some_and(|c| {
+                    matches!(c.ty, ColumnType::Int | ColumnType::UInt | ColumnType::Bool)
+                })
+        }
+        Expr::BinaryOp { left, op, right } => {
+            matches!(op, Plus | Minus | Multiply | Modulo | MyIntegerDivide)
+                && is_integer_expr(left, schema)
+                && is_integer_expr(right, schema)
+        }
+        _ => false,
+    }
+}
+
 fn decimal_scale_of(expr: &Expr, schema: &Schema) -> Option<u8> {
     use sqlparser::ast::BinaryOperator::*;
     match expr {

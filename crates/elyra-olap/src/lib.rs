@@ -12,6 +12,9 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hasher};
 
+mod numslot;
+pub use numslot::{exact_avg, NumSlot};
+
 /// Fast, non-cryptographic hasher (FxHash, as used by rustc/Firefox) for the
 /// aggregation hash maps. The default `SipHash` is DoS-resistant but far slower
 /// than we need for internal, trusted group keys; FxHash cuts the per-row
@@ -381,6 +384,20 @@ fn update(acc: &mut Acc, spec: &AggSpec, val: Option<Value>, row: &[Value]) {
                                 (*i as i128).saturating_mul(10i128.pow(acc.dscale as u32)),
                             );
                         }
+                        // `BIGINT UNSIGNED` is exact too. Without this arm it fell
+                        // into the float branch, so a sum past 2^53 rounded:
+                        // 2^64-1 + 5 + 7 came back as 18446744073709552000.
+                        Value::UInt(u) => {
+                            acc.dsum = acc.dsum.saturating_add(
+                                i128::from(*u).saturating_mul(10i128.pow(acc.dscale as u32)),
+                            );
+                        }
+                        // A boolean is the integer 0 or 1, as in MySQL.
+                        Value::Bool(b) => {
+                            acc.dsum = acc.dsum.saturating_add(
+                                i128::from(*b).saturating_mul(10i128.pow(acc.dscale as u32)),
+                            );
+                        }
                         Value::Decimal(u, s) => {
                             acc.sum_is_int = false;
                             let s = *s;
@@ -645,17 +662,11 @@ fn finish(acc: &Acc, spec: &AggSpec) -> Value {
                 // AVG over DECIMAL(12,2) has scale 6, and over integers scale 4.
                 // The exact sum is already accumulated for SUM; dividing the
                 // f64 mirror instead would drift on long columns.
-                let scale = acc.dscale.saturating_add(elyra_core::DIV_SCALE_INCREMENT);
-                let shifted = 10i128
-                    .checked_pow(u32::from(elyra_core::DIV_SCALE_INCREMENT))
-                    .and_then(|f| acc.dsum.checked_mul(f))
-                    .and_then(|n| elyra_core::div_round_half_away(n, i128::from(acc.count)));
-                match shifted {
-                    Some(units) => Value::Decimal(units, scale),
-                    // Overflowing the exact path is not a reason to fail the
-                    // query; fall back to the float average.
-                    None => Value::Float(acc.sum / acc.count as f64),
-                }
+                // Shared with the columnar paths (`NumSlot`), so they round alike.
+                // Overflowing the exact path is not a reason to fail the query;
+                // fall back to the float average.
+                exact_avg(acc.dsum, acc.dscale, acc.count)
+                    .unwrap_or(Value::Float(acc.sum / acc.count as f64))
             } else {
                 Value::Float(acc.sum / acc.count as f64)
             }

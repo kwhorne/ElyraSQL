@@ -6,6 +6,31 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **Integer aggregates are exact on every path.** The fast columnar paths --
+  used for two or more aggregates, a `GROUP BY` on one numeric column, and the
+  opt-in column cache -- carried every numeric column as a double, so past 2^53
+  answers were wrong with no error: `SUM(a), COUNT(*)` over `2^53+1` and `1`
+  gave `9007199254740992`, and `MAX(a)` a neighbouring integer. Worse, a table
+  with a `BIGINT UNSIGNED` column had **every other column's values counted
+  twice** on those paths (`SUM(a), COUNT(a)` gave `120, 6` for `60, 3`), because
+  the row decoder did not recognise the unsigned value and its fallback pushed
+  the row again. Integer columns now aggregate as integers throughout, the
+  decoder understands unsigned values, and a value a path cannot keep exactly
+  sends the query to the general aggregator instead of being rounded. The
+  general aggregator also rounded `SUM`/`AVG` over `BIGINT UNSIGNED` and `BOOL`,
+  now exact. Verified against MySQL 8.4 on every path, with new differential
+  cases; no measurable speed change.
+
+### Changed
+
+- **`AVG` over an integer column or expression is `DECIMAL`**, with four
+  decimals, as in MySQL: `AVG(a)` over `(10, 21, 2^53+1, 1)` is
+  `2251799813685256.2500`. It was declared `DOUBLE`, which discarded the exact
+  quotient every path already computed. `MIN`/`MAX` of an integer expression
+  (`MIN(a*3)`) is now `BIGINT` rather than `DECIMAL`, also as in MySQL.
+
 ## [1.11.4] - 2026-09-26
 
 ### Security

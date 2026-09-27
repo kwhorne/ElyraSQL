@@ -220,6 +220,16 @@ fn decode_cols(
                     Value::Null
                 }
             }
+            // `UInt` (BIGINT UNSIGNED). Missing before, so every row of a table
+            // with such a column took the full `bincode` fallback.
+            12 => {
+                let n = c.u64()?;
+                if want {
+                    Value::UInt(n)
+                } else {
+                    Value::Null
+                }
+            }
             // Unknown variant tag: bail out to the authoritative decoder.
             _ => return Ok(false),
         };
@@ -228,31 +238,137 @@ fn decode_cols(
     Ok(true)
 }
 
-/// Extract the numeric (`Int`/`Float`/`Bool`) values of selected columns from a
-/// bincode row into per-column `f64` arrays, in a single walk. `slot_of[col]`
-/// is the destination array index, or `-1` to skip. NULL / non-numeric values
-/// are simply not pushed (so each array holds that column's present values).
-/// This is the row-to-columnar step of the vectorised aggregation path.
+/// One column's values extracted for the vectorised aggregation paths, typed by
+/// the column: an integer column keeps its values as `i64` so its aggregates
+/// stay exact past 2^53 (see `elyra_olap::NumSlot`); a float column as `f64`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum NumBuf {
+    Int(Vec<i64>),
+    Float(Vec<f64>),
+}
+
+impl NumBuf {
+    pub fn new(is_int: bool) -> Self {
+        if is_int {
+            NumBuf::Int(Vec::new())
+        } else {
+            NumBuf::Float(Vec::new())
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            NumBuf::Int(v) => v.len(),
+            NumBuf::Float(v) => v.len(),
+        }
+    }
+
+    fn truncate(&mut self, n: usize) {
+        match self {
+            NumBuf::Int(v) => v.truncate(n),
+            NumBuf::Float(v) => v.truncate(n),
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.truncate(0);
+    }
+
+    /// Append an integer. A float column widens it, as its coercion would.
+    #[inline]
+    fn push_int(&mut self, n: i64) {
+        match self {
+            NumBuf::Int(v) => v.push(n),
+            NumBuf::Float(v) => v.push(n as f64),
+        }
+    }
+
+    /// Append an unsigned integer; `false` if it does not fit an integer
+    /// column's `i64` exactly.
+    #[inline]
+    fn push_uint(&mut self, n: u64) -> bool {
+        match self {
+            NumBuf::Int(v) => match i64::try_from(n) {
+                Ok(i) => {
+                    v.push(i);
+                    true
+                }
+                Err(_) => false,
+            },
+            NumBuf::Float(v) => {
+                v.push(n as f64);
+                true
+            }
+        }
+    }
+
+    /// Append a float; `false` for an integer column, which cannot hold a
+    /// fraction exactly (the caller then uses the general path).
+    #[inline]
+    fn push_float(&mut self, f: f64) -> bool {
+        match self {
+            NumBuf::Float(v) => {
+                v.push(f);
+                true
+            }
+            NumBuf::Int(_) => false,
+        }
+    }
+
+    /// Append a decoded value by its own variant. NULL and non-numeric values
+    /// are not pushed. `false` if it cannot be kept exactly (see above).
+    fn push_value(&mut self, v: Option<&Value>) -> bool {
+        match v {
+            Some(Value::Int(n)) => {
+                self.push_int(*n);
+                true
+            }
+            Some(Value::Bool(b)) => {
+                self.push_int(i64::from(*b));
+                true
+            }
+            Some(Value::UInt(n)) => self.push_uint(*n),
+            Some(Value::Float(f)) => self.push_float(*f),
+            _ => true,
+        }
+    }
+}
+
+/// Extract the numeric (`Int`/`Float`/`Bool`/`UInt`) values of selected
+/// columns from a bincode row into per-column typed buffers, in a single walk.
+/// `slot_of[col]` is the destination buffer index, or `-1` to skip. NULL and
+/// non-numeric values are not pushed, so each buffer holds that column's present
+/// values. This is the row-to-columnar step of the vectorised aggregation path.
+///
+/// Returns `Ok(false)` if a value cannot be kept exactly in its buffer (a
+/// fraction, or an unsigned value past `i64::MAX`, in an integer column); the
+/// caller must then answer through the general path. The column's own coercion
+/// means that does not happen for well-formed rows.
+///
+/// A value tag the fast walk does not know falls back to the authoritative
+/// `bincode` decoder. The values this row already pushed are rolled back first:
+/// they used to stay, so the fallback counted them a second time.
 pub fn extract_numeric_cols(
     bytes: &[u8],
     ncols: usize,
     slot_of: &[i32],
-    arrays: &mut [Vec<f64>],
-) -> Result<()> {
+    bufs: &mut [NumBuf],
+) -> Result<bool> {
     let mut c = Cur { b: bytes, p: 0 };
     let count = c.u64()? as usize;
     if count != ncols {
-        let row =
-            bincode::deserialize::<Vec<Value>>(bytes).map_err(|e| Error::Storage(e.to_string()))?;
-        for (col, s) in slot_of.iter().enumerate() {
-            if *s >= 0 {
-                if let Some((v, _)) = numeric_of(row.get(col)) {
-                    arrays[*s as usize].push(v);
-                }
-            }
-        }
-        return Ok(());
+        return push_decoded(bytes, slot_of, bufs);
     }
+    // Buffers this row has pushed to, so an unknown tag can undo them. Each
+    // buffer gains at most one value per row; a row with more than 64 extracted
+    // columns records the lengths instead.
+    let mut pushed: u64 = 0;
+    let wide = bufs.len() > 64;
+    let lens: Vec<usize> = if wide {
+        bufs.iter().map(NumBuf::len).collect()
+    } else {
+        Vec::new()
+    };
     for i in 0..count {
         let tag = c.u32()?;
         let slot = slot_of.get(i).copied().unwrap_or(-1);
@@ -261,19 +377,30 @@ pub fn extract_numeric_cols(
             1 => {
                 let b = c.take(1)?[0];
                 if slot >= 0 {
-                    arrays[slot as usize].push(if b != 0 { 1.0 } else { 0.0 });
+                    bufs[slot as usize].push_int(i64::from(b != 0));
+                    if !wide {
+                        pushed |= 1u64 << slot;
+                    }
                 }
             }
             2 => {
                 let n = c.i64()?;
                 if slot >= 0 {
-                    arrays[slot as usize].push(n as f64);
+                    bufs[slot as usize].push_int(n);
+                    if !wide {
+                        pushed |= 1u64 << slot;
+                    }
                 }
             }
             3 => {
                 let bits = c.u64()?;
                 if slot >= 0 {
-                    arrays[slot as usize].push(f64::from_bits(bits));
+                    if !bufs[slot as usize].push_float(f64::from_bits(bits)) {
+                        return Ok(false);
+                    }
+                    if !wide {
+                        pushed |= 1u64 << slot;
+                    }
                 }
             }
             4 | 5 | 11 => {
@@ -294,30 +421,48 @@ pub fn extract_numeric_cols(
                 c.take(16)?;
                 c.take(1)?;
             }
+            // `UInt` (BIGINT UNSIGNED). Unknown here before, so every row of a
+            // table with such a column went to the fallback below.
+            12 => {
+                let n = c.u64()?;
+                if slot >= 0 {
+                    if !bufs[slot as usize].push_uint(n) {
+                        return Ok(false);
+                    }
+                    if !wide {
+                        pushed |= 1u64 << slot;
+                    }
+                }
+            }
             _ => {
-                let row = bincode::deserialize::<Vec<Value>>(bytes)
-                    .map_err(|e| Error::Storage(e.to_string()))?;
-                for (col, s) in slot_of.iter().enumerate() {
-                    if *s >= 0 {
-                        if let Some((v, _)) = numeric_of(row.get(col)) {
-                            arrays[*s as usize].push(v);
+                if wide {
+                    for (b, &n) in bufs.iter_mut().zip(&lens) {
+                        b.truncate(n);
+                    }
+                } else {
+                    for (s, b) in bufs.iter_mut().enumerate() {
+                        if pushed & (1 << s) != 0 {
+                            b.truncate(b.len() - 1);
                         }
                     }
                 }
-                return Ok(());
+                return push_decoded(bytes, slot_of, bufs);
             }
         }
     }
-    Ok(())
+    Ok(true)
 }
 
-fn numeric_of(v: Option<&Value>) -> Option<(f64, bool)> {
-    match v {
-        Some(Value::Int(n)) => Some((*n as f64, true)),
-        Some(Value::Bool(b)) => Some((if *b { 1.0 } else { 0.0 }, true)),
-        Some(Value::Float(f)) => Some((*f, false)),
-        _ => None,
+/// Decode the whole row with `bincode` and push each selected column's value.
+fn push_decoded(bytes: &[u8], slot_of: &[i32], bufs: &mut [NumBuf]) -> Result<bool> {
+    let row =
+        bincode::deserialize::<Vec<Value>>(bytes).map_err(|e| Error::Storage(e.to_string()))?;
+    for (col, s) in slot_of.iter().enumerate() {
+        if *s >= 0 && !bufs[*s as usize].push_value(row.get(col)) {
+            return Ok(false);
+        }
     }
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -338,6 +483,7 @@ mod tests {
             Value::Decimal(1050, 2),
             Value::Time(3_600_000_000),
             Value::Json("{\"a\":1}".into()),
+            Value::UInt(u64::MAX),
         ]
     }
 
@@ -373,5 +519,76 @@ mod tests {
         // Ask for the wrong column count -> full decode fallback (all present).
         let got = decode_projected(&bytes, row.len() + 1, &[false]).unwrap();
         assert_eq!(got, row);
+    }
+
+    fn extract(row: &[Value], slot_of: &[i32], kinds: &[bool]) -> (bool, Vec<NumBuf>) {
+        let bytes = bincode::serialize(&row.to_vec()).unwrap();
+        let mut bufs: Vec<NumBuf> = kinds.iter().map(|&k| NumBuf::new(k)).collect();
+        let ok = extract_numeric_cols(&bytes, row.len(), slot_of, &mut bufs).unwrap();
+        (ok, bufs)
+    }
+
+    /// The regression: a `BIGINT UNSIGNED` column after an extracted one used to
+    /// send the row to the fallback, which pushed the earlier column again, so
+    /// `SUM(a), COUNT(*)` on such a table came back doubled.
+    #[test]
+    fn an_unsigned_column_does_not_double_the_columns_before_it() {
+        let row = [Value::Int(1), Value::Int(10), Value::UInt(u64::MAX)];
+        let (ok, bufs) = extract(&row, &[-1, 0, -1], &[true]);
+        assert!(ok);
+        assert_eq!(bufs, vec![NumBuf::Int(vec![10])]);
+    }
+
+    #[test]
+    fn integers_are_extracted_exactly_past_2_pow_53() {
+        let big = 9_007_199_254_740_993i64;
+        let (ok, bufs) = extract(
+            &[Value::Int(big), Value::Float(2.5)],
+            &[0, 1],
+            &[true, false],
+        );
+        assert!(ok);
+        assert_eq!(bufs, vec![NumBuf::Int(vec![big]), NumBuf::Float(vec![2.5])]);
+    }
+
+    #[test]
+    fn a_value_an_integer_buffer_cannot_hold_exactly_is_refused() {
+        // A fraction, and an unsigned value past i64::MAX.
+        assert!(!extract(&[Value::Float(1.5)], &[0], &[true]).0);
+        assert!(!extract(&[Value::UInt(u64::MAX)], &[0], &[true]).0);
+        // Both fit a float buffer, and an in-range unsigned fits an integer one.
+        let (ok, bufs) = extract(&[Value::UInt(u64::MAX)], &[0], &[false]);
+        assert!(ok);
+        assert_eq!(bufs, vec![NumBuf::Float(vec![u64::MAX as f64])]);
+        let (ok, bufs) = extract(&[Value::UInt(7)], &[0], &[true]);
+        assert!(ok);
+        assert_eq!(bufs, vec![NumBuf::Int(vec![7])]);
+    }
+
+    #[test]
+    fn nulls_and_non_numeric_values_are_not_pushed() {
+        let row = [Value::Null, Value::Text("x".into()), Value::Bool(true)];
+        let (ok, bufs) = extract(&row, &[0, 1, 2], &[true, true, true]);
+        assert!(ok);
+        assert_eq!(
+            bufs,
+            vec![
+                NumBuf::Int(vec![]),
+                NumBuf::Int(vec![]),
+                NumBuf::Int(vec![1])
+            ]
+        );
+    }
+
+    /// A row written before a column was added has fewer columns than the
+    /// schema; it is decoded by `bincode` and pushed exactly once.
+    #[test]
+    fn a_short_row_is_decoded_once() {
+        let row = vec![Value::Int(5), Value::UInt(9)];
+        let bytes = bincode::serialize(&row).unwrap();
+        let mut bufs = vec![NumBuf::new(true), NumBuf::new(true)];
+        let ok = extract_numeric_cols(&bytes, 3, &[0, 1, -1], &mut bufs).unwrap();
+        assert!(ok);
+        assert_eq!(bufs, vec![NumBuf::Int(vec![5]), NumBuf::Int(vec![9])]);
     }
 }

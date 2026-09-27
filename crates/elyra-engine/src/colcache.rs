@@ -16,7 +16,7 @@
 
 use crate::rowdec;
 use elyra_core::{ColumnType, Result, Schema, Value};
-use elyra_olap::{AggFunc, FxHasher};
+use elyra_olap::{AggFunc, FxHasher, NumSlot};
 use std::collections::HashMap;
 use std::hash::BuildHasherDefault;
 use std::sync::{OnceLock, RwLock};
@@ -34,12 +34,43 @@ impl ColArray {
             ColArray::Float(v, n) => v.len() * 8 + n.len(),
         }
     }
-    /// Numeric value at row `i`, or `None` if that cell is NULL.
+    /// Fold row `i` into `slot` (nothing for a NULL cell), exactly: an integer
+    /// column stays integer. This used to go through `f64`, so aggregates over
+    /// `BIGINT` values past 2^53 rounded.
     #[inline]
-    fn get_f64(&self, i: usize) -> Option<f64> {
+    fn feed(&self, i: usize, slot: &mut NumSlot) {
         match self {
-            ColArray::Int(v, n) => (!n[i]).then(|| v[i] as f64),
-            ColArray::Float(v, n) => (!n[i]).then(|| v[i]),
+            ColArray::Int(v, n) => {
+                if !n[i] {
+                    slot.push_int(v[i]);
+                }
+            }
+            ColArray::Float(v, n) => {
+                if !n[i] {
+                    // A float array only ever feeds a float slot.
+                    let _ = slot.push_float(v[i]);
+                }
+            }
+        }
+    }
+
+    /// Fold the whole column into `slot`.
+    fn feed_all(&self, slot: &mut NumSlot) {
+        match self {
+            ColArray::Int(v, n) => {
+                for (x, &null) in v.iter().zip(n) {
+                    if !null {
+                        slot.push_int(*x);
+                    }
+                }
+            }
+            ColArray::Float(v, n) => {
+                for (x, &null) in v.iter().zip(n) {
+                    if !null {
+                        let _ = slot.push_float(*x);
+                    }
+                }
+            }
         }
     }
 }
@@ -203,49 +234,14 @@ pub fn scalar_agg(ct: &CachedTable, specs: &[(AggFunc, Option<usize>, bool)]) ->
     specs
         .iter()
         .map(|&(func, arg, is_int)| {
-            let arr = arg.and_then(|c| ct.cols.get(c).and_then(|o| o.as_ref()));
-            match func {
-                AggFunc::CountStar => Value::Int(ct.nrows as i64),
-                AggFunc::Count => {
-                    let mut c = 0i64;
-                    if let Some(a) = arr {
-                        for i in 0..ct.nrows {
-                            if a.get_f64(i).is_some() {
-                                c += 1;
-                            }
-                        }
-                    }
-                    Value::Int(c)
-                }
-                AggFunc::Sum | AggFunc::Avg => {
-                    let (mut sum, mut cnt) = (0.0f64, 0i64);
-                    if let Some(a) = arr {
-                        for i in 0..ct.nrows {
-                            if let Some(x) = a.get_f64(i) {
-                                sum += x;
-                                cnt += 1;
-                            }
-                        }
-                    }
-                    finish_sum_avg(func, sum, cnt, is_int)
-                }
-                AggFunc::Min | AggFunc::Max => {
-                    let mut ext: Option<f64> = None;
-                    if let Some(a) = arr {
-                        for i in 0..ct.nrows {
-                            if let Some(x) = a.get_f64(i) {
-                                ext = Some(match (ext, func) {
-                                    (None, _) => x,
-                                    (Some(e), AggFunc::Min) => e.min(x),
-                                    (Some(e), _) => e.max(x),
-                                });
-                            }
-                        }
-                    }
-                    finish_ext(ext, is_int)
-                }
-                _ => Value::Null,
+            if func == AggFunc::CountStar {
+                return Value::Int(ct.nrows as i64);
             }
+            let mut slot = NumSlot::new(is_int);
+            if let Some(a) = arg.and_then(|c| ct.cols.get(c).and_then(|o| o.as_ref())) {
+                a.feed_all(&mut slot);
+            }
+            slot.finish(func)
         })
         .collect()
 }
@@ -265,33 +261,23 @@ pub fn group_agg(
     let naggs = specs.len();
     let max_groups = elyra_olap::default_max_groups();
     let gcol = ct.cols.get(group_col).and_then(|o| o.as_ref());
+    let args: Vec<Option<&ColArray>> = specs
+        .iter()
+        .map(|&(_, arg, _)| arg.and_then(|c| ct.cols.get(c).and_then(|o| o.as_ref())))
+        .collect();
+    let blank: Vec<NumSlot> = specs.iter().map(|s| NumSlot::new(s.2)).collect();
     let mut index: FxU64Map = FxU64Map::default();
     let mut null_gid = u32::MAX;
     let mut keyvals: Vec<Value> = Vec::new();
-    let mut count: Vec<i64> = Vec::new();
-    let mut sum: Vec<f64> = Vec::new();
-    let mut min: Vec<f64> = Vec::new();
-    let mut max: Vec<f64> = Vec::new();
-    let mut has: Vec<bool> = Vec::new();
+    let mut slots: Vec<NumSlot> = Vec::new();
 
-    let new_group = |keyvals: &mut Vec<Value>,
-                     count: &mut Vec<i64>,
-                     sum: &mut Vec<f64>,
-                     min: &mut Vec<f64>,
-                     max: &mut Vec<f64>,
-                     has: &mut Vec<bool>,
-                     kv: Value|
-     -> Option<u32> {
+    let new_group = |keyvals: &mut Vec<Value>, slots: &mut Vec<NumSlot>, kv: Value| {
         if max_groups > 0 && keyvals.len() >= max_groups {
             return None;
         }
         let gid = keyvals.len() as u32;
         keyvals.push(kv);
-        count.resize(count.len() + naggs, 0);
-        sum.resize(sum.len() + naggs, 0.0);
-        min.resize(min.len() + naggs, f64::INFINITY);
-        max.resize(max.len() + naggs, f64::NEG_INFINITY);
-        has.resize(has.len() + naggs, false);
+        slots.extend_from_slice(&blank);
         Some(gid)
     };
 
@@ -320,66 +306,26 @@ pub fn group_agg(
         };
         let gid = if is_null {
             if null_gid == u32::MAX {
-                null_gid = new_group(
-                    &mut keyvals,
-                    &mut count,
-                    &mut sum,
-                    &mut min,
-                    &mut max,
-                    &mut has,
-                    Value::Null,
-                )?;
+                null_gid = new_group(&mut keyvals, &mut slots, Value::Null)?;
             }
             null_gid
         } else {
             match index.get(&bits) {
                 Some(&g) => g,
                 None => {
-                    let g = new_group(
-                        &mut keyvals,
-                        &mut count,
-                        &mut sum,
-                        &mut min,
-                        &mut max,
-                        &mut has,
-                        kv,
-                    )?;
+                    let g = new_group(&mut keyvals, &mut slots, kv)?;
                     index.insert(bits, g);
                     g
                 }
             }
         };
         let base = gid as usize * naggs;
-        for (a, &(func, arg, _)) in specs.iter().enumerate() {
-            match func {
-                AggFunc::CountStar => count[base + a] += 1,
-                _ => {
-                    let x = arg
-                        .and_then(|c| ct.cols.get(c).and_then(|o| o.as_ref()))
-                        .and_then(|arr| arr.get_f64(i));
-                    if let Some(x) = x {
-                        match func {
-                            AggFunc::Count => count[base + a] += 1,
-                            AggFunc::Sum | AggFunc::Avg => {
-                                sum[base + a] += x;
-                                count[base + a] += 1;
-                            }
-                            AggFunc::Min => {
-                                has[base + a] = true;
-                                if x < min[base + a] {
-                                    min[base + a] = x;
-                                }
-                            }
-                            AggFunc::Max => {
-                                has[base + a] = true;
-                                if x > max[base + a] {
-                                    max[base + a] = x;
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                }
+        for (a, &(func, _, _)) in specs.iter().enumerate() {
+            let slot = &mut slots[base + a];
+            if func == AggFunc::CountStar {
+                slot.count_row();
+            } else if let Some(arr) = args[a] {
+                arr.feed(i, slot);
             }
         }
     }
@@ -390,15 +336,7 @@ pub fn group_agg(
         let results: Vec<Value> = specs
             .iter()
             .enumerate()
-            .map(|(a, &(func, _, is_int))| match func {
-                AggFunc::CountStar | AggFunc::Count => Value::Int(count[base + a]),
-                AggFunc::Sum | AggFunc::Avg => {
-                    finish_sum_avg(func, sum[base + a], count[base + a], is_int)
-                }
-                AggFunc::Min => finish_ext(has[base + a].then_some(min[base + a]), is_int),
-                AggFunc::Max => finish_ext(has[base + a].then_some(max[base + a]), is_int),
-                _ => Value::Null,
-            })
+            .map(|(a, &(func, _, _))| slots[base + a].finish(func))
             .collect();
         let mut sample = vec![Value::Null; base_len];
         if group_col < base_len {
@@ -407,28 +345,4 @@ pub fn group_agg(
         out.push((sample, results));
     }
     Some(out)
-}
-
-fn finish_sum_avg(func: AggFunc, sum: f64, count: i64, is_int: bool) -> Value {
-    if count == 0 {
-        return Value::Null;
-    }
-    match func {
-        AggFunc::Avg => Value::Float(sum / count as f64),
-        _ => {
-            if is_int && sum.fract() == 0.0 {
-                Value::Int(sum as i64)
-            } else {
-                Value::Float(sum)
-            }
-        }
-    }
-}
-
-fn finish_ext(ext: Option<f64>, is_int: bool) -> Value {
-    match ext {
-        None => Value::Null,
-        Some(x) if is_int => Value::Int(x as i64),
-        Some(x) => Value::Float(x),
-    }
 }

@@ -170,6 +170,13 @@ FIXTURES = [
     "DROP TABLE IF EXISTS cs",
     "CREATE TABLE cs (s VARCHAR(20), sb VARCHAR(20) COLLATE utf8mb4_bin)",
     "INSERT INTO cs VALUES ('Hello','Hello')",
+    # Exact-integer aggregation fixture: values past 2^53 (not representable in
+    # a double), and a BIGINT UNSIGNED column, whose every value is stored in a
+    # representation the fast columnar paths once did not recognise.
+    "DROP TABLE IF EXISTS bi",
+    "CREATE TABLE bi (id INT PRIMARY KEY, a BIGINT, g INT, u BIGINT UNSIGNED)",
+    "INSERT INTO bi VALUES (1,10,1,5),(2,21,1,18446744073709551615),"
+    "(3,9007199254740993,2,7),(4,1,2,NULL),(5,-9007199254740993,3,9007199254740993)",
 ]
 
 # (category, sql). Kept side-effect free (SELECTs) except the fixtures above.
@@ -475,6 +482,22 @@ CASES = [
     #     deterministic regardless of the wall clock.
     #   - FROM_UNIXTIME renders epoch seconds in the session zone and
     #     UNIX_TIMESTAMP reads its argument as a session-zone datetime.
+    # Integer aggregates stay exact on every aggregation path. Each shape picks a
+    # different one: two aggregates take the columnar scalar path, one takes the
+    # streaming path, GROUP BY the columnar grouped path, a WHERE the compiled
+    # filter. They used to go through a double, so past 2^53 SUM/MIN/MAX
+    # rounded, and a BIGINT UNSIGNED column doubled every other column's values.
+    ("exactint", "SELECT SUM(a), COUNT(*) FROM bi"),
+    ("exactint", "SELECT SUM(a) FROM bi"),
+    ("exactint", "SELECT MIN(a), MAX(a) FROM bi"),
+    ("exactint", "SELECT AVG(a), COUNT(a) FROM bi"),
+    ("exactint", "SELECT AVG(a) FROM bi"),
+    ("exactint", "SELECT SUM(u), COUNT(u) FROM bi"),
+    ("exactint", "SELECT MIN(u), MAX(u), AVG(u) FROM bi"),
+    ("exactint", "SELECT g, SUM(a), AVG(a), MIN(a), MAX(a), COUNT(*) FROM bi GROUP BY g ORDER BY g"),
+    ("exactint", "SELECT g, SUM(a) FROM bi WHERE a > 5 GROUP BY g ORDER BY g"),
+    ("exactint", "SELECT SUM(a), COUNT(*) FROM bi WHERE id > 1"),
+    ("exactint", "SELECT SUM(a*3), MIN(a*3), MAX(a*3), AVG(a+1) FROM bi"),
     ("tzset", "SET time_zone='+02:00'"),
     ("tzoffset", "SELECT TIMESTAMPDIFF(HOUR, UTC_TIMESTAMP(), NOW())"),
     ("tzoffset", "SELECT TIMESTAMPDIFF(MINUTE, UTC_TIME(), CURTIME())"),

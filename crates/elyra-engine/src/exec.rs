@@ -6740,13 +6740,15 @@ async fn select_inner(
         } else {
             None
         };
-        let (schema, out_rows) = if let Some(specs) = columnar {
-            // Unfiltered scalar aggregation may use the columnar cache (opt-in).
-            let results = if colcache::enabled() {
-                columnar_cached_scalar(db, &def, &specs).await?
-            } else {
-                scan_columnar_scalar(db, &def, &specs).await?
-            };
+        // Unfiltered scalar aggregation may use the columnar cache (opt-in). A
+        // value the columnar path cannot keep exactly sends the query to the
+        // general aggregator below rather than returning a rounded answer.
+        let columnar_results = match columnar {
+            Some(specs) if colcache::enabled() => columnar_cached_scalar(db, &def, &specs).await?,
+            Some(specs) => scan_columnar_scalar(db, &def, &specs).await?,
+            None => None,
+        };
+        let (schema, out_rows) = if let Some(results) = columnar_results {
             plan.project_scalar(results)?
         } else if est_groups.is_some_and(|g| g > cap) {
             partitioned_aggregate(db, &def, filter.clone(), &plan).await?
@@ -22015,61 +22017,74 @@ async fn olap_aggregate(
 }
 
 /// Vectorised (columnar) scalar aggregation state for one worker. Rows are
-/// extracted into per-column `f64` arrays, then aggregated with tight,
-/// SIMD-friendly loops over the contiguous arrays instead of per-row `Value`
-/// dispatch. Arrays are flushed into the running accumulators every FLUSH rows
-/// to bound memory.
+/// extracted into per-column typed buffers -- `i64` for an integer column, `f64`
+/// for a float one -- then folded into one exact [`elyra_olap::NumSlot`] per
+/// aggregate with tight loops over the contiguous buffers, instead of per-row
+/// `Value` dispatch. Buffers are flushed every FLUSH rows to bound memory.
+///
+/// Integer columns used to be carried as `f64` here, so `SUM`/`MIN`/`MAX` over
+/// `BIGINT` values past 2^53 came back rounded, with no error.
 struct ColAgg {
     // static config (per agg slot)
     funcs: Vec<elyra_olap::AggFunc>,
-    agg_slot: Vec<Option<usize>>, // column array index; None = COUNT(*)
-    is_int: Vec<bool>,
-    slot_of: Vec<i32>, // col -> array index or -1
+    agg_slot: Vec<Option<usize>>, // column buffer index; None = COUNT(*)
+    slot_of: Vec<i32>,            // col -> buffer index or -1
     ncols: usize,
     // batch buffers, one per distinct column
-    arrays: Vec<Vec<f64>>,
+    bufs: Vec<rowdec::NumBuf>,
     batch_rows: u64,
-    // running accumulators, one per agg
-    count: Vec<i64>,
-    sum: Vec<f64>,
-    min: Vec<f64>,
-    max: Vec<f64>,
-    has: Vec<bool>,
+    // running state
+    rows: i64,
+    slots: Vec<elyra_olap::NumSlot>,
+    /// A value could not be kept exactly (see `rowdec::extract_numeric_cols`);
+    /// the caller answers through the general path instead.
+    inexact: bool,
 }
 
 const COLAGG_FLUSH: u64 = 1 << 20;
 
 impl ColAgg {
     fn new(specs: &[(elyra_olap::AggFunc, Option<usize>, bool)], ncols: usize) -> Self {
-        let mut dcols: Vec<usize> = specs.iter().filter_map(|(_, c, _)| *c).collect();
+        let mut dcols: Vec<(usize, bool)> = specs
+            .iter()
+            .filter_map(|&(_, c, is_int)| c.map(|c| (c, is_int)))
+            .collect();
         dcols.sort_unstable();
-        dcols.dedup();
+        dcols.dedup_by_key(|d| d.0);
         let mut slot_of = vec![-1i32; ncols];
-        for (i, &c) in dcols.iter().enumerate() {
+        for (i, &(c, _)) in dcols.iter().enumerate() {
             slot_of[c] = i as i32;
         }
-        let n = specs.len();
         ColAgg {
             funcs: specs.iter().map(|s| s.0).collect(),
             agg_slot: specs
                 .iter()
                 .map(|s| s.1.map(|c| slot_of[c] as usize))
                 .collect(),
-            is_int: specs.iter().map(|s| s.2).collect(),
             slot_of,
             ncols,
-            arrays: vec![Vec::new(); dcols.len()],
+            bufs: dcols
+                .iter()
+                .map(|&(_, is_int)| rowdec::NumBuf::new(is_int))
+                .collect(),
             batch_rows: 0,
-            count: vec![0; n],
-            sum: vec![0.0; n],
-            min: vec![f64::INFINITY; n],
-            max: vec![f64::NEG_INFINITY; n],
-            has: vec![false; n],
+            rows: 0,
+            slots: specs
+                .iter()
+                .map(|s| elyra_olap::NumSlot::new(s.2))
+                .collect(),
+            inexact: false,
         }
     }
 
     fn feed(&mut self, v: &[u8]) -> Result<()> {
-        rowdec::extract_numeric_cols(v, self.ncols, &self.slot_of, &mut self.arrays)?;
+        if self.inexact {
+            return Ok(());
+        }
+        if !rowdec::extract_numeric_cols(v, self.ncols, &self.slot_of, &mut self.bufs)? {
+            self.inexact = true;
+            return Ok(());
+        }
         self.batch_rows += 1;
         if self.batch_rows >= COLAGG_FLUSH {
             self.flush();
@@ -22078,109 +22093,57 @@ impl ColAgg {
     }
 
     fn flush(&mut self) {
-        use elyra_olap::AggFunc::*;
+        self.rows += self.batch_rows as i64;
         for a in 0..self.funcs.len() {
-            match self.funcs[a] {
-                CountStar => self.count[a] += self.batch_rows as i64,
-                Count => self.count[a] += self.arrays[self.agg_slot[a].unwrap()].len() as i64,
-                Sum | Avg => {
-                    let arr = &self.arrays[self.agg_slot[a].unwrap()];
-                    self.count[a] += arr.len() as i64;
-                    self.sum[a] += arr.iter().sum::<f64>();
-                }
-                Min => {
-                    let arr = &self.arrays[self.agg_slot[a].unwrap()];
-                    if !arr.is_empty() {
-                        self.has[a] = true;
-                        self.min[a] =
-                            self.min[a].min(arr.iter().copied().fold(f64::INFINITY, f64::min));
+            if let Some(b) = self.agg_slot[a] {
+                match &self.bufs[b] {
+                    rowdec::NumBuf::Int(vals) => self.slots[a].add_ints(vals),
+                    rowdec::NumBuf::Float(vals) => {
+                        if !self.slots[a].add_floats(vals) {
+                            self.inexact = true;
+                        }
                     }
                 }
-                Max => {
-                    let arr = &self.arrays[self.agg_slot[a].unwrap()];
-                    if !arr.is_empty() {
-                        self.has[a] = true;
-                        self.max[a] =
-                            self.max[a].max(arr.iter().copied().fold(f64::NEG_INFINITY, f64::max));
-                    }
-                }
-                _ => {}
             }
         }
-        for arr in &mut self.arrays {
-            arr.clear();
+        for b in &mut self.bufs {
+            b.clear();
         }
         self.batch_rows = 0;
     }
 
     fn merge(&mut self, o: &ColAgg) {
-        use elyra_olap::AggFunc::*;
-        for a in 0..self.funcs.len() {
-            self.count[a] += o.count[a];
-            self.sum[a] += o.sum[a];
-            if o.has[a] {
-                self.has[a] = true;
-                match self.funcs[a] {
-                    Min => self.min[a] = self.min[a].min(o.min[a]),
-                    Max => self.max[a] = self.max[a].max(o.max[a]),
-                    _ => {}
-                }
-            }
+        self.rows += o.rows;
+        self.inexact |= o.inexact;
+        for (mine, theirs) in self.slots.iter_mut().zip(&o.slots) {
+            mine.merge(theirs);
         }
     }
 
-    fn finish(&self) -> Vec<Value> {
-        use elyra_olap::AggFunc::*;
-        (0..self.funcs.len())
-            .map(|a| match self.funcs[a] {
-                CountStar | Count => Value::Int(self.count[a]),
-                Sum => {
-                    if self.count[a] == 0 {
-                        Value::Null
-                    } else if self.is_int[a] && self.sum[a].fract() == 0.0 {
-                        Value::Int(self.sum[a] as i64)
-                    } else {
-                        Value::Float(self.sum[a])
-                    }
-                }
-                Avg => {
-                    if self.count[a] == 0 {
-                        Value::Null
-                    } else {
-                        Value::Float(self.sum[a] / self.count[a] as f64)
-                    }
-                }
-                Min => {
-                    if !self.has[a] {
-                        Value::Null
-                    } else if self.is_int[a] {
-                        Value::Int(self.min[a] as i64)
-                    } else {
-                        Value::Float(self.min[a])
-                    }
-                }
-                Max => {
-                    if !self.has[a] {
-                        Value::Null
-                    } else if self.is_int[a] {
-                        Value::Int(self.max[a] as i64)
-                    } else {
-                        Value::Float(self.max[a])
-                    }
-                }
-                _ => Value::Null,
-            })
-            .collect()
+    /// One result per aggregate, or `None` if a value could not be kept exactly.
+    fn finish(&self) -> Option<Vec<Value>> {
+        if self.inexact {
+            return None;
+        }
+        Some(
+            (0..self.funcs.len())
+                .map(|a| match self.funcs[a] {
+                    elyra_olap::AggFunc::CountStar => Value::Int(self.rows),
+                    f => self.slots[a].finish(f),
+                })
+                .collect(),
+        )
     }
 }
 
 /// Run vectorised scalar aggregation (no GROUP BY, no filter) over parallel
-/// clustered ranges and return one `Value` per aggregate slot.
+/// clustered ranges and return one `Value` per aggregate slot, or `None` if a
+/// value could not be kept exactly and the general path must answer.
 async fn scan_columnar_scalar(
     db: &Session,
     def: &TableDef,
     specs: &[(elyra_olap::AggFunc, Option<usize>, bool)],
-) -> Result<Vec<Value>> {
+) -> Result<Option<Vec<Value>>> {
     let ncols = def.schema.columns.len();
     let prefix = def.data_prefix();
     let raw = db.raw_db();
@@ -22234,15 +22197,14 @@ type FxU64Map =
 /// Vectorised (columnar) *grouped* aggregation state for one worker (OLAP phase
 /// 3). One numeric GROUP BY column, numeric aggregates. Only the needed columns
 /// are decoded; the group key is kept exactly (integer value or canonical float
-/// bits), and per-group accumulators live in flat `f64`/`i64` arrays indexed by
-/// `group_ordinal * naggs + slot`, avoiding the byte-key encoding and per-row
-/// `Value` dispatch of the general grouping path.
+/// bits), and per-group accumulators are exact [`elyra_olap::NumSlot`]s in one
+/// flat array indexed by `group_ordinal * naggs + slot`, avoiding the byte-key
+/// encoding and per-row `Value` dispatch of the general grouping path.
 struct ColGroup {
     group_col: usize,
     // static agg config (per slot)
     funcs: Vec<elyra_olap::AggFunc>,
     agg_arg: Vec<Option<usize>>, // base column read by this agg; None = COUNT(*)
-    is_int: Vec<bool>,
     naggs: usize,
     // decode
     ncols: usize,
@@ -22254,13 +22216,11 @@ struct ColGroup {
     index: FxU64Map,
     null_gid: u32,       // u32::MAX until a NULL-keyed row is seen
     keyvals: Vec<Value>, // group ordinal -> representative group-column value
-    // flat accumulators, naggs per group
-    count: Vec<i64>,
-    sum: Vec<f64>,
-    min: Vec<f64>,
-    max: Vec<f64>,
-    has: Vec<bool>,
-    // distinct-group cap (bounds memory; on overflow the caller re-runs spilling)
+    // flat accumulators, naggs per group, and one empty slot per agg to copy
+    slots: Vec<elyra_olap::NumSlot>,
+    blank: Vec<elyra_olap::NumSlot>,
+    // distinct-group cap (bounds memory), or a value the slots cannot keep
+    // exactly; either way the caller re-runs on the spilling general path
     max_groups: usize,
     overflow: bool,
 }
@@ -22280,7 +22240,6 @@ impl ColGroup {
             group_col,
             funcs: specs.iter().map(|s| s.0).collect(),
             agg_arg: specs.iter().map(|s| s.1).collect(),
-            is_int: specs.iter().map(|s| s.2).collect(),
             naggs: n,
             ncols,
             needed,
@@ -22289,11 +22248,11 @@ impl ColGroup {
             index: FxU64Map::default(),
             null_gid: NO_GID,
             keyvals: Vec::new(),
-            count: Vec::new(),
-            sum: Vec::new(),
-            min: Vec::new(),
-            max: Vec::new(),
-            has: Vec::new(),
+            slots: Vec::new(),
+            blank: specs
+                .iter()
+                .map(|s| elyra_olap::NumSlot::new(s.2))
+                .collect(),
             max_groups: elyra_olap::default_max_groups(),
             overflow: false,
         }
@@ -22308,12 +22267,7 @@ impl ColGroup {
         }
         let gid = self.keyvals.len() as u32;
         self.keyvals.push(keyval);
-        self.count.resize(self.count.len() + self.naggs, 0);
-        self.sum.resize(self.sum.len() + self.naggs, 0.0);
-        self.min.resize(self.min.len() + self.naggs, f64::INFINITY);
-        self.max
-            .resize(self.max.len() + self.naggs, f64::NEG_INFINITY);
-        self.has.resize(self.has.len() + self.naggs, false);
+        self.slots.extend_from_slice(&self.blank);
         Some(gid)
     }
 
@@ -22358,38 +22312,27 @@ impl ColGroup {
             }
         };
         let base = gid as usize * self.naggs;
+        let mut exact = true;
         for a in 0..self.naggs {
-            match self.funcs[a] {
-                elyra_olap::AggFunc::CountStar => self.count[base + a] += 1,
-                _ => {
-                    let n = self.agg_arg[a]
-                        .and_then(|c| self.buf.get(c))
-                        .and_then(|v| v.as_f64());
-                    if let Some(n) = n {
-                        use elyra_olap::AggFunc::*;
-                        match self.funcs[a] {
-                            Count => self.count[base + a] += 1,
-                            Sum | Avg => {
-                                self.sum[base + a] += n;
-                                self.count[base + a] += 1;
-                            }
-                            Min => {
-                                self.has[base + a] = true;
-                                if n < self.min[base + a] {
-                                    self.min[base + a] = n;
-                                }
-                            }
-                            Max => {
-                                self.has[base + a] = true;
-                                if n > self.max[base + a] {
-                                    self.max[base + a] = n;
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                }
+            let slot = &mut self.slots[base + a];
+            if self.funcs[a] == elyra_olap::AggFunc::CountStar {
+                slot.count_row();
+                continue;
             }
+            match self.agg_arg[a].and_then(|c| self.buf.get(c)) {
+                Some(Value::Int(i)) => slot.push_int(*i),
+                Some(Value::Bool(b)) => slot.push_int(i64::from(*b)),
+                Some(Value::Float(f)) => exact &= slot.push_float(*f),
+                Some(Value::UInt(u)) => match i64::try_from(*u) {
+                    Ok(i) => slot.push_int(i),
+                    Err(_) => exact = false,
+                },
+                // NULL (and, in a typed Int/Float column, nothing else occurs)
+                _ => {}
+            }
+        }
+        if !exact {
+            self.overflow = true;
         }
         Ok(())
     }
@@ -22400,28 +22343,14 @@ impl ColGroup {
             index,
             null_gid,
             keyvals,
-            count,
-            sum,
-            min,
-            max,
-            has,
+            slots,
             naggs,
             ..
         } = o;
         let merge_slots = |me: &mut ColGroup, dst: u32, src: u32| {
             let (db, sb) = (dst as usize * naggs, src as usize * naggs);
             for a in 0..naggs {
-                me.count[db + a] += count[sb + a];
-                me.sum[db + a] += sum[sb + a];
-                if has[sb + a] {
-                    me.has[db + a] = true;
-                    if min[sb + a] < me.min[db + a] {
-                        me.min[db + a] = min[sb + a];
-                    }
-                    if max[sb + a] > me.max[db + a] {
-                        me.max[db + a] = max[sb + a];
-                    }
-                }
+                me.slots[db + a].merge(&slots[sb + a]);
             }
         };
         if null_gid != NO_GID {
@@ -22453,53 +22382,12 @@ impl ColGroup {
     /// carries the group-column value at its own position so the normal
     /// projection can read it.
     fn into_groups(self, base_len: usize) -> Vec<(Vec<Value>, Vec<Value>)> {
-        use elyra_olap::AggFunc::*;
         let ngroups = self.keyvals.len();
         let mut out = Vec::with_capacity(ngroups);
         for gid in 0..ngroups {
             let base = gid * self.naggs;
             let results: Vec<Value> = (0..self.naggs)
-                .map(|a| {
-                    let (c, s) = (self.count[base + a], self.sum[base + a]);
-                    match self.funcs[a] {
-                        CountStar | Count => Value::Int(c),
-                        Sum => {
-                            if c == 0 {
-                                Value::Null
-                            } else if self.is_int[a] && s.fract() == 0.0 {
-                                Value::Int(s as i64)
-                            } else {
-                                Value::Float(s)
-                            }
-                        }
-                        Avg => {
-                            if c == 0 {
-                                Value::Null
-                            } else {
-                                Value::Float(s / c as f64)
-                            }
-                        }
-                        Min => {
-                            if !self.has[base + a] {
-                                Value::Null
-                            } else if self.is_int[a] {
-                                Value::Int(self.min[base + a] as i64)
-                            } else {
-                                Value::Float(self.min[base + a])
-                            }
-                        }
-                        Max => {
-                            if !self.has[base + a] {
-                                Value::Null
-                            } else if self.is_int[a] {
-                                Value::Int(self.max[base + a] as i64)
-                            } else {
-                                Value::Float(self.max[base + a])
-                            }
-                        }
-                        _ => Value::Null,
-                    }
-                })
+                .map(|a| self.slots[base + a].finish(self.funcs[a]))
                 .collect();
             let mut sample = vec![Value::Null; base_len];
             if self.group_col < base_len {
@@ -22714,16 +22602,16 @@ async fn columnar_cached_scalar(
     db: &Session,
     def: &TableDef,
     specs: &[(elyra_olap::AggFunc, Option<usize>, bool)],
-) -> Result<Vec<Value>> {
+) -> Result<Option<Vec<Value>>> {
     let epoch = db.raw_db().write_epoch()?;
     if let Some(ct) = colcache::get(&def.name, epoch) {
-        return Ok(colcache::scalar_agg(&ct, specs));
+        return Ok(Some(colcache::scalar_agg(&ct, specs)));
     }
     match build_cached_table(db, def, epoch).await? {
         Some(ct) => {
             let ct = std::sync::Arc::new(ct);
             colcache::store(&def.name, ct.clone());
-            Ok(colcache::scalar_agg(&ct, specs))
+            Ok(Some(colcache::scalar_agg(&ct, specs)))
         }
         None => scan_columnar_scalar(db, def, specs).await,
     }
