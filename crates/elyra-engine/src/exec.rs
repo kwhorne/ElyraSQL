@@ -6136,12 +6136,7 @@ async fn aggregation_strategy(
         Err(e) => return Ok(Some(format!("Aggregate: row path ({e})"))),
     };
     let in_txn = db.in_txn();
-    if filter.is_none()
-        && !in_txn
-        && plan
-            .scalar_agg_plan(&def.schema)
-            .is_some_and(|s| s.len() >= 2)
-    {
+    if filter.is_none() && !in_txn && plan.scalar_agg_plan(&def.schema).is_some() {
         return Ok(Some("Aggregate: columnar scalar".into()));
     }
     let est_groups = estimate_group_count(db, def, plan.group_cols()).await?;
@@ -6712,14 +6707,13 @@ async fn select_inner(
         let est_groups = estimate_group_count(db, &def, plan.group_cols()).await?;
         let cap = elyra_olap::default_max_groups() as u64;
         // Vectorised (columnar) scalar-aggregate fast path: no GROUP BY, no
-        // filter, numeric aggregates. Extracts columns into f64 arrays and
-        // aggregates with tight SIMD-friendly loops.
-        // Only when at least two aggregates share the scan (e.g. SUM+AVG+MIN+MAX
-        // or SUM+COUNT): vectorising then amortises the columnar extraction over
-        // several tight aggregation loops. A single aggregate stays on the
-        // streaming path, which is as fast for one accumulator.
+        // filter, numeric aggregates. Extracts the needed columns into typed
+        // arrays and aggregates them with tight loops. This used to require at
+        // least two aggregates, on the assumption that the streaming path was as
+        // fast for one accumulator; measured, a single SUM/MIN/COUNT/AVG over
+        // 20M rows is 2.1x faster here (574 -> 271 ms), and COUNT(*) 2.4x.
         let columnar = if filter.is_none() && !db.in_txn() {
-            plan.scalar_agg_plan(&def.schema).filter(|s| s.len() >= 2)
+            plan.scalar_agg_plan(&def.schema)
         } else {
             None
         };
@@ -22661,7 +22655,7 @@ async fn columnar_cached_group(
 }
 
 /// Degree of parallelism for full-scan aggregation: `ELYRASQL_AGG_WORKERS` if
-/// set (clamped to 1..=64), else min(available cores, 8).
+/// set (clamped to 1..=64), else the available cores, capped at 8.
 fn agg_workers() -> usize {
     use std::sync::OnceLock;
     static N: OnceLock<usize> = OnceLock::new();
@@ -22672,12 +22666,15 @@ fn agg_workers() -> usize {
         {
             return v.clamp(1, 64);
         }
-        // Full-scan aggregation is largely memory-bandwidth bound: ~4 parallel
-        // readers saturate bandwidth, and beyond that the coordination and
-        // read-transaction overhead makes it slower (measured). Cap the default
-        // at 4 regardless of core count; operators can raise it explicitly.
+        // Measured on 20M rows (16-core M4 Max, page cache warm): going from 4
+        // workers to 8 made a plain SUM 1.2x faster, GROUP BY 1.4x, COUNT(*)
+        // 1.5x and an aggregate over an expression 1.7x; beyond 8, COUNT(*)
+        // got slower again while the CPU-heavy shapes still gained a little.
+        // The scan is CPU-bound (decoding), not bandwidth-bound: 20M rows in
+        // ~230 ms is ~1 GB/s. So: all cores, capped at 8. A 4-core machine is
+        // unchanged; operators can raise or lower it explicitly.
         std::thread::available_parallelism()
-            .map(|n| n.get().min(4))
+            .map(|n| n.get().min(8))
             .unwrap_or(4)
     })
 }
@@ -22761,7 +22758,7 @@ async fn scan_aggregate_fast(
     // clustered sub-range and the partials merge. The group aggregator reuses
     // its key buffer, so grouped aggregation no longer thrashes the allocator
     // across threads. `ELYRASQL_AGG_WORKERS` overrides the degree of parallelism
-    // (0/1 = single-threaded); default is min(cores, 8).
+    // (0/1 = single-threaded); the default is the available cores, capped at 8.
     // A DISTINCT aggregate whose value merges additively (SUM/AVG/GROUP_CONCAT) must
     // NOT be split across workers: a value seen by two workers would be added
     // twice. COUNT(DISTINCT) is safe because merging unions the distinct set and

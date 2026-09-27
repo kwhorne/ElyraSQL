@@ -31,6 +31,16 @@ All notable changes to ElyraSQL are documented here. The format is based on
   quotient every path already computed. `MIN`/`MAX` of an integer expression
   (`MIN(a*3)`) is now `BIGINT` rather than `DECIMAL`, also as in MySQL.
 
+- **A single aggregate uses the columnar path, and aggregation uses up to 8
+  cores.** The columnar scalar path required two or more aggregates, on the
+  assumption that the streaming path was as fast for one; measured, `SUM`,
+  `MIN`, `COUNT` or `AVG` alone over 20M rows is 2.1x faster there (574 -> 271
+  ms) and `COUNT(*)` 2.4x. Aggregation parallelism was capped at 4 workers on
+  the assumption that the scan is memory-bandwidth bound; it is CPU-bound, and
+  8 workers were 1.2-1.7x faster than 4 on a 16-core machine (beyond 8,
+  `COUNT(*)` slowed again). The default is now the available cores, capped at
+  8, so a 4-core machine is unchanged. `ELYRASQL_AGG_WORKERS` still overrides.
+
 - **An aggregate over a primary-key range scans just that range, in
   parallel.** `SUM(...) ... WHERE id > n` on an integer primary key fetched the
   matching rows into memory first -- every one decoded and held -- then

@@ -147,7 +147,7 @@ The defaults are safe and fast; these knobs trade memory or a bounded
 crash-loss window for more throughput on analytical workloads (see
 [Configuration](configuration.md) for details):
 
-- **`ELYRASQL_AGG_WORKERS`** — aggregation parallelism (default `min(cores, 4)`).
+- **`ELYRASQL_AGG_WORKERS`** — aggregation parallelism (default `min(cores, 8)`).
 - **`ELYRASQL_COLUMN_CACHE_MB`** — cache a table's numeric columns in memory so
   repeated **unfiltered** aggregations skip the scan (default off).
 - **`ELYRASQL_ZONE_MAPS`** — per-chunk min/max so **filtered** aggregations skip
