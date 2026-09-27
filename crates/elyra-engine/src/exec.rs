@@ -22543,6 +22543,7 @@ async fn get_or_build_zonemap(
 /// numeric bounds, skip chunks that cannot match,
 /// then re-validate that no write raced the skipping scan (else recompute in
 /// full). Correctness never depends on the zone map -- only which rows are read.
+#[allow(clippy::too_many_arguments)]
 async fn scan_columnar_group_zm(
     db: &Session,
     def: &TableDef,
