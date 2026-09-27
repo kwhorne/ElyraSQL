@@ -11,10 +11,14 @@ All notable changes to ElyraSQL are documented here. The format is based on
 ### Security
 
 - **rustls 0.23.45 (RUSTSEC-2026-0285).** rustls's TLS 1.3 handshake accepted
-  handshake messages across encryption-level boundaries. The server terminates
-  client TLS with rustls (through tokio-rustls), and the engine's outbound
-  embedding calls use it through ureq, so every release from 0.9.9 through
-  1.11.3 shipped an affected version (0.23.41). The advisory was published on
+  handshake messages sent at the wrong encryption level when they followed a
+  key-changing message in the same record. The transcript is still
+  authenticated, so a handshake cannot be altered or completed through it; the
+  advisory rates it CVSS 5.3, low confidentiality impact only. ElyraSQL uses
+  rustls wherever it speaks TLS -- the MySQL listener, replication and the
+  cluster control plane (as both server and client), and outbound embedding
+  calls through ureq -- so every release from 0.9.9 through 1.11.3 shipped an
+  affected version (0.23.41). The advisory was published on
   2026-09-14, two days after 1.11.3, which is why that release's audit was
   green. rustls is now 0.23.45 and rustls-webpki 0.103.15, in both lockfiles; no
   code change.

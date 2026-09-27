@@ -17,6 +17,51 @@ ElyraSQL release builds target **Ubuntu 24.04+** and **Apple Silicon macOS
     done, so an interrupted upgrade simply resumes on the next start. **Take a backup
     first, and note that downgrading to 1.4.x afterwards is not supported.**
 
+!!! warning "Upgrading to 1.11.4 — security release"
+
+    1.11.4 updates rustls to 0.23.45 for **RUSTSEC-2026-0285**. Its TLS 1.3
+    handshake accepted handshake messages sent at the wrong encryption level when
+    they followed a key-changing message in the same record, where RFC 8446
+    requires the connection to be closed. The handshake transcript is still
+    authenticated, so an attacker in the network path cannot alter or complete a
+    handshake through it. The advisory rates it CVSS 5.3: low confidentiality
+    impact, none on integrity or availability.
+
+    Every release from 0.9.9 through 1.11.3 ships an affected rustls, on each path
+    where ElyraSQL speaks TLS:
+
+    - the MySQL listener, when started with `--tls-cert`/`--tls-key`;
+    - replication and the cluster control plane (`ELYRASQL_CLUSTER_TLS_*`), as
+      both server and client;
+    - outbound HTTPS calls for AI embeddings.
+
+    If you use none of these over TLS, nothing changes for you. Either way it is a
+    drop-in upgrade: no on-disk format change and no behaviour change, so a 1.11.3
+    database opens in 1.11.4 unchanged.
+
+!!! info "Upgrading to 1.11.3"
+
+    No on-disk format change; a 1.11.2 database opens in 1.11.3 unchanged. Four
+    changes can alter what existing, working code sees:
+
+    - **`SET @var` in a stored procedure now writes the session variable**, as in
+      MySQL. It used to land in the procedure's local scope and vanish when `CALL`
+      returned. A procedure that uses an `@name` its caller also uses now
+      overwrites the caller's value; use a `DECLARE`d local for scratch values.
+    - **`NOW()` and its family return one instant per statement.** A long
+      `INSERT ... SELECT` that stamped rows with `NOW()` now stamps them all alike.
+      `SYSDATE()` still reads the clock each time it runs.
+    - **An embedded engine derives its expression-depth limit from the calling
+      thread's stack.** `elyrasql` itself runs on 16 MiB worker stacks and keeps
+      the configured ceiling (`ELYRASQL_MAX_EXPR_DEPTH`, default 2000). Under
+      `elyra-embed` on a small thread, a deeply nested expression is now refused
+      as *too deeply nested*, where before it either ran or overflowed the stack
+      and aborted the process. Run the engine on a larger thread if you generate
+      deep expressions.
+    - **`EXPLAIN` fills `Extra` for grouped queries** with the aggregation path,
+      such as `Aggregate: columnar scalar`. A tool that expected it empty will
+      now see text.
+
 !!! danger "Upgrading to 1.11.1 — binary data written through prepared statements"
 
     **If any application inserted BLOB or binary data using server-side prepared
