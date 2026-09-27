@@ -51,8 +51,8 @@ For a grouped or aggregating query, `Extra` also names which of the
 
 | `Extra` | Path |
 |---|---|
-| `Aggregate: columnar scalar` | No `GROUP BY`, no `WHERE`, two or more numeric aggregates: columns are extracted to arrays and reduced in tight loops. |
-| `Aggregate: columnar group, zone maps` | One numeric group column and numeric aggregates; `WHERE` compiled to the fast predicate. `, columnar cache` when the whole-column cache serves it. |
+| `Aggregate: columnar scalar` | No `GROUP BY`, no `WHERE`, numeric aggregates: columns are extracted to arrays and reduced in tight loops. |
+| `Aggregate: columnar group` | One numeric group column and numeric aggregates; `WHERE` compiled to the fast predicate. `, primary-key range` when the filter bounds a single integer primary key, so only those keys are read; otherwise `, zone maps` when `ELYRASQL_ZONE_MAPS` is on and the filter has a bound to skip on; `, columnar cache` when the whole-column cache serves an unfiltered query. |
 | `Aggregate: parallel streaming (spills past N groups)` | The general path: batches aggregated on worker threads and merged. Spills to disk if the group count exceeds the cap at run time. |
 | `Aggregate: partitioned, spilling (N estimated groups > cap)` | Statistics predict more groups than fit in memory, so the spilling path is chosen up front. |
 | `Rollup: N aggregation passes` | `WITH ROLLUP`: one pass per grouping prefix. |

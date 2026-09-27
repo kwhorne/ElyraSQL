@@ -54,21 +54,45 @@ impl ColArray {
         }
     }
 
-    /// Fold the whole column into `slot`.
+    /// Fold the whole column into `slot`. A column without NULLs goes to the
+    /// slot's batch loops in one slice; otherwise non-NULL values are gathered
+    /// into short runs first, so the per-value work is still a tight loop and
+    /// not a type dispatch per cell.
     fn feed_all(&self, slot: &mut NumSlot) {
+        const RUN: usize = 4096;
         match self {
             ColArray::Int(v, n) => {
-                for (x, &null) in v.iter().zip(n) {
-                    if !null {
-                        slot.push_int(*x);
-                    }
+                if !n.contains(&true) {
+                    return slot.add_ints(v);
+                }
+                let mut run = Vec::with_capacity(RUN);
+                for (vc, nc) in v.chunks(RUN).zip(n.chunks(RUN)) {
+                    run.clear();
+                    run.extend(
+                        vc.iter()
+                            .zip(nc)
+                            .filter(|(_, &null)| !null)
+                            .map(|(x, _)| *x),
+                    );
+                    slot.add_ints(&run);
                 }
             }
+            // A float array only ever feeds a float slot.
             ColArray::Float(v, n) => {
-                for (x, &null) in v.iter().zip(n) {
-                    if !null {
-                        let _ = slot.push_float(*x);
-                    }
+                if !n.contains(&true) {
+                    let _ = slot.add_floats(v);
+                    return;
+                }
+                let mut run = Vec::with_capacity(RUN);
+                for (vc, nc) in v.chunks(RUN).zip(n.chunks(RUN)) {
+                    run.clear();
+                    run.extend(
+                        vc.iter()
+                            .zip(nc)
+                            .filter(|(_, &null)| !null)
+                            .map(|(x, _)| *x),
+                    );
+                    let _ = slot.add_floats(&run);
                 }
             }
         }
@@ -231,16 +255,26 @@ pub fn build(schema: &Schema, wseq: u64, blobs: &[Vec<u8>]) -> Result<CachedTabl
 /// Scalar (no GROUP BY) aggregation over cached columns. `specs` are
 /// `(func, arg column, is_integer)`; mirrors the scan-based columnar finish.
 pub fn scalar_agg(ct: &CachedTable, specs: &[(AggFunc, Option<usize>, bool)]) -> Vec<Value> {
+    // A slot holds count, sum, minimum and maximum together, so aggregates
+    // over the same column (`SUM(x), MIN(x), MAX(x)`) share one pass over it.
+    let mut folded: Vec<(usize, NumSlot)> = Vec::new();
     specs
         .iter()
         .map(|&(func, arg, is_int)| {
             if func == AggFunc::CountStar {
                 return Value::Int(ct.nrows as i64);
             }
+            let Some(c) = arg else {
+                return NumSlot::new(is_int).finish(func);
+            };
+            if let Some((_, slot)) = folded.iter().find(|(col, _)| *col == c) {
+                return slot.finish(func);
+            }
             let mut slot = NumSlot::new(is_int);
-            if let Some(a) = arg.and_then(|c| ct.cols.get(c).and_then(|o| o.as_ref())) {
+            if let Some(a) = ct.cols.get(c).and_then(|o| o.as_ref()) {
                 a.feed_all(&mut slot);
             }
+            folded.push((c, slot));
             slot.finish(func)
         })
         .collect()

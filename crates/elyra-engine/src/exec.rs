@@ -6150,7 +6150,24 @@ async fn aggregation_strategy(
         && plan.columnar_group_plan(&def.schema).is_some()
         && filter.is_none_or(|f| cpred::compile(f, &def.schema).is_some());
     if columnar_group {
-        let mut s = String::from("Aggregate: columnar group, zone maps");
+        // Name what will actually run: a primary-key range when the filter
+        // bounds the key; otherwise zone maps only when they are enabled and the
+        // filter gives them a bound to skip on; the columnar cache only when it
+        // is enabled and the query is unfiltered (which it serves). This said
+        // "zone maps" for every columnar GROUP BY, including with them off.
+        let mut s = String::from("Aggregate: columnar group");
+        let pk_range = match filter {
+            Some(f) => pk_bounds(def, f)?.is_some(),
+            None => false,
+        };
+        let zone_bound = filter
+            .and_then(|f| cpred::compile(f, &def.schema))
+            .is_some_and(|cp| !cp.bounds().is_empty());
+        if pk_range {
+            s.push_str(", primary-key range");
+        } else if zonemap::enabled() && zone_bound {
+            s.push_str(", zone maps");
+        }
         if colcache::enabled() && filter.is_none() {
             s.push_str(", columnar cache");
         }
@@ -6760,7 +6777,12 @@ async fn select_inner(
             match cached {
                 Some(groups) => plan.project_grouped(groups)?,
                 None => {
-                    match scan_columnar_group_zm(db, &def, gc, &specs, cf, needed, base_len).await?
+                    let pk = match &filter {
+                        Some(f) => pk_bounds(&def, f)?,
+                        None => None,
+                    };
+                    match scan_columnar_group_zm(db, &def, gc, &specs, cf, needed, base_len, pk)
+                        .await?
                     {
                         Some(groups) => plan.project_grouped(groups)?,
                         None => partitioned_aggregate(db, &def, filter.clone(), &plan).await?,
@@ -22516,8 +22538,9 @@ async fn get_or_build_zonemap(
     Ok(Some(zm))
 }
 
-/// Zone-map-aware wrapper over [`scan_columnar_group`]: when zone maps are
-/// enabled and the filter has numeric bounds, skip chunks that cannot match,
+/// Range-aware wrapper over [`scan_columnar_group`]: a primary-key range reads
+/// only those keys; otherwise, when zone maps are enabled and the filter has
+/// numeric bounds, skip chunks that cannot match,
 /// then re-validate that no write raced the skipping scan (else recompute in
 /// full). Correctness never depends on the zone map -- only which rows are read.
 async fn scan_columnar_group_zm(
@@ -22528,7 +22551,31 @@ async fn scan_columnar_group_zm(
     cfilter: Option<cpred::CompiledPredicate>,
     needed: Vec<bool>,
     base_len: usize,
+    pk: Option<PkBounds>,
 ) -> Result<Option<Vec<(Vec<Value>, Vec<Value>)>>> {
+    // A range on the integer primary key reads just those keys, split across the
+    // workers. This path used to scan the whole table for `WHERE id > n`, and
+    // zone maps could not help: they skip blocks by the values of other
+    // columns. The exact key range needs no build and takes precedence.
+    if let Some(bounds) = pk {
+        let raw = db.raw_db();
+        let prefix = def.data_prefix();
+        if let Some(ranges) =
+            pk_split_ranges_within(&raw, def, &prefix, agg_workers(), Some(bounds)).await?
+        {
+            return scan_columnar_group(
+                db,
+                def,
+                group_col,
+                specs,
+                cfilter,
+                needed,
+                base_len,
+                Some(ranges),
+            )
+            .await;
+        }
+    }
     if zonemap::enabled() && !db.in_txn() {
         if let Some(cf) = &cfilter {
             let bounds = cf.bounds();
@@ -22859,12 +22906,19 @@ fn pk_bounds(def: &TableDef, filter: &Expr) -> Result<Option<PkBounds>> {
     {
         return Ok(None);
     }
-    let Some(rq) = range_bounds(def, Some(filter))? else {
+    // The key's own constraints, not the first indexed column's: with an index
+    // on another column (`WHERE g > 5 AND id > n`) the key range still applies.
+    let pk = def.pk_cols[0];
+    let (equalities, ranges) = predicate_constraints(def, Some(filter))?;
+    if let Some(Value::Int(i)) = equalities.get(&pk) {
+        return Ok(Some(PkBounds {
+            lo: Some(*i),
+            hi: Some(*i),
+        }));
+    }
+    let Some((lo, hi)) = ranges.get(&pk) else {
         return Ok(None);
     };
-    if rq.col != def.pk_cols[0] {
-        return Ok(None);
-    }
     // Bounds are taken as inclusive whatever the operator: widening by one key
     // is harmless because the filter re-checks every row.
     let as_i64 = |b: &Option<(Value, bool)>| -> Option<Option<i64>> {
@@ -22874,7 +22928,7 @@ fn pk_bounds(def: &TableDef, filter: &Expr) -> Result<Option<PkBounds>> {
             Some(_) => None,
         }
     };
-    let (Some(lo), Some(hi)) = (as_i64(&rq.lo), as_i64(&rq.hi)) else {
+    let (Some(lo), Some(hi)) = (as_i64(lo), as_i64(hi)) else {
         return Ok(None);
     };
     if lo.is_none() && hi.is_none() {

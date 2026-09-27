@@ -174,7 +174,8 @@ crash-loss window for more throughput on analytical workloads (see
   materialised path rather than this engine.
 
 `EXPLAIN` names the path a grouped query will take in its `Extra` column --
-`Aggregate: columnar scalar`, `Aggregate: columnar group, zone maps`,
+`Aggregate: columnar scalar`, `Aggregate: columnar group` (with `, primary-key
+range`, `, zone maps` or `, columnar cache` when those apply),
 `Aggregate: parallel streaming`, `Aggregate: partitioned, spilling`, or
 `Rollup: N aggregation passes` -- so a client can show which one ran, and a
 rewrite that pushes a query off the fast path is visible before it runs. See

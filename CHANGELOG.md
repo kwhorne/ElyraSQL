@@ -52,6 +52,32 @@ All notable changes to ElyraSQL are documented here. The format is based on
   spanning fewer than 10,000 keys keeps the direct fetch, so point and short
   range queries are unchanged.
 
+- **A columnar `GROUP BY` over a primary-key range reads just that range.**
+  The columnar grouped path scanned the whole table whatever the filter, so
+  `... WHERE id = 777 GROUP BY g` over 20M rows took 200 ms and `WHERE id > 15M`
+  as long as no filter at all; zone maps could not help, because they skip by
+  the values of other columns. A range or equality on a single integer primary
+  key now reads only those keys, split across the workers: `id = 777` 200 ->
+  0.2 ms, `id > 15M` 210 -> 58 ms. The key's range is used even when another
+  column in the filter has an index.
+
+- **The column cache aggregates in tight loops, one pass per column.** With
+  `ELYRASQL_COLUMN_CACHE_MB` set, every value went through a per-cell type
+  dispatch, and each aggregate re-read its column, so `SUM(x), MIN(x), MAX(x)`
+  took three passes. A column now goes to the aggregate in whole slices (NULLs
+  gathered out in runs), aggregates over the same column share one pass, an
+  integer sum is computed exactly in vectorisable halves rather than as a
+  128-bit add per value, and a large float batch is summed in eight lanes. On
+  20M cached rows: `SUM` 19 -> 11 ms, `SUM, MIN, MAX` 56 -> 11 ms. A float
+  batch of 1024 or more values can now differ from a strictly left-to-right sum
+  in the last digit, as results merged from parallel workers already could;
+  smaller batches keep MySQL's order exactly.
+
+- **`EXPLAIN` no longer claims zone maps that do not run.** Every columnar
+  `GROUP BY` was reported as `Aggregate: columnar group, zone maps`, including
+  with zone maps off. It now names `, primary-key range`, `, zone maps` or
+  `, columnar cache` only when that is what will run.
+
 - **Expressions are compiled once per scan, not interpreted per row.** A
   column reference used to be resolved by name against the schema on every row
   -- two passes plus a fresh `Vec` each time -- a literal re-parsed, and a

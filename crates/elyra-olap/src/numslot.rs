@@ -134,7 +134,7 @@ impl NumSlot {
                 max,
             } => {
                 *count += vals.len() as i64;
-                *sum += vals.iter().map(|&x| i128::from(x)).sum::<i128>();
+                *sum += exact_sum(vals);
                 *min = (*min).min(vals.iter().copied().min().unwrap_or(i64::MAX));
                 *max = (*max).max(vals.iter().copied().max().unwrap_or(i64::MIN));
             }
@@ -161,9 +161,10 @@ impl NumSlot {
                 max,
             } => {
                 *count += vals.len() as i64;
-                *sum += vals.iter().sum::<f64>();
-                *min = min.min(vals.iter().copied().fold(f64::INFINITY, f64::min));
-                *max = max.max(vals.iter().copied().fold(f64::NEG_INFINITY, f64::max));
+                let (s, lo, hi) = float_sum_min_max(vals);
+                *sum += s;
+                *min = min.min(lo);
+                *max = max.max(hi);
                 true
             }
             NumSlot::Int { .. } => false,
@@ -258,6 +259,65 @@ pub fn exact_avg(sum: i128, scale: u8, count: i64) -> Option<Value> {
         .and_then(|f| sum.checked_mul(f))
         .and_then(|n| elyra_core::div_round_half_away(n, i128::from(count)))
         .map(|units| Value::Decimal(units, out_scale))
+}
+
+/// Below this many values a float batch is summed left to right, in the order a
+/// row-at-a-time engine (MySQL) adds them, so small results match to the bit.
+const LANE_MIN: usize = 1024;
+const LANES: usize = 8;
+
+/// The exact sum of `vals`. Adding each value as `i128` is a long dependency
+/// chain the compiler cannot vectorise; instead each value is split into a
+/// signed high and an unsigned low 32-bit half, and the halves are summed in
+/// plain `i64` lanes. Neither half-sum can overflow for up to 2^30 values
+/// (|high| < 2^31 and low < 2^32 per value), so the recombined total is exact.
+fn exact_sum(vals: &[i64]) -> i128 {
+    let mut total = 0i128;
+    for chunk in vals.chunks(1 << 30) {
+        let (mut hi, mut lo) = (0i64, 0i64);
+        for &x in chunk {
+            hi += x >> 32;
+            lo += x & 0xFFFF_FFFF;
+        }
+        total += (i128::from(hi) << 32) + i128::from(lo);
+    }
+    total
+}
+
+/// Sum, minimum and maximum of a float batch. A single running sum waits on
+/// the previous addition for every value; for a large batch eight independent
+/// lanes keep the adder busy (and are, if anything, more accurate: each lane's
+/// rounding error grows with an eighth of the values). The last digit can then
+/// differ from a strictly sequential sum, as it already does wherever partial
+/// sums from parallel workers are merged.
+fn float_sum_min_max(vals: &[f64]) -> (f64, f64, f64) {
+    if vals.len() < LANE_MIN {
+        return (
+            vals.iter().sum(),
+            vals.iter().copied().fold(f64::INFINITY, f64::min),
+            vals.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+        );
+    }
+    let mut sum = [0.0f64; LANES];
+    let mut min = [f64::INFINITY; LANES];
+    let mut max = [f64::NEG_INFINITY; LANES];
+    let (chunks, rest) = vals.as_chunks::<LANES>();
+    for c in chunks {
+        for l in 0..LANES {
+            sum[l] += c[l];
+            min[l] = min[l].min(c[l]);
+            max[l] = max[l].max(c[l]);
+        }
+    }
+    let mut s = sum.iter().sum::<f64>();
+    let mut lo = min.iter().copied().fold(f64::INFINITY, f64::min);
+    let mut hi = max.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    for &x in rest {
+        s += x;
+        lo = lo.min(x);
+        hi = hi.max(x);
+    }
+    (s, lo, hi)
 }
 
 #[cfg(test)]
@@ -356,5 +416,29 @@ mod tests {
         assert_eq!(s.finish(AggFunc::Min), Value::Float(-4.0));
         assert_eq!(s.finish(AggFunc::Max), Value::Float(2.5));
         assert_eq!(s.finish(AggFunc::Avg), Value::Float(-0.5 / 3.0));
+    }
+    #[test]
+    fn the_split_integer_sum_is_exact_at_the_extremes() {
+        let vals = [i64::MIN, i64::MAX, -1, i64::MIN, 0, 1, i64::MAX, i64::MAX];
+        let want: i128 = vals.iter().map(|&x| i128::from(x)).sum();
+        assert_eq!(exact_sum(&vals), want);
+        let many = vec![i64::MIN; 5000];
+        assert_eq!(exact_sum(&many), i128::from(i64::MIN) * 5000);
+    }
+
+    #[test]
+    fn laned_float_batches_agree_with_sequential_ones() {
+        // Integers well inside 2^53 sum exactly in any order, so the laned and
+        // sequential results must be identical; extremes must match too.
+        let vals: Vec<f64> = (0..10_003)
+            .map(|i| ((i * 7919) % 10_007) as f64 - 5000.0)
+            .collect();
+        let (s, lo, hi) = float_sum_min_max(&vals);
+        assert_eq!(s, vals.iter().sum::<f64>());
+        assert_eq!(lo, -5000.0);
+        assert_eq!(hi, 5006.0);
+        // A small batch keeps the sequential order exactly.
+        let small = [0.1, 0.2, 0.3, 1e16, -1e16];
+        assert_eq!(float_sum_min_max(&small).0, small.iter().sum::<f64>());
     }
 }
