@@ -3,6 +3,7 @@
 //! Implements `CREATE TABLE`, `INSERT`, `SELECT ... FROM`, `DROP TABLE`.
 //! Inserts are batched into one group-commit; scans stream.
 
+use crate::cexpr::CExpr;
 use crate::session::Session;
 use elyra_core::{
     CatalogError, ColumnDef, ColumnType, DuplicateError, Error, Result, Schema, Value,
@@ -22678,20 +22679,32 @@ async fn scan_aggregate_fast(
     let schema = def.schema.clone();
     let needed = agg_needed_mask(&schema, filter.as_ref(), plan);
     let ncols = schema.columns.len();
-    let arg_exprs = plan.arg_exprs().to_vec();
+    // Aggregate arguments that are expressions, compiled once: column references
+    // resolved to indexes, literals parsed (see `cexpr`). They used to be walked
+    // as AST per row, resolving every column by name each time.
+    let arg_exprs: Vec<CExpr> = plan
+        .arg_exprs()
+        .iter()
+        .map(|e| CExpr::compile(e, &schema))
+        .collect();
     let raw = db.raw_db();
     // Compile the filter once (pre-resolved column indices, native comparison)
-    // for the common numeric-conjunction shape; fall back to the interpreter.
+    // for the common numeric-conjunction shape; otherwise as a compiled
+    // expression, which still resolves columns and literals only once.
     let cfilter = filter.as_ref().and_then(|f| cpred::compile(f, &schema));
+    let filter: Option<CExpr> = match &cfilter {
+        Some(_) => None,
+        None => filter.as_ref().map(|f| CExpr::compile(f, &schema)),
+    };
 
     // A closure factory: builds the per-worker fold body (each captures its own
     // aggregator + reusable buffer).
-    let make_body = |filter: Option<Expr>,
+    let make_body = |filter: Option<CExpr>,
                      cfilter: Option<cpred::CompiledPredicate>,
                      needed: Option<Vec<bool>>,
                      schema: Schema,
-                     arg_exprs: Vec<Expr>| {
-        let mut buf: Vec<Value> = Vec::with_capacity(ncols);
+                     arg_exprs: Vec<CExpr>| {
+        let mut buf: Vec<Value> = Vec::with_capacity(ncols + arg_exprs.len());
         move |agg: &mut GroupAggregator, _k: &[u8], v: &[u8]| -> Result<()> {
             match &needed {
                 Some(m) => rowdec::decode_projected_into(v, ncols, m, &mut buf)?,
@@ -22699,18 +22712,24 @@ async fn scan_aggregate_fast(
             }
             let keep = match (&cfilter, &filter) {
                 (Some(cp), _) => cp.matches(&buf),
-                (None, Some(e)) => predicate::matches(e, &schema, &buf)?,
+                (None, Some(e)) => e.matches(&schema, &buf)?,
                 (None, None) => true,
             };
             if keep {
                 if arg_exprs.is_empty() {
                     agg.feed(&buf);
                 } else {
-                    let mut r = buf.clone();
+                    // Computed arguments sit after the base columns. Append them
+                    // to the reused buffer rather than cloning the row for each
+                    // one; a row stored before a column was added is padded to
+                    // the schema first, so they land where the plan reads them.
+                    buf.resize(ncols, Value::Null);
                     for e in &arg_exprs {
-                        r.push(predicate::eval_row(e, &schema, &buf)?);
+                        let v = e.eval(&schema, &buf[..ncols])?;
+                        buf.push(v);
                     }
-                    agg.feed(&r);
+                    agg.feed(&buf);
+                    buf.truncate(ncols);
                 }
             }
             Ok(())

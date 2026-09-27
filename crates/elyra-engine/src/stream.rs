@@ -5,6 +5,7 @@
 //! `LIMIT`/`OFFSET`, then project — all with bounded memory. The server
 //! drains batches straight to the wire.
 
+use crate::cexpr::CExpr;
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::PathBuf;
@@ -14,7 +15,6 @@ use elyra_storage::Db;
 use sqlparser::ast::Expr;
 
 use crate::catalog::TableDef;
-use crate::predicate;
 
 /// How many storage rows to pull per underlying scan step.
 const SCAN_CHUNK: usize = 1024;
@@ -48,7 +48,11 @@ struct Scan {
     full_schema: Schema,
     /// Row-index for each output column (projection).
     projection: Vec<usize>,
-    filter: Option<Expr>,
+    /// Whether no column is projected twice, so values can be moved out of the
+    /// decoded row instead of cloned.
+    projection_unique: bool,
+    /// The WHERE clause, compiled once for the scan (see `crate::cexpr`).
+    filter: Option<CExpr>,
     offset: usize,
     limit: Option<usize>,
     done: bool,
@@ -133,8 +137,16 @@ impl RowStream {
                 prefix: table.data_prefix(),
                 cursor: None,
                 full_schema: table.schema.clone(),
+                projection_unique: {
+                    let mut seen = spec.projection.clone();
+                    seen.sort_unstable();
+                    seen.windows(2).all(|w| w[0] != w[1])
+                },
                 projection: spec.projection,
-                filter: spec.filter,
+                filter: spec
+                    .filter
+                    .as_ref()
+                    .map(|f| CExpr::compile(f, &table.schema)),
                 offset: spec.offset,
                 limit: spec.limit,
                 done: false,
@@ -254,7 +266,7 @@ impl Scan {
 
                 // WHERE
                 if let Some(f) = &self.filter {
-                    if !predicate::matches(f, &self.full_schema, &row)? {
+                    if !f.matches(&self.full_schema, &row)? {
                         continue;
                     }
                 }
@@ -264,7 +276,7 @@ impl Scan {
                     continue;
                 }
 
-                out.push(self.project(&row));
+                out.push(self.project(row));
 
                 // LIMIT
                 if let Some(l) = self.limit.as_mut() {
@@ -280,11 +292,25 @@ impl Scan {
         Ok(out)
     }
 
-    fn project(&self, row: &[Value]) -> Vec<Value> {
-        self.projection
-            .iter()
-            .map(|&i| row.get(i).cloned().unwrap_or(Value::Null))
-            .collect()
+    /// The output row. The decoded row is this scan's own, so its values are
+    /// moved rather than cloned -- a text column used to be copied once per
+    /// row -- unless a column is projected more than once.
+    fn project(&self, mut row: Vec<Value>) -> Vec<Value> {
+        if self.projection_unique {
+            self.projection
+                .iter()
+                .map(|&i| {
+                    row.get_mut(i)
+                        .map(|v| std::mem::replace(v, Value::Null))
+                        .unwrap_or(Value::Null)
+                })
+                .collect()
+        } else {
+            self.projection
+                .iter()
+                .map(|&i| row.get(i).cloned().unwrap_or(Value::Null))
+                .collect()
+        }
     }
 }
 

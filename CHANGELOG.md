@@ -31,6 +31,18 @@ All notable changes to ElyraSQL are documented here. The format is based on
   quotient every path already computed. `MIN`/`MAX` of an integer expression
   (`MIN(a*3)`) is now `BIGINT` rather than `DECIMAL`, also as in MySQL.
 
+- **Expressions are compiled once per scan, not interpreted per row.** A
+  column reference used to be resolved by name against the schema on every row
+  -- two passes plus a fresh `Vec` each time -- a literal re-parsed, and a
+  comparison's collation re-derived. Aggregate arguments (`SUM(col*2+1)`),
+  aggregate filters and the `WHERE` of a streaming `SELECT` now compile to a
+  small form with column indexes and parsed literals, evaluated through the
+  same operator code as before (nodes without a compiled form stay
+  interpreted, so results and errors are unchanged). The interpreter's own
+  column lookup is also a single allocation-free pass now, and a streaming scan
+  moves projected values instead of cloning them. On 20M rows: `SUM(col*2+1)`
+  1071 -> 697 ms, an `OR` filter 1103 -> 664 ms, a filtered `SELECT` 4.1 -> 3.0 s.
+
 - **The page cache is sized to available memory.** ElyraSQL used redb's fixed
   1 GiB default, so a scan over any larger table found nothing cached and
   re-read every page from the file through a syscall -- a third of an

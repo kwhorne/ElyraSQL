@@ -46,6 +46,51 @@ pub(crate) fn identifier_eq(left: &str, right: &str) -> bool {
     }
 }
 
+/// Apply a unary operator to an evaluated operand. Shared by the row evaluator
+/// and compiled expressions (`crate::cexpr`), so both agree exactly.
+pub(crate) fn unary_value(op: &UnaryOperator, v: Value) -> Result<Value> {
+    match (op, v) {
+        (UnaryOperator::Not, v) => Ok(if v.is_null() {
+            Value::Null // NOT NULL = NULL (three-valued logic)
+        } else {
+            Value::Bool(!truthy(&v))
+        }),
+        // Same reason as in `arith`: `-!0` is -1, not -1.0.
+        (UnaryOperator::Minus, Value::Bool(b)) => Ok(Value::Int(-i64::from(b))),
+        (UnaryOperator::Minus, Value::Int(i)) => i
+            .checked_neg()
+            .map(Value::Int)
+            .ok_or_else(|| Error::OutOfRange(format!("BIGINT value is out of range in '-({i})'"))),
+        (UnaryOperator::Minus, Value::Float(f)) => Ok(Value::Float(-f)),
+        (UnaryOperator::Minus, Value::Decimal(units, scale)) => units
+            .checked_neg()
+            .map(|units| Value::Decimal(units, scale))
+            .ok_or_else(|| Error::OutOfRange("DECIMAL value is out of range".into())),
+        // Negating a large unsigned literal (e.g. `-9223372036854775808`,
+        // parsed as UInt because it exceeds i64::MAX): valid iff it fits
+        // the signed range once negated, else out of range like MySQL.
+        (UnaryOperator::Minus, Value::UInt(u)) => {
+            if u <= (i64::MAX as u64) + 1 {
+                Ok(Value::Int((u as i128).wrapping_neg() as i64))
+            } else {
+                Err(Error::OutOfRange(format!(
+                    "BIGINT value is out of range in '-({u})'"
+                )))
+            }
+        }
+        (UnaryOperator::Minus, v) => Ok(v
+            .as_mysql_f64()
+            .map(|n| Value::Float(-n))
+            .unwrap_or(Value::Null)),
+        (UnaryOperator::Plus, v) => Ok(v),
+        (UnaryOperator::PGBitwiseNot, v) => Ok(match v.as_mysql_f64() {
+            Some(x) => Value::Int(!(x as i64)),
+            None => Value::Null,
+        }),
+        _ => Err(Error::Unsupported("unsupported unary operator".into())),
+    }
+}
+
 /// Evaluate `expr` against a row. Column identifiers resolve via `schema`.
 pub fn eval_row(expr: &Expr, schema: &Schema, row: &[Value]) -> Result<Value> {
     match expr {
@@ -56,17 +101,19 @@ pub fn eval_row(expr: &Expr, schema: &Schema, row: &[Value]) -> Result<Value> {
             if id.value.starts_with("@@") {
                 return Ok(system_var(&id.value));
             }
-            // Niladic functions like CURRENT_TIMESTAMP appear as bare identifiers.
-            if !schema
-                .columns
-                .iter()
-                .any(|c| identifier_eq(&c.name, &id.value))
-            {
+            // One allocation-free pass: whether any column's stored name matches
+            // (which rules out a niladic function such as CURRENT_TIMESTAMP, which
+            // appears as a bare identifier), and the unique visible column the
+            // name resolves to. This runs for every column reference on every
+            // row; it used to scan the schema twice and collect the matches
+            // into a fresh Vec each time.
+            let (raw_hit, found) = resolve_bare(&id.value, schema);
+            if !raw_hit {
                 if let Some(v) = niladic_fn(&id.value) {
                     return Ok(v);
                 }
             }
-            resolve(&id.value, schema, row)
+            found.map(|idx| row.get(idx).cloned().unwrap_or(Value::Null))
         }
         Expr::CompoundIdentifier(parts) => {
             // `@@session.var` / `@@global.var` arrive as a compound identifier.
@@ -156,50 +203,7 @@ pub fn eval_row(expr: &Expr, schema: &Schema, row: &[Value]) -> Result<Value> {
         }
         Expr::IsUnknown(e) => Ok(Value::Bool(eval_row(e, schema, row)?.is_null())),
         Expr::IsNotUnknown(e) => Ok(Value::Bool(!eval_row(e, schema, row)?.is_null())),
-        Expr::UnaryOp { op, expr } => {
-            let v = eval_row(expr, schema, row)?;
-            match (op, v) {
-                (UnaryOperator::Not, v) => Ok(if v.is_null() {
-                    Value::Null // NOT NULL = NULL (three-valued logic)
-                } else {
-                    Value::Bool(!truthy(&v))
-                }),
-                // Same reason as in `arith`: `-!0` is -1, not -1.0.
-                (UnaryOperator::Minus, Value::Bool(b)) => Ok(Value::Int(-i64::from(b))),
-                (UnaryOperator::Minus, Value::Int(i)) => {
-                    i.checked_neg().map(Value::Int).ok_or_else(|| {
-                        Error::OutOfRange(format!("BIGINT value is out of range in '-({i})'"))
-                    })
-                }
-                (UnaryOperator::Minus, Value::Float(f)) => Ok(Value::Float(-f)),
-                (UnaryOperator::Minus, Value::Decimal(units, scale)) => units
-                    .checked_neg()
-                    .map(|units| Value::Decimal(units, scale))
-                    .ok_or_else(|| Error::OutOfRange("DECIMAL value is out of range".into())),
-                // Negating a large unsigned literal (e.g. `-9223372036854775808`,
-                // parsed as UInt because it exceeds i64::MAX): valid iff it fits
-                // the signed range once negated, else out of range like MySQL.
-                (UnaryOperator::Minus, Value::UInt(u)) => {
-                    if u <= (i64::MAX as u64) + 1 {
-                        Ok(Value::Int((u as i128).wrapping_neg() as i64))
-                    } else {
-                        Err(Error::OutOfRange(format!(
-                            "BIGINT value is out of range in '-({u})'"
-                        )))
-                    }
-                }
-                (UnaryOperator::Minus, v) => Ok(v
-                    .as_mysql_f64()
-                    .map(|n| Value::Float(-n))
-                    .unwrap_or(Value::Null)),
-                (UnaryOperator::Plus, v) => Ok(v),
-                (UnaryOperator::PGBitwiseNot, v) => Ok(match v.as_mysql_f64() {
-                    Some(x) => Value::Int(!(x as i64)),
-                    None => Value::Null,
-                }),
-                _ => Err(Error::Unsupported("unsupported unary operator".into())),
-            }
-        }
+        Expr::UnaryOp { op, expr } => unary_value(op, eval_row(expr, schema, row)?),
         Expr::Between {
             expr,
             negated,
@@ -273,10 +277,7 @@ pub fn eval_row(expr: &Expr, schema: &Schema, row: &[Value]) -> Result<Value> {
                 eval_row(left, schema, row)?,
                 op,
                 || eval_row(right, schema, row),
-                left,
-                right,
-                schema,
-                row,
+                || cmp_collation(left, right, schema),
             ),
         },
         Expr::Extract { field, expr, .. } => {
@@ -2889,11 +2890,6 @@ fn to_vector(v: &Value) -> Result<Vec<f32>> {
     }
 }
 
-fn resolve(name: &str, schema: &Schema, row: &[Value]) -> Result<Value> {
-    let idx = resolve_index(name, schema)?;
-    Ok(row.get(idx).cloned().unwrap_or(Value::Null))
-}
-
 fn qualifier_matches_parts(qualifier: &[String], reference: &[sqlparser::ast::Ident]) -> bool {
     reference.len() <= qualifier.len()
         && qualifier[qualifier.len() - reference.len()..]
@@ -2991,23 +2987,56 @@ fn dotted(parts: &[sqlparser::ast::Ident]) -> String {
 /// [`resolve_index_parts`] so quoted dots remain identifier data rather than
 /// being mistaken for component separators.
 pub fn resolve_index(name: &str, schema: &Schema) -> Result<usize> {
-    let hits = schema
-        .columns
-        .iter()
-        .enumerate()
-        .filter(|(index, column)| {
-            !schema.is_hidden_from_unqualified(*index) && identifier_eq(column_name(column), name)
-        })
-        .map(|(index, _)| index)
-        .collect::<Vec<_>>();
-    match hits.as_slice() {
-        [index] => Ok(*index),
-        [] => Err(Error::Catalog(
+    resolve_bare(name, schema).1
+}
+
+/// The column index a bare identifier evaluates to, or `None` when `eval_row`
+/// would do something else with it: a niladic function such as
+/// `CURRENT_TIMESTAMP` (when no column's stored name matches), or an error
+/// (unknown, ambiguous). For compiling expressions (`crate::cexpr`).
+pub(crate) fn bare_column(name: &str, schema: &Schema) -> Option<usize> {
+    let (raw_hit, found) = resolve_bare(name, schema);
+    if !raw_hit && niladic_fn(name).is_some() {
+        return None;
+    }
+    found.ok()
+}
+
+/// The resolution rule for an unqualified name, in one pass without allocating:
+/// `(any column's stored name matches, the unique visible column it names)`.
+/// A column matches on its unqualified name, skipping columns hidden from
+/// unqualified references; none is "unknown", more than one "ambiguous".
+fn resolve_bare(name: &str, schema: &Schema) -> (bool, Result<usize>) {
+    let mut raw_hit = false;
+    let mut found: Option<usize> = None;
+    let mut ambiguous = false;
+    for (index, column) in schema.columns.iter().enumerate() {
+        let raw = identifier_eq(&column.name, name);
+        raw_hit |= raw;
+        let short = column_name(column);
+        // Unqualified columns' short name is the stored name: reuse the result.
+        let eq = if short.len() == column.name.len() {
+            raw
+        } else {
+            identifier_eq(short, name)
+        };
+        if eq && !schema.is_hidden_from_unqualified(index) {
+            if found.is_some() {
+                ambiguous = true;
+            } else {
+                found = Some(index);
+            }
+        }
+    }
+    let result = match (found, ambiguous) {
+        (Some(_), true) => Err(Error::Query(format!("ambiguous column: {name}"))),
+        (Some(index), false) => Ok(index),
+        (None, _) => Err(Error::Catalog(
             CatalogError::UnknownColumn,
             format!("unknown column: {name}"),
         )),
-        _ => Err(Error::Query(format!("ambiguous column: {name}"))),
-    }
+    };
+    (raw_hit, result)
 }
 
 fn literal(v: &SqlValue) -> Result<Value> {
@@ -3015,14 +3044,15 @@ fn literal(v: &SqlValue) -> Result<Value> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn binary(
+/// Apply a binary operator. `collation` gives the comparison collation of the
+/// two operands; it is only called for comparisons, so the row evaluator derives
+/// it from the operand expressions on demand while a compiled expression
+/// (`crate::cexpr`) passes the one it computed once.
+pub(crate) fn binary(
     l: Value,
     op: &BinaryOperator,
     eval_right: impl FnOnce() -> Result<Value>,
-    lexpr: &Expr,
-    rexpr: &Expr,
-    schema: &Schema,
-    _row: &[Value],
+    collation: impl FnOnce() -> Collation,
 ) -> Result<Value> {
     use BinaryOperator::*;
     // Logical operators with MySQL three-valued logic: for AND, FALSE dominates
@@ -3058,7 +3088,7 @@ fn binary(
             return Ok(Value::Bool(match (l.is_null(), r.is_null()) {
                 (true, true) => true,
                 (true, false) | (false, true) => false,
-                (false, false) => cmp(&l, &r, cmp_collation(lexpr, rexpr, schema))?
+                (false, false) => cmp(&l, &r, collation())?
                     .map(|o| o.is_eq())
                     .unwrap_or(false),
             }));
@@ -3073,7 +3103,11 @@ fn binary(
         return Ok(Value::Null);
     }
     // A binary-collation column operand makes the text comparison case-sensitive.
-    let coll = cmp_collation(lexpr, rexpr, schema);
+    let coll = if matches!(op, Eq | NotEq | Lt | LtEq | Gt | GtEq) {
+        collation()
+    } else {
+        Collation::Ci
+    };
     match op {
         Eq => Ok(Value::Bool(
             cmp(&l, &r, coll)?.map(|o| o.is_eq()).unwrap_or(false),
@@ -3306,7 +3340,7 @@ fn expr_collation(e: &Expr, schema: &Schema) -> Option<Collation> {
 
 /// The comparison collation for two operands: case-sensitive if either is a
 /// binary-collation column, else the default case-insensitive collation.
-fn cmp_collation(l: &Expr, r: &Expr, schema: &Schema) -> Collation {
+pub(crate) fn cmp_collation(l: &Expr, r: &Expr, schema: &Schema) -> Collation {
     if matches!(expr_collation(l, schema), Some(Collation::Bin))
         || matches!(expr_collation(r, schema), Some(Collation::Bin))
     {
@@ -3584,7 +3618,7 @@ mod scalar_function_support_tests {
     }
 }
 
-fn truthy(v: &Value) -> bool {
+pub(crate) fn truthy(v: &Value) -> bool {
     match v {
         Value::Bool(b) => *b,
         Value::Int(i) => *i != 0,

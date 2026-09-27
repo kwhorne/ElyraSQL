@@ -10,6 +10,7 @@ mod aggregate;
 mod aggspill;
 mod aiembed;
 mod catalog;
+mod cexpr;
 mod colcache;
 pub mod collmig;
 mod cpred;
