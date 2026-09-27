@@ -498,6 +498,17 @@ CASES = [
     ("exactint", "SELECT g, SUM(a) FROM bi WHERE a > 5 GROUP BY g ORDER BY g"),
     ("exactint", "SELECT SUM(a), COUNT(*) FROM bi WHERE id > 1"),
     ("exactint", "SELECT SUM(a*3), MIN(a*3), MAX(a*3), AVG(a+1) FROM bi"),
+    # An aggregate over a primary-key range reads only that key range, split
+    # across the parallel scan workers; the filter is re-applied to every row.
+    # One-sided ranges take that path, a short two-sided one the direct fetch.
+    ("pkrange", "SELECT SUM(g), COUNT(*) FROM jn WHERE id > 100"),
+    ("pkrange", "SELECT SUM(g), COUNT(*) FROM jn WHERE id >= 400"),
+    ("pkrange", "SELECT SUM(g), COUNT(*) FROM jn WHERE id < 0"),
+    ("pkrange", "SELECT SUM(g), COUNT(*) FROM jn WHERE id <= 37"),
+    ("pkrange", "SELECT SUM(g), COUNT(*) FROM jn WHERE id BETWEEN 50 AND 350"),
+    ("pkrange", "SELECT g, COUNT(*) FROM jn WHERE id > 37 GROUP BY g ORDER BY g"),
+    ("pkrange", "SELECT COUNT(DISTINCT g), SUM(DISTINCT g) FROM jn WHERE id > 5"),
+    ("pkrange", "SELECT SUM(g) FROM jn WHERE id > 10 AND g > 3"),
     ("tzset", "SET time_zone='+02:00'"),
     ("tzoffset", "SELECT TIMESTAMPDIFF(HOUR, UTC_TIMESTAMP(), NOW())"),
     ("tzoffset", "SELECT TIMESTAMPDIFF(MINUTE, UTC_TIME(), CURTIME())"),

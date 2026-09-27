@@ -21988,6 +21988,24 @@ async fn olap_aggregate(
                 return Ok(agg);
             }
         }
+        // A range on a single integer primary key: scan just those keys with the
+        // same parallel, decode-in-place aggregation as a full scan. It used to
+        // fetch the matching rows into memory first -- every one decoded and
+        // held, then aggregated on one core -- so `WHERE id > n` over half a
+        // table was three times slower than aggregating all of it.
+        // A range known to be narrow keeps the direct fetch below: it is a few
+        // rows, and handing it to scan workers only adds a thread hop.
+        if !db.in_txn() {
+            if let Some(pk) = pk_bounds(def, f)? {
+                let narrow = matches!(
+                    (pk.lo, pk.hi),
+                    (Some(lo), Some(hi)) if (hi as i128 - lo as i128) < PK_NARROW_RANGE
+                );
+                if !narrow {
+                    return scan_aggregate_fast(db, def, filter.clone(), plan, Some(pk)).await;
+                }
+            }
+        }
         // Equality or range on a PK/indexed column: aggregate just the matching
         // rows fetched via the index, rather than scanning the whole table.
         if accelerable(def, Some(f))? {
@@ -22012,7 +22030,7 @@ async fn olap_aggregate(
     // single read transaction (no per-row copy). Inside a transaction we must
     // merge the write overlay, so fall back to the batch-copy parallel path.
     if !db.in_txn() {
-        return scan_aggregate_fast(db, def, filter, plan).await;
+        return scan_aggregate_fast(db, def, filter, plan, None).await;
     }
     parallel_aggregate(db, def, filter, plan).await
 }
@@ -22674,6 +22692,9 @@ async fn scan_aggregate_fast(
     def: &TableDef,
     filter: Option<Expr>,
     plan: &AggPlan,
+    // A primary-key range the filter confines the scan to: only those keys are
+    // read, still in parallel. The filter is re-applied to every row.
+    pk: Option<PkBounds>,
 ) -> Result<GroupAggregator> {
     let prefix = def.data_prefix();
     let schema = def.schema.clone();
@@ -22751,8 +22772,13 @@ async fn scan_aggregate_fast(
     } else {
         agg_workers()
     };
-    if workers > 1 {
-        if let Some(ranges) = pk_split_ranges(&raw, def, &prefix, workers).await? {
+    let ranges = if workers > 1 || pk.is_some() {
+        pk_split_ranges_within(&raw, def, &prefix, workers, pk).await?
+    } else {
+        None
+    };
+    {
+        if let Some(ranges) = ranges {
             // One snapshot shared by every worker: the parallel range scans then
             // observe a single consistent point-in-time view (concurrent commits
             // are all-or-nothing across the whole aggregate).
@@ -22809,6 +22835,68 @@ async fn pk_split_ranges(
     prefix: &[u8],
     n: usize,
 ) -> Result<Option<Vec<(Vec<u8>, Vec<u8>)>>> {
+    pk_split_ranges_within(raw, def, prefix, n, None).await
+}
+
+/// A primary-key range spanning fewer keys than this is aggregated by fetching
+/// its rows directly rather than by the parallel range scan.
+const PK_NARROW_RANGE: i128 = 10_000;
+
+/// Inclusive bounds on a single integer primary key that a filter confines a
+/// scan to. A superset of the matching keys is fine: the full filter is
+/// re-applied to every row the bounded scan reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PkBounds {
+    lo: Option<i64>,
+    hi: Option<i64>,
+}
+
+/// The primary-key range `filter` confines a scan to, when it is a range (or
+/// equality) on a single integer primary key.
+fn pk_bounds(def: &TableDef, filter: &Expr) -> Result<Option<PkBounds>> {
+    if def.pk_cols.len() != 1
+        || !matches!(
+            def.schema.columns[def.pk_cols[0]].ty,
+            elyra_core::ColumnType::Int
+        )
+    {
+        return Ok(None);
+    }
+    let Some(rq) = range_bounds(def, Some(filter))? else {
+        return Ok(None);
+    };
+    if rq.col != def.pk_cols[0] {
+        return Ok(None);
+    }
+    // Bounds are taken as inclusive whatever the operator: widening by one key
+    // is harmless because the filter re-checks every row.
+    let as_i64 = |b: &Option<(Value, bool)>| -> Option<Option<i64>> {
+        match b {
+            None => Some(None),
+            Some((Value::Int(i), _)) => Some(Some(*i)),
+            Some(_) => None,
+        }
+    };
+    let (Some(lo), Some(hi)) = (as_i64(&rq.lo), as_i64(&rq.hi)) else {
+        return Ok(None);
+    };
+    if lo.is_none() && hi.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(PkBounds { lo, hi }))
+}
+
+/// [`pk_split_ranges`], optionally restricted to a primary-key range. With
+/// `bounds`, the result always covers exactly that range (clamped to the
+/// table's keys), as one range when it is too narrow to split; `None` then
+/// means the table has no rows in it, or no single integer key.
+async fn pk_split_ranges_within(
+    raw: &elyra_storage::Db,
+    def: &TableDef,
+    prefix: &[u8],
+    n: usize,
+    bounds: Option<PkBounds>,
+) -> Result<Option<Vec<(Vec<u8>, Vec<u8>)>>> {
     if def.pk_cols.len() != 1 {
         return Ok(None);
     }
@@ -22826,29 +22914,50 @@ async fn pk_split_ranges(
         let u = u64::from_be_bytes(b.try_into().ok()?);
         Some((u ^ 0x8000_0000_0000_0000) as i64)
     };
-    let (Some(lo), Some(hi)) = (decode(&first), decode(&last)) else {
+    let (Some(table_lo), Some(table_hi)) = (decode(&first), decode(&last)) else {
         return Ok(None);
     };
-    // Need a spread wide enough to bother splitting.
-    if hi <= lo || (hi as i128 - lo as i128) < n as i128 {
-        return Ok(None);
-    }
     let key_of = |pk: i64| -> Vec<u8> {
         let mut k = prefix.to_vec();
         k.extend_from_slice(&((pk as u64) ^ 0x8000_0000_0000_0000).to_be_bytes());
         k
     };
+    let upper = prefix_successor(prefix); // exclusive end past the last row
+                                          // The keys to cover: the whole table, or the bounded range within it.
+    let lo = bounds
+        .and_then(|b| b.lo)
+        .map_or(table_lo, |b| b.max(table_lo));
+    let hi = bounds
+        .and_then(|b| b.hi)
+        .map_or(table_hi, |b| b.min(table_hi));
+    let first_key = if lo == table_lo {
+        first.clone()
+    } else {
+        key_of(lo)
+    };
+    let end_key = if hi >= table_hi {
+        upper.clone()
+    } else {
+        key_of(hi + 1) // hi < table_hi <= i64::MAX, so this cannot overflow
+    };
+    if lo > hi {
+        // A range outside the table's keys: nothing to scan.
+        return Ok(bounds.map(|_| Vec::new()));
+    }
+    // Need a spread wide enough to bother splitting.
+    if hi == lo || (hi as i128 - lo as i128) < n as i128 {
+        return Ok(bounds.map(|_| vec![(first_key, end_key)]));
+    }
     let span = hi as i128 - lo as i128;
     let mut ranges = Vec::with_capacity(n);
-    let upper = prefix_successor(prefix); // exclusive end past the last row
     for i in 0..n {
         let start = if i == 0 {
-            first.clone()
+            first_key.clone()
         } else {
             key_of((lo as i128 + span * i as i128 / n as i128) as i64)
         };
         let end = if i == n - 1 {
-            upper.clone()
+            end_key.clone()
         } else {
             key_of((lo as i128 + span * (i as i128 + 1) / n as i128) as i64)
         };
@@ -22856,7 +22965,7 @@ async fn pk_split_ranges(
             ranges.push((start, end));
         }
     }
-    if ranges.len() < 2 {
+    if ranges.len() < 2 && bounds.is_none() {
         return Ok(None);
     }
     Ok(Some(ranges))

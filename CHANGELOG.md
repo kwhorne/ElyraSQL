@@ -31,6 +31,17 @@ All notable changes to ElyraSQL are documented here. The format is based on
   quotient every path already computed. `MIN`/`MAX` of an integer expression
   (`MIN(a*3)`) is now `BIGINT` rather than `DECIMAL`, also as in MySQL.
 
+- **An aggregate over a primary-key range scans just that range, in
+  parallel.** `SUM(...) ... WHERE id > n` on an integer primary key fetched the
+  matching rows into memory first -- every one decoded and held -- then
+  aggregated them on one core, so over half a table it was three times slower
+  than aggregating all of it. It now runs the same parallel, decode-in-place
+  scan as a full-table aggregate, over only the keys in range, re-applying the
+  filter to every row. On 20M rows: `SUM ... WHERE id > 10M` 1761 -> 281 ms,
+  `COUNT(*)` likewise 1731 -> 278 ms, a range `GROUP BY` 1972 -> 477 ms. A range
+  spanning fewer than 10,000 keys keeps the direct fetch, so point and short
+  range queries are unchanged.
+
 - **Expressions are compiled once per scan, not interpreted per row.** A
   column reference used to be resolved by name against the schema on every row
   -- two passes plus a fresh `Vec` each time -- a literal re-parsed, and a
