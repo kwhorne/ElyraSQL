@@ -31,6 +31,17 @@ All notable changes to ElyraSQL are documented here. The format is based on
   quotient every path already computed. `MIN`/`MAX` of an integer expression
   (`MIN(a*3)`) is now `BIGINT` rather than `DECIMAL`, also as in MySQL.
 
+- **The page cache is sized to available memory.** ElyraSQL used redb's fixed
+  1 GiB default, so a scan over any larger table found nothing cached and
+  re-read every page from the file through a syscall -- a third of an
+  aggregate's CPU time on a 2.6 GB table, with the file already in the OS cache.
+  The default is now a quarter of the memory the process can use: physical
+  memory, or the cgroup limit in a container when that is lower (floor 64 MiB).
+  `ELYRASQL_PAGE_CACHE_MB` overrides it, and the size is logged at startup. The
+  cache fills only as pages are read. On 20M rows, aggregates became 1.7-2.7x
+  faster; a cache smaller than the scanned table gives almost nothing, because
+  a sequential scan evicts its own pages.
+
 ## [1.11.4] - 2026-09-26
 
 ### Security

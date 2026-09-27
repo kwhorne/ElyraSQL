@@ -45,6 +45,9 @@ regex = "1"
 
 # Single-file ACID storage engine
 redb = "2.2"
+# Physical memory and page size, to size the page cache (already a transitive
+# dependency through tokio).
+libc = "0.2"
 bincode = "1.3"
 
 # Async runtime + MySQL wire protocol

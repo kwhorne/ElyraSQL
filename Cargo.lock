@@ -583,6 +583,7 @@ dependencies = [
  "async-trait",
  "bincode",
  "elyra-core",
+ "libc",
  "redb",
  "serde",
  "tempfile",

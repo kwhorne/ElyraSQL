@@ -17,6 +17,9 @@ pub mod binlog;
 mod db;
 pub use db::{CloseWaiter, Consensus, Db, Validation, WriteEvent, WriteOp};
 
+mod cache;
+pub use cache::{page_cache_bytes, CacheSource, PAGE_CACHE_ENV};
+
 use std::path::Path;
 use std::sync::Arc;
 
@@ -276,14 +279,36 @@ impl Storage {
     /// Open (or create) the single ElyraSQL database file at `path`.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let pathbuf = path.as_ref().to_path_buf();
-        let db = Database::create(&pathbuf).map_err(|e| match e {
-            // redb reports this as its own variant, so the distinction survives
-            // without anyone matching on the message text.
-            redb::DatabaseError::DatabaseAlreadyOpen => {
-                Error::StorageLocked(pathbuf.display().to_string())
-            }
-            other => Error::Storage(other.to_string()),
-        })?;
+        // Sized to the memory available rather than redb's fixed 1 GiB, which
+        // left every scan over a larger table re-reading each page from the
+        // file (see `cache`).
+        let (cache_bytes, source) = page_cache_bytes();
+        match source {
+            CacheSource::Configured => tracing::info!(
+                cache_mb = cache_bytes / (1024 * 1024),
+                "page cache set by {PAGE_CACHE_ENV}"
+            ),
+            CacheSource::Memory { available } => tracing::info!(
+                cache_mb = cache_bytes / (1024 * 1024),
+                available_mb = available / (1024 * 1024),
+                "page cache sized to a quarter of available memory"
+            ),
+            CacheSource::Fallback => tracing::info!(
+                cache_mb = cache_bytes / (1024 * 1024),
+                "page cache at the default; available memory could not be read"
+            ),
+        }
+        let db = redb::Builder::new()
+            .set_cache_size(usize::try_from(cache_bytes).unwrap_or(usize::MAX))
+            .create(&pathbuf)
+            .map_err(|e| match e {
+                // redb reports this as its own variant, so the distinction survives
+                // without anyone matching on the message text.
+                redb::DatabaseError::DatabaseAlreadyOpen => {
+                    Error::StorageLocked(pathbuf.display().to_string())
+                }
+                other => Error::Storage(other.to_string()),
+            })?;
         // Ensure the KV table exists so first reads don't fail.
         let wtx = db
             .begin_write()
