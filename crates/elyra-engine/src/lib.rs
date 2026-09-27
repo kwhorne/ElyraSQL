@@ -5962,9 +5962,12 @@ mod sqlx_session_setup_tests {
 
     /// The local now-family follows the session offset while the `UTC_*` forms
     /// stay in UTC. Both are frozen to the same instant within one statement, so
-    /// the difference is exact and independent of the wall clock. MySQL 8.4 with
-    /// `time_zone='+02:00'` gives `TIMESTAMPDIFF(HOUR, UTC_TIMESTAMP(), NOW())`
-    /// = 2 and `TIMESTAMPDIFF(MINUTE, UTC_TIME(), CURTIME())` = 120.
+    /// the timestamp difference is exact. MySQL 8.4 with `time_zone='+02:00'`
+    /// gives `TIMESTAMPDIFF(HOUR, UTC_TIMESTAMP(), NOW())` = 2, and
+    /// `TIMESTAMPDIFF(MINUTE, UTC_TIME(), CURTIME())` = 120 -- except from 22:00
+    /// to 24:00 UTC, when local time has passed midnight: both TIMEs are widened
+    /// with today's date, so it is -1320, and the local date is a day ahead.
+    /// That window made this test fail two hours a day.
     #[tokio::test]
     async fn the_local_now_family_follows_the_session_offset() {
         let (engine, session) = engine().await;
@@ -5978,9 +5981,12 @@ mod sqlx_session_setup_tests {
         )
         .await;
         assert_eq!(text(&r[0]), "2");
-        assert_eq!(text(&r[1]), "120");
-        // Same UTC day at +02:00 around midday, so the date does not shift.
-        assert_eq!(text(&r[2]), "0");
+        // Before local midnight: 120 minutes, same date. After it: the TIME of
+        // day wraps and the local date is one ahead. Always consistent.
+        match (text(&r[1]).as_str(), text(&r[2]).as_str()) {
+            ("120", "0") | ("-1320", "1") => {}
+            other => panic!("inconsistent local/UTC time and date: {other:?}"),
+        }
 
         // A negative offset shifts the other way.
         run(&engine, &session, "SET time_zone = '-05:30'")
