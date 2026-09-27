@@ -1180,13 +1180,17 @@ impl Engine {
                 Error::Query(format!("LOAD DATA: cannot read '{}': {e}", spec.path))
             })?;
             // Keep LOAD DATA on the plain-INSERT writer fast path while
-            // amortising SQL parsing and durable commits over a genuinely
-            // bulk-sized unit. The builder still splits larger files so one
-            // statement cannot grow without bound.
-            let stmts = exec::build_load_inserts(&spec, &content, 50_000);
+            // amortising durable commits over a genuinely bulk-sized unit. Each
+            // batch is built as an INSERT statement directly -- no SQL text to
+            // parse -- and one at a time, so a large file never exists as
+            // statements all at once.
             let mut total = 0u64;
-            for stmt in stmts {
-                for r in Box::pin(self.execute_as(&stmt, privilege, user, sess)).await? {
+            for rows in exec::load_batches(&spec, &content, 50_000) {
+                let stmt = exec::load_insert(&spec, rows)?;
+                for r in self
+                    .run_statements(vec![stmt], privilege, user, sess, None, None)
+                    .await?
+                {
                     match r {
                         QueryResult::Affected(n)
                         | QueryResult::Insert {
@@ -1491,6 +1495,30 @@ impl Engine {
             }
         };
 
+        self.run_statements(
+            statements,
+            privilege,
+            user,
+            sess,
+            update_modifiers,
+            dml_limit,
+        )
+        .await
+    }
+
+    /// Run parsed statements: the per-statement privilege checks, session
+    /// function rewrites, implicit transactions, materialised-view refreshes and
+    /// `ROW_COUNT()` tracking, then execution. Every statement goes through here,
+    /// whether parsed from SQL text or built directly (`LOAD DATA`).
+    async fn run_statements(
+        &self,
+        statements: Vec<Statement>,
+        privilege: Privilege,
+        user: &str,
+        sess: &Session,
+        update_modifiers: Option<UpdateModifiers>,
+        dml_limit: Option<usize>,
+    ) -> Result<Vec<QueryResult>> {
         let mut out = Vec::with_capacity(statements.len());
         for stmt in statements {
             let mut stmt = stmt;
@@ -6531,5 +6559,110 @@ mod pipes_as_concat_tests {
             txt(scalar(&e, &s, "SELECT id FROM t WHERE a || b = 'xy'").await),
             "1"
         );
+    }
+}
+
+#[cfg(test)]
+mod load_data_engine_tests {
+    use super::{Engine, Privilege, QueryResult};
+    use elyra_core::Value;
+
+    async fn exec(engine: &Engine, session: &crate::Session, sql: &str) -> Vec<QueryResult> {
+        engine
+            .execute(sql, Privilege::Admin, session)
+            .await
+            .unwrap()
+    }
+
+    async fn rows(engine: &Engine, session: &crate::Session, sql: &str) -> Vec<Vec<String>> {
+        match exec(engine, session, sql).await.remove(0) {
+            QueryResult::Rows(mut stream) => stream
+                .next_batch(100)
+                .await
+                .unwrap()
+                .iter()
+                .map(|r| {
+                    r.iter()
+                        .map(|v| match v {
+                            Value::Null => "NULL".to_string(),
+                            v => v.to_wire_string().unwrap_or_default(),
+                        })
+                        .collect()
+                })
+                .collect(),
+            _ => panic!("expected rows"),
+        }
+    }
+
+    fn file(name: &str, content: &str) -> std::path::PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("elyra-load-{}-{name}.csv", std::process::id()));
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    /// `LOAD DATA` builds its INSERTs as syntax rather than SQL text; what the
+    /// insert does with them must not change: the column list, skipped header,
+    /// enclosing quotes, `\N` as NULL, quotes inside a field, defaults and
+    /// AUTO_INCREMENT, triggers, the affected count, and a duplicate key.
+    #[tokio::test]
+    async fn load_data_inserts_as_the_equivalent_insert_would() {
+        let engine = Engine::new(elyra_storage::Db::in_memory().unwrap());
+        let s = engine.session();
+        for sql in [
+            "CREATE TABLE ld (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(40), \
+             score DOUBLE, note VARCHAR(40) DEFAULT 'none')",
+            "CREATE TABLE ld_audit (n VARCHAR(40))",
+            "CREATE TRIGGER ld_t AFTER INSERT ON ld FOR EACH ROW \
+             INSERT INTO ld_audit VALUES (NEW.name)",
+        ] {
+            exec(&engine, &s, sql).await;
+        }
+        let path = file("ok", "name,score\n\"it's\",1.5\n\"q\",\\N\n\"x\",\"2\"\n");
+        let res = exec(
+            &engine,
+            &s,
+            &format!(
+                "LOAD DATA INFILE '{}' INTO TABLE ld FIELDS TERMINATED BY ',' \
+                 ENCLOSED BY '\"' LINES TERMINATED BY '\\n' IGNORE 1 LINES (name, score)",
+                path.display()
+            ),
+        )
+        .await;
+        std::fs::remove_file(&path).unwrap();
+        assert!(matches!(res[..], [QueryResult::Affected(3)]));
+        assert_eq!(
+            rows(
+                &engine,
+                &s,
+                "SELECT id, name, score, note FROM ld ORDER BY id"
+            )
+            .await,
+            [
+                ["1", "it's", "1.5", "none"],
+                ["2", "q", "NULL", "none"],
+                ["3", "x", "2", "none"],
+            ]
+        );
+        assert_eq!(
+            rows(&engine, &s, "SELECT COUNT(*) FROM ld_audit").await,
+            [["3"]]
+        );
+
+        let path = file("dup", "2,again\n");
+        let err = engine
+            .execute(
+                &format!(
+                    "LOAD DATA INFILE '{}' INTO TABLE ld FIELDS TERMINATED BY ',' (id, name)",
+                    path.display()
+                ),
+                Privilege::Admin,
+                &s,
+            )
+            .await
+            .err()
+            .expect("a duplicate key must fail the load");
+        std::fs::remove_file(&path).unwrap();
+        assert!(err.to_string().contains("Duplicate entry"), "{err}");
     }
 }

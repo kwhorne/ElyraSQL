@@ -10897,11 +10897,74 @@ pub fn parse_load_data(sql: &str) -> Result<LoadSpec> {
     })
 }
 
-/// Turn file `content` into batched `INSERT` statements per the load spec.
-pub fn build_load_inserts(spec: &LoadSpec, content: &str, batch: usize) -> Vec<String> {
+/// The rows of a load file, `batch` lines at a time, as the `VALUES` tuples of
+/// an `INSERT`: each field a string literal -- coerced to its column's type on
+/// insert, exactly as a quoted value in SQL is -- and `\N` a `NULL`.
+///
+/// `LOAD DATA` used to write these tuples out as SQL text and hand it back to
+/// the parser, which spent more time tokenising the file than the insert spent
+/// storing it. The tuples now go to the insert as syntax directly.
+pub fn load_batches<'a>(
+    spec: &'a LoadSpec,
+    content: &'a str,
+    batch: usize,
+) -> impl Iterator<Item = Vec<Vec<Expr>>> + 'a {
     let batch = batch.max(1);
-    let mut stmts = Vec::new();
-    let col_list = if spec.cols.is_empty() {
+    let mut lines = content
+        .split(spec.line_term.as_str())
+        .skip(spec.ignore)
+        .filter(|l| !l.is_empty())
+        .peekable();
+    std::iter::from_fn(move || {
+        lines.peek()?;
+        let rows: Vec<Vec<Expr>> = lines
+            .by_ref()
+            .take(batch)
+            .map(|line| {
+                line.split(spec.field_term.as_str())
+                    .map(|f| {
+                        let f = match spec.enclosed {
+                            Some(q) => f.trim_matches(q),
+                            None => f,
+                        };
+                        Expr::Value(if f == "\\N" {
+                            sqlparser::ast::Value::Null
+                        } else {
+                            sqlparser::ast::Value::SingleQuotedString(f.to_string())
+                        })
+                    })
+                    .collect()
+            })
+            .collect();
+        Some(rows)
+    })
+}
+
+/// The `INSERT` for one batch of [`load_batches`]: the statement a client would
+/// send (`INSERT INTO t (cols) VALUES ...`), built without printing the rows.
+pub fn load_insert(spec: &LoadSpec, rows: Vec<Vec<Expr>>) -> Result<sqlparser::ast::Statement> {
+    let sql = format!(
+        "INSERT INTO `{}`{} VALUES (NULL)",
+        spec.table,
+        load_column_list(spec)
+    );
+    let mut stmts =
+        sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::MySqlDialect {}, &sql)
+            .map_err(|e| Error::Parse(format!("LOAD DATA: {e}")))?;
+    match (stmts.pop(), stmts.is_empty()) {
+        (Some(sqlparser::ast::Statement::Insert(mut ins)), true) => {
+            match ins.source.as_mut().map(|q| q.body.as_mut()) {
+                Some(SetExpr::Values(values)) => values.rows = rows,
+                _ => return Err(Error::Query("LOAD DATA: unexpected INSERT shape".into())),
+            }
+            Ok(sqlparser::ast::Statement::Insert(ins))
+        }
+        _ => Err(Error::Query("LOAD DATA: unexpected INSERT shape".into())),
+    }
+}
+
+fn load_column_list(spec: &LoadSpec) -> String {
+    if spec.cols.is_empty() {
         String::new()
     } else {
         format!(
@@ -10912,43 +10975,14 @@ pub fn build_load_inserts(spec: &LoadSpec, content: &str, batch: usize) -> Vec<S
                 .collect::<Vec<_>>()
                 .join(", ")
         )
-    };
-    let mut rows_iter = content
-        .split(spec.line_term.as_str())
-        .skip(spec.ignore)
-        .filter(|l| !l.is_empty())
-        .peekable();
-    while rows_iter.peek().is_some() {
-        let mut tuples: Vec<String> = Vec::with_capacity(batch.min(50_000));
-        for line in rows_iter.by_ref().take(batch) {
-            let fields = line.split(spec.field_term.as_str()).map(|f| {
-                let f = match spec.enclosed {
-                    Some(q) => f.trim_matches(q),
-                    None => f,
-                };
-                if f == "\\N" {
-                    "NULL".to_string()
-                } else {
-                    format!("'{}'", f.replace('\\', "\\\\").replace('\'', "''"))
-                }
-            });
-            tuples.push(format!("({})", fields.collect::<Vec<_>>().join(", ")));
-        }
-        if !tuples.is_empty() {
-            stmts.push(format!(
-                "INSERT INTO `{}`{} VALUES {}",
-                spec.table,
-                col_list,
-                tuples.join(", ")
-            ));
-        }
     }
-    stmts
 }
 
 #[cfg(test)]
 mod load_data_tests {
-    use super::{build_load_inserts, LoadSpec};
+    use super::{load_batches, load_insert, LoadSpec};
+    use sqlparser::dialect::MySqlDialect;
+    use sqlparser::parser::Parser;
 
     fn spec() -> LoadSpec {
         LoadSpec {
@@ -10963,15 +10997,50 @@ mod load_data_tests {
     }
 
     #[test]
-    fn load_builder_honors_bulk_boundaries_and_zero_batch() {
+    fn load_batches_honor_bulk_boundaries_and_zero_batch() {
         let content = "1\tone\n2\ttwo\n3\tthree\n";
-        let statements = build_load_inserts(&spec(), content, 2);
-        assert_eq!(statements.len(), 2);
-        assert!(statements[0].contains("(\'1\', \'one\'), (\'2\', \'two\')"));
-        assert!(statements[1].contains("(\'3\', \'three\')"));
+        let sizes: Vec<usize> = load_batches(&spec(), content, 2).map(|b| b.len()).collect();
+        assert_eq!(sizes, [2, 1]);
+        let sizes: Vec<usize> = load_batches(&spec(), content, 0).map(|b| b.len()).collect();
+        assert_eq!(sizes, [1, 1, 1]);
+        assert_eq!(load_batches(&spec(), "", 10).count(), 0);
+    }
 
-        let zero_batch = build_load_inserts(&spec(), content, 0);
-        assert_eq!(zero_batch.len(), 3);
+    /// The statement built directly is the one the parser produced from the SQL
+    /// text `LOAD DATA` used to generate (quotes doubled, backslashes escaped,
+    /// `\N` as NULL), field for field -- so the insert sees the same values.
+    #[test]
+    fn built_insert_equals_the_parsed_text_it_replaces() {
+        let mut sp = spec();
+        sp.enclosed = Some('"');
+        sp.ignore = 1;
+        let content = "header\n1\t\"it's\"\n2\t\\N\n3\ta\\b\\\\c\n4\t\n5\t''\n";
+        let mut tuples = Vec::new();
+        for line in content.split('\n').skip(1).filter(|l| !l.is_empty()) {
+            let fields: Vec<String> = line
+                .split('\t')
+                .map(|f| {
+                    let f = f.trim_matches('"');
+                    if f == "\\N" {
+                        "NULL".to_string()
+                    } else {
+                        format!("'{}'", f.replace('\\', "\\\\").replace('\'', "''"))
+                    }
+                })
+                .collect();
+            tuples.push(format!("({})", fields.join(", ")));
+        }
+        let text = format!(
+            "INSERT INTO `items` (`id`, `label`) VALUES {}",
+            tuples.join(", ")
+        );
+        let want = Parser::parse_sql(&MySqlDialect {}, &text)
+            .unwrap()
+            .remove(0);
+        let mut batches = load_batches(&sp, content, 100);
+        let got = load_insert(&sp, batches.next().unwrap()).unwrap();
+        assert!(batches.next().is_none());
+        assert_eq!(got, want);
     }
 }
 

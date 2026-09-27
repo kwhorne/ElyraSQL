@@ -78,6 +78,16 @@ All notable changes to ElyraSQL are documented here. The format is based on
   with zone maps off. It now names `, primary-key range`, `, zone maps` or
   `, columnar cache` only when that is what will run.
 
+- **`LOAD DATA INFILE` is 2.4x faster.** It turned the file into `INSERT`
+  statements as SQL text, 50,000 rows each, and handed that text back to the
+  SQL parser -- which spent more time tokenising the file than the insert spent
+  storing it. The batches are now built as statements directly and inserted
+  through the same path (same coercion, defaults, triggers, privileges and
+  errors; the statement built is checked equal to the one parsed from the old
+  text). One batch exists at a time, where the whole file used to be held as
+  SQL strings. 20M rows (three numeric columns): 76 -> 32 s. MySQL 8.4 takes
+  26 s; what remains is the single storage writer's B-tree inserts.
+
 - **Expressions are compiled once per scan, not interpreted per row.** A
   column reference used to be resolved by name against the schema on every row
   -- two passes plus a fresh `Vec` each time -- a literal re-parsed, and a
