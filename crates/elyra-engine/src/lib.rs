@@ -24,6 +24,7 @@ pub mod lockmgr;
 mod predicate;
 mod proc;
 mod rowdec;
+mod schemacache;
 mod sessfn;
 mod session;
 mod sort;
@@ -6770,6 +6771,53 @@ mod schema_cache_tests {
             as_lim("SELECT secret FROM vault").await.is_err(),
             "a replicated column grant was not enforced"
         );
+    }
+
+    /// Schema reads are cached; each of these changes must still apply to the
+    /// next statement: a foreign key added after an UPDATE cached "no child
+    /// tables", a view created after a lookup cached "not a view", and a column
+    /// widened after an INSERT cached its width.
+    #[tokio::test]
+    async fn cached_schema_reads_follow_ddl() {
+        let engine = Engine::new(elyra_storage::Db::in_memory().unwrap());
+        let s = engine.session();
+        let ok = |sql: &'static str| {
+            let (engine, s) = (&engine, &s);
+            async move {
+                engine
+                    .execute(sql, Privilege::Admin, s)
+                    .await
+                    .unwrap_or_else(|e| panic!("{sql}: {e}"));
+            }
+        };
+        let fails = |sql: &'static str| {
+            let (engine, s) = (&engine, &s);
+            async move {
+                assert!(
+                    engine.execute(sql, Privilege::Admin, s).await.is_err(),
+                    "{sql} should fail"
+                );
+            }
+        };
+
+        ok("CREATE TABLE fp (id INT PRIMARY KEY, n INT)").await;
+        ok("INSERT INTO fp VALUES (1, 0), (2, 0)").await;
+        ok("UPDATE fp SET n = 1 WHERE id = 1").await;
+        ok("DELETE FROM fp WHERE id = 2").await;
+        ok("CREATE TABLE fc (id INT PRIMARY KEY, pid INT, FOREIGN KEY (pid) REFERENCES fp(id))")
+            .await;
+        ok("INSERT INTO fc VALUES (1, 1)").await;
+        fails("DELETE FROM fp WHERE id = 1").await;
+
+        fails("SELECT * FROM later_view").await;
+        ok("CREATE VIEW later_view AS SELECT 1 AS x").await;
+        ok("SELECT x FROM later_view").await;
+
+        ok("CREATE TABLE fw (id INT PRIMARY KEY, s VARCHAR(3))").await;
+        ok("INSERT INTO fw VALUES (1, 'abc')").await;
+        fails("INSERT INTO fw VALUES (2, 'abcdef')").await;
+        ok("ALTER TABLE fw MODIFY s VARCHAR(10)").await;
+        ok("INSERT INTO fw VALUES (2, 'abcdef')").await;
     }
 
     /// A trigger that arrives below the session fires: a cluster follower that

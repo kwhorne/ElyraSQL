@@ -14510,6 +14510,21 @@ pub async fn delete(
 /// `ON DELETE CASCADE` never fired, so deleting the root of a hierarchy left the
 /// children behind pointing at a row that no longer existed.
 async fn referencing_children(db: &Session, parent: &str) -> Result<Vec<TableDef>> {
+    // Every UPDATE and DELETE asks this. Answering it loads every table's
+    // definition, so the answer is cached per parent, tagged like the
+    // definitions themselves (see `catalog::cache_tag`).
+    type Children = std::collections::HashMap<(u64, String), (catalog::CacheTag, Vec<TableDef>)>;
+    static CACHE: std::sync::OnceLock<std::sync::RwLock<Children>> = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    let tag = catalog::cache_tag();
+    let key = (db.db_id(), parent.to_ascii_lowercase());
+    if !db.in_txn() {
+        if let Some((t, children)) = cache.read().unwrap().get(&key) {
+            if *t == tag {
+                return Ok(children.clone());
+            }
+        }
+    }
     let mut out = Vec::new();
     for t in catalog::list_tables(db).await? {
         let def = catalog::load(db, &t).await?;
@@ -14520,6 +14535,13 @@ async fn referencing_children(db: &Session, parent: &str) -> Result<Vec<TableDef
         {
             out.push(def);
         }
+    }
+    if !db.in_txn() {
+        let mut cache = cache.write().unwrap();
+        if cache.len() >= 4096 {
+            cache.clear();
+        }
+        cache.insert(key, (tag, out.clone()));
     }
     Ok(out)
 }

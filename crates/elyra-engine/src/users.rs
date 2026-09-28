@@ -98,96 +98,9 @@ pub fn is_user_stmt(head: &str) -> bool {
         || h.eq_ignore_ascii_case("show grants")
 }
 
-// --- Cached reads for enforcement -----------------------------------------
-//
-// Every `SELECT ... FROM` checks the user's global privileges, and every write
-// by a non-admin user its table grants: two to four storage reads per
-// statement for records that almost never change. The enforcement accessors
-// below read through this cache instead. It holds raw committed reads -- a
-// key's value, or the keys under a prefix, including "absent" -- tagged with
-// the storage layer's schema generation, which is bumped after every commit
-// that touches a schema key (accounts and grants among them) on any path (sessions, replicas, cluster
-// followers). So an entry is served only while no account, grant or role has
-// changed since it was read, and the logic above it is unchanged. Inside a
-// transaction reads go to the session as before, so its own uncommitted
-// changes and serializable read tracking are unaffected. GRANT, REVOKE and the
-// other account statements never read through it.
-
-#[derive(Clone)]
-enum AuthRead {
-    Value(Option<Vec<u8>>),
-    Keys(Vec<Vec<u8>>),
-}
-
-/// (database id, 0 = get / 1 = prefix scan, key or prefix).
-type AuthKey = (u64, u8, Vec<u8>);
-
-/// Bound on cached reads; past it the cache is cleared and refills.
-const AUTH_CACHE_MAX: usize = 16_384;
-
-fn auth_cache() -> &'static std::sync::RwLock<std::collections::HashMap<AuthKey, (u64, AuthRead)>> {
-    use std::sync::{OnceLock, RwLock};
-    static C: OnceLock<RwLock<std::collections::HashMap<AuthKey, (u64, AuthRead)>>> =
-        OnceLock::new();
-    C.get_or_init(|| RwLock::new(std::collections::HashMap::new()))
-}
-
-fn auth_cached(key: &AuthKey, generation: u64) -> Option<AuthRead> {
-    match auth_cache().read().unwrap().get(key) {
-        Some((g, read)) if *g == generation => Some(read.clone()),
-        _ => None,
-    }
-}
-
-fn auth_store(key: AuthKey, generation: u64, read: AuthRead) {
-    let mut cache = auth_cache().write().unwrap();
-    if cache.len() >= AUTH_CACHE_MAX {
-        cache.clear();
-    }
-    cache.insert(key, (generation, read));
-}
-
-/// `sess.get(key)` for an enforcement read, cached outside transactions.
-async fn auth_get(sess: &Session, key: Vec<u8>) -> Result<Option<Vec<u8>>> {
-    if sess.in_txn() {
-        return sess.get(key).await;
-    }
-    // Load the generation before reading: a commit this read might miss bumps
-    // it afterwards, so the entry is never served for the newer state.
-    let generation = elyra_storage::schema_generation();
-    let ck = (sess.db_id(), 0, key);
-    if let Some(AuthRead::Value(v)) = auth_cached(&ck, generation) {
-        return Ok(v);
-    }
-    let v = sess.get(ck.2.clone()).await?;
-    auth_store(ck, generation, AuthRead::Value(v.clone()));
-    Ok(v)
-}
-
-/// The keys under `prefix` (at most 4096, as the uncached reads took), for an
-/// enforcement read, cached outside transactions.
-async fn auth_keys(sess: &Session, prefix: &[u8]) -> Result<Vec<Vec<u8>>> {
-    let scan = || async {
-        Ok::<_, Error>(
-            sess.scan_batch(prefix.to_vec(), None, 4096)
-                .await?
-                .into_iter()
-                .map(|(k, _)| k)
-                .collect::<Vec<_>>(),
-        )
-    };
-    if sess.in_txn() {
-        return scan().await;
-    }
-    let generation = elyra_storage::schema_generation();
-    let ck = (sess.db_id(), 1, prefix.to_vec());
-    if let Some(AuthRead::Keys(keys)) = auth_cached(&ck, generation) {
-        return Ok(keys);
-    }
-    let keys = scan().await?;
-    auth_store(ck, generation, AuthRead::Keys(keys.clone()));
-    Ok(keys)
-}
+// Enforcement reads go through `schemacache`: every `SELECT ... FROM` checks
+// the user's global privileges, and every write by a non-admin user its table
+// grants. GRANT, REVOKE and the other account statements read fresh.
 
 /// A user's per-column SELECT grants on `table`. `None` means the user is not
 /// column-restricted on this table (no column grants); `Some(cols)` restricts
@@ -211,7 +124,7 @@ pub async fn column_grants(sess: &Session, user: &str, table: &str) -> Result<Op
 }
 
 async fn scan_column_grants(sess: &Session, prefix: &[u8]) -> Result<Vec<String>> {
-    Ok(auth_keys(sess, prefix)
+    Ok(crate::schemacache::keys(sess, prefix)
         .await?
         .iter()
         .map(|key| String::from_utf8_lossy(&key[prefix.len()..]).into_owned())
@@ -221,7 +134,7 @@ async fn scan_column_grants(sess: &Session, prefix: &[u8]) -> Result<Vec<String>
 /// The role names granted (directly) to `user`.
 pub async fn roles_of(sess: &Session, user: &str) -> Result<Vec<String>> {
     let prefix = role_member_prefix(user);
-    Ok(auth_keys(sess, &prefix)
+    Ok(crate::schemacache::keys(sess, &prefix)
         .await?
         .iter()
         .map(|k| String::from_utf8_lossy(&k[prefix.len()..]).into_owned())
@@ -230,7 +143,7 @@ pub async fn roles_of(sess: &Session, user: &str) -> Result<Vec<String>> {
 
 /// A principal's own global privilege (`Read` if unknown).
 async fn own_privilege(sess: &Session, name: &str) -> Result<Privilege> {
-    Ok(auth_get(sess, user_key(name))
+    Ok(crate::schemacache::get(sess, user_key(name))
         .await?
         .and_then(|b| decode_user(&b))
         .map(|r| r.privilege)
@@ -251,13 +164,15 @@ pub async fn effective_global(sess: &Session, user: &str) -> Result<Privilege> {
 /// Per-table grants are now stored as a 4-byte flag set; a 1-byte value is a
 /// legacy tier encoding.
 async fn own_table_grant(sess: &Session, name: &str, table: &str) -> Result<Privilege> {
-    Ok(match auth_get(sess, table_grant_key(name, table)).await? {
-        Some(b) if b.len() == 4 => {
-            elyra_core::users::tier_from_privset(elyra_core::users::decode_privset(&b))
-        }
-        Some(b) => decode_privilege(&b).unwrap_or(Privilege::Read),
-        None => Privilege::Read,
-    })
+    Ok(
+        match crate::schemacache::get(sess, table_grant_key(name, table)).await? {
+            Some(b) if b.len() == 4 => {
+                elyra_core::users::tier_from_privset(elyra_core::users::decode_privset(&b))
+            }
+            Some(b) => decode_privilege(&b).unwrap_or(Privilege::Read),
+            None => Privilege::Read,
+        },
+    )
 }
 
 /// Effective per-table privilege of `user` on `table`, including roles.
@@ -279,7 +194,7 @@ pub async fn effective_table_grant(sess: &Session, user: &str, table: &str) -> R
 /// A principal's own global privilege flag set (migrating a legacy account that
 /// only stored a coarse tier).
 async fn own_global_privset(sess: &Session, name: &str) -> Result<u32> {
-    match auth_get(sess, elyra_core::users::ugrant_key(name)).await? {
+    match crate::schemacache::get(sess, elyra_core::users::ugrant_key(name)).await? {
         Some(b) => Ok(elyra_core::users::decode_privset(&b)),
         None => Ok(elyra_core::users::privset_from_tier(
             own_privilege(sess, name).await?,
@@ -290,7 +205,7 @@ async fn own_global_privset(sess: &Session, name: &str) -> Result<u32> {
 /// A principal's own per-table grant flag set (0 if none). Migrates the legacy
 /// single-byte tier encoding to a flag set.
 async fn own_table_privset(sess: &Session, name: &str, table: &str) -> Result<u32> {
-    match auth_get(sess, table_grant_key(name, table)).await? {
+    match crate::schemacache::get(sess, table_grant_key(name, table)).await? {
         Some(b) if b.len() == 4 => Ok(elyra_core::users::decode_privset(&b)),
         Some(b) => Ok(elyra_core::users::privset_from_tier(
             decode_privilege(&b).unwrap_or(Privilege::Read),

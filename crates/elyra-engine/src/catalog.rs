@@ -469,7 +469,7 @@ pub fn coldecl_key(table: &str) -> Vec<u8> {
 /// metadata. Missing metadata is deliberately not an error: old catalog files
 /// stay readable and retain their pre-existing storage semantics.
 pub async fn load_declarations(db: &Session, table: &str) -> Result<Option<ColumnDeclarations>> {
-    match db.get(coldecl_key(table)).await? {
+    match crate::schemacache::get(db, coldecl_key(table)).await? {
         Some(bytes) => Ok(bincode::deserialize(&bytes).ok()),
         None => Ok(None),
     }
@@ -478,7 +478,7 @@ pub async fn load_declarations(db: &Session, table: &str) -> Result<Option<Colum
 /// The declared integer widths of `table`, or `None` when the table predates
 /// this metadata (in which case width is not enforced for it).
 pub async fn load_widths(db: &Session, table: &str) -> Result<Option<ColumnWidths>> {
-    match db.get(colwidth_key(table)).await? {
+    match crate::schemacache::get(db, colwidth_key(table)).await? {
         Some(bytes) => Ok(bincode::deserialize(&bytes).ok()),
         None => Ok(None),
     }
@@ -533,7 +533,8 @@ pub async fn load_partspec(db: &Session, table: &str) -> Result<Option<Partition
 
 /// Load a view's stored SELECT text, if it exists.
 pub async fn load_view(db: &Session, name: &str) -> Result<Option<String>> {
-    match db.get(view_key(name)).await? {
+    // Every table reference asks this, usually to learn "not a view".
+    match crate::schemacache::get(db, view_key(name)).await? {
         Some(bytes) => Ok(Some(String::from_utf8_lossy(&bytes).into_owned())),
         None => Ok(None),
     }
@@ -751,28 +752,15 @@ pub async fn load(db: &Session, table: &str) -> Result<TableDef> {
 
 /// List all user table names (excluding internal temp relations), sorted.
 pub async fn list_tables(db: &Session) -> Result<Vec<String>> {
-    let prefix = b"catalog::".to_vec();
-    let mut names = Vec::new();
-    let mut cursor: Option<Vec<u8>> = None;
-    loop {
-        let batch = db.scan_batch(prefix.clone(), cursor.clone(), 4096).await?;
-        if batch.is_empty() {
-            break;
-        }
-        cursor = batch.last().map(|(k, _)| k.clone());
-        let last = batch.len() < 4096;
-        for (k, _) in &batch {
-            if let Some(rest) = k.strip_prefix(prefix.as_slice()) {
-                let name = String::from_utf8_lossy(rest).into_owned();
-                if !name.starts_with("__cte_") {
-                    names.push(name);
-                }
-            }
-        }
-        if last {
-            break;
-        }
-    }
+    // UPDATE and DELETE call this to find the foreign keys that point at their
+    // table; it used to scan every table definition each time.
+    let prefix = b"catalog::";
+    let mut names: Vec<String> = crate::schemacache::keys(db, prefix)
+        .await?
+        .iter()
+        .map(|k| String::from_utf8_lossy(&k[prefix.len()..]).into_owned())
+        .filter(|name| !name.starts_with("__cte_"))
+        .collect();
     names.sort();
     Ok(names)
 }

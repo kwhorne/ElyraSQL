@@ -100,6 +100,17 @@ All notable changes to ElyraSQL are documented here. The format is based on
   with zone maps off. It now names `, primary-key range`, `, zone maps` or
   `, columnar cache` only when that is what will run.
 
+- **Statements no longer re-read the schema.** A point `SELECT` read its
+  table's view record twice to learn it was not a view; an `INSERT` or
+  `UPDATE` read the table's declared column widths; and every `UPDATE` and
+  `DELETE` listed *every* table definition in the database to find foreign
+  keys pointing at its own, so it slowed down with the number of tables. These
+  reads now go through one cache of committed schema reads, checked against
+  the storage layer's schema generation (the same one that keeps replicas
+  correct), and the referencing-table lookup is cached per table. A point
+  `SELECT` reads only its row: 73 -> 45 µs of server CPU. With 200 tables, an
+  `UPDATE` by key takes 1.08 ms of CPU instead of 1.63.
+
 - **Privilege checks no longer read storage on every statement.** Every
   `SELECT ... FROM` looked up the user's global privileges and roles -- two
   storage reads, each a hop to a blocking thread, even for an admin -- and
