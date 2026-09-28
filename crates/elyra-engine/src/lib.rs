@@ -432,66 +432,63 @@ impl Engine {
         }))
     }
 
-    /// Enforce per-column SELECT masking: if `user` has column grants on a table
-    /// referenced by a `SELECT`, they may only read those columns. Enforced for
-    /// single-base-table selects; a restricted table used in a more complex
-    /// query (joins/subqueries) is denied (deny-safe).
-    async fn enforce_column_masking(
-        &self,
-        user: &str,
-        stmt: &Statement,
-        sess: &Session,
-    ) -> Result<()> {
-        use sqlparser::ast::{SelectItem, SetExpr, Visit, Visitor};
-        use std::ops::ControlFlow;
+    /// Authorize every table `stmt` reads rows from, for `user`.
+    ///
+    /// A table is readable with the SELECT privilege. A table on which the user
+    /// has column grants is readable only through the one shape whose columns
+    /// can be verified -- a plain `SELECT` from that single table -- and only
+    /// the granted columns. Every table a statement reads is checked: set
+    /// operations, subqueries, and the source of an `INSERT ... SELECT` or the
+    /// tables of an `UPDATE`/`DELETE`, not only a top-level `SELECT`. The
+    /// column check used to stop at a statement that was not a single
+    /// `SELECT`, so `SELECT secret FROM t UNION SELECT 'x'` and
+    /// `INSERT INTO mine SELECT secret FROM t` read ungranted columns.
+    async fn authorize_reads(&self, user: &str, stmt: &Statement, sess: &Session) -> Result<()> {
+        use sqlparser::ast::{SelectItem, SetExpr};
 
-        #[derive(Default)]
-        struct RelationCollector {
-            tables: Vec<String>,
-        }
-
-        impl Visitor for RelationCollector {
-            type Break = ();
-
-            fn pre_visit_relation(
-                &mut self,
-                relation: &sqlparser::ast::ObjectName,
-            ) -> ControlFlow<Self::Break> {
-                if let Some(table) = object_name_last(relation) {
-                    self.tables.push(table);
-                }
-                ControlFlow::Continue(())
-            }
-        }
-
-        let Statement::Query(q) = stmt else {
+        let tables = read_relations(stmt);
+        if tables.is_empty() {
             return Ok(());
-        };
-        let SetExpr::Select(select) = q.body.as_ref() else {
-            return Ok(());
-        };
-        // Walk the complete query, including derived tables, scalar subqueries,
-        // CTEs, and set-operation arms. Restricted tables are only accepted in
-        // the directly verifiable single-base-table shape below; every complex
-        // occurrence is denied instead of disappearing from authorization.
-        let mut collector = RelationCollector::default();
-        let _ = q.visit(&mut collector);
-        collector.tables.sort_unstable();
-        collector.tables.dedup();
-        let tables = collector.tables;
-        let simple = select.from.len() == 1
-            && select.from[0].joins.is_empty()
-            && single_base_table(&select.from[0]).is_some()
-            && tables.len() == 1;
+        }
+        let restricted_possible = catalog::colgrants_exist(sess).await;
+        let global_select = users::effective_global_privset(sess, user).await?
+            & elyra_core::users::priv_bits::SELECT
+            != 0;
         for t in &tables {
-            let Some(granted) = users::column_grants(sess, user, t).await? else {
-                continue; // not column-restricted on this table
+            let granted = if restricted_possible {
+                users::column_grants(sess, user, t).await?
+            } else {
+                None
             };
-            if !simple {
+            let Some(granted) = granted else {
+                if !global_select {
+                    return Err(Error::Query(format!(
+                        "access denied: SELECT command denied to user '{user}'"
+                    )));
+                }
+                continue;
+            };
+            // Column-restricted: only a plain single-table SELECT can be verified.
+            let simple = match stmt {
+                Statement::Query(q) => match q.body.as_ref() {
+                    SetExpr::Select(select) => {
+                        select.from.len() == 1
+                            && select.from[0].joins.is_empty()
+                            && single_base_table(&select.from[0]).is_some()
+                            && tables.len() == 1
+                    }
+                    _ => false,
+                },
+                _ => false,
+            };
+            let (Statement::Query(q), true) = (stmt, simple) else {
                 return Err(Error::Query(format!(
                     "access denied: column-restricted table '{t}' cannot be used in this query"
                 )));
-            }
+            };
+            let SetExpr::Select(select) = q.body.as_ref() else {
+                unreachable!("checked above");
+            };
             // Collect referenced columns; a wildcard means all table columns.
             let mut refs: Vec<String> = Vec::new();
             let mut ok = true;
@@ -1549,6 +1546,10 @@ impl Engine {
                 .effective_privilege(privilege, user, &stmt, sess)
                 .await?;
             require_privilege(effective, PrivilegedAction::Statement(need))?;
+            // Every table the statement reads, column grants included.
+            if !user.is_empty() {
+                self.authorize_reads(user, &stmt, sess).await?;
+            }
             // Fine-grained write enforcement: within the write tier, require the
             // *specific* privilege (INSERT/UPDATE/DELETE) on each target table,
             // not merely "some write". Skipped for Admin/open-auth connections
@@ -1603,13 +1604,6 @@ impl Engine {
             let statement_result: Result<QueryResult> = async {
                 for table in &stale_matviews {
                     self.refresh_matview(table, privilege, user, sess).await?;
-                }
-
-                // Per-column masking: a column-restricted user may only read the
-                // columns granted to them on a table. Skipped when no column grants
-                // exist anywhere.
-                if !user.is_empty() && catalog::colgrants_exist(sess).await {
-                    self.enforce_column_masking(user, &stmt, sess).await?;
                 }
 
                 // Pessimistic locking: while another session holds an explicit
@@ -1677,17 +1671,6 @@ impl Engine {
         sess: &Session,
     ) -> Result<Privilege> {
         let need = required_privilege(stmt);
-        if need <= Privilege::Read
-            && !user.is_empty()
-            && matches!(stmt, Statement::Query(query) if query_has_from(query))
-        {
-            let bits = users::effective_global_privset(sess, user).await?;
-            if bits & elyra_core::users::priv_bits::SELECT == 0 {
-                return Err(Error::Query(format!(
-                    "access denied: SELECT command denied to user '{user}'"
-                )));
-            }
-        }
         // Fast path: the connection's own privilege already satisfies the
         // statement. Roles and per-table grants only ever *add* privileges, so
         // no grant lookup (a storage read on every statement) is needed here.
@@ -2724,6 +2707,101 @@ fn single_base_table(twj: &sqlparser::ast::TableWithJoins) -> Option<String> {
         sqlparser::ast::TableFactor::Table { name, .. } => object_name_last(name),
         _ => None,
     }
+}
+
+/// The tables `stmt` reads rows from, by name. Relations in `information_schema`
+/// and the other system schemas are left out; statements that only change
+/// their own targets' definitions read nothing.
+///
+/// The write target of an `UPDATE` or `DELETE` counts as read when the
+/// statement has a `WHERE`, joins, or computes a value (its columns decide
+/// what is written), and an `INSERT` target when `ON DUPLICATE KEY UPDATE` can
+/// copy one of its columns into another. Anything not recognised reads every
+/// relation it mentions (deny-safe).
+fn read_relations(stmt: &Statement) -> Vec<String> {
+    use sqlparser::ast::{Expr, FromTable, ObjectName, Visit, Visitor};
+    use std::ops::ControlFlow;
+
+    #[derive(Default)]
+    struct Relations(Vec<ObjectName>);
+    impl Visitor for Relations {
+        type Break = ();
+        fn pre_visit_relation(&mut self, relation: &ObjectName) -> ControlFlow<()> {
+            self.0.push(relation.clone());
+            ControlFlow::Continue(())
+        }
+    }
+    fn relations<V: Visit>(node: &V) -> Vec<ObjectName> {
+        let mut r = Relations::default();
+        let _ = node.visit(&mut r);
+        r.0
+    }
+
+    let names: Vec<ObjectName> = match stmt {
+        Statement::Insert(ins) => {
+            let mut v = ins.source.as_ref().map(relations).unwrap_or_default();
+            if let Some(on) = &ins.on {
+                v.extend(relations(on));
+                v.push(ins.table_name.clone());
+            }
+            v
+        }
+        Statement::Update {
+            assignments,
+            from,
+            selection,
+            ..
+        } => {
+            let all = relations(stmt);
+            let computes = assignments
+                .iter()
+                .any(|a| !matches!(a.value, Expr::Value(_)));
+            if selection.is_some() || from.is_some() || computes {
+                all
+            } else {
+                // `UPDATE t SET c = <literal>` reads nothing.
+                Vec::new()
+            }
+        }
+        Statement::Delete(del) => {
+            let joined = match &del.from {
+                FromTable::WithFromKeyword(v) | FromTable::WithoutKeyword(v) => {
+                    v.len() > 1 || v.iter().any(|t| !t.joins.is_empty())
+                }
+            };
+            if del.selection.is_some()
+                || del.using.is_some()
+                || !del.tables.is_empty()
+                || joined
+                || !del.order_by.is_empty()
+            {
+                relations(stmt)
+            } else {
+                Vec::new()
+            }
+        }
+        Statement::CreateTable(ct) => ct.query.as_ref().map(relations).unwrap_or_default(),
+        Statement::CreateView { query, .. } => relations(query),
+        Statement::Explain { statement, .. } => return read_relations(statement),
+        Statement::Drop { .. }
+        | Statement::Truncate { .. }
+        | Statement::AlterTable { .. }
+        | Statement::CreateIndex(_) => Vec::new(),
+        _ => relations(stmt),
+    };
+    let mut tables: Vec<String> = names
+        .iter()
+        .filter(|name| {
+            !(name.0.len() > 1
+                && ["information_schema", "performance_schema", "mysql", "sys"]
+                    .iter()
+                    .any(|s| name.0[0].value.eq_ignore_ascii_case(s)))
+        })
+        .filter_map(object_name_last)
+        .collect();
+    tables.sort_unstable();
+    tables.dedup();
+    tables
 }
 
 /// The base tables a write/DDL statement targets (that must satisfy its

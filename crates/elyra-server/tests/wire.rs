@@ -11394,6 +11394,59 @@ async fn privilege_changes_apply_to_the_next_statement_of_a_reading_connection()
         .is_err());
 }
 
+/// A column grant is checked on every table a statement reads, not only on a
+/// top-level SELECT: a set operation, the source of an INSERT ... SELECT, the
+/// subqueries of an UPDATE or DELETE, and an UPDATE or upsert that copies a
+/// column inside the restricted table all read it. Each of the first four
+/// returned or copied the ungranted column before.
+#[tokio::test]
+async fn column_grants_hold_in_every_statement_that_reads() {
+    let srv = TestServer::start_with_auth("root", "rootpw").await;
+    let mut root = srv.conn_as("root", "rootpw").await;
+    for sql in [
+        "CREATE TABLE reads_vault (id INT PRIMARY KEY, pub TEXT, sec TEXT)",
+        "INSERT INTO reads_vault VALUES (1, 'p', 'classified')",
+        "CREATE TABLE reads_mine (id INT PRIMARY KEY, v TEXT)",
+        "CREATE USER reads_lim IDENTIFIED BY 'passw0rd'",
+        "GRANT SELECT(pub) ON reads_vault TO reads_lim",
+        "GRANT INSERT, UPDATE ON reads_vault TO reads_lim",
+        "GRANT SELECT, INSERT, UPDATE, DELETE ON reads_mine TO reads_lim",
+    ] {
+        root.query_drop(sql).await.unwrap();
+    }
+    let mut lim = srv.conn_as("reads_lim", "passw0rd").await;
+    let public: Option<String> = lim
+        .query_first("SELECT pub FROM reads_vault")
+        .await
+        .unwrap();
+    assert_eq!(public.as_deref(), Some("p"));
+    for sql in [
+        "SELECT sec FROM reads_vault UNION SELECT 'x'",
+        "SELECT 'x' UNION ALL SELECT sec FROM reads_vault",
+        "INSERT INTO reads_mine SELECT id, sec FROM reads_vault",
+        "INSERT INTO reads_mine (id, v) SELECT 5, (SELECT sec FROM reads_vault WHERE id = 1)",
+        "UPDATE reads_mine SET v = 'x' WHERE id IN (SELECT id FROM reads_vault WHERE sec LIKE 'c%')",
+        "DELETE FROM reads_mine WHERE v IN (SELECT sec FROM reads_vault)",
+        "UPDATE reads_vault SET pub = sec",
+        "INSERT INTO reads_vault (id, pub) VALUES (1, 'x') ON DUPLICATE KEY UPDATE pub = sec",
+    ] {
+        assert!(lim.query_drop(sql).await.is_err(), "allowed: {sql}");
+    }
+    // Nothing reached the user's own table or the public column.
+    let copied: Vec<String> = lim.query("SELECT v FROM reads_mine").await.unwrap();
+    assert!(copied.is_empty(), "{copied:?}");
+    let public: Vec<String> = lim.query("SELECT pub FROM reads_vault").await.unwrap();
+    assert_eq!(public, ["p"]);
+    // The user's own table works as before.
+    for sql in [
+        "INSERT INTO reads_mine VALUES (7, 'plain')",
+        "UPDATE reads_mine SET v = 'y' WHERE id = 7",
+        "DELETE FROM reads_mine WHERE id = 7",
+    ] {
+        lim.query_drop(sql).await.unwrap();
+    }
+}
+
 #[tokio::test]
 async fn derived_table_cannot_bypass_column_grants() {
     let srv = TestServer::start_with_auth("root", "rootpw").await;

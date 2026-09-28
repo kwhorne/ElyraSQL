@@ -8,6 +8,18 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ### Security
 
+- **Column grants hold in every statement that reads, not only a plain
+  `SELECT`.** A user granted `SELECT(pub)` on a table could read its other
+  columns with a set operation (`SELECT sec FROM t UNION SELECT 'x'`), or copy
+  them out with `INSERT INTO mine SELECT sec FROM t`: the column check
+  returned early for any statement that was not a single `SELECT`. Every table
+  a statement reads -- set operations, subqueries, the source of an `INSERT
+  ... SELECT`, the tables of an `UPDATE` or `DELETE`, and a restricted table
+  an `UPDATE` or `ON DUPLICATE KEY UPDATE` would copy within -- is now checked;
+  a column-restricted table is readable only through a plain single-table
+  `SELECT` of granted columns. The SELECT-privilege check also covers those
+  statements now; it used to apply only to a `SELECT ... FROM`.
+
 - **Replicas enforce column grants made after they started, and follow the
   primary's DDL.** A replica applies its primary's writes straight to storage,
   below the SQL session, but the engine's schema caches were invalidated only
