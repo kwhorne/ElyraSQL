@@ -17,6 +17,53 @@ ElyraSQL release builds target **Ubuntu 24.04+** and **Apple Silicon macOS
     done, so an interrupted upgrade simply resumes on the next start. **Take a backup
     first, and note that downgrading to 1.4.x afterwards is not supported.**
 
+!!! warning "Upgrading to 1.12.0 — security fixes and MySQL privileges"
+
+    No on-disk format change; a 1.11.4 database opens in 1.12.0 unchanged.
+
+    **Two security fixes.** Upgrade replicas as well as the primary.
+
+    - **Column grants could be bypassed.** A user granted `SELECT(col)` on a
+      table could read its other columns through a set operation (`... UNION
+      SELECT ...`) or copy them into a table of their own with `INSERT ...
+      SELECT`. Every table a statement reads is now checked; a column-restricted
+      table is readable only through a plain single-table `SELECT`.
+    - **Replicas missed schema and grant changes.** A replica did not enforce a
+      column grant created on the primary after it had last checked for one,
+      and kept serving a table's old definition after `ALTER TABLE`, until it
+      was restarted.
+
+    **Privileges now work as in MySQL.** This can change what existing setups
+    see:
+
+    - **A new account starts with no privileges** (`USAGE`). A script that runs
+      `CREATE USER` and expects the account to read must grant it, e.g.
+      `GRANT SELECT ON *.* TO 'app'` or `GRANT SELECT ON orders TO 'app'`.
+      Accounts created before 1.12.0 keep the read access they had by default;
+      `REVOKE SELECT ON *.* FROM 'app'` brings one in line. Accounts configured
+      at startup (`--user`, `--auth`) keep their configured tier.
+    - **Table and column grants grant read access on their own**, including
+      after `REVOKE SELECT ON *.*`, which used to refuse them.
+    - **An `UPDATE` or `DELETE` with a `WHERE` needs `SELECT` on its table**, as
+      in MySQL. An account granted only `UPDATE` can no longer run `UPDATE t SET
+      ... WHERE ...`; grant it `SELECT` as well.
+    - **`--auth user:pass:write` accounts can write.** They could not `INSERT`,
+      `UPDATE` or `DELETE` at all before.
+
+    **Other changes a client can see:**
+
+    - **`AVG` over an integer column or expression returns `DECIMAL`** with four
+      decimals, as in MySQL, not `DOUBLE`. A client that decodes it strictly as a
+      float (sqlx `f64`, for example) must accept a decimal. `MIN`/`MAX` of an
+      integer expression is `BIGINT` rather than `DECIMAL`.
+    - **The page cache defaults to a quarter of available memory** (the container
+      limit, if lower), not a fixed 1 GiB, so scanning a large table can raise
+      memory use on a shared host. `ELYRASQL_PAGE_CACHE_MB` caps it.
+    - **`EXPLAIN` names only what runs.** `Aggregate: columnar group, zone maps`
+      is now `Aggregate: columnar group`, followed by `, primary-key range`,
+      `, zone maps` or `, columnar cache` when that is what will run. Match the
+      prefix rather than the whole string.
+
 !!! warning "Upgrading to 1.11.4 — security release"
 
     1.11.4 updates rustls to 0.23.45 for **RUSTSEC-2026-0285**. Its TLS 1.3
@@ -413,8 +460,8 @@ macOS).
 Multi-arch image (`amd64` + `arm64`) on the GitHub Container Registry:
 
 ```bash
-docker pull ghcr.io/kwhorne/elyrasql:1.11.4   # or :latest
-docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.11.4
+docker pull ghcr.io/kwhorne/elyrasql:1.12.0   # or :latest
+docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.12.0
 ```
 
 The image is ~15 MB, runs as a non-root user, stores data in the

@@ -6,6 +6,8 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.12.0] - 2026-09-28
+
 ### Security
 
 - **Column grants hold in every statement that reads, not only a plain
