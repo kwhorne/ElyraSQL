@@ -78,6 +78,18 @@ All notable changes to ElyraSQL are documented here. The format is based on
   with zone maps off. It now names `, primary-key range`, `, zone maps` or
   `, columnar cache` only when that is what will run.
 
+- **Privilege checks no longer read storage on every statement.** Every
+  `SELECT ... FROM` looked up the user's global privileges and roles -- two
+  storage reads, each a hop to a blocking thread, even for an admin -- and
+  every write by a non-admin user its table grants as well. Those reads are
+  now cached, tagged with a generation of the `sys::` keyspace that the
+  storage layer bumps after every commit touching an account, grant or role,
+  on every path (sessions, replicas, cluster followers). A `GRANT` or
+  `REVOKE` therefore applies to the very next statement of every connection,
+  as before; inside a transaction reads still go through the transaction. A
+  point query now costs 73 µs of server CPU instead of 112, and 8 clients
+  reach 40,400 queries/s instead of 31,600.
+
 - **`LOAD DATA INFILE` is 2.4x faster.** It turned the file into `INSERT`
   statements as SQL text, 50,000 rows each, and handed that text back to the
   SQL parser -- which spent more time tokenising the file than the insert spent

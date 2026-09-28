@@ -11326,6 +11326,74 @@ async fn revoked_select_user_connects_but_cannot_read_tables() {
         .is_err());
 }
 
+/// Privilege checks read through a cache; every change must still take effect
+/// on the very next statement of a connection that has been reading all along
+/// (and so has the old answer cached): a global revoke and re-grant, a role
+/// granted and taken away, and a table grant.
+#[tokio::test]
+async fn privilege_changes_apply_to_the_next_statement_of_a_reading_connection() {
+    let srv = TestServer::start_with_auth("root", "rootpw").await;
+    let mut root = srv.conn_as("root", "rootpw").await;
+    for sql in [
+        "CREATE TABLE cached_grants (id INT PRIMARY KEY)",
+        "INSERT INTO cached_grants VALUES (1)",
+        "CREATE USER cache_reader IDENTIFIED BY 'passw0rd'",
+        "GRANT SELECT ON *.* TO cache_reader",
+    ] {
+        root.query_drop(sql).await.unwrap();
+    }
+    let mut reader = srv.conn_as("cache_reader", "passw0rd").await;
+    let read = "SELECT id FROM cached_grants";
+    for _ in 0..3 {
+        reader.query_drop(read).await.unwrap();
+    }
+
+    root.query_drop("REVOKE SELECT ON *.* FROM cache_reader")
+        .await
+        .unwrap();
+    assert!(reader.query_drop(read).await.is_err(), "revoke not applied");
+    root.query_drop("GRANT SELECT ON *.* TO cache_reader")
+        .await
+        .unwrap();
+    reader.query_drop(read).await.unwrap();
+
+    // Through a role.
+    root.query_drop("REVOKE SELECT ON *.* FROM cache_reader")
+        .await
+        .unwrap();
+    assert!(reader.query_drop(read).await.is_err());
+    for sql in [
+        "CREATE ROLE cache_readers",
+        "GRANT SELECT ON *.* TO cache_readers",
+        "GRANT cache_readers TO cache_reader",
+    ] {
+        root.query_drop(sql).await.unwrap();
+    }
+    reader.query_drop(read).await.unwrap();
+    root.query_drop("REVOKE cache_readers FROM cache_reader")
+        .await
+        .unwrap();
+    assert!(
+        reader.query_drop(read).await.is_err(),
+        "role revoke not applied"
+    );
+
+    // A table grant for a write.
+    let write = "INSERT INTO cached_grants VALUES (2)";
+    assert!(reader.query_drop(write).await.is_err());
+    root.query_drop("GRANT SELECT, INSERT ON cached_grants TO cache_reader")
+        .await
+        .unwrap();
+    reader.query_drop(write).await.unwrap();
+    root.query_drop("REVOKE INSERT ON cached_grants FROM cache_reader")
+        .await
+        .unwrap();
+    assert!(reader
+        .query_drop("INSERT INTO cached_grants VALUES (3)")
+        .await
+        .is_err());
+}
+
 #[tokio::test]
 async fn derived_table_cannot_bypass_column_grants() {
     let srv = TestServer::start_with_auth("root", "rootpw").await;
