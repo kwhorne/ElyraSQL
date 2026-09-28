@@ -66,6 +66,18 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ### Changed
 
+- **Privileges work as in MySQL: new accounts start with none, and reads need
+  a grant.** A new account (`CREATE USER`, `CREATE ROLE`) could read every
+  table; it now starts with `USAGE` only, as in MySQL. Reads are checked per
+  table: `SELECT` granted globally or on the table reads it, column grants read
+  those columns, and a table grant reads its table even after a global `REVOKE
+  SELECT` -- which used to refuse it, as it did a column grant. An `UPDATE` or
+  `DELETE` with a `WHERE` needs `SELECT` on its table, as in MySQL. A matrix of
+  eight accounts by seven statements gives MySQL 8.4's answers exactly. Accounts
+  created before this keep the global `SELECT` they had by default (`REVOKE
+  SELECT ON *.* FROM u` aligns one); accounts configured at startup keep their
+  configured tier.
+
 - **`AVG` over an integer column or expression is `DECIMAL`**, with four
   decimals, as in MySQL: `AVG(a)` over `(10, 21, 2^53+1, 1)` is
   `2251799813685256.2500`. It was declared `DOUBLE`, which discarded the exact

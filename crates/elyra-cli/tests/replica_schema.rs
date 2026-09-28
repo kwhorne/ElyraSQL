@@ -93,6 +93,8 @@ async fn a_replica_follows_ddl_and_grants_made_after_it_looked() {
         "CREATE TABLE rt (id INT PRIMARY KEY, public TEXT, secret TEXT)",
         "INSERT INTO rt VALUES (1, 'hello', 'classified')",
         "CREATE USER lim IDENTIFIED BY 'passw0rd'",
+        // Everything readable, until the column grant below restricts `rt`.
+        "GRANT SELECT ON *.* TO lim",
     ] {
         p.query_drop(sql).await.unwrap();
     }

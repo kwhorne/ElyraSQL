@@ -10336,6 +10336,12 @@ async fn grant_and_revoke_reject_unselected_database_qualifiers() {
         root.query_drop(format!("CREATE USER '{user}' IDENTIFIED BY 'passw0rd'"))
             .await
             .unwrap();
+        // Reading is not what this is about: an UPDATE with a WHERE needs SELECT
+        // as well (as in MySQL), so give it to every user and leave UPDATE as
+        // the one privilege the qualifiers decide.
+        root.query_drop(format!("GRANT SELECT ON *.* TO '{user}'"))
+            .await
+            .unwrap();
     }
 
     for sql in [
@@ -11442,6 +11448,99 @@ async fn privilege_changes_apply_to_the_next_statement_of_a_reading_connection()
         .query_drop("INSERT INTO cached_grants VALUES (3)")
         .await
         .is_err());
+}
+
+/// Privileges as MySQL 8.4 has them (the same matrix was run against it): a new
+/// account reads nothing until granted; `SELECT` on a table reads that table
+/// only; column grants read those columns only; `INSERT` alone does not read;
+/// `SELECT` on a table and column grants on it add up; a table grant still reads
+/// after the global `SELECT` is revoked. Statements that touch no table work.
+#[tokio::test]
+async fn new_accounts_have_mysql_privileges() {
+    let srv = TestServer::start_with_auth("root", "rootpw").await;
+    let mut root = srv.conn_as("root", "rootpw").await;
+    for sql in [
+        "CREATE TABLE mp_t (id INT PRIMARY KEY, pub TEXT, sec TEXT)",
+        "INSERT INTO mp_t VALUES (1, 'p', 's')",
+        "CREATE TABLE mp_o (id INT PRIMARY KEY)",
+        "INSERT INTO mp_o VALUES (1)",
+    ] {
+        root.query_drop(sql).await.unwrap();
+    }
+    let probes = [
+        "SELECT pub FROM mp_t",
+        "SELECT sec FROM mp_t",
+        "SELECT * FROM mp_t",
+        "SELECT id FROM mp_o",
+        "INSERT INTO mp_t VALUES (9, 'x', 'y')",
+    ];
+    // (user, grants, which probes succeed)
+    let cases: [(&str, &[&str], [bool; 5]); 7] = [
+        ("mp_fresh", &[], [false, false, false, false, false]),
+        (
+            "mp_table",
+            &["GRANT SELECT ON mp_t TO mp_table"],
+            [true, true, true, false, false],
+        ),
+        (
+            "mp_cols",
+            &["GRANT SELECT (pub) ON mp_t TO mp_cols"],
+            [true, false, false, false, false],
+        ),
+        (
+            "mp_insert",
+            &["GRANT INSERT ON mp_t TO mp_insert"],
+            [false, false, false, false, true],
+        ),
+        (
+            "mp_both",
+            &[
+                "GRANT SELECT (pub) ON mp_t TO mp_both",
+                "GRANT SELECT ON mp_t TO mp_both",
+            ],
+            [true, true, true, false, false],
+        ),
+        (
+            "mp_revoked",
+            &[
+                "GRANT SELECT ON *.* TO mp_revoked",
+                "REVOKE SELECT ON *.* FROM mp_revoked",
+                "GRANT SELECT ON mp_t TO mp_revoked",
+            ],
+            [true, true, true, false, false],
+        ),
+        (
+            "mp_global",
+            &["GRANT SELECT ON *.* TO mp_global"],
+            [true, true, true, true, false],
+        ),
+    ];
+    for (user, grants, expect) in cases {
+        root.query_drop(format!("CREATE USER {user} IDENTIFIED BY 'passw0rd'"))
+            .await
+            .unwrap();
+        for g in grants {
+            root.query_drop(*g).await.unwrap();
+        }
+        let mut c = srv.conn_as(user, "passw0rd").await;
+        for (sql, want) in probes.iter().zip(expect) {
+            let got = c.query_drop(*sql).await.is_ok();
+            assert_eq!(got, want, "{user}: {sql}");
+            if got && sql.starts_with("INSERT") {
+                root.query_drop("DELETE FROM mp_t WHERE id = 9")
+                    .await
+                    .unwrap();
+            }
+        }
+        // No table: always allowed, including a CTE.
+        let one: Option<i64> = c.query_first("SELECT 1").await.unwrap();
+        assert_eq!(one, Some(1));
+        let x: Option<i64> = c
+            .query_first("WITH c AS (SELECT 2 AS x) SELECT x FROM c")
+            .await
+            .unwrap();
+        assert_eq!(x, Some(2), "{user}: CTE");
+    }
 }
 
 /// A column grant is checked on every table a statement reads, not only on a

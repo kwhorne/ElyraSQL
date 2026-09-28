@@ -231,6 +231,16 @@ pub async fn effective_global_privset(sess: &Session, user: &str) -> Result<u32>
     Ok(bits)
 }
 
+/// The privileges `user` holds on `table` through table grants alone --
+/// their own and their roles' -- without the global set.
+pub async fn table_grant_privset(sess: &Session, user: &str, table: &str) -> Result<u32> {
+    let mut bits = own_table_privset(sess, user, table).await?;
+    for role in roles_of(sess, user).await? {
+        bits |= own_table_privset(sess, &role, table).await?;
+    }
+    Ok(bits)
+}
+
 /// Effective privilege flag set of `user` on `table`: their global set unioned
 /// with the per-table grant, both including grants inherited from roles.
 pub async fn effective_table_privset(sess: &Session, user: &str, table: &str) -> Result<u32> {
@@ -278,6 +288,11 @@ pub async fn execute(sql: &str, sess: &Session, privilege: Privilege) -> Result<
             };
             puts.push((user_key(&name), encode_user(&rec)));
             puts.push((role_flag_key(&name), vec![1]));
+            // Like a new user, a new role grants nothing until granted some.
+            puts.push((
+                elyra_core::users::ugrant_key(&name),
+                elyra_core::users::encode_privset(0),
+            ));
             i = j;
             if matches!(toks.get(i), Some(Tok::Sym(','))) {
                 i += 1;
@@ -304,6 +319,7 @@ pub async fn execute(sql: &str, sess: &Session, privilege: Privilege) -> Result<
         while let Some((name, j)) = parse_userspec(&toks, i) {
             deletes.push(user_key(&name));
             deletes.push(role_flag_key(&name));
+            deletes.push(elyra_core::users::ugrant_key(&name));
             i = j;
             if matches!(toks.get(i), Some(Tok::Sym(','))) {
                 i += 1;
@@ -361,8 +377,20 @@ pub async fn execute(sql: &str, sess: &Session, privilege: Privilege) -> Result<
             digest: password_digest(password.as_bytes()),
             privilege: Privilege::Read,
         };
-        sess.commit_write(vec![(user_key(&name), encode_user(&rec))], vec![])
-            .await?;
+        // A new account has no privileges until granted some (MySQL's USAGE):
+        // an explicit empty set. An account created before this has none
+        // stored and keeps the global SELECT that used to be the default.
+        sess.commit_write(
+            vec![
+                (user_key(&name), encode_user(&rec)),
+                (
+                    elyra_core::users::ugrant_key(&name),
+                    elyra_core::users::encode_privset(0),
+                ),
+            ],
+            vec![],
+        )
+        .await?;
         return Ok(QueryResult::Affected(0));
     }
 
@@ -829,6 +857,38 @@ mod auth_cache_tests {
             .unwrap();
         assert_eq!(
             effective_global_privset(&sess, "cache_bob").await.unwrap(),
+            0
+        );
+    }
+
+    /// An account stored before new accounts started without privileges has no
+    /// privilege set; it keeps the global SELECT that was the default then. A
+    /// new account has an explicit empty set.
+    #[tokio::test]
+    async fn an_account_from_before_keeps_reading_a_new_one_does_not() {
+        let engine = crate::Engine::new(elyra_storage::Db::in_memory().unwrap());
+        let sess = engine.session();
+        engine
+            .execute(
+                "CREATE USER cache_new IDENTIFIED BY 'passw0rd'",
+                Privilege::Admin,
+                &sess,
+            )
+            .await
+            .unwrap();
+        let old = UserRecord {
+            digest: password_digest(b"passw0rd"),
+            privilege: Privilege::Read,
+        };
+        sess.commit_write(vec![(user_key("cache_old"), encode_user(&old))], vec![])
+            .await
+            .unwrap();
+        assert_ne!(
+            effective_global_privset(&sess, "cache_old").await.unwrap() & priv_bits::SELECT,
+            0
+        );
+        assert_eq!(
+            effective_global_privset(&sess, "cache_new").await.unwrap(),
             0
         );
     }

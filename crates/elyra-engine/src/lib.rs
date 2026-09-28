@@ -434,10 +434,14 @@ impl Engine {
 
     /// Authorize every table `stmt` reads rows from, for `user`.
     ///
-    /// A table is readable with the SELECT privilege. A table on which the user
-    /// has column grants is readable only through the one shape whose columns
-    /// can be verified -- a plain `SELECT` from that single table -- and only
-    /// the granted columns. Every table a statement reads is checked: set
+    /// As in MySQL, a table is readable with the SELECT privilege globally or
+    /// on that table, or -- for the granted columns -- with column grants on
+    /// it. Column grants restrict unless the user also has SELECT on that
+    /// table itself: with only the global SELECT they still limit what can be
+    /// read, which is how accounts created before new accounts started with
+    /// no privileges use them. A column-restricted table is readable only
+    /// through the one shape whose columns can be verified -- a plain `SELECT`
+    /// from that single table -- and only the granted columns. Every table a statement reads is checked: set
     /// operations, subqueries, and the source of an `INSERT ... SELECT` or the
     /// tables of an `UPDATE`/`DELETE`, not only a top-level `SELECT`. The
     /// column check used to stop at a statement that was not a single
@@ -455,18 +459,30 @@ impl Engine {
             & elyra_core::users::priv_bits::SELECT
             != 0;
         for t in &tables {
-            let granted = if restricted_possible {
+            let table_select = users::table_grant_privset(sess, user, t).await?
+                & elyra_core::users::priv_bits::SELECT
+                != 0;
+            let granted = if restricted_possible && !table_select {
                 users::column_grants(sess, user, t).await?
             } else {
                 None
             };
             let Some(granted) = granted else {
-                if !global_select {
-                    return Err(Error::Query(format!(
-                        "access denied: SELECT command denied to user '{user}'"
-                    )));
+                if global_select || table_select {
+                    continue;
                 }
-                continue;
+                // A name that is no table or view -- a CTE, or a typo the query
+                // will report -- has no privileges to check.
+                let is_relation = crate::schemacache::get(sess, catalog::catalog_key(t))
+                    .await?
+                    .is_some()
+                    || catalog::load_view(sess, t).await?.is_some();
+                if !is_relation {
+                    continue;
+                }
+                return Err(Error::Query(format!(
+                    "access denied: SELECT command denied to user '{user}' for table '{t}'"
+                )));
             };
             // Column-restricted: only a plain single-table SELECT can be verified.
             let simple = match stmt {
@@ -6829,6 +6845,8 @@ mod schema_cache_tests {
         let schema = [
             "CREATE TABLE vault (id INT PRIMARY KEY, public TEXT, secret TEXT)",
             "CREATE USER lim IDENTIFIED BY 'passw0rd'",
+            // Everything readable, until the column grant restricts `vault`.
+            "GRANT SELECT ON *.* TO lim",
         ];
         let primary = Engine::new(elyra_storage::Db::in_memory().unwrap());
         let p = primary.session();

@@ -339,21 +339,23 @@ judge fit before deploying.
   `INSERT`, `UPDATE` and `DELETE` are checked separately, per target table, so a
   user granted only `INSERT` cannot `UPDATE`/`DELETE`, and revoking one write
   privilege leaves the others intact. Grants apply **globally** or **per table**.
-  (Reads are still allowed at the global baseline — see below; DDL such as
+  New accounts start with no privileges, and reads need `SELECT` globally, on
+  the table, or on the columns read, as in MySQL. (DDL such as
   `CREATE`/`DROP`/`ALTER`/`CREATE INDEX` and administrative statements are gated
   at the `ADMIN` tier rather than by their individual `CREATE`/`DROP`/`ALTER`
   privileges.)
   **Roles** are supported: `CREATE ROLE` / `DROP ROLE`, `GRANT <role> TO <user>`
   / `REVOKE <role> FROM <user>`; a user inherits the global and per-table grants
   of every role granted to them. `GRANT ... ON db.*` is accepted and maps to a
-  global grant (single default database). Reads are allowed at the global
-  baseline (table-level `SELECT` is not required for an authenticated user).
+  global grant (single default database).
   **Per-column** SELECT grants are
   enforced (`GRANT SELECT(col, ...) ON t TO u`): a column-restricted user may
   only read those columns of `t` — querying an ungranted column (including via
   `SELECT *` or a `WHERE`/`ORDER BY` reference) is denied. Enforcement covers
-  single-base-table selects; a column-restricted table used in a join or
-  subquery is denied (deny-safe).
+  single-base-table selects; a column-restricted table used in a join,
+  subquery, set operation or `INSERT ... SELECT` is denied (deny-safe).
+  `SHOW TABLES` and `information_schema` still list every table, where MySQL
+  lists only those the account has a privilege on.
 - An optional **audit log** (`--audit-log <path>`) appends one tab-separated
   line per executed statement (`timestamp  conn_id  user  OK|ERR  sql`).
 - **Cluster/replication authentication.** Set `ELYRASQL_CLUSTER_SECRET` (the same

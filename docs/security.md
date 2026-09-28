@@ -88,10 +88,13 @@ work), accounts can be created at runtime and are **persisted in the database
 file**, so they survive restarts:
 
 ```sql
-CREATE USER 'app'@'%' IDENTIFIED BY 's3cret';   -- created read-only
-GRANT SELECT, INSERT, UPDATE, DELETE ON *.* TO 'app';  -- promote to write
+CREATE USER 'app'@'%' IDENTIFIED BY 's3cret';   -- no privileges yet (USAGE)
+GRANT SELECT ON *.* TO 'app';                         -- read every table
+GRANT SELECT, INSERT, UPDATE, DELETE ON *.* TO 'app';  -- read and write
+GRANT SELECT ON orders TO 'report';                   -- one table only
+GRANT SELECT (id, total) ON orders TO 'auditor';      -- two columns only
 GRANT ALL PRIVILEGES ON *.* TO 'admin_user';          -- promote to admin
-REVOKE ALL PRIVILEGES ON *.* FROM 'app';              -- back to read-only
+REVOKE ALL PRIVILEGES ON *.* FROM 'app';              -- back to none
 SET PASSWORD FOR 'app' = 'newsecret';
 SHOW GRANTS FOR 'app';
 DROP USER 'app';
@@ -99,7 +102,18 @@ DROP USER 'app';
 
 Notes and current limitations:
 
-- New accounts start **read-only**; use `GRANT` to raise them.
+- New accounts start with **no privileges** (`USAGE`), as in MySQL: they can
+  connect and run statements that touch no table, and read or write a table
+  only once granted to. Accounts created before 1.12 have no stored privilege
+  set and keep the global `SELECT` that was the default then; `REVOKE SELECT ON
+  *.* FROM 'u'` brings one in line. Accounts configured at startup (`--auth`,
+  `--user`) are governed by their configured tier.
+- **Reads are checked per table**, in every statement that reads -- a `SELECT`
+  and its subqueries and set operations, the source of an `INSERT ... SELECT`,
+  the tables of an `UPDATE` or `DELETE` (including its own table when a `WHERE`
+  or computed value reads it, as in MySQL). A table is readable with `SELECT`
+  granted globally (`*.*`, `db.*`) or on that table, or -- for the granted
+  columns only -- with column grants on it.
 - **Global** grants track the individual privileges granted as a set, so
   `GRANT`/`REVOKE ON *.*` add/remove exactly the named privileges. Revoking one
   privilege no longer collapses the account: e.g. `REVOKE INSERT` from an admin
@@ -110,14 +124,19 @@ Notes and current limitations:
   `UPDATE`/`DELETE`, and revoking one write privilege blocks *only* that action.
   Administrative statements and DDL (`CREATE`/`DROP`/`ALTER`/`CREATE INDEX`,
   triggers, procedures, `BACKUP`, `LOAD DATA`, ...) are gated at the `admin`
-  tier (`GRANT ALL`/`GRANT OPTION`/`SUPER`). Reads are allowed at the baseline
-  for any authenticated user (no table-level `SELECT` grant required).
+  tier (`GRANT ALL`/`GRANT OPTION`/`SUPER`).
 - **Scope:** `GRANT ... ON *.*` (or `db.*`) sets the account's **global**
   privileges; `GRANT ... ON <table>` (or `db.table`) is a **per-table** grant of
   exactly the named privileges on that table only (stored as a privilege set, so
-  `REVOKE ... ON <table>` removes just those). Reads are allowed at the global
-  baseline, so table grants are used to give a read-only account specific write
-  privileges on specific tables. `REVOKE ON <table>` removes a table grant.
+  `REVOKE ... ON <table>` removes just those). `REVOKE ON <table>` removes a
+  table grant.
+- **Column grants** (`GRANT SELECT (a, b) ON t`) allow reading those columns of
+  `t` through a plain single-table `SELECT`; `t` in a join, subquery, set
+  operation or `INSERT ... SELECT` is refused, since which columns it reads
+  there cannot be verified. With `SELECT` on `t` itself as well, `t` is fully
+  readable, as in MySQL. With only a global `SELECT`, column grants still
+  restrict `t` (stricter than MySQL, which would allow every column), because
+  that is how accounts that had read access by default use them.
 - `DROP USER` purges the account's global, per-table, per-column, and role-
   membership grants, so recreating a user with the same name does not inherit
   stale privileges.
@@ -127,7 +146,8 @@ Notes and current limitations:
 - The host part of `'user'@'host'` is accepted but ignored (accounts are
   host-independent).
 - Passwords are stored only as `SHA1(SHA1(password))`.
-- A privilege change takes effect on the account's **next connection**.
+- A privilege change takes effect on the account's **next statement**, on every
+  connection -- replicas included.
 - Managing users requires the **admin** privilege. Creating the first account
   (in an otherwise open/dev server) turns authentication on for subsequent
   connections — keep a bootstrap `--auth` admin so you don't lock yourself out.
