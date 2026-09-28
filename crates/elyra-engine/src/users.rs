@@ -105,8 +105,8 @@ pub fn is_user_stmt(head: &str) -> bool {
 // statement for records that almost never change. The enforcement accessors
 // below read through this cache instead. It holds raw committed reads -- a
 // key's value, or the keys under a prefix, including "absent" -- tagged with
-// the storage layer's `sys::` generation, which is bumped after every commit
-// that touches a `sys::` key on any path (sessions, replicas, cluster
+// the storage layer's schema generation, which is bumped after every commit
+// that touches a schema key (accounts and grants among them) on any path (sessions, replicas, cluster
 // followers). So an entry is served only while no account, grant or role has
 // changed since it was read, and the logic above it is unchanged. Inside a
 // transaction reads go to the session as before, so its own uncommitted
@@ -154,7 +154,7 @@ async fn auth_get(sess: &Session, key: Vec<u8>) -> Result<Option<Vec<u8>>> {
     }
     // Load the generation before reading: a commit this read might miss bumps
     // it afterwards, so the entry is never served for the newer state.
-    let generation = elyra_storage::sys_generation();
+    let generation = elyra_storage::schema_generation();
     let ck = (sess.db_id(), 0, key);
     if let Some(AuthRead::Value(v)) = auth_cached(&ck, generation) {
         return Ok(v);
@@ -179,7 +179,7 @@ async fn auth_keys(sess: &Session, prefix: &[u8]) -> Result<Vec<Vec<u8>>> {
     if sess.in_txn() {
         return scan().await;
     }
-    let generation = elyra_storage::sys_generation();
+    let generation = elyra_storage::schema_generation();
     let ck = (sess.db_id(), 1, prefix.to_vec());
     if let Some(AuthRead::Keys(keys)) = auth_cached(&ck, generation) {
         return Ok(keys);

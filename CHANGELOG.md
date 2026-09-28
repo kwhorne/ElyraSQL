@@ -6,6 +6,28 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+### Security
+
+- **Replicas enforce column grants made after they started, and follow the
+  primary's DDL.** A replica applies its primary's writes straight to storage,
+  below the SQL session, but the engine's schema caches were invalidated only
+  by statements run through a session. So on a replica:
+  - a column grant (`GRANT SELECT(public) ON t TO u`) created on the primary
+    after the replica had looked for one was **not enforced**: `u` could read
+    every column of `t` there until the replica was restarted;
+  - after an `ALTER TABLE` on the primary, the replica kept serving the old
+    definition (a new column was "unknown");
+  - a trigger created on the primary was missing from the replica's cache, so
+    a cluster follower promoted to leader could write without it.
+
+  The storage layer now keeps a schema generation, bumped after every commit
+  that touches a schema key (table definitions, views, accounts, grants, roles,
+  triggers) on every path, and the table-definition, trigger, privilege and
+  feature caches are checked against it. The "do any column grants /
+  materialized views exist" flags are also per database now; they were shared
+  by every database in the process. Verified end to end with a primary and a
+  replica, and by tests that fail on the previous release.
+
 ### Fixed
 
 - **Integer aggregates are exact on every path.** The fast columnar paths --

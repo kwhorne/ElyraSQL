@@ -229,28 +229,42 @@ fn next_wseq() -> u64 {
     WSEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
 }
 
-/// Generation of the `sys::` keyspace -- accounts, grants, roles, triggers,
-/// procedures. Bumped *after* every committed write that touches a `sys::`
-/// key, and whenever a database is opened, so a cache of those keys tagged
-/// with the generation it was read at is valid while the generation is
+/// Key prefixes of the schema: table definitions and their declared widths and
+/// storage generations, views, materialized views, accounts, grants, roles,
+/// triggers and procedures. The engine caches what it reads under these.
+pub const SCHEMA_PREFIXES: &[&[u8]] = &[
+    b"sys::",
+    b"catalog::",
+    b"view::",
+    b"matview::",
+    b"coldecl::",
+    b"colwidth::",
+    b"meta::generation::",
+];
+
+/// Generation of the schema keyspace ([`SCHEMA_PREFIXES`]). Bumped *after*
+/// every committed write that touches a schema key, whichever path it came by
+/// -- a session, a replica applying its primary's stream, a cluster follower
+/// -- and whenever a database is opened. A cache of schema reads tagged with
+/// the generation it was read at is therefore valid while the generation is
 /// unchanged. Bumping after the commit is what makes that race-free: a reader
 /// loads the generation before reading, so any commit it might have missed
 /// bumps the generation past the tag. Process-wide, so a database reopened in
 /// the same process (a replica re-bootstrapping) never matches an old tag.
-static SYS_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+static SCHEMA_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-/// The current [`SYS_GEN`] generation.
-pub fn sys_generation() -> u64 {
-    SYS_GEN.load(std::sync::atomic::Ordering::Acquire)
+/// The current [`SCHEMA_GEN`] generation.
+pub fn schema_generation() -> u64 {
+    SCHEMA_GEN.load(std::sync::atomic::Ordering::Acquire)
 }
 
-fn bump_sys_generation() {
-    SYS_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
+fn bump_schema_generation() {
+    SCHEMA_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
 }
 
-/// Whether any key is in the `sys::` keyspace.
-fn touches_sys<'a>(mut keys: impl Iterator<Item = &'a [u8]>) -> bool {
-    keys.any(|k| k.starts_with(b"sys::"))
+/// Whether any key is a schema key.
+fn touches_schema<'a>(mut keys: impl Iterator<Item = &'a [u8]>) -> bool {
+    keys.any(|k| SCHEMA_PREFIXES.iter().any(|p| k.starts_with(p)))
 }
 
 /// Smallest key strictly greater than every key starting with `prefix`
@@ -343,7 +357,7 @@ impl Storage {
         }
         wtx.commit().map_err(|e| Error::Storage(e.to_string()))?;
         // A (re)opened database: nothing cached from another applies.
-        bump_sys_generation();
+        bump_schema_generation();
         Ok(Self {
             db,
             path: Some(pathbuf),
@@ -422,7 +436,7 @@ impl Storage {
         }
         wtx.commit().map_err(|e| Error::Storage(e.to_string()))?;
         // A (re)opened database: nothing cached from another applies.
-        bump_sys_generation();
+        bump_schema_generation();
         Ok(Self {
             db,
             path: None,
@@ -442,8 +456,8 @@ impl Storage {
                 .map_err(|e| Error::Storage(e.to_string()))?;
         }
         wtx.commit().map_err(|e| Error::Storage(e.to_string()))?;
-        if touches_sys(std::iter::once(key)) {
-            bump_sys_generation();
+        if touches_schema(std::iter::once(key)) {
+            bump_schema_generation();
         }
         Ok(())
     }
@@ -500,8 +514,8 @@ impl Storage {
                 .is_some();
         }
         wtx.commit().map_err(|e| Error::Storage(e.to_string()))?;
-        if touches_sys(std::iter::once(key)) {
-            bump_sys_generation();
+        if touches_schema(std::iter::once(key)) {
+            bump_schema_generation();
         }
         Ok(existed)
     }
@@ -1038,10 +1052,10 @@ impl Storage {
         }
         wtx.commit().map_err(|e| Error::Storage(e.to_string()))?;
         if jobs.iter().any(|j| {
-            touches_sys(j.puts.iter().map(|(k, _)| k.as_slice()))
-                || touches_sys(j.deletes.iter().map(Vec::as_slice))
+            touches_schema(j.puts.iter().map(|(k, _)| k.as_slice()))
+                || touches_schema(j.deletes.iter().map(Vec::as_slice))
         }) {
-            bump_sys_generation();
+            bump_schema_generation();
         }
         Ok(results)
     }
@@ -1104,10 +1118,10 @@ impl Storage {
                 .map_err(|e| Error::Storage(e.to_string()))?;
         }
         wtx.commit().map_err(|e| Error::Storage(e.to_string()))?;
-        if touches_sys(puts.iter().map(|(k, _)| k.as_slice()))
-            || touches_sys(deletes.iter().map(Vec::as_slice))
+        if touches_schema(puts.iter().map(|(k, _)| k.as_slice()))
+            || touches_schema(deletes.iter().map(Vec::as_slice))
         {
-            bump_sys_generation();
+            bump_schema_generation();
         }
         Ok(())
     }
@@ -1135,10 +1149,10 @@ impl Storage {
                 .map_err(|e| Error::Storage(e.to_string()))?;
         }
         wtx.commit().map_err(|e| Error::Storage(e.to_string()))?;
-        if touches_sys(puts.iter().map(|(k, _)| k.as_slice()))
-            || touches_sys(deletes.iter().map(Vec::as_slice))
+        if touches_schema(puts.iter().map(|(k, _)| k.as_slice()))
+            || touches_schema(deletes.iter().map(Vec::as_slice))
         {
-            bump_sys_generation();
+            bump_schema_generation();
         }
         Ok(())
     }
@@ -1183,10 +1197,10 @@ impl Storage {
                 .map_err(|e| Error::Storage(e.to_string()))?;
         }
         wtx.commit().map_err(|e| Error::Storage(e.to_string()))?;
-        if touches_sys(new.iter().chain(aux).map(|(k, _)| k.as_slice()))
-            || touches_sys(deletes.iter().map(Vec::as_slice))
+        if touches_schema(new.iter().chain(aux).map(|(k, _)| k.as_slice()))
+            || touches_schema(deletes.iter().map(Vec::as_slice))
         {
-            bump_sys_generation();
+            bump_schema_generation();
         }
         Ok(())
     }
@@ -1205,11 +1219,11 @@ impl Storage {
 mod tests {
     use super::*;
 
-    /// Every write path that commits a `sys::` key moves the generation on,
+    /// Every write path that commits a schema key moves the generation on,
     /// after the commit. (Other tests run concurrently and may bump it too, so
     /// only "moved on" is asserted here; which keys count is tested below.)
     #[test]
-    fn sys_writes_on_every_path_bump_the_generation() {
+    fn schema_writes_on_every_path_bump_the_generation() {
         let s = Storage::in_memory().unwrap();
         let k = b"sys::ugrant::alice".to_vec();
         let v = 7u32.to_le_bytes().to_vec();
@@ -1227,11 +1241,11 @@ mod tests {
             },
         ];
         for (i, write) in paths.iter().enumerate() {
-            let before = sys_generation();
+            let before = schema_generation();
             write();
-            assert!(sys_generation() > before, "path {i} did not bump");
+            assert!(schema_generation() > before, "path {i} did not bump");
         }
-        let before = sys_generation();
+        let before = schema_generation();
         let job = ValidatedCommit {
             keys: &[],
             ranges: &[],
@@ -1239,16 +1253,32 @@ mod tests {
             deletes: &[],
         };
         s.apply_validated_batch(&[job]).unwrap();
-        assert!(sys_generation() > before, "validated batch did not bump");
+        assert!(schema_generation() > before, "validated batch did not bump");
     }
 
     #[test]
-    fn only_sys_keys_count() {
-        let keys: [&[u8]; 3] = [b"data::t::1", b"catalog::t", b"meta::wseq"];
-        assert!(!touches_sys(keys.iter().copied()));
-        assert!(touches_sys(
-            [&b"data::t::1"[..], b"sys::user::bob"].into_iter()
-        ));
+    fn only_schema_keys_count() {
+        let data: [&[u8]; 4] = [
+            b"data::t::1",
+            b"meta::wseq",
+            b"meta::wcount::t",
+            b"stats::t",
+        ];
+        assert!(!touches_schema(data.iter().copied()));
+        for key in [
+            &b"sys::user::bob"[..],
+            b"catalog::t",
+            b"view::v",
+            b"matview::m",
+            b"coldecl::t",
+            b"colwidth::t",
+            b"meta::generation::t",
+        ] {
+            assert!(
+                touches_schema([&b"data::t::1"[..], key].into_iter()),
+                "{key:?}"
+            );
+        }
     }
 
     #[test]

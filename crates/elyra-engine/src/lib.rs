@@ -6666,3 +6666,148 @@ mod load_data_engine_tests {
         assert!(err.to_string().contains("Duplicate entry"), "{err}");
     }
 }
+
+#[cfg(test)]
+mod schema_cache_tests {
+    use super::{Engine, Privilege, QueryResult};
+
+    async fn columns(engine: &Engine, s: &crate::Session, sql: &str) -> usize {
+        match engine
+            .execute(sql, Privilege::Admin, s)
+            .await
+            .unwrap()
+            .remove(0)
+        {
+            QueryResult::Rows(stream) => stream.schema.columns.len(),
+            _ => panic!("expected rows"),
+        }
+    }
+
+    /// A replica applies the primary's DDL straight to storage, below the
+    /// session. The cached table definition must not outlive it.
+    #[tokio::test]
+    async fn ddl_written_below_the_session_replaces_the_cached_definition() {
+        // The table with a second column, as the primary would have it. Built
+        // first: its CREATE bumps the engine's own epoch, which would hide the
+        // bug this test is for.
+        let other = Engine::new(elyra_storage::Db::in_memory().unwrap());
+        let o = other.session();
+        other
+            .execute(
+                "CREATE TABLE rt (a INT PRIMARY KEY, b INT)",
+                Privilege::Admin,
+                &o,
+            )
+            .await
+            .unwrap();
+        let key = crate::catalog::catalog_key("rt");
+        let def = o.raw_db().get(key.clone()).await.unwrap().unwrap();
+
+        let engine = Engine::new(elyra_storage::Db::in_memory().unwrap());
+        let s = engine.session();
+        engine
+            .execute("CREATE TABLE rt (a INT PRIMARY KEY)", Privilege::Admin, &s)
+            .await
+            .unwrap();
+        assert_eq!(columns(&engine, &s, "SELECT * FROM rt").await, 1);
+
+        s.raw_db().commit(vec![(key, def)], vec![]).await.unwrap();
+        assert_eq!(columns(&engine, &s, "SELECT * FROM rt").await, 2);
+    }
+
+    /// Copy `keys` from `from`'s storage into `to`'s the way a replica applies
+    /// its primary's writes: straight to storage, below every session.
+    async fn replicate(from: &crate::Session, to: &crate::Session, prefix: &[u8]) {
+        let pairs = from
+            .raw_db()
+            .scan_batch(prefix.to_vec(), None, 4096)
+            .await
+            .unwrap();
+        assert!(!pairs.is_empty(), "nothing under {prefix:?}");
+        to.raw_db().commit(pairs, vec![]).await.unwrap();
+    }
+
+    async fn setup(engine: &Engine, s: &crate::Session, sqls: &[&str]) {
+        for sql in sqls {
+            engine.execute(sql, Privilege::Admin, s).await.unwrap();
+        }
+    }
+
+    /// A column grant that arrives below the session must be enforced: this
+    /// was a replica reading every column for a column-restricted user, when
+    /// the replica had already looked and found no column grants.
+    #[tokio::test]
+    async fn a_column_grant_written_below_the_session_is_enforced() {
+        let schema = [
+            "CREATE TABLE vault (id INT PRIMARY KEY, public TEXT, secret TEXT)",
+            "CREATE USER lim IDENTIFIED BY 'passw0rd'",
+        ];
+        let primary = Engine::new(elyra_storage::Db::in_memory().unwrap());
+        let p = primary.session();
+        setup(&primary, &p, &schema).await;
+        setup(&primary, &p, &["GRANT SELECT(public) ON vault TO lim"]).await;
+
+        let replica = Engine::new(elyra_storage::Db::in_memory().unwrap());
+        let r = replica.session();
+        setup(&replica, &r, &schema).await;
+        setup(
+            &replica,
+            &r,
+            &["INSERT INTO vault VALUES (1, 'hello', 'classified')"],
+        )
+        .await;
+        let as_lim = |sql: &'static str| {
+            let replica = &replica;
+            let r = &r;
+            async move { replica.execute_as(sql, Privilege::Read, "lim", r).await }
+        };
+        // The replica looks, and there is no column grant yet.
+        as_lim("SELECT secret FROM vault").await.unwrap();
+
+        replicate(&p, &r, b"sys::colgrant::").await;
+        as_lim("SELECT public FROM vault").await.unwrap();
+        assert!(
+            as_lim("SELECT secret FROM vault").await.is_err(),
+            "a replicated column grant was not enforced"
+        );
+    }
+
+    /// A trigger that arrives below the session fires: a cluster follower that
+    /// becomes the leader must write with its primary's triggers, not the set it
+    /// had cached before.
+    #[tokio::test]
+    async fn a_trigger_written_below_the_session_fires() {
+        let schema = [
+            "CREATE TABLE tt (id INT PRIMARY KEY)",
+            "CREATE TABLE tt_audit (id INT)",
+        ];
+        let primary = Engine::new(elyra_storage::Db::in_memory().unwrap());
+        let p = primary.session();
+        setup(&primary, &p, &schema).await;
+        setup(
+            &primary,
+            &p,
+            &["CREATE TRIGGER tt_t AFTER INSERT ON tt FOR EACH ROW INSERT INTO tt_audit VALUES (NEW.id)"],
+        )
+        .await;
+
+        let follower = Engine::new(elyra_storage::Db::in_memory().unwrap());
+        let f = follower.session();
+        setup(&follower, &f, &schema).await;
+        setup(&follower, &f, &["INSERT INTO tt VALUES (1)"]).await; // caches "no triggers"
+        replicate(&p, &f, b"sys::trigger::").await;
+        setup(&follower, &f, &["INSERT INTO tt VALUES (2)"]).await;
+        match follower
+            .execute("SELECT COUNT(*) FROM tt_audit", Privilege::Admin, &f)
+            .await
+            .unwrap()
+            .remove(0)
+        {
+            QueryResult::Rows(mut stream) => {
+                let row = stream.next_batch(1).await.unwrap().remove(0);
+                assert_eq!(row[0].to_wire_string().unwrap(), "1");
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+}

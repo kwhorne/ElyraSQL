@@ -332,7 +332,7 @@ pub fn trigname_key(name: &str) -> Vec<u8> {
 
 /// Load all triggers defined on `table`.
 pub async fn load_triggers(db: &Session, table: &str) -> Result<Vec<TriggerDef>> {
-    let epoch = CATALOG_EPOCH.load(Ordering::Acquire);
+    let epoch = cache_tag();
     let cache_key = (db.db_id(), table.to_ascii_lowercase());
     if !db.in_txn() {
         if let Some((cached_epoch, triggers)) = trigger_cache().read().unwrap().get(&cache_key) {
@@ -358,11 +358,13 @@ pub async fn load_triggers(db: &Session, table: &str) -> Result<Vec<TriggerDef>>
 
 #[allow(clippy::type_complexity)]
 fn trigger_cache() -> &'static std::sync::RwLock<
-    std::collections::HashMap<(u64, String), (u64, std::sync::Arc<Vec<TriggerDef>>)>,
+    std::collections::HashMap<(u64, String), (CacheTag, std::sync::Arc<Vec<TriggerDef>>)>,
 > {
     use std::sync::{OnceLock, RwLock};
     static CACHE: OnceLock<
-        RwLock<std::collections::HashMap<(u64, String), (u64, std::sync::Arc<Vec<TriggerDef>>)>>,
+        RwLock<
+            std::collections::HashMap<(u64, String), (CacheTag, std::sync::Arc<Vec<TriggerDef>>)>,
+        >,
     > = OnceLock::new();
     CACHE.get_or_init(|| RwLock::new(std::collections::HashMap::new()))
 }
@@ -596,69 +598,93 @@ pub fn bump_epoch() {
     CATALOG_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
 }
 
-// --- Rarely-used-feature existence flags -------------------------------------
+/// What a cached schema read is tagged with: the engine's catalog epoch and
+/// the storage layer's schema generation, both loaded before the read. The
+/// epoch is bumped by this engine's own writes -- eagerly, so a transaction's
+/// uncommitted DDL is seen. The generation is bumped after the commit of a
+/// schema write by *any* path, including the ones below the session: a
+/// replica applying its primary's stream, a cluster follower. With the epoch
+/// alone, a replica kept serving a table's old definition after the primary's
+/// `ALTER TABLE` until it restarted.
+pub type CacheTag = (u64, u64);
+
+pub fn cache_tag() -> CacheTag {
+    (
+        CATALOG_EPOCH.load(std::sync::atomic::Ordering::Acquire),
+        elyra_storage::schema_generation(),
+    )
+}
+
+// --- Rarely-used-feature existence checks ----------------------------------
 //
 // Materialized-view auto-refresh and per-column masking otherwise cost a
-// storage read on *every* SELECT. These flags let the common path (no matviews,
-// no column grants) skip those reads entirely. They default to `true` (safe:
-// the feature check runs), are corrected once by a lazy startup scan, and are
-// set back to `true` whenever the corresponding key is written.
-use std::sync::atomic::{AtomicBool, Ordering};
-static MATVIEWS_EXIST: AtomicBool = AtomicBool::new(true);
-static COLGRANTS_EXIST: AtomicBool = AtomicBool::new(true);
-static MV_INIT: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
-static CG_INIT: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+// storage read on *every* SELECT. Whether any such key exists is cached per
+// database, tagged with the storage schema generation, so the common path (no
+// matviews, no column grants) skips those reads until a schema write lands.
+//
+// These were process-wide flags, set once by a startup scan and turned on only
+// by writes that went through a session. A replica applies its primary's
+// writes below the session, so a column grant created on the primary after the
+// replica had looked was never enforced there: the restricted user could read
+// every column. They were also shared by every database in the process.
 
-/// Called for every committed write: flip a feature flag on if its key appears.
-pub fn note_feature_writes(puts: &[(Vec<u8>, Vec<u8>)], deletes: &[Vec<u8>]) {
-    let hit = |p: &[u8]| {
-        puts.iter().any(|(k, _)| k.starts_with(p)) || deletes.iter().any(|k| k.starts_with(p))
-    };
-    if hit(b"matview::") {
-        MATVIEWS_EXIST.store(true, Ordering::Release);
-    }
-    if hit(b"sys::colgrant::") {
-        COLGRANTS_EXIST.store(true, Ordering::Release);
-    }
+const FEATURE_MATVIEWS: u8 = 0;
+const FEATURE_COLGRANTS: u8 = 1;
+
+#[allow(clippy::type_complexity)]
+fn feature_cache() -> &'static std::sync::RwLock<std::collections::HashMap<(u64, u8), (u64, bool)>>
+{
+    use std::sync::{OnceLock, RwLock};
+    static C: OnceLock<RwLock<std::collections::HashMap<(u64, u8), (u64, bool)>>> = OnceLock::new();
+    C.get_or_init(|| RwLock::new(std::collections::HashMap::new()))
 }
 
-/// Whether any materialized view exists (lazily scanned once, then cached).
+/// Whether any key under `prefix` exists: committed, or written by this
+/// session's open transaction. A failed scan answers `true`, so the guarded
+/// check runs rather than being skipped.
+async fn feature_exists(sess: &Session, feature: u8, prefix: &[u8]) -> bool {
+    if sess.txn_touches_prefix(prefix) {
+        return true;
+    }
+    let generation = elyra_storage::schema_generation();
+    let key = (sess.db_id(), feature);
+    if let Some((g, exists)) = feature_cache().read().unwrap().get(&key) {
+        if *g == generation {
+            return *exists;
+        }
+    }
+    // Committed state only: a transaction's own writes were checked above, and
+    // an answer that saw them must not be cached for other sessions.
+    let exists = sess
+        .raw_db()
+        .scan_batch(prefix.to_vec(), None, 1)
+        .await
+        .map(|batch| !batch.is_empty())
+        .unwrap_or(true);
+    feature_cache()
+        .write()
+        .unwrap()
+        .insert(key, (generation, exists));
+    exists
+}
+
+/// Whether any materialized view exists.
 pub async fn matviews_exist(sess: &Session) -> bool {
-    MV_INIT
-        .get_or_init(|| async {
-            let any = sess
-                .scan_batch(b"matview::".to_vec(), None, 1)
-                .await
-                .map(|b| !b.is_empty())
-                .unwrap_or(true);
-            MATVIEWS_EXIST.store(any, Ordering::Release);
-        })
-        .await;
-    MATVIEWS_EXIST.load(Ordering::Acquire)
+    feature_exists(sess, FEATURE_MATVIEWS, b"matview::").await
 }
 
-/// Whether any per-column grant exists (lazily scanned once, then cached).
+/// Whether any per-column grant exists.
 pub async fn colgrants_exist(sess: &Session) -> bool {
-    CG_INIT
-        .get_or_init(|| async {
-            let any = sess
-                .scan_batch(b"sys::colgrant::".to_vec(), None, 1)
-                .await
-                .map(|b| !b.is_empty())
-                .unwrap_or(true);
-            COLGRANTS_EXIST.store(any, Ordering::Release);
-        })
-        .await;
-    COLGRANTS_EXIST.load(Ordering::Acquire)
+    feature_exists(sess, FEATURE_COLGRANTS, b"sys::colgrant::").await
 }
 
 #[allow(clippy::type_complexity)]
 fn catalog_cache() -> &'static std::sync::RwLock<
-    std::collections::HashMap<(u64, String), (u64, std::sync::Arc<TableDef>)>,
+    std::collections::HashMap<(u64, String), (CacheTag, std::sync::Arc<TableDef>)>,
 > {
     use std::sync::{OnceLock, RwLock};
     static C: OnceLock<
-        RwLock<std::collections::HashMap<(u64, String), (u64, std::sync::Arc<TableDef>)>>,
+        RwLock<std::collections::HashMap<(u64, String), (CacheTag, std::sync::Arc<TableDef>)>>,
     > = OnceLock::new();
     C.get_or_init(|| RwLock::new(std::collections::HashMap::new()))
 }
@@ -669,7 +695,7 @@ fn catalog_cache() -> &'static std::sync::RwLock<
 /// transaction the definition is always read fresh (through the write overlay),
 /// so uncommitted DDL is visible.
 pub async fn load(db: &Session, table: &str) -> Result<TableDef> {
-    let epoch = CATALOG_EPOCH.load(std::sync::atomic::Ordering::Acquire);
+    let epoch = cache_tag();
     // Key the process-global cache by (database id, table name) so multiple Dbs
     // in one process never serve each other's schema for a same-named table.
     let ckey = (db.db_id(), table.to_string());

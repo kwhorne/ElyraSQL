@@ -632,6 +632,25 @@ impl Session {
         }
     }
 
+    /// Whether this session's open transaction has written or deleted a key
+    /// under `prefix` (false outside a transaction).
+    pub fn txn_touches_prefix(&self, prefix: &[u8]) -> bool {
+        let guard = self.txn.lock().unwrap();
+        let Some(tx) = guard.as_ref() else {
+            return false;
+        };
+        let under = |k: &Vec<u8>| k.starts_with(prefix);
+        tx.puts
+            .range(prefix.to_vec()..)
+            .next()
+            .is_some_and(|(k, _)| under(k))
+            || tx
+                .deletes
+                .range(prefix.to_vec()..)
+                .next()
+                .is_some_and(under)
+    }
+
     pub fn in_txn(&self) -> bool {
         self.txn.lock().unwrap().is_some()
     }
@@ -1080,7 +1099,6 @@ impl Session {
         if catalog_changed {
             crate::catalog::bump_epoch();
         }
-        crate::catalog::note_feature_writes(&puts, &deletes);
         {
             let mut guard = self.txn.lock().unwrap();
             if let Some(tx) = guard.as_mut() {
