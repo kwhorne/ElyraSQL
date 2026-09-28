@@ -102,6 +102,14 @@ pub fn is_user_stmt(head: &str) -> bool {
 // the user's global privileges, and every write by a non-admin user its table
 // grants. GRANT, REVOKE and the other account statements read fresh.
 
+/// Whether `user` is a stored account (created with `CREATE USER`, or a role),
+/// rather than one configured at startup.
+pub async fn is_stored_account(sess: &Session, user: &str) -> Result<bool> {
+    Ok(crate::schemacache::get(sess, user_key(user))
+        .await?
+        .is_some())
+}
+
 /// A user's per-column SELECT grants on `table`. `None` means the user is not
 /// column-restricted on this table (no column grants); `Some(cols)` restricts
 /// reads to exactly those columns.

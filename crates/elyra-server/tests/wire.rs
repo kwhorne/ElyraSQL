@@ -859,6 +859,56 @@ async fn session_setup_statements_need_no_privilege() {
     );
 }
 
+/// An account configured at startup with the `write` tier can write. It has no
+/// stored record, and the per-privilege check found no grants for it and fell
+/// back to read, refusing every INSERT, UPDATE and DELETE. A `read` account is
+/// still refused, and a stored account is still held to its grants.
+#[tokio::test]
+async fn a_configured_write_account_can_write() {
+    let srv = TestServer::start_with_tiers(&[
+        ("admin", "adminpw", elyra_core::Privilege::Admin),
+        ("writer", "writerpw", elyra_core::Privilege::Write),
+        ("reader", "readerpw", elyra_core::Privilege::Read),
+    ])
+    .await;
+    let mut admin = srv.conn_as("admin", "adminpw").await;
+    for sql in [
+        "CREATE TABLE tiered (id INT PRIMARY KEY, v INT)",
+        "CREATE USER stored_reader IDENTIFIED BY 'passw0rd'",
+    ] {
+        admin.query_drop(sql).await.unwrap();
+    }
+
+    let mut writer = srv.conn_as("writer", "writerpw").await;
+    for sql in [
+        "INSERT INTO tiered VALUES (1, 1)",
+        "UPDATE tiered SET v = 2 WHERE id = 1",
+        "INSERT INTO tiered VALUES (2, 2)",
+        "DELETE FROM tiered WHERE id = 2",
+    ] {
+        writer
+            .query_drop(sql)
+            .await
+            .unwrap_or_else(|e| panic!("writer: {sql}: {e:?}"));
+    }
+    let v: Option<i64> = writer
+        .query_first("SELECT v FROM tiered WHERE id = 1")
+        .await
+        .unwrap();
+    assert_eq!(v, Some(2));
+
+    let mut reader = srv.conn_as("reader", "readerpw").await;
+    assert!(reader
+        .query_drop("INSERT INTO tiered VALUES (3, 3)")
+        .await
+        .is_err());
+    let mut stored = srv.conn_as("stored_reader", "passw0rd").await;
+    assert!(stored
+        .query_drop("INSERT INTO tiered VALUES (4, 4)")
+        .await
+        .is_err());
+}
+
 /// Declared integer width is a constraint, not just documentation: storage is
 /// 64-bit for every integer type, so nothing else stops a `TINYINT` holding 300
 /// (ESQL-56). Widths live in a separate catalog key, so a table created before

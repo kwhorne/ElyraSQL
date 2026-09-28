@@ -42,6 +42,13 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ### Fixed
 
+- **An account configured with the `write` tier can write.** `--auth
+  user:pass:write` (and `--user`) accounts have no stored record, and the
+  per-privilege check looked for their grants, found none and fell back to
+  read, so such an account could not `INSERT`, `UPDATE` or `DELETE` anything.
+  A configured account is now governed by its configured tier, as documented;
+  grants apply to stored accounts (`CREATE USER`), which are unchanged.
+
 - **Integer aggregates are exact on every path.** The fast columnar paths --
   used for two or more aggregates, a `GROUP BY` on one numeric column, and the
   opt-in column cache -- carried every numeric column as a double, so past 2^53

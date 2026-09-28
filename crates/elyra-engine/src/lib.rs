@@ -1555,7 +1555,16 @@ impl Engine {
             // not merely "some write". Skipped for Admin/open-auth connections
             // (full access) and for reads/DDL (handled by the tier/Admin gates).
             let need_bits = required_privset(&stmt);
-            if need_bits != 0 && privilege < Privilege::Admin && !user.is_empty() {
+            // Only a stored account (CREATE USER) has grants to check. An account
+            // configured at startup (`--auth user:pass:write`, `--user`) has no
+            // record; its configured tier, already enforced above, is all it
+            // has. Checking it against grants found none and fell back to read,
+            // so a `write` account could not INSERT, UPDATE or DELETE at all.
+            if need_bits != 0
+                && privilege < Privilege::Admin
+                && !user.is_empty()
+                && users::is_stored_account(sess, user).await?
+            {
                 let targets = stmt_targets(&stmt);
                 if targets.is_empty() {
                     let have = users::effective_global_privset(sess, user).await?;
