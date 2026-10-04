@@ -122,6 +122,21 @@ pub enum Error {
     #[error("Can't drop database '{0}'; database doesn't exist")]
     DatabaseMissing(String),
 
+    /// `SELECT ... INTO @a, @b` whose select list has a different number of
+    /// columns. MySQL 1222 (`ER_WRONG_NUMBER_OF_COLUMNS_IN_SELECT`), its text.
+    #[error("The used SELECT statements have a different number of columns")]
+    IntoColumnCount,
+
+    /// `SELECT ... INTO name` where `name` is no declared local (or is used
+    /// outside a procedure). MySQL 1327 (`ER_SP_UNDECLARED_VAR`), its text.
+    #[error("Undeclared variable: {0}")]
+    UndeclaredVariable(String),
+
+    /// `SELECT ... INTO @var` that found more than one row. MySQL 1172
+    /// (`ER_TOO_MANY_ROWS`), with its text.
+    #[error("Result consisted of more than one row")]
+    TooManyRows,
+
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -158,6 +173,9 @@ impl Error {
             Error::ReadOnlyTransaction => 1792, // ER_CANT_EXECUTE_IN_READ_ONLY_TRANSACTION
             Error::TransactionInProgress => 1568, // ER_CANT_CHANGE_TX_CHARACTERISTICS
             Error::DatabaseMissing(_) => 1008, // ER_DB_DROP_EXISTS
+            Error::IntoColumnCount => 1222, // ER_WRONG_NUMBER_OF_COLUMNS_IN_SELECT
+            Error::TooManyRows => 1172,    // ER_TOO_MANY_ROWS
+            Error::UndeclaredVariable(_) => 1327, // ER_SP_UNDECLARED_VAR
             _ => 1105,
         }
     }
@@ -180,6 +198,9 @@ impl Error {
             Error::Duplicate(DuplicateError::ColumnName, _) => b"42S21",
             Error::ReadOnlyTransaction => b"25006",
             Error::TransactionInProgress => b"25001",
+            Error::IntoColumnCount => b"21000",
+            Error::TooManyRows => b"42000",
+            Error::UndeclaredVariable(_) => b"42000",
             _ => b"HY000",
         }
     }

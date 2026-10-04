@@ -8,6 +8,19 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ### Fixed
 
+- **`SELECT ... INTO @var` assigns the variable.** The clause was ignored --
+  the row came back as a result set and the variable stayed NULL -- or, once
+  the variable held a value, the statement failed as a syntax error, since
+  `@var` was replaced by its value before parsing (`INTO 5`). It now works as
+  in MySQL 8.4: after the select list or at the end, into several variables,
+  with no result set; no row leaves the variables unchanged, a second row is
+  error 1172 (after the first is assigned), and a column-count mismatch 1222.
+  In a stored procedure, `SELECT ... INTO` also assigns locals (`DECLARE n
+  INT; SELECT COUNT(*) INTO n FROM t`, which failed the same way), and no row
+  raises `NOT FOUND` for a handler. A `DECIMAL` or `BIGINT UNSIGNED` in a user
+  variable now reads back as a number rather than text (`SET @x = 1.5` gave
+  `'1.5'`).
+
 - **Read-only transactions refuse writes.** `START TRANSACTION READ ONLY` was
   accepted but not enforced: an `INSERT`, `UPDATE` or `DELETE` in it ran, and
   only a later `ROLLBACK` undid it. Every write -- including `REPLACE`, an

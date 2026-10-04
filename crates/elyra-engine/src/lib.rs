@@ -375,6 +375,61 @@ impl Engine {
                         }
                     }
                 }
+                ProcStmt::Sql(s) if split_select_into(s).is_some() => {
+                    // SELECT ... INTO locals and @variables. The targets are cut
+                    // out before locals are substituted: substituting them made
+                    // `INTO n` read `INTO 0`, a syntax error.
+                    let outcome = async {
+                        let (query, targets) = split_select_into(s).expect("checked")?;
+                        for target in &targets {
+                            if let IntoTarget::Local(name) = target {
+                                if !env.contains_key(&name.to_ascii_lowercase()) {
+                                    return Err(Error::UndeclaredVariable(name.clone()));
+                                }
+                            }
+                        }
+                        let query = exec::substitute_vars(&query, env);
+                        let (row, more) = self
+                            .select_into_row(&query, targets.len(), privilege, user, sess)
+                            .await?;
+                        let found = row.is_some();
+                        for (target, value) in targets.iter().zip(row.unwrap_or_default()) {
+                            match target {
+                                IntoTarget::User(name) => sess.set_user_var(name, value),
+                                IntoTarget::Local(name) => {
+                                    env.insert(name.to_ascii_lowercase(), value);
+                                }
+                            }
+                        }
+                        if more {
+                            return Err(Error::TooManyRows);
+                        }
+                        Ok(found)
+                    }
+                    .await;
+                    match outcome {
+                        Ok(true) => {}
+                        // No row: MySQL's NOT FOUND condition, as for FETCH.
+                        Ok(false) => {
+                            if let Some(Flow::Exit) = self
+                                .run_handler(ctx, env, true, privilege, user, sess)
+                                .await?
+                            {
+                                return Ok(Flow::Exit);
+                            }
+                        }
+                        Err(e) => {
+                            match self
+                                .run_handler(ctx, env, false, privilege, user, sess)
+                                .await?
+                            {
+                                Some(Flow::Exit) => return Ok(Flow::Exit),
+                                Some(_) => {}
+                                None => return Err(e),
+                            }
+                        }
+                    }
+                }
                 ProcStmt::Sql(s) => {
                     let sql = exec::substitute_vars(s, env);
                     match Box::pin(self.execute_as(&sql, privilege, user, sess)).await {
@@ -1434,6 +1489,36 @@ impl Engine {
             return Ok(vec![r]); // session/introspection: read-level
         }
 
+        // SELECT ... INTO @var: run the query, assign its row. Recognised before
+        // @user variables are substituted below, which used to turn `INTO @y`
+        // into `INTO <value of @y>` -- a syntax error, or an INTO the parser
+        // took and the engine ignored, returning the row instead.
+        if head.starts_with("select") {
+            if let Some(split) = split_select_into(trimmed) {
+                let (query, targets) = split?;
+                // Outside a procedure only @variables exist, as in MySQL.
+                if let Some(IntoTarget::Local(name)) =
+                    targets.iter().find(|t| matches!(t, IntoTarget::Local(_)))
+                {
+                    return Err(Error::UndeclaredVariable(name.clone()));
+                }
+                let (row, more) = self
+                    .select_into_row(&query, targets.len(), privilege, user, sess)
+                    .await?;
+                if let Some(row) = row {
+                    for (target, value) in targets.iter().zip(row) {
+                        if let IntoTarget::User(name) = target {
+                            sess.set_user_var(name, value);
+                        }
+                    }
+                }
+                if more {
+                    return Err(Error::TooManyRows);
+                }
+                return Ok(vec![QueryResult::empty_ok()]);
+            }
+        }
+
         let dialect = MySqlDialect {};
         // Substitute @user variables (leaving @@system vars) before parsing.
         let mut subst_sql: Cow<'_, str> = if exec::contains_uvar_reference(sql) {
@@ -1551,6 +1636,36 @@ impl Engine {
             dml_limit,
         )
         .await
+    }
+
+    /// Run the query of a `SELECT ... INTO`, as MySQL does: the select list must
+    /// have one column per target (1222, even when no row is found). Returns
+    /// the first row, if any, and whether there was another -- which the
+    /// caller reports as 1172 after assigning the first, as MySQL does. The
+    /// query itself runs as any other, privileges included.
+    async fn select_into_row(
+        &self,
+        query: &str,
+        targets: usize,
+        privilege: Privilege,
+        user: &str,
+        sess: &Session,
+    ) -> Result<(Option<Vec<Value>>, bool)> {
+        let mut results = Box::pin(self.execute_as(query, privilege, user, sess)).await?;
+        let Some(QueryResult::Rows(mut rows)) = results.pop() else {
+            return Err(Error::Query(
+                "SELECT ... INTO: the query returned no rows".into(),
+            ));
+        };
+        if rows.schema.columns.len() != targets {
+            return Err(Error::IntoColumnCount);
+        }
+        let mut found = rows.next_batch(2).await?;
+        if found.is_empty() {
+            return Ok((None, false));
+        }
+        let first = found.remove(0);
+        Ok((Some(first), !found.is_empty()))
     }
 
     /// Run parsed statements: the per-statement privilege checks, session
@@ -2409,6 +2524,75 @@ fn text_statement_writes(head: &str) -> bool {
     ]
     .iter()
     .any(|prefix| head.starts_with(prefix))
+}
+
+/// A target of `SELECT ... INTO`: a session `@variable`, or (inside a stored
+/// procedure) a local.
+#[derive(Debug, Clone, PartialEq)]
+enum IntoTarget {
+    User(String),
+    Local(String),
+}
+
+/// Split `SELECT ... INTO a [, @b ...] ...` into the query without the INTO
+/// clause and its targets. MySQL accepts the clause after the select list or at
+/// the end; either way it is the top-level `INTO`, outside literals, comments
+/// and subqueries. `None` when the statement has no such clause, or it is
+/// `INTO OUTFILE`/`DUMPFILE`.
+fn split_select_into(sql: &str) -> Option<Result<(String, Vec<IntoTarget>)>> {
+    use crate::sqllex::{find_top_level, keyword_at};
+    let sql = sql.trim().trim_end_matches(';').trim_end();
+    if !keyword_at(sql, 0, "select") {
+        return None;
+    }
+    let into = find_top_level(sql, |s, c| keyword_at(s, c.index, "into"))?;
+    let bytes = sql.as_bytes();
+    let skip_ws = |mut i: usize| {
+        while bytes.get(i).is_some_and(u8::is_ascii_whitespace) {
+            i += 1;
+        }
+        i
+    };
+    let ident = |c: &u8| c.is_ascii_alphanumeric() || *c == b'_' || *c == b'$';
+    let mut at = skip_ws(into + "into".len());
+    if keyword_at(sql, at, "outfile") || keyword_at(sql, at, "dumpfile") {
+        return None;
+    }
+    let mut targets = Vec::new();
+    loop {
+        let user = bytes.get(at) == Some(&b'@');
+        if user && bytes.get(at + 1) == Some(&b'@') {
+            return Some(Err(Error::Parse(
+                "SELECT ... INTO: a system variable cannot be a target".into(),
+            )));
+        }
+        let start = if user { at + 1 } else { at };
+        let mut end = start;
+        while bytes
+            .get(end)
+            .is_some_and(|c| ident(c) || (user && *c == b'.'))
+        {
+            end += 1;
+        }
+        if end == start {
+            return Some(Err(Error::Parse(
+                "SELECT ... INTO: expected a variable".into(),
+            )));
+        }
+        let name = sql[start..end].to_string();
+        targets.push(if user {
+            IntoTarget::User(name)
+        } else {
+            IntoTarget::Local(name)
+        });
+        let next = skip_ws(end);
+        if bytes.get(next) == Some(&b',') {
+            at = skip_ws(next + 1);
+            continue;
+        }
+        let query = format!("{} {}", sql[..into].trim_end(), sql[end..].trim_start());
+        return Some(Ok((query.trim().to_string(), targets)));
+    }
 }
 
 fn statement_starts_implicit_transaction(statement: &Statement) -> bool {
@@ -7384,5 +7568,158 @@ mod read_only_transaction_tests {
             "READ-COMMITTED"
         );
         assert_eq!(count(&e, &s).await, "1 1");
+    }
+}
+
+#[cfg(test)]
+mod select_into_tests {
+    use super::{split_select_into, Engine, IntoTarget, Privilege, QueryResult};
+    use elyra_core::Error;
+
+    async fn setup() -> (Engine, crate::Session) {
+        let engine = Engine::new(elyra_storage::Db::in_memory().unwrap());
+        let s = engine.session();
+        for sql in [
+            "CREATE TABLE it (id INT PRIMARY KEY, v INT, s VARCHAR(10))",
+            "INSERT INTO it VALUES (1, 10, 'a'), (2, 20, 'b')",
+        ] {
+            engine.execute(sql, Privilege::Admin, &s).await.unwrap();
+        }
+        (engine, s)
+    }
+
+    async fn run(e: &Engine, s: &crate::Session, sql: &str) -> Vec<QueryResult> {
+        e.execute(sql, Privilege::Admin, s)
+            .await
+            .unwrap_or_else(|err| panic!("{sql}: {err}"))
+    }
+
+    async fn row(e: &Engine, s: &crate::Session, sql: &str) -> Vec<String> {
+        match run(e, s, sql).await.remove(0) {
+            QueryResult::Rows(mut rows) => rows
+                .next_batch(1)
+                .await
+                .unwrap()
+                .remove(0)
+                .iter()
+                .map(|v| v.to_wire_string().unwrap_or_else(|| "NULL".into()))
+                .collect(),
+            _ => panic!("{sql}: expected rows"),
+        }
+    }
+
+    #[test]
+    fn the_into_clause_is_found_where_mysql_accepts_it() {
+        let split = |sql| split_select_into(sql).map(|r| r.unwrap());
+        let user = |n: &str| IntoTarget::User(n.into());
+        assert_eq!(
+            split("SELECT v INTO @y FROM it WHERE id = 1"),
+            Some(("SELECT v FROM it WHERE id = 1".into(), vec![user("y")]))
+        );
+        assert_eq!(
+            split("SELECT v, s FROM it LIMIT 1 INTO @a, @b;"),
+            Some((
+                "SELECT v, s FROM it LIMIT 1".into(),
+                vec![user("a"), user("b")]
+            ))
+        );
+        assert_eq!(
+            split("SELECT COUNT(*) INTO n FROM it"),
+            Some((
+                "SELECT COUNT(*) FROM it".into(),
+                vec![IntoTarget::Local("n".into())]
+            ))
+        );
+        // Not a top-level INTO, or not into variables.
+        for sql in [
+            "SELECT 'x INTO @y' FROM it",
+            "SELECT (SELECT 1) FROM it",
+            "SELECT v FROM it /* INTO @y */",
+            "SELECT v FROM it INTO OUTFILE '/tmp/x'",
+            "INSERT INTO it VALUES (3, 30, 'c')",
+        ] {
+            assert_eq!(split(sql), None, "{sql}");
+        }
+    }
+
+    /// `SELECT ... INTO @var` assigns instead of returning the row. It used to
+    /// be ignored -- the row came back and `@var` stayed NULL -- or, once the
+    /// variable had a value, to fail as a syntax error (`INTO 5`). Rules as in
+    /// MySQL 8.4.
+    #[tokio::test]
+    async fn select_into_assigns_user_variables() {
+        let (e, s) = setup().await;
+        let res = run(&e, &s, "SELECT v INTO @y FROM it WHERE id = 1").await;
+        assert!(
+            matches!(res[..], [QueryResult::Affected(_)]),
+            "no result set"
+        );
+        assert_eq!(row(&e, &s, "SELECT @y").await, ["10"]);
+        // At the end, several variables, and an existing value (once `INTO 10`).
+        run(&e, &s, "SELECT v, s FROM it WHERE id = 2 INTO @y, @t").await;
+        assert_eq!(row(&e, &s, "SELECT @y, @t").await, ["20", "b"]);
+        // An aggregate; the variable is usable afterwards.
+        run(&e, &s, "SELECT MAX(v) INTO @m FROM it").await;
+        assert_eq!(row(&e, &s, "SELECT id FROM it WHERE v = @m").await, ["2"]);
+        // No row: unchanged.
+        run(&e, &s, "SET @y = 5").await;
+        run(&e, &s, "SELECT v INTO @y FROM it WHERE id = 99").await;
+        assert_eq!(row(&e, &s, "SELECT @y").await, ["5"]);
+        // Two rows: 1172, after the first was assigned.
+        let err = e
+            .execute("SELECT v INTO @y FROM it ORDER BY id", Privilege::Admin, &s)
+            .await
+            .err()
+            .expect("two rows into one variable");
+        assert!(matches!(err, Error::TooManyRows));
+        assert_eq!((err.mysql_code(), err.sqlstate()), (1172, b"42000"));
+        assert_eq!(row(&e, &s, "SELECT @y").await, ["10"]);
+        // Column count: 1222, before any row is read.
+        let err = e
+            .execute(
+                "SELECT v, s INTO @a FROM it WHERE id = 99",
+                Privilege::Admin,
+                &s,
+            )
+            .await
+            .err()
+            .expect("two columns into one variable");
+        assert_eq!(err.mysql_code(), 1222);
+        // A bare name outside a procedure.
+        let err = e
+            .execute("SELECT v INTO x FROM it WHERE id = 1", Privilege::Admin, &s)
+            .await
+            .err()
+            .expect("no local outside a procedure");
+        assert_eq!(err.mysql_code(), 1327);
+    }
+
+    /// In a procedure, INTO assigns locals and @variables; no row raises NOT
+    /// FOUND for a handler; a local used to be substituted by its value first
+    /// (`INTO n` read `INTO 0`, a syntax error).
+    #[tokio::test]
+    async fn select_into_works_in_procedures() {
+        let (e, s) = setup().await;
+        for sql in [
+            "CREATE PROCEDURE p_into() BEGIN \
+               DECLARE a INT DEFAULT 0; DECLARE b INT DEFAULT 0; \
+               SELECT id, v INTO a, b FROM it WHERE id = 2; \
+               SELECT id INTO a FROM it WHERE v = b - 10; \
+               SET @out = a + b; END",
+            "CREATE PROCEDURE p_none() BEGIN \
+               DECLARE done INT DEFAULT 0; DECLARE x INT DEFAULT -1; \
+               DECLARE CONTINUE HANDLER FOR NOT FOUND SET done = 1; \
+               SELECT v INTO x FROM it WHERE id = 99; \
+               SET @done = done; SET @x = x; END",
+            "CREATE PROCEDURE p_sum() BEGIN SELECT SUM(v) INTO @total FROM it; END",
+        ] {
+            run(&e, &s, sql).await;
+        }
+        run(&e, &s, "CALL p_into()").await;
+        assert_eq!(row(&e, &s, "SELECT @out").await, ["21"]);
+        run(&e, &s, "CALL p_none()").await;
+        assert_eq!(row(&e, &s, "SELECT @done, @x").await, ["1", "-1"]);
+        run(&e, &s, "CALL p_sum()").await;
+        assert_eq!(row(&e, &s, "SELECT @total").await, ["30"]);
     }
 }

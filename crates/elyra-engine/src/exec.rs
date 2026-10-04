@@ -5359,6 +5359,10 @@ pub(crate) fn value_sql_literal(v: &Value) -> String {
             b.iter().map(|x| format!("{x:02x}")).collect::<String>()
         ),
         Value::Vector(_) => "NULL".into(),
+        // Numbers stay numbers: a DECIMAL (`SUM` of integers, `1.5`) or BIGINT
+        // UNSIGNED in a user variable reads back as one, as in MySQL. Quoted,
+        // they came back as text.
+        Value::Decimal(..) | Value::UInt(_) => v.to_wire_string().unwrap_or_else(|| "NULL".into()),
         other => match other.to_wire_string() {
             Some(s) => format!("'{}'", s.replace('\'', "''")),
             None => "NULL".into(),

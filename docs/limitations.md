@@ -11,7 +11,8 @@ judge fit before deploying.
   `WITH RECURSIVE`), `HAVING`, window functions with explicit `ROWS`/`RANGE`
   frames, set operations, and `FROM`-less `SELECT` are supported.
 - Stored procedures support `IN`/`OUT`/`INOUT` parameters, session `@user`
-  variables (`SET @x = ...`), local variables (`DECLARE`, `SET`), and control
+  variables (`SET @x = ...`), local variables (`DECLARE`, `SET`, `SELECT ...
+  INTO a, @b`, where no row raises `NOT FOUND` for a handler), and control
   flow: `IF`/`ELSEIF`/`ELSE`, `WHILE`, `LOOP`, `REPEAT ... UNTIL`, with labeled
   `LEAVE`/`ITERATE`. `OUT`/`INOUT` arguments must be `@user` variables (written
   back on return). **Cursors** (`DECLARE ... CURSOR FOR`, `OPEN`, `FETCH ...
@@ -21,7 +22,10 @@ judge fit before deploying.
   block), and handlers are scoped to the whole procedure body. **`OPEN` buffers
   the cursor's full result set in memory** (it is not a streaming server-side
   cursor), so cursors are intended for the modest result sets typical of
-  procedural logic, not for iterating huge tables.
+  procedural logic, not for iterating huge tables. **`CALL` returns no result
+  sets**: a `SELECT` in a procedure body runs, but its rows are not sent to the
+  client as MySQL would. Return values through `OUT` parameters, `@variables`
+  or `SELECT ... INTO`.
 - Row-level triggers are supported: `CREATE TRIGGER name {BEFORE|AFTER}
   {INSERT|UPDATE|DELETE} ON t FOR EACH ROW <body>`, with `NEW.col`/`OLD.col`.
   BEFORE bodies support `SET NEW.col = expr`; AFTER bodies run arbitrary DML.
