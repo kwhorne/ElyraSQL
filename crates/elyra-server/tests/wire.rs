@@ -11389,6 +11389,59 @@ async fn revoked_select_user_connects_but_cannot_read_tables() {
         .is_err());
 }
 
+/// `SHOW TABLES` applies its filter and lists views, as MySQL does: `LIKE`
+/// (case-sensitive, as table names are, with the pattern in the column
+/// header), `WHERE` over the columns, and `FULL` with `Table_type`. The filter
+/// was ignored -- `SHOW TABLES LIKE 'nope'` listed every table, so a tool
+/// asking whether a table exists always heard yes -- and views were missing.
+#[tokio::test]
+async fn show_tables_filters_and_lists_views() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    for sql in [
+        "CREATE TABLE st_orders (id INT)",
+        "CREATE TABLE st_order_lines (id INT)",
+        "CREATE TABLE Mixed_Case (id INT)",
+        "CREATE VIEW st_view AS SELECT 1 AS one",
+    ] {
+        c.query_drop(sql).await.unwrap();
+    }
+    let names = |rows: Vec<String>| rows;
+    let all: Vec<String> = c.query("SHOW TABLES").await.unwrap();
+    assert_eq!(
+        names(all),
+        ["Mixed_Case", "st_order_lines", "st_orders", "st_view"]
+    );
+    let exact: Vec<String> = c.query("SHOW TABLES LIKE 'st_orders'").await.unwrap();
+    assert_eq!(exact, ["st_orders"]);
+    let none: Vec<String> = c.query("SHOW TABLES LIKE 'nope'").await.unwrap();
+    assert!(none.is_empty());
+    let case: Vec<String> = c.query("SHOW TABLES LIKE 'mixed_case'").await.unwrap();
+    assert!(case.is_empty(), "table names are case-sensitive");
+    let pattern: Vec<String> = c.query("SHOW TABLES LIKE 'st_v%'").await.unwrap();
+    assert_eq!(pattern, ["st_view"]);
+    let filtered: Vec<String> = c
+        .query("SHOW TABLES WHERE Tables_in_elyra LIKE '%line%'")
+        .await
+        .unwrap();
+    assert_eq!(filtered, ["st_order_lines"]);
+
+    let full: Vec<(String, String)> = c.query("SHOW FULL TABLES").await.unwrap();
+    assert!(full.contains(&("st_orders".into(), "BASE TABLE".into())));
+    assert!(full.contains(&("st_view".into(), "VIEW".into())));
+    let views: Vec<(String, String)> = c
+        .query("SHOW FULL TABLES WHERE Table_type = 'VIEW'")
+        .await
+        .unwrap();
+    assert_eq!(views, [("st_view".to_string(), "VIEW".to_string())]);
+
+    // The column header names the pattern, as MySQL's does.
+    let result = c.query_iter("SHOW TABLES LIKE 'st%'").await.unwrap();
+    let header = result.columns().unwrap()[0].name_str().into_owned();
+    drop(result);
+    assert_eq!(header, "Tables_in_elyra (st%)");
+}
+
 /// Read every result set of a CALL: (columns, rows as text) for each SELECT,
 /// in order.
 async fn call_sets(

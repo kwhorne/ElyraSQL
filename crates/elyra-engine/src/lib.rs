@@ -2100,11 +2100,17 @@ impl Engine {
                 sess.release_savepoint(&name.value)?;
                 Ok(QueryResult::empty_ok())
             }
-            Statement::ShowTables { show_options, .. } => {
+            Statement::ShowTables {
+                full, show_options, ..
+            } => {
                 if let Some(database) = show_options.show_in.and_then(|show| show.parent_name) {
                     exec::selected_database_ident(sess, &database)?;
                 }
-                exec::show_tables(sess).await
+                let filter = show_options.filter_position.map(|position| match position {
+                    sqlparser::ast::ShowStatementFilterPosition::Infix(f)
+                    | sqlparser::ast::ShowStatementFilterPosition::Suffix(f) => f,
+                });
+                exec::show_tables(sess, full, filter.as_ref()).await
             }
             Statement::ShowCreate {
                 obj_type: sqlparser::ast::ShowCreateObject::Table,

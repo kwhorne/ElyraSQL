@@ -834,17 +834,77 @@ pub async fn create_table(
 }
 
 /// SHOW TABLES: one column of user table names.
-pub async fn show_tables(db: &Session) -> Result<QueryResult> {
-    let names = catalog::list_tables(db).await?;
-    let schema = Schema::new(vec![ColumnDef {
-        name: format!("Tables_in_{}", db.database()),
+/// `SHOW [FULL] TABLES [LIKE 'pattern' | WHERE expr]`, as MySQL answers it:
+/// tables and views, with `Table_type` when `FULL`, filtered by the pattern
+/// (case-sensitive, as table names are; the column header then names the
+/// pattern) or by the `WHERE` over those columns. The filter used to be
+/// ignored, so `SHOW TABLES LIKE 'x'` -- how many tools test whether a table
+/// exists -- listed every table; and views were left out.
+pub async fn show_tables(
+    db: &Session,
+    full: bool,
+    filter: Option<&sqlparser::ast::ShowStatementFilter>,
+) -> Result<QueryResult> {
+    use sqlparser::ast::ShowStatementFilter;
+    let mut entries: Vec<(String, &str)> = catalog::list_tables(db)
+        .await?
+        .into_iter()
+        .map(|name| (name, "BASE TABLE"))
+        .collect();
+    let view_prefix = b"view::";
+    for key in crate::schemacache::keys(db, view_prefix).await? {
+        entries.push((
+            String::from_utf8_lossy(&key[view_prefix.len()..]).into_owned(),
+            "VIEW",
+        ));
+    }
+    entries.sort();
+
+    let column = format!("Tables_in_{}", db.database());
+    let header = match filter {
+        Some(ShowStatementFilter::Like(pattern)) => format!("{column} ({pattern})"),
+        _ => column.clone(),
+    };
+    let text_column = |name: String| ColumnDef {
+        name,
         ty: ColumnType::Text,
         nullable: false,
         collation: elyra_core::Collation::Ci,
         qualifier: Vec::new(),
         result_metadata: Default::default(),
-    }]);
-    let rows = names.into_iter().map(|n| vec![Value::Text(n)]).collect();
+    };
+    let mut columns = vec![text_column(header)];
+    if full {
+        columns.push(text_column("Table_type".into()));
+    }
+    let schema = Schema::new(columns);
+    // `WHERE` refers to the columns by their own names.
+    let mut where_columns = vec![text_column(column)];
+    if full {
+        where_columns.push(text_column("Table_type".into()));
+    }
+    let where_schema = Schema::new(where_columns);
+
+    let mut rows = Vec::new();
+    for (name, kind) in entries {
+        let mut row = vec![Value::Text(name.clone())];
+        if full {
+            row.push(Value::Text(kind.into()));
+        }
+        let keep = match filter {
+            None => true,
+            Some(ShowStatementFilter::Like(pattern)) => show_like_case(&name, pattern, true),
+            Some(ShowStatementFilter::Where(expr)) => {
+                crate::predicate::truthy(&crate::predicate::eval_row(expr, &where_schema, &row)?)
+            }
+            Some(other) => {
+                return Err(Error::Unsupported(format!("SHOW TABLES {other}")));
+            }
+        };
+        if keep {
+            rows.push(row);
+        }
+    }
     Ok(QueryResult::Rows(RowStream::literal(schema, rows)))
 }
 
@@ -1189,28 +1249,36 @@ fn system_variables() -> Vec<(&'static str, String)> {
 
 /// Case-insensitive SQL LIKE (`%` = any run, `_` = one char) for SHOW filters.
 fn show_like(name: &str, pattern: &str) -> bool {
+    show_like_case(name, pattern, false)
+}
+
+/// A `LIKE` pattern (`%`, `_`, `\` escapes) matched against a name, with or
+/// without regard to case.
+fn show_like_case(name: &str, pattern: &str, case_sensitive: bool) -> bool {
+    let fold = |c: char| {
+        if case_sensitive {
+            c
+        } else {
+            c.to_ascii_lowercase()
+        }
+    };
     enum Token {
         Literal(char),
         Any,
         One,
     }
 
-    let text = name
-        .chars()
-        .map(|character| character.to_ascii_lowercase())
-        .collect::<Vec<_>>();
+    let text = name.chars().map(fold).collect::<Vec<_>>();
     let mut tokens = Vec::with_capacity(pattern.len());
     let mut characters = pattern.chars();
     while let Some(character) = characters.next() {
         if character == '\\' {
-            tokens.push(Token::Literal(
-                characters.next().unwrap_or('\\').to_ascii_lowercase(),
-            ));
+            tokens.push(Token::Literal(fold(characters.next().unwrap_or('\\'))));
         } else {
             tokens.push(match character {
                 '%' => Token::Any,
                 '_' => Token::One,
-                literal => Token::Literal(literal.to_ascii_lowercase()),
+                literal => Token::Literal(fold(literal)),
             });
         }
     }

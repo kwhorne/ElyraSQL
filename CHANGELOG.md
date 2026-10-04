@@ -23,6 +23,14 @@ All notable changes to ElyraSQL are documented here. The format is based on
   commits it and runs, as in MySQL, instead of being refused. `ANALYZE TABLE`
   names the table with its database, as MySQL does.
 
+- **`SHOW TABLES` applies its filter and lists views.** `LIKE` and `WHERE`
+  were ignored, so `SHOW TABLES LIKE 'nope'` listed every table -- and a tool
+  that checks for a table that way always found it. They now filter as in
+  MySQL: `LIKE` case-sensitively, as table names are, with the pattern in the
+  column header (`Tables_in_elyra (st%)`), and `WHERE` over the result's
+  columns. Views are listed too, and `SHOW FULL TABLES` adds `Table_type`
+  (`BASE TABLE` or `VIEW`).
+
 ## [1.12.2] - 2026-10-04
 
 ### Fixed
