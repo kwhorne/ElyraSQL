@@ -6,6 +6,23 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **DDL commits the open transaction first, as in MySQL.** `CREATE`, `ALTER`,
+  `DROP`, `RENAME`, `TRUNCATE` (of tables, indexes, views, triggers,
+  procedures), account statements, `LOCK TABLES`, `ANALYZE TABLE` and a new
+  `BEGIN` ran *inside* an open transaction, so a `ROLLBACK` after
+  `INSERT ...; CREATE TABLE ...` undid the `INSERT` as well -- which MySQL
+  had already committed. Worse, a second `BEGIN` in an open transaction
+  silently discarded its writes, where MySQL commits them. These statements
+  now commit the open transaction before they run, even when they then
+  fail; temporary tables do not, as in MySQL. `REFRESH MATERIALIZED VIEW`
+  stays inside the transaction, and the refresh the engine runs on reading a
+  stale view no longer risks committing the reader's transaction. Checked
+  against MySQL 8.4 on 18 sequences. In a read-only transaction, DDL now
+  commits it and runs, as in MySQL, instead of being refused. `ANALYZE TABLE`
+  names the table with its database, as MySQL does.
+
 ## [1.12.2] - 2026-10-04
 
 ### Fixed

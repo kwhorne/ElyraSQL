@@ -1210,8 +1210,13 @@ async fn recreated_table_does_not_reuse_a_generation_being_cleaned() {
     assert_eq!(renamed, vec![(2, "renamed".into())]);
 }
 
+/// ALTER TABLE inside a transaction commits it and takes effect at once, as in
+/// MySQL: another connection is held to the new primary key before the first
+/// one's COMMIT. (DDL used to run inside the transaction, where a write landing
+/// between the ALTER and the COMMIT had to be caught by commit validation; that
+/// window no longer exists.)
 #[tokio::test]
-async fn alter_add_primary_key_rejects_a_concurrent_post_scan_insert() {
+async fn alter_add_primary_key_in_a_transaction_takes_effect_at_once() {
     let srv = TestServer::start().await;
     let mut ddl = srv.conn().await;
     let mut writer = srv.conn().await;
@@ -1219,33 +1224,35 @@ async fn alter_add_primary_key_rejects_a_concurrent_post_scan_insert() {
     ddl.query_drop("CREATE TABLE add_pk_race (id INT, label TEXT)")
         .await
         .unwrap();
+    ddl.query_drop("START TRANSACTION").await.unwrap();
     ddl.query_drop("INSERT INTO add_pk_race VALUES (1, 'before')")
         .await
         .unwrap();
-    ddl.query_drop("START TRANSACTION").await.unwrap();
     ddl.query_drop("ALTER TABLE add_pk_race ADD PRIMARY KEY (id)")
         .await
         .unwrap();
 
-    // This row is committed after the ALTER's recluster scan but before its
-    // transaction commits. Range validation must reject the stale rewrite.
-    writer
-        .query_drop("INSERT INTO add_pk_race VALUES (2, 'raced')")
-        .await
-        .unwrap();
-    assert!(ddl.query_drop("COMMIT").await.is_err());
-
+    // Committed by the ALTER: visible to the other connection, and the key holds.
     let rows: Vec<(i64, String)> = writer
         .query("SELECT id, label FROM add_pk_race ORDER BY id")
         .await
         .unwrap();
-    assert_eq!(rows, vec![(1, "before".into()), (2, "raced".into())]);
-    // The failed ALTER left the table in rowid mode, so a duplicate id remains
-    // legal and proves no PK metadata escaped the aborted transaction.
+    assert_eq!(rows, vec![(1, "before".into())]);
+    assert!(writer
+        .query_drop("INSERT INTO add_pk_race VALUES (1, 'duplicate')")
+        .await
+        .is_err());
     writer
-        .query_drop("INSERT INTO add_pk_race VALUES (1, 'still rowid')")
+        .query_drop("INSERT INTO add_pk_race VALUES (2, 'after')")
         .await
         .unwrap();
+    // The transaction the ALTER ended has nothing left to commit or undo.
+    ddl.query_drop("ROLLBACK").await.unwrap();
+    let rows: Vec<(i64, String)> = writer
+        .query("SELECT id, label FROM add_pk_race ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![(1, "before".into()), (2, "after".into())]);
 }
 
 /// The compact execution schema may store several MySQL declarations in the

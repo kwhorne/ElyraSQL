@@ -720,6 +720,9 @@ impl Engine {
         user: &str,
         sess: &Session,
     ) -> Result<()> {
+        // The DROP and CREATE below are one refresh, inside the caller's
+        // transaction: they must not commit it the way a user's DDL does.
+        let _internal = sess.internal_statements();
         let query = match sess.get(catalog::matview_key(name)).await? {
             Some(b) => String::from_utf8_lossy(&b).into_owned(),
             None => {
@@ -1043,6 +1046,14 @@ impl Engine {
             .take(24)
             .collect::<String>()
             .to_ascii_lowercase();
+
+        // DDL, account statements, LOCK TABLES and a new BEGIN commit the open
+        // transaction first, as in MySQL -- even when the statement then fails.
+        // They used to run inside it, so a ROLLBACK undid the transaction's
+        // earlier writes too, and a second BEGIN discarded them.
+        if sess.in_txn() && sess.implicit_commit_allowed() && text_commits_implicitly(&head) {
+            sess.commit().await?;
+        }
 
         // Writes handled as text below never reach the per-statement check in
         // `run_statements`, so a read-only transaction refuses them here.
@@ -1744,6 +1755,11 @@ impl Engine {
             // Every table the statement reads, column grants included.
             if !user.is_empty() {
                 self.authorize_reads(user, &stmt, sess).await?;
+            }
+            // A statement after the first in one query string: the same implicit
+            // commit as above, per statement.
+            if sess.in_txn() && sess.implicit_commit_allowed() && commits_implicitly(&stmt) {
+                sess.commit().await?;
             }
             // A read-only transaction (or session) refuses every write before it
             // runs. It used to accept START TRANSACTION READ ONLY and then let
@@ -2500,6 +2516,63 @@ fn start_transaction_modes(sql: &str) -> Option<Result<Option<bool>>> {
         }
     }
     Some(Ok(access))
+}
+
+/// Statements MySQL commits the open transaction before, by their opening
+/// words: DDL (except on temporary tables), account statements, `LOCK
+/// TABLES`, table maintenance, and starting a new transaction. `REFRESH
+/// MATERIALIZED VIEW` -- ElyraSQL's own, rewriting a table's rows rather than
+/// its definition -- stays inside the transaction, like the DML it amounts to.
+fn text_commits_implicitly(head: &str) -> bool {
+    if head.starts_with("create temporary") || head.starts_with("drop temporary") {
+        return false;
+    }
+    [
+        "create ",
+        "drop ",
+        "alter ",
+        "rename ",
+        "truncate",
+        "grant ",
+        "revoke ",
+        "set password",
+        "lock table",
+        "analyze ",
+        "optimize ",
+        "repair ",
+        "check table",
+        "begin",
+        "start transaction",
+    ]
+    .iter()
+    .any(|prefix| head.starts_with(prefix))
+}
+
+/// [`text_commits_implicitly`] for a parsed statement.
+fn commits_implicitly(stmt: &Statement) -> bool {
+    match stmt {
+        Statement::CreateTable(ct) => !ct.temporary,
+        Statement::Drop { temporary, .. } => !temporary,
+        Statement::CreateView { .. }
+        | Statement::CreateIndex(_)
+        | Statement::CreateFunction(_)
+        | Statement::CreateProcedure { .. }
+        | Statement::CreateTrigger { .. }
+        | Statement::CreateDatabase { .. }
+        | Statement::CreateSchema { .. }
+        | Statement::AlterTable { .. }
+        | Statement::AlterView { .. }
+        | Statement::AlterIndex { .. }
+        | Statement::DropFunction { .. }
+        | Statement::DropProcedure { .. }
+        | Statement::DropTrigger { .. }
+        | Statement::Truncate { .. }
+        | Statement::Analyze { .. }
+        | Statement::Grant { .. }
+        | Statement::Revoke { .. }
+        | Statement::StartTransaction { .. } => true,
+        _ => false,
+    }
 }
 
 /// Whether `stmt` writes: data, schema, or row locks for update. In a read-only
@@ -7491,11 +7564,7 @@ mod read_only_transaction_tests {
                 "UPDATE rot SET v = 9 WHERE id = 404",
                 "DELETE FROM rot",
                 "SELECT * FROM rot FOR UPDATE",
-                "CREATE TABLE rot2 (id INT)",
                 "CREATE TEMPORARY TABLE tmp1 (id INT)",
-                "CREATE TRIGGER t1 AFTER INSERT ON rot FOR EACH ROW SET @x = 1",
-                "CREATE USER ro_probe IDENTIFIED BY 'passw0rd'",
-                "DROP TABLE rot",
             ] {
                 refused(&e, &s, write).await;
             }
@@ -7506,6 +7575,12 @@ mod read_only_transaction_tests {
             ok(&e, &s, "COMMIT").await;
             assert_eq!(count(&e, &s).await, "1 1");
         }
+        // DDL commits the read-only transaction first, as in MySQL, and then
+        // runs: the transaction is over, so the INSERT after it is allowed.
+        ok(&e, &s, "START TRANSACTION READ ONLY").await;
+        ok(&e, &s, "CREATE TABLE rot2 (id INT)").await;
+        ok(&e, &s, "INSERT INTO rot2 VALUES (1)").await;
+        ok(&e, &s, "DROP TABLE rot2").await;
         // After it, writes work again.
         ok(&e, &s, "INSERT INTO rot VALUES (2, 2)").await;
         ok(&e, &s, "START TRANSACTION READ WRITE").await;
@@ -7752,5 +7827,131 @@ mod select_into_tests {
         assert_eq!(row(&e, &s, "SELECT @done, @x").await, ["1", "-1"]);
         run(&e, &s, "CALL p_sum()").await;
         assert_eq!(row(&e, &s, "SELECT @total").await, ["30"]);
+    }
+}
+
+#[cfg(test)]
+mod implicit_commit_tests {
+    use super::{Engine, Privilege, QueryResult};
+
+    async fn setup() -> (Engine, crate::Session) {
+        let engine = Engine::new(elyra_storage::Db::in_memory().unwrap());
+        let s = engine.session();
+        engine
+            .execute("CREATE TABLE ic (id INT PRIMARY KEY)", Privilege::Admin, &s)
+            .await
+            .unwrap();
+        (engine, s)
+    }
+
+    async fn run(
+        e: &Engine,
+        s: &crate::Session,
+        sql: &str,
+    ) -> elyra_core::Result<Vec<QueryResult>> {
+        e.execute(sql, Privilege::Admin, s).await
+    }
+
+    async fn rows_in(e: &Engine, s: &crate::Session, table: &str) -> i64 {
+        match run(e, s, &format!("SELECT COUNT(*) FROM {table}"))
+            .await
+            .unwrap()
+            .remove(0)
+        {
+            QueryResult::Rows(mut r) => match &r.next_batch(1).await.unwrap()[0][0] {
+                elyra_core::Value::Int(n) => *n,
+                other => panic!("{other:?}"),
+            },
+            _ => panic!("expected rows"),
+        }
+    }
+
+    /// As in MySQL 8.4 (the same sequences were run against it): these commit
+    /// the open transaction before they run, so the INSERT survives the
+    /// ROLLBACK. They used to run inside it and be rolled back with it -- and a
+    /// second BEGIN silently discarded the first transaction's writes.
+    #[tokio::test]
+    async fn ddl_and_begin_commit_the_open_transaction() {
+        for (setup_sql, stmt) in [
+            ("", "CREATE TABLE ic2 (id INT)"),
+            ("", "ALTER TABLE ic ADD COLUMN x INT"),
+            ("CREATE TABLE ic3 (id INT)", "DROP TABLE ic3"),
+            ("CREATE TABLE ic3 (id INT)", "TRUNCATE TABLE ic3"),
+            ("CREATE TABLE ic3 (id INT)", "RENAME TABLE ic3 TO ic4"),
+            ("", "CREATE INDEX ix ON ic (id)"),
+            ("", "CREATE VIEW icv AS SELECT 1 AS one"),
+            ("", "CREATE USER ic_u IDENTIFIED BY 'passw0rd'"),
+            ("", "ANALYZE TABLE ic"),
+            ("", "LOCK TABLES ic WRITE"),
+            ("", "BEGIN"),
+            ("", "START TRANSACTION"),
+            // A DDL statement that then fails has committed all the same.
+            ("", "CREATE TABLE ic (id INT)"),
+        ] {
+            let (e, s) = setup().await;
+            if !setup_sql.is_empty() {
+                run(&e, &s, setup_sql).await.unwrap();
+            }
+            run(&e, &s, "START TRANSACTION").await.unwrap();
+            run(&e, &s, "INSERT INTO ic VALUES (1)").await.unwrap();
+            let _ = run(&e, &s, stmt).await;
+            let _ = run(&e, &s, "UNLOCK TABLES").await;
+            run(&e, &s, "ROLLBACK").await.unwrap();
+            assert_eq!(rows_in(&e, &s, "ic").await, 1, "{stmt} did not commit");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_transaction_after_ddl_is_a_new_one() {
+        // Autocommit off: the implicit transaction is committed too.
+        let (e, s) = setup().await;
+        run(&e, &s, "SET autocommit = 0").await.unwrap();
+        run(&e, &s, "INSERT INTO ic VALUES (1)").await.unwrap();
+        run(&e, &s, "CREATE TABLE ic2 (id INT)").await.unwrap();
+        run(&e, &s, "INSERT INTO ic VALUES (2)").await.unwrap();
+        run(&e, &s, "ROLLBACK").await.unwrap();
+        run(&e, &s, "SET autocommit = 1").await.unwrap();
+        assert_eq!(rows_in(&e, &s, "ic").await, 1);
+
+        // A temporary table does not commit, as in MySQL.
+        let (e, s) = setup().await;
+        run(&e, &s, "START TRANSACTION").await.unwrap();
+        run(&e, &s, "INSERT INTO ic VALUES (1)").await.unwrap();
+        run(&e, &s, "CREATE TEMPORARY TABLE tt (id INT)")
+            .await
+            .unwrap();
+        run(&e, &s, "ROLLBACK").await.unwrap();
+        assert_eq!(rows_in(&e, &s, "ic").await, 0);
+    }
+
+    /// A stale materialized view read inside a transaction is refreshed with
+    /// a DROP and a CREATE the engine runs itself. Those must not commit the
+    /// user's transaction the way the user's own DDL would.
+    #[tokio::test]
+    async fn an_automatic_refresh_does_not_commit_the_users_transaction() {
+        let (e, s) = setup().await;
+        run(&e, &s, "CREATE TABLE src (id INT PRIMARY KEY)")
+            .await
+            .unwrap();
+        run(&e, &s, "CREATE MATERIALIZED VIEW mv AS SELECT id FROM src")
+            .await
+            .unwrap();
+        run(&e, &s, "INSERT INTO src VALUES (1)").await.unwrap(); // mv is stale now
+        run(&e, &s, "START TRANSACTION").await.unwrap();
+        run(&e, &s, "INSERT INTO ic VALUES (1)").await.unwrap();
+        assert_eq!(rows_in(&e, &s, "mv").await, 1, "refreshed on read");
+        run(&e, &s, "ROLLBACK").await.unwrap();
+        assert_eq!(
+            rows_in(&e, &s, "ic").await,
+            0,
+            "the refresh committed the transaction"
+        );
+
+        // REFRESH MATERIALIZED VIEW, ElyraSQL's own statement, stays inside it.
+        run(&e, &s, "START TRANSACTION").await.unwrap();
+        run(&e, &s, "INSERT INTO ic VALUES (2)").await.unwrap();
+        run(&e, &s, "REFRESH MATERIALIZED VIEW mv").await.unwrap();
+        run(&e, &s, "ROLLBACK").await.unwrap();
+        assert_eq!(rows_in(&e, &s, "ic").await, 0);
     }
 }

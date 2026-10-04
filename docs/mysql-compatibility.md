@@ -221,16 +221,21 @@ gaps:
   (with or without `WITH CONSISTENT SNAPSHOT`), `SET TRANSACTION READ ONLY` for
   the next transaction, and `SET SESSION TRANSACTION READ ONLY` or
   `@@transaction_read_only = 1` for the session refuse every write -- `INSERT`,
-  `UPDATE`, `DELETE`, `REPLACE`, `SELECT ... FOR UPDATE`, DDL, temporary
-  tables -- with error 1792 *Cannot execute statement in a READ ONLY
-  transaction*, before it runs. `SELECT ... FOR SHARE` is allowed. `READ WRITE`
+  `UPDATE`, `DELETE`, `REPLACE`, `SELECT ... FOR UPDATE`, temporary tables --
+  with error 1792 *Cannot execute statement in a READ ONLY transaction*, before
+  it runs. DDL in a read-only transaction commits it first (see below), so only
+  a read-only session refuses DDL, as in MySQL. `SELECT ... FOR SHARE` is allowed. `READ WRITE`
   and the combined form (`SET SESSION TRANSACTION ISOLATION LEVEL READ
   COMMITTED, READ ONLY`) are accepted, and an unscoped `SET TRANSACTION` inside
   an open transaction is refused with 1568, as MySQL does.
-- **DDL inside a transaction is part of it.** MySQL commits the open
-  transaction implicitly before `CREATE`/`ALTER`/`DROP`; ElyraSQL runs the DDL
-  inside it, so a `ROLLBACK` undoes both. For the same reason, DDL in a
-  read-only transaction is refused rather than committing it first.
+- **Implicit commit, as in MySQL.** DDL (`CREATE`, `ALTER`, `DROP`, `RENAME`,
+  `TRUNCATE`, indexes, views, triggers, procedures), account statements
+  (`CREATE USER`, `GRANT`, `REVOKE`, ...), `LOCK TABLES`, `ANALYZE TABLE` and a
+  new `BEGIN`/`START TRANSACTION` commit the open transaction before they run --
+  also when the statement then fails. A `ROLLBACK` afterwards no longer undoes
+  the writes made before the DDL. Temporary tables do not commit, and neither
+  does `REFRESH MATERIALIZED VIEW`, ElyraSQL's own statement, which rewrites a
+  table's rows inside the transaction like the DML it amounts to.
 - `SHOW` and `information_schema` cover what GUI tools and drivers need to
   connect and browse (`tables`, `columns`, `engines`, `schemata`, `views`,
   `routines`, `triggers`, `events`, `statistics`, `partitions`); it is not the

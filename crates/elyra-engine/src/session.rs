@@ -153,6 +153,17 @@ fn undo_entry_size(entry: &UndoEntry) -> usize {
     entry.key.len() + entry.prev_put.as_ref().map_or(0, Vec::len) + 1
 }
 
+/// Guard from [`Session::internal_statements`].
+pub(crate) struct InternalStatements<'a>(&'a Session);
+
+impl Drop for InternalStatements<'_> {
+    fn drop(&mut self) {
+        self.0
+            .internal_statements
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 pub struct Session {
     db: Db,
     txn: Mutex<Option<TxnState>>,
@@ -173,6 +184,10 @@ pub struct Session {
     /// `SET TRANSACTION READ ONLY | READ WRITE` without a scope: the access mode
     /// of the next transaction only, then back to the session's.
     next_read_only: Mutex<Option<bool>>,
+    /// Statements the engine runs for its own purposes (a materialized view's
+    /// DROP + CREATE on refresh) are part of the operation that issued them,
+    /// and must not commit the transaction it runs in.
+    internal_statements: std::sync::atomic::AtomicUsize,
     foreign_key_checks: std::sync::atomic::AtomicBool,
     no_auto_value_on_zero: std::sync::atomic::AtomicBool,
     group_concat_max_len: std::sync::atomic::AtomicUsize,
@@ -243,6 +258,7 @@ impl Session {
             autocommit: std::sync::atomic::AtomicBool::new(true),
             session_read_only: std::sync::atomic::AtomicBool::new(false),
             next_read_only: Mutex::new(None),
+            internal_statements: std::sync::atomic::AtomicUsize::new(0),
             foreign_key_checks: std::sync::atomic::AtomicBool::new(true),
             no_auto_value_on_zero: std::sync::atomic::AtomicBool::new(false),
             group_concat_max_len: std::sync::atomic::AtomicUsize::new(1024),
@@ -670,6 +686,22 @@ impl Session {
 
     pub fn in_txn(&self) -> bool {
         self.txn.lock().unwrap().is_some()
+    }
+
+    /// Mark statements run from here until the guard drops as the engine's own,
+    /// exempt from the implicit commit a user's DDL causes.
+    pub(crate) fn internal_statements(&self) -> InternalStatements<'_> {
+        self.internal_statements
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        InternalStatements(self)
+    }
+
+    /// Whether a statement run now may commit the open transaction implicitly:
+    /// a user's statement, not one the engine runs inside its own operation.
+    pub(crate) fn implicit_commit_allowed(&self) -> bool {
+        self.internal_statements
+            .load(std::sync::atomic::Ordering::Relaxed)
+            == 0
     }
 
     /// The session's access mode (`@@transaction_read_only`).

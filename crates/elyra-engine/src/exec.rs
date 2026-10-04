@@ -24123,8 +24123,9 @@ pub async fn analyze_table(db: &Session, name: &str) -> Result<QueryResult> {
         ColumnDef::new("Msg_type", ColumnType::Text, false),
         ColumnDef::new("Msg_text", ColumnType::Text, false),
     ]);
+    // MySQL names the table with its database: `app.orders`.
     let row = vec![
-        Value::Text(name.to_string()),
+        Value::Text(format!("{}.{name}", db.database())),
         Value::Text("analyze".into()),
         Value::Text("status".into()),
         Value::Text("OK".into()),
