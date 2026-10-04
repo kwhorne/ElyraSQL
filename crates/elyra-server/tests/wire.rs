@@ -11382,6 +11382,103 @@ async fn revoked_select_user_connects_but_cannot_read_tables() {
         .is_err());
 }
 
+/// Read every result set of a CALL: (columns, rows as text) for each SELECT,
+/// in order.
+async fn call_sets(
+    mut result: mysql_async::QueryResult<'_, '_, mysql_async::TextProtocol>,
+) -> Vec<(Vec<String>, Vec<Vec<String>>)> {
+    let text = |v: mysql_async::Value| match v {
+        mysql_async::Value::Bytes(b) => String::from_utf8(b).unwrap(),
+        mysql_async::Value::Int(i) => i.to_string(),
+        mysql_async::Value::NULL => "NULL".into(),
+        other => format!("{other:?}"),
+    };
+    let mut sets = Vec::new();
+    while !result.is_empty() {
+        let names: Vec<String> = result
+            .columns()
+            .map(|cols| cols.iter().map(|c| c.name_str().into_owned()).collect())
+            .unwrap_or_default();
+        let rows: Vec<mysql_async::Row> = result.collect().await.unwrap();
+        if !names.is_empty() {
+            sets.push((
+                names,
+                rows.into_iter()
+                    .map(|r| r.unwrap().into_iter().map(text).collect())
+                    .collect(),
+            ));
+        }
+    }
+    sets
+}
+
+fn set(name: &str, rows: &[&str]) -> (Vec<String>, Vec<Vec<String>>) {
+    (
+        vec![name.to_string()],
+        rows.iter().map(|r| vec![r.to_string()]).collect(),
+    )
+}
+
+/// `CALL` sends every SELECT the procedure runs as its own result set, then
+/// its OK, as MySQL does -- nested CALLs and loops included. It used to send
+/// only an OK: the rows were run and dropped. Text and binary protocols both.
+#[tokio::test]
+async fn call_returns_each_select_as_a_result_set() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    for sql in [
+        "CREATE TABLE ct (id INT PRIMARY KEY, v INT)",
+        "INSERT INTO ct VALUES (1, 10), (2, 20)",
+        "CREATE PROCEDURE c_two() BEGIN SELECT COUNT(*) AS n FROM ct; \
+           SELECT v FROM ct WHERE id = 2; END",
+        "CREATE PROCEDURE c_mixed() BEGIN DECLARE x INT DEFAULT 0; SELECT 'a' AS s; \
+           SET x = 5; INSERT INTO ct VALUES (3, 30); SELECT x AS x; \
+           DELETE FROM ct WHERE id = 3; END",
+        "CREATE PROCEDURE c_args(IN p INT) BEGIN SELECT v FROM ct WHERE id = p; END",
+        "CREATE PROCEDURE c_nested() BEGIN SELECT 'outer' AS w; CALL c_two(); END",
+        "CREATE PROCEDURE c_loop() BEGIN DECLARE i INT DEFAULT 0; \
+           WHILE i < 3 DO SELECT i; SET i = i + 1; END WHILE; END",
+        "CREATE PROCEDURE c_none() BEGIN UPDATE ct SET v = v + 0 WHERE id = 1; END",
+    ] {
+        c.query_drop(sql).await.unwrap();
+    }
+
+    let sets = call_sets(c.query_iter("CALL c_two()").await.unwrap()).await;
+    assert_eq!(sets, [set("n", &["2"]), set("v", &["20"])]);
+    let sets = call_sets(c.query_iter("CALL c_mixed()").await.unwrap()).await;
+    assert_eq!(sets, [set("s", &["a"]), set("x", &["5"])]);
+    let sets = call_sets(c.query_iter("CALL c_args(2)").await.unwrap()).await;
+    assert_eq!(sets, [set("v", &["20"])]);
+    let sets = call_sets(c.query_iter("CALL c_nested()").await.unwrap()).await;
+    assert_eq!(
+        sets,
+        [set("w", &["outer"]), set("n", &["2"]), set("v", &["20"])]
+    );
+    // A bare local keeps its name, as in MySQL.
+    let sets = call_sets(c.query_iter("CALL c_loop()").await.unwrap()).await;
+    assert_eq!(sets, [set("i", &["0"]), set("i", &["1"]), set("i", &["2"])]);
+    // No SELECT: just the OK, as before.
+    assert!(call_sets(c.query_iter("CALL c_none()").await.unwrap())
+        .await
+        .is_empty());
+
+    // The binary protocol (a prepared CALL), as sqlx and exec_* send it.
+    let mut result = c.exec_iter("CALL c_args(?)", (1,)).await.unwrap();
+    let rows: Vec<mysql_async::Row> = result.collect().await.unwrap();
+    let values: Vec<Option<i64>> = rows.into_iter().map(|r| r.get(0)).collect();
+    assert_eq!(values, [Some(10)]);
+    while !result.is_empty() {
+        let _: Vec<mysql_async::Row> = result.collect().await.unwrap();
+    }
+    drop(result);
+    let rows: Vec<(i64,)> = c.exec("CALL c_two()", ()).await.unwrap();
+    assert_eq!(rows, [(2,)]);
+
+    // The connection is in a clean state afterwards.
+    let n: Option<i64> = c.query_first("SELECT COUNT(*) FROM ct").await.unwrap();
+    assert_eq!(n, Some(2));
+}
+
 /// Privilege checks read through a cache; every change must still take effect
 /// on the very next statement of a connection that has been reading all along
 /// (and so has the old answer cached): a global revoke and re-grant, a role

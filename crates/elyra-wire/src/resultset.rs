@@ -201,6 +201,14 @@ impl<'a, W: AsyncWrite + Unpin> QueryResultWriter<'a, W> {
         writers::write_err(kind, msg.borrow(), self.writer).await
     }
 
+    /// Whether the client accepts several result sets for one statement
+    /// (`CLIENT_MULTI_RESULTS`), which a `CALL` that returns rows needs.
+    pub fn client_multi_results(&self) -> bool {
+        self.client_capabilities.intersects(
+            CapabilityFlags::CLIENT_MULTI_RESULTS | CapabilityFlags::CLIENT_PS_MULTI_RESULTS,
+        )
+    }
+
     /// Send the last bits of the last resultset to the client, and indicate that there are no more
     /// resultsets coming.
     pub async fn no_more_results(mut self) -> io::Result<()> {
@@ -429,6 +437,20 @@ impl<'a, W: AsyncWrite + Unpin + 'a> RowWriter<'a, W> {
             add_status_flags(finalizer, status_flags);
         }
         self.result.take().unwrap().no_more_results().await
+    }
+
+    /// End this resultset with connection status flags on its terminating
+    /// EOF/OK packet, leaving the writer open for another resultset (which
+    /// adds `SERVER_MORE_RESULTS_EXISTS` when it starts).
+    pub async fn finish_one_with_status(
+        mut self,
+        status_flags: StatusFlags,
+    ) -> io::Result<QueryResultWriter<'a, W>> {
+        self.finish_inner("", true).await?;
+        if let Some(finalizer) = self.result.as_mut().unwrap().last_end.as_mut() {
+            add_status_flags(finalizer, status_flags);
+        }
+        Ok(self.result.take().unwrap())
     }
 
     /// End this resultset response, and indicate to the client that no more rows are coming.

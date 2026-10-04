@@ -6,6 +6,20 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **`CALL` returns the procedure's result sets.** A `SELECT` in a procedure
+  body ran, but its rows were dropped: the client got only an OK. Every
+  `SELECT` -- in loops, handlers and nested `CALL`s too -- now comes back as
+  its own result set, followed by the `CALL`'s OK with the rows the last
+  statement affected, as MySQL sends them, over the text and the binary
+  protocol. The server now offers `CLIENT_MULTI_RESULTS`, which clients such
+  as `mysql_async` and sqlx only use when offered; a client without it gets
+  MySQL's 1312. Inside procedures, a local named in the select list keeps its
+  name as the column's (`SELECT n` returned a column named after `n`'s
+  value), and an alias that is also a local's name is left alone (`SELECT x
+  AS x` was a syntax error).
+
 ## [1.12.1] - 2026-10-04
 
 ### Fixed

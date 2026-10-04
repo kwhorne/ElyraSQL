@@ -166,6 +166,9 @@ jobs:
       - name: Native (binary) prepared statements (PDO)
         run: ELYRASQL_PORT=3307 ELYRASQL_DB=elyra php tests/compat/php/native_prepare.php
 
+      - name: CALL result sets (PDO, emulated and native)
+        run: ELYRASQL_PORT=3307 ELYRASQL_DB=elyra php tests/compat/php/call_result_sets.php
+
       - name: Stop server
         if: always()
         run: kill "$SERVER_PID" || true

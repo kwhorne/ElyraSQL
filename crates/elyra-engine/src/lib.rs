@@ -407,6 +407,7 @@ impl Engine {
                         Ok(found)
                     }
                     .await;
+                    ctx.last_affected = 0;
                     match outcome {
                         Ok(true) => {}
                         // No row: MySQL's NOT FOUND condition, as for FETCH.
@@ -433,7 +434,28 @@ impl Engine {
                 ProcStmt::Sql(s) => {
                     let sql = exec::substitute_vars(s, env);
                     match Box::pin(self.execute_as(&sql, privilege, user, sess)).await {
-                        Ok(_) => {}
+                        Ok(results) => {
+                            for result in results {
+                                ctx.last_affected = match result {
+                                    QueryResult::Rows(mut rows) => {
+                                        let mut all = Vec::new();
+                                        loop {
+                                            let batch = rows.next_batch(1024).await?;
+                                            if batch.is_empty() {
+                                                break;
+                                            }
+                                            all.extend(batch);
+                                        }
+                                        ctx.results.push((rows.schema.clone(), all));
+                                        0
+                                    }
+                                    QueryResult::Affected(n)
+                                    | QueryResult::Insert {
+                                        affected_rows: n, ..
+                                    } => n,
+                                };
+                            }
+                        }
                         Err(e) => {
                             match self
                                 .run_handler(ctx, env, false, privilege, user, sess)
@@ -1471,7 +1493,16 @@ impl Engine {
             for (pname, var) in writeback {
                 sess.set_user_var(&var, env.get(&pname).cloned().unwrap_or(Value::Null));
             }
-            return Ok(vec![QueryResult::empty_ok()]);
+            // Every SELECT's result set, then the CALL's own OK, as MySQL sends
+            // them. The server writes a CALL's results as one multi-result
+            // response; the result sets used to be dropped.
+            let mut out: Vec<QueryResult> = ctx
+                .results
+                .drain(..)
+                .map(|(schema, rows)| QueryResult::Rows(RowStream::literal(schema, rows)))
+                .collect();
+            out.push(QueryResult::Affected(ctx.last_affected));
+            return Ok(out);
         }
 
         // User management (CREATE USER / GRANT / REVOKE / ...): parsed and

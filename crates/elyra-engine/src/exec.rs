@@ -5164,6 +5164,7 @@ pub(crate) fn substitute_vars(sql: &str, env: &std::collections::HashMap<String,
     if env.is_empty() {
         return sql.to_string();
     }
+    let sql = name_bare_projected_vars(sql, env);
     let cs: Vec<char> = sql.chars().collect();
     let mut out = String::with_capacity(sql.len());
     let mut i = 0;
@@ -5182,7 +5183,16 @@ pub(crate) fn substitute_vars(sql: &str, env: &std::collections::HashMap<String,
             let prev_dot = start > 0 && cs[start - 1] == '.';
             let next_dot = i < cs.len() && cs[i] == '.';
             let lw = word.to_ascii_lowercase();
-            if !prev_dot && !next_dot && env.contains_key(&lw) {
+            // A name after AS is an alias, never a reference: `SELECT x AS x`
+            // became `SELECT 5 AS 5`, a syntax error.
+            let before = out.trim_end().as_bytes();
+            let after_as = before.len() >= 2
+                && before[before.len() - 2..].eq_ignore_ascii_case(b"as")
+                && (before.len() == 2 || {
+                    let c = before[before.len() - 3];
+                    !(c.is_ascii_alphanumeric() || c == b'_')
+                });
+            if !prev_dot && !next_dot && !after_as && env.contains_key(&lw) {
                 out.push_str(&value_sql_literal(&env[&lw]));
             } else {
                 out.push_str(&word);
@@ -5193,6 +5203,58 @@ pub(crate) fn substitute_vars(sql: &str, env: &std::collections::HashMap<String,
         i += 1;
     }
     out
+}
+
+/// In a `SELECT`, give each select-list item that is just a local variable its
+/// own name as an alias, so the column is named `n` rather than after the
+/// value substituted for it (`SELECT n` returned a column named `3`). MySQL
+/// names it `n`.
+fn name_bare_projected_vars(sql: &str, env: &std::collections::HashMap<String, Value>) -> String {
+    use crate::sqllex::{find_top_level, keyword_at, split_top_level};
+    let trimmed = sql.trim_start();
+    let lead = sql.len() - trimmed.len();
+    if !keyword_at(trimmed, 0, "select") {
+        return sql.to_string();
+    }
+    let list_start = "select".len();
+    let list_end = find_top_level(trimmed, |s, c| {
+        c.index > list_start
+            && [
+                "from", "where", "group", "having", "order", "limit", "union", "into", "for",
+            ]
+            .iter()
+            .any(|kw| keyword_at(s, c.index, kw))
+    })
+    .unwrap_or(trimmed.len());
+    let items = split_top_level(&trimmed[list_start..list_end], ',');
+    let mut changed = false;
+    let items: Vec<String> = items
+        .into_iter()
+        .map(|item| {
+            let name = item.trim();
+            let bare = !name.is_empty()
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                && !name.starts_with(|c: char| c.is_ascii_digit());
+            if bare && env.contains_key(&name.to_ascii_lowercase()) {
+                changed = true;
+                let pad = &item[..item.len() - item.trim_start().len()];
+                let trail = &item[item.trim_end().len()..];
+                format!("{pad}{name} AS `{name}`{trail}")
+            } else {
+                item
+            }
+        })
+        .collect();
+    if !changed {
+        return sql.to_string();
+    }
+    format!(
+        "{}{}{}{}",
+        &sql[..lead + list_start],
+        items.join(","),
+        "",
+        &trimmed[list_end..]
+    )
 }
 
 /// Replace `@user` variable references with their SQL literals (unset = NULL),
@@ -25638,13 +25700,40 @@ mod substitution_tests {
     }
 
     #[test]
+    fn a_local_is_not_substituted_as_an_alias_or_a_column_name() {
+        let vars = HashMap::from([
+            ("x".to_owned(), Value::Int(5)),
+            ("n".to_owned(), Value::Int(2)),
+        ]);
+        assert_eq!(
+            substitute_vars("SELECT x AS x, n FROM t WHERE id = n", &vars),
+            "SELECT 5 AS x, 2 AS `n` FROM t WHERE id = 2"
+        );
+        assert_eq!(
+            substitute_vars("SELECT n + 1 AS total, 'as n' AS label", &vars),
+            "SELECT 2 + 1 AS total, 'as n' AS label"
+        );
+        // Not a select list: nothing named, references still replaced.
+        assert_eq!(
+            substitute_vars("UPDATE t SET v = x WHERE id = n", &vars),
+            "UPDATE t SET v = 5 WHERE id = 2"
+        );
+        // Multi-byte text before AS must not split a character.
+        assert_eq!(
+            substitute_vars("SELECT '€' AS x, x", &vars),
+            "SELECT '€' AS x, 5 AS `x`"
+        );
+    }
+
+    #[test]
     fn procedure_variable_substitution_skips_escaped_string_literals() {
         let vars = HashMap::from([("example".to_owned(), Value::Text("changed".to_owned()))]);
         let sql = r#"SELECT 'O\'Keefe@example.com', example"#;
 
+        // The bare variable keeps its name as the column's, as in MySQL.
         assert_eq!(
             substitute_vars(sql, &vars),
-            r#"SELECT 'O\'Keefe@example.com', 'changed'"#
+            r#"SELECT 'O\'Keefe@example.com', 'changed' AS `example`"#
         );
     }
 }

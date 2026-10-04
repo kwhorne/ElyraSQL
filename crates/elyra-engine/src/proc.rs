@@ -79,12 +79,21 @@ pub struct Cursor {
     pub pos: usize,
 }
 
-/// Mutable procedure runtime context: declared cursors and handlers.
+/// Mutable procedure runtime context: declared cursors and handlers, and what
+/// the `CALL` returns.
 #[derive(Default)]
 pub struct ProcCtx {
     pub cursor_defs: HashMap<String, String>,
     pub cursors: HashMap<String, Cursor>,
     pub handlers: Vec<Handler>,
+    /// The result set of every `SELECT` the body ran, in order -- including
+    /// those of nested `CALL`s -- which the `CALL` sends to the client, as
+    /// MySQL does. Read when the `SELECT` runs, so later statements in the
+    /// body cannot change them.
+    pub results: Vec<(elyra_core::Schema, Vec<Vec<Value>>)>,
+    /// Rows affected by the last statement the body ran (0 for a `SELECT`):
+    /// what MySQL reports in the `CALL`'s final OK.
+    pub last_affected: u64,
 }
 
 /// A parsed procedural statement.

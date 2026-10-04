@@ -22,10 +22,12 @@ judge fit before deploying.
   block), and handlers are scoped to the whole procedure body. **`OPEN` buffers
   the cursor's full result set in memory** (it is not a streaming server-side
   cursor), so cursors are intended for the modest result sets typical of
-  procedural logic, not for iterating huge tables. **`CALL` returns no result
-  sets**: a `SELECT` in a procedure body runs, but its rows are not sent to the
-  client as MySQL would. Return values through `OUT` parameters, `@variables`
-  or `SELECT ... INTO`.
+  procedural logic, not for iterating huge tables. **`CALL` returns every
+  `SELECT` the procedure runs as its own result set**, then its status, as
+  MySQL does (text and binary protocol; a client must accept multiple result
+  sets, as every current driver does). Each result set is read when its
+  `SELECT` runs and held in memory until the `CALL` ends, so -- as with
+  cursors -- a procedure is not the way to stream a huge table.
 - Row-level triggers are supported: `CREATE TRIGGER name {BEFORE|AFTER}
   {INSERT|UPDATE|DELETE} ON t FOR EACH ROW <body>`, with `NEW.col`/`OLD.col`.
   BEFORE bodies support `SET NEW.col = expr`; AFTER bodies run arbitrary DML.

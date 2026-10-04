@@ -711,7 +711,9 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for ElyraShim {
             a.record(self.conn_id, &user, &sql, res.is_ok());
         }
         match res {
-            Ok(outcomes) => write_outcomes(outcomes, results, self.session.in_txn()).await,
+            Ok(outcomes) => {
+                write_outcomes(outcomes, results, self.session.in_txn(), is_call(&sql)).await
+            }
             Err(e) => {
                 results
                     .error(elyra_kind(&e), e.to_string().as_bytes())
@@ -757,7 +759,9 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for ElyraShim {
             a.record(self.conn_id, &user, query, res.is_ok());
         }
         match res {
-            Ok(outcomes) => write_outcomes(outcomes, results, self.session.in_txn()).await,
+            Ok(outcomes) => {
+                write_outcomes(outcomes, results, self.session.in_txn(), is_call(query)).await
+            }
             Err(e) => {
                 results
                     .error(elyra_kind(&e), e.to_string().as_bytes())
@@ -808,55 +812,76 @@ fn transaction_status(in_trans: bool) -> StatusFlags {
     }
 }
 
+/// The wire columns of a result set.
+fn columns_of(stream: &elyra_engine::RowStream) -> Vec<Column> {
+    stream
+        .schema
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(i, c)| result_column(stream.schema.table_of(i).unwrap_or_default().to_string(), c))
+        .collect()
+}
+
+/// Drain `stream` onto `rw`, batch by batch. `Ok(Some(e))` is an engine error
+/// mid-stream, for the caller to end the result set with.
+async fn stream_rows<W: AsyncWrite + Send + Unpin>(
+    rw: &mut elyra_wire::RowWriter<'_, W>,
+    stream: &mut elyra_engine::RowStream,
+) -> Result<Option<elyra_core::Error>, std::io::Error> {
+    loop {
+        let batch = match stream.next_batch(STREAM_BATCH).await {
+            Ok(b) => b,
+            Err(e) => return Ok(Some(e)),
+        };
+        if batch.is_empty() {
+            return Ok(None);
+        }
+        for row in batch {
+            if row.len() != stream.schema.columns.len() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "result row does not match its schema",
+                ));
+            }
+            // Encode each cell as the type advertised in the result metadata.
+            // This matters for binary prepared statements.
+            for (v, column) in row.iter().zip(&stream.schema.columns) {
+                write_cell(rw, v, &column.ty)?;
+            }
+            rw.end_row().await?;
+        }
+    }
+}
+
+/// Whether `sql` is a `CALL`, whose results go out as a multi-result response.
+fn is_call(sql: &str) -> bool {
+    let sql = sql.trim_start();
+    sql.get(..4).is_some_and(|w| w.eq_ignore_ascii_case("call"))
+        && sql[4..].starts_with(|c: char| c.is_whitespace() || c == '`')
+}
+
 async fn write_outcomes<W: AsyncWrite + Send + Unpin>(
     mut outcomes: Vec<QueryResult>,
     results: QueryResultWriter<'_, W>,
     in_trans: bool,
+    call: bool,
 ) -> Result<(), std::io::Error> {
     // Report an open transaction in the OK status flags so clients can track
     // transaction state correctly.
     let status_flags = transaction_status(in_trans);
-    // The text protocol returns a single result per query in this build.
+    if call && outcomes.len() > 1 {
+        return write_call_outcomes(outcomes, results, status_flags).await;
+    }
+    // Any other statement returns a single result.
     match outcomes.drain(..).next() {
         Some(QueryResult::Rows(mut stream)) => {
-            let cols: Vec<Column> = stream
-                .schema
-                .columns
-                .iter()
-                .enumerate()
-                .map(|(i, c)| {
-                    result_column(stream.schema.table_of(i).unwrap_or_default().to_string(), c)
-                })
-                .collect();
-
+            let cols = columns_of(&stream);
             let mut rw = results.start(&cols).await?;
-            // Drain the stream batch-by-batch straight onto the wire.
-            loop {
-                let batch = match stream.next_batch(STREAM_BATCH).await {
-                    Ok(b) => b,
-                    Err(e) => {
-                        // Mid-stream engine error: surface it and stop.
-                        let msg = e.to_string().into_bytes();
-                        return rw.finish_error(elyra_kind(&e), &msg).await;
-                    }
-                };
-                if batch.is_empty() {
-                    break;
-                }
-                for row in batch {
-                    if row.len() != stream.schema.columns.len() {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            "result row does not match its schema",
-                        ));
-                    }
-                    // Encode each cell as the type advertised in the result
-                    // metadata. This matters for binary prepared statements.
-                    for (v, column) in row.iter().zip(&stream.schema.columns) {
-                        write_cell(&mut rw, v, &column.ty)?;
-                    }
-                    rw.end_row().await?;
-                }
+            if let Some(e) = stream_rows(&mut rw, &mut stream).await? {
+                // Mid-stream engine error: surface it and stop.
+                let msg = e.to_string().into_bytes();
+                return rw.finish_error(elyra_kind(&e), &msg).await;
             }
             rw.finish_with_status(status_flags).await
         }
@@ -891,6 +916,71 @@ async fn write_outcomes<W: AsyncWrite + Send + Unpin>(
                 .await
         }
     }
+}
+
+/// A `CALL`'s results as MySQL sends them: each `SELECT`'s result set flagged
+/// `SERVER_MORE_RESULTS_EXISTS`, then the `CALL`'s own OK with the rows the
+/// last statement affected. A client that did not announce
+/// `CLIENT_MULTI_RESULTS` cannot read that, and gets MySQL's 1312 instead.
+async fn write_call_outcomes<W: AsyncWrite + Send + Unpin>(
+    mut outcomes: Vec<QueryResult>,
+    results: QueryResultWriter<'_, W>,
+    status_flags: StatusFlags,
+) -> Result<(), std::io::Error> {
+    if !results.client_multi_results() {
+        return results
+            .error(
+                ErrorKind::ER_SP_BADSELECT,
+                b"PROCEDURE can't return a result set in the given context",
+            )
+            .await;
+    }
+    let affected_rows = match outcomes.pop() {
+        Some(QueryResult::Affected(n))
+        | Some(QueryResult::Insert {
+            affected_rows: n, ..
+        }) => n,
+        _ => 0,
+    };
+    let columns: Vec<Vec<Column>> = outcomes
+        .iter()
+        .map(|outcome| match outcome {
+            QueryResult::Rows(stream) => columns_of(stream),
+            _ => Vec::new(),
+        })
+        .collect();
+    let mut writer = results;
+    for (outcome, cols) in outcomes.into_iter().zip(&columns) {
+        writer = match outcome {
+            QueryResult::Rows(mut stream) => {
+                let mut rw = writer.start(cols).await?;
+                if let Some(e) = stream_rows(&mut rw, &mut stream).await? {
+                    let msg = e.to_string().into_bytes();
+                    return rw.finish_error(elyra_kind(&e), &msg).await;
+                }
+                rw.finish_one_with_status(status_flags).await?
+            }
+            QueryResult::Affected(n)
+            | QueryResult::Insert {
+                affected_rows: n, ..
+            } => {
+                writer
+                    .complete_one(OkResponse {
+                        affected_rows: n,
+                        status_flags,
+                        ..Default::default()
+                    })
+                    .await?
+            }
+        };
+    }
+    writer
+        .completed(OkResponse {
+            affected_rows,
+            status_flags,
+            ..Default::default()
+        })
+        .await
 }
 
 /// A temporal result value encoded according to its MySQL binary wire type.

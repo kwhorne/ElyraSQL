@@ -534,7 +534,12 @@ where
             | CapabilityFlags::CLIENT_PLUGIN_AUTH
             | CapabilityFlags::CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA
             | CapabilityFlags::CLIENT_CONNECT_WITH_DB
-            | CapabilityFlags::CLIENT_DEPRECATE_EOF;
+            | CapabilityFlags::CLIENT_DEPRECATE_EOF
+            // A CALL answers with one result set per SELECT in the procedure,
+            // over the text and the binary protocol, as MySQL's does. A client
+            // only asks for what the server offers.
+            | CapabilityFlags::CLIENT_MULTI_RESULTS
+            | CapabilityFlags::CLIENT_PS_MULTI_RESULTS;
 
         #[cfg(feature = "tls")]
         let server_capabilities = if tls_conf.is_some() {
