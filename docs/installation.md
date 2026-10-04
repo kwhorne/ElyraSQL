@@ -17,6 +17,25 @@ ElyraSQL release builds target **Ubuntu 24.04+** and **Apple Silicon macOS
     done, so an interrupted upgrade simply resumes on the next start. **Take a backup
     first, and note that downgrading to 1.4.x afterwards is not supported.**
 
+!!! warning "Upgrading to 1.12.3 — implicit commit, as in MySQL"
+
+    No on-disk format change; a 1.12.2 database opens in 1.12.3 unchanged. Three
+    fixes change what existing code can see:
+
+    - **DDL commits the open transaction first.** `CREATE`, `ALTER`, `DROP`,
+      `RENAME`, `TRUNCATE`, account statements, `LOCK TABLES`, `ANALYZE TABLE`
+      and a new `BEGIN` now commit an open transaction before they run, as MySQL
+      does. A `ROLLBACK` after such a statement no longer undoes the writes made
+      before it. Code that relied on DDL being part of the transaction must
+      commit or roll back first. A second `BEGIN` no longer discards the open
+      transaction's writes: it commits them. Temporary tables and `REFRESH
+      MATERIALIZED VIEW` stay inside the transaction.
+    - **`\_` and `\%` in `LIKE` match literally.** `'axb' LIKE 'a\_b'` is now
+      false, as in MySQL; it was true. Searches that escape their input this way
+      return fewer, correct, rows.
+    - **`SHOW TABLES` applies `LIKE` and `WHERE`, and lists views.** `SHOW TABLES
+      LIKE 'name'` used to list every table.
+
 !!! info "Upgrading to 1.12.2"
 
     No on-disk format change; a 1.12.1 database opens in 1.12.2 unchanged.
@@ -493,8 +512,8 @@ macOS).
 Multi-arch image (`amd64` + `arm64`) on the GitHub Container Registry:
 
 ```bash
-docker pull ghcr.io/kwhorne/elyrasql:1.12.2   # or :latest
-docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.12.2
+docker pull ghcr.io/kwhorne/elyrasql:1.12.3   # or :latest
+docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.12.3
 ```
 
 The image is ~15 MB, runs as a non-root user, stores data in the

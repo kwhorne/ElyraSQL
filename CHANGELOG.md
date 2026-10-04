@@ -6,6 +6,8 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.12.3] - 2026-10-04
+
 ### Fixed
 
 - **`\_` and `\%` in a `LIKE` pattern match literally, as in MySQL.** The
