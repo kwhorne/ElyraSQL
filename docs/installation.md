@@ -17,6 +17,21 @@ ElyraSQL release builds target **Ubuntu 24.04+** and **Apple Silicon macOS
     done, so an interrupted upgrade simply resumes on the next start. **Take a backup
     first, and note that downgrading to 1.4.x afterwards is not supported.**
 
+!!! info "Upgrading to 1.12.2"
+
+    No on-disk format change; a 1.12.1 database opens in 1.12.2 unchanged.
+
+    - **`CALL` returns the procedure's result sets.** Each `SELECT` a procedure
+      runs now comes back as its own result set, followed by the `CALL`'s
+      status, as in MySQL. A client that called a procedure and read only an
+      OK will now find result sets first: read them, or move to the next
+      result (`nextRowset()` in PDO, `nextset()` in PyMySQL) until the end.
+    - **The server offers `CLIENT_MULTI_RESULTS`.** Every current driver
+      supports it. Only a `CALL` uses it; every other statement still returns
+      a single result.
+    - **Inside procedures**, a local variable selected on its own names the
+      column after itself (`SELECT n` gives a column `n`), as in MySQL.
+
 !!! info "Upgrading to 1.12.1"
 
     No on-disk format change; a 1.12.0 database opens in 1.12.1 unchanged. Three
@@ -478,8 +493,8 @@ macOS).
 Multi-arch image (`amd64` + `arm64`) on the GitHub Container Registry:
 
 ```bash
-docker pull ghcr.io/kwhorne/elyrasql:1.12.1   # or :latest
-docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.12.1
+docker pull ghcr.io/kwhorne/elyrasql:1.12.2   # or :latest
+docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.12.2
 ```
 
 The image is ~15 MB, runs as a non-root user, stores data in the

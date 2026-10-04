@@ -6,6 +6,8 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.12.2] - 2026-10-04
+
 ### Fixed
 
 - **`CALL` returns the procedure's result sets.** A `SELECT` in a procedure
