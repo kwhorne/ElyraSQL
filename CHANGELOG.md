@@ -6,6 +6,8 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.12.1] - 2026-10-04
+
 ### Fixed
 
 - **`SELECT ... INTO @var` assigns the variable.** The clause was ignored --

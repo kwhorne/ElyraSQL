@@ -17,6 +17,24 @@ ElyraSQL release builds target **Ubuntu 24.04+** and **Apple Silicon macOS
     done, so an interrupted upgrade simply resumes on the next start. **Take a backup
     first, and note that downgrading to 1.4.x afterwards is not supported.**
 
+!!! info "Upgrading to 1.12.1"
+
+    No on-disk format change; a 1.12.0 database opens in 1.12.1 unchanged. Three
+    fixes change what existing code can see:
+
+    - **Read-only transactions refuse writes.** In `START TRANSACTION READ ONLY`,
+      or with `SET SESSION TRANSACTION READ ONLY` / `@@transaction_read_only`, an
+      `INSERT`, `UPDATE`, `DELETE`, `SELECT ... FOR UPDATE` or DDL now fails with
+      error 1792, as in MySQL. They used to run, and only a `ROLLBACK` undid them.
+      An unscoped `SET TRANSACTION` inside an open transaction is now refused
+      (1568).
+    - **`SELECT ... INTO @var` assigns the variable and returns no rows.** It used
+      to be ignored and return the row, so code that read that row must read
+      `@var` instead. Inside procedures, `SELECT ... INTO` a local works too.
+    - **`DROP DATABASE other_name` reports 1008** (*database doesn't exist*) when
+      the name is neither `elyra` nor this connection's own database name, rather
+      than 1235 *not supported*. `IF EXISTS` is still a no-op.
+
 !!! warning "Upgrading to 1.12.0 — security fixes and MySQL privileges"
 
     No on-disk format change; a 1.11.4 database opens in 1.12.0 unchanged.
@@ -460,8 +478,8 @@ macOS).
 Multi-arch image (`amd64` + `arm64`) on the GitHub Container Registry:
 
 ```bash
-docker pull ghcr.io/kwhorne/elyrasql:1.12.0   # or :latest
-docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.12.0
+docker pull ghcr.io/kwhorne/elyrasql:1.12.1   # or :latest
+docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.12.1
 ```
 
 The image is ~15 MB, runs as a non-root user, stores data in the
