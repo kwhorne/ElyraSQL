@@ -11442,6 +11442,34 @@ async fn show_tables_filters_and_lists_views() {
     assert_eq!(header, "Tables_in_elyra (st%)");
 }
 
+/// A search escaping its input the way Laravel does (`addcslashes($term,
+/// '%_')`) finds only the literal underscore or percent sign, over the text
+/// protocol and a native prepared statement alike.
+#[tokio::test]
+async fn escaped_like_searches_match_literally_over_the_wire() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    for sql in [
+        "CREATE TABLE products (name VARCHAR(30))",
+        "INSERT INTO products VALUES ('top_seller'), ('topXseller'), ('50% off'), ('500 off')",
+    ] {
+        c.query_drop(sql).await.unwrap();
+    }
+    let text: Vec<String> = c
+        .query(r"SELECT name FROM products WHERE name LIKE '%p\_s%' ORDER BY name")
+        .await
+        .unwrap();
+    assert_eq!(text, ["top_seller"]);
+    // The parameter carries the backslash; the server quotes it into SQL.
+    for (pattern, want) in [(r"%p\_s%", "top_seller"), (r"%0\%%", "50% off")] {
+        let found: Vec<String> = c
+            .exec("SELECT name FROM products WHERE name LIKE ?", (pattern,))
+            .await
+            .unwrap();
+        assert_eq!(found, [want], "{pattern}");
+    }
+}
+
 /// Read every result set of a CALL: (columns, rows as text) for each SELECT,
 /// in order.
 async fn call_sets(

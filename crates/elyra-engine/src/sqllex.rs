@@ -257,6 +257,99 @@ pub fn matching_paren_end(sql: &str, start: usize) -> Option<usize> {
     None
 }
 
+/// Keep the backslash of `\_` and `\%` inside string literals, as MySQL does.
+///
+/// MySQL's string escapes drop the backslash everywhere except before `_` and
+/// `%`: `'a\_b'` is the three characters `a\_b`, so that a `LIKE` pattern can
+/// match a literal underscore or percent sign. The SQL parser follows the
+/// general rule and turned it into `a_b`, a wildcard -- `'axb' LIKE 'a\_b'`
+/// was true, and a search escaping its input that way (Laravel's
+/// `addcslashes($term, '%_')`) matched too much. Doubling the backslash before
+/// parsing gives the parser `\\_`, which it reads back as `\_`.
+///
+/// A backslash pair (`\\`) is left as it is, so `'x\\_y'` still means `x\_y`.
+/// `None` when nothing needs changing.
+pub fn keep_like_escapes(sql: &str) -> Option<String> {
+    if !sql.contains("\\_") && !sql.contains("\\%") {
+        return None;
+    }
+    let b = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len() + 8);
+    let (mut i, mut copied) = (0usize, 0usize);
+    let mut state = Quoting::Code;
+    while i < b.len() {
+        let next = b.get(i + 1).copied();
+        match state {
+            Quoting::Code => match b[i] {
+                b'\'' => state = Quoting::Single,
+                b'"' => state = Quoting::Double,
+                b'`' => state = Quoting::Backtick,
+                b'#' => state = Quoting::LineComment,
+                b'-' if next == Some(b'-')
+                    && b.get(i + 2).is_none_or(|c| c.is_ascii_whitespace()) =>
+                {
+                    state = Quoting::LineComment;
+                    i += 1;
+                }
+                b'/' if next == Some(b'*') => {
+                    state = Quoting::BlockComment;
+                    i += 1;
+                }
+                _ => {}
+            },
+            Quoting::Single | Quoting::Double => {
+                let quote = if state == Quoting::Single {
+                    b'\''
+                } else {
+                    b'"'
+                };
+                if b[i] == b'\\' {
+                    if matches!(next, Some(b'_' | b'%')) {
+                        out.push_str(&sql[copied..i]);
+                        out.push_str("\\\\");
+                        copied = i + 1;
+                    }
+                    i += 2;
+                    continue;
+                }
+                if b[i] == quote {
+                    if next == Some(quote) {
+                        i += 2;
+                        continue;
+                    }
+                    state = Quoting::Code;
+                }
+            }
+            Quoting::Backtick => {
+                if b[i] == b'`' {
+                    if next == Some(b'`') {
+                        i += 2;
+                        continue;
+                    }
+                    state = Quoting::Code;
+                }
+            }
+            Quoting::LineComment => {
+                if b[i] == b'\n' {
+                    state = Quoting::Code;
+                }
+            }
+            Quoting::BlockComment => {
+                if b[i] == b'*' && next == Some(b'/') {
+                    state = Quoting::Code;
+                    i += 1;
+                }
+            }
+        }
+        i += 1;
+    }
+    if copied == 0 {
+        return None;
+    }
+    out.push_str(&sql[copied..]);
+    Some(out)
+}
+
 // --- Statement tokens -------------------------------------------------------
 //
 // A second, coarser level than the byte scanner above: a whole statement as a
@@ -339,6 +432,45 @@ pub(crate) fn tokenize(sql: &str) -> Vec<Tok> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod like_escape_tests {
+    use super::keep_like_escapes;
+
+    #[test]
+    fn backslash_underscore_and_percent_keep_their_backslash_in_literals() {
+        assert_eq!(
+            keep_like_escapes(r#"SELECT 'a\_b', 'x\%y', "z\_w""#).as_deref(),
+            Some(r#"SELECT 'a\\_b', 'x\\%y', "z\\_w""#)
+        );
+        // A backslash pair stays as it is: 'x\\_y' already means x\_y.
+        assert_eq!(keep_like_escapes(r"SELECT 'x\\_y'"), None);
+        // Other escapes, doubled quotes and a quote escaped inside: untouched.
+        assert_eq!(
+            keep_like_escapes(r"SELECT 'it''s \_', 'it\'s \_', 'a\nb'").as_deref(),
+            Some(r"SELECT 'it''s \\_', 'it\'s \\_', 'a\nb'")
+        );
+    }
+
+    #[test]
+    fn code_comments_and_identifiers_are_left_alone() {
+        for sql in [
+            r"SELECT `a\_b` FROM t",
+            r"SELECT 1 -- '\_'",
+            r"SELECT 1 # '\_'",
+            r"SELECT 1 /* '\_' */",
+            r"SELECT a\_b",
+            "SELECT 'plain'",
+        ] {
+            assert_eq!(keep_like_escapes(sql), None, "{sql}");
+        }
+        // After a comment, literals are literals again.
+        assert_eq!(
+            keep_like_escapes("SELECT 1 /* x */, '\\_'").as_deref(),
+            Some("SELECT 1 /* x */, '\\\\_'")
+        );
+    }
 }
 
 #[cfg(test)]

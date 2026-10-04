@@ -5483,7 +5483,11 @@ pub(crate) fn value_sql_literal(v: &Value) -> String {
         }
         Value::Int(i) => i.to_string(),
         Value::Float(f) => f.to_string(),
-        Value::Text(s) | Value::Json(s) => format!("'{}'", s.replace('\'', "''")),
+        // Backslashes doubled: substituted back into SQL, `a\b` must read
+        // back as `a\b`, not as an escape sequence.
+        Value::Text(s) | Value::Json(s) => {
+            format!("'{}'", s.replace('\\', "\\\\").replace('\'', "''"))
+        }
         Value::Bytes(b) => format!(
             "x'{}'",
             b.iter().map(|x| format!("{x:02x}")).collect::<String>()
@@ -19100,6 +19104,9 @@ fn from_has_plain_table(query: &SqlQuery) -> bool {
 }
 
 fn parse_query(sql: &str) -> Result<SqlQuery> {
+    // A stored view's text, parsed again: `\_` and `\%` keep their backslash.
+    let kept = crate::sqllex::keep_like_escapes(sql);
+    let sql = kept.as_deref().unwrap_or(sql);
     let dialect = sqlparser::dialect::MySqlDialect {};
     let stmts = sqlparser::parser::Parser::parse_sql(&dialect, sql)
         .map_err(|e| Error::Parse(e.to_string()))?;

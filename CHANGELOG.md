@@ -8,6 +8,17 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ### Fixed
 
+- **`\_` and `\%` in a `LIKE` pattern match literally, as in MySQL.** The
+  backslash was dropped when the string literal was read, leaving a wildcard:
+  `'axb' LIKE 'a\_b'` and `'500' LIKE '50\%'` were true. A search that escapes
+  its input that way -- Laravel's `addcslashes($term, '%_')`, for one --
+  matched rows it should not have. Literals now keep the backslash before `_`
+  and `%` (`LENGTH('\_')` is 2, as in MySQL), and `LIKE` treats the backslash
+  as its escape character unless `ESCAPE` names another. Text in a user
+  variable also keeps its backslashes when substituted back into a statement
+  (`SET @v = 'a\\b'` read back as `a` and a backspace). Checked against MySQL
+  8.4 on 17 cases, including stored views and both prepared-statement paths.
+
 - **DDL commits the open transaction first, as in MySQL.** `CREATE`, `ALTER`,
   `DROP`, `RENAME`, `TRUNCATE` (of tables, indexes, views, triggers,
   procedures), account statements, `LOCK TABLES`, `ANALYZE TABLE` and a new

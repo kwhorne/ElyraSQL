@@ -485,7 +485,13 @@ pub fn eval_row(expr: &Expr, schema: &Schema, row: &[Value]) -> Result<Value> {
             if text.is_null() || pat.is_null() {
                 return Ok(Value::Null);
             }
-            let esc = escape_char.as_ref().and_then(|s| s.chars().next());
+            // MySQL's default escape character is the backslash; `ESCAPE ''`
+            // turns escaping off. The backslash used to vanish from the literal
+            // before matching, so there was nothing to escape.
+            let esc = match escape_char.as_ref() {
+                None => Some('\\'),
+                Some(s) => s.chars().next(),
+            };
             // Default collation is case-insensitive (utf8mb4_0900_ai_ci), as is
             // ILIKE, so both match case-insensitively.
             let m = like_eval(

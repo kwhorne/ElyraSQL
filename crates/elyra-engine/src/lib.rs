@@ -862,7 +862,8 @@ impl Engine {
         use sqlparser::ast::{Expr, SelectItem, SetExpr, TableFactor};
         // Never parse a pathologically deep expression (stack-overflow guard).
         guard_sql_complexity(sql).ok()?;
-        let stmts = Parser::parse_sql(&MySqlDialect {}, sql).ok()?;
+        let sql = crate::sqllex::keep_like_escapes(sql).unwrap_or_else(|| sql.to_string());
+        let stmts = Parser::parse_sql(&MySqlDialect {}, &sql).ok()?;
         if stmts.len() != 1 {
             return None;
         }
@@ -1647,6 +1648,10 @@ impl Engine {
         // Rewrite the `!` logical-NOT prefix into `(NOT (...))` (after `~` so a
         // mixed `!~x` is already parenthesised).
         if let Some(rewritten) = rewrite_bang(&subst_sql) {
+            subst_sql = Cow::Owned(rewritten);
+        }
+        // `\_` and `\%` keep their backslash, as in MySQL (see the function).
+        if let Some(rewritten) = crate::sqllex::keep_like_escapes(&subst_sql) {
             subst_sql = Cow::Owned(rewritten);
         }
         let statements = match Parser::parse_sql(&dialect, subst_sql.as_ref()) {
@@ -7959,5 +7964,77 @@ mod implicit_commit_tests {
         run(&e, &s, "REFRESH MATERIALIZED VIEW mv").await.unwrap();
         run(&e, &s, "ROLLBACK").await.unwrap();
         assert_eq!(rows_in(&e, &s, "ic").await, 0);
+    }
+}
+
+#[cfg(test)]
+mod like_escape_engine_tests {
+    use super::{Engine, Privilege, QueryResult};
+
+    async fn row(e: &Engine, s: &crate::Session, sql: &str) -> Vec<String> {
+        match e.execute(sql, Privilege::Admin, s).await.unwrap().remove(0) {
+            QueryResult::Rows(mut r) => r
+                .next_batch(1)
+                .await
+                .unwrap()
+                .remove(0)
+                .iter()
+                .map(|v| v.to_wire_string().unwrap_or_else(|| "NULL".into()))
+                .collect(),
+            _ => panic!("expected rows"),
+        }
+    }
+
+    /// `\_` and `\%` are a literal underscore and percent sign in a LIKE
+    /// pattern, as in MySQL (whose default escape character is the
+    /// backslash). The backslash used to vanish from the literal, leaving a
+    /// wildcard: `'axb' LIKE 'a\_b'` was true, and a search that escaped its
+    /// input matched rows it should not have.
+    #[tokio::test]
+    async fn escaped_wildcards_match_literally() {
+        let e = Engine::new(elyra_storage::Db::in_memory().unwrap());
+        let s = e.session();
+        assert_eq!(
+            row(&e, &s, r"SELECT 'a_b' LIKE 'a\_b', 'axb' LIKE 'a\_b'").await,
+            ["1", "0"]
+        );
+        assert_eq!(
+            row(&e, &s, r"SELECT '50%' LIKE '50\%', '500' LIKE '50\%'").await,
+            ["1", "0"]
+        );
+        assert_eq!(
+            row(&e, &s, r"SELECT LENGTH('\_'), '\_' = '_'").await,
+            ["2", "0"]
+        );
+        // A custom escape character, and none.
+        assert_eq!(
+            row(
+                &e,
+                &s,
+                r"SELECT 'a_b' LIKE 'a|_b' ESCAPE '|', 'axb' LIKE 'a|_b' ESCAPE '|'"
+            )
+            .await,
+            ["1", "0"]
+        );
+        // Over a table, as a search does.
+        for sql in [
+            "CREATE TABLE names (n VARCHAR(20))",
+            "INSERT INTO names VALUES ('snake_case'), ('snakeXcase'), ('100%'), ('1000')",
+        ] {
+            e.execute(sql, Privilege::Admin, &s).await.unwrap();
+        }
+        assert_eq!(
+            row(&e, &s, r"SELECT COUNT(*) FROM names WHERE n LIKE '%e\_c%'").await,
+            ["1"]
+        );
+        assert_eq!(
+            row(&e, &s, r"SELECT COUNT(*) FROM names WHERE n LIKE '%0\%'").await,
+            ["1"]
+        );
+        // A user variable keeps its backslashes on the way back into SQL.
+        e.execute(r"SET @v = 'a\\b'", Privilege::Admin, &s)
+            .await
+            .unwrap();
+        assert_eq!(row(&e, &s, "SELECT @v, LENGTH(@v)").await, [r"a\b", "3"]);
     }
 }
