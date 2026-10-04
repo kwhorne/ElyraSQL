@@ -2582,23 +2582,35 @@ fn create_database_result(if_not_exists: bool) -> Result<QueryResult> {
     ))
 }
 
-/// `DROP DATABASE`/`SCHEMA` under the same single-database model.
+/// `DROP DATABASE`/`SCHEMA` under the single-database model.
 ///
-/// `IF EXISTS` on a database that does not exist here is a no-op, which is what
-/// the caller asked for. Dropping the database the session is actually using is
-/// refused rather than silently ignored: the caller expects its data to be gone.
+/// Every table lives in one database. A connection may select it under any
+/// name -- `elyra`, or the application's own (`USE app_test`, a `DB_DATABASE`),
+/// which the catalog then reports as the table schema, as Laravel expects.
+/// Dropping a name that is this connection's name for it, or `elyra`, would
+/// drop every table, and is refused. Any other name holds nothing: it is MySQL's
+/// 1008 *database doesn't exist*, or a no-op with `IF EXISTS`. That used to be
+/// "not supported", which read as if something were there that could not be
+/// removed.
 fn drop_database_result(
     current: &str,
     if_exists: bool,
     target: Option<&str>,
 ) -> Result<QueryResult> {
-    let names_current = target.is_some_and(|t| t.eq_ignore_ascii_case(current));
-    if if_exists && !names_current {
+    let target = target.unwrap_or_default();
+    let holds_every_table = [current, "elyra", "information_schema"]
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case(target));
+    if holds_every_table {
+        return Err(Error::Unsupported(format!(
+            "DROP DATABASE `{target}`: on this connection that names ElyraSQL's single \
+             database, which holds every table; drop the tables instead"
+        )));
+    }
+    if if_exists {
         return Ok(QueryResult::empty_ok());
     }
-    Err(Error::Unsupported(
-        "DROP DATABASE is not supported; ElyraSQL uses the single `elyra` database".into(),
-    ))
+    Err(Error::DatabaseMissing(target.to_string()))
 }
 
 #[cfg(test)]
@@ -2616,6 +2628,33 @@ mod database_ddl_tests {
         assert!(drop_database_result("elyra", true, Some("scratch")).is_ok());
         assert!(drop_database_result("elyra", true, Some("ELYRA")).is_err());
         assert!(drop_database_result("elyra", false, Some("scratch")).is_err());
+    }
+
+    /// A name that holds nothing is MySQL's 1008, not "unsupported"; the
+    /// connection's own alias and `elyra` hold every table and are refused.
+    #[test]
+    fn dropping_a_name_that_holds_nothing_says_it_does_not_exist() {
+        let missing = drop_database_result("elyra", false, Some("probe_ro"))
+            .err()
+            .expect("a missing database cannot be dropped");
+        assert_eq!(missing.mysql_code(), 1008);
+        assert_eq!(
+            missing.to_string(),
+            "Can't drop database 'probe_ro'; database doesn't exist"
+        );
+        for (current, target) in [
+            ("app_test", "app_test"),
+            ("app_test", "APP_TEST"),
+            ("app_test", "elyra"),
+            ("elyra", "information_schema"),
+        ] {
+            for if_exists in [true, false] {
+                let refused = drop_database_result(current, if_exists, Some(target))
+                    .err()
+                    .unwrap_or_else(|| panic!("{current}: DROP {target} must be refused"));
+                assert_eq!(refused.mysql_code(), 1235, "{current}: {target}");
+            }
+        }
     }
 }
 

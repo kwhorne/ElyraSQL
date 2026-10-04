@@ -197,10 +197,16 @@ gaps:
   with several of them is consistent, as in MySQL. The local forms carry the
   session offset (above); the `UTC_*` forms do not. `SYSDATE()` is the exception:
   it reads the clock when it runs.
-- **One database.** `CREATE DATABASE`/`SCHEMA` is refused unless written with
-  `IF NOT EXISTS`; see the note under *Laravel / Eloquent* above. `USE <name>`
-  is accepted and changes what the catalog reports, but does not give a separate
-  namespace.
+- **One database, under any name.** Every table lives in one database. A
+  connection selects it as `elyra`, or under its own name (`USE app_test`, or the
+  database named at connect, such as Laravel's `DB_DATABASE`), and `DATABASE()`,
+  `SHOW DATABASES` and `information_schema.tables.table_schema` then report that
+  name -- an alias, not a separate namespace: two connections using different
+  names see the same tables. `CREATE DATABASE`/`SCHEMA` is refused unless written
+  with `IF NOT EXISTS`; see the note under *Laravel / Eloquent* above.
+  `DROP DATABASE` refuses the connection's own name and `elyra`, which would drop
+  every table; any other name holds nothing, so it is MySQL's 1008 *database
+  doesn't exist* (a no-op with `IF EXISTS`).
 - **Isolation levels:** `SET TRANSACTION ISOLATION LEVEL ...` is accepted for all
   four standard levels, but only two engines exist — `SERIALIZABLE` (opt-in) and
   **snapshot** isolation, which backs everything else. Snapshot is *at least as

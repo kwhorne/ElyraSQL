@@ -23,6 +23,18 @@ All notable changes to ElyraSQL are documented here. The format is based on
   stale materialized view is read as last refreshed in a read-only
   transaction, since refreshing it would be a write.
 
+- **`DROP DATABASE` tells the truth about a name that holds nothing.** Every
+  table lives in one database, which a connection may select under any name
+  (`USE probe_ro` is accepted, and the catalog reports that name, as Laravel
+  expects). Such a name then looked like a database that could not be dropped:
+  `DROP DATABASE probe_ro` answered "not supported". From any connection not
+  using that name it is now MySQL's 1008 *Can't drop database 'probe_ro';
+  database doesn't exist*, which is the case -- nothing is stored under it --
+  and a no-op with `IF EXISTS`. Dropping the connection's own name or `elyra`,
+  which would drop every table, is still refused, with a message that says so.
+  The docs now describe the aliasing; `frameworks.md` said `DB_DATABASE` had to
+  be `elyra`.
+
 ## [1.12.0] - 2026-09-28
 
 ### Security

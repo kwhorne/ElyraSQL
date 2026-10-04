@@ -117,6 +117,11 @@ pub enum Error {
     #[error("Transaction characteristics can't be changed while a transaction is in progress")]
     TransactionInProgress,
 
+    /// `DROP DATABASE` naming one that does not exist. MySQL 1008
+    /// (`ER_DB_DROP_EXISTS`), with its text.
+    #[error("Can't drop database '{0}'; database doesn't exist")]
+    DatabaseMissing(String),
+
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -152,6 +157,7 @@ impl Error {
             Error::ForeignKey(_) => 1452,  // ER_NO_REFERENCED_ROW
             Error::ReadOnlyTransaction => 1792, // ER_CANT_EXECUTE_IN_READ_ONLY_TRANSACTION
             Error::TransactionInProgress => 1568, // ER_CANT_CHANGE_TX_CHARACTERISTICS
+            Error::DatabaseMissing(_) => 1008, // ER_DB_DROP_EXISTS
             _ => 1105,
         }
     }

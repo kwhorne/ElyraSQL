@@ -54,10 +54,12 @@ DB_PASSWORD=
 
 ### Why these settings
 
-- **`DB_DATABASE=elyra`** — ElyraSQL exposes a single database named `elyra`.
-  Laravel uses this name as the `information_schema` schema for
-  `Schema::hasTable()` / `hasColumn()` and for `SHOW` introspection, so it must
-  match.
+- **`DB_DATABASE=elyra`** — ElyraSQL keeps every table in a single database,
+  `elyra`. Another name works too: ElyraSQL accepts it as an alias and reports it
+  as the `information_schema` schema, which is what `Schema::hasTable()` /
+  `hasColumn()` and `SHOW` introspection look for. It does not give a separate
+  set of tables: two applications pointed at different names share one, so give
+  each application its own ElyraSQL instance.
 - **`PDO::ATTR_EMULATE_PREPARES => true`** — see the note above; required for
   parameter-bound queries to behave correctly today.
 - **`'strict' => false`** — avoids Laravel issuing `SET SESSION sql_mode=...`
