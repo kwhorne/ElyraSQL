@@ -6,6 +6,23 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **Read-only transactions refuse writes.** `START TRANSACTION READ ONLY` was
+  accepted but not enforced: an `INSERT`, `UPDATE` or `DELETE` in it ran, and
+  only a later `ROLLBACK` undid it. Every write -- including `REPLACE`, an
+  upsert, `SELECT ... FOR UPDATE`, DDL and temporary tables -- is now refused
+  before it runs, with MySQL's error 1792 (SQLSTATE 25006). The forms around
+  it that were refused or failed to parse now work as in MySQL:
+  `START TRANSACTION READ WRITE`, `... WITH CONSISTENT SNAPSHOT`, `SET
+  TRANSACTION READ ONLY | READ WRITE` for the next transaction, `SET SESSION
+  TRANSACTION READ ONLY` and `@@transaction_read_only` for the session (which
+  also covers autocommit statements), and the combined `ISOLATION LEVEL ...,
+  READ ONLY` form. An unscoped `SET TRANSACTION` inside an open transaction is
+  refused with 1568. Checked statement by statement against MySQL 8.4. A
+  stale materialized view is read as last refreshed in a read-only
+  transaction, since refreshing it would be a write.
+
 ## [1.12.0] - 2026-09-28
 
 ### Security

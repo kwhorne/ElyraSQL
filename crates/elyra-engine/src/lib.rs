@@ -967,11 +967,44 @@ impl Engine {
             .collect::<String>()
             .to_ascii_lowercase();
 
+        // Writes handled as text below never reach the per-statement check in
+        // `run_statements`, so a read-only transaction refuses them here.
+        if text_statement_writes(&head) && sess.read_only_now() {
+            return Err(Error::ReadOnlyTransaction);
+        }
+
+        // START TRANSACTION with MySQL's modes, which sqlparser does not all
+        // accept (`WITH CONSISTENT SNAPSHOT` -- every transaction here reads a
+        // snapshot, so it is a no-op).
+        if head.starts_with("start transaction") {
+            if let Some(access) = start_transaction_modes(trimmed) {
+                sess.begin_with_access(access?)?;
+                return Ok(vec![QueryResult::empty_ok()]);
+            }
+        }
+
         // sqlparser does not accept MySQL's `SET SESSION TRANSACTION ...`
         // spelling, so handle that narrow form before generic parsing.
         if head.starts_with("set") {
-            if let Some(level) = session_transaction_isolation(trimmed) {
-                sess.set_transaction_isolation(&level)?;
+            if let Some(characteristics) = set_transaction_characteristics(trimmed) {
+                let TransactionCharacteristics {
+                    session,
+                    isolation,
+                    read_only,
+                } = characteristics?;
+                // Unscoped, it is aimed at the next transaction: MySQL refuses it
+                // while one is open.
+                if !session && sess.in_txn() {
+                    return Err(Error::TransactionInProgress);
+                }
+                if let Some(level) = isolation {
+                    sess.set_transaction_isolation(&level)?;
+                }
+                match (read_only, session) {
+                    (Some(read_only), true) => sess.set_session_read_only(read_only),
+                    (Some(read_only), false) => sess.set_next_read_only(read_only)?,
+                    (None, _) => {}
+                }
                 return Ok(vec![QueryResult::empty_ok()]);
             }
             // SET @user = expr
@@ -1566,6 +1599,19 @@ impl Engine {
             if !user.is_empty() {
                 self.authorize_reads(user, &stmt, sess).await?;
             }
+            // A read-only transaction (or session) refuses every write before it
+            // runs. It used to accept START TRANSACTION READ ONLY and then let
+            // writes through, so only a ROLLBACK undid them.
+            if sess.read_only_now() && statement_writes(&stmt) {
+                return Err(Error::ReadOnlyTransaction);
+            }
+            // An autocommit statement that touches a table is its own
+            // transaction: it uses up a pending `SET TRANSACTION` access mode.
+            // One that touches none (`SELECT 1`, `SELECT @@var`) does not, as
+            // in MySQL.
+            if statement_writes(&stmt) || !read_relations(&stmt).is_empty() {
+                sess.consume_next_access_unless_implicit();
+            }
             // Fine-grained write enforcement: within the write tier, require the
             // *specific* privilege (INSERT/UPDATE/DELETE) on each target table,
             // not merely "some write". Skipped for Admin/open-auth connections
@@ -1610,7 +1656,9 @@ impl Engine {
             // Refreshes and the query that consumes them are one atomic unit.
             // Autocommit uses a temporary transaction; an explicit transaction
             // uses a private checkpoint outside the client's savepoint namespace.
-            let stale_matviews = if catalog::matviews_exist(sess).await {
+            // Refreshing a stale materialized view is a write; a read-only
+            // transaction reads it as last refreshed.
+            let stale_matviews = if !sess.read_only_now() && catalog::matviews_exist(sess).await {
                 self.stale_matviews(&stmt, sess).await?
             } else {
                 Vec::new()
@@ -1857,8 +1905,14 @@ impl Engine {
                 }
                 Ok(QueryResult::Affected(0))
             }
-            Statement::StartTransaction { .. } => {
-                sess.begin()?;
+            Statement::StartTransaction { modes, .. } => {
+                let access = modes.iter().rev().find_map(|mode| match mode {
+                    sqlparser::ast::TransactionMode::AccessMode(access) => {
+                        Some(*access == sqlparser::ast::TransactionAccessMode::ReadOnly)
+                    }
+                    _ => None,
+                });
+                sess.begin_with_access(access)?;
                 Ok(QueryResult::empty_ok())
             }
             Statement::Commit { .. } => {
@@ -2040,6 +2094,9 @@ impl Engine {
                 "transaction_isolation" | "tx_isolation" => {
                     sess.set_transaction_isolation(&session_text(value, "transaction_isolation")?)?
                 }
+                "transaction_read_only" | "tx_read_only" => {
+                    sess.set_session_read_only(session_bool(&value, "transaction_read_only")?)
+                }
                 "time_zone" => sess.set_time_zone(&session_text(value, "time_zone")?)?,
                 unsupported => {
                     return Err(Error::Unsupported(format!(
@@ -2211,24 +2268,147 @@ fn session_usize(value: &Value, variable: &str) -> Result<usize> {
         .map_err(|_| Error::OutOfRange(format!("{variable} is too large: {value}")))
 }
 
-fn session_transaction_isolation(sql: &str) -> Option<String> {
+/// `SET [SESSION | LOCAL] TRANSACTION <characteristic> [, <characteristic>]`,
+/// where a characteristic is `ISOLATION LEVEL <level>`, `READ ONLY` or `READ
+/// WRITE`. `session` is false for the unscoped form, which MySQL aims at the
+/// next transaction only. sqlparser does not accept MySQL's spellings of these,
+/// so they are read here. `None` when the statement is not this form at all
+/// (`SET GLOBAL TRANSACTION` included, which stays unsupported).
+struct TransactionCharacteristics {
+    session: bool,
+    isolation: Option<String>,
+    read_only: Option<bool>,
+}
+
+fn set_transaction_characteristics(sql: &str) -> Option<Result<TransactionCharacteristics>> {
     let sql = sql.trim().trim_end_matches(';').trim();
     let mut words = sql.split_ascii_whitespace();
     if !words.next()?.eq_ignore_ascii_case("set") {
         return None;
     }
     let mut word = words.next()?;
-    if word.eq_ignore_ascii_case("session") || word.eq_ignore_ascii_case("local") {
+    let session = word.eq_ignore_ascii_case("session") || word.eq_ignore_ascii_case("local");
+    if session {
         word = words.next()?;
     }
-    if !word.eq_ignore_ascii_case("transaction")
-        || !words.next()?.eq_ignore_ascii_case("isolation")
-        || !words.next()?.eq_ignore_ascii_case("level")
+    if !word.eq_ignore_ascii_case("transaction") {
+        return None;
+    }
+    let rest = words.collect::<Vec<_>>().join(" ");
+    let mut characteristics = TransactionCharacteristics {
+        session,
+        isolation: None,
+        read_only: None,
+    };
+    for part in rest.split(',') {
+        let part = part.split_ascii_whitespace().collect::<Vec<_>>();
+        let upper: Vec<String> = part.iter().map(|w| w.to_ascii_uppercase()).collect();
+        let upper: Vec<&str> = upper.iter().map(String::as_str).collect();
+        match upper.as_slice() {
+            ["READ", "ONLY"] => characteristics.read_only = Some(true),
+            ["READ", "WRITE"] => characteristics.read_only = Some(false),
+            ["ISOLATION", "LEVEL", level @ ..] if !level.is_empty() => {
+                characteristics.isolation = Some(part[2..].join(" "));
+            }
+            _ => {
+                return Some(Err(Error::Parse(format!(
+                    "SET TRANSACTION: expected ISOLATION LEVEL, READ ONLY or READ WRITE, \
+                     found `{}`",
+                    part.join(" ")
+                ))))
+            }
+        }
+    }
+    Some(Ok(characteristics))
+}
+
+/// The access mode of `START TRANSACTION [<mode> [, <mode>]]`, where a mode is
+/// `READ ONLY`, `READ WRITE` or `WITH CONSISTENT SNAPSHOT`: `Some(Ok(None))`
+/// when none is given. `None` when the text is not this statement.
+fn start_transaction_modes(sql: &str) -> Option<Result<Option<bool>>> {
+    let sql = sql.trim().trim_end_matches(';').trim();
+    let mut words = sql.split_ascii_whitespace();
+    if !words.next()?.eq_ignore_ascii_case("start")
+        || !words.next()?.eq_ignore_ascii_case("transaction")
     {
         return None;
     }
-    let level = words.collect::<Vec<_>>().join(" ");
-    (!level.is_empty()).then_some(level)
+    let rest = words.collect::<Vec<_>>().join(" ");
+    let mut access = None;
+    for part in rest.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        let upper = part
+            .split_ascii_whitespace()
+            .map(str::to_ascii_uppercase)
+            .collect::<Vec<_>>()
+            .join(" ");
+        match upper.as_str() {
+            "READ ONLY" => access = Some(true),
+            "READ WRITE" => access = Some(false),
+            "WITH CONSISTENT SNAPSHOT" => {}
+            _ => {
+                return Some(Err(Error::Parse(format!(
+                    "START TRANSACTION: expected READ ONLY, READ WRITE or WITH \
+                     CONSISTENT SNAPSHOT, found `{part}`"
+                ))))
+            }
+        }
+    }
+    Some(Ok(access))
+}
+
+/// Whether `stmt` writes: data, schema, or row locks for update. In a read-only
+/// transaction these are refused before they run (MySQL 1792), whether or not
+/// they would have changed anything. `SELECT ... FOR SHARE` is allowed, as in
+/// MySQL. DDL is refused too: here it is part of the open transaction rather
+/// than committing it implicitly, so it would be a write inside it.
+fn statement_writes(stmt: &Statement) -> bool {
+    match stmt {
+        Statement::Query(q) => q
+            .locks
+            .iter()
+            .any(|lock| lock.lock_type == sqlparser::ast::LockType::Update),
+        Statement::Insert(_)
+        | Statement::Update { .. }
+        | Statement::Delete(_)
+        | Statement::Merge { .. }
+        | Statement::CreateTable(_)
+        | Statement::CreateView { .. }
+        | Statement::CreateIndex(_)
+        | Statement::CreateFunction(_)
+        | Statement::CreateProcedure { .. }
+        | Statement::CreateTrigger { .. }
+        | Statement::AlterTable { .. }
+        | Statement::AlterView { .. }
+        | Statement::AlterIndex { .. }
+        | Statement::Drop { .. }
+        | Statement::DropFunction { .. }
+        | Statement::DropProcedure { .. }
+        | Statement::DropTrigger { .. }
+        | Statement::Truncate { .. } => true,
+        _ => false,
+    }
+}
+
+/// Statements handled as text before parsing that write -- refused in a
+/// read-only transaction before they are dispatched.
+fn text_statement_writes(head: &str) -> bool {
+    [
+        "insert",
+        "replace",
+        "update",
+        "delete",
+        "create ",
+        "drop ",
+        "alter ",
+        "rename ",
+        "truncate",
+        "load data",
+        "grant ",
+        "revoke ",
+        "refresh materialized",
+    ]
+    .iter()
+    .any(|prefix| head.starts_with(prefix))
 }
 
 fn statement_starts_implicit_transaction(statement: &Statement) -> bool {
@@ -6962,5 +7142,208 @@ mod schema_cache_tests {
             }
             _ => panic!("expected rows"),
         }
+    }
+}
+
+#[cfg(test)]
+mod read_only_transaction_tests {
+    use super::{Engine, Privilege, QueryResult};
+    use elyra_core::Error;
+
+    async fn setup() -> (Engine, crate::Session) {
+        let engine = Engine::new(elyra_storage::Db::in_memory().unwrap());
+        let s = engine.session();
+        for sql in [
+            "CREATE TABLE rot (id INT PRIMARY KEY, v INT)",
+            "INSERT INTO rot VALUES (1, 1)",
+        ] {
+            engine.execute(sql, Privilege::Admin, &s).await.unwrap();
+        }
+        (engine, s)
+    }
+
+    async fn ok(engine: &Engine, s: &crate::Session, sql: &str) {
+        engine
+            .execute(sql, Privilege::Admin, s)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+
+    /// The statement fails with MySQL's error, code and SQLSTATE included.
+    async fn refused(engine: &Engine, s: &crate::Session, sql: &str) {
+        match engine.execute(sql, Privilege::Admin, s).await {
+            Err(Error::ReadOnlyTransaction) => {}
+            Err(e) => panic!("{sql}: expected 1792, got {e}"),
+            Ok(_) => panic!("{sql}: a write in a read-only transaction ran"),
+        }
+    }
+
+    async fn count(engine: &Engine, s: &crate::Session) -> String {
+        match engine
+            .execute("SELECT COUNT(*), SUM(v) FROM rot", Privilege::Admin, s)
+            .await
+            .unwrap()
+            .remove(0)
+        {
+            QueryResult::Rows(mut rows) => {
+                let row = rows.next_batch(1).await.unwrap().remove(0);
+                format!(
+                    "{} {}",
+                    row[0].to_wire_string().unwrap(),
+                    row[1].to_wire_string().unwrap()
+                )
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    async fn var(engine: &Engine, s: &crate::Session, sql: &str) -> String {
+        match engine
+            .execute(sql, Privilege::Admin, s)
+            .await
+            .unwrap()
+            .remove(0)
+        {
+            QueryResult::Rows(mut rows) => rows.next_batch(1).await.unwrap().remove(0)[0]
+                .to_wire_string()
+                .unwrap_or_default(),
+            _ => panic!("expected rows"),
+        }
+    }
+
+    /// `START TRANSACTION READ ONLY` refuses every write before it runs, as
+    /// MySQL does (1792). It used to accept them; only a ROLLBACK undid them.
+    #[tokio::test]
+    async fn a_read_only_transaction_refuses_writes() {
+        let (e, s) = setup().await;
+        let err = Error::ReadOnlyTransaction;
+        assert_eq!((err.mysql_code(), err.sqlstate()), (1792, b"25006"));
+        assert_eq!(
+            err.to_string(),
+            "Cannot execute statement in a READ ONLY transaction."
+        );
+
+        for start in [
+            "START TRANSACTION READ ONLY",
+            "START TRANSACTION READ ONLY, WITH CONSISTENT SNAPSHOT",
+            "START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY",
+        ] {
+            ok(&e, &s, start).await;
+            for write in [
+                "INSERT INTO rot VALUES (2, 2)",
+                "REPLACE INTO rot VALUES (1, 5)",
+                "INSERT INTO rot VALUES (1, 1) ON DUPLICATE KEY UPDATE v = 6",
+                "UPDATE rot SET v = 9",
+                "UPDATE rot SET v = 9 WHERE id = 404",
+                "DELETE FROM rot",
+                "SELECT * FROM rot FOR UPDATE",
+                "CREATE TABLE rot2 (id INT)",
+                "CREATE TEMPORARY TABLE tmp1 (id INT)",
+                "CREATE TRIGGER t1 AFTER INSERT ON rot FOR EACH ROW SET @x = 1",
+                "CREATE USER ro_probe IDENTIFIED BY 'passw0rd'",
+                "DROP TABLE rot",
+            ] {
+                refused(&e, &s, write).await;
+            }
+            // Reads, shared locks and session statements still work.
+            ok(&e, &s, "SELECT * FROM rot").await;
+            ok(&e, &s, "SELECT * FROM rot FOR SHARE").await;
+            ok(&e, &s, "SET @x = 5").await;
+            ok(&e, &s, "COMMIT").await;
+            assert_eq!(count(&e, &s).await, "1 1");
+        }
+        // After it, writes work again.
+        ok(&e, &s, "INSERT INTO rot VALUES (2, 2)").await;
+        ok(&e, &s, "START TRANSACTION READ WRITE").await;
+        ok(&e, &s, "UPDATE rot SET v = 3 WHERE id = 2").await;
+        ok(&e, &s, "COMMIT").await;
+        assert_eq!(count(&e, &s).await, "2 4");
+    }
+
+    /// `SET TRANSACTION READ ONLY` (no scope) is for the next transaction only:
+    /// a START TRANSACTION, a COMMIT or an autocommit statement that runs uses
+    /// it up; a write it refused did not start one and leaves it set. Inside
+    /// an open transaction it is refused (1568). All as in MySQL 8.4.
+    #[tokio::test]
+    async fn set_transaction_read_only_is_for_the_next_transaction() {
+        let (e, s) = setup().await;
+        ok(&e, &s, "SET TRANSACTION READ ONLY").await;
+        // Like MySQL, the variable shows the session's mode, and a statement
+        // that touches no table does not use the pending one up.
+        assert_eq!(var(&e, &s, "SELECT @@transaction_read_only").await, "0");
+        ok(&e, &s, "SELECT 1").await;
+        ok(&e, &s, "START TRANSACTION").await;
+        refused(&e, &s, "INSERT INTO rot VALUES (4, 4)").await;
+        ok(&e, &s, "COMMIT").await;
+        ok(&e, &s, "START TRANSACTION").await;
+        ok(&e, &s, "INSERT INTO rot VALUES (4, 4)").await;
+        ok(&e, &s, "ROLLBACK").await;
+
+        // Autocommit: a refused write leaves it set; a SELECT uses it up.
+        ok(&e, &s, "SET TRANSACTION READ ONLY").await;
+        refused(&e, &s, "INSERT INTO rot VALUES (5, 5)").await;
+        refused(&e, &s, "DELETE FROM rot").await;
+        ok(&e, &s, "SELECT 1 FROM rot").await;
+        ok(&e, &s, "INSERT INTO rot VALUES (5, 5)").await;
+
+        // A COMMIT uses it up too.
+        ok(&e, &s, "SET TRANSACTION READ ONLY").await;
+        ok(&e, &s, "COMMIT").await;
+        ok(&e, &s, "DELETE FROM rot WHERE id = 5").await;
+
+        // Refused inside a transaction, which is left as it was.
+        ok(&e, &s, "START TRANSACTION READ ONLY").await;
+        match e
+            .execute("SET TRANSACTION READ WRITE", Privilege::Admin, &s)
+            .await
+        {
+            Err(err @ Error::TransactionInProgress) => {
+                assert_eq!((err.mysql_code(), err.sqlstate()), (1568, b"25001"))
+            }
+            other => panic!("expected 1568, got {:?}", other.err()),
+        }
+        refused(&e, &s, "INSERT INTO rot VALUES (6, 6)").await;
+        ok(&e, &s, "ROLLBACK").await;
+        assert_eq!(count(&e, &s).await, "1 1");
+    }
+
+    /// The session access mode applies to every transaction and to autocommit
+    /// statements, DDL included, until set back; `START TRANSACTION READ
+    /// WRITE` overrides it for one transaction.
+    #[tokio::test]
+    async fn the_session_access_mode_applies_until_reset() {
+        let (e, s) = setup().await;
+        for set_ro in [
+            "SET SESSION TRANSACTION READ ONLY",
+            "SET @@transaction_read_only = 1",
+            "SET SESSION transaction_read_only = ON",
+            "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED, READ ONLY",
+        ] {
+            ok(&e, &s, set_ro).await;
+            assert_eq!(var(&e, &s, "SELECT @@transaction_read_only").await, "1");
+            refused(&e, &s, "INSERT INTO rot VALUES (7, 7)").await;
+            refused(&e, &s, "CREATE TABLE rot3 (id INT)").await;
+            ok(&e, &s, "BEGIN").await;
+            refused(&e, &s, "UPDATE rot SET v = 2").await;
+            ok(&e, &s, "ROLLBACK").await;
+            ok(&e, &s, "START TRANSACTION READ WRITE").await;
+            ok(&e, &s, "INSERT INTO rot VALUES (7, 7)").await;
+            ok(&e, &s, "ROLLBACK").await;
+            // With autocommit off, the implicit transaction is read-only too.
+            ok(&e, &s, "SET autocommit = 0").await;
+            ok(&e, &s, "SELECT 1 FROM rot").await;
+            refused(&e, &s, "INSERT INTO rot VALUES (7, 7)").await;
+            ok(&e, &s, "ROLLBACK").await;
+            ok(&e, &s, "SET autocommit = 1").await;
+            ok(&e, &s, "SET SESSION TRANSACTION READ WRITE").await;
+            assert_eq!(var(&e, &s, "SELECT @@transaction_read_only").await, "0");
+            ok(&e, &s, "INSERT INTO rot VALUES (7, 7)").await;
+            ok(&e, &s, "DELETE FROM rot WHERE id = 7").await;
+        }
+        assert_eq!(
+            var(&e, &s, "SELECT @@transaction_isolation").await,
+            "READ-COMMITTED"
+        );
+        assert_eq!(count(&e, &s).await, "1 1");
     }
 }

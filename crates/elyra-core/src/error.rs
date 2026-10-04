@@ -106,6 +106,17 @@ pub enum Error {
     #[error("unsupported: {0}")]
     Unsupported(String),
 
+    /// A write attempted in a read-only transaction (`START TRANSACTION READ
+    /// ONLY`, `SET [SESSION] TRANSACTION READ ONLY`, `transaction_read_only`).
+    /// MySQL 1792 (`ER_CANT_EXECUTE_IN_READ_ONLY_TRANSACTION`), with its text.
+    #[error("Cannot execute statement in a READ ONLY transaction.")]
+    ReadOnlyTransaction,
+
+    /// `SET TRANSACTION` (no scope) while a transaction is open. MySQL 1568
+    /// (`ER_CANT_CHANGE_TX_CHARACTERISTICS`), with its text.
+    #[error("Transaction characteristics can't be changed while a transaction is in progress")]
+    TransactionInProgress,
+
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -139,6 +150,8 @@ impl Error {
             Error::Duplicate(DuplicateError::ColumnName, _) => 1060, // ER_DUP_FIELDNAME
             Error::Duplicate(DuplicateError::Entry, _) => 1062, // ER_DUP_ENTRY
             Error::ForeignKey(_) => 1452,  // ER_NO_REFERENCED_ROW
+            Error::ReadOnlyTransaction => 1792, // ER_CANT_EXECUTE_IN_READ_ONLY_TRANSACTION
+            Error::TransactionInProgress => 1568, // ER_CANT_CHANGE_TX_CHARACTERISTICS
             _ => 1105,
         }
     }
@@ -159,6 +172,8 @@ impl Error {
             Error::OutOfRange(_) => b"22003",
             Error::DataTooLong(_) => b"22001",
             Error::Duplicate(DuplicateError::ColumnName, _) => b"42S21",
+            Error::ReadOnlyTransaction => b"25006",
+            Error::TransactionInProgress => b"25001",
             _ => b"HY000",
         }
     }

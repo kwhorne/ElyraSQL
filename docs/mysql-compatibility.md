@@ -211,6 +211,20 @@ gaps:
   transactions' commits mid-flight (it reads a consistent snapshot from `BEGIN`),
   whereas true `READ COMMITTED` would. `@@transaction_isolation` reports
   `REPEATABLE-READ` (MySQL's default), which is what most ORMs expect.
+- **Read-only transactions** work as in MySQL. `START TRANSACTION READ ONLY`
+  (with or without `WITH CONSISTENT SNAPSHOT`), `SET TRANSACTION READ ONLY` for
+  the next transaction, and `SET SESSION TRANSACTION READ ONLY` or
+  `@@transaction_read_only = 1` for the session refuse every write -- `INSERT`,
+  `UPDATE`, `DELETE`, `REPLACE`, `SELECT ... FOR UPDATE`, DDL, temporary
+  tables -- with error 1792 *Cannot execute statement in a READ ONLY
+  transaction*, before it runs. `SELECT ... FOR SHARE` is allowed. `READ WRITE`
+  and the combined form (`SET SESSION TRANSACTION ISOLATION LEVEL READ
+  COMMITTED, READ ONLY`) are accepted, and an unscoped `SET TRANSACTION` inside
+  an open transaction is refused with 1568, as MySQL does.
+- **DDL inside a transaction is part of it.** MySQL commits the open
+  transaction implicitly before `CREATE`/`ALTER`/`DROP`; ElyraSQL runs the DDL
+  inside it, so a `ROLLBACK` undoes both. For the same reason, DDL in a
+  read-only transaction is refused rather than committing it first.
 - `SHOW` and `information_schema` cover what GUI tools and drivers need to
   connect and browse (`tables`, `columns`, `engines`, `schemata`, `views`,
   `routines`, `triggers`, `events`, `statistics`, `partitions`); it is not the

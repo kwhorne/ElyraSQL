@@ -31,6 +31,9 @@ pub enum Isolation {
 
 struct TxnState {
     snapshot: Snapshot,
+    /// Started `READ ONLY` (explicitly, or from the next-transaction or session
+    /// access mode): every write statement is refused with MySQL 1792.
+    read_only: bool,
     puts: BTreeMap<Vec<u8>, Vec<u8>>,
     deletes: BTreeSet<Vec<u8>>,
     /// Serializable bookkeeping (unused under snapshot isolation).
@@ -163,6 +166,13 @@ pub struct Session {
     /// see [`Session::set_time_zone`].
     time_zone: Mutex<String>,
     autocommit: std::sync::atomic::AtomicBool,
+    /// The session's transaction access mode (`SET SESSION TRANSACTION READ
+    /// ONLY`, `@@transaction_read_only`): applies to every transaction this
+    /// session starts, and to autocommit statements.
+    session_read_only: std::sync::atomic::AtomicBool,
+    /// `SET TRANSACTION READ ONLY | READ WRITE` without a scope: the access mode
+    /// of the next transaction only, then back to the session's.
+    next_read_only: Mutex<Option<bool>>,
     foreign_key_checks: std::sync::atomic::AtomicBool,
     no_auto_value_on_zero: std::sync::atomic::AtomicBool,
     group_concat_max_len: std::sync::atomic::AtomicUsize,
@@ -231,6 +241,8 @@ impl Session {
             sql_mode: Mutex::new("STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION".into()),
             time_zone: Mutex::new("SYSTEM".into()),
             autocommit: std::sync::atomic::AtomicBool::new(true),
+            session_read_only: std::sync::atomic::AtomicBool::new(false),
+            next_read_only: Mutex::new(None),
             foreign_key_checks: std::sync::atomic::AtomicBool::new(true),
             no_auto_value_on_zero: std::sync::atomic::AtomicBool::new(false),
             group_concat_max_len: std::sync::atomic::AtomicUsize::new(1024),
@@ -627,6 +639,11 @@ impl Session {
                 Value::Int(i64::try_from(self.group_concat_max_len()).unwrap_or(i64::MAX))
             }
             "tx_isolation" | "transaction_isolation" => Value::Text(self.transaction_isolation()),
+            // The session's mode -- neither a pending SET TRANSACTION one nor the
+            // open transaction's, which MySQL does not report here either.
+            "tx_read_only" | "transaction_read_only" => {
+                Value::Int(i64::from(self.session_read_only()))
+            }
             "time_zone" => Value::Text(self.time_zone()),
             _ => crate::predicate::system_var(raw),
         }
@@ -655,6 +672,51 @@ impl Session {
         self.txn.lock().unwrap().is_some()
     }
 
+    /// The session's access mode (`@@transaction_read_only`).
+    pub fn session_read_only(&self) -> bool {
+        self.session_read_only
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn set_session_read_only(&self, read_only: bool) {
+        self.session_read_only
+            .store(read_only, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// `SET TRANSACTION READ ONLY | READ WRITE` without a scope: the next
+    /// transaction's access mode. Refused while one is open, as in MySQL.
+    pub fn set_next_read_only(&self, read_only: bool) -> Result<()> {
+        if self.in_txn() {
+            return Err(Error::TransactionInProgress);
+        }
+        *self.next_read_only.lock().unwrap() = Some(read_only);
+        Ok(())
+    }
+
+    /// Whether a statement run now is read-only: the open transaction's mode,
+    /// or -- for an autocommit statement, which is its own transaction -- the
+    /// next-transaction mode if set, else the session's.
+    pub fn read_only_now(&self) -> bool {
+        if let Some(tx) = self.txn.lock().unwrap().as_ref() {
+            return tx.read_only;
+        }
+        self.next_read_only
+            .lock()
+            .unwrap()
+            .unwrap_or_else(|| self.session_read_only())
+    }
+
+    /// An autocommit statement ran as its own transaction: a next-transaction
+    /// access mode has now been used. (A statement refused for writing in a
+    /// read-only one never started, and leaves it set, as in MySQL.)
+    pub fn consume_next_access_unless_implicit(&self) {
+        // With autocommit off, the statement opens a real transaction, and
+        // `begin` takes the pending mode for it.
+        if !self.in_txn() && self.autocommit() {
+            self.next_read_only.lock().unwrap().take();
+        }
+    }
+
     /// The underlying committed-state handle (used for streaming scans in
     /// autocommit mode only).
     /// The stable, process-unique id of the underlying database (for keying
@@ -675,10 +737,22 @@ impl Session {
     // --- transaction control ---
 
     pub fn begin(&self) -> Result<()> {
+        self.begin_with_access(None)
+    }
+
+    /// Start a transaction with an explicit access mode (`START TRANSACTION
+    /// READ ONLY | READ WRITE`), or, with `None`, the next-transaction mode if
+    /// one is set (it is consumed) and otherwise the session's.
+    pub fn begin_with_access(&self, read_only: Option<bool>) -> Result<()> {
+        let pending = self.next_read_only.lock().unwrap().take();
+        let read_only = read_only
+            .or(pending)
+            .unwrap_or_else(|| self.session_read_only());
         let snapshot = self.db.snapshot()?;
         let serializable = *self.isolation.lock().unwrap() == Isolation::Serializable;
         *self.txn.lock().unwrap() = Some(TxnState {
             snapshot,
+            read_only,
             puts: BTreeMap::new(),
             deletes: BTreeSet::new(),
             serializable,
@@ -825,10 +899,14 @@ impl Session {
     }
 
     pub async fn commit(&self) -> Result<()> {
+        // COMMIT ends the "next transaction" a SET TRANSACTION was aimed at,
+        // even with none open (as MySQL does).
+        self.next_read_only.lock().unwrap().take();
         let staged = self.txn.lock().unwrap().take();
         let Some(tx) = staged else { return Ok(()) };
         let TxnState {
             snapshot,
+            read_only: _,
             puts,
             deletes,
             serializable,
@@ -939,6 +1017,7 @@ impl Session {
     }
 
     pub fn rollback(&self) {
+        self.next_read_only.lock().unwrap().take();
         *self.txn.lock().unwrap() = None;
     }
 
