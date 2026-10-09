@@ -20264,7 +20264,16 @@ fn projection_has_potential_bare_correlation(projection: &[sqlparser::ast::Selec
     })
 }
 
-fn expr_has_subquery(e: &Expr) -> bool {
+/// Does this expression contain a subquery anywhere inside it?
+///
+/// The one answer to that question. There were two: this one, which walks the
+/// whole expression through `map_expr`, and a hand-written match in `lib.rs`
+/// that descended into `BinaryOp` and `Nested` but not into a `CASE` arm or a
+/// function's arguments. The router for `FROM`-less selects used the incomplete
+/// one, so `SELECT (SELECT 1) + 1` reached the full engine while
+/// `SELECT ABS((SELECT -1))` went to the literal evaluator, which has no notion
+/// of a query, and came back refused.
+pub(crate) fn expr_has_subquery(e: &Expr) -> bool {
     let found = std::cell::Cell::new(false);
     let _ = map_expr(e, &|x| {
         if matches!(
@@ -21434,6 +21443,94 @@ fn resolve_subqueries<'a>(
                 low: Box::new(resolve_subqueries(db, vindex, *low).await?),
                 high: Box::new(resolve_subqueries(db, vindex, *high).await?),
             },
+            /*
+             * The arms below are the ones `map_expr` grew for the same reason and
+             * this walker did not.
+             *
+             * A subquery left standing here is not a missing optimisation: the row
+             * evaluator has no notion of a query, so it reaches the catch-all and
+             * the statement is refused. `SELECT (SELECT 1) + 1` answered 2 because
+             * `BinaryOp` is above; `SELECT ABS((SELECT -1))` and
+             * `SELECT CASE WHEN 1 IN (SELECT 1) THEN 1 ELSE 0 END` -- both plain
+             * MySQL -- were refused because a function's arguments and a CASE arm
+             * fell through to `other => other`.
+             *
+             * `expr_has_subquery` is asked of `map_expr`, so the router was already
+             * sending these here before this walker could answer them.
+             */
+            Expr::Function(mut func) => {
+                if let sqlparser::ast::FunctionArguments::List(list) = &mut func.args {
+                    for arg in &mut list.args {
+                        if let sqlparser::ast::FunctionArg::Unnamed(
+                            sqlparser::ast::FunctionArgExpr::Expr(e),
+                        ) = arg
+                        {
+                            *e = resolve_subqueries(db, vindex, e.clone()).await?;
+                        }
+                    }
+                }
+                Expr::Function(func)
+            }
+            Expr::Case {
+                operand,
+                conditions,
+                results,
+                else_result,
+            } => {
+                let mut resolved_conditions = Vec::with_capacity(conditions.len());
+                for condition in conditions {
+                    resolved_conditions.push(resolve_subqueries(db, vindex, condition).await?);
+                }
+                let mut resolved_results = Vec::with_capacity(results.len());
+                for result in results {
+                    resolved_results.push(resolve_subqueries(db, vindex, result).await?);
+                }
+                let operand = match operand {
+                    Some(e) => Some(Box::new(resolve_subqueries(db, vindex, *e).await?)),
+                    None => None,
+                };
+                let else_result = match else_result {
+                    Some(e) => Some(Box::new(resolve_subqueries(db, vindex, *e).await?)),
+                    None => None,
+                };
+                Expr::Case {
+                    operand,
+                    conditions: resolved_conditions,
+                    results: resolved_results,
+                    else_result,
+                }
+            }
+            Expr::Cast {
+                kind,
+                expr,
+                data_type,
+                format,
+            } => Expr::Cast {
+                kind,
+                expr: Box::new(resolve_subqueries(db, vindex, *expr).await?),
+                data_type,
+                format,
+            },
+            Expr::InList {
+                expr,
+                list,
+                negated,
+            } => {
+                let inner = resolve_subqueries(db, vindex, *expr).await?;
+                let mut resolved = Vec::with_capacity(list.len());
+                for item in list {
+                    resolved.push(resolve_subqueries(db, vindex, item).await?);
+                }
+                Expr::InList {
+                    expr: Box::new(inner),
+                    list: resolved,
+                    negated,
+                }
+            }
+            Expr::IsNull(e) => Expr::IsNull(Box::new(resolve_subqueries(db, vindex, *e).await?)),
+            Expr::IsNotNull(e) => {
+                Expr::IsNotNull(Box::new(resolve_subqueries(db, vindex, *e).await?))
+            }
             other => other,
         })
     })

@@ -502,8 +502,25 @@ pub fn eval_row(expr: &Expr, schema: &Schema, row: &[Value]) -> Result<Value> {
             );
             Ok(Value::Bool(m != *negated))
         }
+        /*
+         * This evaluator answers a row, not a clause: a projection item, a CASE
+         * arm, an aggregate's argument and an ORDER BY key all arrive here. The
+         * message used to say "in WHERE" regardless, which sent the reader to
+         * the one clause the expression was not in -- on the report that found
+         * this, to a WHERE subquery the engine supports perfectly well, while
+         * the expression it refused was in the select list.
+         *
+         * A subquery says so in its own words, because it is the one shape that
+         * cannot be evaluated here even in principle: running a query needs the
+         * session this function does not have.
+         */
+        other @ (Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists { .. }) => {
+            Err(Error::Unsupported(format!(
+                "a subquery is not supported in this expression: {other}"
+            )))
+        }
         other => Err(Error::Unsupported(format!(
-            "expression not supported in WHERE: {other}"
+            "expression not supported: {other}"
         ))),
     }
 }

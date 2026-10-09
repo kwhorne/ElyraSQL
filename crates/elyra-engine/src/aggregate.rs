@@ -530,6 +530,38 @@ pub fn build_plan(
     projection: &[SelectItem],
     group_by: &[Expr],
 ) -> Result<AggPlan> {
+    /*
+     * Refused here, while the plan is being built, rather than when a row
+     * arrives.
+     *
+     * Uncorrelated subqueries in the projection are resolved before this runs,
+     * so one still standing is correlated: it would have to be evaluated per
+     * row, and the row evaluator has no notion of a query. It used to find that
+     * out one row at a time -- which meant the same statement was *accepted* on
+     * an empty table, because nothing ever reached the expression, and refused
+     * on the first row that did.
+     *
+     * That is worse than the missing feature. A limitation that only appears
+     * once there is data cannot be caught by a test fixture, an empty
+     * development database or a CI run; it is discovered in production, on the
+     * largest table, by whoever is unlucky. A report shipped against this
+     * engine 500-ed for exactly that reason while passing every test.
+     *
+     * `join_correlated_select` already refuses the same shape up front. This is
+     * the single-table path saying the same thing.
+     */
+    for item in projection {
+        let expr = match item {
+            SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => e,
+            _ => continue,
+        };
+        if crate::exec::expr_has_subquery(expr) {
+            return Err(Error::Unsupported(format!(
+                "a correlated subquery in an aggregate expression is not supported: {expr}"
+            )));
+        }
+    }
+
     let mut aggs = Vec::new();
     let mut agg_types: Vec<ColumnType> = Vec::new();
     let mut plan = Vec::new();

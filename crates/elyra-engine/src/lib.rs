@@ -2245,8 +2245,9 @@ impl Engine {
                 // `SET sql_mode = (SELECT CONCAT(@@sql_mode, ',...'))` is how
                 // sqlx opens every connection. The scalar evaluator has no
                 // notion of a query, so this ran the whole statement into
-                // "expression not supported in WHERE" -- and with it, every
-                // sqlx application, before its first real query. A subquery
+                // "a subquery is not supported in this expression" -- and with
+                // it, every sqlx application, before its first real query. A
+                // subquery
                 // in this position is a query like any other: run it, and
                 // require the one row and one column MySQL requires.
                 Some(query) => self.set_value_from_query(sess, query).await?,
@@ -5295,32 +5296,19 @@ fn query_has_from(q: &sqlparser::ast::Query) -> bool {
 }
 
 /// Whether a SELECT's projection or WHERE contains a subquery expression.
+///
+/// Asked of `crate::exec`, which walks the whole expression. This used to have
+/// its own hand-written walker that stopped at a `CASE` arm and at a function's
+/// arguments, so `SELECT ABS((SELECT -1))` was routed to the literal evaluator
+/// and refused while `SELECT (SELECT 1) + 1` ran.
 fn select_has_subquery(s: &sqlparser::ast::Select) -> bool {
     use sqlparser::ast::SelectItem;
+    let has = crate::exec::expr_has_subquery;
     let proj = s.projection.iter().any(|it| match it {
-        SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
-            expr_has_subquery(e)
-        }
+        SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => has(e),
         _ => false,
     });
-    proj || s.selection.as_ref().is_some_and(expr_has_subquery)
-}
-
-fn expr_has_subquery(e: &sqlparser::ast::Expr) -> bool {
-    use sqlparser::ast::Expr;
-    match e {
-        Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } => true,
-        Expr::Nested(x)
-        | Expr::UnaryOp { expr: x, .. }
-        | Expr::Cast { expr: x, .. }
-        | Expr::IsNull(x)
-        | Expr::IsNotNull(x) => expr_has_subquery(x),
-        Expr::BinaryOp { left, right, .. } => expr_has_subquery(left) || expr_has_subquery(right),
-        Expr::Between {
-            expr, low, high, ..
-        } => expr_has_subquery(expr) || expr_has_subquery(low) || expr_has_subquery(high),
-        _ => false,
-    }
+    proj || s.selection.as_ref().is_some_and(has)
 }
 
 #[cfg(test)]
@@ -8036,5 +8024,127 @@ mod like_escape_engine_tests {
             .await
             .unwrap();
         assert_eq!(row(&e, &s, "SELECT @v, LENGTH(@v)").await, [r"a\b", "3"]);
+    }
+}
+
+#[cfg(test)]
+mod subquery_inside_an_expression_tests {
+    //! A subquery nested inside another expression -- a `CASE` arm, a function
+    //! argument -- is a subquery, and the engine has to see it as one.
+    //!
+    //! Two faults met here. The router that decides which engine answers a
+    //! `FROM`-less `SELECT` walked the expression by hand and never descended
+    //! into `CASE` or a function's arguments, so those queries went to the
+    //! literal evaluator, which has no notion of a query; and the refusal that
+    //! followed was raised per row, so the same statement was accepted on an
+    //! empty table and refused on the first row that reached it.
+    use super::{Engine, Privilege, QueryResult, Session};
+
+    async fn scalar(e: &Engine, s: &Session, sql: &str) -> Result<String, String> {
+        match e.execute(sql, Privilege::Admin, s).await {
+            Err(error) => Err(error.to_string()),
+            Ok(mut results) => match results.remove(0) {
+                QueryResult::Rows(mut rows) => Ok(rows
+                    .next_batch(1)
+                    .await
+                    .unwrap()
+                    .remove(0)
+                    .remove(0)
+                    .to_wire_string()
+                    .unwrap_or_else(|| "NULL".into())),
+                _ => Err("expected rows".into()),
+            },
+        }
+    }
+
+    /// `(SELECT 1) + 1` always worked, because the hand-written walker knew
+    /// about `BinaryOp`. The same subquery one level deeper did not.
+    #[tokio::test]
+    async fn a_subquery_is_found_inside_case_and_function_arguments() {
+        let e = Engine::new(elyra_storage::Db::in_memory().unwrap());
+        let s = e.session();
+
+        for (sql, want) in [
+            ("SELECT (SELECT 1) + 1", "2"),
+            ("SELECT CASE WHEN 1 IN (SELECT 1) THEN 1 ELSE 0 END", "1"),
+            ("SELECT CASE WHEN 2 IN (SELECT 1) THEN 1 ELSE 0 END", "0"),
+            ("SELECT CASE WHEN EXISTS (SELECT 1) THEN 1 ELSE 0 END", "1"),
+            ("SELECT ABS((SELECT -1))", "1"),
+            ("SELECT COALESCE((SELECT NULL), 7)", "7"),
+        ] {
+            assert_eq!(scalar(&e, &s, sql).await.as_deref(), Ok(want), "{sql}");
+        }
+    }
+
+    async fn workload_table(e: &Engine, s: &Session, rows: usize) {
+        for sql in [
+            "CREATE TABLE issues (id BIGINT, status VARCHAR(50), workspace_id BIGINT)",
+            "CREATE TABLE states (id BIGINT, `key` VARCHAR(50), workspace_id BIGINT, \
+             category VARCHAR(50), is_paused TINYINT)",
+            "INSERT INTO states VALUES (1, 'in_progress', 1, 'started', 0)",
+        ] {
+            e.execute(sql, Privilege::Admin, s).await.unwrap();
+        }
+        for n in 1..=rows {
+            e.execute(
+                &format!("INSERT INTO issues VALUES ({n}, 'in_progress', 1)"),
+                Privilege::Admin,
+                s,
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    /// The shape that took a production report down: a correlated subquery
+    /// inside an aggregate's `CASE`. Whatever the engine decides about it, it
+    /// has to decide the same thing with no rows and with one -- a limitation
+    /// that only appears once a row arrives cannot be caught by any test.
+    #[tokio::test]
+    async fn an_aggregate_projection_answers_the_same_way_empty_or_not() {
+        const SQL: &str = "SELECT SUM(CASE WHEN issues.status IN \
+             (SELECT `key` FROM states WHERE states.workspace_id = issues.workspace_id \
+             AND states.category = 'started' AND states.is_paused = 0) \
+             THEN 1 ELSE 0 END) AS moving FROM issues WHERE issues.workspace_id = 1";
+
+        let empty = Engine::new(elyra_storage::Db::in_memory().unwrap());
+        let empty_session = empty.session();
+        workload_table(&empty, &empty_session, 0).await;
+        let on_empty = scalar(&empty, &empty_session, SQL).await;
+
+        let filled = Engine::new(elyra_storage::Db::in_memory().unwrap());
+        let filled_session = filled.session();
+        workload_table(&filled, &filled_session, 3).await;
+        let on_filled = scalar(&filled, &filled_session, SQL).await;
+
+        assert_eq!(
+            on_empty.is_ok(),
+            on_filled.is_ok(),
+            "accepted on an empty table and refused on a populated one:\n  \
+             empty  -> {on_empty:?}\n  filled -> {on_filled:?}"
+        );
+    }
+
+    /// If it is refused, the refusal must not send the reader to the WHERE
+    /// clause when the expression is in the projection.
+    #[tokio::test]
+    async fn a_refusal_does_not_name_the_wrong_clause() {
+        let e = Engine::new(elyra_storage::Db::in_memory().unwrap());
+        let s = e.session();
+        workload_table(&e, &s, 3).await;
+
+        if let Err(message) = scalar(
+            &e,
+            &s,
+            "SELECT SUM(CASE WHEN issues.status IN (SELECT `key` FROM states \
+             WHERE states.workspace_id = issues.workspace_id) THEN 1 ELSE 0 END) FROM issues",
+        )
+        .await
+        {
+            assert!(
+                !message.contains("in WHERE"),
+                "the expression is in the projection: {message}"
+            );
+        }
     }
 }

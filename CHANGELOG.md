@@ -6,6 +6,39 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **A subquery inside a `CASE` arm or a function argument is seen as a
+  subquery.** `SELECT (SELECT 1) + 1` answered 2 while `SELECT ABS((SELECT -1))`,
+  `SELECT COALESCE((SELECT NULL), 7)`,
+  `SELECT CASE WHEN 1 IN (SELECT 1) THEN 1 ELSE 0 END` and the same with
+  `EXISTS` were all refused — plain MySQL, every one of them. Three walkers
+  over the same expression tree disagreed about where a subquery can appear:
+  the router that picks which engine answers a `FROM`-less `SELECT` and the
+  pass that resolves subqueries both stopped at `BinaryOp` and never descended
+  into a `CASE` arm or a function's arguments, while `map_expr` — which had
+  already grown those arms for the same reason — did. The router now asks the
+  complete walker, which is now the only one; the resolver descends as far.
+  This also makes an **uncorrelated** subquery work inside an aggregate:
+  `SUM(CASE WHEN t.col IN (SELECT k FROM s) THEN 1 ELSE 0 END)` returns a
+  number where it used to be refused.
+
+- **A correlated subquery in an aggregate expression is refused when the
+  statement is planned, not when a row arrives.** It was the catch-all of the
+  per-row expression evaluator, so whether the statement was accepted depended
+  on whether a row ever reached the expression: the same query was accepted on
+  an empty table and refused on the first matching row. A limitation that only
+  appears once there is data cannot be caught by a test fixture, an empty
+  development database or a CI run — it is discovered in production, on the
+  largest table. The single-table aggregate path now refuses it up front, as
+  the join path already did, and names the aggregate it found it in.
+
+- **The row evaluator no longer blames `WHERE` for an expression that is not in
+  it.** It answers projection items, `CASE` arms, aggregate arguments and
+  `ORDER BY` keys, and said "expression not supported in WHERE" for all of
+  them — pointing at the one clause the expression was not in. A subquery now
+  says what it is; anything else names no clause.
+
 ## [1.12.3] - 2026-10-04
 
 ### Fixed

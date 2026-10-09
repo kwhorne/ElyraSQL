@@ -43,8 +43,14 @@ judge fit before deploying.
   ORDER BY ...)`, including `OVER (w ...)` inheriting a named window.
 - Numeric value-offset `RANGE` frames and peer-offset `GROUPS` frames are
   supported. Temporal `RANGE` offsets are not yet supported. Other gaps include
-  correlated subqueries combined with aggregation over a join, user-defined
-  functions, and events.
+  user-defined functions and events.
+- **A correlated subquery inside an aggregate expression** is not supported —
+  `SUM(CASE WHEN t.col IN (SELECT ... WHERE s.k = t.k) THEN 1 ELSE 0 END)`,
+  over one table or a join. It is refused while the statement is planned, so an
+  empty table and a full one answer the same way. An **uncorrelated** subquery
+  in the same position is supported: it is evaluated once, before any row is
+  read. Where the correlation is only a lookup, resolving the keys first and
+  binding them as a list is also one query instead of one per row.
 - `INSERT ... SET col = val, ...` (MySQL shorthand) is supported — it is
   rewritten to `INSERT ... (cols) VALUES (...)` before parsing, including
   `ON DUPLICATE KEY UPDATE`.
