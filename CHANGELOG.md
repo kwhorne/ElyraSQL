@@ -6,7 +6,18 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.12.4] - 2026-10-09
+
 ### Fixed
+
+- **The page cache no longer grows without bound under a write workload**
+  (redb 2.6.3 → 2.6.4). `remove()` left the key's entry in the LRU queue behind
+  and a later `insert()` of the same key pushed another, while the only trim ran
+  inside `remove()` behind a size test the queue could stay under. A server whose
+  page cache never reaches its configured limit therefore grew for as long as it
+  ran — which is every long-lived deployment with a steady write load. Entries
+  now carry a sequence number, so a stale queue entry is recognisable and an
+  insert over a live key replaces it in place.
 
 - **A subquery inside a `CASE` arm or a function argument is seen as a
   subquery.** `SELECT (SELECT 1) + 1` answered 2 while `SELECT ABS((SELECT -1))`,
