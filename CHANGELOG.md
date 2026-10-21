@@ -6,6 +6,19 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **The server stops on SIGTERM.** Only SIGINT (Ctrl-C) was handled. SIGTERM
+  is what `docker stop`, systemd and Kubernetes send, and a process running as
+  PID 1 in a container ignores a signal it has no handler for: `docker stop`
+  waited out its timeout (10 s by default) and then killed the server, which
+  exited with 137. Outside a container SIGTERM ended it at once, as a crash.
+  `serve`, `cluster` and `replica` now stop on either signal, and flush first,
+  so with `ELYRASQL_SYNC=normal` every acknowledged commit is on disk before
+  the process exits. Nothing was lost by the kill itself — every commit had
+  reached the operating system — but a host shut down right after could lose
+  the last unflushed ones.
+
 ## [1.12.5] - 2026-10-21
 
 ### Fixed

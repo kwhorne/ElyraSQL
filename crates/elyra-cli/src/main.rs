@@ -233,6 +233,35 @@ fn parse_auth_spec(spec: &str) -> anyhow::Result<(String, String, elyra_core::Pr
     Ok((parts[0].to_string(), parts[1].to_string(), role))
 }
 
+/// Resolves on SIGINT (Ctrl-C) or SIGTERM, the signal `docker stop`, systemd
+/// and Kubernetes send to stop a service. Only SIGINT used to be handled, and
+/// as PID 1 in a container a process ignores a signal it has no handler for:
+/// `docker stop` waited out its timeout and then killed the server.
+async fn shutdown_signal() -> &'static str {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        if let Ok(mut term) = signal(SignalKind::terminate()) {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => return "SIGINT",
+                _ = term.recv() => return "SIGTERM",
+            }
+        }
+    }
+    let _ = tokio::signal::ctrl_c().await;
+    "SIGINT"
+}
+
+/// Stop on `signal`: flush first, so with relaxed durability every
+/// acknowledged commit is on disk -- not only in the OS's buffers -- before the
+/// process exits and the host is perhaps shut down after it.
+fn shut_down(db: &Db, signal: &str) {
+    tracing::info!(signal, "shutting down");
+    if let Err(e) = db.flush() {
+        tracing::error!(error = %e, "final flush failed");
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     // A generous worker-thread stack gives headroom for deep (but depth-guarded)
     // recursion via triggers and stored procedures.
@@ -386,9 +415,7 @@ async fn run() -> anyhow::Result<()> {
             };
             tokio::select! {
                 result = elyra_server::serve(config, engine) => result?,
-                _ = tokio::signal::ctrl_c() => {
-                    tracing::info!("received SIGINT, shutting down");
-                }
+                signal = shutdown_signal() => shut_down(&db, signal),
             }
         }
         Command::BinlogReplay {
@@ -444,7 +471,7 @@ async fn run() -> anyhow::Result<()> {
                 node.clone(),
                 read_only.clone(),
             ));
-            let auth = std::sync::Arc::new(elyra_server::Auth::open().with_db(db));
+            let auth = std::sync::Arc::new(elyra_server::Auth::open().with_db(db.clone()));
             let config = elyra_server::ServerConfig {
                 listen,
                 auth,
@@ -458,6 +485,7 @@ async fn run() -> anyhow::Result<()> {
             tokio::select! {
                 result = node.run() => result?,
                 result = elyra_server::serve(config, engine) => result?,
+                signal = shutdown_signal() => shut_down(&db, signal),
             }
         }
         Command::Replica {
@@ -518,7 +546,7 @@ async fn run() -> anyhow::Result<()> {
                 } else {
                     elyra_server::Auth::with_users(entries)
                 }
-                .with_db(db),
+                .with_db(db.clone()),
             );
             let config = elyra_server::ServerConfig {
                 listen,
@@ -530,7 +558,10 @@ async fn run() -> anyhow::Result<()> {
                 replication_listen: None,
                 read_only: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             };
-            elyra_server::serve(config, engine).await?;
+            tokio::select! {
+                result = elyra_server::serve(config, engine) => result?,
+                signal = shutdown_signal() => shut_down(&db, signal),
+            }
         }
     }
     Ok(())
