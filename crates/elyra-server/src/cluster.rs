@@ -573,15 +573,19 @@ impl Node {
             (s.term, log.last_index(), log.last_term())
         };
         info!(id = self.cfg.id, term, last_index, "standing for election");
+        let m = Msg::RequestVote {
+            term,
+            candidate: self.cfg.id,
+            last_log_index: last_index,
+            last_log_term: last_term,
+        };
+        // Every peer at once, as a replication round does.
+        let peers = self.peer_snapshot();
+        let replies =
+            futures_util::future::join_all(peers.iter().map(|p| rpc(&p.control_addr, &m))).await;
         let mut votes = 1;
-        for peer in self.peer_snapshot() {
-            let m = Msg::RequestVote {
-                term,
-                candidate: self.cfg.id,
-                last_log_index: last_index,
-                last_log_term: last_term,
-            };
-            if let Ok(Msg::Vote { term: t, granted }) = rpc(&peer.control_addr, &m).await {
+        for reply in replies {
+            if let Ok(Msg::Vote { term: t, granted }) = reply {
                 let mut s = self.state.lock().unwrap();
                 if t > s.term {
                     s.term = t;
@@ -675,59 +679,55 @@ impl Node {
                     .unwrap_or(0)
             }
         };
-        let mut quorum_acks = 1usize; // this leader counts itself
-        for peer in peers {
-            let (prev_index, prev_term, entries) = {
-                let log = self.log.lock().unwrap();
-                let next = self
-                    .progress
-                    .lock()
-                    .unwrap()
-                    .get(&peer.id)
-                    .map(|p| p.next)
-                    .unwrap_or(1);
-                let prev_index = next.saturating_sub(1);
-                let prev_term = log.term_at(prev_index).unwrap_or(0);
-                (prev_index, prev_term, log.entries_after(prev_index))
-            };
-            let m = Msg::AppendEntries {
-                term,
-                leader: self.cfg.id,
-                repl_addr: self.cfg.replication_addr.clone(),
-                members: members.clone(),
-                prev_index,
-                prev_term,
-                entries,
-                leader_commit,
-                compact_index,
-            };
-            // Reuse the persistent connection; reconnect once on failure.
-            let reply = match conns.get_mut(&peer.id) {
-                Some(s) => append_rpc(s, &m).await.ok(),
-                None => None,
-            };
-            let reply = match reply {
-                Some(r) => Some(r),
-                None => {
-                    conns.remove(&peer.id);
-                    match connect_peer(&peer.control_addr).await {
-                        Ok(mut s) => {
-                            if auth_connect(&mut s).await.is_err() {
-                                conns.remove(&peer.id);
-                                continue;
-                            }
-                            match append_rpc(&mut s, &m).await {
-                                Ok(r) => {
-                                    conns.insert(peer.id, s);
-                                    Some(r)
-                                }
-                                Err(_) => None,
-                            }
-                        }
-                        Err(_) => None,
-                    }
+        // Every follower at once, each within one deadline: asked in turn, a
+        // peer that was down or slow held up the rest, and a reconnect had no
+        // deadline at all, so the round could outlast the leader lease.
+        let exchanges: Vec<_> = peers
+            .iter()
+            .map(|peer| {
+                let (prev_index, prev_term, entries) = {
+                    let log = self.log.lock().unwrap();
+                    let next = self
+                        .progress
+                        .lock()
+                        .unwrap()
+                        .get(&peer.id)
+                        .map(|p| p.next)
+                        .unwrap_or(1);
+                    let prev_index = next.saturating_sub(1);
+                    let prev_term = log.term_at(prev_index).unwrap_or(0);
+                    (prev_index, prev_term, log.entries_after(prev_index))
+                };
+                let m = Msg::AppendEntries {
+                    term,
+                    leader: self.cfg.id,
+                    repl_addr: self.cfg.replication_addr.clone(),
+                    members: members.clone(),
+                    prev_index,
+                    prev_term,
+                    entries,
+                    leader_commit,
+                    compact_index,
+                };
+                let conn = conns.remove(&peer.id);
+                let addr = peer.control_addr.clone();
+                async move {
+                    tokio::time::timeout(
+                        Duration::from_millis(PEER_RPC_MS),
+                        append_exchange(conn, &addr, &m),
+                    )
+                    .await
+                    .unwrap_or((None, None))
                 }
-            };
+            })
+            .collect();
+        let replies = futures_util::future::join_all(exchanges).await;
+
+        let mut quorum_acks = 1usize; // this leader counts itself
+        for (peer, (conn, reply)) in peers.iter().zip(replies) {
+            if let Some(conn) = conn {
+                conns.insert(peer.id, conn);
+            }
             match reply {
                 Some(Msg::AppendAck {
                     term: t,
@@ -1008,8 +1008,11 @@ pub async fn auth_respond_to_peer<S: tokio::io::AsyncRead + tokio::io::AsyncWrit
     Ok(())
 }
 
-/// One-shot request/response RPC to a peer with a short timeout (elections,
-/// membership).
+/// Deadline for one exchange with a peer -- connecting, authenticating and the
+/// request and its reply. Well inside the leader lease, so a round in which
+/// some peers never answer still renews it with the others' acks.
+const PEER_RPC_MS: u64 = 500;
+
 /// Open a control-plane connection to a peer: plain TCP, or TLS (verifying the
 /// peer's certificate against `ELYRASQL_CLUSTER_TLS_CA`) when configured.
 async fn connect_peer(addr: &str) -> std::io::Result<PeerConn> {
@@ -1024,6 +1027,8 @@ async fn connect_peer(addr: &str) -> std::io::Result<PeerConn> {
     }
 }
 
+/// One-shot request/response RPC to a peer with a short timeout (elections,
+/// membership).
 async fn rpc(addr: &str, m: &Msg) -> std::io::Result<Msg> {
     let fut = async {
         let mut stream = connect_peer(addr).await?;
@@ -1033,7 +1038,7 @@ async fn rpc(addr: &str, m: &Msg) -> std::io::Result<Msg> {
             .await?
             .ok_or_else(|| Error::new(ErrorKind::UnexpectedEof, "peer closed"))
     };
-    tokio::time::timeout(Duration::from_millis(500), fut)
+    tokio::time::timeout(Duration::from_millis(PEER_RPC_MS), fut)
         .await
         .map_err(|_| Error::new(ErrorKind::TimedOut, "rpc timeout"))?
 }
@@ -1049,9 +1054,34 @@ async fn append_rpc<S: AsyncRead + AsyncWrite + Unpin>(
             .await?
             .ok_or_else(|| Error::new(ErrorKind::UnexpectedEof, "peer closed"))
     };
-    tokio::time::timeout(Duration::from_millis(500), fut)
+    tokio::time::timeout(Duration::from_millis(PEER_RPC_MS), fut)
         .await
         .map_err(|_| Error::new(ErrorKind::TimedOut, "append rpc timeout"))?
+}
+
+/// One AppendEntries to a follower over its persistent connection, connecting
+/// afresh if there is none or it failed. Returns the connection to keep, if
+/// any, and the reply. Unbounded itself: the caller sets the deadline.
+async fn append_exchange(
+    conn: Option<PeerConn>,
+    addr: &str,
+    m: &Msg,
+) -> (Option<PeerConn>, Option<Msg>) {
+    if let Some(mut s) = conn {
+        if let Ok(reply) = append_rpc(&mut s, m).await {
+            return (Some(s), Some(reply));
+        }
+    }
+    let Ok(mut s) = connect_peer(addr).await else {
+        return (None, None);
+    };
+    if auth_connect(&mut s).await.is_err() {
+        return (None, None);
+    }
+    match append_rpc(&mut s, m).await {
+        Ok(reply) => (Some(s), Some(reply)),
+        Err(_) => (None, None),
+    }
 }
 
 /// Operator command: add/remove a peer on the node at `node_addr`.
@@ -1115,6 +1145,60 @@ mod tests {
         assert_eq!(mk(0), 1);
         assert_eq!(mk(2), 2);
         assert_eq!(mk(4), 3);
+    }
+
+    /// A replication round and an election ask every peer at once, each within
+    /// one deadline, so peers that never answer cost one deadline in all, not
+    /// one each. Asked in turn, two silent peers kept a round past the leader
+    /// lease, and a reconnect that stalled had no deadline at all.
+    #[tokio::test]
+    async fn silent_peers_cost_one_deadline_not_one_each() {
+        // Listeners that are never accepted from: the connection is made, and
+        // nothing is ever answered.
+        let mut silent = Vec::new();
+        let mut peers = Vec::new();
+        for id in [2, 3] {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            peers.push(Peer {
+                id,
+                control_addr: l.local_addr().unwrap().to_string(),
+            });
+            silent.push(l);
+        }
+        let node = Node::new(
+            ClusterConfig {
+                id: 1,
+                control_listen: String::new(),
+                replication_addr: String::new(),
+                peers,
+                state_path: None,
+                log_path: None,
+            },
+            Db::in_memory().unwrap(),
+        );
+        let within = Duration::from_millis(PEER_RPC_MS * 8 / 5);
+
+        let started = Instant::now();
+        node.start_election().await;
+        assert!(
+            started.elapsed() < within,
+            "election took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(node.state.lock().unwrap().role, Role::Candidate);
+
+        {
+            let mut s = node.state.lock().unwrap();
+            s.role = Role::Leader;
+        }
+        let started = Instant::now();
+        node.replicate_round(&mut HashMap::new()).await;
+        assert!(
+            started.elapsed() < within,
+            "round took {:?}",
+            started.elapsed()
+        );
+        assert!(started.elapsed() < Duration::from_millis(LEADER_LEASE_MS));
     }
 
     // The control-plane framing must work over any AsyncRead+AsyncWrite transport
