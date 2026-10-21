@@ -267,6 +267,14 @@ fn touches_schema<'a>(mut keys: impl Iterator<Item = &'a [u8]>) -> bool {
     keys.any(|k| SCHEMA_PREFIXES.iter().any(|p| k.starts_with(p)))
 }
 
+/// One plain or `INSERT` write for [`Storage::apply_jobs`]: `new` keys must
+/// not exist yet (an `INSERT`), `puts` may overwrite, `deletes` go first.
+pub struct PlainJob<'a> {
+    pub new: Option<&'a [(Vec<u8>, Vec<u8>)]>,
+    pub puts: &'a [(Vec<u8>, Vec<u8>)],
+    pub deletes: &'a [Vec<u8>],
+}
+
 /// Smallest key strictly greater than every key starting with `prefix`
 /// (`None` when the prefix is all `0xFF`). Used to bound prefix range scans to
 /// a single keyspace instead of the whole database.
@@ -1157,6 +1165,80 @@ impl Storage {
         Ok(())
     }
 
+    /// Apply several plain or `INSERT` writes in one write transaction (one
+    /// fsync) -- the writer's group commit -- each **in turn**: its deletes,
+    /// then its new keys, then its puts, as [`Storage::apply_insert`] and
+    /// [`Storage::apply`] do for one. The group used to be merged into a single
+    /// write with every delete applied before every put, so a key one job wrote
+    /// and a later job in the same group deleted survived. A Raft follower
+    /// catching up applies a batch of committed entries this way, so a row
+    /// deleted on the leader stayed on the follower.
+    ///
+    /// A job whose new keys are already present (or repeat within it) is
+    /// refused before any of it is written, with the duplicate error
+    /// `apply_insert` returns; the other jobs are unaffected. Returns a result
+    /// per job, in order.
+    pub fn apply_jobs(&self, jobs: &[PlainJob<'_>]) -> Result<Vec<Result<()>>> {
+        let wtx = self.raw_begin_write()?;
+        let mut results = Vec::with_capacity(jobs.len());
+        let mut schema = false;
+        {
+            let mut t = wtx
+                .open_table(KV)
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            for job in jobs {
+                if let Some(new) = job.new {
+                    // What `apply_insert` would find: a key present after this
+                    // job's own deletes, or one it inserts twice.
+                    let deleted: std::collections::HashSet<&[u8]> =
+                        job.deletes.iter().map(Vec::as_slice).collect();
+                    let mut seen = std::collections::HashSet::with_capacity(new.len());
+                    let mut duplicate = false;
+                    for (k, _) in new {
+                        let present = !deleted.contains(k.as_slice())
+                            && t.get(k.as_slice())
+                                .map_err(|e| Error::Storage(e.to_string()))?
+                                .is_some();
+                        if present || !seen.insert(k.as_slice()) {
+                            duplicate = true;
+                            break;
+                        }
+                    }
+                    if duplicate {
+                        results.push(Err(Error::Duplicate(
+                            DuplicateError::Entry,
+                            "Duplicate entry for key 'PRIMARY'".into(),
+                        )));
+                        continue;
+                    }
+                }
+                for k in job.deletes {
+                    t.remove(k.as_slice())
+                        .map_err(|e| Error::Storage(e.to_string()))?;
+                }
+                for (k, v) in job.new.unwrap_or_default().iter().chain(job.puts) {
+                    t.insert(k.as_slice(), v.as_slice())
+                        .map_err(|e| Error::Storage(e.to_string()))?;
+                }
+                schema |= touches_schema(
+                    job.new
+                        .unwrap_or_default()
+                        .iter()
+                        .chain(job.puts)
+                        .map(|(k, _)| k.as_slice()),
+                ) || touches_schema(job.deletes.iter().map(Vec::as_slice));
+                results.push(Ok(()));
+            }
+            t.insert(WSEQ_KEY, next_wseq().to_le_bytes().as_slice())
+                .map_err(|e| Error::Storage(e.to_string()))?;
+        }
+        wtx.commit().map_err(|e| Error::Storage(e.to_string()))?;
+        if schema {
+            bump_schema_generation();
+        }
+        Ok(results)
+    }
+
     /// Insert `new` keys that must not already exist (plain `INSERT`), plus
     /// `aux` puts (index entries, counters) that may overwrite. If any `new`
     /// key is already present the whole transaction is aborted and a duplicate
@@ -1279,6 +1361,103 @@ mod tests {
                 "{key:?}"
             );
         }
+    }
+
+    fn kv(k: &[u8], v: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        (k.to_vec(), v.to_vec())
+    }
+
+    /// Jobs in one group apply in order. Merged, every delete ran before every
+    /// put, so a key written by one job and deleted by the next survived.
+    #[test]
+    fn grouped_jobs_apply_in_order() {
+        let s = Storage::in_memory().unwrap();
+        let put_k = [kv(b"data::t::k", b"1")];
+        let del_k = [b"data::t::k".to_vec()];
+        let none: [(Vec<u8>, Vec<u8>); 0] = [];
+        let no_del: [Vec<u8>; 0] = [];
+        // INSERT k, then DELETE k.
+        let r = s
+            .apply_jobs(&[
+                PlainJob {
+                    new: Some(&put_k),
+                    puts: &none,
+                    deletes: &no_del,
+                },
+                PlainJob {
+                    new: None,
+                    puts: &none,
+                    deletes: &del_k,
+                },
+            ])
+            .unwrap();
+        assert!(r.iter().all(|r| r.is_ok()));
+        assert_eq!(s.get(b"data::t::k").unwrap(), None, "deleted key survived");
+        // DELETE k, then put k: present.
+        s.apply_jobs(&[
+            PlainJob {
+                new: None,
+                puts: &none,
+                deletes: &del_k,
+            },
+            PlainJob {
+                new: None,
+                puts: &put_k,
+                deletes: &no_del,
+            },
+        ])
+        .unwrap();
+        assert_eq!(s.get(b"data::t::k").unwrap().as_deref(), Some(&b"1"[..]));
+    }
+
+    /// A duplicate fails its own job, before any of it is written; the others
+    /// apply. A job may delete a key and insert it again (as apply_insert).
+    #[test]
+    fn a_duplicate_fails_only_its_own_job() {
+        let s = Storage::in_memory().unwrap();
+        s.put(b"data::t::1", b"old").unwrap();
+        let none: [(Vec<u8>, Vec<u8>); 0] = [];
+        let no_del: [Vec<u8>; 0] = [];
+        let dup = [kv(b"data::t::2", b"x"), kv(b"data::t::1", b"y")];
+        let dup_aux = [kv(b"idx::t::a", b"aux")];
+        let fine = [kv(b"data::t::3", b"z")];
+        let twice = [kv(b"data::t::4", b"a"), kv(b"data::t::4", b"b")];
+        let reinsert = [kv(b"data::t::1", b"new")];
+        let del_1 = [b"data::t::1".to_vec()];
+        let r = s
+            .apply_jobs(&[
+                PlainJob {
+                    new: Some(&dup),
+                    puts: &dup_aux,
+                    deletes: &no_del,
+                },
+                PlainJob {
+                    new: Some(&fine),
+                    puts: &none,
+                    deletes: &no_del,
+                },
+                PlainJob {
+                    new: Some(&twice),
+                    puts: &none,
+                    deletes: &no_del,
+                },
+                PlainJob {
+                    new: Some(&reinsert),
+                    puts: &none,
+                    deletes: &del_1,
+                },
+            ])
+            .unwrap();
+        assert!(matches!(r[0], Err(Error::Duplicate(..))));
+        assert!(r[1].is_ok());
+        assert!(matches!(r[2], Err(Error::Duplicate(..))));
+        assert!(r[3].is_ok());
+        // Nothing of the refused jobs was written.
+        assert_eq!(s.get(b"data::t::2").unwrap(), None);
+        assert_eq!(s.get(b"idx::t::a").unwrap(), None);
+        assert_eq!(s.get(b"data::t::4").unwrap(), None);
+        assert_eq!(s.get(b"data::t::3").unwrap().as_deref(), Some(&b"z"[..]));
+        assert_eq!(s.get(b"data::t::1").unwrap().as_deref(), Some(&b"new"[..]));
     }
 
     #[test]

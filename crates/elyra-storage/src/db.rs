@@ -973,33 +973,21 @@ fn apply_job_group(storage: &Arc<Storage>, jobs: Vec<WriteJob>, repl: &mut Repl)
         return;
     }
 
-    let mut new = Vec::new();
-    let mut puts = Vec::new();
-    let mut deletes = Vec::new();
-    for j in &jobs {
-        if let Some(n) = &j.insert_new {
-            new.extend_from_slice(n);
-        }
-        puts.extend_from_slice(&j.puts);
-        deletes.extend_from_slice(&j.deletes);
-    }
-
-    match storage.apply_insert(&new, &puts, &deletes) {
-        Ok(()) => {
-            if repl.active() {
-                let mut all_puts = new.clone();
-                all_puts.extend_from_slice(&puts);
-                repl.publish(all_puts, deletes.clone());
-            }
-            for job in jobs {
-                let _ = job.ack.send(Ok(()));
-            }
-        }
-        Err(Error::Duplicate(..)) => {
-            // A duplicate somewhere in the group: redo each job on its own so
-            // only the statement with the duplicate fails.
-            for job in jobs {
-                let r = apply_one(&job);
+    // One transaction for the group, each job applied in turn (see
+    // `Storage::apply_jobs`); published to replicas and the binlog one job at a
+    // time, in the same order.
+    let plain: Vec<crate::PlainJob<'_>> = jobs
+        .iter()
+        .map(|j| crate::PlainJob {
+            new: j.insert_new.as_deref(),
+            puts: &j.puts,
+            deletes: &j.deletes,
+        })
+        .collect();
+    match storage.apply_jobs(&plain) {
+        Ok(results) => {
+            drop(plain);
+            for (job, r) in jobs.into_iter().zip(results) {
                 if r.is_ok() && repl.active() {
                     repl.publish(job_puts(&job), job.deletes.clone());
                 }
@@ -1007,10 +995,83 @@ fn apply_job_group(storage: &Arc<Storage>, jobs: Vec<WriteJob>, repl: &mut Repl)
             }
         }
         Err(e) => {
+            drop(plain);
             for job in jobs {
                 let _ = job.ack.send(Err(Error::Storage(e.to_string())));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod group_commit_tests {
+    use super::*;
+
+    fn job(
+        new: Option<Vec<(Vec<u8>, Vec<u8>)>>,
+        puts: Vec<(Vec<u8>, Vec<u8>)>,
+        deletes: Vec<Vec<u8>>,
+    ) -> (WriteJob, oneshot::Receiver<Result<()>>) {
+        let (ack, rx) = oneshot::channel();
+        (
+            WriteJob {
+                puts,
+                deletes,
+                validation: None,
+                insert_new: new,
+                ack,
+            },
+            rx,
+        )
+    }
+
+    /// The writer's group commit applies jobs in order and acks each. A Raft
+    /// follower catching up submits committed entries together, so an INSERT
+    /// and a later DELETE of the same row land in one group; the row used to
+    /// survive there while the leader had deleted it.
+    #[test]
+    fn a_group_applies_its_jobs_in_order() {
+        let storage = Arc::new(Storage::in_memory().unwrap());
+        let (tx, _rx) = broadcast::channel(16);
+        let mut repl = Repl {
+            lsn: Arc::new(AtomicU64::new(0)),
+            tx,
+            binlog: None,
+        };
+        let k = b"data::t::k".to_vec();
+        let (insert, a1) = job(Some(vec![(k.clone(), b"row".to_vec())]), vec![], vec![]);
+        let (delete, a2) = job(None, vec![], vec![k.clone()]);
+        apply_job_group(&storage, vec![insert, delete], &mut repl);
+        assert!(a1.blocking_recv().unwrap().is_ok());
+        assert!(a2.blocking_recv().unwrap().is_ok());
+        assert_eq!(
+            storage.get(&k).unwrap(),
+            None,
+            "the deleted row survived the group"
+        );
+
+        // A duplicate in a group fails only its own job.
+        let (fine, a3) = job(
+            Some(vec![(b"data::t::i".to_vec(), b"x".to_vec())]),
+            vec![],
+            vec![],
+        );
+        let (dup, a4) = job(
+            Some(vec![
+                (b"data::t::j".to_vec(), b"x".to_vec()),
+                (b"data::t::j".to_vec(), b"y".to_vec()),
+            ]),
+            vec![],
+            vec![],
+        );
+        apply_job_group(&storage, vec![fine, dup], &mut repl);
+        assert!(a3.blocking_recv().unwrap().is_ok());
+        assert!(matches!(
+            a4.blocking_recv().unwrap(),
+            Err(Error::Duplicate(..))
+        ));
+        assert!(storage.get(b"data::t::i").unwrap().is_some());
+        assert_eq!(storage.get(b"data::t::j").unwrap(), None);
     }
 }
 

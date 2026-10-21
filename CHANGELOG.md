@@ -6,6 +6,18 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **A group commit applies its writes in the order they were made.** The
+  storage writer folds consecutive writes into one transaction, and applied
+  every job's deletes before any job's puts. A row inserted by one job and
+  deleted by a later one in the same group therefore survived. Under load on a
+  single server two sessions could hit this; on a cluster follower catching up
+  it is the normal case — the follower applies a batch of log entries
+  concurrently, so `INSERT` followed by `DELETE` of the same row diverged from
+  the leader. Each job's deletes and puts are now applied in turn, inside the
+  one transaction, and a duplicate key still fails only its own job.
+
 ### Security
 
 - **rustls 0.23.46, rustls-webpki 0.103.16, webpki-roots 1.0.10**, for
