@@ -223,10 +223,18 @@ const KV: TableDefinition<&[u8], &[u8]> = TableDefinition::new("elyra_kv");
 /// observes the `wseq` that exactly identifies its committed state -- the basis
 /// for race-free cache invalidation in the engine (a cached artifact tagged
 /// with a `wseq` is valid iff the current committed `wseq` still matches).
+///
+/// The counter is per database and resumes from the persisted value when the
+/// file is opened. It used to be one process-wide counter starting at 1, so
+/// after a restart the sequence ran through values the file had already had,
+/// and an engine cache tagged with one of them was served again for a
+/// different state of the data.
 const WSEQ_KEY: &[u8] = b"meta::wseq";
-static WSEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-fn next_wseq() -> u64 {
-    WSEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+
+fn decode_wseq(v: Option<&[u8]>) -> u64 {
+    v.and_then(|b| b.try_into().ok())
+        .map(u64::from_le_bytes)
+        .unwrap_or(0)
 }
 
 /// Key prefixes of the schema: table definitions and their declared widths and
@@ -310,6 +318,8 @@ pub struct Storage {
     /// Monotonic marker so a forced [`flush`](Self::flush) is always a real
     /// (non-empty) `Immediate` commit that persists queued `Eventual` writes.
     flush_seq: std::sync::atomic::AtomicU64,
+    /// The last write sequence handed out (see [`WSEQ_KEY`]).
+    wseq: std::sync::atomic::AtomicU64,
 }
 
 /// Read the configured durability from `ELYRASQL_SYNC` (`full` -> Immediate,
@@ -355,14 +365,18 @@ impl Storage {
                 }
                 other => Error::Storage(other.to_string()),
             })?;
-        // Ensure the KV table exists so first reads don't fail.
+        // Ensure the KV table exists so first reads don't fail, and pick up
+        // the write sequence where the file left it.
         let wtx = db
             .begin_write()
             .map_err(|e| Error::Storage(e.to_string()))?;
-        {
-            wtx.open_table(KV)
+        let wseq = {
+            let t = wtx
+                .open_table(KV)
                 .map_err(|e| Error::Storage(e.to_string()))?;
-        }
+            let v = t.get(WSEQ_KEY).map_err(|e| Error::Storage(e.to_string()))?;
+            decode_wseq(v.as_ref().map(|v| v.value()))
+        };
         wtx.commit().map_err(|e| Error::Storage(e.to_string()))?;
         // A (re)opened database: nothing cached from another applies.
         bump_schema_generation();
@@ -371,12 +385,20 @@ impl Storage {
             path: Some(pathbuf),
             durability: configured_durability(),
             flush_seq: std::sync::atomic::AtomicU64::new(0),
+            wseq: std::sync::atomic::AtomicU64::new(wseq),
         })
     }
 
     /// The data file path this storage was opened from, if known.
     pub fn path(&self) -> Option<&Path> {
         self.path.as_deref()
+    }
+
+    /// The next write sequence, to be written at [`WSEQ_KEY`] in the write
+    /// transaction being built. Write transactions are serialised, so the
+    /// committed values follow the order of the commits.
+    fn next_wseq(&self) -> u64 {
+        self.wseq.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
     }
 
     /// Begin a write transaction at the configured data-write durability.
@@ -450,6 +472,7 @@ impl Storage {
             path: None,
             durability: Durability::Immediate,
             flush_seq: std::sync::atomic::AtomicU64::new(0),
+            wseq: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -461,6 +484,8 @@ impl Storage {
                 .open_table(KV)
                 .map_err(|e| Error::Storage(e.to_string()))?;
             t.insert(key, value)
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            t.insert(WSEQ_KEY, self.next_wseq().to_le_bytes().as_slice())
                 .map_err(|e| Error::Storage(e.to_string()))?;
         }
         wtx.commit().map_err(|e| Error::Storage(e.to_string()))?;
@@ -520,6 +545,8 @@ impl Storage {
                 .remove(key)
                 .map_err(|e| Error::Storage(e.to_string()))?
                 .is_some();
+            t.insert(WSEQ_KEY, self.next_wseq().to_le_bytes().as_slice())
+                .map_err(|e| Error::Storage(e.to_string()))?;
         }
         wtx.commit().map_err(|e| Error::Storage(e.to_string()))?;
         if touches_schema(std::iter::once(key)) {
@@ -1055,7 +1082,7 @@ impl Storage {
                     )));
                 }
             }
-            t.insert(WSEQ_KEY, next_wseq().to_le_bytes().as_slice())
+            t.insert(WSEQ_KEY, self.next_wseq().to_le_bytes().as_slice())
                 .map_err(|e| Error::Storage(e.to_string()))?;
         }
         wtx.commit().map_err(|e| Error::Storage(e.to_string()))?;
@@ -1122,7 +1149,7 @@ impl Storage {
                 t.insert(k.as_slice(), v.as_slice())
                     .map_err(|e| Error::Storage(e.to_string()))?;
             }
-            t.insert(WSEQ_KEY, next_wseq().to_le_bytes().as_slice())
+            t.insert(WSEQ_KEY, self.next_wseq().to_le_bytes().as_slice())
                 .map_err(|e| Error::Storage(e.to_string()))?;
         }
         wtx.commit().map_err(|e| Error::Storage(e.to_string()))?;
@@ -1153,7 +1180,7 @@ impl Storage {
                 t.insert(k.as_slice(), v.as_slice())
                     .map_err(|e| Error::Storage(e.to_string()))?;
             }
-            t.insert(WSEQ_KEY, next_wseq().to_le_bytes().as_slice())
+            t.insert(WSEQ_KEY, self.next_wseq().to_le_bytes().as_slice())
                 .map_err(|e| Error::Storage(e.to_string()))?;
         }
         wtx.commit().map_err(|e| Error::Storage(e.to_string()))?;
@@ -1229,7 +1256,7 @@ impl Storage {
                 ) || touches_schema(job.deletes.iter().map(Vec::as_slice));
                 results.push(Ok(()));
             }
-            t.insert(WSEQ_KEY, next_wseq().to_le_bytes().as_slice())
+            t.insert(WSEQ_KEY, self.next_wseq().to_le_bytes().as_slice())
                 .map_err(|e| Error::Storage(e.to_string()))?;
         }
         wtx.commit().map_err(|e| Error::Storage(e.to_string()))?;
@@ -1275,7 +1302,7 @@ impl Storage {
                 t.insert(k.as_slice(), v.as_slice())
                     .map_err(|e| Error::Storage(e.to_string()))?;
             }
-            t.insert(WSEQ_KEY, next_wseq().to_le_bytes().as_slice())
+            t.insert(WSEQ_KEY, self.next_wseq().to_le_bytes().as_slice())
                 .map_err(|e| Error::Storage(e.to_string()))?;
         }
         wtx.commit().map_err(|e| Error::Storage(e.to_string()))?;
@@ -1289,11 +1316,7 @@ impl Storage {
 
     /// The current committed write sequence (see [`WSEQ_KEY`]). `0` if unset.
     pub fn write_epoch(&self) -> Result<u64> {
-        Ok(self
-            .get(WSEQ_KEY)?
-            .and_then(|b| b.as_slice().try_into().ok())
-            .map(u64::from_le_bytes)
-            .unwrap_or(0))
+        Ok(decode_wseq(self.get(WSEQ_KEY)?.as_deref()))
     }
 }
 
@@ -1336,6 +1359,30 @@ mod tests {
         };
         s.apply_validated_batch(&[job]).unwrap();
         assert!(schema_generation() > before, "validated batch did not bump");
+    }
+
+    /// The write sequence continues from the file's value when it is opened
+    /// again, one step per commit, on every write path.
+    #[test]
+    fn the_write_sequence_resumes_where_the_file_left_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wseq.edb");
+        let kv = (b"data::t::1".to_vec(), b"x".to_vec());
+        let before = {
+            let s = Storage::open(&path).unwrap();
+            s.apply(std::slice::from_ref(&kv), &[]).unwrap();
+            s.apply(std::slice::from_ref(&kv), &[]).unwrap();
+            s.write_epoch().unwrap()
+        };
+        assert!(before >= 2);
+        let s = Storage::open(&path).unwrap();
+        assert_eq!(s.write_epoch().unwrap(), before);
+        s.put(&kv.0, &kv.1).unwrap();
+        assert_eq!(s.write_epoch().unwrap(), before + 1);
+        s.delete(&kv.0).unwrap();
+        assert_eq!(s.write_epoch().unwrap(), before + 2);
+        s.apply_insert(std::slice::from_ref(&kv), &[], &[]).unwrap();
+        assert_eq!(s.write_epoch().unwrap(), before + 3);
     }
 
     #[test]

@@ -118,7 +118,9 @@ fn next_tick() -> u64 {
     CLOCK.fetch_add(1, Ordering::Relaxed)
 }
 
-type Map = HashMap<String, std::sync::Arc<CachedTable>>;
+/// Keyed by (database id, table): a write sequence identifies a state of one
+/// database only, and two databases open in one process can share a table name.
+type Map = HashMap<(u64, String), std::sync::Arc<CachedTable>>;
 
 fn cache() -> &'static RwLock<Map> {
     static C: OnceLock<RwLock<Map>> = OnceLock::new();
@@ -141,10 +143,14 @@ pub fn enabled() -> bool {
     budget_bytes() > 0
 }
 
-/// Fetch a cached table iff it exists and its `wseq` matches `epoch`.
-pub fn get(table: &str, epoch: u64) -> Option<std::sync::Arc<CachedTable>> {
+/// Fetch database `db`'s cached `table` iff it exists and its `wseq` matches
+/// `epoch`.
+pub fn get(db: u64, table: &str, epoch: u64) -> Option<std::sync::Arc<CachedTable>> {
     let g = cache().read().unwrap_or_else(|e| e.into_inner());
-    let hit = g.get(table).filter(|t| t.wseq == epoch).cloned();
+    let hit = g
+        .get(&(db, table.to_string()))
+        .filter(|t| t.wseq == epoch)
+        .cloned();
     if let Some(t) = &hit {
         // Mark as most-recently-used for approximate-LRU eviction (atomic, so no
         // read->write lock upgrade).
@@ -157,13 +163,14 @@ pub fn get(table: &str, epoch: u64) -> Option<std::sync::Arc<CachedTable>> {
 /// Store a freshly built table, evicting others if the budget would be exceeded.
 /// If the entry alone exceeds the budget it is not cached (aggregation still ran
 /// from the built arrays for the current query).
-pub fn store(table: &str, ct: std::sync::Arc<CachedTable>) {
+pub fn store(db: u64, table: &str, ct: std::sync::Arc<CachedTable>) {
     let budget = budget_bytes();
     if ct.bytes > budget {
         return;
     }
+    let key = (db, table.to_string());
     let mut g = cache().write().unwrap_or_else(|e| e.into_inner());
-    g.remove(table);
+    g.remove(&key);
     let mut total: usize = g.values().map(|t| t.bytes).sum();
     // Evict the least-recently-used entries until the newcomer fits.
     while total + ct.bytes > budget {
@@ -182,7 +189,7 @@ pub fn store(table: &str, ct: std::sync::Arc<CachedTable>) {
     }
     ct.last_used
         .store(next_tick(), std::sync::atomic::Ordering::Relaxed);
-    g.insert(table.to_string(), ct);
+    g.insert(key, ct);
 }
 
 /// Build a [`CachedTable`] from already-scanned rows. `rows` is the raw stored
@@ -379,4 +386,20 @@ pub fn group_agg(
         out.push((sample, results));
     }
     Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Write sequences are per database, so two databases in one process reach
+    /// the same one; an entry is only ever served to the database it came from.
+    #[test]
+    fn an_entry_belongs_to_its_database() {
+        let table = "colcache_db_key_test";
+        let ct = std::sync::Arc::new(build(&Schema::new(vec![]), 5, &[]).unwrap());
+        store(u64::MAX, table, ct);
+        assert!(get(u64::MAX, table, 5).is_some());
+        assert!(get(u64::MAX - 1, table, 5).is_none());
+    }
 }

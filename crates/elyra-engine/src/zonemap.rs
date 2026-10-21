@@ -173,7 +173,8 @@ impl ZoneMap {
     }
 }
 
-type Map = HashMap<String, Arc<ZoneMap>>;
+/// Keyed by (database id, table), as the column cache is.
+type Map = HashMap<(u64, String), Arc<ZoneMap>>;
 
 fn cache() -> &'static RwLock<Map> {
     static C: OnceLock<RwLock<Map>> = OnceLock::new();
@@ -190,11 +191,13 @@ pub fn enabled() -> bool {
     })
 }
 
-pub fn get(table: &str, epoch: u64) -> Option<Arc<ZoneMap>> {
+pub fn get(db: u64, table: &str, epoch: u64) -> Option<Arc<ZoneMap>> {
     let g = cache().read().unwrap();
-    g.get(table).filter(|z| z.wseq == epoch).cloned()
+    g.get(&(db, table.to_string()))
+        .filter(|z| z.wseq == epoch)
+        .cloned()
 }
 
-pub fn store(table: &str, z: Arc<ZoneMap>) {
-    cache().write().unwrap().insert(table.to_string(), z);
+pub fn store(db: u64, table: &str, z: Arc<ZoneMap>) {
+    cache().write().unwrap().insert((db, table.to_string()), z);
 }
