@@ -17,6 +17,18 @@ ElyraSQL release builds target **Ubuntu 24.04+** and **Apple Silicon macOS
     done, so an interrupted upgrade simply resumes on the next start. **Take a backup
     first, and note that downgrading to 1.4.x afterwards is not supported.**
 
+!!! info "Upgrading to 1.12.6"
+
+    No on-disk format change; a 1.12.5 database opens in 1.12.6 unchanged.
+
+    - **The server stops on SIGTERM**, as `docker stop`, systemd and Kubernetes
+      send it. In a container it used to ignore the signal until `docker stop`
+      gave up and killed it (exit 137, after 10 s by default); elsewhere it
+      ended at once, reported as a crash. It now flushes and exits with 0. A
+      supervisor that counted those exits as failures will see clean stops,
+      and anything that relied on SIGTERM being ignored will find the server
+      stopping.
+
 !!! info "Upgrading to 1.12.5"
 
     No on-disk format change; a 1.12.4 database opens in 1.12.5 unchanged, and
@@ -557,8 +569,8 @@ macOS).
 Multi-arch image (`amd64` + `arm64`) on the GitHub Container Registry:
 
 ```bash
-docker pull ghcr.io/kwhorne/elyrasql:1.12.5   # or :latest
-docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.12.5
+docker pull ghcr.io/kwhorne/elyrasql:1.12.6   # or :latest
+docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.12.6
 ```
 
 The image is ~15 MB, runs as a non-root user, stores data in the
