@@ -368,6 +368,14 @@ impl Db {
         self.binlog_dir.as_deref()
     }
 
+    /// Force everything committed so far to disk (see [`Storage::flush`]).
+    /// For shutdown: with relaxed durability (`ELYRASQL_SYNC=normal`) a commit
+    /// is acknowledged before it is durable, and the periodic flush may not
+    /// have run since.
+    pub fn flush(&self) -> Result<()> {
+        self.storage.flush()
+    }
+
     /// The data file path this database was opened from, if known (used to derive
     /// sibling artifacts such as the vector-index cache).
     pub fn data_path(&self) -> Option<std::path::PathBuf> {
