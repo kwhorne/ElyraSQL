@@ -10330,14 +10330,14 @@ async fn table_rows(db: &Session, def: &TableDef) -> Result<u64> {
     }
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
-    type Cache = HashMap<String, (u64, u64)>; // table -> (epoch, rows)
+    type Cache = HashMap<(u64, String), (u64, u64)>; // (database, table) -> (epoch, rows)
     static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let epoch = db.raw_db().write_epoch()?;
     if let Some(&(e, rows)) = cache
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .get(&def.name)
+        .get(&(db.db_id(), def.name.clone()))
     {
         if e == epoch {
             return Ok(rows);
@@ -10347,7 +10347,7 @@ async fn table_rows(db: &Session, def: &TableDef) -> Result<u64> {
     cache
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .insert(def.name.clone(), (epoch, rows));
+        .insert((db.db_id(), def.name.clone()), (epoch, rows));
     Ok(rows)
 }
 
@@ -22842,7 +22842,7 @@ async fn get_or_build_zonemap(
     def: &TableDef,
     epoch: u64,
 ) -> Result<Option<std::sync::Arc<zonemap::ZoneMap>>> {
-    if let Some(zm) = zonemap::get(&def.name, epoch) {
+    if let Some(zm) = zonemap::get(db.db_id(), &def.name, epoch) {
         return Ok(Some(zm));
     }
     let raw = db.raw_db();
@@ -22863,7 +22863,7 @@ async fn get_or_build_zonemap(
         return Ok(None);
     }
     let zm = std::sync::Arc::new(b.finish(epoch, upper));
-    zonemap::store(&def.name, zm.clone());
+    zonemap::store(db.db_id(), &def.name, zm.clone());
     Ok(Some(zm))
 }
 
@@ -22994,13 +22994,13 @@ async fn columnar_cached_scalar(
     specs: &[(elyra_olap::AggFunc, Option<usize>, bool)],
 ) -> Result<Option<Vec<Value>>> {
     let epoch = db.raw_db().write_epoch()?;
-    if let Some(ct) = colcache::get(&def.name, epoch) {
+    if let Some(ct) = colcache::get(db.db_id(), &def.name, epoch) {
         return Ok(Some(colcache::scalar_agg(&ct, specs)));
     }
     match build_cached_table(db, def, epoch).await? {
         Some(ct) => {
             let ct = std::sync::Arc::new(ct);
-            colcache::store(&def.name, ct.clone());
+            colcache::store(db.db_id(), &def.name, ct.clone());
             Ok(Some(colcache::scalar_agg(&ct, specs)))
         }
         None => scan_columnar_scalar(db, def, specs).await,
@@ -23018,13 +23018,13 @@ async fn columnar_cached_group(
     base_len: usize,
 ) -> Result<Option<Vec<(Vec<Value>, Vec<Value>)>>> {
     let epoch = db.raw_db().write_epoch()?;
-    if let Some(ct) = colcache::get(&def.name, epoch) {
+    if let Some(ct) = colcache::get(db.db_id(), &def.name, epoch) {
         return Ok(colcache::group_agg(&ct, group_col, specs, base_len));
     }
     match build_cached_table(db, def, epoch).await? {
         Some(ct) => {
             let ct = std::sync::Arc::new(ct);
-            colcache::store(&def.name, ct.clone());
+            colcache::store(db.db_id(), &def.name, ct.clone());
             Ok(colcache::group_agg(&ct, group_col, specs, base_len))
         }
         None => Ok(None),

@@ -8,6 +8,17 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ### Fixed
 
+- **A cached aggregate is no longer served stale after a restart.** With the
+  column cache on (`ELYRASQL_COLUMN_CACHE_MB`), zone maps on, or for the row
+  estimate the planner uses, the engine caches per table and serves an entry
+  while the storage write sequence still equals the one it was built at. That
+  sequence restarted at 1 in every process instead of continuing from the value
+  in the data file, so after a restart it climbed back through values the file
+  had already had: an aggregate read soon after the restart came back,
+  unchanged, once as many writes had gone by — `COUNT(*)` gave 3 for a table
+  with 4 rows. The sequence now resumes from the file, and is kept per
+  database, and the caches are keyed by database as well as table.
+
 - **A group commit applies its writes in the order they were made.** The
   storage writer folds consecutive writes into one transaction, and applied
   every job's deletes before any job's puts. A row inserted by one job and
