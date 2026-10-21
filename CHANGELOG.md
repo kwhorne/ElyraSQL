@@ -6,6 +6,8 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.12.6] - 2026-10-21
+
 ### Fixed
 
 - **The server stops on SIGTERM.** Only SIGINT (Ctrl-C) was handled. SIGTERM
