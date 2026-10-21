@@ -6,6 +6,8 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.12.5] - 2026-10-21
+
 ### Fixed
 
 - **A cluster leader no longer loses its lease to one unreachable peer.** A

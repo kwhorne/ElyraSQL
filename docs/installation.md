@@ -17,6 +17,27 @@ ElyraSQL release builds target **Ubuntu 24.04+** and **Apple Silicon macOS
     done, so an interrupted upgrade simply resumes on the next start. **Take a backup
     first, and note that downgrading to 1.4.x afterwards is not supported.**
 
+!!! info "Upgrading to 1.12.5"
+
+    No on-disk format change; a 1.12.4 database opens in 1.12.5 unchanged, and
+    nothing that ran before answers differently. Nodes talk to each other as
+    before, so a cluster can be upgraded one node at a time.
+
+    - **Cluster mode: check your followers.** A follower could keep a row the
+      leader had deleted, when the insert and the delete reached it in one batch
+      of log entries — typically while it caught up after a restart or an
+      outage. 1.12.5 stops this from happening again but does not repair a
+      follower that already differs. After upgrading, compare each follower's
+      tables with the leader's (`SELECT COUNT(*)` per table is enough to find
+      one).
+    - **Column cache and zone maps.** With `ELYRASQL_COLUMN_CACHE_MB` or
+      `ELYRASQL_ZONE_MAPS` on, an aggregate could be answered from a stale
+      cache entry some time after a restart. Only answers were wrong, never
+      stored data, so there is nothing to repair.
+    - **TLS**: rustls 0.23.46 and rustls-webpki 0.103.16, for six security
+      advisories. They cover the MySQL port's TLS and the cluster and
+      replication links.
+
 !!! warning "Upgrading to 1.12.4 — an aggregate subquery is refused sooner"
 
     No on-disk format change; a 1.12.3 database opens in 1.12.4 unchanged. One
@@ -536,8 +557,8 @@ macOS).
 Multi-arch image (`amd64` + `arm64`) on the GitHub Container Registry:
 
 ```bash
-docker pull ghcr.io/kwhorne/elyrasql:1.12.4   # or :latest
-docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.12.4
+docker pull ghcr.io/kwhorne/elyrasql:1.12.5   # or :latest
+docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.12.5
 ```
 
 The image is ~15 MB, runs as a non-root user, stores data in the
