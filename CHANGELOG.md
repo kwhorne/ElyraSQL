@@ -8,6 +8,16 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ### Fixed
 
+- **A cluster leader no longer loses its lease to one unreachable peer.** A
+  replication round and an election asked the peers one after another, each
+  allowed 500 ms, and reconnecting to a follower had no deadline at all. Two
+  peers that did not answer kept a round past the 900 ms leader lease, so a
+  healthy majority still saw its leader step down; a follower whose host
+  accepted the connection and then stalled held the leader in the round
+  indefinitely, and writes with it. Every peer is now asked at once, and each
+  exchange — connecting, authenticating, the request and its reply — has one
+  500 ms deadline.
+
 - **A cached aggregate is no longer served stale after a restart.** With the
   column cache on (`ELYRASQL_COLUMN_CACHE_MB`), zone maps on, or for the row
   estimate the planner uses, the engine caches per table and serves an entry
