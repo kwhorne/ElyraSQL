@@ -6,6 +6,13 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+### Security
+
+- **rustls 0.23.46, rustls-webpki 0.103.16, webpki-roots 1.0.10**, for
+  RUSTSEC-2026-0346, -0347, -0348, -0349, -0381 and -0382. ElyraSQL uses rustls
+  for TLS on the MySQL port and on the cluster and replication links, and
+  verifies peer certificates with rustls-webpki.
+
 ## [1.12.4] - 2026-10-09
 
 ### Fixed
