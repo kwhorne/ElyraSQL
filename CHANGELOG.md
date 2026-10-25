@@ -6,6 +6,8 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.12.8] - 2026-10-25
+
 ### Fixed
 
 - **`ORDER BY` a joined table's column that is not selected sorts by that

@@ -17,6 +17,16 @@ ElyraSQL release builds target **Ubuntu 24.04+** and **Apple Silicon macOS
     done, so an interrupted upgrade simply resumes on the next start. **Take a backup
     first, and note that downgrading to 1.4.x afterwards is not supported.**
 
+!!! info "Upgrading to 1.12.8"
+
+    No on-disk format change; a 1.12.7 database opens in 1.12.8 unchanged.
+
+    - **`ORDER BY` a joined table's column that is not selected sorts by that
+      column.** `SELECT x.name, y.id ... ORDER BY x.id, y.id` sorted by `y.id`
+      instead of `x.id`, so the rows came back in the wrong order and a
+      `LIMIT` kept the wrong ones. A query of that shape now returns MySQL's
+      order; one that relied on the old order will see a different one.
+
 !!! warning "Upgrading to 1.12.7 — who is asking, views, and mysqldump"
 
     No on-disk format change; a 1.12.6 database opens in 1.12.7 unchanged, and
@@ -598,8 +608,8 @@ macOS).
 Multi-arch image (`amd64` + `arm64`) on the GitHub Container Registry:
 
 ```bash
-docker pull ghcr.io/kwhorne/elyrasql:1.12.7   # or :latest
-docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.12.7
+docker pull ghcr.io/kwhorne/elyrasql:1.12.8   # or :latest
+docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.12.8
 ```
 
 The image is ~15 MB, runs as a non-root user, stores data in the
