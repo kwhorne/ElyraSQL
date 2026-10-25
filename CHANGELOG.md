@@ -8,6 +8,17 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ### Fixed
 
+- **A view's columns are described.** `information_schema.COLUMNS` left them
+  out and `SHOW COLUMNS FROM <view>` / `DESCRIBE <view>` failed with 1146, so a
+  tool that lists a view's columns -- an ORM's introspection, a GUI's schema
+  tree -- found none. They are now described as in MySQL, without reading a
+  row: a table's column as it is declared (NULL on the padded side of an outer
+  join), a computed column typed as MySQL types it (`amt * 2` is
+  `decimal(11,2)`, `SUM(amt)` is `decimal(32,2)`, `CONCAT(name, code)` is
+  `varchar(23)`), and a `UNION` column as the wider of its arms. A view whose
+  table was dropped is left out of `information_schema.COLUMNS`, and `SHOW
+  COLUMNS` of it is 1356, as in MySQL.
+
 - **Views are listed in `information_schema.TABLES` and `SHOW TABLE STATUS`.**
   Both left views out, though `SHOW FULL TABLES` listed them, so a tool that
   read the catalog to find a view, or counted what a schema holds, found

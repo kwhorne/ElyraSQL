@@ -5,6 +5,7 @@
 
 use crate::cexpr::CExpr;
 use crate::session::Session;
+use crate::viewtype::ViewColumn;
 use elyra_core::{
     CatalogError, ColumnDef, ColumnType, DuplicateError, Error, Result, Schema, Value,
 };
@@ -214,7 +215,7 @@ fn integer_declaration(
 /// Preserve the MySQL declaration separately from the compact storage type.
 /// `ColumnType` intentionally merges families that share a representation
 /// (for example `INT` and `BIGINT`), so it cannot reconstruct this later.
-fn declaration_from_data_type(dt: &DataType) -> Result<catalog::ColumnDeclaration> {
+pub(crate) fn declaration_from_data_type(dt: &DataType) -> Result<catalog::ColumnDeclaration> {
     Ok(match dt {
         DataType::Bool | DataType::Boolean => {
             declaration("tinyint", "tinyint(1)", None, Some(3), Some(0))
@@ -1564,8 +1565,360 @@ pub async fn show_table_status(db: &Session, pattern: Option<&str>) -> Result<Qu
     Ok(QueryResult::Rows(RowStream::literal(schema, rows)))
 }
 
+/// The columns of `view`, as MySQL describes them.
+///
+/// A column that is a table's column (or another view's), named as it is or
+/// through `*`, is described as that column is declared -- `varchar(20)`, `NOT
+/// NULL` -- as in MySQL; on the padded side of an outer join it may be NULL.
+/// Any other column is typed by its expression, as MySQL types it
+/// (`viewtype`), and described as `text` where that has no rule.
+async fn view_columns(
+    db: &Session,
+    vindex: &VectorRegistry,
+    view: &str,
+    depth: usize,
+) -> Result<Vec<ViewColumn>> {
+    let Some(sql) = catalog::load_view(db, view).await? else {
+        return Err(Error::Catalog(
+            CatalogError::Missing,
+            format!("no such table: {view}"),
+        ));
+    };
+    let mut query = parse_query(&sql)?;
+    normalize_query_qualifiers(&mut query, &db.database())?;
+    query_columns(db, vindex, &query, depth).await
+}
+
+/// The columns of `query`. It is run, reading no rows (`LIMIT 0`), only when
+/// its column names cannot be worked out without running it.
+async fn query_columns(
+    db: &Session,
+    vindex: &VectorRegistry,
+    query: &SqlQuery,
+    depth: usize,
+) -> Result<Vec<ViewColumn>> {
+    if depth >= 32 {
+        return Err(Error::Query("views nest too deeply".into()));
+    }
+    let sources = if query.with.is_none() {
+        Box::pin(set_expr_sources(db, vindex, &query.body, depth)).await?
+    } else {
+        None
+    };
+    let schema = match Box::pin(static_query_schema(db, query, None)).await {
+        Ok(schema) => schema,
+        Err(_) => {
+            let mut empty = query.clone();
+            empty.limit = Some(Expr::Value(sqlparser::ast::Value::Number(
+                "0".into(),
+                false,
+            )));
+            empty.offset = None;
+            Box::pin(run_subquery_schema(db, vindex, &empty)).await?.0
+        }
+    };
+    let sources = sources.filter(|sources| sources.len() == schema.columns.len());
+    Ok(schema
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(i, column)| {
+            let name = column_name(column).to_owned();
+            match sources.as_ref().and_then(|sources| sources[i].clone()) {
+                Some(source) => ViewColumn { name, ..source },
+                None => {
+                    let mut declaration = declaration_from_storage_type(&column.ty);
+                    if let (ColumnType::Text, Some(length)) =
+                        (&column.ty, column.result_metadata.character_max_length)
+                    {
+                        declaration.data_type = "varchar".into();
+                        declaration.column_type = format!("varchar({length})");
+                        declaration.character_maximum_length = Some(u64::from(length));
+                    }
+                    ViewColumn {
+                        name,
+                        declaration,
+                        nullable: column.nullable,
+                        collation: column.collation,
+                        default: None,
+                        literal_digits: None,
+                    }
+                }
+            }
+        })
+        .collect())
+}
+
+/// The stored column behind each column of a query body; a `UNION` column is
+/// one when its arms agree on it.
+async fn set_expr_sources(
+    db: &Session,
+    vindex: &VectorRegistry,
+    body: &SetExpr,
+    depth: usize,
+) -> Result<Option<Vec<Option<ViewColumn>>>> {
+    match body {
+        SetExpr::Select(select) => Box::pin(view_column_sources(db, vindex, select, depth)).await,
+        SetExpr::Query(query) if query.with.is_none() => {
+            Box::pin(set_expr_sources(db, vindex, &query.body, depth)).await
+        }
+        SetExpr::SetOperation { left, right, .. } => {
+            let left = Box::pin(set_expr_sources(db, vindex, left, depth)).await?;
+            let right = Box::pin(set_expr_sources(db, vindex, right, depth)).await?;
+            Ok(match (left, right) {
+                (Some(left), Some(right)) if left.len() == right.len() => Some(
+                    left.into_iter()
+                        .zip(right)
+                        .map(|(l, r)| union_column(l?, r?))
+                        .collect(),
+                ),
+                _ => None,
+            })
+        }
+        _ => Ok(None),
+    }
+}
+
+/// One column of a `UNION`, from the same column of each arm: the same type,
+/// or the longer of two character types; NULL when either arm may be, and
+/// otherwise showing its type's implicit default, as MySQL does.
+fn union_column(left: ViewColumn, right: ViewColumn) -> Option<ViewColumn> {
+    let nullable = left.nullable || right.nullable;
+    let default = |declaration: &catalog::ColumnDeclaration| {
+        (!nullable)
+            .then(|| crate::viewtype::implicit_default(declaration))
+            .flatten()
+    };
+    if left.declaration == right.declaration {
+        return Some(ViewColumn {
+            nullable,
+            default: default(&left.declaration),
+            ..left
+        });
+    }
+    let character = |c: &ViewColumn| {
+        matches!(c.declaration.data_type.as_str(), "char" | "varchar")
+            .then_some(c.declaration.character_maximum_length)
+            .flatten()
+    };
+    let length = character(&left)?.max(character(&right)?);
+    let mut declaration = left.declaration.clone();
+    declaration.data_type = "varchar".into();
+    declaration.column_type = format!("varchar({length})");
+    declaration.character_maximum_length = Some(length);
+    Some(ViewColumn {
+        default: default(&declaration),
+        declaration,
+        nullable,
+        ..left
+    })
+}
+
+/// For each column a view's `SELECT` lists, the stored column it is, or `None`
+/// for an expression. `None` overall when `*` covers a relation whose columns
+/// are not known here (a derived table) or a join merges columns (`USING`).
+async fn view_column_sources(
+    db: &Session,
+    vindex: &VectorRegistry,
+    select: &Select,
+    depth: usize,
+) -> Result<Option<Vec<Option<ViewColumn>>>> {
+    use sqlparser::ast::SelectItem;
+
+    // Each relation in FROM: the name it is known by, and its columns when it
+    // is a table or a view.
+    let mut relations: Vec<(String, Option<Vec<ViewColumn>>)> = Vec::new();
+    for table in &select.from {
+        let factors = std::iter::once((&table.relation, None)).chain(
+            table
+                .joins
+                .iter()
+                .map(|j| (&j.relation, Some(&j.join_operator))),
+        );
+        for (factor, operator) in factors {
+            if operator.is_some_and(|operator| {
+                matches!(
+                    join_constraint(operator),
+                    Some(JoinConstraint::Using(_) | JoinConstraint::Natural)
+                )
+            }) {
+                return Ok(None);
+            }
+            let (known_as, columns) = match factor {
+                TableFactor::Table { name, alias, .. } => {
+                    // `information_schema.tables` and the like are not stored
+                    // here; their columns are left unknown.
+                    let stored = stored_table_ident(db, name).ok();
+                    let known_as = alias
+                        .as_ref()
+                        .map(|a| a.name.value.clone())
+                        .or_else(|| stored.clone())
+                        .or_else(|| name.0.last().map(|i| i.value.clone()))
+                        .unwrap_or_default();
+                    let Some(table) = stored else {
+                        relations.push((known_as, None));
+                        continue;
+                    };
+                    let columns = if catalog::load_view(db, &table).await?.is_some() {
+                        Some(Box::pin(view_columns(db, vindex, &table, depth + 1)).await?)
+                    } else if catalog::exists(db, &table).await? {
+                        Some(table_view_columns(db, &table).await?)
+                    } else {
+                        None
+                    };
+                    (known_as, columns)
+                }
+                TableFactor::Derived {
+                    subquery, alias, ..
+                } => {
+                    let mut columns =
+                        Box::pin(query_columns(db, vindex, subquery, depth + 1)).await?;
+                    let renamed = alias.as_ref().map(|a| &a.columns[..]).unwrap_or(&[]);
+                    for (column, name) in columns.iter_mut().zip(renamed) {
+                        column.name = name.name.value.clone();
+                    }
+                    (
+                        alias
+                            .as_ref()
+                            .map(|a| a.name.value.clone())
+                            .unwrap_or_default(),
+                        Some(columns),
+                    )
+                }
+                _ => (String::new(), None),
+            };
+            // The padded side of an outer join may be NULL.
+            match operator {
+                Some(JoinOperator::LeftOuter(_)) => {
+                    relations.push((known_as, columns.map(nullable_columns)));
+                    continue;
+                }
+                Some(JoinOperator::RightOuter(_) | JoinOperator::FullOuter(_)) => {
+                    for (_, earlier) in &mut relations {
+                        *earlier = earlier.take().map(nullable_columns);
+                    }
+                }
+                _ => {}
+            }
+            let columns = match operator {
+                Some(JoinOperator::FullOuter(_)) => columns.map(nullable_columns),
+                _ => columns,
+            };
+            relations.push((known_as, columns));
+        }
+    }
+
+    let by_name = |name: &str| -> Option<ViewColumn> {
+        let mut hits = relations
+            .iter()
+            .filter_map(|(_, columns)| columns.as_ref())
+            .flatten()
+            .filter(|c| predicate::identifier_eq(&c.name, name));
+        let hit = hits.next()?;
+        hits.next().is_none().then(|| hit.clone())
+    };
+    let in_relation = |relation: &str, name: &str| -> Option<ViewColumn> {
+        relations
+            .iter()
+            .find(|(known_as, _)| predicate::identifier_eq(known_as, relation))
+            .and_then(|(_, columns)| columns.as_ref())?
+            .iter()
+            .find(|c| predicate::identifier_eq(&c.name, name))
+            .cloned()
+    };
+    let column_of = |e: &Expr| match e {
+        Expr::Identifier(column) => by_name(&column.value),
+        Expr::CompoundIdentifier(parts) if parts.len() >= 2 => {
+            in_relation(&parts[parts.len() - 2].value, &parts[parts.len() - 1].value)
+        }
+        _ => None,
+    };
+    let ungrouped_aggregate = aggregate::projection_has_aggregate(&select.projection)
+        && matches!(&select.group_by, sqlparser::ast::GroupByExpr::Expressions(e, _) if e.is_empty());
+    let mut sources = Vec::new();
+    for item in &select.projection {
+        match item {
+            SelectItem::Wildcard(_) => {
+                for (_, columns) in &relations {
+                    let Some(columns) = columns else {
+                        return Ok(None);
+                    };
+                    sources.extend(columns.iter().cloned().map(Some));
+                }
+            }
+            SelectItem::QualifiedWildcard(object, _) => {
+                let wanted = object.0.last().map(|i| i.value.as_str()).unwrap_or("");
+                let Some((_, Some(columns))) = relations
+                    .iter()
+                    .find(|(known_as, _)| predicate::identifier_eq(known_as, wanted))
+                else {
+                    return Ok(None);
+                };
+                sources.extend(columns.iter().cloned().map(Some));
+            }
+            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                let mut source = crate::viewtype::expr_column(expr, &column_of);
+                // Without GROUP BY, an aggregating view returns its one row over
+                // no rows too, with NULL in every column but a count.
+                if ungrouped_aggregate {
+                    if let Some(c) = source.as_mut() {
+                        if !matches!(expr, Expr::Function(_)) {
+                            c.nullable = true;
+                            c.default = None;
+                        }
+                    }
+                }
+                sources.push(source);
+            }
+        }
+    }
+    Ok(Some(sources))
+}
+
+fn nullable_columns(columns: Vec<ViewColumn>) -> Vec<ViewColumn> {
+    columns
+        .into_iter()
+        .map(|c| ViewColumn {
+            nullable: true,
+            ..c
+        })
+        .collect()
+}
+
+/// A table's columns as a view that selects them describes them.
+async fn table_view_columns(db: &Session, table: &str) -> Result<Vec<ViewColumn>> {
+    let def = catalog::load(db, table).await?;
+    let declarations = catalog::load_declarations(db, table).await?;
+    Ok(def
+        .schema
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(i, c)| ViewColumn {
+            name: c.name.clone(),
+            declaration: column_declaration(declarations.as_ref(), c, i).into_owned(),
+            nullable: c.nullable,
+            collation: c.collation,
+            // MySQL shows an auto-increment column's default as `0` in a view.
+            default: {
+                let meta = def.meta(i);
+                meta.default
+                    .or_else(|| meta.auto_increment.then(|| "0".to_string()))
+            },
+            literal_digits: None,
+        })
+        .collect())
+}
+
 /// SHOW COLUMNS / DESCRIBE: column metadata (Field/Type/Null/Key/Default/Extra).
-pub async fn show_columns(db: &Session, table: &str) -> Result<QueryResult> {
+pub async fn show_columns(
+    db: &Session,
+    vindex: &VectorRegistry,
+    table: &str,
+) -> Result<QueryResult> {
+    if catalog::load_view(db, table).await?.is_some() {
+        return Box::pin(show_view_columns(db, vindex, table)).await;
+    }
     let def = catalog::load(db, table).await?;
     let declarations = catalog::load_declarations(db, table).await?;
     let head = ["Field", "Type", "Null", "Key", "Default", "Extra"];
@@ -1614,6 +1967,48 @@ pub async fn show_columns(db: &Session, table: &str) -> Result<QueryResult> {
             Value::Text(extra.to_string()),
         ]);
     }
+    Ok(QueryResult::Rows(RowStream::literal(schema, rows)))
+}
+
+/// SHOW COLUMNS of a view: a view has no keys and no `Extra`.
+async fn show_view_columns(
+    db: &Session,
+    vindex: &VectorRegistry,
+    view: &str,
+) -> Result<QueryResult> {
+    let schema = Schema::new(
+        ["Field", "Type", "Null", "Key", "Default", "Extra"]
+            .iter()
+            .map(|n| ColumnDef {
+                name: (*n).to_string(),
+                ty: ColumnType::Text,
+                nullable: *n == "Default",
+                collation: elyra_core::Collation::Ci,
+                qualifier: Vec::new(),
+                result_metadata: Default::default(),
+            })
+            .collect(),
+    );
+    // A view that no longer resolves -- a table it reads was dropped -- is
+    // MySQL's 1356, naming the view.
+    let columns = match Box::pin(view_columns(db, vindex, view, 0)).await {
+        Ok(columns) => columns,
+        Err(e @ Error::ViewRights(_)) => return Err(e),
+        Err(_) => return Err(Error::ViewRights(format!("{}.{view}", db.database()))),
+    };
+    let rows = columns
+        .into_iter()
+        .map(|c| {
+            vec![
+                Value::Text(c.name),
+                Value::Text(c.declaration.column_type),
+                Value::Text(if c.nullable { "YES" } else { "NO" }.into()),
+                Value::Text(String::new()),
+                c.default.map(Value::Text).unwrap_or(Value::Null),
+                Value::Text(String::new()),
+            ]
+        })
+        .collect();
     Ok(QueryResult::Rows(RowStream::literal(schema, rows)))
 }
 
@@ -2207,6 +2602,7 @@ fn information_schema_schema(view: &str) -> Result<Schema> {
 /// them scoped avoids changing historical unqualified virtual-view queries.
 async fn information_schema(
     db: &Session,
+    vindex: &VectorRegistry,
     view: &str,
     include_catalog_rows: bool,
 ) -> Result<(Schema, Vec<Vec<Value>>)> {
@@ -2324,6 +2720,61 @@ async fn information_schema(
                             Some(g) => Value::Text(g.clone()),
                             None => Value::Text(String::new()),
                         },
+                        charset,
+                        Value::Text(COLUMN_PRIVILEGES.into()),
+                    ]);
+                }
+            }
+            // A view's columns, as MySQL lists them: no key, nothing extra. A
+            // view that no longer resolves (a table it reads was dropped) is
+            // left out, as MySQL leaves it out with a warning.
+            for view in catalog::list_views(db).await? {
+                // Boxed: describing a view can run one, and `select` holds
+                // this future inline.
+                let Ok(columns) = Box::pin(view_columns(db, vindex, &view, 0)).await else {
+                    continue;
+                };
+                for (i, c) in columns.into_iter().enumerate() {
+                    let is_text = matches!(
+                        c.declaration.data_type.as_str(),
+                        "char"
+                            | "varchar"
+                            | "tinytext"
+                            | "text"
+                            | "mediumtext"
+                            | "longtext"
+                            | "enum"
+                            | "set"
+                            | "json"
+                    );
+                    let (collation, charset) = match (is_text, c.collation) {
+                        (false, _) => (Value::Null, Value::Null),
+                        (true, elyra_core::Collation::Bin) => (
+                            Value::Text("utf8mb4_bin".into()),
+                            Value::Text("utf8mb4".into()),
+                        ),
+                        (true, _) => (
+                            Value::Text("utf8mb4_0900_ai_ci".into()),
+                            Value::Text("utf8mb4".into()),
+                        ),
+                    };
+                    rows.push(vec![
+                        Value::Text(database.clone()),
+                        Value::Text(view.clone()),
+                        Value::Text(c.name),
+                        Value::Int(i as i64 + 1),
+                        c.default.map(Value::Text).unwrap_or(Value::Null),
+                        Value::Text(if c.nullable { "YES" } else { "NO" }.into()),
+                        Value::Text(c.declaration.data_type),
+                        optional_u64_value(c.declaration.character_maximum_length),
+                        optional_u64_value(c.declaration.numeric_precision),
+                        optional_u64_value(c.declaration.numeric_scale),
+                        Value::Text(c.declaration.column_type),
+                        Value::Text(String::new()),
+                        Value::Text(String::new()),
+                        collation,
+                        Value::Text(String::new()),
+                        Value::Text(String::new()),
                         charset,
                         Value::Text(COLUMN_PRIVILEGES.into()),
                     ]);
@@ -6773,7 +7224,7 @@ async fn select_inner(
             .selection
             .as_ref()
             .is_some_and(requests_information_schema_rows);
-        let (schema, rows) = information_schema(db, &view, include_catalog_rows).await?;
+        let (schema, rows) = information_schema(db, vindex, &view, include_catalog_rows).await?;
         let qualifier = wildcard_schema_qualifier(db, &select.from[0].relation)
             .unwrap_or_else(|| ObjectName(vec![Ident::new(view)]));
         let schema = qualify_relation_schema(schema, &qualifier);
@@ -9876,7 +10327,7 @@ async fn load_relation(
     // information_schema.<view>: synthesize a virtual relation.
     if let Some(view) = information_schema_view(tf) {
         let include_catalog_rows = conjuncts.iter().any(requests_information_schema_rows);
-        let (schema, rows) = information_schema(db, &view, include_catalog_rows).await?;
+        let (schema, rows) = information_schema(db, vindex, &view, include_catalog_rows).await?;
         let qualifier =
             wildcard_schema_qualifier(db, tf).unwrap_or_else(|| ObjectName(vec![Ident::new(view)]));
         return Ok((qualify_relation_schema(schema, &qualifier).columns, rows));

@@ -241,8 +241,18 @@ FROM information_schema.columns GROUP BY table_name;
 `information_schema.tables` lists views beside tables, as MySQL does: with
 `TABLE_TYPE` `VIEW`, the comment `VIEW`, and NULL in the columns only stored
 tables have (`ENGINE`, `TABLE_ROWS`, `AUTO_INCREMENT`, ...). `SHOW TABLE
-STATUS` lists them the same way. `information_schema.columns` and `SHOW
-COLUMNS` do not describe a view's columns yet.
+STATUS` lists them the same way.
+
+A view's columns are in `information_schema.columns`, and `SHOW COLUMNS` /
+`DESCRIBE` describe them, as MySQL does and without reading a row. A column
+that is a table's column, named as it is or through `*`, is described as that
+column is declared (`varchar(20)`, `NOT NULL`, its default), but may be NULL on
+the padded side of an outer join. A computed column is typed as MySQL types it:
+`amt * 2` over a `DECIMAL(10,2)` is `decimal(11,2)`, `SUM(amt)` is
+`decimal(32,2)`, `COUNT(*)` is `bigint`, `CONCAT(name, code)` is
+`varchar(23)`. An expression without such a rule is described as `text`. A
+view that no longer resolves (a table it reads was dropped) is left out of
+`information_schema.columns`, and `SHOW COLUMNS` of it is error 1356.
 
 ## Views
 

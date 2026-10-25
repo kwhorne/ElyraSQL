@@ -14028,3 +14028,139 @@ async fn views_are_listed_in_information_schema_tables() {
         ]
     );
 }
+
+/// A view's columns were described nowhere: `information_schema.COLUMNS` left
+/// them out and `SHOW COLUMNS FROM <view>` was 1146, so a tool that lists a
+/// view's columns -- an ORM's introspection, a GUI's schema tree, mysqldump --
+/// found none. They are now described as MySQL 8.4 describes them, without
+/// reading a row: a table's column as it is declared, NULL on the padded side
+/// of an outer join, and a computed one typed as MySQL types it. Every row is
+/// MySQL's.
+#[tokio::test]
+async fn view_columns_are_described() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    for sql in [
+        "CREATE TABLE vc_t (id INT PRIMARY KEY AUTO_INCREMENT, name VARCHAR(20) NOT NULL, \
+         code CHAR(3), amt DECIMAL(10,2) NOT NULL DEFAULT 0.00)",
+        "CREATE TABLE vc_u (id INT PRIMARY KEY, tid INT NOT NULL, label VARCHAR(30) NOT NULL)",
+        "CREATE TABLE vc_gone (id INT PRIMARY KEY)",
+        "CREATE VIEW vc_left AS SELECT t.id, t.name AS n, u.label FROM vc_t t \
+         LEFT JOIN vc_u u ON u.tid = t.id",
+        "CREATE VIEW vc_expr AS SELECT id + 1 AS nxt, amt * 2 AS dbl, CONCAT(name, code) AS cc, \
+         'x' AS lit, COALESCE(code, name) AS co FROM vc_t",
+        "CREATE VIEW vc_agg AS SELECT name, COUNT(*) AS n, SUM(amt) AS s, AVG(id) AS a \
+         FROM vc_t GROUP BY name",
+        "CREATE VIEW vc_union AS SELECT id, name FROM vc_t UNION SELECT id, label FROM vc_u",
+        "CREATE VIEW vc_nested (k, v) AS SELECT id, amt FROM vc_t",
+        "CREATE VIEW vc_star AS SELECT * FROM vc_nested",
+        "CREATE VIEW vc_broken AS SELECT id FROM vc_gone",
+        "DROP TABLE vc_gone",
+    ] {
+        c.query_drop(sql)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+
+    type Described = (String, String, String, Option<String>);
+    let show = |rows: Vec<mysql_async::Row>| -> Vec<Described> {
+        rows.into_iter()
+            .map(|r| {
+                (
+                    r.get(0).unwrap(),
+                    r.get(1).unwrap(),
+                    r.get(2).unwrap(),
+                    r.get(4).unwrap(),
+                )
+            })
+            .collect()
+    };
+    let d = |field: &str, ty: &str, null: &str, default: Option<&str>| -> Described {
+        (
+            field.into(),
+            ty.into(),
+            null.into(),
+            default.map(Into::into),
+        )
+    };
+    for (view, want) in [
+        (
+            "vc_left",
+            vec![
+                d("id", "int", "NO", Some("0")),
+                d("n", "varchar(20)", "NO", None),
+                d("label", "varchar(30)", "YES", None),
+            ],
+        ),
+        (
+            "vc_expr",
+            vec![
+                d("nxt", "bigint", "NO", Some("0")),
+                d("dbl", "decimal(11,2)", "NO", Some("0.00")),
+                d("cc", "varchar(23)", "YES", None),
+                d("lit", "varchar(1)", "NO", Some("")),
+                d("co", "varchar(20)", "NO", Some("")),
+            ],
+        ),
+        (
+            "vc_agg",
+            vec![
+                d("name", "varchar(20)", "NO", None),
+                d("n", "bigint", "NO", Some("0")),
+                d("s", "decimal(32,2)", "YES", None),
+                d("a", "decimal(14,4)", "YES", None),
+            ],
+        ),
+        (
+            "vc_union",
+            vec![
+                d("id", "int", "NO", Some("0")),
+                d("name", "varchar(30)", "NO", Some("")),
+            ],
+        ),
+        (
+            "vc_star",
+            vec![
+                d("k", "int", "NO", Some("0")),
+                d("v", "decimal(10,2)", "NO", Some("0.00")),
+            ],
+        ),
+    ] {
+        let got = show(c.query(format!("SHOW COLUMNS FROM {view}")).await.unwrap());
+        assert_eq!(got, want, "SHOW COLUMNS FROM {view}");
+        let described = show(c.query(format!("DESCRIBE {view}")).await.unwrap());
+        assert_eq!(described, want, "DESCRIBE {view}");
+    }
+
+    let listed: Vec<(String, String, String, String)> = c
+        .query(
+            "SELECT TABLE_NAME, COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE FROM information_schema.COLUMNS \
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN ('vc_left', 'vc_broken') \
+             ORDER BY TABLE_NAME, ORDINAL_POSITION",
+        )
+        .await
+        .unwrap();
+    // A view that no longer resolves is left out, as MySQL leaves it out.
+    assert_eq!(
+        listed,
+        vec![
+            ("vc_left".into(), "id".into(), "int".into(), "NO".into()),
+            (
+                "vc_left".into(),
+                "n".into(),
+                "varchar(20)".into(),
+                "NO".into()
+            ),
+            (
+                "vc_left".into(),
+                "label".into(),
+                "varchar(30)".into(),
+                "YES".into()
+            ),
+        ]
+    );
+    match c.query_drop("SHOW COLUMNS FROM vc_broken").await {
+        Err(mysql_async::Error::Server(e)) => assert_eq!(e.code, 1356, "{e:?}"),
+        other => panic!("expected 1356, got {other:?}"),
+    }
+}
