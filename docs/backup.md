@@ -101,3 +101,32 @@ recovery to any moment.
 !!! note "Not yet available"
     There is no incremental (block-level) backup. See
     [Limitations](limitations.md).
+
+## Importing a MySQL dump
+
+A `mysqldump` of one MySQL database restores into ElyraSQL with the `mysql`
+client:
+
+```bash
+# On the MySQL side: one database, without --databases.
+mysqldump --routines --triggers --single-transaction --set-gtid-purged=OFF \
+  shop > shop.sql
+
+# Into ElyraSQL.
+mysql -h elyrasql.example.com -P 3307 -u root -p elyra < shop.sql
+```
+
+Tables, rows, indexes, foreign keys, views (with their definer and `SQL
+SECURITY`), triggers and stored procedures arrive as they were; this was
+checked with MySQL 8.4's `mysqldump`. The dump's version comments
+(`/*!50001 ... */`) and session settings run as they do in MySQL.
+
+Two things to know:
+
+- **Dump without `--databases`.** With it, the dump opens with
+  `CREATE DATABASE ... DEFAULT CHARACTER SET ...`, which ElyraSQL refuses;
+  the restore stops there.
+- **Stored functions are not supported yet.** A dump with `--routines`
+  contains every `CREATE FUNCTION`, and the restore stops at the first one.
+  Leave them out of the dump, or restore with `mysql --force`, which reports
+  each and carries on.
