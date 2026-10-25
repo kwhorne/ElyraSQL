@@ -138,6 +138,12 @@ pub enum Error {
     #[error("Operation {0} failed for '{1}'@'%'")]
     AccountOperation(&'static str, String),
 
+    /// A view whose definer (or, `SQL SECURITY INVOKER`, whose invoker) cannot
+    /// read what it reads. MySQL 1356 (`ER_VIEW_INVALID`), its text, which
+    /// names the view and not the table behind it.
+    #[error("View '{0}' references invalid table(s) or column(s) or function(s) or definer/invoker of view lack rights to use them")]
+    ViewRights(String),
+
     /// `SELECT ... INTO @var` that found more than one row. MySQL 1172
     /// (`ER_TOO_MANY_ROWS`), with its text.
     #[error("Result consisted of more than one row")]
@@ -183,6 +189,7 @@ impl Error {
             Error::TooManyRows => 1172,    // ER_TOO_MANY_ROWS
             Error::UndeclaredVariable(_) => 1327, // ER_SP_UNDECLARED_VAR
             Error::AccountOperation(..) => 1396, // ER_CANNOT_USER
+            Error::ViewRights(_) => 1356,  // ER_VIEW_INVALID
             _ => 1105,
         }
     }

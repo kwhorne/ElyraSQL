@@ -14,6 +14,7 @@ mod cexpr;
 mod colcache;
 pub mod collmig;
 mod cpred;
+mod definer;
 pub mod embedix;
 mod eval;
 mod exec;
@@ -529,6 +530,17 @@ impl Engine {
     /// `SELECT`, so `SELECT secret FROM t UNION SELECT 'x'` and
     /// `INSERT INTO mine SELECT secret FROM t` read ungranted columns.
     async fn authorize_reads(&self, user: &str, stmt: &Statement, sess: &Session) -> Result<()> {
+        self.authorize_reads_at(user, stmt, sess, 0).await
+    }
+
+    /// [`Engine::authorize_reads`], `depth` views down.
+    async fn authorize_reads_at(
+        &self,
+        user: &str,
+        stmt: &Statement,
+        sess: &Session,
+        depth: usize,
+    ) -> Result<()> {
         use sqlparser::ast::{SelectItem, SetExpr};
 
         let tables = read_relations(stmt);
@@ -641,7 +653,61 @@ impl Engine {
                 }
             }
         }
+        // What a view reads, it reads with its definer's privileges -- or,
+        // `SQL SECURITY INVOKER`, with the querying user's -- as in MySQL. Both
+        // are checked here, a view inside a view included. A definer that is no
+        // stored account (`root@%`, an account configured at startup) is an
+        // administrator and reads everything; every view created before
+        // definers were recorded is one. A refusal names the view, not the
+        // table behind it.
+        for t in &tables {
+            if catalog::load_view(sess, t).await?.is_some() {
+                Box::pin(self.authorize_view_body(user, t, sess, depth)).await?;
+            }
+        }
         Ok(())
+    }
+
+    async fn authorize_view_body(
+        &self,
+        user: &str,
+        view: &str,
+        sess: &Session,
+        depth: usize,
+    ) -> Result<()> {
+        const MAX_DEPTH: usize = 32;
+        if depth >= MAX_DEPTH {
+            return Err(Error::Query(format!(
+                "view {view} nests more than {MAX_DEPTH} views deep"
+            )));
+        }
+        let Some(sql) = catalog::load_view(sess, view).await? else {
+            return Ok(());
+        };
+        // A view from before definers were recorded reads as it always has.
+        let Some(security) = exec::recorded_view_security(sess, view).await? else {
+            return Ok(());
+        };
+        let reader = if security.invoker {
+            user.to_string()
+        } else {
+            let definer = security
+                .definer
+                .split('@')
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            if !users::is_stored_account(sess, &definer).await? {
+                return Ok(());
+            }
+            definer
+        };
+        let body = Statement::Query(Box::new(exec::parse_query(&sql)?));
+        match Box::pin(self.authorize_reads_at(&reader, &body, sess, depth + 1)).await {
+            Ok(()) => Ok(()),
+            Err(e @ Error::ViewRights(_)) => Err(e),
+            Err(_) => Err(Error::ViewRights(format!("{}.{view}", sess.database()))),
+        }
     }
 
     /// Handle CREATE / REFRESH / DROP MATERIALIZED VIEW by driving ordinary
@@ -1044,6 +1110,16 @@ impl Engine {
         // Reject pathologically deep expressions before any parsing/evaluation so
         // a hostile query can't overflow the worker stack and abort the process.
         guard_sql_complexity(sql)?;
+        // `CREATE [ALGORITHM=...] [DEFINER=...] [SQL SECURITY ...] VIEW` and
+        // `CREATE DEFINER=... PROCEDURE|TRIGGER|...`, as mysqldump writes them:
+        // the clauses are taken out, held for the statement, and the rest runs
+        // as any other.
+        if let Some((rewritten, clauses)) = definer::strip(sql) {
+            sess.set_view_clauses(Some(clauses));
+            let result = Box::pin(self.execute_as(&rewritten, privilege, user, sess)).await;
+            sess.set_view_clauses(None);
+            return result;
+        }
         // Cheap keyword dispatch on a short prefix — statements can be huge
         // (bulk INSERT), so never lowercase the whole thing here.
         let trimmed = sql.trim_start();

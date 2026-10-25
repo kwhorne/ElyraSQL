@@ -244,6 +244,7 @@ pub const SCHEMA_PREFIXES: &[&[u8]] = &[
     b"sys::",
     b"catalog::",
     b"view::",
+    b"viewsec::",
     b"matview::",
     b"coldecl::",
     b"colwidth::",
