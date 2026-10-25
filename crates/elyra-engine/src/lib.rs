@@ -1159,6 +1159,49 @@ impl Engine {
             }
         }
 
+        // `SET a = 1, @b = @@c, ...`: user and system variables mixed in one
+        // list. Only the first assignment used to run -- the rest were dropped
+        // without an error, so mysqldump's `SET @OLD_SQL_MODE=@@SQL_MODE,
+        // SQL_MODE='NO_AUTO_VALUE_ON_ZERO'` never set the mode. As in MySQL,
+        // every right-hand side reads the variables as they were before the
+        // statement (`SET @x = 1, @y = @x` gives `@y` the old `@x`), and then
+        // the assignments are made left to right.
+        if head.starts_with("set") {
+            if let Some(assignments) = set_assignment_list(trimmed) {
+                let uvars = sess.user_vars_snapshot();
+                let resolved: Vec<String> = assignments
+                    .iter()
+                    .map(|(target, value)| {
+                        let value = exec::substitute_uvars(value, &uvars);
+                        let value =
+                            exec::substitute_system_vars(&value, |name| sess.system_var(name));
+                        format!("SET {target} = {value}")
+                    })
+                    .collect();
+                for one in resolved {
+                    Box::pin(self.execute_as(&one, privilege, user, sess)).await?;
+                }
+                return Ok(vec![QueryResult::empty_ok()]);
+            }
+        }
+
+        // `ALTER TABLE t DISABLE KEYS` / `ENABLE KEYS`, which mysqldump wraps
+        // around every table's rows: a no-op, as it is for InnoDB, once the
+        // table is known to exist.
+        if head.starts_with("alter table") {
+            if let Some(table) = alter_table_keys(trimmed) {
+                let name = sqlparser::ast::ObjectName(vec![sqlparser::ast::Ident::new(table)]);
+                let table = exec::stored_table_ident(sess, &name)?;
+                if !catalog::exists(sess, &table).await? {
+                    return Err(Error::Catalog(
+                        CatalogError::Missing,
+                        format!("no such table: {table}"),
+                    ));
+                }
+                return Ok(vec![QueryResult::empty_ok()]);
+            }
+        }
+
         // sqlparser does not accept MySQL's `SET SESSION TRANSACTION ...`
         // spelling, so handle that narrow form before generic parsing.
         if head.starts_with("set") {
@@ -1530,9 +1573,35 @@ impl Engine {
             require_privilege(privilege, PrivilegedAction::DropProcedure)?;
             let procedure = mysql_named_object(trimmed, "procedure")?;
             let name = exec::stored_table_ident(sess, &procedure)?;
+            // A missing procedure is MySQL's 1305 unless `IF EXISTS`; it used to
+            // be dropped silently either way.
+            if sess.get(catalog::proc_key(&name)).await?.is_none() {
+                if drop_if_exists(trimmed) {
+                    return Ok(vec![QueryResult::empty_ok()]);
+                }
+                return Err(Error::RoutineMissing(
+                    "PROCEDURE",
+                    format!("{}.{name}", sess.database()),
+                ));
+            }
             sess.commit_write(vec![], vec![catalog::proc_key(&name)])
                 .await?;
             return Ok(vec![QueryResult::empty_ok()]);
+        }
+        // Stored functions are not supported, so none exists: `DROP FUNCTION IF
+        // EXISTS`, which mysqldump writes before every function, has nothing to
+        // do, and the plain form fails as MySQL's does for a missing one.
+        if head.starts_with("drop function") {
+            require_privilege(privilege, PrivilegedAction::DropProcedure)?;
+            let function = mysql_named_object(trimmed, "function")?;
+            let name = exec::stored_table_ident(sess, &function)?;
+            if drop_if_exists(trimmed) {
+                return Ok(vec![QueryResult::empty_ok()]);
+            }
+            return Err(Error::RoutineMissing(
+                "FUNCTION",
+                format!("{}.{name}", sess.database()),
+            ));
         }
         if head.starts_with("call ") {
             let call = trimmed[4..].trim().trim_end_matches(';');
@@ -1540,7 +1609,12 @@ impl Engine {
             let name = exec::stored_table_ident(sess, &procedure)?;
             let def: proc::ProcDef = match sess.get(catalog::proc_key(&name)).await? {
                 Some(b) => bincode::deserialize(&b).map_err(|e| Error::Storage(e.to_string()))?,
-                None => return Err(Error::Query(format!("procedure does not exist: {name}"))),
+                None => {
+                    return Err(Error::RoutineMissing(
+                        "PROCEDURE",
+                        format!("{}.{name}", sess.database()),
+                    ))
+                }
             };
             // Bind arguments to parameters (IN evaluated; OUT/INOUT bound to a
             // @user variable to write back).
@@ -2366,6 +2440,18 @@ impl Engine {
                     sess.set_session_read_only(session_bool(&value, "transaction_read_only")?)
                 }
                 "time_zone" => sess.set_time_zone(&session_text(value, "time_zone")?)?,
+                // The connection's character sets, as `SET NAMES` sets them:
+                // accepted, and the server goes on speaking utf8mb4, which is
+                // what `@@character_set_client` and the rest report. `sql_notes`
+                // (there are no notes to suppress) and `unique_checks` (keys are
+                // always checked) are accepted the same way. mysqldump saves,
+                // sets and restores all of them around every table and view.
+                "character_set_client"
+                | "character_set_results"
+                | "character_set_connection"
+                | "collation_connection"
+                | "sql_notes"
+                | "unique_checks" => {}
                 unsupported => {
                     return Err(Error::Unsupported(format!(
                         "session variable is not supported: {unsupported}"
@@ -2471,13 +2557,91 @@ fn session_variable_name(variable: &sqlparser::ast::ObjectName) -> String {
 }
 
 fn set_expression_value(expr: &sqlparser::ast::Expr) -> Result<Value> {
+    // A bare word assigned to a system variable is its value, as in MySQL:
+    // `SET autocommit = ON`, `SET character_set_client = utf8mb4`.
     if let sqlparser::ast::Expr::Identifier(identifier) = expr {
         let value = identifier.value.to_ascii_uppercase();
         if matches!(value.as_str(), "ON" | "OFF" | "TRUE" | "FALSE") {
             return Ok(Value::Text(value));
         }
+        if identifier.quote_style.is_none() {
+            return Ok(Value::Text(identifier.value.clone()));
+        }
     }
     eval::eval_expr(expr)
+}
+
+/// The assignments of `SET a = 1, @b = 2, ...` when it has more than one, as
+/// `(target, value)`; `None` for a single assignment, and for the `SET` forms
+/// whose commas do not separate assignments (`SET ROLE a, b`, `SET NAMES ...`,
+/// `SET TRANSACTION ...`, `SET PASSWORD ...`).
+fn set_assignment_list(sql: &str) -> Option<Vec<(String, String)>> {
+    let body = sql.trim().trim_end_matches(';');
+    if !crate::sqllex::keyword_at(body, 0, "set") {
+        return None;
+    }
+    let rest = body[3..].trim_start();
+    for form in [
+        "names",
+        "character",
+        "charset",
+        "role",
+        "default",
+        "password",
+        "transaction",
+    ] {
+        if crate::sqllex::keyword_at(rest, 0, form) {
+            return None;
+        }
+    }
+    for scope in ["session", "global", "local", "persist"] {
+        if crate::sqllex::keyword_at(rest, 0, scope)
+            && crate::sqllex::keyword_at(rest[scope.len()..].trim_start(), 0, "transaction")
+        {
+            return None;
+        }
+    }
+    let parts = crate::sqllex::split_top_level(rest, ',');
+    if parts.len() < 2 {
+        return None;
+    }
+    // Every part must be an assignment; otherwise this is not a list.
+    parts
+        .iter()
+        .map(|p| {
+            let eq = crate::sqllex::find_top_level(p, |_, c| c.byte == b'=')?;
+            // `@a := 1` is the same assignment.
+            let target = p[..eq].trim().trim_end_matches(':').trim();
+            Some((target.to_string(), p[eq + 1..].trim().to_string()))
+        })
+        .collect()
+}
+
+/// The table of `ALTER TABLE t {DISABLE|ENABLE} KEYS`, unquoted, or `None`.
+fn alter_table_keys(sql: &str) -> Option<String> {
+    let body = sql.trim().trim_end_matches(';').trim_end();
+    let low = body.to_ascii_lowercase();
+    let without = low.strip_suffix("keys")?.trim_end();
+    let without = without
+        .strip_suffix("disable")
+        .or_else(|| without.strip_suffix("enable"))?
+        .trim_end();
+    let name = without
+        .strip_prefix("alter")?
+        .trim_start()
+        .strip_prefix("table")?;
+    if !name.starts_with(char::is_whitespace) {
+        return None;
+    }
+    // The original spelling (case) of the name: `name` is a slice of `low`,
+    // and lowercasing ASCII keeps every byte offset.
+    let start = name.as_ptr() as usize - low.as_ptr() as usize;
+    let original = body[start..start + name.len()].trim();
+    let unquoted = original.trim_matches('`');
+    if unquoted.is_empty() || unquoted.contains(char::is_whitespace) {
+        return None;
+    }
+    Some(unquoted.to_string())
 }
 
 fn session_bool(value: &Value, variable: &str) -> Result<bool> {
@@ -4102,6 +4266,17 @@ fn mysql_table_name(
         }
         _ => None,
     }
+}
+
+/// Whether a `DROP <kind>` statement says `IF EXISTS` after its kind.
+fn drop_if_exists(sql: &str) -> bool {
+    let words: Vec<String> = sql
+        .split_whitespace()
+        .take(4)
+        .map(str::to_ascii_lowercase)
+        .collect();
+    words.get(2).map(String::as_str) == Some("if")
+        && words.get(3).map(String::as_str) == Some("exists")
 }
 
 fn mysql_named_object(sql: &str, keyword: &str) -> Result<sqlparser::ast::ObjectName> {

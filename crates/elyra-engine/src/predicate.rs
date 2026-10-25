@@ -1012,7 +1012,7 @@ pub fn system_var(raw: &str) -> Value {
         "hostname" => text("elyrasql"),
         "port" => Value::Int(3307),
         "sql_auto_is_null" => Value::Int(0),
-        "foreign_key_checks" | "unique_checks" => Value::Int(1),
+        "foreign_key_checks" | "unique_checks" | "sql_notes" => Value::Int(1),
         "init_connect" => text(""),
         _ => Value::Null,
     }

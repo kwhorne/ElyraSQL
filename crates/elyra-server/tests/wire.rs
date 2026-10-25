@@ -13884,3 +13884,79 @@ async fn parenthesised_joins_are_read() {
         .unwrap();
     assert_eq!(comma, vec![1, 3]);
 }
+
+/// The session statements mysqldump writes around every table and view, each
+/// as MySQL 8.4 answers it. `SET a = ..., b = ...` ran only its first
+/// assignment, so `SQL_MODE='NO_AUTO_VALUE_ON_ZERO'` was never set and a row
+/// with id 0 was renumbered on restore; the character-set variables, `sql_notes`
+/// and `unique_checks` were refused, and so was `ALTER TABLE ... DISABLE KEYS`.
+#[tokio::test]
+async fn mysqldump_session_statements_run() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    for sql in [
+        "CREATE TABLE md_ai (id INT AUTO_INCREMENT PRIMARY KEY, v VARCHAR(10))",
+        "SET @OLD_SQL_MODE=@@SQL_MODE, SQL_MODE='NO_AUTO_VALUE_ON_ZERO'",
+        "SET @OLD_UNIQUE_CHECKS=@@UNIQUE_CHECKS, UNIQUE_CHECKS=0",
+        "SET @OLD_SQL_NOTES=@@SQL_NOTES, SQL_NOTES=0",
+        "SET @saved_cs_client = @@character_set_client",
+        "SET character_set_client = utf8mb4",
+        "SET character_set_results = utf8mb4",
+        "SET collation_connection = utf8mb4_0900_ai_ci",
+        "ALTER TABLE `md_ai` DISABLE KEYS",
+        "INSERT INTO md_ai VALUES (0, 'zero'), (5, 'five')",
+        "ALTER TABLE `md_ai` ENABLE KEYS",
+        "SET character_set_client = @saved_cs_client",
+        "SET SQL_MODE=@OLD_SQL_MODE",
+        "SET UNIQUE_CHECKS=@OLD_UNIQUE_CHECKS",
+        "SET SQL_NOTES=@OLD_SQL_NOTES",
+    ] {
+        c.query_drop(sql)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    let rows: Vec<(i64, String)> = c
+        .query("SELECT id, v FROM md_ai ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![(0, "zero".into()), (5, "five".into())]);
+    let mode: String = c.query_first("SELECT @@sql_mode").await.unwrap().unwrap();
+    assert_eq!(mode, "STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION");
+
+    // Every right-hand side reads the variables as they were before the list.
+    c.query_drop("SET @x = 5").await.unwrap();
+    c.query_drop("SET @x = 1, @y = @x, @z = 'a,b'")
+        .await
+        .unwrap();
+    let xyz: (i64, i64, String) = c.query_first("SELECT @x, @y, @z").await.unwrap().unwrap();
+    assert_eq!(xyz, (1, 5, "a,b".into()));
+
+    match c.query_drop("ALTER TABLE md_missing DISABLE KEYS").await {
+        Err(mysql_async::Error::Server(e)) => assert_eq!(e.code, 1146, "{}", e.message),
+        other => panic!("expected 1146, got {other:?}"),
+    }
+
+    // mysqldump drops every routine before creating it. A missing one is
+    // nothing to do with IF EXISTS, and MySQL's 1305 without.
+    c.query_drop("DROP FUNCTION IF EXISTS `md_fn`")
+        .await
+        .unwrap();
+    c.query_drop("DROP PROCEDURE IF EXISTS `md_proc`")
+        .await
+        .unwrap();
+    for (sql, text) in [
+        ("DROP FUNCTION md_fn", "FUNCTION elyra.md_fn does not exist"),
+        (
+            "DROP PROCEDURE md_proc",
+            "PROCEDURE elyra.md_proc does not exist",
+        ),
+        ("CALL md_proc()", "PROCEDURE elyra.md_proc does not exist"),
+    ] {
+        match c.query_drop(sql).await {
+            Err(mysql_async::Error::Server(e)) => {
+                assert_eq!((e.code, e.message.as_str()), (1305, text), "{sql}")
+            }
+            other => panic!("{sql}: expected 1305, got {other:?}"),
+        }
+    }
+}
