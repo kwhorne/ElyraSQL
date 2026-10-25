@@ -743,6 +743,27 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for ElyraShim {
         writer.ok().await
     }
 
+    async fn on_query_bytes<'a>(
+        &'a mut self,
+        query: &'a [u8],
+        results: QueryResultWriter<'a, W>,
+    ) -> Result<(), Self::Error> {
+        // Bytes that are not UTF-8 are data in a string literal -- every BLOB
+        // in a mysqldump file -- and the literal is read as the hex literal of
+        // its bytes. Anywhere else they are refused, as MySQL refuses them.
+        match elyra_engine::sqllex::binary_literals_as_hex(query) {
+            Some(query) => self.on_query(&query, results).await,
+            None => {
+                results
+                    .error(
+                        ErrorKind::ER_INVALID_CHARACTER_STRING,
+                        b"Invalid utf8mb4 character string in the query",
+                    )
+                    .await
+            }
+        }
+    }
+
     async fn on_query<'a>(
         &'a mut self,
         query: &'a str,

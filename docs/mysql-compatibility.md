@@ -230,7 +230,7 @@ gaps:
   an open transaction is refused with 1568, as MySQL does.
 - **Implicit commit, as in MySQL.** DDL (`CREATE`, `ALTER`, `DROP`, `RENAME`,
   `TRUNCATE`, indexes, views, triggers, procedures), account statements
-  (`CREATE USER`, `GRANT`, `REVOKE`, ...), `LOCK TABLES`, `ANALYZE TABLE` and a
+  (`CREATE USER`, `GRANT`, `REVOKE`, ...), `LOCK TABLES`, `FLUSH`, `ANALYZE TABLE` and a
   new `BEGIN`/`START TRANSACTION` commit the open transaction before they run --
   also when the statement then fails. A `ROLLBACK` afterwards no longer undoes
   the writes made before the DDL. Temporary tables do not commit, and neither
@@ -238,8 +238,10 @@ gaps:
   table's rows inside the transaction like the DML it amounts to.
 - `SHOW` and `information_schema` cover what GUI tools and drivers need to
   connect and browse (`tables`, `columns`, `engines`, `schemata`, `views`,
-  `routines`, `triggers`, `events`, `statistics`, `partitions`); it is not the
-  complete MySQL catalog.
+  `routines`, `triggers`, `events`, `statistics`, `partitions`), and what
+  `mysqldump` reads to dump a database (`SHOW CREATE TABLE|VIEW|TRIGGER|PROCEDURE`,
+  `SHOW TRIGGERS`, `SHOW PROCEDURE STATUS`, `files`, `column_statistics`); it is
+  not the complete MySQL catalog.
 
 See [Limitations](limitations.md) for the full picture.
 

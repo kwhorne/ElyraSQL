@@ -1216,6 +1216,7 @@ fn system_variables() -> Vec<(&'static str, String)> {
         ("group_concat_max_len", "1024".into()),
         ("have_query_cache", "NO".into()),
         ("hostname", "elyrasql".into()),
+        ("information_schema_stats_expiry", "0".into()),
         ("init_connect", String::new()),
         ("interactive_timeout", "28800".into()),
         ("license", "MIT".into()),
@@ -1469,20 +1470,390 @@ pub fn show_warnings() -> Result<QueryResult> {
     )))
 }
 
-/// `SHOW {FUNCTION|PROCEDURE} STATUS [WHERE ...|LIKE ...]` — always empty
-/// (ElyraSQL exposes no stored functions here). Handled pre-parse because the
-/// `WHERE` form doesn't parse.
-pub fn show_routine_status() -> Result<QueryResult> {
+/// The rows of a SHOW result its filter keeps: `LIKE` matches the column at
+/// `like_column` (case-sensitively for a table name, as MySQL's does), and
+/// `WHERE` is evaluated over the result's own columns.
+fn filter_show_rows(
+    schema: &Schema,
+    rows: Vec<Vec<Value>>,
+    filter: Option<&sqlparser::ast::ShowStatementFilter>,
+    like_column: usize,
+    case_sensitive: bool,
+) -> Result<Vec<Vec<Value>>> {
+    use sqlparser::ast::ShowStatementFilter;
+    let mut kept = Vec::with_capacity(rows.len());
+    for row in rows {
+        let keep = match filter {
+            None => true,
+            Some(ShowStatementFilter::Like(pattern)) => match &row[like_column] {
+                Value::Text(name) => show_like_case(name, pattern, case_sensitive),
+                _ => false,
+            },
+            Some(ShowStatementFilter::Where(expr)) => {
+                crate::predicate::truthy(&crate::predicate::eval_row(expr, schema, &row)?)
+            }
+            Some(other) => return Err(Error::Unsupported(format!("SHOW filter {other}"))),
+        };
+        if keep {
+            kept.push(row);
+        }
+    }
+    Ok(kept)
+}
+
+/// A name as MySQL quotes it in `SHOW CREATE`: in backticks, a backtick in it
+/// doubled.
+fn quoted_name(name: &str) -> String {
+    format!("`{}`", name.replace('`', "``"))
+}
+
+/// An account, `user@host`, as `DEFINER=` spells it: `` `user`@`host` ``.
+fn quoted_account(account: &str) -> String {
+    match account.rsplit_once('@') {
+        Some((user, host)) => format!("{}@{}", quoted_name(user), quoted_name(host)),
+        None => quoted_name(account),
+    }
+}
+
+/// The sql_mode a trigger or procedure reports. ElyraSQL does not record the
+/// mode one was created under -- its body runs under the caller's -- so it is
+/// the server's default, which is what `SET sql_mode` in a dump then restores.
+const ROUTINE_SQL_MODE: &str = crate::session::DEFAULT_SQL_MODE;
+
+/// The character set, connection collation and database collation every
+/// stored object reports: ElyraSQL speaks only utf8mb4.
+fn object_charset_columns() -> [Value; 3] {
+    [
+        Value::Text("utf8mb4".into()),
+        Value::Text("utf8mb4_0900_ai_ci".into()),
+        Value::Text("utf8mb4_0900_ai_ci".into()),
+    ]
+}
+
+/// Every trigger, by table and then name: the order they fire in.
+pub(crate) async fn all_triggers(db: &Session) -> Result<Vec<catalog::TriggerDef>> {
+    let prefix = b"sys::trigger::".to_vec();
+    let mut triggers = Vec::new();
+    let mut after: Option<Vec<u8>> = None;
+    loop {
+        let batch = db.scan_batch(prefix.clone(), after.clone(), 512).await?;
+        if batch.is_empty() {
+            break;
+        }
+        triggers.extend(
+            batch
+                .iter()
+                .filter_map(|(_, v)| bincode::deserialize::<catalog::TriggerDef>(v).ok()),
+        );
+        after = batch.last().map(|(k, _)| k.clone());
+        if batch.len() < 512 {
+            break;
+        }
+    }
+    Ok(triggers)
+}
+
+fn trigger_event(t: &catalog::TriggerDef) -> &'static str {
+    match t.event {
+        catalog::TrigEvent::Insert => "INSERT",
+        catalog::TrigEvent::Update => "UPDATE",
+        catalog::TrigEvent::Delete => "DELETE",
+    }
+}
+
+fn trigger_timing(t: &catalog::TriggerDef) -> &'static str {
+    if t.before {
+        "BEFORE"
+    } else {
+        "AFTER"
+    }
+}
+
+/// `SHOW TRIGGERS [FROM db] [LIKE 'table' | WHERE ...]`. `LIKE` matches the
+/// table a trigger is on, not its name, as in MySQL: mysqldump asks it for
+/// each table's triggers. `Created` is NULL, as MySQL reports it for a
+/// trigger from before it recorded one; ElyraSQL does not record it.
+pub async fn show_triggers(
+    db: &Session,
+    filter: Option<&sqlparser::ast::ShowStatementFilter>,
+) -> Result<QueryResult> {
+    let schema = text_schema(&[
+        "Trigger",
+        "Event",
+        "Table",
+        "Statement",
+        "Timing",
+        "Created",
+        "sql_mode",
+        "Definer",
+        "character_set_client",
+        "collation_connection",
+        "Database Collation",
+    ]);
+    let rows = all_triggers(db)
+        .await?
+        .into_iter()
+        .map(|t| {
+            let mut row = vec![
+                Value::Text(t.name.clone()),
+                Value::Text(trigger_event(&t).into()),
+                Value::Text(t.table.clone()),
+                Value::Text(t.body.clone()),
+                Value::Text(trigger_timing(&t).into()),
+                Value::Null,
+                Value::Text(ROUTINE_SQL_MODE.into()),
+                Value::Text(crate::sessfn::DEFINER.into()),
+            ];
+            row.extend(object_charset_columns());
+            row
+        })
+        .collect();
+    let rows = filter_show_rows(&schema, rows, filter, 2, true)?;
+    Ok(QueryResult::Rows(RowStream::literal(schema, rows)))
+}
+
+/// `SHOW CREATE TRIGGER name`: the statement that recreates it.
+pub async fn show_create_trigger(db: &Session, name: &str) -> Result<QueryResult> {
+    let t = catalog::find_trigger(db, name)
+        .await?
+        .ok_or(Error::TriggerMissing)?;
+    let statement = format!(
+        "CREATE DEFINER={} TRIGGER {} {} {} ON {} FOR EACH ROW {}",
+        quoted_account(crate::sessfn::DEFINER),
+        quoted_name(&t.name),
+        trigger_timing(&t),
+        trigger_event(&t),
+        quoted_name(&t.table),
+        t.body
+    );
+    let schema = text_schema(&[
+        "Trigger",
+        "sql_mode",
+        "SQL Original Statement",
+        "character_set_client",
+        "collation_connection",
+        "Database Collation",
+        "Created",
+    ]);
+    let mut row = vec![
+        Value::Text(t.name),
+        Value::Text(ROUTINE_SQL_MODE.into()),
+        Value::Text(statement),
+    ];
+    row.extend(object_charset_columns());
+    row.push(Value::Null);
+    Ok(QueryResult::Rows(RowStream::literal(schema, vec![row])))
+}
+
+/// A stored procedure as `SHOW` and `information_schema` describe it.
+pub(crate) struct ProcedureListing {
+    pub name: String,
+    /// Everything after the name in its `CREATE PROCEDURE`.
+    pub definition: String,
+    /// Microseconds since the epoch; `None` for a procedure created before
+    /// ElyraSQL recorded it.
+    pub created: Option<i64>,
+}
+
+/// Every stored procedure, by name.
+///
+/// One created before its source was recorded ([`catalog::ProcSource`]) is
+/// rebuilt from what was kept: its parameters' names and modes and its body.
+/// Its parameter types are lost, so it reads back without them -- which
+/// ElyraSQL accepts and MySQL does not.
+pub(crate) async fn all_procedures(db: &Session) -> Result<Vec<ProcedureListing>> {
+    let prefix = b"sys::proc::".to_vec();
+    let mut procedures = Vec::new();
+    let mut after: Option<Vec<u8>> = None;
+    loop {
+        let batch = db.scan_batch(prefix.clone(), after.clone(), 512).await?;
+        if batch.is_empty() {
+            break;
+        }
+        for (k, v) in &batch {
+            let key = String::from_utf8_lossy(&k[prefix.len()..]).into_owned();
+            if let Some(source) = catalog::load_proc_source(db, &key).await? {
+                procedures.push(ProcedureListing {
+                    name: source.name,
+                    definition: source.definition,
+                    created: Some(source.created),
+                });
+                continue;
+            }
+            let Ok(def) = bincode::deserialize::<crate::proc::ProcDef>(v) else {
+                continue;
+            };
+            let params = def
+                .params
+                .iter()
+                .map(|(name, mode)| match mode {
+                    crate::proc::ParamMode::In => name.clone(),
+                    crate::proc::ParamMode::Out => format!("OUT {name}"),
+                    crate::proc::ParamMode::Inout => format!("INOUT {name}"),
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            procedures.push(ProcedureListing {
+                name: key,
+                definition: format!("({params})\nBEGIN\n{}\nEND", def.body),
+                created: None,
+            });
+        }
+        after = batch.last().map(|(k, _)| k.clone());
+        if batch.len() < 512 {
+            break;
+        }
+    }
+    Ok(procedures)
+}
+
+/// `SHOW {FUNCTION|PROCEDURE} STATUS [LIKE ... | WHERE ...]`: one row per
+/// routine of that kind. There are no stored functions, so that listing is
+/// empty. mysqldump finds the procedures it dumps here; this used to be empty
+/// for both, and a dump left every procedure out.
+pub async fn show_routine_status(
+    db: &Session,
+    procedures: bool,
+    filter: Option<&sqlparser::ast::ShowStatementFilter>,
+) -> Result<QueryResult> {
+    let schema = text_schema(&[
+        "Db",
+        "Name",
+        "Type",
+        "Language",
+        "Definer",
+        "Modified",
+        "Created",
+        "Security_type",
+        "Comment",
+        "character_set_client",
+        "collation_connection",
+        "Database Collation",
+    ]);
+    let mut rows = Vec::new();
+    if procedures {
+        for p in all_procedures(db).await? {
+            let created = p.created.map(Value::DateTime).unwrap_or(Value::Null);
+            let mut row = vec![
+                Value::Text(db.database()),
+                Value::Text(p.name),
+                Value::Text("PROCEDURE".into()),
+                Value::Text("SQL".into()),
+                Value::Text(crate::sessfn::DEFINER.into()),
+                created.clone(),
+                created,
+                Value::Text("DEFINER".into()),
+                Value::Text(String::new()),
+            ];
+            row.extend(object_charset_columns());
+            rows.push(row);
+        }
+    }
+    let rows = filter_show_rows(&schema, rows, filter, 1, false)?;
+    Ok(QueryResult::Rows(RowStream::literal(schema, rows)))
+}
+
+/// `SHOW CREATE PROCEDURE name`.
+pub async fn show_create_procedure(db: &Session, name: &str) -> Result<QueryResult> {
+    let procedure = all_procedures(db)
+        .await?
+        .into_iter()
+        .find(|p| p.name.eq_ignore_ascii_case(name))
+        .ok_or_else(|| Error::RoutineMissing("PROCEDURE", name.to_string()))?;
+    let statement = format!(
+        "CREATE DEFINER={} PROCEDURE {}{}",
+        quoted_account(crate::sessfn::DEFINER),
+        quoted_name(&procedure.name),
+        procedure.definition
+    );
+    let schema = text_schema(&[
+        "Procedure",
+        "sql_mode",
+        "Create Procedure",
+        "character_set_client",
+        "collation_connection",
+        "Database Collation",
+    ]);
+    let mut row = vec![
+        Value::Text(procedure.name),
+        Value::Text(ROUTINE_SQL_MODE.into()),
+        Value::Text(statement),
+    ];
+    row.extend(object_charset_columns());
+    Ok(QueryResult::Rows(RowStream::literal(schema, vec![row])))
+}
+
+/// `SHOW CREATE VIEW name`, and `SHOW CREATE TABLE` of a view, which answers
+/// the same way in MySQL: the statement that recreates it, with the definer
+/// and security type mysqldump looks for to put in its version comments.
+pub async fn show_create_view(db: &Session, name: &str) -> Result<Option<QueryResult>> {
+    let Some(definition) = catalog::load_view(db, name).await? else {
+        return Ok(None);
+    };
+    let security = view_security(db, name).await?;
+    let statement = format!(
+        "CREATE ALGORITHM=UNDEFINED DEFINER={} SQL SECURITY {} VIEW {} AS {}",
+        quoted_account(&security.definer),
+        if security.invoker {
+            "INVOKER"
+        } else {
+            "DEFINER"
+        },
+        quoted_name(name),
+        definition
+    );
+    let schema = text_schema(&[
+        "View",
+        "Create View",
+        "character_set_client",
+        "collation_connection",
+    ]);
+    let row = vec![
+        Value::Text(name.to_string()),
+        Value::Text(statement),
+        Value::Text("utf8mb4".into()),
+        Value::Text("utf8mb4_0900_ai_ci".into()),
+    ];
+    Ok(Some(QueryResult::Rows(RowStream::literal(
+        schema,
+        vec![row],
+    ))))
+}
+
+/// `SHOW CREATE DATABASE [IF NOT EXISTS] name` of the one database there is.
+pub fn show_create_database(db: &Session, if_not_exists: bool) -> Result<QueryResult> {
+    let database = db.database();
+    let statement = format!(
+        "CREATE DATABASE {}{} /*!40100 DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci */ /*!80016 DEFAULT ENCRYPTION='N' */",
+        if if_not_exists {
+            "/*!32312 IF NOT EXISTS*/ "
+        } else {
+            ""
+        },
+        quoted_name(&database)
+    );
+    Ok(QueryResult::Rows(RowStream::literal(
+        text_schema(&["Database", "Create Database"]),
+        vec![vec![Value::Text(database), Value::Text(statement)]],
+    )))
+}
+
+/// `SHOW EVENTS`: ElyraSQL has no scheduled events.
+pub fn show_events() -> Result<QueryResult> {
     Ok(QueryResult::Rows(RowStream::literal(
         text_schema(&[
             "Db",
             "Name",
-            "Type",
             "Definer",
-            "Modified",
-            "Created",
-            "Security_type",
-            "Comment",
+            "Time zone",
+            "Type",
+            "Execute at",
+            "Interval value",
+            "Interval field",
+            "Starts",
+            "Ends",
+            "Status",
+            "Originator",
             "character_set_client",
             "collation_connection",
             "Database Collation",
@@ -2032,8 +2403,8 @@ pub async fn show_create_table(db: &Session, name: &str) -> Result<QueryResult> 
         let declaration = column_declaration(declarations.as_ref(), c, i);
         let meta = def.meta(i);
         let mut s = format!(
-            "  `{}` {}",
-            c.name,
+            "  {} {}",
+            quoted_name(&c.name),
             declaration.column_type.to_ascii_uppercase()
         );
         if !c.nullable {
@@ -2054,7 +2425,7 @@ pub async fn show_create_table(db: &Session, name: &str) -> Result<QueryResult> 
         let cols = def
             .pk_cols
             .iter()
-            .map(|&i| format!("`{}`", def.schema.columns[i].name))
+            .map(|&i| quoted_name(&def.schema.columns[i].name))
             .collect::<Vec<_>>()
             .join(", ");
         lines.push(format!("  PRIMARY KEY ({cols})"));
@@ -2070,10 +2441,10 @@ pub async fn show_create_table(db: &Session, name: &str) -> Result<QueryResult> 
         let cols = idx
             .cols
             .iter()
-            .map(|&i| format!("`{}`", def.schema.columns[i].name))
+            .map(|&i| quoted_name(&def.schema.columns[i].name))
             .collect::<Vec<_>>()
             .join(", ");
-        lines.push(format!("  {kind} `{}` ({cols})", idx.name));
+        lines.push(format!("  {kind} {} ({cols})", quoted_name(&idx.name)));
     }
     // CHECK and FOREIGN KEY constraints are enforced but used to be invisible
     // here, so a dump taken through SHOW CREATE TABLE silently dropped them and
@@ -2085,18 +2456,19 @@ pub async fn show_create_table(db: &Session, name: &str) -> Result<QueryResult> 
         let cols = fk
             .columns
             .iter()
-            .map(|&i| format!("`{}`", def.schema.columns[i].name))
+            .map(|&i| quoted_name(&def.schema.columns[i].name))
             .collect::<Vec<_>>()
             .join(", ");
         let ref_cols = fk
             .ref_columns
             .iter()
-            .map(|c| format!("`{c}`"))
+            .map(|c| quoted_name(c))
             .collect::<Vec<_>>()
             .join(", ");
         let mut line = format!(
-            "  CONSTRAINT `{}` FOREIGN KEY ({cols}) REFERENCES `{}` ({ref_cols})",
-            fk.name, fk.ref_table
+            "  CONSTRAINT {} FOREIGN KEY ({cols}) REFERENCES {} ({ref_cols})",
+            quoted_name(&fk.name),
+            quoted_name(&fk.ref_table)
         );
         // MySQL omits the default NO ACTION, so only referential actions that
         // were actually asked for are echoed back.
@@ -2108,7 +2480,15 @@ pub async fn show_create_table(db: &Session, name: &str) -> Result<QueryResult> 
         }
         lines.push(line);
     }
-    let ddl = format!("CREATE TABLE `{name}` (\n{}\n)", lines.join(",\n"));
+    let mut ddl = format!(
+        "CREATE TABLE {} (\n{}\n)",
+        quoted_name(name),
+        lines.join(",\n")
+    );
+    // Partitioning, as MySQL writes it, so a dump recreates it.
+    if let Some(spec) = catalog::load_partspec(db, name).await? {
+        ddl.push_str(&partition_clause_sql(&spec));
+    }
     let schema = Schema::new(vec![
         ColumnDef {
             name: "Table".into(),
@@ -2129,6 +2509,44 @@ pub async fn show_create_table(db: &Session, name: &str) -> Result<QueryResult> 
     ]);
     let rows = vec![vec![Value::Text(name.to_string()), Value::Text(ddl)]];
     Ok(QueryResult::Rows(RowStream::literal(schema, rows)))
+}
+
+/// A table's `PARTITION BY` clause in MySQL's `SHOW CREATE TABLE` form.
+fn partition_clause_sql(spec: &catalog::PartitionSpec) -> String {
+    let head = format!(
+        "\n/*!50100 PARTITION BY {} ({})",
+        spec.method,
+        quoted_name(&spec.column)
+    );
+    if spec.method == "HASH" && spec.parts.is_empty() {
+        return format!("{head}\nPARTITIONS {} */", spec.hash_count);
+    }
+    let parts = spec
+        .parts
+        .iter()
+        .map(|p| {
+            let values = if spec.method == "LIST" {
+                let list = p
+                    .list_values
+                    .iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!("VALUES IN ({list})")
+            } else {
+                match p.less_than {
+                    Some(bound) => format!("VALUES LESS THAN ({bound})"),
+                    None => "VALUES LESS THAN MAXVALUE".to_string(),
+                }
+            };
+            format!(
+                "PARTITION {} {values} ENGINE = InnoDB",
+                quoted_name(&p.name)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",\n ");
+    format!("{head}\n({parts}) */")
 }
 
 /// SHOW INDEX FROM table: one row per index column.
@@ -2221,6 +2639,7 @@ const INFORMATION_SCHEMA_VIEWS: &[&str] = &[
     "table_constraints",
     "check_constraints",
     "column_statistics",
+    "files",
     "partitions",
     "engines",
     "triggers",
@@ -2459,6 +2878,7 @@ fn information_schema_schema(view: &str) -> Result<Schema> {
             text("CHECK_CLAUSE"),
         ]),
         "column_statistics" => Schema::new(vec![
+            text("SCHEMA_NAME"),
             text("TABLE_NAME"),
             text("COLUMN_NAME"),
             int("NDV"),
@@ -2467,12 +2887,72 @@ fn information_schema_schema(view: &str) -> Result<Schema> {
             text("MAX_VALUE"),
             text("HISTOGRAM"),
         ]),
+        "files" => Schema::new(vec![
+            int("FILE_ID"),
+            text("FILE_NAME"),
+            text("FILE_TYPE"),
+            text("TABLESPACE_NAME"),
+            text("TABLE_CATALOG"),
+            text("TABLE_SCHEMA"),
+            text("TABLE_NAME"),
+            text("LOGFILE_GROUP_NAME"),
+            int("LOGFILE_GROUP_NUMBER"),
+            text("ENGINE"),
+            text("FULLTEXT_KEYS"),
+            int("DELETED_ROWS"),
+            int("UPDATE_COUNT"),
+            int("FREE_EXTENTS"),
+            int("TOTAL_EXTENTS"),
+            int("EXTENT_SIZE"),
+            int("INITIAL_SIZE"),
+            int("MAXIMUM_SIZE"),
+            int("AUTOEXTEND_SIZE"),
+            text("CREATION_TIME"),
+            text("LAST_UPDATE_TIME"),
+            text("LAST_ACCESS_TIME"),
+            text("RECOVER_TIME"),
+            int("TRANSACTION_COUNTER"),
+            int("VERSION"),
+            text("ROW_FORMAT"),
+            int("TABLE_ROWS"),
+            int("AVG_ROW_LENGTH"),
+            int("DATA_LENGTH"),
+            int("MAX_DATA_LENGTH"),
+            int("INDEX_LENGTH"),
+            int("DATA_FREE"),
+            text("CREATE_TIME"),
+            text("UPDATE_TIME"),
+            text("CHECK_TIME"),
+            int("CHECKSUM"),
+            text("STATUS"),
+            text("EXTRA"),
+        ]),
         "partitions" => Schema::new(vec![
+            text("TABLE_CATALOG"),
+            text("TABLE_SCHEMA"),
             text("TABLE_NAME"),
             text("PARTITION_NAME"),
+            text("SUBPARTITION_NAME"),
+            int("PARTITION_ORDINAL_POSITION"),
+            int("SUBPARTITION_ORDINAL_POSITION"),
             text("PARTITION_METHOD"),
+            text("SUBPARTITION_METHOD"),
             text("PARTITION_EXPRESSION"),
+            text("SUBPARTITION_EXPRESSION"),
             text("PARTITION_DESCRIPTION"),
+            int("TABLE_ROWS"),
+            int("AVG_ROW_LENGTH"),
+            int("DATA_LENGTH"),
+            int("MAX_DATA_LENGTH"),
+            int("INDEX_LENGTH"),
+            int("DATA_FREE"),
+            text("CREATE_TIME"),
+            text("UPDATE_TIME"),
+            text("CHECK_TIME"),
+            int("CHECKSUM"),
+            text("PARTITION_COMMENT"),
+            text("NODEGROUP"),
+            text("TABLESPACE_NAME"),
         ]),
         "mysql.user" => text_columns(&[
             "Host",
@@ -2997,18 +3477,23 @@ async fn information_schema(
                     continue;
                 };
                 for c in &stats.columns {
-                    let hist = if c.hist.is_empty() {
-                        Value::Null
-                    } else {
-                        // MySQL-style: buckets as a JSON array of boundaries.
-                        let items: Vec<String> = c
-                            .hist
-                            .iter()
-                            .map(|b| format!("\"{}\"", b.replace('"', "\\\"")))
-                            .collect();
-                        Value::Text(format!("{{\"buckets\":[{}]}}", items.join(",")))
-                    };
+                    // The bucket boundaries, and the number of buckets
+                    // asked for under MySQL's name for it: mysqldump reads
+                    // that to write `ANALYZE TABLE ... UPDATE HISTOGRAM ...
+                    // WITH n BUCKETS`, so a restore collects the statistics
+                    // again. A column too small for a histogram has no
+                    // boundaries, and still the count.
+                    let items: Vec<String> = c
+                        .hist
+                        .iter()
+                        .map(|b| format!("\"{}\"", b.replace('"', "\\\"")))
+                        .collect();
+                    let hist = Value::Text(format!(
+                        "{{\"buckets\":[{}],\"number-of-buckets-specified\":{HISTOGRAM_BUCKETS}}}",
+                        items.join(",")
+                    ));
                     rows.push(vec![
+                        Value::Text(database.clone()),
                         Value::Text(tname.clone()),
                         Value::Text(c.name.clone()),
                         Value::Int(c.ndv as i64),
@@ -3021,22 +3506,20 @@ async fn information_schema(
             }
             Ok((schema, rows))
         }
+        // Tablespace files: ElyraSQL keeps a database in one file of its own,
+        // with no tablespaces to list. mysqldump asks before anything else.
+        "files" => Ok((schema, Vec::new())),
         "partitions" => {
+            // One row per partition of each partitioned table, in MySQL's
+            // columns; the statistics MySQL keeps per partition are not kept.
             let mut rows = Vec::new();
             for tname in names {
                 let Some(spec) = catalog::load_partspec(db, &tname).await? else {
                     continue;
                 };
+                let mut partitions: Vec<(String, Value)> = Vec::new();
                 if spec.parts.is_empty() && spec.method == "HASH" {
-                    for i in 0..spec.hash_count {
-                        rows.push(vec![
-                            Value::Text(tname.clone()),
-                            Value::Text(format!("p{i}")),
-                            Value::Text(spec.method.clone()),
-                            Value::Text(spec.column.clone()),
-                            Value::Null,
-                        ]);
-                    }
+                    partitions.extend((0..spec.hash_count).map(|i| (format!("p{i}"), Value::Null)));
                 }
                 for p in &spec.parts {
                     let desc = if let Some(v) = p.less_than {
@@ -3050,13 +3533,30 @@ async fn information_schema(
                     } else {
                         "MAXVALUE".to_string()
                     };
-                    rows.push(vec![
+                    partitions.push((p.name.clone(), Value::Text(desc)));
+                }
+                for (position, (name, description)) in partitions.into_iter().enumerate() {
+                    let mut row = vec![
+                        Value::Text("def".into()),
+                        Value::Text(database.clone()),
                         Value::Text(tname.clone()),
-                        Value::Text(p.name.clone()),
+                        Value::Text(name),
+                        Value::Null,
+                        Value::Int(position as i64 + 1),
+                        Value::Null,
                         Value::Text(spec.method.clone()),
-                        Value::Text(spec.column.clone()),
-                        Value::Text(desc),
+                        Value::Null,
+                        Value::Text(quoted_name(&spec.column)),
+                        Value::Null,
+                        description,
+                    ];
+                    row.extend(std::iter::repeat_n(Value::Null, 10));
+                    row.extend([
+                        Value::Text(String::new()),
+                        Value::Text("default".into()),
+                        Value::Null,
                     ]);
+                    rows.push(row);
                 }
             }
             Ok((schema, rows))
@@ -3135,89 +3635,63 @@ async fn information_schema(
             Ok((schema, rows))
         }
         "triggers" => {
-            let prefix = b"sys::trigger::".to_vec();
-            let mut rows = Vec::new();
-            let mut after: Option<Vec<u8>> = None;
-            loop {
-                let batch = db.scan_batch(prefix.clone(), after.clone(), 512).await?;
-                if batch.is_empty() {
-                    break;
-                }
-                for (_, v) in &batch {
-                    let Ok(t) = bincode::deserialize::<catalog::TriggerDef>(v) else {
-                        continue;
-                    };
-                    let event = match t.event {
-                        catalog::TrigEvent::Insert => "INSERT",
-                        catalog::TrigEvent::Update => "UPDATE",
-                        catalog::TrigEvent::Delete => "DELETE",
-                    };
-                    rows.push(vec![
+            let rows = all_triggers(db)
+                .await?
+                .into_iter()
+                .map(|t| {
+                    vec![
                         Value::Text("def".into()),
                         Value::Text(database.clone()),
-                        Value::Text(t.name),
-                        Value::Text(event.into()),
+                        Value::Text(t.name.clone()),
+                        Value::Text(trigger_event(&t).into()),
                         Value::Text("def".into()),
                         Value::Text(database.clone()),
-                        Value::Text(t.table),
+                        Value::Text(t.table.clone()),
                         Value::Text("1".into()),
                         Value::Null,
-                        Value::Text(t.body),
+                        Value::Text(t.body.clone()),
                         Value::Text("ROW".into()),
-                        Value::Text(if t.before { "BEFORE" } else { "AFTER" }.into()),
+                        Value::Text(trigger_timing(&t).into()),
                         Value::Null,
-                        Value::Text(String::new()),
-                        Value::Text("root@%".into()),
+                        Value::Text(ROUTINE_SQL_MODE.into()),
+                        Value::Text(crate::sessfn::DEFINER.into()),
                         Value::Text("utf8mb4".into()),
                         Value::Text("utf8mb4_0900_ai_ci".into()),
                         Value::Text("utf8mb4_0900_ai_ci".into()),
-                    ]);
-                }
-                after = batch.last().map(|(k, _)| k.clone());
-                if batch.len() < 512 {
-                    break;
-                }
-            }
+                    ]
+                })
+                .collect();
             Ok((schema, rows))
         }
         "routines" => {
-            let prefix = b"sys::proc::".to_vec();
-            let mut rows = Vec::new();
-            let mut after: Option<Vec<u8>> = None;
-            loop {
-                let batch = db.scan_batch(prefix.clone(), after.clone(), 512).await?;
-                if batch.is_empty() {
-                    break;
-                }
-                for (k, _) in &batch {
-                    let name = String::from_utf8_lossy(&k[prefix.len()..]).to_string();
-                    rows.push(vec![
-                        Value::Text(name.clone()),
+            let rows = all_procedures(db)
+                .await?
+                .into_iter()
+                .map(|p| {
+                    let created = p.created.map(Value::DateTime).unwrap_or(Value::Null);
+                    vec![
+                        Value::Text(p.name.clone()),
                         Value::Text("def".into()),
                         Value::Text(database.clone()),
-                        Value::Text(name),
+                        Value::Text(p.name),
                         Value::Text("PROCEDURE".into()),
                         Value::Text(String::new()),
                         Value::Text("SQL".into()),
                         Value::Null,
                         Value::Text("CONTAINS SQL".into()),
                         Value::Text("DEFINER".into()),
-                        Value::Null,
-                        Value::Null,
+                        created.clone(),
+                        created,
+                        Value::Text(ROUTINE_SQL_MODE.into()),
                         Value::Text(String::new()),
-                        Value::Text(String::new()),
-                        Value::Text("root@%".into()),
+                        Value::Text(crate::sessfn::DEFINER.into()),
                         Value::Text("utf8mb4".into()),
                         Value::Text("utf8mb4_0900_ai_ci".into()),
                         Value::Text("utf8mb4_0900_ai_ci".into()),
                         Value::Text(String::new()),
-                    ]);
-                }
-                after = batch.last().map(|(k, _)| k.clone());
-                if batch.len() < 512 {
-                    break;
-                }
-            }
+                    ]
+                })
+                .collect();
             Ok((schema, rows))
         }
         "views" => {
@@ -11349,27 +11823,48 @@ pub fn parse_partition_clause(clause: &str) -> Result<catalog::PartitionSpec> {
                 .unwrap_or(0);
         }
     } else {
-        // Parse the `(PARTITION name VALUES ...)` list after the column group.
+        // Parse the `(PARTITION name VALUES ...)` list after the column group,
+        // in any case, and with whatever follows each bound: SHOW CREATE TABLE
+        // in MySQL, and so every dump, writes `... LESS THAN (10) ENGINE =
+        // InnoDB`. That suffix used to hide the bound, which made the
+        // partition MAXVALUE.
         let rest = &c[close + 1..];
-        for seg in rest.split("PARTITION").skip(1) {
-            let seg = seg.trim().trim_end_matches([',', ')']).trim();
-            if seg.is_empty() {
+        let starts: Vec<usize> = rest
+            .to_ascii_lowercase()
+            .match_indices("partition")
+            .map(|(i, _)| i)
+            .filter(|&i| crate::sqllex::keyword_at(rest, i, "partition"))
+            .collect();
+        for (n, &start) in starts.iter().enumerate() {
+            let end = starts.get(n + 1).copied().unwrap_or(rest.len());
+            let seg = rest[start + "partition".len()..end].trim();
+            let name = seg
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .trim_matches('`')
+                .to_string();
+            if name.is_empty() {
                 continue;
             }
-            let name = seg.split_whitespace().next().unwrap_or("").to_string();
             let seg_low = seg.to_ascii_lowercase();
+            // The contents of the parenthesised group `after` opens with.
+            let group = |after: &str| -> Option<String> {
+                let after = after.trim_start();
+                let end = crate::sqllex::matching_paren_end(after, 0)?;
+                Some(after[1..end - 1].trim().to_string())
+            };
             let mut less_than = None;
             let mut list_values = Vec::new();
             if let Some(lt) = seg_low.find("less than") {
-                let after = seg[lt + "less than".len()..].trim();
-                let inner = after.trim_start_matches('(').trim_end_matches(')').trim();
-                if !inner.eq_ignore_ascii_case("maxvalue") {
-                    less_than = inner.parse::<i64>().ok();
+                if let Some(inner) = group(&seg[lt + "less than".len()..]) {
+                    if !inner.eq_ignore_ascii_case("maxvalue") {
+                        less_than = inner.parse::<i64>().ok();
+                    }
                 }
             } else if let Some(iv) = seg_low.find(" in ") {
-                let after = &seg[iv + 4..];
-                if let (Some(o), Some(cl)) = (after.find('('), after.rfind(')')) {
-                    list_values = after[o + 1..cl]
+                if let Some(inner) = group(&seg[iv + " in ".len()..]) {
+                    list_values = inner
                         .split(',')
                         .filter_map(|v| v.trim().parse::<i64>().ok())
                         .collect();
@@ -24786,6 +25281,9 @@ fn equi_height_hist(sample: &mut [Value], buckets: usize) -> Vec<String> {
     out
 }
 
+/// How many buckets `ANALYZE TABLE` divides a column's histogram into.
+const HISTOGRAM_BUCKETS: usize = 32;
+
 pub async fn analyze_table(db: &Session, name: &str) -> Result<QueryResult> {
     if !catalog::exists(db, name).await? {
         return Err(Error::Catalog(
@@ -24803,7 +25301,6 @@ pub async fn analyze_table(db: &Session, name: &str) -> Result<QueryResult> {
     let mut maxs: Vec<Option<Value>> = vec![None; ncols];
     // Reservoir sample per column for equi-height histograms.
     const SAMPLE_CAP: usize = 20_000;
-    const HIST_BUCKETS: usize = 32;
     let mut sample: Vec<Vec<Value>> = vec![Vec::new(); ncols];
     let mut seen: Vec<u64> = vec![0; ncols];
     let mut rng: u64 = 0x9E37_79B9_7F4A_7C15;
@@ -24872,7 +25369,7 @@ pub async fn analyze_table(db: &Session, name: &str) -> Result<QueryResult> {
             nulls: nulls[i],
             min: mins[i].as_ref().and_then(|v| v.to_wire_string()),
             max: maxs[i].as_ref().and_then(|v| v.to_wire_string()),
-            hist: equi_height_hist(&mut sample[i], HIST_BUCKETS),
+            hist: equi_height_hist(&mut sample[i], HISTOGRAM_BUCKETS),
         })
         .collect();
     let stats = catalog::TableStats { rows, columns };

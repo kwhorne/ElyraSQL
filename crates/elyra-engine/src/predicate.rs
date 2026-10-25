@@ -1014,6 +1014,7 @@ pub fn system_var(raw: &str) -> Value {
         "sql_auto_is_null" => Value::Int(0),
         "foreign_key_checks" | "unique_checks" | "sql_notes" => Value::Int(1),
         "init_connect" => text(""),
+        "information_schema_stats_expiry" => Value::Int(0),
         _ => Value::Null,
     }
 }
@@ -1370,9 +1371,13 @@ fn eval_scalar(name: &str, a: &[Value]) -> Result<Option<Value>> {
         "upper" | "ucase" => str1(a, |s| s.to_uppercase()),
         "lower" | "lcase" => str1(a, |s| s.to_lowercase()),
         // MySQL: LENGTH/OCTET_LENGTH are byte lengths; CHAR_LENGTH is characters.
-        "length" | "octet_length" => match sstr(a, 0) {
-            Some(s) => Value::Int(s.len() as i64),
-            None => Value::Null,
+        "length" | "octet_length" => match &a[0] {
+            // A binary string's bytes, not its text form's.
+            Value::Bytes(b) => Value::Int(b.len() as i64),
+            _ => match sstr(a, 0) {
+                Some(s) => Value::Int(s.len() as i64),
+                None => Value::Null,
+            },
         },
         "char_length" | "character_length" => match sstr(a, 0) {
             Some(s) => Value::Int(s.chars().count() as i64),
@@ -1776,6 +1781,9 @@ fn eval_scalar(name: &str, a: &[Value]) -> Result<Option<Value>> {
         "hex" => match &a[0] {
             Value::Null => Value::Null,
             Value::Int(i) => Value::Text(format!("{i:X}")),
+            // The bytes themselves: their text form replaces any that are not
+            // UTF-8.
+            Value::Bytes(b) => Value::Text(b.iter().map(|b| format!("{b:02X}")).collect()),
             v => Value::Text(
                 wire(v)
                     .unwrap_or_default()

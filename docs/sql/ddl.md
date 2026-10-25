@@ -209,10 +209,22 @@ SHOW COLUMNS FROM users;
 DESCRIBE users;   -- or DESC users
 SHOW CREATE TABLE users;
 SHOW INDEX FROM users;   -- or SHOW KEYS FROM users
+SHOW CREATE VIEW active_users;
+SHOW TRIGGERS LIKE 'orders';          -- the triggers on a table
+SHOW CREATE TRIGGER orders_ai;
+SHOW PROCEDURE STATUS WHERE Db = 'elyra';
+SHOW CREATE PROCEDURE add_order;
+SHOW CREATE DATABASE elyra;
 ```
 
 `SHOW CREATE TABLE` reconstructs the `CREATE TABLE` DDL (columns, defaults,
-auto-increment, generated columns, primary key, and indexes). `SHOW INDEX` /
+auto-increment, generated columns, primary key, indexes, `CHECK` and foreign
+key constraints, and partitioning, as MySQL writes it). Of a view, it answers
+as `SHOW CREATE VIEW` does, with the view's definer and `SQL SECURITY`. `SHOW
+CREATE PROCEDURE` gives the procedure back as it was written, parameter types
+included (a procedure created before 1.12.9, when they were not yet recorded,
+without them). These are the statements `mysqldump` reads; see
+[Dumping with mysqldump](../backup.md#dumping-with-mysqldump). `SHOW INDEX` /
 `SHOW KEYS` lists one row per index column
 (`Table | Non_unique | Key_name | Seq_in_index | Column_name | ... | Index_type`).
 

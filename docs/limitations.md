@@ -109,7 +109,9 @@ judge fit before deploying.
 - `ANALYZE TABLE` records row-count and per-column statistics (NDV, null count,
   min/max, and an **equi-height histogram** built from a reservoir sample),
   surfaced as `information_schema.tables.TABLE_ROWS` and
-  `information_schema.column_statistics` (including a JSON `HISTOGRAM`). The
+  `information_schema.column_statistics` (MySQL's `SCHEMA_NAME`, `TABLE_NAME`,
+  `COLUMN_NAME` and a JSON `HISTOGRAM`, plus `NDV`, `NULLS`, `MIN_VALUE` and
+  `MAX_VALUE`). The
   planner estimates WHERE-predicate selectivity from the histograms to order
   comma cross-joins by estimated (not just raw) row counts, reorders explicit
   INNER-join chains cost-based, and picks hash-join build sides by live size.
@@ -237,7 +239,8 @@ judge fit before deploying.
 
 - `CREATE TABLE ... PARTITION BY RANGE|LIST|HASH (<pk column>) (...)` records a
   partitioning scheme over the primary key, exposed in
-  `information_schema.partitions`. Partitions are **managed primary-key ranges**
+  `information_schema.partitions` (one row per partition, in MySQL's columns)
+  and written back by `SHOW CREATE TABLE`. Partitions are **managed primary-key ranges**
   (metadata over the clustered PK), not physically separate files:
   `ALTER TABLE t DROP PARTITION p` / `TRUNCATE PARTITION p` cheaply delete a
   partition's rows (a range/`IN` delete, with index cleanup), and queries with a

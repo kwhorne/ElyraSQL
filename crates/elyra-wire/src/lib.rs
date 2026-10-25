@@ -284,6 +284,16 @@ pub trait AsyncMysqlShim<W: Send> {
         results: QueryResultWriter<'a, W>,
     ) -> Result<(), Self::Error>;
 
+    /// Called for a query whose text is not UTF-8. The default ends the
+    /// connection, as every such query used to.
+    async fn on_query_bytes<'a>(
+        &'a mut self,
+        _query: &'a [u8],
+        _results: QueryResultWriter<'a, W>,
+    ) -> Result<(), Self::Error> {
+        Err(io::Error::new(io::ErrorKind::InvalidData, "query text is not valid UTF-8").into())
+    }
+
     /// Called when client switches database.
     async fn on_init<'a>(
         &'a mut self,
@@ -844,16 +854,10 @@ where
                                         w.write_row(iter::once(67108864u32)).await?;
                                         w.finish().await?;
                                     }
-                                    _ => {
-                                        self.shim
-                                            .on_query(
-                                                ::std::str::from_utf8(q).map_err(|e| {
-                                                    io::Error::new(io::ErrorKind::InvalidData, e)
-                                                })?,
-                                                w,
-                                            )
-                                            .await?;
-                                    }
+                                    _ => match ::std::str::from_utf8(q) {
+                                        Ok(query) => self.shim.on_query(query, w).await?,
+                                        Err(_) => self.shim.on_query_bytes(q, w).await?,
+                                    },
                                 }
                             } else if !self.process_use_statement_on_query
                                 && (q.starts_with(b"USE ") || q.starts_with(b"use "))
@@ -872,14 +876,11 @@ where
                                     false,
                                     self.client_capabilities,
                                 );
-                                self.shim
-                                    .on_query(
-                                        ::std::str::from_utf8(q).map_err(|e| {
-                                            io::Error::new(io::ErrorKind::InvalidData, e)
-                                        })?,
-                                        w,
-                                    )
-                                    .await?;
+                                match ::std::str::from_utf8(q) {
+                                    Ok(query) => self.shim.on_query(query, w).await?,
+                                    // mysqldump writes BLOB values as raw bytes.
+                                    Err(_) => self.shim.on_query_bytes(q, w).await?,
+                                }
                             }
                         }
                         Command::Prepare(q) => {

@@ -176,6 +176,9 @@ impl Drop for DefinerGuard<'_> {
     }
 }
 
+/// The sql_mode a session starts with, and `@@GLOBAL.sql_mode`.
+pub const DEFAULT_SQL_MODE: &str = "STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION";
+
 pub struct Session {
     db: Db,
     txn: Mutex<Option<TxnState>>,
@@ -273,7 +276,7 @@ impl Session {
             transaction_isolation: Mutex::new("REPEATABLE-READ".into()),
             database: Mutex::new("elyra".into()),
             strict_sql_mode: std::sync::atomic::AtomicBool::new(true),
-            sql_mode: Mutex::new("STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION".into()),
+            sql_mode: Mutex::new(DEFAULT_SQL_MODE.into()),
             time_zone: Mutex::new("SYSTEM".into()),
             autocommit: std::sync::atomic::AtomicBool::new(true),
             session_read_only: std::sync::atomic::AtomicBool::new(false),
