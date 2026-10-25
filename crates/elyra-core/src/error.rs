@@ -132,6 +132,12 @@ pub enum Error {
     #[error("Undeclared variable: {0}")]
     UndeclaredVariable(String),
 
+    /// `DROP` or `CALL` of a stored routine that does not exist. MySQL 1305
+    /// (`ER_SP_DOES_NOT_EXIST`), its text: `(kind, qualified name)`, as
+    /// `FUNCTION elyra.f`.
+    #[error("{0} {1} does not exist")]
+    RoutineMissing(&'static str, String),
+
     /// `CREATE USER|ROLE` of an account that exists, or `DROP USER|ROLE` of
     /// one that does not, without `IF [NOT] EXISTS`. MySQL 1396
     /// (`ER_CANNOT_USER`), its text: `(operation, account name)`.
@@ -188,6 +194,7 @@ impl Error {
             Error::IntoColumnCount => 1222, // ER_WRONG_NUMBER_OF_COLUMNS_IN_SELECT
             Error::TooManyRows => 1172,    // ER_TOO_MANY_ROWS
             Error::UndeclaredVariable(_) => 1327, // ER_SP_UNDECLARED_VAR
+            Error::RoutineMissing(..) => 1305, // ER_SP_DOES_NOT_EXIST
             Error::AccountOperation(..) => 1396, // ER_CANNOT_USER
             Error::ViewRights(_) => 1356,  // ER_VIEW_INVALID
             _ => 1105,
@@ -215,6 +222,7 @@ impl Error {
             Error::IntoColumnCount => b"21000",
             Error::TooManyRows => b"42000",
             Error::UndeclaredVariable(_) => b"42000",
+            Error::RoutineMissing(..) => b"42000",
             _ => b"HY000",
         }
     }

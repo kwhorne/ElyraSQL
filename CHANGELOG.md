@@ -8,6 +8,22 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ### Fixed
 
+- **mysqldump's session statements run.** `SET a = ..., b = ...` ran only its
+  first assignment and dropped the rest without an error, so mysqldump's `SET
+  @OLD_SQL_MODE=@@SQL_MODE, SQL_MODE='NO_AUTO_VALUE_ON_ZERO'` never set the mode,
+  and a row with id 0 in an `AUTO_INCREMENT` column was renumbered on restore.
+  Every assignment now runs, left to right, each right-hand side reading the
+  variables as they were before the statement, as in MySQL.
+  `character_set_client`, `character_set_results`, `character_set_connection`
+  and `collation_connection` are accepted as `SET NAMES` is (the server speaks
+  utf8mb4), as are `sql_notes` and `unique_checks`; a bare word assigned to a
+  system variable is its value (`SET character_set_client = utf8mb4`); and
+  `ALTER TABLE t DISABLE KEYS` / `ENABLE KEYS` is a no-op, as for InnoDB.
+  `DROP FUNCTION IF EXISTS`, written before every function, has nothing to do
+  (stored functions are not supported, so none exists), and `DROP PROCEDURE`
+  of a missing procedure, which succeeded silently, fails with MySQL's 1305
+  unless `IF EXISTS`, as `CALL` of one now does too (it was 1105).
+
 - **A join in parentheses is read: `FROM (a JOIN b ON ...)`.** MySQL stores
   every view with a join in this form and mysqldump writes it back, so a
   restored view with a join was refused ("unknown column"), and so was any
