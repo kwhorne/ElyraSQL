@@ -13616,3 +13616,73 @@ async fn before_trigger_applies_every_assignment_of_a_set() {
         .unwrap();
     assert_eq!(updated, (50, 9, "x;y,".to_string()));
 }
+
+/// `IF [NOT] EXISTS` on user and role DDL is honoured, the errors without it
+/// are MySQL's 1396, and a statement naming several accounts is all or nothing.
+/// `DROP USER IF EXISTS` and `CREATE USER IF NOT EXISTS` used to fail like the
+/// plain forms; `CREATE ROLE` overwrote an existing user, password and all, and
+/// `DROP ROLE` of a missing name succeeded. Each case as MySQL 8.4 answers it.
+#[tokio::test]
+async fn account_ddl_honours_if_exists_and_is_all_or_nothing() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    let code = |e: mysql_async::Error| match e {
+        mysql_async::Error::Server(e) => (e.code, e.message),
+        other => panic!("expected a server error, got {other:?}"),
+    };
+
+    c.query_drop("CREATE USER carol IDENTIFIED BY 'Passw0rd!x'")
+        .await
+        .unwrap();
+    let dup = c
+        .query_drop("CREATE USER carol IDENTIFIED BY 'Passw0rd!x'")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        code(dup),
+        (1396, "Operation CREATE USER failed for 'carol'@'%'".into())
+    );
+    // Left as it is, password included.
+    c.query_drop("CREATE USER IF NOT EXISTS carol IDENTIFIED BY 'Other0rd!x'")
+        .await
+        .unwrap();
+    srv.conn_as("carol", "Passw0rd!x").await; // she keeps her password
+
+    c.query_drop("DROP USER IF EXISTS nobody").await.unwrap();
+    let missing = c.query_drop("DROP USER nobody").await.unwrap_err();
+    assert_eq!(
+        code(missing),
+        (1396, "Operation DROP USER failed for 'nobody'@'%'".into())
+    );
+    // One missing name drops none of them.
+    c.query_drop("DROP USER carol, nobody").await.unwrap_err();
+    c.query_drop("DROP USER IF EXISTS carol, nobody")
+        .await
+        .unwrap();
+
+    // CREATE ROLE never overwrites an account, user or role.
+    c.query_drop("CREATE USER dave IDENTIFIED BY 'Passw0rd!x'")
+        .await
+        .unwrap();
+    let over = c.query_drop("CREATE ROLE dave").await.unwrap_err();
+    assert_eq!(
+        code(over),
+        (1396, "Operation CREATE ROLE failed for 'dave'@'%'".into())
+    );
+    srv.conn_as("dave", "Passw0rd!x").await; // still a user
+    c.query_drop("CREATE ROLE r1").await.unwrap();
+    c.query_drop("CREATE ROLE r2, r1").await.unwrap_err();
+    c.query_drop("CREATE ROLE IF NOT EXISTS r1, r2")
+        .await
+        .unwrap();
+
+    let gone = c.query_drop("DROP ROLE nothere").await.unwrap_err();
+    assert_eq!(
+        code(gone),
+        (1396, "Operation DROP ROLE failed for 'nothere'@'%'".into())
+    );
+    c.query_drop("DROP ROLE r2, nothere").await.unwrap_err();
+    c.query_drop("DROP ROLE IF EXISTS r1, r2, nothere")
+        .await
+        .unwrap();
+}

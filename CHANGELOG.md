@@ -8,6 +8,15 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ### Fixed
 
+- **`IF [NOT] EXISTS` on user and role DDL is honoured, and the errors are
+  MySQL's.** `DROP USER IF EXISTS` of a missing account and `CREATE USER IF NOT
+  EXISTS` of an existing one failed like the plain forms. `CREATE ROLE` of an
+  existing account overwrote it: run against a user, it replaced their password
+  and made them a role nobody could log in as. `DROP ROLE` of a missing name
+  succeeded. Now, as in MySQL 8.4, the `IF` forms skip those names, the plain
+  forms fail with 1396 (`Operation CREATE USER failed for 'carol'@'%'`; it was
+  1105), and a statement naming several accounts is all or nothing.
+
 - **A `BEFORE` trigger applies every assignment of a `SET`.** `SET NEW.a = x,
   NEW.b = y` applied only the first assignment and dropped the rest without an
   error, so the row was written with the other columns unset. The assignments

@@ -132,6 +132,12 @@ pub enum Error {
     #[error("Undeclared variable: {0}")]
     UndeclaredVariable(String),
 
+    /// `CREATE USER|ROLE` of an account that exists, or `DROP USER|ROLE` of
+    /// one that does not, without `IF [NOT] EXISTS`. MySQL 1396
+    /// (`ER_CANNOT_USER`), its text: `(operation, account name)`.
+    #[error("Operation {0} failed for '{1}'@'%'")]
+    AccountOperation(&'static str, String),
+
     /// `SELECT ... INTO @var` that found more than one row. MySQL 1172
     /// (`ER_TOO_MANY_ROWS`), with its text.
     #[error("Result consisted of more than one row")]
@@ -176,6 +182,7 @@ impl Error {
             Error::IntoColumnCount => 1222, // ER_WRONG_NUMBER_OF_COLUMNS_IN_SELECT
             Error::TooManyRows => 1172,    // ER_TOO_MANY_ROWS
             Error::UndeclaredVariable(_) => 1327, // ER_SP_UNDECLARED_VAR
+            Error::AccountOperation(..) => 1396, // ER_CANNOT_USER
             _ => 1105,
         }
     }

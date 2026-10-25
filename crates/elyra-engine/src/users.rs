@@ -276,11 +276,28 @@ pub async fn execute(sql: &str, sess: &Session, privilege: Privilege) -> Result<
         && toks.get(1).map(|t| t.is_word("role")).unwrap_or(false)
     {
         let mut i = 2;
-        if toks.get(i).map(|t| t.is_word("if")).unwrap_or(false) {
+        let if_not_exists = toks.get(i).map(|t| t.is_word("if")).unwrap_or(false);
+        if if_not_exists {
             i += 3; // IF NOT EXISTS
         }
         let mut puts = Vec::new();
+        let mut named = false;
         while let Some((name, j)) = parse_userspec(&toks, i) {
+            named = true;
+            i = j;
+            // An existing account -- a role, or a user -- is never overwritten:
+            // that used to replace a user's password and make them a role. All
+            // or nothing, as in MySQL: an error writes none of the names.
+            if sess.get(user_key(&name)).await?.is_some() {
+                if !if_not_exists {
+                    return Err(Error::AccountOperation("CREATE ROLE", name));
+                }
+                if matches!(toks.get(i), Some(Tok::Sym(','))) {
+                    i += 1;
+                    continue;
+                }
+                break;
+            }
             // A role is a principal (empty password) plus a role marker.
             let rec = UserRecord {
                 digest: password_digest(b""),
@@ -293,14 +310,13 @@ pub async fn execute(sql: &str, sess: &Session, privilege: Privilege) -> Result<
                 elyra_core::users::ugrant_key(&name),
                 elyra_core::users::encode_privset(0),
             ));
-            i = j;
             if matches!(toks.get(i), Some(Tok::Sym(','))) {
                 i += 1;
             } else {
                 break;
             }
         }
-        if puts.is_empty() {
+        if !named {
             return Err(Error::Parse("CREATE ROLE: expected a role name".into()));
         }
         sess.commit_write(puts, vec![]).await?;
@@ -312,11 +328,25 @@ pub async fn execute(sql: &str, sess: &Session, privilege: Privilege) -> Result<
         && toks.get(1).map(|t| t.is_word("role")).unwrap_or(false)
     {
         let mut i = 2;
-        if toks.get(i).map(|t| t.is_word("if")).unwrap_or(false) {
+        let if_exists = toks.get(i).map(|t| t.is_word("if")).unwrap_or(false);
+        if if_exists {
             i += 2;
         }
         let mut deletes = Vec::new();
+        let mut named = false;
         while let Some((name, j)) = parse_userspec(&toks, i) {
+            named = true;
+            if sess.get(user_key(&name)).await?.is_none() {
+                if !if_exists {
+                    return Err(Error::AccountOperation("DROP ROLE", name));
+                }
+                i = j;
+                if matches!(toks.get(i), Some(Tok::Sym(','))) {
+                    i += 1;
+                    continue;
+                }
+                break;
+            }
             deletes.push(user_key(&name));
             deletes.push(role_flag_key(&name));
             deletes.push(elyra_core::users::ugrant_key(&name));
@@ -327,7 +357,7 @@ pub async fn execute(sql: &str, sess: &Session, privilege: Privilege) -> Result<
                 break;
             }
         }
-        if deletes.is_empty() {
+        if !named {
             return Err(Error::Parse("DROP ROLE: expected a role name".into()));
         }
         sess.commit_write(vec![], deletes).await?;
@@ -349,13 +379,18 @@ pub async fn execute(sql: &str, sess: &Session, privilege: Privilege) -> Result<
     // CREATE USER [IF NOT EXISTS] spec IDENTIFIED BY 'pw'
     if toks.first().map(|t| t.is_word("create")).unwrap_or(false) {
         let mut i = 2; // after CREATE USER
-        if toks.get(i).map(|t| t.is_word("if")).unwrap_or(false) {
+        let if_not_exists = toks.get(i).map(|t| t.is_word("if")).unwrap_or(false);
+        if if_not_exists {
             i += 3; // IF NOT EXISTS
         }
         let (name, mut j) = parse_userspec(&toks, i)
             .ok_or_else(|| Error::Parse("CREATE USER: expected a user name".into()))?;
         if sess.get(user_key(&name)).await?.is_some() {
-            return Err(Error::Query(format!("user '{name}' already exists")));
+            // An existing account is left as it is, password included.
+            if if_not_exists {
+                return Ok(QueryResult::Affected(0));
+            }
+            return Err(Error::AccountOperation("CREATE USER", name));
         }
         // IDENTIFIED BY 'pw' (optional → empty password)
         let mut password = String::new();
@@ -397,13 +432,25 @@ pub async fn execute(sql: &str, sess: &Session, privilege: Privilege) -> Result<
     // DROP USER [IF EXISTS] spec [, spec ...]
     if toks.first().map(|t| t.is_word("drop")).unwrap_or(false) {
         let mut i = 2;
-        if toks.get(i).map(|t| t.is_word("if")).unwrap_or(false) {
+        let if_exists = toks.get(i).map(|t| t.is_word("if")).unwrap_or(false);
+        if if_exists {
             i += 2; // IF EXISTS
         }
         let mut deletes = Vec::new();
+        let mut named = false;
         while let Some((name, j)) = parse_userspec(&toks, i) {
+            named = true;
+            // All or nothing, as in MySQL: an error drops none of the names.
             if sess.get(user_key(&name)).await?.is_none() {
-                return Err(Error::Query(format!("user '{name}' does not exist")));
+                if !if_exists {
+                    return Err(Error::AccountOperation("DROP USER", name));
+                }
+                i = j;
+                if matches!(toks.get(i), Some(Tok::Sym(','))) {
+                    i += 1;
+                    continue;
+                }
+                break;
             }
             deletes.push(user_key(&name));
             deletes.push(elyra_core::users::ugrant_key(&name));
@@ -436,7 +483,7 @@ pub async fn execute(sql: &str, sess: &Session, privilege: Privilege) -> Result<
                 break;
             }
         }
-        if deletes.is_empty() {
+        if !named {
             return Err(Error::Parse("DROP USER: expected a user name".into()));
         }
         sess.commit_write(vec![], deletes).await?;
