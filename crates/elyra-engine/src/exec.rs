@@ -19193,7 +19193,10 @@ pub(crate) fn parse_query(sql: &str) -> Result<SqlQuery> {
     let stmts = sqlparser::parser::Parser::parse_sql(&dialect, sql)
         .map_err(|e| Error::Parse(e.to_string()))?;
     match stmts.into_iter().next() {
-        Some(sqlparser::ast::Statement::Query(q)) => Ok(*q),
+        Some(sqlparser::ast::Statement::Query(mut q)) => {
+            crate::nestjoin::flatten(&mut q);
+            Ok(*q)
+        }
         _ => Err(Error::Query("view definition is not a query".into())),
     }
 }
