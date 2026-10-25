@@ -164,6 +164,18 @@ impl Drop for InternalStatements<'_> {
     }
 }
 
+/// Holds a session in a procedure's or trigger's definer context; see
+/// [`Session::as_definer`].
+pub struct DefinerGuard<'a>(&'a Session);
+
+impl Drop for DefinerGuard<'_> {
+    fn drop(&mut self) {
+        self.0
+            .definer_depth
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 pub struct Session {
     db: Db,
     txn: Mutex<Option<TxnState>>,
@@ -210,6 +222,11 @@ pub struct Session {
     /// loops so a runaway statement stops burning CPU instead of running to
     /// completion after the client has already been given up on.
     cancel: Arc<elyra_core::cancel::QueryCancel>,
+    /// Who is connected, for `USER()`, `CURRENT_USER()` and `CONNECTION_ID()`.
+    identity: Mutex<crate::sessfn::Identity>,
+    /// How many procedure or trigger bodies are running: inside one,
+    /// `CURRENT_USER()` is the definer's account, as in MySQL.
+    definer_depth: std::sync::atomic::AtomicUsize,
 }
 
 fn is_meta(k: &[u8]) -> bool {
@@ -270,6 +287,8 @@ impl Session {
             last_insert_id: std::sync::atomic::AtomicI64::new(0),
             row_count: std::sync::atomic::AtomicI64::new(-1),
             cancel: Arc::new(elyra_core::cancel::QueryCancel::new()),
+            identity: Mutex::new(crate::sessfn::Identity::default()),
+            definer_depth: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -553,6 +572,36 @@ impl Session {
     }
 
     /// Set a session user variable (`@name`).
+    /// Record who is connected; the server calls this once the client has
+    /// authenticated.
+    pub fn set_identity(&self, identity: crate::sessfn::Identity) {
+        *self.identity.lock().unwrap_or_else(|e| e.into_inner()) = identity;
+    }
+
+    pub fn identity(&self) -> crate::sessfn::Identity {
+        self.identity
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// The account `CURRENT_USER()` answers with inside a procedure or trigger
+    /// body, or `None` outside one.
+    pub fn definer(&self) -> Option<&'static str> {
+        (self
+            .definer_depth
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0)
+        .then_some(crate::sessfn::DEFINER)
+    }
+
+    /// Run inside a procedure or trigger body until the guard is dropped.
+    pub fn as_definer(&self) -> DefinerGuard<'_> {
+        self.definer_depth
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        DefinerGuard(self)
+    }
+
     pub fn set_user_var(&self, name: &str, value: elyra_core::Value) {
         self.user_vars
             .lock()

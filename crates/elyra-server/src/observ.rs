@@ -256,6 +256,11 @@ impl ProcRegistry {
         }
     }
 
+    /// The client address connection `id` came from.
+    pub fn host(&self, id: u32) -> Option<String> {
+        self.inner.lock().unwrap().get(&id).map(|e| e.host.clone())
+    }
+
     pub fn begin_query(&self, id: u32, sql: &str) {
         if let Some(e) = self.inner.lock().unwrap().get_mut(&id) {
             e.current = Some((truncate(sql, 1000), Instant::now()));

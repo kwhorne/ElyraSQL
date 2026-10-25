@@ -26,6 +26,7 @@ mod proc;
 mod rowdec;
 mod schemacache;
 mod sessfn;
+pub use sessfn::Identity;
 mod session;
 mod sort;
 pub mod sqllex;
@@ -196,7 +197,10 @@ impl Engine {
         use proc::{Flow, ProcStmt};
         const MAX_LOOP: u64 = 10_000_000;
         let cond = |c: &str, env: &std::collections::HashMap<String, Value>| -> Result<bool> {
-            Ok(truthy(&exec::eval_scalar(&subst_proc(c, env, sess))?))
+            Ok(truthy(&exec::eval_scalar_as(
+                sess,
+                &subst_proc(c, env, sess),
+            )?))
         };
         // How a loop body's escape signal is handled by a loop with `label`.
         enum Act {
@@ -216,13 +220,13 @@ impl Engine {
             match stmt {
                 ProcStmt::Declare { name, default } => {
                     let v = match default {
-                        Some(e) => exec::eval_scalar(&subst_proc(e, env, sess))?,
+                        Some(e) => exec::eval_scalar_as(sess, &subst_proc(e, env, sess))?,
                         None => Value::Null,
                     };
                     env.insert(name.to_ascii_lowercase(), v);
                 }
                 ProcStmt::Set { name, expr } => {
-                    let v = exec::eval_scalar(&subst_proc(expr, env, sess))?;
+                    let v = exec::eval_scalar_as(sess, &subst_proc(expr, env, sess))?;
                     // A `@user` variable belongs to the session and outlives the
                     // CALL (as in MySQL); a bare name is a procedure local. `@@`
                     // system variables are left to the dispatcher, unchanged.
@@ -832,6 +836,7 @@ impl Engine {
             return Ok(());
         }
         sess.enter_call()?;
+        let _definer = sess.as_definer();
         let mut result = Ok(());
         for sql in pending {
             if let Err(e) = Box::pin(self.execute_as(&sql, Privilege::Admin, "", sess)).await {
@@ -1106,7 +1111,7 @@ impl Engine {
                     let name = rest[..eq].trim().to_string();
                     let expr = rest[eq + 1..].trim().trim_end_matches(';');
                     let subst = exec::substitute_uvars(expr, &sess.user_vars_snapshot());
-                    let v = exec::eval_scalar(&subst)?;
+                    let v = exec::eval_scalar_as(sess, &subst)?;
                     sess.set_user_var(&name, v);
                     return Ok(vec![QueryResult::empty_ok()]);
                 }
@@ -1477,7 +1482,7 @@ impl Engine {
                         proc::ParamMode::In => {
                             env.insert(
                                 pname.clone(),
-                                exec::eval_scalar(&exec::substitute_uvars(a, &uvars))?,
+                                exec::eval_scalar_as(sess, &exec::substitute_uvars(a, &uvars))?,
                             );
                         }
                         proc::ParamMode::Out | proc::ParamMode::Inout => {
@@ -1498,8 +1503,10 @@ impl Engine {
             let stmts = proc::parse(&def.body)?;
             let mut ctx = proc::ProcCtx::default();
             sess.enter_call()?;
-            let r =
-                Box::pin(self.run_proc(&stmts, &mut env, &mut ctx, privilege, user, sess)).await;
+            let r = {
+                let _definer = sess.as_definer();
+                Box::pin(self.run_proc(&stmts, &mut env, &mut ctx, privilege, user, sess)).await
+            };
             sess.leave_call();
             r?; // Flow::Exit from an EXIT handler is normal completion
             for (pname, var) in writeback {
@@ -1745,6 +1752,9 @@ impl Engine {
                 // UNIX_TIMESTAMP/FROM_UNIXTIME are resolved against it.
                 sess.time_zone_offset_minutes(),
             );
+            if sessfn::resolves_identity(&stmt) {
+                sessfn::rewrite_identity(&mut stmt, &sess.identity(), sess.definer());
+            }
             // `||` means logical OR by default and string concatenation under
             // PIPES_AS_CONCAT (MySQL). sqlparser parses it as one operator either
             // way; the stateless evaluator concatenates it, so when the mode is

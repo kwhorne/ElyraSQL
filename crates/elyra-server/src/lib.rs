@@ -295,6 +295,14 @@ impl ElyraShim {
         *self.privilege.lock().unwrap() = self.auth.privilege(username);
         let name = String::from_utf8_lossy(username).into_owned();
         *self.user.lock().unwrap() = name.clone();
+        self.session.set_identity(elyra_engine::Identity {
+            user: name.clone(),
+            host: self
+                .procs
+                .host(self.conn_id)
+                .unwrap_or_else(|| "localhost".into()),
+            connection_id: u64::from(self.conn_id),
+        });
         self.procs.set_user(self.conn_id, name);
     }
 
