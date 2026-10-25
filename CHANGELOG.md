@@ -6,6 +6,8 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.12.7] - 2026-10-25
+
 ### Fixed
 
 - **mysqldump's session statements run.** `SET a = ..., b = ...` ran only its

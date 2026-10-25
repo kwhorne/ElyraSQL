@@ -17,6 +17,35 @@ ElyraSQL release builds target **Ubuntu 24.04+** and **Apple Silicon macOS
     done, so an interrupted upgrade simply resumes on the next start. **Take a backup
     first, and note that downgrading to 1.4.x afterwards is not supported.**
 
+!!! warning "Upgrading to 1.12.7 — who is asking, views, and mysqldump"
+
+    No on-disk format change; a 1.12.6 database opens in 1.12.7 unchanged, and
+    its views read exactly as before. Several answers become MySQL's, and code
+    that depended on the old ones will notice:
+
+    - **`USER()`, `CURRENT_USER()` and `CONNECTION_ID()` answer for the
+      connection.** They were `root@%` and `1` for everyone. A comparison with
+      `'root@%'`, or a column default or trigger that recorded it, now sees the
+      real account.
+    - **Views run as their definer.** A view created from now on records its
+      definer (the `DEFINER` clause, or whoever creates it). When that is a
+      stored account, its privileges on the tables are checked;
+      `SQL SECURITY INVOKER` checks the querying user's instead. A refusal is
+      error 1356. Views created before 1.12.7 run as they always have.
+    - **Version comments run.** The body of `/*!NNNNN ... */` up to 8.0.12 is
+      code, as in MySQL. A script that carried statements in them -- every
+      mysqldump file does -- now runs them, and one that fails now reports it.
+    - **Errors MySQL gives, with MySQL's codes:** `CREATE ROLE` of an existing
+      account (it overwrote it), `DROP ROLE` or `DROP PROCEDURE` of a missing
+      one (both succeeded), all 1396 or 1305; `CREATE USER` / `DROP USER` without
+      `IF [NOT] EXISTS` now give 1396 instead of 1105, and the `IF` forms are
+      honoured.
+
+    A mysqldump of a MySQL 8.4 database now restores with the `mysql` client --
+    tables, rows, views, triggers and procedures -- except stored functions,
+    which ElyraSQL does not have yet. See
+    [Importing a MySQL dump](backup.md#importing-a-mysql-dump).
+
 !!! info "Upgrading to 1.12.6"
 
     No on-disk format change; a 1.12.5 database opens in 1.12.6 unchanged.
@@ -569,8 +598,8 @@ macOS).
 Multi-arch image (`amd64` + `arm64`) on the GitHub Container Registry:
 
 ```bash
-docker pull ghcr.io/kwhorne/elyrasql:1.12.6   # or :latest
-docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.12.6
+docker pull ghcr.io/kwhorne/elyrasql:1.12.7   # or :latest
+docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.12.7
 ```
 
 The image is ~15 MB, runs as a non-root user, stores data in the
