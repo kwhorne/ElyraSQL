@@ -8,6 +8,17 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ### Fixed
 
+- **`CREATE VIEW` takes MySQL's `ALGORITHM`, `DEFINER` and `SQL SECURITY`
+  clauses, and honours them.** `mysqldump` writes all three on every view, and
+  each such statement was refused with a syntax error; so was `CREATE
+  DEFINER=... PROCEDURE` or `TRIGGER`. A view now records its definer (the
+  clause, or its creator) and runs as it: when the definer is a stored account,
+  its privileges on the tables are checked, as in MySQL. `SQL SECURITY INVOKER`
+  checks the querying user's instead. A refusal is MySQL's 1356 and names the
+  view, not the tables behind it. `CURRENT_USER()` inside a view and
+  `information_schema.VIEWS` report the definer and security type. Views created
+  earlier run as `root@%`, as they always have.
+
 - **`IF [NOT] EXISTS` on user and role DDL is honoured, and the errors are
   MySQL's.** `DROP USER IF EXISTS` of a missing account and `CREATE USER IF NOT
   EXISTS` of an existing one failed like the plain forms. `CREATE ROLE` of an

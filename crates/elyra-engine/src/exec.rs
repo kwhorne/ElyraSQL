@@ -2748,6 +2748,7 @@ async fn information_schema(
                 for (k, v) in &batch {
                     let name = String::from_utf8_lossy(&k[prefix.len()..]).to_string();
                     let def = String::from_utf8_lossy(v).to_string();
+                    let security = view_security(db, &name).await?;
                     rows.push(vec![
                         Value::Text("def".into()),
                         Value::Text(database.clone()),
@@ -2755,8 +2756,15 @@ async fn information_schema(
                         Value::Text(def),
                         Value::Text("NONE".into()),
                         Value::Text("NO".into()),
-                        Value::Text("root@%".into()),
-                        Value::Text("DEFINER".into()),
+                        Value::Text(security.definer),
+                        Value::Text(
+                            if security.invoker {
+                                "INVOKER"
+                            } else {
+                                "DEFINER"
+                            }
+                            .into(),
+                        ),
                         Value::Text("utf8mb4".into()),
                         Value::Text("utf8mb4_0900_ai_ci".into()),
                     ]);
@@ -19047,12 +19055,50 @@ pub async fn create_view(
         }
     }
 
+    // Who the view runs as: the `DEFINER` clause, or whoever creates it.
+    let clauses = db.take_view_clauses().unwrap_or_default();
+    let security = crate::definer::ViewSecurity {
+        definer: clauses
+            .definer
+            .unwrap_or_else(|| format!("{}@%", db.identity().user)),
+        invoker: clauses.invoker,
+    };
     db.commit_write(
-        vec![(catalog::view_key(&name), q.to_string().into_bytes())],
+        vec![
+            (catalog::view_key(&name), q.to_string().into_bytes()),
+            (
+                crate::definer::view_security_key(&name),
+                crate::definer::encode(&security),
+            ),
+        ],
         vec![],
     )
     .await?;
     Ok(QueryResult::empty_ok())
+}
+
+/// A view's definer and security type; a view created before they were
+/// recorded runs as `root@%`, with its definer's rights.
+pub(crate) async fn view_security(
+    db: &Session,
+    name: &str,
+) -> Result<crate::definer::ViewSecurity> {
+    Ok(recorded_view_security(db, name)
+        .await?
+        .unwrap_or_else(crate::definer::ViewSecurity::legacy))
+}
+
+/// A view's recorded definer and security type, or `None` for a view created
+/// before they were recorded.
+pub(crate) async fn recorded_view_security(
+    db: &Session,
+    name: &str,
+) -> Result<Option<crate::definer::ViewSecurity>> {
+    Ok(
+        crate::schemacache::get(db, crate::definer::view_security_key(name))
+            .await?
+            .map(|b| crate::definer::decode(&b)),
+    )
 }
 
 pub async fn drop_view(db: &Session, name: &str, if_exists: bool) -> Result<QueryResult> {
@@ -19065,8 +19111,14 @@ pub async fn drop_view(db: &Session, name: &str, if_exists: bool) -> Result<Quer
             format!("no such view: {name}"),
         ));
     }
-    db.commit_write(vec![], vec![catalog::view_key(name)])
-        .await?;
+    db.commit_write(
+        vec![],
+        vec![
+            catalog::view_key(name),
+            crate::definer::view_security_key(name),
+        ],
+    )
+    .await?;
     Ok(QueryResult::empty_ok())
 }
 
@@ -19094,9 +19146,15 @@ async fn expand_view_factor(db: &Session, tf: &mut TableFactor) -> Result<()> {
         let table = stored_table_ident(db, name)?;
         if let Some(sql) = catalog::load_view(db, &table).await? {
             let mut vq = parse_query(&sql)?;
-            // A view runs as its definer: `CURRENT_USER()` in it is the
-            // definer's account, while `USER()` stays the connection's own.
-            crate::sessfn::rewrite_identity(&mut vq, &db.identity(), Some(crate::sessfn::DEFINER));
+            // `CURRENT_USER()` in a view is its definer's account, or, `SQL
+            // SECURITY INVOKER`, the invoker's; `USER()` is the connection's.
+            let security = view_security(db, &table).await?;
+            let definer = if security.invoker {
+                db.definer().map(str::to_string)
+            } else {
+                Some(security.definer)
+            };
+            crate::sessfn::rewrite_identity(&mut vq, &db.identity(), definer.as_deref());
             let al = alias.clone().unwrap_or_else(|| sqlparser::ast::TableAlias {
                 name: sqlparser::ast::Ident::new(table),
                 columns: Vec::new(),
@@ -19127,7 +19185,7 @@ fn from_has_plain_table(query: &SqlQuery) -> bool {
     }
 }
 
-fn parse_query(sql: &str) -> Result<SqlQuery> {
+pub(crate) fn parse_query(sql: &str) -> Result<SqlQuery> {
     // A stored view's text, parsed again: `\_` and `\%` keep their backslash.
     let kept = crate::sqllex::keep_like_escapes(sql);
     let sql = kept.as_deref().unwrap_or(sql);

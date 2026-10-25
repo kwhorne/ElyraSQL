@@ -128,11 +128,11 @@ follows three-valued logic in `AND`/`OR`/`IN`/`BETWEEN` (e.g. `NULL AND 1` and
 - `UUID()` — a random version-4 UUID string.
 - `USER()`, `SESSION_USER()`, `SYSTEM_USER()` — the connection's own
   `user@client-address`, also inside a view, procedure or trigger.
-- `CURRENT_USER()` / `CURRENT_USER` — the account, `user@%`. Inside a view,
-  procedure or trigger it is the definer's account, as in MySQL. Only an
-  administrator can create those, and the definer is not recorded, so it is
-  `root@%` there, the account `information_schema` reports for them. To filter
-  rows by who is asking, use `USER()`:
+- `CURRENT_USER()` / `CURRENT_USER` — the account, `user@%`. Inside a view it
+  is the view's definer, or the invoker for a `SQL SECURITY INVOKER` view (see
+  [Views](ddl.md#definer-and-sql-security)); inside a procedure or trigger it is
+  `root@%`, the definer `information_schema` reports for them. To filter rows by
+  who is asking, use `USER()`:
 
   ```sql
   CREATE VIEW my_docs AS

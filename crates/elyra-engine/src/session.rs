@@ -227,6 +227,9 @@ pub struct Session {
     /// How many procedure or trigger bodies are running: inside one,
     /// `CURRENT_USER()` is the definer's account, as in MySQL.
     definer_depth: std::sync::atomic::AtomicUsize,
+    /// The definer clauses taken out of the statement being run, for the
+    /// `CREATE VIEW` in it (see `crate::definer`).
+    view_clauses: Mutex<Option<crate::definer::Clauses>>,
 }
 
 fn is_meta(k: &[u8]) -> bool {
@@ -289,6 +292,7 @@ impl Session {
             cancel: Arc::new(elyra_core::cancel::QueryCancel::new()),
             identity: Mutex::new(crate::sessfn::Identity::default()),
             definer_depth: std::sync::atomic::AtomicUsize::new(0),
+            view_clauses: Mutex::new(None),
         }
     }
 
@@ -593,6 +597,20 @@ impl Session {
             .load(std::sync::atomic::Ordering::Relaxed)
             > 0)
         .then_some(crate::sessfn::DEFINER)
+    }
+
+    /// Hold the definer clauses of the statement about to run; `None` clears
+    /// them.
+    pub fn set_view_clauses(&self, clauses: Option<crate::definer::Clauses>) {
+        *self.view_clauses.lock().unwrap_or_else(|e| e.into_inner()) = clauses;
+    }
+
+    /// The definer clauses of the statement being run, once.
+    pub fn take_view_clauses(&self) -> Option<crate::definer::Clauses> {
+        self.view_clauses
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
     }
 
     /// Run inside a procedure or trigger body until the guard is dropped.

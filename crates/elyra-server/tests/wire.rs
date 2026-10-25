@@ -13686,3 +13686,89 @@ async fn account_ddl_honours_if_exists_and_is_all_or_nothing() {
         .await
         .unwrap();
 }
+
+/// `CREATE [ALGORITHM=...] [DEFINER=...] [SQL SECURITY ...] VIEW`, as mysqldump
+/// writes it, was refused by the parser, and so was `CREATE DEFINER=...` on a
+/// procedure or trigger. A view now runs as its recorded definer -- whose
+/// privileges are checked when it is a stored account -- or, `SQL SECURITY
+/// INVOKER`, as whoever queries it; `CURRENT_USER()` inside follows; and a
+/// refusal is MySQL's 1356, naming the view. Each case as MySQL 8.4 answers it.
+#[tokio::test]
+async fn view_definer_and_sql_security_are_honoured() {
+    let srv = TestServer::start().await;
+    let mut root = srv.conn().await;
+    for sql in [
+        "CREATE TABLE vs_docs (id INT PRIMARY KEY)",
+        "INSERT INTO vs_docs VALUES (1), (2)",
+        "CREATE TABLE vs_pub (id INT PRIMARY KEY)",
+        "INSERT INTO vs_pub VALUES (7)",
+        "CREATE USER vs_alice IDENTIFIED BY 'Passw0rd!x'",
+        "CREATE USER vs_app IDENTIFIED BY 'Passw0rd!x'",
+        "GRANT SELECT ON elyra.vs_pub TO vs_app",
+        "CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`%` SQL SECURITY DEFINER VIEW vs_def AS \
+         SELECT id, CURRENT_USER() AS cu FROM vs_docs",
+        "CREATE SQL SECURITY INVOKER VIEW vs_inv AS SELECT id, CURRENT_USER() AS cu FROM vs_docs",
+        // A definer without the right to what the view reads.
+        "CREATE DEFINER=`vs_app`@`%` VIEW vs_app_docs AS SELECT id FROM vs_docs",
+        "CREATE DEFINER='vs_app'@'%' VIEW vs_app_pub AS SELECT id, CURRENT_USER() AS cu FROM vs_pub",
+        "CREATE DEFINER=`root`@`%` PROCEDURE vs_proc() BEGIN SELECT 1; END",
+        "CREATE DEFINER=`root`@`%` TRIGGER vs_trig BEFORE INSERT ON vs_pub FOR EACH ROW SET NEW.id = NEW.id",
+    ] {
+        root.query_drop(sql).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    for view in ["vs_def", "vs_inv", "vs_app_docs", "vs_app_pub"] {
+        root.query_drop(format!("GRANT SELECT ON elyra.{view} TO vs_alice"))
+            .await
+            .unwrap();
+    }
+
+    let mut alice = srv.conn_as("vs_alice", "Passw0rd!x").await;
+    let def: Vec<(i64, String)> = alice
+        .query("SELECT * FROM vs_def ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(def, vec![(1, "root@%".into()), (2, "root@%".into())]);
+    let app_pub: Vec<(i64, String)> = alice.query("SELECT * FROM vs_app_pub").await.unwrap();
+    assert_eq!(app_pub, vec![(7, "vs_app@%".into())]);
+    for view in ["vs_inv", "vs_app_docs"] {
+        match alice.query_drop(format!("SELECT * FROM {view}")).await {
+            Err(mysql_async::Error::Server(e)) => {
+                assert_eq!(e.code, 1356, "{view}: {}", e.message);
+                assert!(e.message.contains(view), "{}", e.message);
+                assert!(!e.message.contains("vs_docs"), "{}", e.message);
+            }
+            other => panic!("{view}: expected 1356, got {other:?}"),
+        }
+    }
+
+    let views: Vec<(String, String, String)> = root
+        .query(
+            "SELECT TABLE_NAME, DEFINER, SECURITY_TYPE FROM information_schema.VIEWS \
+             WHERE TABLE_NAME LIKE 'vs\\_%' ORDER BY TABLE_NAME",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        views,
+        vec![
+            ("vs_app_docs".into(), "vs_app@%".into(), "DEFINER".into()),
+            ("vs_app_pub".into(), "vs_app@%".into(), "DEFINER".into()),
+            ("vs_def".into(), "root@%".into(), "DEFINER".into()),
+            ("vs_inv".into(), "root@%".into(), "INVOKER".into()),
+        ]
+    );
+
+    // An invoker who can read the table can read the view, as themselves.
+    root.query_drop("GRANT SELECT ON elyra.vs_docs TO vs_alice")
+        .await
+        .unwrap();
+    let mut alice = srv.conn_as("vs_alice", "Passw0rd!x").await;
+    let inv: Vec<(i64, String)> = alice
+        .query("SELECT * FROM vs_inv ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(
+        inv,
+        vec![(1, "vs_alice@%".into()), (2, "vs_alice@%".into())]
+    );
+}

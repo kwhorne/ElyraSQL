@@ -258,6 +258,34 @@ view, and views that reference other views. Views are read-only (no inserts or
 updates through a view). Materialized views and `WITH CHECK OPTION` are not
 supported.
 
+### Definer and SQL SECURITY
+
+```sql
+CREATE ALGORITHM=UNDEFINED DEFINER=`app`@`%` SQL SECURITY DEFINER VIEW my_docs AS
+    SELECT * FROM docs WHERE owner = SUBSTRING_INDEX(USER(), '@', 1);
+
+CREATE SQL SECURITY INVOKER VIEW all_docs AS SELECT * FROM docs;
+```
+
+The clauses are MySQL's, in the form `mysqldump` writes them. `ALGORITHM` is
+accepted and has no effect.
+
+- **`SQL SECURITY DEFINER`** (the default): the view reads its tables with its
+  definer's privileges, so a user granted `SELECT` on the view alone can read
+  through it. The definer is `DEFINER = account`, or whoever creates the view.
+  When the definer is a stored account, its privileges on the tables are
+  checked on every query; `root` and the accounts configured at startup are
+  administrators and read everything. Views created before 1.12.7 run as
+  `root@%`.
+- **`SQL SECURITY INVOKER`**: the view reads with the privileges of whoever
+  queries it, who needs `SELECT` on the tables as well as on the view.
+
+A user who may not read what a view reads gets MySQL's error 1356, which names
+the view and not the tables behind it. `CURRENT_USER()` inside a view is its
+definer, or the invoker for an `INVOKER` view; `information_schema.VIEWS`
+reports both. `DEFINER = account` is also accepted on `CREATE PROCEDURE`,
+`FUNCTION`, `TRIGGER` and `EVENT`, and not recorded: those run as `root@%`.
+
 ## DROP TABLE
 
 ```sql
