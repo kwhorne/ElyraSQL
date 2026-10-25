@@ -765,6 +765,18 @@ pub async fn list_tables(db: &Session) -> Result<Vec<String>> {
     Ok(names)
 }
 
+/// Every view name, sorted.
+pub async fn list_views(db: &Session) -> Result<Vec<String>> {
+    let prefix = b"view::";
+    let mut names: Vec<String> = crate::schemacache::keys(db, prefix)
+        .await?
+        .iter()
+        .map(|k| String::from_utf8_lossy(&k[prefix.len()..]).into_owned())
+        .collect();
+    names.sort();
+    Ok(names)
+}
+
 /// Check whether a table exists.
 pub async fn exists(db: &Session, table: &str) -> Result<bool> {
     Ok(db.get(catalog_key(table)).await?.is_some())

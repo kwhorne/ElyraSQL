@@ -13960,3 +13960,71 @@ async fn mysqldump_session_statements_run() {
         }
     }
 }
+
+/// `information_schema.TABLES` and `SHOW TABLE STATUS` left views out, though
+/// `SHOW FULL TABLES` listed them: a tool that read the catalog to find a view,
+/// or counted what a schema holds, found nothing. A view is now listed as MySQL
+/// 8.4 lists it -- `TABLE_TYPE` `VIEW`, the comment `VIEW`, and NULL for what
+/// only stored tables have.
+#[tokio::test]
+async fn views_are_listed_in_information_schema_tables() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    for sql in [
+        "CREATE TABLE ist_t (id INT PRIMARY KEY AUTO_INCREMENT, name VARCHAR(20))",
+        "CREATE VIEW ist_v AS SELECT id, name FROM ist_t",
+    ] {
+        c.query_drop(sql)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    let listed: Vec<(String, String)> = c
+        .query(
+            "SELECT TABLE_NAME, TABLE_TYPE FROM information_schema.TABLES \
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME LIKE 'ist\\_%' ORDER BY TABLE_NAME",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        listed,
+        vec![
+            ("ist_t".into(), "BASE TABLE".into()),
+            ("ist_v".into(), "VIEW".into())
+        ]
+    );
+    type Row = (
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        String,
+        Option<String>,
+        Option<i64>,
+        Option<String>,
+    );
+    let view: Option<Row> = c
+        .query_first(
+            "SELECT ENGINE, TABLE_ROWS, DATA_LENGTH, INDEX_LENGTH, TABLE_COMMENT, \
+             TABLE_COLLATION, AUTO_INCREMENT, CREATE_OPTIONS \
+             FROM information_schema.TABLES WHERE TABLE_NAME = 'ist_v'",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        view,
+        Some((None, None, None, None, "VIEW".into(), None, None, None))
+    );
+
+    let status: Vec<mysql_async::Row> = c.query("SHOW TABLE STATUS LIKE 'ist%'").await.unwrap();
+    let summary: Vec<(String, Option<String>, Option<String>)> = status
+        .iter()
+        .map(|r| (r.get(0).unwrap(), r.get(1).unwrap(), r.get(17).unwrap()))
+        .collect();
+    assert_eq!(
+        summary,
+        vec![
+            ("ist_t".into(), Some("InnoDB".into()), Some(String::new())),
+            ("ist_v".into(), None, Some("VIEW".into())),
+        ]
+    );
+}

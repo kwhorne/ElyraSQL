@@ -851,13 +851,12 @@ pub async fn show_tables(
         .into_iter()
         .map(|name| (name, "BASE TABLE"))
         .collect();
-    let view_prefix = b"view::";
-    for key in crate::schemacache::keys(db, view_prefix).await? {
-        entries.push((
-            String::from_utf8_lossy(&key[view_prefix.len()..]).into_owned(),
-            "VIEW",
-        ));
-    }
+    entries.extend(
+        catalog::list_views(db)
+            .await?
+            .into_iter()
+            .map(|name| (name, "VIEW")),
+    );
     entries.sort();
 
     let column = format!("Tables_in_{}", db.database());
@@ -1513,12 +1512,30 @@ pub async fn show_table_status(db: &Session, pattern: Option<&str>) -> Result<Qu
         "Create_options",
         "Comment",
     ]);
-    let names = catalog::list_tables(db).await?;
-    let mut rows = Vec::with_capacity(names.len());
-    for n in names
+    let mut names: Vec<(String, bool)> = catalog::list_tables(db)
+        .await?
         .into_iter()
-        .filter(|name| pattern.is_none_or(|pattern| show_like(name, pattern)))
-    {
+        .map(|name| (name, false))
+        .chain(
+            catalog::list_views(db)
+                .await?
+                .into_iter()
+                .map(|name| (name, true)),
+        )
+        .filter(|(name, _)| pattern.is_none_or(|pattern| show_like(name, pattern)))
+        .collect();
+    names.sort();
+    let mut rows = Vec::with_capacity(names.len());
+    for (n, view) in names {
+        if view {
+            // A view has no storage: everything is NULL but its name and the
+            // comment `VIEW`, as MySQL shows it.
+            let mut row = vec![Value::Null; 18];
+            row[0] = Value::Text(n);
+            row[17] = Value::Text("VIEW".into());
+            rows.push(row);
+            continue;
+        }
         let nrows = match catalog::load_stats(db, &n).await? {
             Some(s) => s.rows.to_string(),
             None => "0".to_string(),
@@ -2228,6 +2245,22 @@ async fn information_schema(
                     Value::Text("utf8mb4_0900_ai_ci".into()),
                     auto_increment,
                     Value::Text(String::new()),
+                ]);
+            }
+            // A view, as MySQL lists it: its type, and `VIEW` as the comment.
+            for name in catalog::list_views(db).await? {
+                rows.push(vec![
+                    Value::Text(database.clone()),
+                    Value::Text(name),
+                    Value::Text("VIEW".into()),
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::Text("VIEW".into()),
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
                 ]);
             }
             if include_catalog_rows {
