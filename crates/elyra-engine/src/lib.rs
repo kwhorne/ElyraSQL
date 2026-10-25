@@ -7292,6 +7292,82 @@ mod rollup_grouping_and_explain_tests {
         );
     }
 
+    // ---- ORDER BY a qualified column that is not projected ----------------------
+
+    /// `SELECT x.name, y.id ... ORDER BY x.id, y.id` sorted by `y.id` twice:
+    /// the join schema names its columns `x.id`, so `x.id` was looked up by its
+    /// bare name and found the projected `y.id`. The rows were right and their
+    /// order was not -- the NULL-padded `nobody` came first, and a `LIMIT` kept
+    /// the wrong rows. Every expected row is MySQL 8.4's.
+    #[tokio::test]
+    async fn order_by_an_unprojected_qualified_column_keeps_its_table() {
+        let (e, s) = fixture().await;
+        for sql in [
+            "CREATE TABLE c (id INT PRIMARY KEY, name TEXT)",
+            "CREATE TABLE o (id INT PRIMARY KEY, cid INT)",
+            "INSERT INTO c VALUES (1,'a'),(2,'b'),(3,'nobody')",
+            "INSERT INTO o VALUES (1,1),(2,1),(3,2),(4,9)",
+        ] {
+            e.execute(sql, Privilege::Admin, &s).await.unwrap();
+        }
+        let joined = vec![
+            r(&[Some("a"), Some("1")]),
+            r(&[Some("a"), Some("2")]),
+            r(&[Some("b"), Some("3")]),
+            r(&[Some("nobody"), N]),
+        ];
+        let desc = vec![
+            r(&[Some("b"), Some("3")]),
+            r(&[Some("a"), Some("1")]),
+            r(&[Some("a"), Some("2")]),
+        ];
+        let cases: [(&str, Vec<Vec<Option<String>>>); 7] = [
+            (
+                "SELECT x.name, y.id FROM c x LEFT JOIN o y ON y.cid = x.id ORDER BY x.id, y.id",
+                joined.clone(),
+            ),
+            (
+                "SELECT x.name, y.id FROM c x LEFT JOIN o y ON y.cid = x.id \
+                 ORDER BY x.id, y.id LIMIT 2",
+                joined[..2].to_vec(),
+            ),
+            (
+                "SELECT x.name AS n, y.id FROM c x LEFT JOIN o y ON y.cid = x.id ORDER BY x.id, y.id",
+                joined,
+            ),
+            (
+                "SELECT x.name, y.id FROM c x JOIN o y ON y.cid = x.id ORDER BY x.id DESC, y.id",
+                desc.clone(),
+            ),
+            (
+                "SELECT x.name, y.id FROM c x, o y WHERE y.cid = x.id ORDER BY x.id DESC, y.id",
+                desc,
+            ),
+            (
+                "SELECT y.id, COUNT(*) FROM c x LEFT JOIN o y ON y.cid = x.id \
+                 GROUP BY x.id, y.id ORDER BY x.id DESC, y.id",
+                vec![
+                    r(&[N, Some("1")]),
+                    r(&[Some("3"), Some("1")]),
+                    r(&[Some("1"), Some("1")]),
+                    r(&[Some("2"), Some("1")]),
+                ],
+            ),
+            (
+                "SELECT y.id, MAX(x.name) FROM c x JOIN o y ON y.cid = x.id \
+                 GROUP BY y.id ORDER BY MAX(x.id) DESC, y.id",
+                vec![
+                    r(&[Some("3"), Some("b")]),
+                    r(&[Some("1"), Some("a")]),
+                    r(&[Some("2"), Some("a")]),
+                ],
+            ),
+        ];
+        for (sql, want) in cases {
+            assert_eq!(rows(&e, &s, sql).await, want, "{sql}");
+        }
+    }
+
     // ---- EXPLAIN names the aggregation strategy ---------------------------------
 
     async fn extra(e: &Engine, s: &crate::Session, sql: &str) -> String {
