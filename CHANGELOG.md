@@ -8,6 +8,12 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ### Fixed
 
+- **MySQL's version comments run.** The body of `/*! ... */`, and of
+  `/*!NNNNN ... */` up to this server's 8.0.12 (`80012`), is code, as in MySQL;
+  a later version's stays a comment. mysqldump writes every view, every trigger
+  header and most of its session settings this way, and they were skipped as
+  comments: a restored dump had no views and no triggers, and no error said so.
+
 - **`CREATE VIEW` takes MySQL's `ALGORITHM`, `DEFINER` and `SQL SECURITY`
   clauses, and honours them.** `mysqldump` writes all three on every view, and
   each such statement was refused with a syntax error; so was `CREATE

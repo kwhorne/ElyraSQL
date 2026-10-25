@@ -1110,6 +1110,11 @@ impl Engine {
         // Reject pathologically deep expressions before any parsing/evaluation so
         // a hostile query can't overflow the worker stack and abort the process.
         guard_sql_complexity(sql)?;
+        // MySQL's version comments, `/*!50001 CREATE ... */`, are code up to
+        // this server's version: mysqldump writes every view this way.
+        if let Some(expanded) = sqllex::expand_version_comments(sql, sqllex::mysql_version_id()) {
+            return Box::pin(self.execute_as(&expanded, privilege, user, sess)).await;
+        }
         // `CREATE [ALGORITHM=...] [DEFINER=...] [SQL SECURITY ...] VIEW` and
         // `CREATE DEFINER=... PROCEDURE|TRIGGER|...`, as mysqldump writes them:
         // the clauses are taken out, held for the statement, and the rest runs

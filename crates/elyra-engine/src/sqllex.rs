@@ -32,8 +32,9 @@
 //! * `-- ` and `#` run to end of line; `--` needs whitespace or end of input
 //!   after it, so `a--b` is arithmetic, not a comment.
 //! * `/* … */` runs to the closing delimiter. MySQL *executes* the body of a
-//!   `/*! … */` version comment, but no rewriter here needs to reach inside one,
-//!   so it is scanned as an ordinary comment: content is never rewritten.
+//!   `/*! … */` version comment; [`expand_version_comments`] turns the ones
+//!   this server runs into code before any rewriter sees the statement, so the
+//!   scanner here only meets those it does not, and skips them as comments.
 //!
 //! Nothing here allocates per byte, and nothing panics on arbitrary input — a
 //! property test and the `preprocess` fuzz target both depend on that.
@@ -173,6 +174,147 @@ impl Iterator for CodeBytes<'_> {
         }
         None
     }
+}
+
+/// The `MYSQL_VERSION_ID` this server answers to, from the version it reports
+/// (`8.0.12-ElyraSQL-...` is 80012), for version comments.
+pub fn mysql_version_id() -> u32 {
+    let mut parts = elyra_core::SERVER_VERSION
+        .split(|c: char| !c.is_ascii_digit())
+        .map(|p| p.parse::<u32>().unwrap_or(0));
+    let (major, minor, patch) = (
+        parts.next().unwrap_or(0),
+        parts.next().unwrap_or(0),
+        parts.next().unwrap_or(0),
+    );
+    major * 10_000 + minor * 100 + patch
+}
+
+/// Run MySQL's version comments as MySQL does: the body of `/*! … */` is code,
+/// and so is the body of `/*!NNNNN … */` when `NNNNN` (five or six digits,
+/// `80012` = 8.0.12) is at most `server`; a later version's stays a comment.
+/// Returns `None` when `sql` has no version comment to run.
+///
+/// `mysqldump` writes every view, trigger header and most session settings
+/// this way. They used to be skipped as comments: a dump restored without an
+/// error and without its views.
+///
+/// The delimiters of a comment that runs become spaces, so byte offsets inside
+/// the body are unchanged. Quoting inside the body follows the rules above, so
+/// a `*/` inside a string literal does not end it.
+pub fn expand_version_comments(sql: &str, server: u32) -> Option<String> {
+    let b = sql.as_bytes();
+    if !sql.contains("/*!") {
+        return None;
+    }
+    let mut out = String::with_capacity(sql.len());
+    let mut state = Quoting::Code;
+    // Inside the body of a version comment that runs.
+    let mut in_version = false;
+    let mut changed = false;
+    let mut i = 0usize;
+    let mut copied = 0usize;
+    while i < b.len() {
+        let c = b[i];
+        let next = b.get(i + 1).copied();
+        match state {
+            Quoting::Code => match c {
+                b'\'' => {
+                    state = Quoting::Single;
+                    i += 1;
+                }
+                b'"' => {
+                    state = Quoting::Double;
+                    i += 1;
+                }
+                b'`' => {
+                    state = Quoting::Backtick;
+                    i += 1;
+                }
+                b'#' => {
+                    state = Quoting::LineComment;
+                    i += 1;
+                }
+                b'-' if next == Some(b'-')
+                    && b.get(i + 2).is_none_or(|c| c.is_ascii_whitespace()) =>
+                {
+                    state = Quoting::LineComment;
+                    i += 2;
+                }
+                b'*' if in_version && next == Some(b'/') => {
+                    out.push_str(&sql[copied..i]);
+                    out.push_str("  ");
+                    i += 2;
+                    copied = i;
+                    in_version = false;
+                    changed = true;
+                }
+                b'/' if next == Some(b'*') && b.get(i + 2) == Some(&b'!') && !in_version => {
+                    let digits = b[i + 3..].iter().take_while(|d| d.is_ascii_digit()).count();
+                    // Five digits, or six; a longer run is a five-digit version
+                    // followed by a number.
+                    let len = match digits {
+                        0 => 0,
+                        6 => 6,
+                        n => n.min(5),
+                    };
+                    let version: u32 = sql[i + 3..i + 3 + len].parse().unwrap_or(0);
+                    if len == 0 || version <= server {
+                        out.push_str(&sql[copied..i]);
+                        out.push_str(&" ".repeat(3 + len));
+                        i += 3 + len;
+                        copied = i;
+                        in_version = true;
+                        changed = true;
+                    } else {
+                        state = Quoting::BlockComment;
+                        i += 2;
+                    }
+                }
+                b'/' if next == Some(b'*') => {
+                    state = Quoting::BlockComment;
+                    i += 2;
+                }
+                _ => i += 1,
+            },
+            Quoting::Single | Quoting::Double | Quoting::Backtick => {
+                let quote = match state {
+                    Quoting::Single => b'\'',
+                    Quoting::Double => b'"',
+                    _ => b'`',
+                };
+                if c == b'\\' && state != Quoting::Backtick {
+                    i = (i + 2).min(b.len());
+                } else if c == quote && next == Some(quote) {
+                    i += 2;
+                } else {
+                    if c == quote {
+                        state = Quoting::Code;
+                    }
+                    i += 1;
+                }
+            }
+            Quoting::LineComment => {
+                if c == b'\n' {
+                    state = Quoting::Code;
+                }
+                i += 1;
+            }
+            Quoting::BlockComment => {
+                if c == b'*' && next == Some(b'/') {
+                    state = Quoting::Code;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+        }
+    }
+    if !changed {
+        return None;
+    }
+    out.push_str(&sql[copied..]);
+    Some(out)
 }
 
 /// Split `sql` on every top-level code occurrence of `sep`, which must be ASCII.
@@ -538,6 +680,52 @@ mod tests {
         // Both commas are inside the call; the parentheses in the literal are
         // not counted.
         assert_eq!(depths, vec![1, 1]);
+    }
+
+    #[test]
+    fn version_comments_run_up_to_the_server_version() {
+        let run = |sql: &str| {
+            super::expand_version_comments(sql, 80012)
+                .map(|s| s.split_whitespace().collect::<Vec<_>>().join(" "))
+        };
+        // What mysqldump writes.
+        assert_eq!(
+            run("/*!50001 CREATE ALGORITHM=UNDEFINED */ /*!50013 DEFINER=`root`@`%` SQL SECURITY DEFINER */ /*!50001 VIEW `v` AS select 1 AS `x` */").as_deref(),
+            Some("CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`%` SQL SECURITY DEFINER VIEW `v` AS select 1 AS `x`")
+        );
+        assert_eq!(
+            run("/*!40101 SET NAMES utf8mb4 */").as_deref(),
+            Some("SET NAMES utf8mb4")
+        );
+        assert_eq!(run("SELECT 1 /*! + 1 */").as_deref(), Some("SELECT 1 + 1"));
+        // Six digits (8.0.34 and later spell the version so).
+        assert_eq!(
+            run("SELECT 1 /*!080000 + 1 */").as_deref(),
+            Some("SELECT 1 + 1")
+        );
+        // A later version's body stays a comment.
+        assert_eq!(
+            run("/*!80016 SET @@session.default_table_encryption=0*/"),
+            None
+        );
+        assert_eq!(
+            run("/*!40101 SET @a = 1 */ /*!90000 SET @b = 2 */").as_deref(),
+            Some("SET @a = 1 /*!90000 SET @b = 2 */")
+        );
+        // Quoting inside the body: a `*/` in a literal does not end it.
+        assert_eq!(
+            run("/*!50001 SELECT '*/' AS x */").as_deref(),
+            Some("SELECT '*/' AS x")
+        );
+        // Outside code nothing changes.
+        assert_eq!(run("SELECT '/*!50001 x */'"), None);
+        assert_eq!(run("SELECT 1 /* plain */"), None);
+        assert_eq!(run("SELECT 1 -- /*!50001 x */"), None);
+    }
+
+    #[test]
+    fn mysql_version_id_is_the_reported_version() {
+        assert_eq!(super::mysql_version_id(), 80012);
     }
 
     #[test]
