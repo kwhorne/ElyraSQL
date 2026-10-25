@@ -6,6 +6,14 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **Views are listed in `information_schema.TABLES` and `SHOW TABLE STATUS`.**
+  Both left views out, though `SHOW FULL TABLES` listed them, so a tool that
+  read the catalog to find a view, or counted what a schema holds, found
+  nothing. A view is now listed as in MySQL: `TABLE_TYPE` `VIEW`, the comment
+  `VIEW`, and NULL in the columns only stored tables have.
+
 ## [1.12.8] - 2026-10-25
 
 ### Fixed

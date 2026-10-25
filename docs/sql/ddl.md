@@ -238,6 +238,12 @@ SELECT table_name, COUNT(*) AS columns
 FROM information_schema.columns GROUP BY table_name;
 ```
 
+`information_schema.tables` lists views beside tables, as MySQL does: with
+`TABLE_TYPE` `VIEW`, the comment `VIEW`, and NULL in the columns only stored
+tables have (`ENGINE`, `TABLE_ROWS`, `AUTO_INCREMENT`, ...). `SHOW TABLE
+STATUS` lists them the same way. `information_schema.columns` and `SHOW
+COLUMNS` do not describe a view's columns yet.
+
 ## Views
 
 ```sql
