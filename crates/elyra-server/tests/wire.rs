@@ -13580,3 +13580,39 @@ async fn now_is_frozen_within_a_statement() {
         .unwrap();
     assert_eq!(cross, 1, "all NOW() in one INSERT are the same instant");
 }
+
+/// A BEFORE trigger's `SET NEW.a = x, NEW.b = y` applies every assignment, in
+/// order, each seeing the ones before it. Only the first used to be applied,
+/// the rest dropped without an error; and a `;` inside a string literal in the
+/// body broke every statement that fired the trigger. Both as in MySQL 8.4.
+#[tokio::test]
+async fn before_trigger_applies_every_assignment_of_a_set() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    for sql in [
+        "CREATE TABLE trig_set (id INT PRIMARY KEY, a INT, b INT, s VARCHAR(20))",
+        "CREATE TRIGGER trig_set_ins BEFORE INSERT ON trig_set FOR EACH ROW
+         SET NEW.a = 1, NEW.b = NEW.a + 1",
+        "CREATE TRIGGER trig_set_upd BEFORE UPDATE ON trig_set FOR EACH ROW
+         BEGIN SET NEW.s = CONCAT('x;y', ','), NEW.b := 9; SET NEW.a = NEW.a * 10; END",
+        "INSERT INTO trig_set (id) VALUES (1)",
+    ] {
+        c.query_drop(sql).await.unwrap();
+    }
+    let inserted: (i64, i64) = c
+        .query_first("SELECT a, b FROM trig_set")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(inserted, (1, 2));
+
+    c.query_drop("UPDATE trig_set SET a = 5 WHERE id = 1")
+        .await
+        .unwrap();
+    let updated: (i64, i64, String) = c
+        .query_first("SELECT a, b, s FROM trig_set")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(updated, (50, 9, "x;y,".to_string()));
+}

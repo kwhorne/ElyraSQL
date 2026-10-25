@@ -5598,6 +5598,13 @@ fn substitute_newold(
 }
 
 /// Apply a BEFORE trigger (supports `SET NEW.col = expr` statements) to `row`.
+///
+/// The body is split on top-level `;` and each `SET` on top-level `,`, so a
+/// separator inside a string or a call is text, not syntax. The assignments of
+/// `SET NEW.a = x, NEW.b = y` run in order, each seeing the ones before it, as
+/// in MySQL. Only the first used to be applied and the rest dropped without an
+/// error; and a `;` inside a string literal broke every statement that fired
+/// the trigger.
 fn apply_before_trigger(
     db: &Session,
     t: &catalog::TriggerDef,
@@ -5606,40 +5613,44 @@ fn apply_before_trigger(
     old: Option<&[Value]>,
 ) -> Result<()> {
     let empty = Schema::new(vec![]);
-    for stmt in strip_begin_end(&t.body).split(';') {
+    for stmt in crate::sqllex::split_top_level(&strip_begin_end(&t.body), ';') {
         let s = stmt.trim();
         if s.is_empty() {
             continue;
         }
-        let low = s.to_ascii_lowercase();
-        if !low.starts_with("set ") {
+        if !crate::sqllex::keyword_at(s, 0, "set") {
             return Err(Error::Unsupported(
                 "BEFORE triggers support only SET NEW.col = expr".into(),
             ));
         }
-        let rest = s[4..].trim();
-        let eq = rest
-            .find('=')
-            .ok_or_else(|| Error::Parse("malformed SET in trigger".into()))?;
-        let lhs = rest[..eq].trim();
-        let col = lhs
-            .to_ascii_lowercase()
-            .strip_prefix("new.")
-            .map(|_| lhs[4..].to_string())
-            .ok_or_else(|| {
-                Error::Unsupported("BEFORE trigger SET target must be NEW.col".into())
-            })?;
-        let ci = schema
-            .columns
-            .iter()
-            .position(|c| predicate::identifier_eq(&c.name, &col))
-            .ok_or_else(|| Error::Query(format!("unknown column in trigger: {col}")))?;
-        let sub = substitute_newold(rest[eq + 1..].trim(), schema, Some(row), old)?;
-        let mut expr = parse_scalar_expr(&sub)?;
-        // A trigger runs as its definer.
-        crate::sessfn::rewrite_identity(&mut expr, &db.identity(), Some(crate::sessfn::DEFINER));
-        let val = predicate::eval_row(&expr, &empty, &[])?;
-        row[ci] = coerce(val, &schema.columns[ci].ty, &schema.columns[ci].name)?;
+        for assignment in crate::sqllex::split_top_level(&s[3..], ',') {
+            let eq = crate::sqllex::find_top_level(&assignment, |_, c| c.byte == b'=')
+                .ok_or_else(|| Error::Parse("malformed SET in trigger".into()))?;
+            // `NEW.col := expr` is the same assignment.
+            let lhs = assignment[..eq].trim().trim_end_matches(':').trim();
+            let col = lhs
+                .to_ascii_lowercase()
+                .strip_prefix("new.")
+                .map(|_| lhs[4..].trim_matches('`').to_string())
+                .ok_or_else(|| {
+                    Error::Unsupported("BEFORE trigger SET target must be NEW.col".into())
+                })?;
+            let ci = schema
+                .columns
+                .iter()
+                .position(|c| predicate::identifier_eq(&c.name, &col))
+                .ok_or_else(|| Error::Query(format!("unknown column in trigger: {col}")))?;
+            let sub = substitute_newold(assignment[eq + 1..].trim(), schema, Some(row), old)?;
+            let mut expr = parse_scalar_expr(&sub)?;
+            // A trigger runs as its definer.
+            crate::sessfn::rewrite_identity(
+                &mut expr,
+                &db.identity(),
+                Some(crate::sessfn::DEFINER),
+            );
+            let val = predicate::eval_row(&expr, &empty, &[])?;
+            row[ci] = coerce(val, &schema.columns[ci].ty, &schema.columns[ci].name)?;
+        }
     }
     Ok(())
 }
