@@ -34,6 +34,7 @@ mod sort;
 pub mod sqllex;
 mod stream;
 mod users;
+mod viewtype;
 mod vindex;
 mod zonemap;
 
@@ -2303,11 +2304,11 @@ impl Engine {
                         )
                     })?;
                 let name = exec::stored_table_ident(sess, &name)?;
-                exec::show_columns(sess, &name).await
+                exec::show_columns(sess, &self.vindex, &name).await
             }
             Statement::ExplainTable { table_name, .. } => {
                 let name = exec::stored_table_ident(sess, &table_name)?;
-                exec::show_columns(sess, &name).await
+                exec::show_columns(sess, &self.vindex, &name).await
             }
             Statement::SetVariable {
                 variables, value, ..
