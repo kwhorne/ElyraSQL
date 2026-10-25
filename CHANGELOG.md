@@ -6,6 +6,25 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **`USER()`, `CURRENT_USER()` and `CONNECTION_ID()` answer for the connection
+  that asks.** They answered `root@%` and `1` for everyone. A view that showed
+  each user their own rows (`WHERE owner = SUBSTRING_INDEX(USER(), '@', 1)`)
+  therefore showed nobody anything, a column with `DEFAULT (CURRENT_USER())`
+  or an audit trigger recorded root for every change, and a `DELETE ... WHERE
+  owner = USER()` matched root's rows. Now, as in MySQL 8.4:
+  - `USER()`, `SESSION_USER()` and `SYSTEM_USER()` are `user@client-address`;
+  - `CURRENT_USER()` is the account, `user@%`, and the definer's (`root@%`)
+    inside a view, procedure or trigger;
+  - `CONNECTION_ID()` is the id `SHOW PROCESSLIST` lists.
+
+  They are resolved in every clause, subquery, CTE and statement — `SET @v =`,
+  `DELETE`, `CALL` arguments, procedure conditions, column defaults and
+  `BEFORE` triggers included — and checked position by position against MySQL
+  8.4. `CURRENT_USER` without parentheses, which was read as a column name and
+  refused, works too.
+
 ## [1.12.6] - 2026-10-21
 
 ### Fixed

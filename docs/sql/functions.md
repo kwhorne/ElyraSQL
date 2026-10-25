@@ -126,6 +126,20 @@ follows three-valued logic in `AND`/`OR`/`IN`/`BETWEEN` (e.g. `NULL AND 1` and
 ## Other
 
 - `UUID()` — a random version-4 UUID string.
+- `USER()`, `SESSION_USER()`, `SYSTEM_USER()` — the connection's own
+  `user@client-address`, also inside a view, procedure or trigger.
+- `CURRENT_USER()` / `CURRENT_USER` — the account, `user@%`. Inside a view,
+  procedure or trigger it is the definer's account, as in MySQL. Only an
+  administrator can create those, and the definer is not recorded, so it is
+  `root@%` there, the account `information_schema` reports for them. To filter
+  rows by who is asking, use `USER()`:
+
+  ```sql
+  CREATE VIEW my_docs AS
+    SELECT * FROM docs WHERE owner = SUBSTRING_INDEX(USER(), '@', 1);
+  GRANT SELECT ON elyra.my_docs TO alice;  -- not on docs itself
+  ```
+- `CONNECTION_ID()` — the connection's id, as `SHOW PROCESSLIST` lists it.
 - `CAST(x AS <type>)` / `CONVERT` — to `CHAR`/text, `SIGNED`/integer,
   `DECIMAL(p,s)` (exact, rescaled), `BINARY`/bytes, `DATE`, `DATETIME`, `TIME`.
 

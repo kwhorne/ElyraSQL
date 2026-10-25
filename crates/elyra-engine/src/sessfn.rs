@@ -9,6 +9,112 @@
 
 use sqlparser::ast::{Expr, Query, SetExpr, Statement, Value as SqlValue};
 
+/// Who a connection is: what `USER()`, `CURRENT_USER()` and `CONNECTION_ID()`
+/// answer. Set by the server once the client has authenticated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Identity {
+    /// The account name the client logged in as.
+    pub user: String,
+    /// The client's address, as MySQL reports it in `USER()`.
+    pub host: String,
+    /// The connection's id, as `SHOW PROCESSLIST` lists it.
+    pub connection_id: u64,
+}
+
+impl Default for Identity {
+    /// An embedded session, with no client and no login.
+    fn default() -> Self {
+        Identity {
+            user: "root".into(),
+            host: "localhost".into(),
+            connection_id: 1,
+        }
+    }
+}
+
+/// The account a view, procedure or trigger runs as. Only an administrator can
+/// create one, and the definer is not recorded, so this is the account
+/// `information_schema` has always reported for them.
+pub const DEFINER: &str = "root@%";
+
+/// Resolve the identity functions everywhere in `node` -- every expression, in
+/// any clause, subquery, CTE or derived table -- to literals:
+///
+/// - `USER()`, `SESSION_USER()`, `SYSTEM_USER()`: `user@client-host`, the
+///   connection's own, also inside a view or routine;
+/// - `CURRENT_USER()` / `CURRENT_USER`: the account, `user@%`; but inside a
+///   view, procedure or trigger the definer's (`definer`), as in MySQL;
+/// - `CONNECTION_ID()`.
+///
+/// These used to answer `root@%` and `1` whoever was connected, so a view that
+/// filtered rows on `USER()` matched nothing, and an audit column recorded root
+/// for every change.
+pub fn rewrite_identity<V: sqlparser::ast::VisitMut>(
+    node: &mut V,
+    id: &Identity,
+    definer: Option<&str>,
+) {
+    use std::ops::ControlFlow;
+    let user = format!("{}@{}", id.user, id.host);
+    let account = format!("{}@%", id.user);
+    let current = definer.unwrap_or(&account);
+    let _ = sqlparser::ast::visit_expressions_mut(node, |e| {
+        // `CURRENT_USER` without parentheses is the same function in MySQL
+        // (a reserved word, never a column); the parser reads it as a name.
+        if let Expr::Identifier(ident) = e {
+            if ident.quote_style.is_none() && ident.value.eq_ignore_ascii_case("current_user") {
+                *e = str_lit(current);
+            }
+            return ControlFlow::<()>::Continue(());
+        }
+        if let Some(name) = niladic_name(e) {
+            let lit = match name.as_str() {
+                "user" | "session_user" | "system_user" => Some(str_lit(&user)),
+                "current_user" => Some(str_lit(current)),
+                "connection_id" => Some(Expr::Value(SqlValue::Number(
+                    id.connection_id.to_string(),
+                    false,
+                ))),
+                _ => None,
+            };
+            if let Some(lit) = lit {
+                *e = lit;
+            }
+        }
+        ControlFlow::<()>::Continue(())
+    });
+}
+
+/// Statements whose expressions run now, so identity functions in them are
+/// resolved. DDL is left alone: a view, routine, trigger or column default
+/// stores its expressions and evaluates them later, as whoever runs them then.
+pub fn resolves_identity(stmt: &Statement) -> bool {
+    matches!(
+        stmt,
+        Statement::Query(_)
+            | Statement::Insert(_)
+            | Statement::Update { .. }
+            | Statement::Delete(_)
+            | Statement::SetVariable { .. }
+            | Statement::Call(_)
+    )
+}
+
+/// The lowercased name of a call with no arguments (`f()`, or a bare keyword
+/// such as `CURRENT_USER`), or `None` for anything else.
+fn niladic_name(e: &Expr) -> Option<String> {
+    let Expr::Function(f) = e else { return None };
+    let empty = matches!(&f.args, sqlparser::ast::FunctionArguments::None)
+        || matches!(
+            &f.args,
+            sqlparser::ast::FunctionArguments::List(l) if l.args.is_empty()
+        );
+    if !empty {
+        return None;
+    }
+    Some(f.name.0.last()?.value.to_ascii_lowercase())
+}
+
 /// Rewrite session-state functions in `stmt` to literal values.
 pub fn rewrite(
     stmt: &mut Statement,
@@ -513,5 +619,96 @@ mod frozen_now_tests {
                 .count(),
             2
         );
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::{resolves_identity, rewrite_identity, Identity, DEFINER};
+    use sqlparser::dialect::MySqlDialect;
+    use sqlparser::parser::Parser;
+
+    fn alice() -> Identity {
+        Identity {
+            user: "alice".into(),
+            host: "10.0.0.7".into(),
+            connection_id: 42,
+        }
+    }
+
+    fn resolved(sql: &str, definer: Option<&str>) -> String {
+        let mut stmt = Parser::parse_sql(&MySqlDialect {}, sql).unwrap().remove(0);
+        assert!(resolves_identity(&stmt), "{sql}");
+        rewrite_identity(&mut stmt, &alice(), definer);
+        stmt.to_string()
+    }
+
+    /// Every clause and nesting a query can put an expression in is reached,
+    /// not only the projection and `WHERE` of the outermost `SELECT`.
+    #[test]
+    fn identity_functions_are_resolved_wherever_they_appear() {
+        for sql in [
+            "SELECT USER()",
+            "SELECT 1 FROM t WHERE o = USER()",
+            "SELECT 1 FROM t JOIN u ON u.o = USER()",
+            "SELECT o FROM t GROUP BY o HAVING o = USER()",
+            "SELECT 1 UNION ALL SELECT USER()",
+            "WITH me AS (SELECT USER() AS u) SELECT u FROM me",
+            "SELECT u FROM (SELECT USER() AS u) x",
+            "SELECT (SELECT USER())",
+            "DELETE FROM t WHERE o = USER()",
+            "UPDATE t SET o = USER()",
+            "INSERT INTO t SELECT USER()",
+            "SET @u = USER()",
+        ] {
+            let out = resolved(sql, None);
+            assert!(out.contains("'alice@10.0.0.7'"), "{sql} -> {out}");
+            assert!(!out.to_uppercase().contains("USER()"), "{sql} -> {out}");
+        }
+    }
+
+    #[test]
+    fn each_function_answers_as_mysql_does() {
+        let out = resolved(
+            "SELECT USER(), SESSION_USER(), SYSTEM_USER(), CURRENT_USER(), CURRENT_USER, CONNECTION_ID()",
+            None,
+        );
+        assert_eq!(
+            out,
+            "SELECT 'alice@10.0.0.7', 'alice@10.0.0.7', 'alice@10.0.0.7', 'alice@%', 'alice@%', 42"
+        );
+    }
+
+    /// Inside a view, procedure or trigger `CURRENT_USER()` is the definer's
+    /// account; `USER()` is still the connection's.
+    #[test]
+    fn current_user_is_the_definer_inside_a_definer_context() {
+        let out = resolved("SELECT USER(), CURRENT_USER()", Some(DEFINER));
+        assert_eq!(out, "SELECT 'alice@10.0.0.7', 'root@%'");
+    }
+
+    /// A column called `user` is a column, and `USER(x)` is not the niladic
+    /// function.
+    #[test]
+    fn a_column_named_user_is_left_alone() {
+        assert_eq!(resolved("SELECT user FROM t", None), "SELECT user FROM t");
+        assert_eq!(
+            resolved("SELECT `current_user` FROM t", None),
+            "SELECT `current_user` FROM t"
+        );
+    }
+
+    /// DDL stores its expressions and evaluates them later, as whoever runs
+    /// them then: resolving them now would freeze today's user into a view,
+    /// a routine or a column default.
+    #[test]
+    fn ddl_keeps_its_identity_functions() {
+        for sql in [
+            "CREATE VIEW v AS SELECT * FROM t WHERE o = USER()",
+            "CREATE TABLE t (who VARCHAR(100) DEFAULT (CURRENT_USER()))",
+        ] {
+            let stmt = Parser::parse_sql(&MySqlDialect {}, sql).unwrap().remove(0);
+            assert!(!resolves_identity(&stmt), "{sql}");
+        }
     }
 }

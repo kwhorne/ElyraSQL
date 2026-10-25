@@ -4770,7 +4770,11 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
         for i in 0..ncols {
             let m = def.meta(i);
             if let Some(d) = &m.default {
-                default_exprs[i] = Some(parse_scalar_expr(d)?);
+                // A default is evaluated for the row being inserted, as whoever
+                // inserts it: `DEFAULT (CURRENT_USER())` records them.
+                let mut e = parse_scalar_expr(d)?;
+                crate::sessfn::rewrite_identity(&mut e, &db.identity(), db.definer());
+                default_exprs[i] = Some(e);
             }
             if let Some(g) = &m.generated {
                 generated_exprs[i] = Some(parse_scalar_expr(g)?);
@@ -4897,7 +4901,7 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
         }
 
         for t in &before_ins {
-            apply_before_trigger(t, &def.schema, &mut row, None)?;
+            apply_before_trigger(db, t, &def.schema, &mut row, None)?;
         }
 
         for (i, col) in def.schema.columns.iter().enumerate() {
@@ -5220,9 +5224,12 @@ fn map_ref_action(a: &Option<sqlparser::ast::ReferentialAction>) -> RefAction {
     }
 }
 
-/// Evaluate a scalar SQL expression string (no FROM) to a value.
-pub(crate) fn eval_scalar(sql: &str) -> Result<Value> {
-    let e = parse_scalar_expr(sql)?;
+/// Evaluate a scalar SQL expression string (no FROM) to a value, as `sess`:
+/// `USER()`, `CURRENT_USER()` and `CONNECTION_ID()` answer for the connection
+/// (or, inside a procedure, its definer).
+pub(crate) fn eval_scalar_as(sess: &Session, sql: &str) -> Result<Value> {
+    let mut e = parse_scalar_expr(sql)?;
+    crate::sessfn::rewrite_identity(&mut e, &sess.identity(), sess.definer());
     predicate::eval_row(&e, &Schema::new(vec![]), &[])
 }
 
@@ -5592,6 +5599,7 @@ fn substitute_newold(
 
 /// Apply a BEFORE trigger (supports `SET NEW.col = expr` statements) to `row`.
 fn apply_before_trigger(
+    db: &Session,
     t: &catalog::TriggerDef,
     schema: &Schema,
     row: &mut [Value],
@@ -5627,7 +5635,9 @@ fn apply_before_trigger(
             .position(|c| predicate::identifier_eq(&c.name, &col))
             .ok_or_else(|| Error::Query(format!("unknown column in trigger: {col}")))?;
         let sub = substitute_newold(rest[eq + 1..].trim(), schema, Some(row), old)?;
-        let expr = parse_scalar_expr(&sub)?;
+        let mut expr = parse_scalar_expr(&sub)?;
+        // A trigger runs as its definer.
+        crate::sessfn::rewrite_identity(&mut expr, &db.identity(), Some(crate::sessfn::DEFINER));
         let val = predicate::eval_row(&expr, &empty, &[])?;
         row[ci] = coerce(val, &schema.columns[ci].ty, &schema.columns[ci].name)?;
     }
@@ -14454,7 +14464,7 @@ pub async fn update(
             new_row[*i] = coerce_for_session(db, v, &col.ty, &col.name)?;
         }
         for t in &before_upd {
-            apply_before_trigger(t, &def.schema, &mut new_row, Some(&old_row))?;
+            apply_before_trigger(db, t, &def.schema, &mut new_row, Some(&old_row))?;
         }
 
         for (i, col) in def.schema.columns.iter().enumerate() {
@@ -19072,7 +19082,10 @@ async fn expand_view_factor(db: &Session, tf: &mut TableFactor) -> Result<()> {
     if let TableFactor::Table { name, alias, .. } = tf {
         let table = stored_table_ident(db, name)?;
         if let Some(sql) = catalog::load_view(db, &table).await? {
-            let vq = parse_query(&sql)?;
+            let mut vq = parse_query(&sql)?;
+            // A view runs as its definer: `CURRENT_USER()` in it is the
+            // definer's account, while `USER()` stays the connection's own.
+            crate::sessfn::rewrite_identity(&mut vq, &db.identity(), Some(crate::sessfn::DEFINER));
             let al = alias.clone().unwrap_or_else(|| sqlparser::ast::TableAlias {
                 name: sqlparser::ast::Ident::new(table),
                 columns: Vec::new(),

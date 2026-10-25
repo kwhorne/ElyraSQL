@@ -1263,6 +1263,8 @@ fn eval_scalar(name: &str, a: &[Value]) -> Result<Option<Value>> {
         // ---- server / session info ----
         "version" => Value::Text(elyra_core::SERVER_VERSION.into()),
         "database" | "schema" => Value::Text("elyra".into()),
+        // Resolved for the connection before evaluation (`sessfn::rewrite_identity`);
+        // these answers are only reached where no session exists.
         "user" | "current_user" | "session_user" | "system_user" => Value::Text("root@%".into()),
         "connection_id" => Value::Int(1),
         // Normally resolved from session state by the pre-pass before evaluation;
