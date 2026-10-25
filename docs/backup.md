@@ -102,13 +102,57 @@ recovery to any moment.
     There is no incremental (block-level) backup. See
     [Limitations](limitations.md).
 
+## Dumping with mysqldump
+
+MySQL 8.4's `mysqldump` dumps an ElyraSQL database as it dumps a MySQL one,
+and the dump restores into ElyraSQL or into MySQL:
+
+```bash
+mysqldump -h elyrasql.example.com -P 3307 -u root -p \
+  --routines --triggers --single-transaction --set-gtid-purged=OFF \
+  elyra > elyra.sql
+
+# Into ElyraSQL, or into MySQL.
+mysql -h elyrasql.example.com -P 3307 -u root -p elyra < elyra.sql
+```
+
+Tables and their rows (`BLOB` values included), indexes, foreign keys, `CHECK`
+constraints, generated columns, partitioning, views (with their definer and
+`SQL SECURITY`), triggers and stored procedures (with their parameter types)
+come back as they were. A database that has been through `ANALYZE TABLE` has
+its statistics collected again on restore: mysqldump writes them as `ANALYZE
+TABLE ... UPDATE HISTOGRAM`, which ElyraSQL runs as `ANALYZE TABLE`. This was
+checked with MySQL 8.4's `mysqldump`: a dump restored into an empty ElyraSQL
+dumps again to the same file, and restores into MySQL 8.4 with the same rows.
+
+`--single-transaction` dumps from one snapshot without blocking anyone.
+`--lock-all-tables` works too: its `FLUSH TABLES WITH READ LOCK` takes a read
+lock on every table until the dump ends, so writes to them wait, though a table
+created meanwhile is not locked. `--databases elyra`, `--hex-blob`,
+`--no-data`, `--compact` and `--skip-opt` work as they do against MySQL.
+
+Things to know:
+
+- **Name the database; do not use `--all-databases`.** mysqldump holds back
+  every database it lists until it has seen one named `mysql`, which ElyraSQL
+  does not have, so the dump comes out empty -- and mysqldump reports success.
+- **`--add-drop-database` does not restore into ElyraSQL.** The dump then opens
+  with `DROP DATABASE`, which ElyraSQL refuses for its single database.
+- **A procedure created before 1.12.9 is dumped without its parameter types**,
+  which were not recorded until then. ElyraSQL reads it back; MySQL does not.
+  Drop and create it again to record them.
+- **Triggers and procedures are dumped with `DEFINER=`root`@`%``** and the
+  server's default `sql_mode`, which is what they run with.
+- **Into MySQL:** a `DATETIME` column declared without fractional seconds keeps
+  them in ElyraSQL, and MySQL rounds them away on restore.
+
 ## Importing a MySQL dump
 
 A `mysqldump` of one MySQL database restores into ElyraSQL with the `mysql`
 client:
 
 ```bash
-# On the MySQL side: one database, without --databases.
+# On the MySQL side: one database.
 mysqldump --routines --triggers --single-transaction --set-gtid-purged=OFF \
   shop > shop.sql
 
@@ -121,11 +165,13 @@ SECURITY`), triggers and stored procedures arrive as they were; this was
 checked with MySQL 8.4's `mysqldump`. The dump's version comments
 (`/*!50001 ... */`) and session settings run as they do in MySQL.
 
-Two things to know:
+`BLOB` values, which mysqldump writes as `_binary '...'` with their bytes as
+they are, arrive byte for byte. With `--databases`, the dump's `CREATE DATABASE
+IF NOT EXISTS ... DEFAULT CHARACTER SET ...` is accepted and changes nothing,
+as in MySQL for a database that exists.
 
-- **Dump without `--databases`.** With it, the dump opens with
-  `CREATE DATABASE ... DEFAULT CHARACTER SET ...`, which ElyraSQL refuses;
-  the restore stops there.
+One thing to know:
+
 - **Stored functions are not supported yet.** A dump with `--routines`
   contains every `CREATE FUNCTION`, and the restore stops at the first one.
   Leave them out of the dump, or restore with `mysql --force`, which reports

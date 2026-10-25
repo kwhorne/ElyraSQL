@@ -317,6 +317,130 @@ pub fn expand_version_comments(sql: &str, server: u32) -> Option<String> {
     Some(out)
 }
 
+/// A query whose text is not UTF-8, made into one that is. Bytes that are not
+/// UTF-8 can only be data, inside a string literal; each literal holding them
+/// becomes the hex literal of its bytes, its escapes applied: `'\0\xff'` is
+/// `X'00ff'`. mysqldump writes every BLOB value this way, as `_binary '...'`
+/// with the raw bytes. `None` when such bytes stand anywhere else.
+pub fn binary_literals_as_hex(sql: &[u8]) -> Option<String> {
+    let mut out: Vec<u8> = Vec::with_capacity(sql.len() * 2);
+    let mut state = Quoting::Code;
+    let mut literal_start = 0usize;
+    let mut copied = 0usize;
+    let mut i = 0usize;
+    while i < sql.len() {
+        let c = sql[i];
+        let next = sql.get(i + 1).copied();
+        match state {
+            Quoting::Code => match c {
+                b'\'' | b'"' => {
+                    state = if c == b'\'' {
+                        Quoting::Single
+                    } else {
+                        Quoting::Double
+                    };
+                    literal_start = i;
+                    i += 1;
+                }
+                b'`' => {
+                    state = Quoting::Backtick;
+                    i += 1;
+                }
+                b'#' => {
+                    state = Quoting::LineComment;
+                    i += 1;
+                }
+                b'-' if next == Some(b'-')
+                    && sql.get(i + 2).is_none_or(|c| c.is_ascii_whitespace()) =>
+                {
+                    state = Quoting::LineComment;
+                    i += 2;
+                }
+                b'/' if next == Some(b'*') => {
+                    state = Quoting::BlockComment;
+                    i += 2;
+                }
+                _ => i += 1,
+            },
+            Quoting::Single | Quoting::Double | Quoting::Backtick => {
+                let quote = match state {
+                    Quoting::Single => b'\'',
+                    Quoting::Double => b'"',
+                    _ => b'`',
+                };
+                if c == b'\\' && state != Quoting::Backtick {
+                    i = (i + 2).min(sql.len());
+                } else if c == quote && next == Some(quote) {
+                    i += 2;
+                } else if c == quote {
+                    let body = &sql[literal_start + 1..i];
+                    if state != Quoting::Backtick && std::str::from_utf8(body).is_err() {
+                        out.extend_from_slice(&sql[copied..literal_start]);
+                        out.extend_from_slice(b"X'");
+                        for byte in unescape_literal(body, quote) {
+                            out.extend_from_slice(format!("{byte:02x}").as_bytes());
+                        }
+                        out.push(b'\'');
+                        copied = i + 1;
+                    }
+                    state = Quoting::Code;
+                    i += 1;
+                } else {
+                    i += 1;
+                }
+            }
+            Quoting::LineComment => {
+                if c == b'\n' {
+                    state = Quoting::Code;
+                }
+                i += 1;
+            }
+            Quoting::BlockComment => {
+                if c == b'*' && next == Some(b'/') {
+                    state = Quoting::Code;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+        }
+    }
+    out.extend_from_slice(&sql[copied..]);
+    String::from_utf8(out).ok()
+}
+
+/// The bytes a MySQL string literal's body stands for: `\0`, `\b`, `\n`,
+/// `\r`, `\t` and `\Z` are control bytes, `\%` and `\_` keep their backslash
+/// (they are `LIKE` escapes), any other escaped byte is itself, and a doubled
+/// quote is one.
+fn unescape_literal(body: &[u8], quote: u8) -> Vec<u8> {
+    let mut out = Vec::with_capacity(body.len());
+    let mut i = 0;
+    while i < body.len() {
+        let c = body[i];
+        if c == b'\\' && i + 1 < body.len() {
+            match body[i + 1] {
+                b'0' => out.push(0),
+                b'b' => out.push(8),
+                b'n' => out.push(b'\n'),
+                b'r' => out.push(b'\r'),
+                b't' => out.push(b'\t'),
+                b'Z' => out.push(26),
+                e @ (b'%' | b'_') => out.extend_from_slice(&[b'\\', e]),
+                e => out.push(e),
+            }
+            i += 2;
+        } else if c == quote && body.get(i + 1) == Some(&quote) {
+            out.push(quote);
+            i += 2;
+        } else {
+            out.push(c);
+            i += 1;
+        }
+    }
+    out
+}
+
 /// Split `sql` on every top-level code occurrence of `sep`, which must be ASCII.
 ///
 /// Joining the parts back with `sep` reproduces the input exactly, so a caller
@@ -574,6 +698,38 @@ pub(crate) fn tokenize(sql: &str) -> Vec<Tok> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod binary_literal_tests {
+    use super::binary_literals_as_hex;
+
+    #[test]
+    fn a_literal_that_is_not_utf8_becomes_its_bytes_in_hex() {
+        let sql = b"INSERT INTO t VALUES (_binary '\\0\xff\\'x''',\"\xfe\\n\\_\")";
+        assert_eq!(
+            binary_literals_as_hex(sql).as_deref(),
+            Some("INSERT INTO t VALUES (_binary X'00ff277827',X'fe0a5c5f')")
+        );
+    }
+
+    #[test]
+    fn utf8_literals_identifiers_and_comments_are_left_as_they_are() {
+        let sql = "SELECT 'æøå', `a\\b`, \"x\" -- '\u{fffd}'\n/* 'y' */";
+        assert_eq!(binary_literals_as_hex(sql.as_bytes()).as_deref(), Some(sql));
+    }
+
+    #[test]
+    fn bytes_that_are_not_utf8_outside_a_literal_are_refused() {
+        for sql in [
+            &b"SELECT 1 \xff"[..],
+            b"SELECT `\xff`",
+            b"SELECT 1 -- \xff\n",
+            b"SELECT '\xff",
+        ] {
+            assert_eq!(binary_literals_as_hex(sql), None, "{sql:?}");
+        }
+    }
 }
 
 #[cfg(test)]

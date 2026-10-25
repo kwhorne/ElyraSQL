@@ -150,6 +150,16 @@ pub enum Error {
     #[error("View '{0}' references invalid table(s) or column(s) or function(s) or definer/invoker of view lack rights to use them")]
     ViewRights(String),
 
+    /// `SHOW CREATE TRIGGER` of a trigger that does not exist. MySQL 1360
+    /// (`ER_TRG_DOES_NOT_EXIST`), with its text.
+    #[error("Trigger does not exist")]
+    TriggerMissing,
+
+    /// `SHOW CREATE VIEW` of a table that is not a view. MySQL 1347
+    /// (`ER_WRONG_OBJECT`), its text: the qualified name, as `elyra.t`.
+    #[error("'{0}' is not VIEW")]
+    NotView(String),
+
     /// `SELECT ... INTO @var` that found more than one row. MySQL 1172
     /// (`ER_TOO_MANY_ROWS`), with its text.
     #[error("Result consisted of more than one row")]
@@ -197,6 +207,8 @@ impl Error {
             Error::RoutineMissing(..) => 1305, // ER_SP_DOES_NOT_EXIST
             Error::AccountOperation(..) => 1396, // ER_CANNOT_USER
             Error::ViewRights(_) => 1356,  // ER_VIEW_INVALID
+            Error::TriggerMissing => 1360, // ER_TRG_DOES_NOT_EXIST
+            Error::NotView(_) => 1347,     // ER_WRONG_OBJECT
             _ => 1105,
         }
     }

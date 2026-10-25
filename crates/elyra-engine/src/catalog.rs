@@ -295,6 +295,35 @@ pub fn proc_key(name: &str) -> Vec<u8> {
     format!("sys::proc::{}", name.to_ascii_lowercase()).into_bytes()
 }
 
+/// A stored procedure as it was written, kept beside [`crate::proc::ProcDef`]
+/// under its own key: that definition is bincode-encoded, positionally, and has
+/// no room for more, and it keeps only the parameters' names and modes. This
+/// has what `SHOW CREATE PROCEDURE` gives back -- the parameter types among it
+/// -- so a dump of the procedure recreates the same one. A procedure created
+/// before this was recorded has none.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProcSource {
+    /// The name as written; the keys hold it lowercased.
+    pub name: String,
+    /// Everything after the name in `CREATE PROCEDURE`: the parameter list,
+    /// any characteristics, and the body through its `END`.
+    pub definition: String,
+    /// When it was created, in whole seconds, as microseconds since the epoch.
+    pub created: i64,
+}
+
+pub fn procsrc_key(name: &str) -> Vec<u8> {
+    format!("sys::procsrc::{}", name.to_ascii_lowercase()).into_bytes()
+}
+
+/// The recorded source of procedure `name`, if it has one.
+pub async fn load_proc_source(db: &Session, name: &str) -> Result<Option<ProcSource>> {
+    match db.get(procsrc_key(name)).await? {
+        Some(bytes) => Ok(bincode::deserialize(&bytes).ok()),
+        None => Ok(None),
+    }
+}
+
 /// The DML event a trigger fires on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TrigEvent {

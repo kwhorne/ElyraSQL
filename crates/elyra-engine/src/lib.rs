@@ -1191,7 +1191,7 @@ impl Engine {
         // table is known to exist.
         if head.starts_with("alter table") {
             if let Some(table) = alter_table_keys(trimmed) {
-                let name = sqlparser::ast::ObjectName(vec![sqlparser::ast::Ident::new(table)]);
+                let name = mysql_table_name_fragment(&table)?;
                 let table = exec::stored_table_ident(sess, &name)?;
                 if !catalog::exists(sess, &table).await? {
                     return Err(Error::Catalog(
@@ -1264,10 +1264,30 @@ impl Engine {
             ]);
         }
 
-        // SHOW FUNCTION/PROCEDURE STATUS [WHERE ...] — the WHERE form doesn't
-        // parse, so intercept here and return an empty routines listing.
+        // SHOW {FUNCTION|PROCEDURE} STATUS, whose WHERE form the parser does
+        // not take, and SHOW TRIGGERS, SHOW EVENTS and SHOW CREATE DATABASE,
+        // which it does not take at all. mysqldump sends each of them.
         if head.starts_with("show function status") || head.starts_with("show procedure status") {
-            return Ok(vec![exec::show_routine_status()?]);
+            let (_, filter) = mysql_show_tail(trimmed, 3)?;
+            let procedures = head.starts_with("show procedure");
+            return Ok(vec![
+                exec::show_routine_status(sess, procedures, filter.as_ref()).await?,
+            ]);
+        }
+        if head.starts_with("show triggers") || head.starts_with("show events") {
+            let (database, filter) = mysql_show_tail(trimmed, 2)?;
+            if let Some(database) = database {
+                exec::selected_database_ident(sess, &database)?;
+            }
+            if head.starts_with("show events") {
+                return Ok(vec![exec::show_events()?]);
+            }
+            return Ok(vec![exec::show_triggers(sess, filter.as_ref()).await?]);
+        }
+        if head.starts_with("show create database") || head.starts_with("show create schema") {
+            let (database, if_not_exists) = mysql_show_create_database(trimmed)?;
+            exec::selected_database_ident(sess, &database)?;
+            return Ok(vec![exec::show_create_database(sess, if_not_exists)?]);
         }
 
         // SHOW [FULL] PROCESSLIST — handled in-engine so it works over the
@@ -1470,6 +1490,46 @@ impl Engine {
             return Ok(vec![QueryResult::Affected(total)]);
         }
 
+        // FLUSH: mysqldump --lock-all-tables opens with `FLUSH /*!40101 LOCAL
+        // */ TABLES` and `FLUSH TABLES WITH READ LOCK`. There is no table cache
+        // to close, and grants take effect when they are made, so FLUSH TABLES
+        // and FLUSH PRIVILEGES have nothing to do. The read lock is a READ
+        // lock on every table, held until UNLOCK TABLES: other sessions' writes
+        // to them wait, as in MySQL, but a table created meanwhile is not
+        // locked.
+        if head.starts_with("flush") {
+            if let Some(flush) = mysql_flush(trimmed) {
+                match flush? {
+                    MysqlFlush::Tables => {
+                        require_privilege(privilege, PrivilegedAction::LockTables)?;
+                    }
+                    MysqlFlush::TablesWithReadLock => {
+                        require_privilege(privilege, PrivilegedAction::LockTables)?;
+                        for table in catalog::list_tables(sess).await? {
+                            sess.lock_table(&table, lockmgr::LockMode::Shared).await?;
+                        }
+                    }
+                    MysqlFlush::Privileges => {
+                        require_privilege(
+                            privilege,
+                            PrivilegedAction::Statement(Privilege::Admin),
+                        )?;
+                    }
+                }
+                return Ok(vec![QueryResult::empty_ok()]);
+            }
+        }
+
+        // `CREATE DATABASE IF NOT EXISTS name` with options -- `DEFAULT
+        // CHARACTER SET`, `COLLATE`, `ENCRYPTION` -- as mysqldump --databases
+        // writes it: the parser takes none of them. For a database that is
+        // there MySQL ignores them, and so does this.
+        if head.starts_with("create database") || head.starts_with("create schema") {
+            if let Some(if_not_exists) = mysql_create_database_with_options(trimmed)? {
+                return Ok(vec![create_database_result(if_not_exists)?]);
+            }
+        }
+
         // Pessimistic table locking (LOCK TABLES / UNLOCK TABLES) — not parsed by
         // the SQL frontend.
         if head.starts_with("lock tables") || head.starts_with("lock table ") {
@@ -1557,7 +1617,7 @@ impl Engine {
         // body is not parsed by the SQL frontend, so handle it here.
         if head.starts_with("create procedure") || head.starts_with("create or replace procedure") {
             require_privilege(privilege, PrivilegedAction::CreateProcedure)?;
-            let (_, def) = parse_create_procedure(trimmed)?;
+            let (_, def, definition) = parse_create_procedure(trimmed)?;
             // Parse the body now, not first at CALL. A body that cannot be
             // parsed should fail for the person who wrote it, with the statement
             // in front of them -- not for whoever calls the procedure later,
@@ -1566,8 +1626,20 @@ impl Engine {
             let procedure = mysql_named_object(trimmed, "procedure")?;
             let name = exec::stored_table_ident(sess, &procedure)?;
             let enc = bincode::serialize(&def).map_err(|e| Error::Storage(e.to_string()))?;
-            sess.commit_write(vec![(catalog::proc_key(&name), enc)], vec![])
-                .await?;
+            let source = catalog::ProcSource {
+                name: name.clone(),
+                definition,
+                created: predicate::wall_micros() / 1_000_000 * 1_000_000,
+            };
+            let source = bincode::serialize(&source).map_err(|e| Error::Storage(e.to_string()))?;
+            sess.commit_write(
+                vec![
+                    (catalog::proc_key(&name), enc),
+                    (catalog::procsrc_key(&name), source),
+                ],
+                vec![],
+            )
+            .await?;
             return Ok(vec![QueryResult::empty_ok()]);
         }
         if head.starts_with("drop procedure") {
@@ -1585,8 +1657,11 @@ impl Engine {
                     format!("{}.{name}", sess.database()),
                 ));
             }
-            sess.commit_write(vec![], vec![catalog::proc_key(&name)])
-                .await?;
+            sess.commit_write(
+                vec![],
+                vec![catalog::proc_key(&name), catalog::procsrc_key(&name)],
+            )
+            .await?;
             return Ok(vec![QueryResult::empty_ok()]);
         }
         // Stored functions are not supported, so none exists: `DROP FUNCTION IF
@@ -1814,6 +1889,12 @@ impl Engine {
         if let Some(rewritten) = rewrite_bang(&subst_sql) {
             subst_sql = Cow::Owned(rewritten);
         }
+        if let Some(rewritten) = strip_sql_no_cache(&subst_sql) {
+            subst_sql = Cow::Owned(rewritten);
+        }
+        if let Some(rewritten) = strip_update_histogram(&subst_sql) {
+            subst_sql = Cow::Owned(rewritten);
+        }
         // `\_` and `\%` keep their backslash, as in MySQL (see the function).
         if let Some(rewritten) = crate::sqllex::keep_like_escapes(&subst_sql) {
             subst_sql = Cow::Owned(rewritten);
@@ -1921,6 +2002,7 @@ impl Engine {
             if !sess.pipes_as_concat() {
                 rewrite_pipes_to_or(&mut stmt);
             }
+            rewrite_introducers(&mut stmt);
             let need = required_privilege(&stmt);
             let effective = self
                 .effective_privilege(privilege, user, &stmt, sess)
@@ -2286,12 +2368,34 @@ impl Engine {
                 });
                 exec::show_tables(sess, full, filter.as_ref()).await
             }
-            Statement::ShowCreate {
-                obj_type: sqlparser::ast::ShowCreateObject::Table,
-                obj_name,
-            } => {
+            Statement::ShowCreate { obj_type, obj_name } => {
+                use sqlparser::ast::ShowCreateObject;
                 let name = exec::stored_table_ident(sess, &obj_name)?;
-                exec::show_create_table(sess, &name).await
+                match obj_type {
+                    // A view answers SHOW CREATE TABLE as SHOW CREATE VIEW, as
+                    // in MySQL; mysqldump asks for every view this way.
+                    ShowCreateObject::Table => match exec::show_create_view(sess, &name).await? {
+                        Some(view) => Ok(view),
+                        None => exec::show_create_table(sess, &name).await,
+                    },
+                    ShowCreateObject::View => match exec::show_create_view(sess, &name).await? {
+                        Some(view) => Ok(view),
+                        None if catalog::exists(sess, &name).await? => {
+                            Err(Error::NotView(format!("{}.{name}", sess.database())))
+                        }
+                        None => Err(Error::Catalog(
+                            CatalogError::Missing,
+                            format!("no such table: {name}"),
+                        )),
+                    },
+                    ShowCreateObject::Trigger => exec::show_create_trigger(sess, &name).await,
+                    ShowCreateObject::Procedure => exec::show_create_procedure(sess, &name).await,
+                    // Stored functions are not supported, so none exists.
+                    ShowCreateObject::Function => Err(Error::RoutineMissing("FUNCTION", name)),
+                    ShowCreateObject::Event => {
+                        Err(Error::Unsupported("events are not supported".into()))
+                    }
+                }
             }
             Statement::ShowColumns { show_options, .. } => {
                 let name = show_options
@@ -2447,12 +2551,30 @@ impl Engine {
                 // (there are no notes to suppress) and `unique_checks` (keys are
                 // always checked) are accepted the same way. mysqldump saves,
                 // sets and restores all of them around every table and view.
+                // `information_schema_stats_expiry` is how long MySQL may serve
+                // cached table statistics; ElyraSQL computes them on every
+                // read, so any expiry is already met. mysqldump sets it to 0
+                // before anything else, and then raises the network timeouts
+                // to a day; ElyraSQL never closes a connection for a slow read
+                // or write, so there is nothing to raise.
                 "character_set_client"
                 | "character_set_results"
                 | "character_set_connection"
                 | "collation_connection"
+                | "information_schema_stats_expiry"
+                | "net_read_timeout"
+                | "net_write_timeout"
                 | "sql_notes"
                 | "unique_checks" => {}
+                // `SHOW CREATE` always quotes names, which is what 1 asks for;
+                // mysqldump sets it before every table.
+                "sql_quote_show_create" => {
+                    if !session_bool(&value, "sql_quote_show_create")? {
+                        return Err(Error::Unsupported(
+                            "sql_quote_show_create = 0: SHOW CREATE always quotes names".into(),
+                        ));
+                    }
+                }
                 unsupported => {
                     return Err(Error::Unsupported(format!(
                         "session variable is not supported: {unsupported}"
@@ -2634,15 +2756,14 @@ fn alter_table_keys(sql: &str) -> Option<String> {
     if !name.starts_with(char::is_whitespace) {
         return None;
     }
-    // The original spelling (case) of the name: `name` is a slice of `low`,
-    // and lowercasing ASCII keeps every byte offset.
+    // The original spelling (case) of the name, quotes and all: `name` is a
+    // slice of `low`, and lowercasing ASCII keeps every byte offset.
     let start = name.as_ptr() as usize - low.as_ptr() as usize;
     let original = body[start..start + name.len()].trim();
-    let unquoted = original.trim_matches('`');
-    if unquoted.is_empty() || unquoted.contains(char::is_whitespace) {
+    if original.is_empty() {
         return None;
     }
-    Some(unquoted.to_string())
+    Some(original.to_string())
 }
 
 fn session_bool(value: &Value, variable: &str) -> Result<bool> {
@@ -2808,6 +2929,7 @@ fn text_commits_implicitly(head: &str) -> bool {
         "revoke ",
         "set password",
         "lock table",
+        "flush ",
         "analyze ",
         "optimize ",
         "repair ",
@@ -2994,6 +3116,31 @@ fn rewrite_pipes_to_or(stmt: &mut Statement) {
                 *op = sqlparser::ast::BinaryOperator::Or;
             }
         }
+    });
+}
+
+/// MySQL's character set introducers on string literals: `_binary 'x'` is the
+/// bytes of `'x'`, and `_utf8mb4 'x'` (or `_utf8mb3`, `_utf8`) the string as
+/// it is, which every string here already is. mysqldump writes every BLOB
+/// value as `_binary '...'`, and the evaluator took neither form.
+fn rewrite_introducers(stmt: &mut Statement) {
+    use sqlparser::ast::{Expr, Value as SqlValue};
+    let _ = sqlparser::ast::visit_expressions_mut(stmt, |e| {
+        if let Expr::IntroducedString { introducer, value } = e {
+            let replacement = match (introducer.to_ascii_lowercase().as_str(), &*value) {
+                ("_binary", SqlValue::SingleQuotedString(s) | SqlValue::DoubleQuotedString(s)) => {
+                    let hex: String = s.bytes().map(|b| format!("{b:02x}")).collect();
+                    Some(SqlValue::HexStringLiteral(hex))
+                }
+                ("_binary", SqlValue::HexStringLiteral(_)) => Some(value.clone()),
+                ("_utf8mb4" | "_utf8mb3" | "_utf8", _) => Some(value.clone()),
+                _ => None,
+            };
+            if let Some(value) = replacement {
+                *e = Expr::Value(value);
+            }
+        }
+        std::ops::ControlFlow::<()>::Continue(())
     });
 }
 
@@ -3713,8 +3860,9 @@ fn parse_create_trigger(sql: &str) -> Result<catalog::TriggerDef> {
 }
 
 /// Parse `CREATE [OR REPLACE] PROCEDURE name(params) BEGIN <body> END` into the
-/// procedure name and definition (parameter names + body).
-fn parse_create_procedure(sql: &str) -> Result<(String, proc::ProcDef)> {
+/// procedure name, its definition (parameter names + body), and the text after
+/// the name as written.
+fn parse_create_procedure(sql: &str) -> Result<(String, proc::ProcDef, String)> {
     let lower = sql.to_ascii_lowercase();
     let after_proc = lower
         .find("procedure")
@@ -3725,6 +3873,11 @@ fn parse_create_procedure(sql: &str) -> Result<(String, proc::ProcDef)> {
         .chars()
         .take_while(|c| !c.is_whitespace() && *c != '(')
         .collect();
+    let definition = rest[name.len()..]
+        .trim()
+        .trim_end_matches(';')
+        .trim_end()
+        .to_string();
     let name = name.trim_matches(['`', '"']).to_string();
     if name.is_empty() {
         return Err(Error::Parse("CREATE PROCEDURE requires a name".into()));
@@ -3733,9 +3886,11 @@ fn parse_create_procedure(sql: &str) -> Result<(String, proc::ProcDef)> {
     let mut params = Vec::new();
     if let Some(open) = sql[after_proc..].find('(') {
         let open = after_proc + open;
-        if let Some(close) = sql[open..].find(')') {
-            let inner = &sql[open + 1..open + close];
-            for p in inner.split(',') {
+        // The matching `)`, and the commas between parameters only: a type
+        // such as `DECIMAL(10,2)` has its own.
+        if let Some(close) = crate::sqllex::matching_paren_end(sql, open) {
+            let inner = &sql[open + 1..close - 1];
+            for p in crate::sqllex::split_top_level(inner, ',') {
                 // [IN|OUT|INOUT] name type -> take the name token.
                 let toks: Vec<&str> = p.split_whitespace().collect();
                 let (mode, nm) = match toks.as_slice() {
@@ -3761,7 +3916,7 @@ fn parse_create_procedure(sql: &str) -> Result<(String, proc::ProcDef)> {
         .filter(|e| *e >= begin)
         .ok_or_else(|| Error::Parse("CREATE PROCEDURE requires a BEGIN ... END body".into()))?;
     let body = sql[begin..end].trim().to_string();
-    Ok((name, proc::ProcDef { params, body }))
+    Ok((name, proc::ProcDef { params, body }, definition))
 }
 
 #[derive(Clone, Copy)]
@@ -4278,6 +4433,247 @@ fn drop_if_exists(sql: &str) -> bool {
         .collect();
     words.get(2).map(String::as_str) == Some("if")
         && words.get(3).map(String::as_str) == Some("exists")
+}
+
+/// The `[FROM|IN db] [LIKE 'pattern' | WHERE expr]` that may follow the first
+/// `words` words of a MySQL `SHOW` statement.
+fn mysql_show_tail(
+    sql: &str,
+    words: usize,
+) -> Result<(
+    Option<sqlparser::ast::ObjectName>,
+    Option<sqlparser::ast::ShowStatementFilter>,
+)> {
+    use sqlparser::ast::ShowStatementFilter;
+    let sql = crate::sqllex::keep_like_escapes(sql).map_or(Cow::Borrowed(sql), Cow::Owned);
+    let dialect = MySqlDialect {};
+    let parse_error = |e: sqlparser::parser::ParserError| Error::Parse(e.to_string());
+    let mut parser = Parser::new(&dialect)
+        .try_with_sql(&sql)
+        .map_err(parse_error)?;
+    for _ in 0..words {
+        parser.next_token();
+    }
+    let database = if parser.parse_keyword(Keyword::FROM) || parser.parse_keyword(Keyword::IN) {
+        Some(parser.parse_object_name(false).map_err(parse_error)?)
+    } else {
+        None
+    };
+    let filter = if parser.parse_keyword(Keyword::LIKE) {
+        Some(ShowStatementFilter::Like(
+            parser.parse_literal_string().map_err(parse_error)?,
+        ))
+    } else if parser.parse_keyword(Keyword::WHERE) {
+        Some(ShowStatementFilter::Where(
+            parser.parse_expr().map_err(parse_error)?,
+        ))
+    } else {
+        None
+    };
+    while parser.consume_token(&Token::SemiColon) {}
+    let next = parser.peek_token();
+    if next.token != Token::EOF {
+        return Err(Error::Parse(format!(
+            "unexpected {} in SHOW statement",
+            next.token
+        )));
+    }
+    Ok((database, filter))
+}
+
+/// What a `FLUSH` statement asks for, of the forms ElyraSQL takes.
+enum MysqlFlush {
+    Tables,
+    TablesWithReadLock,
+    Privileges,
+}
+
+/// `FLUSH [NO_WRITE_TO_BINLOG | LOCAL] {TABLES [name, ...] [WITH READ LOCK] |
+/// PRIVILEGES}`; `None` for any other `FLUSH`.
+fn mysql_flush(sql: &str) -> Option<Result<MysqlFlush>> {
+    let tokens = mysql_ddl_tokens(sql)?;
+    let mut position = 1;
+    if mysql_keyword(&tokens, position, "local")
+        || mysql_keyword(&tokens, position, "no_write_to_binlog")
+    {
+        position += 1;
+    }
+    if mysql_keyword(&tokens, position, "privileges") {
+        return (position + 1 == tokens.len()).then_some(Ok(MysqlFlush::Privileges));
+    }
+    if !(mysql_keyword(&tokens, position, "tables") || mysql_keyword(&tokens, position, "table")) {
+        return None;
+    }
+    let rest = &tokens[position + 1..];
+    let with_read_lock = rest.len() >= 3
+        && mysql_keyword(rest, rest.len() - 3, "with")
+        && mysql_keyword(rest, rest.len() - 2, "read")
+        && mysql_keyword(rest, rest.len() - 1, "lock");
+    if with_read_lock {
+        if rest.len() > 3 {
+            return Some(Err(Error::Unsupported(
+                "FLUSH TABLES name, ... WITH READ LOCK: use LOCK TABLES name READ".into(),
+            )));
+        }
+        return Some(Ok(MysqlFlush::TablesWithReadLock));
+    }
+    Some(Ok(MysqlFlush::Tables))
+}
+
+/// `CREATE {DATABASE|SCHEMA} [IF NOT EXISTS] name option ...`: whether it said
+/// `IF NOT EXISTS`, or `None` when there are no options, which the parser
+/// takes as it is.
+fn mysql_create_database_with_options(sql: &str) -> Result<Option<bool>> {
+    let tokens = mysql_ddl_tokens(sql)
+        .ok_or_else(|| Error::Parse("invalid CREATE DATABASE statement".into()))?;
+    let mut position = 2;
+    let if_not_exists = mysql_keyword(&tokens, position, "if")
+        && mysql_keyword(&tokens, position + 1, "not")
+        && mysql_keyword(&tokens, position + 2, "exists");
+    if if_not_exists {
+        position += 3;
+    }
+    if !matches!(tokens.get(position), Some(Token::Word(_))) {
+        return Err(Error::Parse("CREATE DATABASE requires a name".into()));
+    }
+    position += 1;
+    if position == tokens.len() {
+        return Ok(None);
+    }
+    // [DEFAULT] {CHARACTER SET | CHARSET | COLLATE | ENCRYPTION} [=] value
+    while position < tokens.len() {
+        if mysql_keyword(&tokens, position, "default") {
+            position += 1;
+        }
+        if mysql_keyword(&tokens, position, "character")
+            && mysql_keyword(&tokens, position + 1, "set")
+        {
+            position += 2;
+        } else if ["charset", "collate", "encryption"]
+            .iter()
+            .any(|option| mysql_keyword(&tokens, position, option))
+        {
+            position += 1;
+        } else {
+            return Err(Error::Parse(format!(
+                "unexpected {} in CREATE DATABASE",
+                tokens
+                    .get(position)
+                    .map_or(String::new(), ToString::to_string)
+            )));
+        }
+        if matches!(tokens.get(position), Some(Token::Eq)) {
+            position += 1;
+        }
+        match tokens.get(position) {
+            Some(Token::Word(_) | Token::SingleQuotedString(_) | Token::DoubleQuotedString(_)) => {
+                position += 1;
+            }
+            _ => {
+                return Err(Error::Parse(
+                    "CREATE DATABASE option requires a value".into(),
+                ))
+            }
+        }
+    }
+    Ok(Some(if_not_exists))
+}
+
+/// `SHOW CREATE {DATABASE|SCHEMA} [IF NOT EXISTS] name`: the name, and whether
+/// `IF NOT EXISTS` was given.
+fn mysql_show_create_database(sql: &str) -> Result<(sqlparser::ast::ObjectName, bool)> {
+    let tokens = mysql_ddl_tokens(sql)
+        .ok_or_else(|| Error::Parse("invalid SHOW CREATE DATABASE statement".into()))?;
+    let mut position = 3;
+    let if_not_exists = mysql_keyword(&tokens, position, "if")
+        && mysql_keyword(&tokens, position + 1, "not")
+        && mysql_keyword(&tokens, position + 2, "exists");
+    if if_not_exists {
+        position += 3;
+    }
+    if position + 1 != tokens.len() {
+        return Err(Error::Parse(
+            "SHOW CREATE DATABASE requires one database name".into(),
+        ));
+    }
+    let name = mysql_table_name(&tokens, position, position + 1)
+        .ok_or_else(|| Error::Parse("SHOW CREATE DATABASE has an invalid name".into()))?;
+    Ok((name, if_not_exists))
+}
+
+/// Take `SQL_NO_CACHE` out of a select's modifiers. MySQL 8 has no query cache
+/// and accepts the word, deprecated, to change nothing; mysqldump reads every
+/// table with `SELECT /*!40001 SQL_NO_CACHE */ * FROM ...`. It is a keyword
+/// there, so it is only taken where a modifier can stand: right after `SELECT`
+/// or another modifier.
+fn strip_sql_no_cache(sql: &str) -> Option<String> {
+    const WORD: &str = "sql_no_cache";
+    const AFTER: &[&str] = &[
+        "select",
+        "all",
+        "distinct",
+        "distinctrow",
+        "high_priority",
+        "straight_join",
+        "sql_small_result",
+        "sql_big_result",
+        "sql_buffer_result",
+        "sql_calc_found_rows",
+    ];
+    if !contains_ci(sql, WORD) {
+        return None;
+    }
+    let bytes = sql.as_bytes();
+    let mut cuts = Vec::new();
+    for c in crate::sqllex::code_bytes(sql) {
+        if !crate::sqllex::keyword_at(sql, c.index, WORD) {
+            continue;
+        }
+        let mut end = c.index;
+        while end > 0 && bytes[end - 1].is_ascii_whitespace() {
+            end -= 1;
+        }
+        let mut start = end;
+        while start > 0 && (bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_') {
+            start -= 1;
+        }
+        if AFTER
+            .iter()
+            .any(|word| sql[start..end].eq_ignore_ascii_case(word))
+        {
+            cuts.push(c.index);
+        }
+    }
+    if cuts.is_empty() {
+        return None;
+    }
+    let mut out = String::with_capacity(sql.len());
+    let mut last = 0;
+    for cut in cuts {
+        out.push_str(&sql[last..cut]);
+        last = cut + WORD.len();
+    }
+    out.push_str(&sql[last..]);
+    Some(out)
+}
+
+/// `ANALYZE TABLE t UPDATE HISTOGRAM ON c [, ...] [WITH n BUCKETS]` as
+/// `ANALYZE TABLE t`: ElyraSQL's ANALYZE collects every column's statistics,
+/// histogram included, in a set number of buckets. mysqldump writes one for
+/// each column that has statistics, so a restore collects them again.
+fn strip_update_histogram(sql: &str) -> Option<String> {
+    let head = sql.trim_start();
+    if !head
+        .get(..7)
+        .is_some_and(|word| word.eq_ignore_ascii_case("analyze"))
+    {
+        return None;
+    }
+    let at = crate::sqllex::find_top_level(sql, |sql, c| {
+        crate::sqllex::keyword_at(sql, c.index, "update")
+    })?;
+    let rest = sql[at + "update".len()..].trim_start();
+    crate::sqllex::keyword_at(rest, 0, "histogram").then(|| sql[..at].trim_end().to_string())
 }
 
 fn mysql_named_object(sql: &str, keyword: &str) -> Result<sqlparser::ast::ObjectName> {
@@ -5378,6 +5774,16 @@ pub fn fuzz_preprocess_parse(sql: &str) {
     if let Some(x) = rewrite_bang(&s) {
         s = x;
     }
+    if let Some(x) = strip_sql_no_cache(&s) {
+        s = x;
+    }
+    if let Some(x) = strip_update_histogram(&s) {
+        s = x;
+    }
+    let _ = mysql_show_tail(&s, 2);
+    let _ = mysql_flush(&s);
+    let _ = mysql_create_database_with_options(&s);
+    let _ = crate::sqllex::binary_literals_as_hex(s.as_bytes());
     let _ = split_top_level(&s, ',');
     let _ = split_top_level(&s, '=');
     // Parse both dialects (the generic one is the ROLLUP / shift fallback).
@@ -6663,6 +7069,147 @@ mod set_operation_chain_tests {
         // The same protection for the other two set operators.
         assert!(guard_sql_complexity(&chain(50_000, " INTERSECT ")).is_err());
         assert!(guard_sql_complexity(&chain(50_000, " EXCEPT ")).is_err());
+    }
+}
+
+#[cfg(test)]
+mod mysqldump_statement_tests {
+    use super::*;
+
+    #[test]
+    fn sql_no_cache_is_taken_out_where_a_modifier_stands() {
+        for (sql, want) in [
+            ("SELECT  SQL_NO_CACHE  * FROM t", Some("SELECT    * FROM t")),
+            (
+                "select distinct sql_no_cache a FROM t",
+                Some("select distinct  a FROM t"),
+            ),
+            (
+                "SELECT a FROM (SELECT SQL_NO_CACHE a FROM t) x",
+                Some("SELECT a FROM (SELECT  a FROM t) x"),
+            ),
+            ("SELECT 'SQL_NO_CACHE', `sql_no_cache` FROM t", None),
+            ("SELECT a, sql_no_cache FROM t", None),
+        ] {
+            assert_eq!(strip_sql_no_cache(sql).as_deref(), want, "{sql}");
+        }
+    }
+
+    #[test]
+    fn update_histogram_is_an_analyze() {
+        assert_eq!(
+            strip_update_histogram("ANALYZE TABLE `t` UPDATE HISTOGRAM ON `c` WITH 32 BUCKETS")
+                .as_deref(),
+            Some("ANALYZE TABLE `t`")
+        );
+        assert_eq!(strip_update_histogram("ANALYZE TABLE t"), None);
+        assert_eq!(
+            strip_update_histogram("ANALYZE TABLE t DROP HISTOGRAM ON c"),
+            None
+        );
+        assert_eq!(strip_update_histogram("UPDATE t SET histogram = 1"), None);
+    }
+
+    #[test]
+    fn flush_forms() {
+        let kind = |sql: &str| match mysql_flush(sql) {
+            None => "other",
+            Some(Err(_)) => "refused",
+            Some(Ok(MysqlFlush::Tables)) => "tables",
+            Some(Ok(MysqlFlush::TablesWithReadLock)) => "read lock",
+            Some(Ok(MysqlFlush::Privileges)) => "privileges",
+        };
+        for (sql, want) in [
+            ("FLUSH TABLES", "tables"),
+            ("FLUSH   LOCAL   TABLES", "tables"),
+            ("FLUSH NO_WRITE_TO_BINLOG TABLES t1, t2", "tables"),
+            ("FLUSH TABLES WITH READ LOCK", "read lock"),
+            ("FLUSH TABLES t WITH READ LOCK", "refused"),
+            ("FLUSH PRIVILEGES", "privileges"),
+            ("FLUSH LOGS", "other"),
+        ] {
+            assert_eq!(kind(sql), want, "{sql}");
+        }
+    }
+
+    #[test]
+    fn create_database_options_are_read() {
+        for (sql, want) in [
+            (
+                "CREATE DATABASE IF NOT EXISTS `d` DEFAULT CHARACTER SET utf8mb4 \
+                 COLLATE utf8mb4_0900_ai_ci DEFAULT ENCRYPTION='N'",
+                Some(true),
+            ),
+            ("CREATE SCHEMA d CHARSET = utf8mb4", Some(false)),
+            ("CREATE DATABASE IF NOT EXISTS d", None),
+        ] {
+            assert_eq!(
+                mysql_create_database_with_options(sql).unwrap(),
+                want,
+                "{sql}"
+            );
+        }
+        assert!(mysql_create_database_with_options("CREATE DATABASE d WHATEVER x").is_err());
+    }
+
+    async fn text(engine: &Engine, session: &Session, sql: &str, column: usize) -> String {
+        let mut results = engine
+            .execute(sql, Privilege::Admin, session)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}\n  -> {e}"));
+        let QueryResult::Rows(mut stream) = results.remove(0) else {
+            panic!("expected rows for {sql}");
+        };
+        match stream.next_batch(1).await.unwrap().remove(0).remove(column) {
+            Value::Text(s) => s,
+            other => panic!("{sql}: {other:?}"),
+        }
+    }
+
+    /// A procedure from before its source was recorded is given back from what
+    /// was kept, without its parameter types, in a form ElyraSQL reads back.
+    #[tokio::test]
+    async fn a_procedure_without_its_recorded_source_is_rebuilt() {
+        let engine = Engine::new(elyra_storage::Db::in_memory().unwrap());
+        let s = engine.session();
+        for sql in [
+            "CREATE TABLE pc (id INT PRIMARY KEY)",
+            "CREATE PROCEDURE `Old_Proc`(IN a INT, OUT n INT, INOUT m DECIMAL(10,2)) \
+             BEGIN SELECT COUNT(*) INTO n FROM pc; SET m = m + a; END",
+        ] {
+            engine.execute(sql, Privilege::Admin, &s).await.unwrap();
+        }
+        let recorded = text(&engine, &s, "SHOW CREATE PROCEDURE old_proc", 2).await;
+        assert_eq!(
+            recorded,
+            "CREATE DEFINER=`root`@`%` PROCEDURE `Old_Proc`(IN a INT, OUT n INT, \
+             INOUT m DECIMAL(10,2)) BEGIN SELECT COUNT(*) INTO n FROM pc; SET m = m + a; END"
+        );
+        s.commit_write(vec![], vec![catalog::procsrc_key("Old_Proc")])
+            .await
+            .unwrap();
+        let rebuilt = text(&engine, &s, "SHOW CREATE PROCEDURE old_proc", 2).await;
+        assert_eq!(
+            rebuilt,
+            "CREATE DEFINER=`root`@`%` PROCEDURE `old_proc`(a, OUT n, INOUT m)\nBEGIN\n\
+             SELECT COUNT(*) INTO n FROM pc; SET m = m + a;\nEND"
+        );
+        // ... which recreates a procedure that does the same.
+        engine
+            .execute("DROP PROCEDURE old_proc", Privilege::Admin, &s)
+            .await
+            .unwrap();
+        engine
+            .execute(&rebuilt, Privilege::Admin, &s)
+            .await
+            .unwrap();
+        for sql in ["SET @m = 1.5", "CALL old_proc(2, @n, @m)"] {
+            engine.execute(sql, Privilege::Admin, &s).await.unwrap();
+        }
+        assert_eq!(
+            text(&engine, &s, "SELECT CONCAT(@n, ' ', @m)", 0).await,
+            "0 3.5"
+        );
     }
 }
 

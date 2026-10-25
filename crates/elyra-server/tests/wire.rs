@@ -14164,3 +14164,353 @@ async fn view_columns_are_described() {
         other => panic!("expected 1356, got {other:?}"),
     }
 }
+
+/// Everything mysqldump 8.4 asks a server it dumps, as it asks it. The dump
+/// stopped at its first statement, `SET SESSION
+/// information_schema_stats_expiry=0`; past that, `SHOW CREATE TABLE` of a
+/// view, `SHOW TRIGGERS`, `SHOW CREATE TRIGGER`, `SHOW CREATE PROCEDURE` and
+/// the data query `SELECT /*!40001 SQL_NO_CACHE */ *` all failed, and `SHOW
+/// PROCEDURE STATUS` was empty, so a dump would have left every procedure out.
+/// Each answer is MySQL's.
+#[tokio::test]
+async fn mysqldump_can_dump_a_database() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    for sql in [
+        "CREATE TABLE md_c (id INT PRIMARY KEY, name VARCHAR(20) NOT NULL)",
+        "CREATE TABLE md_o (id INT PRIMARY KEY AUTO_INCREMENT, cid INT, total DECIMAL(10,2))",
+        "CREATE TABLE md_log (id INT PRIMARY KEY AUTO_INCREMENT, msg VARCHAR(50))",
+        "INSERT INTO md_c VALUES (1, 'Ada'), (2, 'Bo')",
+        "CREATE TRIGGER md_o_ai AFTER INSERT ON md_o FOR EACH ROW \
+         INSERT INTO md_log (msg) VALUES (CONCAT('order ', NEW.id))",
+        "CREATE SQL SECURITY INVOKER VIEW md_v AS SELECT id, name FROM md_c WHERE id > 0",
+        "CREATE PROCEDURE md_add(IN cust INT, IN amount DECIMAL(10,2), INOUT n INT)\n\
+         BEGIN INSERT INTO md_o (cid, total) VALUES (cust, amount); SET n = n + 1; END",
+        // What mysqldump sets before anything else, and before every table.
+        "/*!80000 SET SESSION information_schema_stats_expiry=0 */",
+        "SET SESSION NET_READ_TIMEOUT= 86400, SESSION NET_WRITE_TIMEOUT= 86400",
+        "SET SQL_QUOTE_SHOW_CREATE=1",
+        "SET SESSION character_set_results = 'binary'",
+    ] {
+        c.query_drop(sql)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+
+    // Tablespaces: there are none.
+    let files: Vec<mysql_async::Row> = c
+        .query(
+            "SELECT DISTINCT TABLESPACE_NAME, FILE_NAME, LOGFILE_GROUP_NAME, EXTENT_SIZE, \
+             INITIAL_SIZE, ENGINE FROM INFORMATION_SCHEMA.FILES WHERE FILE_TYPE = 'DATAFILE' \
+             AND TABLESPACE_NAME IN (SELECT DISTINCT TABLESPACE_NAME FROM \
+             INFORMATION_SCHEMA.PARTITIONS WHERE TABLE_SCHEMA IN ('elyra')) \
+             ORDER BY TABLESPACE_NAME, LOGFILE_GROUP_NAME",
+        )
+        .await
+        .unwrap();
+    assert!(files.is_empty());
+
+    // A view answers SHOW CREATE TABLE as SHOW CREATE VIEW does.
+    for sql in ["SHOW CREATE TABLE `md_v`", "SHOW CREATE VIEW md_v"] {
+        let row: (String, String, String, String) = c.query_first(sql).await.unwrap().unwrap();
+        assert_eq!(
+            row,
+            (
+                "md_v".into(),
+                "CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`%` SQL SECURITY INVOKER VIEW `md_v` \
+                 AS SELECT id, name FROM md_c WHERE id > 0"
+                    .into(),
+                "utf8mb4".into(),
+                "utf8mb4_0900_ai_ci".into(),
+            ),
+            "{sql}"
+        );
+    }
+    match c.query_drop("SHOW CREATE VIEW md_c").await {
+        Err(mysql_async::Error::Server(e)) => {
+            assert_eq!(
+                (e.code, e.message.as_str()),
+                (1347, "'elyra.md_c' is not VIEW")
+            )
+        }
+        other => panic!("expected 1347, got {other:?}"),
+    }
+
+    // The data, read the way mysqldump reads it.
+    let rows: Vec<(i64, String)> = c
+        .query("SELECT /*!40001 SQL_NO_CACHE */ * FROM `md_c`")
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![(1, "Ada".into()), (2, "Bo".into())]);
+
+    // Triggers: LIKE matches the table they are on.
+    let triggers: Vec<mysql_async::Row> = c.query("SHOW TRIGGERS LIKE 'md\\_o'").await.unwrap();
+    assert_eq!(triggers.len(), 1);
+    let t = &triggers[0];
+    let text = |i: usize| -> Option<String> { t.get(i).unwrap() };
+    assert_eq!(
+        (1..=10).filter(|&i| i != 5).map(text).collect::<Vec<_>>(),
+        [
+            "INSERT",
+            "md_o",
+            "INSERT INTO md_log (msg) VALUES (CONCAT('order ', NEW.id))",
+            "AFTER",
+            "STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION",
+            "root@%",
+            "utf8mb4",
+            "utf8mb4_0900_ai_ci",
+            "utf8mb4_0900_ai_ci",
+        ]
+        .map(|s| Some(s.to_string()))
+    );
+    assert!(c
+        .query::<mysql_async::Row, _>("SHOW TRIGGERS LIKE 'md\\_c'")
+        .await
+        .unwrap()
+        .is_empty());
+    let create: (String, String, String) = c
+        .query_first("SHOW CREATE TRIGGER `md_o_ai`")
+        .await
+        .unwrap()
+        .map(|r: mysql_async::Row| (r.get(0).unwrap(), r.get(1).unwrap(), r.get(2).unwrap()))
+        .unwrap();
+    assert_eq!(
+        create,
+        (
+            "md_o_ai".into(),
+            "STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION".into(),
+            "CREATE DEFINER=`root`@`%` TRIGGER `md_o_ai` AFTER INSERT ON `md_o` FOR EACH ROW \
+             INSERT INTO md_log (msg) VALUES (CONCAT('order ', NEW.id))"
+                .into(),
+        )
+    );
+    match c.query_drop("SHOW CREATE TRIGGER md_nope").await {
+        Err(mysql_async::Error::Server(e)) => {
+            assert_eq!(
+                (e.code, e.message.as_str()),
+                (1360, "Trigger does not exist")
+            )
+        }
+        other => panic!("expected 1360, got {other:?}"),
+    }
+
+    // Routines: the procedure is listed, and given back with its types.
+    let listed: Vec<(String, String, String, String)> = c
+        .query("SHOW PROCEDURE STATUS WHERE Db = 'elyra'")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r: mysql_async::Row| {
+            (
+                r.get(0).unwrap(),
+                r.get(1).unwrap(),
+                r.get(2).unwrap(),
+                r.get(4).unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        listed,
+        vec![(
+            "elyra".into(),
+            "md_add".into(),
+            "PROCEDURE".into(),
+            "root@%".into()
+        )]
+    );
+    assert!(c
+        .query::<mysql_async::Row, _>("SHOW PROCEDURE STATUS WHERE Db = 'other'")
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(c
+        .query::<mysql_async::Row, _>("SHOW FUNCTION STATUS WHERE Db = 'elyra'")
+        .await
+        .unwrap()
+        .is_empty());
+    let create: String = c
+        .query_first("SHOW CREATE PROCEDURE `md_add`")
+        .await
+        .unwrap()
+        .map(|r: mysql_async::Row| r.get(2).unwrap())
+        .unwrap();
+    assert_eq!(
+        create,
+        "CREATE DEFINER=`root`@`%` PROCEDURE `md_add`(IN cust INT, IN amount DECIMAL(10,2), \
+         INOUT n INT)\nBEGIN INSERT INTO md_o (cid, total) VALUES (cust, amount); SET n = n + 1; END"
+    );
+    // A parameter type with a comma in it no longer splits the parameters.
+    c.query_drop("SET @n = 5").await.unwrap();
+    c.query_drop("CALL md_add(1, 12.34, @n)").await.unwrap();
+    let after: (i64, String) = c
+        .query_first("SELECT @n, (SELECT msg FROM md_log ORDER BY id DESC LIMIT 1)")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after, (6, "order 1".into()));
+    match c.query_drop("SHOW CREATE FUNCTION md_add").await {
+        Err(mysql_async::Error::Server(e)) => {
+            assert_eq!(
+                (e.code, e.message.as_str()),
+                (1305, "FUNCTION md_add does not exist")
+            )
+        }
+        other => panic!("expected 1305, got {other:?}"),
+    }
+
+    // Statistics come back as the ANALYZE that collects them again.
+    c.query_drop("ANALYZE TABLE md_c").await.unwrap();
+    let stats: Vec<(String, i64)> = c
+        .query(
+            "SELECT COLUMN_NAME, JSON_EXTRACT(HISTOGRAM, '$.\"number-of-buckets-specified\"') \
+             FROM information_schema.COLUMN_STATISTICS \
+             WHERE SCHEMA_NAME = 'elyra' AND TABLE_NAME = 'md_c' ORDER BY COLUMN_NAME",
+        )
+        .await
+        .unwrap();
+    assert_eq!(stats, vec![("id".into(), 32), ("name".into(), 32)]);
+    c.query_drop("/*!80002 ANALYZE TABLE `md_c` UPDATE HISTOGRAM ON `name` WITH 32 BUCKETS */")
+        .await
+        .unwrap();
+
+    // --databases, and --lock-all-tables.
+    let db: (String, String) = c
+        .query_first("SHOW CREATE DATABASE IF NOT EXISTS `elyra`")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        db.1,
+        "CREATE DATABASE /*!32312 IF NOT EXISTS*/ `elyra` /*!40100 DEFAULT CHARACTER SET \
+         utf8mb4 COLLATE utf8mb4_0900_ai_ci */ /*!80016 DEFAULT ENCRYPTION='N' */"
+    );
+    for sql in [
+        db.1.as_str(),
+        "FLUSH /*!40101 LOCAL */ TABLES",
+        "FLUSH TABLES WITH READ LOCK",
+        "UNLOCK TABLES",
+        "FLUSH PRIVILEGES",
+    ] {
+        c.query_drop(sql)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    assert!(c
+        .query::<mysql_async::Row, _>("SHOW EVENTS")
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+/// The table statements a dump consists of, in MySQL's spelling, read back
+/// the way they were written. A name with a backtick in it was written with
+/// the backtick unescaped, which no server could read; `ALTER TABLE ...
+/// DISABLE KEYS` did not take a name with a space; and a partition bound
+/// followed by `ENGINE = InnoDB`, as every MySQL dump writes it, was lost,
+/// which made the partition MAXVALUE.
+#[tokio::test]
+async fn tables_are_written_as_they_are_read() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    for sql in [
+        "CREATE TABLE `md w` (`a``b` INT PRIMARY KEY, `select` VARCHAR(5))",
+        "ALTER TABLE `md w` DISABLE KEYS",
+        "INSERT INTO `md w` VALUES (1, 'x')",
+        "ALTER TABLE `md w` ENABLE KEYS",
+        "CREATE TABLE `md_p` (`id` int NOT NULL, PRIMARY KEY (`id`)) \
+         ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci\n\
+         /*!50100 PARTITION BY RANGE (`id`)\n\
+         (PARTITION p0 VALUES LESS THAN (10) ENGINE = InnoDB,\n \
+         PARTITION p1 VALUES LESS THAN MAXVALUE ENGINE = InnoDB) */",
+        "CREATE TABLE md_l (id INT PRIMARY KEY) partition by list (id) \
+         (partition a values in (1,2), partition b values in (3))",
+    ] {
+        c.query_drop(sql)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    let ddl: (String, String) = c
+        .query_first("SHOW CREATE TABLE `md w`")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        ddl.1,
+        "CREATE TABLE `md w` (\n  `a``b` INT NOT NULL,\n  `select` VARCHAR(5),\n  PRIMARY KEY (`a``b`)\n)"
+    );
+    let parts: Vec<(String, String, i64, String, Option<String>)> = c
+        .query(
+            "SELECT TABLE_NAME, PARTITION_NAME, PARTITION_ORDINAL_POSITION, PARTITION_EXPRESSION, \
+             PARTITION_DESCRIPTION FROM information_schema.PARTITIONS \
+             WHERE TABLE_SCHEMA = 'elyra' ORDER BY TABLE_NAME, PARTITION_ORDINAL_POSITION",
+        )
+        .await
+        .unwrap();
+    let p =
+        |t: &str, n: &str, i: i64, d: &str| (t.into(), n.into(), i, "`id`".into(), Some(d.into()));
+    assert_eq!(
+        parts,
+        vec![
+            p("md_l", "a", 1, "1,2"),
+            p("md_l", "b", 2, "3"),
+            p("md_p", "p0", 1, "10"),
+            p("md_p", "p1", 2, "MAXVALUE"),
+        ]
+    );
+    let ddl: (String, String) = c
+        .query_first("SHOW CREATE TABLE md_p")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        ddl.1,
+        "CREATE TABLE `md_p` (\n  `id` INT NOT NULL,\n  PRIMARY KEY (`id`)\n)\n\
+         /*!50100 PARTITION BY RANGE (`id`)\n\
+         (PARTITION `p0` VALUES LESS THAN (10) ENGINE = InnoDB,\n \
+         PARTITION `p1` VALUES LESS THAN MAXVALUE ENGINE = InnoDB) */"
+    );
+}
+
+/// mysqldump writes every BLOB value as `_binary '...'` with the bytes as
+/// they are, which are seldom UTF-8. The introducer was refused, and a query
+/// that was not UTF-8 ended the connection. The literal is now read as the
+/// bytes it holds; bytes that are not UTF-8 anywhere else are MySQL's 1300,
+/// and the connection stays.
+#[tokio::test]
+async fn blob_values_as_mysqldump_writes_them() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop("CREATE TABLE md_b (id INT PRIMARY KEY, b BLOB)")
+        .await
+        .unwrap();
+    let mut insert: Vec<u8> =
+        b"INSERT INTO md_b VALUES (1,_binary '\\0\xff\x10'),(2,_binary 'it''s \xfe\\\\'),".to_vec();
+    insert.extend_from_slice(b"(3,_binary 'plain'),(4,_binary ''),(5,X'DEADBEEF')");
+    c.query_drop(insert.as_slice()).await.unwrap();
+    let rows: Vec<(i64, String)> = c
+        .query("SELECT id, HEX(b) FROM md_b ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            (1, "00FF10".into()),
+            (2, "6974277320FE5C".into()),
+            (3, "706C61696E".into()),
+            (4, "".into()),
+            (5, "DEADBEEF".into()),
+        ]
+    );
+    let text: String = c
+        .query_first("SELECT _utf8mb4 'æøå'")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(text, "æøå");
+    match c.query_drop(&b"SELECT 1 \xff"[..]).await {
+        Err(mysql_async::Error::Server(e)) => assert_eq!(e.code, 1300, "{}", e.message),
+        other => panic!("expected 1300, got {other:?}"),
+    }
+    let still: i64 = c.query_first("SELECT 7").await.unwrap().unwrap();
+    assert_eq!(still, 7);
+}

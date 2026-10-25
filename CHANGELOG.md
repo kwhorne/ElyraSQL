@@ -8,6 +8,50 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ### Fixed
 
+- **mysqldump can dump an ElyraSQL database.** It stopped at its first
+  statement, `SET SESSION information_schema_stats_expiry=0`. Past that, it
+  needed what ElyraSQL did not answer: `SHOW CREATE TABLE` of a view, `SHOW
+  TRIGGERS`, `SHOW CREATE TRIGGER`, `SHOW CREATE PROCEDURE`,
+  `information_schema.FILES`, `COLUMN_STATISTICS.SCHEMA_NAME`, `SET
+  SQL_QUOTE_SHOW_CREATE`, the data query `SELECT /*!40001 SQL_NO_CACHE */ *`,
+  and for `--lock-all-tables` `FLUSH TABLES [WITH READ LOCK]`. And `SHOW
+  PROCEDURE STATUS` was always empty, so a dump would have left every procedure
+  out. Each is now answered as MySQL 8.4 answers it, and a dump restores into
+  ElyraSQL or MySQL with its tables, rows, views, triggers, procedures,
+  partitioning and statistics; restored into ElyraSQL, it dumps again to the
+  same file. A procedure now records how it was written, so `SHOW CREATE
+  PROCEDURE` gives its parameter types back; one created before this is given
+  back without them. `--all-databases` still gives an empty dump: mysqldump
+  waits for a database named `mysql`, which ElyraSQL does not have.
+
+- **`BLOB` values in a dump restore.** mysqldump writes them as `_binary
+  '...'` with the bytes as they are. The introducer was refused, and a query
+  whose text was not UTF-8 ended the connection. The literal is now read as the
+  bytes it holds; bytes that are not UTF-8 anywhere else are MySQL's 1300, and
+  the connection stays. `HEX()` and `LENGTH()` of a binary value read its bytes,
+  not its text form (`HEX(X'DEADBEEF')` was `DEADEFBFBDEFBFBD`).
+
+- **A partition bound written as MySQL writes it is kept.** `PARTITION p0
+  VALUES LESS THAN (10) ENGINE = InnoDB`, as in every MySQL dump, lost its
+  bound and became `MAXVALUE`, so `TRUNCATE PARTITION p0` emptied the whole
+  table; a lowercase `partition` was not seen at all. `SHOW CREATE TABLE` now
+  writes the partitioning, and `information_schema.PARTITIONS` has MySQL's
+  columns.
+
+- **A procedure parameter whose type has a comma works.** `IN amount
+  DECIMAL(10,2)` split the parameter list at its comma, so the parameters after
+  it were lost and the procedure failed when called.
+
+- **Names with a backtick or a space are written so they can be read back.**
+  `SHOW CREATE TABLE` did not double a backtick in a name, and `ALTER TABLE
+  ... DISABLE KEYS`, which mysqldump writes around every table's rows, did not
+  take a quoted name with a space.
+
+- **`CREATE DATABASE IF NOT EXISTS` with options is accepted**, as `mysqldump
+  --databases` writes it (`DEFAULT CHARACTER SET ... COLLATE ...`); for the
+  database that is there, the options change nothing, as in MySQL. `FLUSH
+  PRIVILEGES` is accepted as well: grants take effect when they are made.
+
 - **A view's columns are described.** `information_schema.COLUMNS` left them
   out and `SHOW COLUMNS FROM <view>` / `DESCRIBE <view>` failed with 1146, so a
   tool that lists a view's columns -- an ORM's introspection, a GUI's schema
