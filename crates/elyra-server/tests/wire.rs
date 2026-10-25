@@ -13772,3 +13772,52 @@ async fn view_definer_and_sql_security_are_honoured() {
         vec![(1, "vs_alice@%".into()), (2, "vs_alice@%".into())]
     );
 }
+
+/// MySQL runs the body of a `/*!NNNNN ... */` version comment when the server
+/// is at least version NNNNN. mysqldump writes every view, and the header of
+/// every trigger, this way; they used to be skipped as comments, so a restored
+/// dump had no views and no error said so.
+#[tokio::test]
+async fn version_comments_run_up_to_the_server_version() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    for sql in [
+        "CREATE TABLE vc_t (id INT PRIMARY KEY, a INT)",
+        "INSERT INTO vc_t VALUES (1, 10), (2, 20)",
+        // As mysqldump writes a view.
+        "/*!50001 CREATE ALGORITHM=UNDEFINED */\n\
+         /*!50013 DEFINER=`root`@`%` SQL SECURITY DEFINER */\n\
+         /*!50001 VIEW `vc_v` AS select `vc_t`.`id` AS `id` from `vc_t` where (`vc_t`.`a` > 15) */",
+        // ...and a trigger.
+        "/*!50003 CREATE*/ /*!50017 DEFINER=`root`@`%`*/ /*!50003 TRIGGER `vc_trig` BEFORE INSERT \
+         ON `vc_t` FOR EACH ROW SET NEW.a = NEW.a + 1 */",
+        "/*!40101 SET @vc = 7 */",
+        // A later version's body stays a comment.
+        "/*!90000 SET @vc = 9 */",
+    ] {
+        c.query_drop(sql)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    let ids: Vec<i64> = c.query("SELECT id FROM vc_v").await.unwrap();
+    assert_eq!(ids, vec![2]);
+    c.query_drop("INSERT INTO vc_t VALUES (3, 30)")
+        .await
+        .unwrap();
+    let a: Option<i64> = c
+        .query_first("SELECT a FROM vc_t WHERE id = 3")
+        .await
+        .unwrap();
+    assert_eq!(
+        a,
+        Some(31),
+        "the trigger in the version comment was created"
+    );
+    let v: Option<i64> = c.query_first("SELECT @vc").await.unwrap();
+    assert_eq!(v, Some(7));
+    let both: Option<i64> = c
+        .query_first("SELECT 1 /*!50001 + 1 */ /*!90000 + 100 */")
+        .await
+        .unwrap();
+    assert_eq!(both, Some(2));
+}
