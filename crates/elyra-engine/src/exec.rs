@@ -1605,7 +1605,7 @@ async fn query_columns(
     } else {
         None
     };
-    let schema = match static_query_schema(db, query, None).await {
+    let schema = match Box::pin(static_query_schema(db, query, None)).await {
         Ok(schema) => schema,
         Err(_) => {
             let mut empty = query.clone();
@@ -1614,7 +1614,7 @@ async fn query_columns(
                 false,
             )));
             empty.offset = None;
-            run_subquery_schema(db, vindex, &empty).await?.0
+            Box::pin(run_subquery_schema(db, vindex, &empty)).await?.0
         }
     };
     let sources = sources.filter(|sources| sources.len() == schema.columns.len());
@@ -1917,7 +1917,7 @@ pub async fn show_columns(
     table: &str,
 ) -> Result<QueryResult> {
     if catalog::load_view(db, table).await?.is_some() {
-        return show_view_columns(db, vindex, table).await;
+        return Box::pin(show_view_columns(db, vindex, table)).await;
     }
     let def = catalog::load(db, table).await?;
     let declarations = catalog::load_declarations(db, table).await?;
@@ -1991,7 +1991,7 @@ async fn show_view_columns(
     );
     // A view that no longer resolves -- a table it reads was dropped -- is
     // MySQL's 1356, naming the view.
-    let columns = match view_columns(db, vindex, view, 0).await {
+    let columns = match Box::pin(view_columns(db, vindex, view, 0)).await {
         Ok(columns) => columns,
         Err(e @ Error::ViewRights(_)) => return Err(e),
         Err(_) => return Err(Error::ViewRights(format!("{}.{view}", db.database()))),
@@ -2729,7 +2729,9 @@ async fn information_schema(
             // view that no longer resolves (a table it reads was dropped) is
             // left out, as MySQL leaves it out with a warning.
             for view in catalog::list_views(db).await? {
-                let Ok(columns) = view_columns(db, vindex, &view, 0).await else {
+                // Boxed: describing a view can run one, and `select` holds
+                // this future inline.
+                let Ok(columns) = Box::pin(view_columns(db, vindex, &view, 0)).await else {
                     continue;
                 };
                 for (i, c) in columns.into_iter().enumerate() {
