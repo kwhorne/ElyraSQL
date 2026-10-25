@@ -8,6 +8,14 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ### Fixed
 
+- **A `BEFORE` trigger applies every assignment of a `SET`.** `SET NEW.a = x,
+  NEW.b = y` applied only the first assignment and dropped the rest without an
+  error, so the row was written with the other columns unset. The assignments
+  now run in order, each seeing the ones before it (`NEW.b = NEW.a + 1` sees the
+  new `a`), and `:=` is accepted, as in MySQL. A `;` or `,` inside a string
+  literal in the body is text: it used to split the body there, and every
+  `INSERT` or `UPDATE` that fired the trigger failed with a syntax error.
+
 - **`USER()`, `CURRENT_USER()` and `CONNECTION_ID()` answer for the connection
   that asks.** They answered `root@%` and `1` for everyone. A view that showed
   each user their own rows (`WHERE owner = SUBSTRING_INDEX(USER(), '@', 1)`)
