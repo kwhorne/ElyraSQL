@@ -2849,7 +2849,9 @@ async fn run_virtual_select(
             db.group_concat_max_len(),
         )?;
         let mut orows = apply_having(select.having.as_ref(), &projection, &osch, orows)?;
-        order_output_rows(&mut orows, &osch, order_exprs)?;
+        // By position: two output columns can share a name (`x.id`, `y.id`).
+        let (order_positions, _) = order_by_output_position(order_exprs, &projection);
+        order_output_rows(&mut orows, &osch, &order_positions)?;
         truncate_hidden_columns(&mut osch, &mut orows, hidden);
         apply_offset_limit(&mut orows, offset, limit);
         return Ok(QueryResult::Rows(RowStream::literal(osch, orows)));
@@ -7623,7 +7625,9 @@ fn finish_materialized_select(
         let (mut osch, orows) =
             aggregate::run(&schema, &projection, group_by, rows, group_concat_max_len)?;
         let mut orows = apply_having(select.having.as_ref(), &projection, &osch, orows)?;
-        order_output_rows(&mut orows, &osch, order_exprs)?;
+        // By position: two output columns can share a name (`x.id`, `y.id`).
+        let (order_positions, _) = order_by_output_position(order_exprs, &projection);
+        order_output_rows(&mut orows, &osch, &order_positions)?;
         truncate_hidden_columns(&mut osch, &mut orows, hidden);
         apply_offset_limit(&mut orows, offset, limit);
         return Ok(QueryResult::Rows(RowStream::literal(osch, orows)));
@@ -8557,6 +8561,13 @@ async fn streaming_join_aggregate(
     if db.in_txn() || select.distinct.is_some() || select.from.is_empty() {
         return Ok(None);
     }
+    // The grouped output holds only the projection; an ORDER BY key outside it
+    // (`ORDER BY x.id` beside a projected `y.id`) needs join_select's hidden
+    // columns.
+    let (order_positions, unmatched) = order_by_output_position(order_exprs, &select.projection);
+    if !unmatched.is_empty() {
+        return Ok(None);
+    }
     // A two-table RIGHT join is streamed by rewriting it to `B LEFT JOIN A` and
     // reordering the output columns back to (A, B) below.
     let swapped = rewrite_right_join(&select.from[0]);
@@ -8697,7 +8708,7 @@ async fn streaming_join_aggregate(
     // output -- exactly as join_select's aggregation branch does.
     let (osch, orows) = sa.finalize()?;
     let mut orows = apply_having(select.having.as_ref(), &select.projection, &osch, orows)?;
-    order_output_rows(&mut orows, &osch, order_exprs)?;
+    order_output_rows(&mut orows, &osch, &order_positions)?;
     apply_offset_limit(&mut orows, offset, limit);
     Ok(Some(QueryResult::Rows(RowStream::literal(osch, orows))))
 }
@@ -15526,10 +15537,18 @@ fn resolve_order_aliases(
                         }
                     }
                 }
-                let is_column = schema
-                    .columns
-                    .iter()
-                    .any(|c| predicate::identifier_eq(&c.name, name));
+                // A join schema names its columns `x.id`, so a qualified
+                // `x.id` is a source column only by its qualifier -- matched
+                // by bare name it became the projected `y.id`.
+                let is_column = match e {
+                    Expr::CompoundIdentifier(parts) => {
+                        predicate::resolve_index_parts(parts, schema).is_ok()
+                    }
+                    _ => schema
+                        .columns
+                        .iter()
+                        .any(|c| predicate::identifier_eq(&c.name, name)),
+                };
                 if !is_column {
                     if let Some(expr) = projected_order_expr(name, projection, schema) {
                         return (expr, *asc);
@@ -15895,7 +15914,11 @@ fn projection_exposes_order_expr(
 ) -> bool {
     use sqlparser::ast::SelectItem;
 
-    let original_name = ident_name(original);
+    // Only a bare name can stand for an output column: `ORDER BY x.id` is not
+    // exposed by a projected `y.id`.
+    let original_name = matches!(original, Expr::Identifier(_))
+        .then(|| ident_name(original))
+        .flatten();
     projection.iter().any(|item| match item {
         SelectItem::Wildcard(_) => ident_name(resolved).is_some(),
         SelectItem::QualifiedWildcard(_, _) => false,

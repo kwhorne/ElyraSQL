@@ -6,6 +6,18 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **`ORDER BY` a joined table's column that is not selected sorts by that
+  column.** In a join, `SELECT x.name, y.id ... ORDER BY x.id, y.id` sorted by
+  `y.id` twice: `x.id` was looked up by its bare name, `id`, and found the
+  selected `y.id`. The rows were right and their order was not -- a row
+  padded with NULLs by a `LEFT JOIN` came first, `ORDER BY x.id DESC, y.id`
+  reversed the second key, and a `LIMIT` kept the wrong rows. It happened
+  whenever the sort column was not selected and a selected column of another
+  table had the same name, with and without `GROUP BY`. `ORDER BY MAX(x.id)`
+  over a grouped join, which failed, now sorts too.
+
 ## [1.12.7] - 2026-10-25
 
 ### Fixed
