@@ -13821,3 +13821,66 @@ async fn version_comments_run_up_to_the_server_version() {
         .unwrap();
     assert_eq!(both, Some(2));
 }
+
+/// `FROM (a JOIN b ON ...)`: MySQL stores every view with a join in this form
+/// and mysqldump writes it back, so a restored view with a join failed to be
+/// created ("unknown column"), and so did any query written that way. The
+/// nesting is taken out where that keeps the result; each answer is MySQL
+/// 8.4's.
+#[tokio::test]
+async fn parenthesised_joins_are_read() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    for sql in [
+        "CREATE TABLE pj_c (id INT PRIMARY KEY, name VARCHAR(20))",
+        "CREATE TABLE pj_o (id INT PRIMARY KEY, cid INT, total INT)",
+        "CREATE TABLE pj_s (oid INT PRIMARY KEY, ship VARCHAR(10))",
+        "INSERT INTO pj_c VALUES (1, 'a'), (2, 'b'), (3, 'nobody')",
+        "INSERT INTO pj_o VALUES (1, 1, 10), (2, 1, 20), (3, 2, 5), (4, 9, 1)",
+        "INSERT INTO pj_s VALUES (1, 'x'), (3, 'y')",
+        // As MySQL stores it, and mysqldump writes it.
+        "CREATE VIEW pj_v AS select `x`.`name` AS `name`,sum(`y`.`total`) AS `total` \
+         from (`pj_c` `x` join `pj_o` `y` on((`y`.`cid` = `x`.`id`))) group by `x`.`name`",
+    ] {
+        c.query_drop(sql)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    let totals: Vec<(String, i64)> = c
+        .query("SELECT name, total FROM pj_v ORDER BY name")
+        .await
+        .unwrap();
+    assert_eq!(totals, vec![("a".into(), 30), ("b".into(), 5)]);
+
+    // Compared as a set: the order of rows after a padded LEFT JOIN row is a
+    // separate matter.
+    let mut left: Vec<(String, Option<i64>)> = c
+        .query(
+            "SELECT x.name, y.id FROM ((pj_c x LEFT JOIN pj_o y ON y.cid = x.id) \
+             JOIN pj_c w ON w.id = x.id)",
+        )
+        .await
+        .unwrap();
+    left.sort();
+    assert_eq!(
+        left,
+        vec![
+            ("a".into(), Some(1)),
+            ("a".into(), Some(2)),
+            ("b".into(), Some(3)),
+            ("nobody".into(), None)
+        ]
+    );
+    // On the right of an inner join, holding only inner joins.
+    let right: Vec<(String, i64)> = c
+        .query("SELECT x.name, y.total FROM pj_c x JOIN (pj_o y JOIN pj_s z ON z.oid = y.id) ON y.cid = x.id ORDER BY y.id")
+        .await
+        .unwrap();
+    assert_eq!(right, vec![("a".into(), 10), ("b".into(), 5)]);
+    // After a comma.
+    let comma: Vec<i64> = c
+        .query("SELECT y.id FROM pj_c x, (pj_o y JOIN pj_s z ON z.oid = y.id) WHERE x.id = y.cid ORDER BY y.id")
+        .await
+        .unwrap();
+    assert_eq!(comma, vec![1, 3]);
+}

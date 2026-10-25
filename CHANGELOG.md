@@ -8,6 +8,14 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ### Fixed
 
+- **A join in parentheses is read: `FROM (a JOIN b ON ...)`.** MySQL stores
+  every view with a join in this form and mysqldump writes it back, so a
+  restored view with a join was refused ("unknown column"), and so was any
+  query written that way. The parentheses are taken out where that keeps the
+  result: on the left of a join list or alone in `FROM` (after a comma too), for
+  every join type, and on the right of an inner join when they hold only inner
+  joins. An outer join inside a parenthesised right operand is still refused.
+
 - **MySQL's version comments run.** The body of `/*! ... */`, and of
   `/*!NNNNN ... */` up to this server's 8.0.12 (`80012`), is code, as in MySQL;
   a later version's stays a comment. mysqldump writes every view, every trigger

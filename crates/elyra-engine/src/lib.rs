@@ -22,6 +22,7 @@ mod ft;
 mod index;
 mod keyenc;
 pub mod lockmgr;
+mod nestjoin;
 mod predicate;
 mod proc;
 mod rowdec;
@@ -1836,6 +1837,8 @@ impl Engine {
             if sessfn::resolves_identity(&stmt) {
                 sessfn::rewrite_identity(&mut stmt, &sess.identity(), sess.definer());
             }
+            // `FROM (a JOIN b ON ...)`, as MySQL stores every view with a join.
+            nestjoin::flatten(&mut stmt);
             // `||` means logical OR by default and string concatenation under
             // PIPES_AS_CONCAT (MySQL). sqlparser parses it as one operator either
             // way; the stateless evaluator concatenates it, so when the mode is
