@@ -6,6 +6,8 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.12.9] - 2026-10-26
+
 ### Fixed
 
 - **mysqldump can dump an ElyraSQL database.** It stopped at its first
