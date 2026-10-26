@@ -17,6 +17,26 @@ ElyraSQL release builds target **Ubuntu 24.04+** and **Apple Silicon macOS
     done, so an interrupted upgrade simply resumes on the next start. **Take a backup
     first, and note that downgrading to 1.4.x afterwards is not supported.**
 
+!!! info "Upgrading to 1.12.9 — mysqldump, views in the catalog"
+
+    No on-disk format change; a 1.12.8 database opens in 1.12.9 unchanged.
+
+    - **mysqldump can dump an ElyraSQL database** with its rows, views,
+      triggers, procedures, partitioning and statistics, and the dump restores
+      into ElyraSQL or MySQL. Name the database: `--all-databases` still gives
+      an empty dump. See [Backup](backup.md#dumping-with-mysqldump).
+    - **A procedure records how it was written**, so `SHOW CREATE PROCEDURE`
+      and a dump give its parameter types back. One created before 1.12.9 is
+      given back without them until it is created again.
+    - **`BLOB` values from a MySQL dump restore.** A `_binary '...'` literal
+      with bytes that are not UTF-8 ended the connection.
+    - **A partition bound followed by `ENGINE = InnoDB`, as in every MySQL
+      dump, is kept.** It became `MAXVALUE`. A table restored from such a dump
+      before 1.12.9 has that partitioning; `SHOW CREATE TABLE` now shows it.
+    - **Views are listed in `information_schema.TABLES`, `SHOW TABLE STATUS`
+      and `information_schema.COLUMNS`**, and `DESCRIBE <view>` works. A tool
+      that reads the catalog will now see them.
+
 !!! info "Upgrading to 1.12.8"
 
     No on-disk format change; a 1.12.7 database opens in 1.12.8 unchanged.
@@ -608,8 +628,8 @@ macOS).
 Multi-arch image (`amd64` + `arm64`) on the GitHub Container Registry:
 
 ```bash
-docker pull ghcr.io/kwhorne/elyrasql:1.12.8   # or :latest
-docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.12.8
+docker pull ghcr.io/kwhorne/elyrasql:1.12.9   # or :latest
+docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.12.9
 ```
 
 The image is ~15 MB, runs as a non-root user, stores data in the
