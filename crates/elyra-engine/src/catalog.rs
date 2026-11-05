@@ -385,6 +385,26 @@ pub async fn load_triggers(db: &Session, table: &str) -> Result<Vec<TriggerDef>>
     Ok(triggers)
 }
 
+/// Every trigger stored on `table` with its key, read past the cache: what
+/// `DROP TABLE` deletes and `RENAME TABLE` moves.
+pub async fn stored_triggers(db: &Session, table: &str) -> Result<Vec<(Vec<u8>, TriggerDef)>> {
+    let batch = db.scan_batch(trigger_prefix(table), None, 4096).await?;
+    Ok(batch
+        .into_iter()
+        .filter_map(|(key, value)| Some((key, bincode::deserialize(&value).ok()?)))
+        .collect())
+}
+
+/// Whether the name index points trigger `name` at `table`. A trigger created
+/// before the index existed has no entry, and one whose name was reused on
+/// another table points there; neither entry belongs to `table`.
+pub async fn trigger_indexed_on(db: &Session, name: &str, table: &str) -> Result<bool> {
+    Ok(db
+        .get(trigname_key(name))
+        .await?
+        .is_some_and(|indexed| String::from_utf8_lossy(&indexed).eq_ignore_ascii_case(table)))
+}
+
 #[allow(clippy::type_complexity)]
 fn trigger_cache() -> &'static std::sync::RwLock<
     std::collections::HashMap<(u64, String), (CacheTag, std::sync::Arc<Vec<TriggerDef>>)>,
