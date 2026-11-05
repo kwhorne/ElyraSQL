@@ -2699,6 +2699,30 @@ fn check_constraint_name(table_name: &str, ordinal: usize) -> String {
     format!("{table_name}_chk_{}", ordinal + 1)
 }
 
+/// A table's declared CHECK constraints with their names, numbered as MySQL
+/// numbers them (`t_chk_1`, ...). The CHECKs ElyraSQL stores for `ENUM` /
+/// `SET` membership are not constraints in MySQL and are left out.
+fn declared_checks(def: &TableDef) -> Vec<(String, &str)> {
+    def.checks
+        .iter()
+        .filter(|text| member_check_column(def, text).is_none())
+        .enumerate()
+        .map(|(ordinal, text)| (check_constraint_name(&def.name, ordinal), text.as_str()))
+        .collect()
+}
+
+/// The column whose `ENUM` / `SET` membership `check` is, if it is the CHECK
+/// `create_table` writes for one.
+fn member_check_column(def: &TableDef, check: &str) -> Option<usize> {
+    def.schema.columns.iter().position(|col| {
+        let quoted = format!("`{}`", col.name);
+        check.starts_with(&format!("{quoted} IN ("))
+            || check.starts_with(&format!(
+                "{quoted} IS NULL OR {quoted} = '' OR {quoted} REGEXP '"
+            ))
+    })
+}
+
 /// The unique key targeted by a foreign key, if the referenced table still has
 /// a matching primary or unique key. Older catalogs may contain a foreign key
 /// that predates this validation, in which case the standard metadata is NULL.
@@ -3448,8 +3472,7 @@ async fn information_schema(
                 for foreign_key in &def.foreign_keys {
                     push(&foreign_key.name, "FOREIGN KEY");
                 }
-                for ordinal in 0..def.checks.len() {
-                    let name = check_constraint_name(&table_name, ordinal);
+                for (name, _) in declared_checks(&def) {
                     push(&name, "CHECK");
                 }
             }
@@ -3459,12 +3482,12 @@ async fn information_schema(
             let mut rows = Vec::new();
             for table_name in names {
                 let def = catalog::load(db, &table_name).await?;
-                rows.extend(def.checks.iter().enumerate().map(|(ordinal, expression)| {
+                rows.extend(declared_checks(&def).into_iter().map(|(name, expression)| {
                     vec![
                         Value::Text("def".into()),
                         Value::Text(database.clone()),
-                        Value::Text(check_constraint_name(&table_name, ordinal)),
-                        Value::Text(expression.clone()),
+                        Value::Text(name),
+                        Value::Text(expression.to_string()),
                     ]
                 }));
             }
@@ -5793,6 +5816,11 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
     // the AUTO_INCREMENT column.
     let mut first_generated_id: i64 = 0;
     let checks = parse_checks(&def)?;
+    let leniency = if ignore {
+        Some(Leniency::load(db, &def).await?)
+    } else {
+        None
+    };
     let trigs = catalog::load_triggers(db, &name).await?;
     let before_ins: Vec<catalog::TriggerDef> = trigs
         .iter()
@@ -5804,7 +5832,7 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
         .filter(|t| !t.before && t.event == catalog::TrigEvent::Insert)
         .cloned()
         .collect();
-    for vals in rows {
+    for (row_index, vals) in rows.into_iter().enumerate() {
         if vals.len() != target.len() {
             return Err(Error::Query(format!(
                 "column count mismatch: {} values for {} columns",
@@ -5816,7 +5844,7 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
         let mut row = vec![Value::Null; def.schema.columns.len()];
         for (slot, v) in target.iter().zip(vals) {
             let col = &def.schema.columns[*slot];
-            row[*slot] = coerce_for_session(db, v, &col.ty, &col.name)?;
+            row[*slot] = coerce_assigned(db, v, col, ignore)?;
         }
 
         if has_meta {
@@ -5871,16 +5899,20 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
         for t in &before_ins {
             apply_before_trigger(db, t, &def.schema, &mut row, None)?;
         }
+        if let Some(leniency) = &leniency {
+            leniency.fix(&def, &mut row);
+        }
 
         for (i, col) in def.schema.columns.iter().enumerate() {
             if !col.nullable && row[i].is_null() {
-                return Err(Error::Query(format!(
-                    "column '{}' cannot be NULL",
-                    col.name
-                )));
+                return Err(Error::NotNull(col.name.clone()));
             }
         }
-        check_row(&def, &checks, &row)?;
+        // INSERT IGNORE leaves out a row that breaks a CHECK constraint.
+        match check_row(&checks, &def, &mut row, None, row_index + 1, ignore) {
+            Err(Error::CheckViolated(_)) if ignore => continue,
+            other => other?,
+        }
 
         let key = if has_pk {
             let encoded = keyenc::encode_columns_coll(&row, &def.pk_cols, &pk_colls)?;
@@ -5898,6 +5930,16 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
 
     if on_dup && index::has_unique(&def) {
         remap_unique_upsert_conflicts(db, &def, &mut built).await?;
+    }
+    // INSERT IGNORE leaves out a row whose foreign key has no parent, before
+    // keys are claimed: a row that is not written holds no unique value.
+    if ignore && db.foreign_key_checks() && !def.foreign_keys.is_empty() {
+        let violations = fk_violations(db, &def, &built).await?;
+        built = built
+            .into_iter()
+            .zip(violations)
+            .filter_map(|(row, violation)| violation.is_none().then_some(row))
+            .collect();
     }
     // INSERT IGNORE skips a row that collides on any unique key, not only the
     // primary key: checking the primary key alone wrote the duplicate.
@@ -6844,26 +6886,79 @@ fn queue_after(
     Ok(())
 }
 
+/// One CHECK of a table, parsed once for a whole statement.
+struct RowCheck {
+    expr: Expr,
+    rule: CheckRule,
+}
+
+/// What a failed CHECK means.
+enum CheckRule {
+    /// A declared constraint: MySQL 3819, naming it.
+    Constraint(String),
+    /// The CHECK `ENUM` / `SET` membership is stored as (see `create_table`),
+    /// for this column: MySQL refuses a non-member with 1265, "Data truncated",
+    /// and an `IGNORE` statement stores `''` instead.
+    Member(usize),
+}
+
 /// Parse a table's CHECK expressions once (for a whole statement).
-fn parse_checks(def: &TableDef) -> Result<Vec<Expr>> {
-    def.checks.iter().map(|s| parse_scalar_expr(s)).collect()
+fn parse_checks(def: &TableDef) -> Result<Vec<RowCheck>> {
+    let mut declared = declared_checks(def).into_iter().map(|(name, _)| name);
+    def.checks
+        .iter()
+        .map(|text| {
+            let rule = match member_check_column(def, text) {
+                Some(column) => CheckRule::Member(column),
+                None => CheckRule::Constraint(declared.next().unwrap_or_default()),
+            };
+            Ok(RowCheck {
+                expr: parse_scalar_expr(text)?,
+                rule,
+            })
+        })
+        .collect()
 }
 
 /// A CHECK is satisfied unless it evaluates to FALSE (NULL/UNKNOWN passes).
-fn check_row(def: &TableDef, checks: &[Expr], row: &[Value]) -> Result<()> {
+///
+/// `old` is the row an UPDATE replaces: MySQL validates an `ENUM` / `SET`
+/// value as it is assigned, so a column the statement leaves alone is not
+/// re-validated. `lenient` is an `IGNORE` statement, which stores `''` for a
+/// non-member instead of failing.
+fn check_row(
+    checks: &[RowCheck],
+    def: &TableDef,
+    row: &mut [Value],
+    old: Option<&[Value]>,
+    row_number: usize,
+    lenient: bool,
+) -> Result<()> {
     for c in checks {
-        let fails = match predicate::eval_row(c, &def.schema, row)? {
+        if let CheckRule::Member(i) = c.rule {
+            if old.is_some_and(|old| old.get(i) == row.get(i)) {
+                continue;
+            }
+        }
+        let fails = match predicate::eval_row(&c.expr, &def.schema, row)? {
             Value::Null => false,
             Value::Bool(b) => !b,
             Value::Int(i) => i == 0,
             Value::Float(f) => f == 0.0,
             _ => false,
         };
-        if fails {
-            return Err(Error::Query(format!(
-                "CHECK constraint violated for '{}'",
-                def.name
-            )));
+        if !fails {
+            continue;
+        }
+        match &c.rule {
+            CheckRule::Member(i) if lenient => row[*i] = Value::Text(String::new()),
+            CheckRule::Member(i) => {
+                return Err(Error::DataTruncated(
+                    def.schema.columns[*i].name.clone(),
+                    row_number,
+                ))
+            }
+            CheckRule::Constraint(name) => return Err(Error::CheckViolated(name.clone())),
         }
     }
     Ok(())
@@ -6970,6 +7065,30 @@ async fn check_widths_batch(
     Ok(())
 }
 
+/// A foreign key as MySQL names it in errors 1451 and 1452: `` `child`,
+/// CONSTRAINT `fk` FOREIGN KEY (`col`) REFERENCES `parent` (`id`) ``.
+fn foreign_key_text(child: &TableDef, fk: &ForeignKey) -> String {
+    let columns = fk
+        .columns
+        .iter()
+        .filter_map(|&i| child.schema.columns.get(i))
+        .map(|col| quoted_name(&col.name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let ref_columns = fk
+        .ref_columns
+        .iter()
+        .map(|col| quoted_name(col))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "{}, CONSTRAINT {} FOREIGN KEY ({columns}) REFERENCES {} ({ref_columns})",
+        quoted_name(&child.name),
+        quoted_name(&fk.name),
+        quoted_name(&fk.ref_table)
+    )
+}
+
 /// Verify every foreign key of `def` for the rows in `batch`: each non-NULL
 /// referencing tuple must exist in the parent (error 1452 otherwise).
 async fn check_fk_batch(
@@ -6977,7 +7096,30 @@ async fn check_fk_batch(
     def: &TableDef,
     batch: &[(Vec<u8>, Vec<Value>)],
 ) -> Result<()> {
-    for fk in &def.foreign_keys {
+    match fk_violations(db, def, batch)
+        .await?
+        .into_iter()
+        .flatten()
+        .next()
+    {
+        Some(fk) => Err(Error::ForeignKey(foreign_key_text(
+            def,
+            &def.foreign_keys[fk],
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// For each row of `batch`, the first foreign key of `def` it breaks (by
+/// position in `def.foreign_keys`): a non-NULL referencing tuple with no
+/// parent row.
+async fn fk_violations(
+    db: &Session,
+    def: &TableDef,
+    batch: &[(Vec<u8>, Vec<Value>)],
+) -> Result<Vec<Option<usize>>> {
+    let mut out = vec![None; batch.len()];
+    for (fk_index, fk) in def.foreign_keys.iter().enumerate() {
         // A self-referencing key can be satisfied by a row of this same
         // statement: MySQL checks each row as it is inserted, so a row may point
         // at one written *earlier in the batch* (or at itself). Batched dumps of
@@ -6997,7 +7139,8 @@ async fn check_fk_batch(
 
         let mut supplied: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
         let mut probes = Vec::new();
-        for (_, row) in batch {
+        let mut probe_rows = Vec::new();
+        for (row_index, (_, row)) in batch.iter().enumerate() {
             // Record what this row offers as a parent before checking what it
             // needs, so a row that references itself (`(5, 5)`) is satisfied.
             if let Some(cols) = &parent_key_cols {
@@ -7018,20 +7161,18 @@ async fn check_fk_batch(
                 continue; // satisfied by an earlier row of this statement
             }
             probes.push(probe);
+            probe_rows.push(row_index);
         }
         if probes.is_empty() {
             continue;
         }
-        for found in db.multi_get(probes).await? {
-            if found.is_none() {
-                return Err(Error::ForeignKey(format!(
-                    "a row in '{}' has no matching parent in '{}' (constraint '{}')",
-                    def.name, fk.ref_table, fk.name
-                )));
+        for (found, row_index) in db.multi_get(probes).await?.into_iter().zip(probe_rows) {
+            if found.is_none() && out[row_index].is_none() {
+                out[row_index] = Some(fk_index);
             }
         }
     }
-    Ok(())
+    Ok(out)
 }
 
 /// Verify that no row in `batch` collides on a unique index, either with
@@ -15530,6 +15671,7 @@ async fn mutation_matches(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn update(
     db: &Session,
     vindex: &VectorRegistry,
@@ -15538,6 +15680,7 @@ pub async fn update(
     selection: Option<&Expr>,
     order_by: &[OrderByExpr],
     limit: Option<usize>,
+    ignore: bool,
 ) -> Result<QueryResult> {
     let hidden = hidden_source_qualifiers(std::slice::from_ref(table));
     let visible = validate_unique_relation_qualifiers(db, std::slice::from_ref(table), "mutation")?;
@@ -15563,7 +15706,7 @@ pub async fn update(
                 "ORDER BY / LIMIT is supported only for single-table UPDATE".into(),
             ));
         }
-        return multi_update(db, vindex, table, assignments, selection).await;
+        return multi_update(db, vindex, table, assignments, selection, ignore).await;
     }
     let name = table_of(db, table)?;
     let def = catalog::load(db, &name).await?;
@@ -15647,13 +15790,96 @@ pub async fn update(
     if let Some(limit) = limit {
         matches.truncate(limit);
     }
-    // MySQL reports *changed* rows, not matched rows: an UPDATE that assigns a
-    // column the value it already had reports 0. (With CLIENT_FOUND_ROWS a client
-    // asks for matched rows instead, but that capability is not negotiated here,
-    // so the changed-row count is always the right answer. If it is ever
-    // honoured, this and the upsert counts in `insert` become conditional.)
-    let mut affected: u64 = 0;
+    let mut changes = Vec::with_capacity(matches.len());
+    for (old_key, old_row) in matches {
+        let mut new_row = old_row.clone();
+        for (idx, expr) in &sets {
+            // Assignment RHS may reference existing column values.
+            let v = predicate::eval_row(expr, &def.schema, &old_row)?;
+            let col = &def.schema.columns[*idx];
+            new_row[*idx] = coerce_assigned(db, v, col, ignore)?;
+        }
+        changes.push(RowUpdate {
+            old_key,
+            old_row,
+            new_row,
+        });
+    }
+    let mut writes = UpdateWrites::default();
+    stage_row_updates(db, &def, changes, ignore, &mut writes).await?;
+    for t in std::mem::take(&mut writes.wcounts) {
+        writes.puts.push(bump_wcount(db, &t).await?);
+    }
+    db.commit_write(writes.puts, writes.deletes).await?;
+    for (triggers, schema, old_row, new_row) in &writes.after {
+        queue_after(db, triggers, schema, Some(new_row), Some(old_row))?;
+    }
+    Ok(QueryResult::Affected(writes.affected))
+}
 
+/// Coerce an assigned value to its column. An `IGNORE` statement converts the
+/// way MySQL's non-strict mode does (an invalid date becomes the zero date,
+/// and so on) instead of failing.
+fn coerce_assigned(db: &Session, v: Value, col: &ColumnDef, ignore: bool) -> Result<Value> {
+    coerce_with_mode(v, &col.ty, &col.name, db.strict_sql_mode() && !ignore)
+}
+
+/// One row an UPDATE changes, with its assignments applied.
+struct RowUpdate {
+    old_key: Vec<u8>,
+    old_row: Vec<Value>,
+    new_row: Vec<Value>,
+}
+
+/// One row an UPDATE has validated, with the storage key it moves to.
+struct StagedUpdate {
+    old_key: Vec<u8>,
+    old_row: Vec<Value>,
+    new_key: Vec<u8>,
+    new_row: Vec<Value>,
+}
+
+/// What an UPDATE writes, across every table it changes.
+#[derive(Default)]
+struct UpdateWrites {
+    puts: Vec<(Vec<u8>, Vec<u8>)>,
+    deletes: Vec<Vec<u8>>,
+    /// Tables whose write counters move.
+    wcounts: Vec<String>,
+    /// MySQL reports *changed* rows, not matched rows: an UPDATE that assigns
+    /// a column the value it already had reports 0. (With CLIENT_FOUND_ROWS a
+    /// client asks for matched rows instead, but that capability is not
+    /// negotiated here, so the changed-row count is always the right answer.
+    /// If it is ever honoured, this and the upsert counts in `insert` become
+    /// conditional.)
+    affected: u64,
+    /// AFTER UPDATE triggers to queue once the write commits.
+    after: Vec<AfterUpdate>,
+}
+
+/// AFTER UPDATE triggers to queue for one changed row: the triggers, the
+/// table's schema, the old row and the new row.
+type AfterUpdate = (Vec<catalog::TriggerDef>, Schema, Vec<Value>, Vec<Value>);
+
+/// Validate the updates of one table and add them to `writes`, as MySQL
+/// applies them: row by row, in order. Each row has its generated columns
+/// recomputed and its BEFORE UPDATE triggers run, then must satisfy NOT NULL,
+/// its CHECK constraints, its primary and unique keys -- against the rows
+/// as they stand at that moment (see `unique_in_row_order`) -- and its
+/// foreign keys, both as a child and as a parent (with the parent's ON UPDATE
+/// actions applied to its children).
+///
+/// With `ignore` (`UPDATE IGNORE`), MySQL turns each of those errors into a
+/// warning: a value its column cannot hold is replaced by the nearest one it
+/// can (see `Leniency`), and a row that breaks a CHECK, a key or a foreign key
+/// is left as it was while the others are written.
+async fn stage_row_updates(
+    db: &Session,
+    def: &TableDef,
+    changes: Vec<RowUpdate>,
+    ignore: bool,
+    writes: &mut UpdateWrites,
+) -> Result<()> {
     // Stored generated columns are recomputed after each update.
     let generated: Vec<(usize, Expr)> = if def.has_col_meta() {
         let mut v = Vec::new();
@@ -15666,16 +15892,13 @@ pub async fn update(
     } else {
         Vec::new()
     };
-
-    let mut puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-    let mut deletes: Vec<Vec<u8>> = Vec::new();
-    let mut fk_parent_changes: Vec<(Vec<Value>, Vec<Value>)> = Vec::new();
-    let check_uniq = index::has_unique(&def);
-    let check_fk = db.foreign_key_checks() && !def.foreign_keys.is_empty();
-    let mut uniq_batch: Vec<(Vec<u8>, Vec<Value>)> = Vec::new();
-    let checks = parse_checks(&def)?;
-
-    let utrigs = catalog::load_triggers(db, &name).await?;
+    let checks = parse_checks(def)?;
+    let leniency = if ignore {
+        Some(Leniency::load(db, def).await?)
+    } else {
+        None
+    };
+    let utrigs = catalog::load_triggers(db, &def.name).await?;
     let before_upd: Vec<catalog::TriggerDef> = utrigs
         .iter()
         .filter(|t| t.before && t.event == catalog::TrigEvent::Update)
@@ -15686,32 +15909,41 @@ pub async fn update(
         .filter(|t| !t.before && t.event == catalog::TrigEvent::Update)
         .cloned()
         .collect();
-    for (old_key, old_row) in matches {
-        let mut new_row = old_row.clone();
-        for (idx, expr) in &sets {
-            // Assignment RHS may reference existing column values.
-            let v = predicate::eval_row(expr, &def.schema, &old_row)?;
-            let col = &def.schema.columns[*idx];
-            new_row[*idx] = coerce_for_session(db, v, &col.ty, &col.name)?;
-        }
+
+    let mut staged: Vec<StagedUpdate> = Vec::with_capacity(changes.len());
+    for (row_index, change) in changes.into_iter().enumerate() {
+        let RowUpdate {
+            old_key,
+            old_row,
+            mut new_row,
+        } = change;
         for (i, ge) in &generated {
             let v = predicate::eval_row(ge, &def.schema, &new_row)?;
             let col = &def.schema.columns[*i];
-            new_row[*i] = coerce_for_session(db, v, &col.ty, &col.name)?;
+            new_row[*i] = coerce_assigned(db, v, col, ignore)?;
         }
         for t in &before_upd {
             apply_before_trigger(db, t, &def.schema, &mut new_row, Some(&old_row))?;
         }
-
+        if let Some(leniency) = &leniency {
+            leniency.fix(def, &mut new_row);
+        }
         for (i, col) in def.schema.columns.iter().enumerate() {
             if !col.nullable && new_row[i].is_null() {
-                return Err(Error::Query(format!(
-                    "column '{}' cannot be NULL",
-                    col.name
-                )));
+                return Err(Error::NotNull(col.name.clone()));
             }
         }
-        check_row(&def, &checks, &new_row)?;
+        match check_row(
+            &checks,
+            def,
+            &mut new_row,
+            Some(&old_row),
+            row_index + 1,
+            ignore,
+        ) {
+            Err(Error::CheckViolated(_)) if ignore => continue,
+            other => other?,
+        }
 
         // If the primary key changed, the clustered key moves.
         let new_key = if def.has_pk() {
@@ -15723,59 +15955,274 @@ pub async fn update(
         } else {
             old_key.clone()
         };
+        staged.push(StagedUpdate {
+            old_key,
+            old_row,
+            new_key,
+            new_row,
+        });
+    }
 
-        // Width constraints apply even to a table with no keys or foreign
-        // keys, so retain every updated row for the common validation pass.
-        uniq_batch.push((new_key.clone(), new_row.clone()));
+    // Under IGNORE a row that breaks a foreign key is skipped, so each row is
+    // tested on its own; otherwise the whole set is tested at once below.
+    let check_fk = db.foreign_key_checks() && !def.foreign_keys.is_empty();
+    let mut eligible = vec![true; staged.len()];
+    if ignore && db.foreign_key_checks() {
+        if check_fk {
+            let batch: Vec<(Vec<u8>, Vec<Value>)> = staged
+                .iter()
+                .map(|row| (row.new_key.clone(), row.new_row.clone()))
+                .collect();
+            let violations = fk_violations(db, def, &batch).await?;
+            for ((row, violation), ok) in staged.iter().zip(violations).zip(eligible.iter_mut()) {
+                if violation.is_some() && row.new_row != row.old_row {
+                    *ok = false;
+                }
+            }
+        }
+        let referenced = !referencing_children(db, &def.name).await?.is_empty();
+        for (row, ok) in staged.iter().zip(eligible.iter_mut()) {
+            if !*ok || row.new_row == row.old_row {
+                continue;
+            }
+            if referenced {
+                let one = [(row.old_row.clone(), row.new_row.clone())];
+                let (mut puts, mut deletes, mut wcounts) = (Vec::new(), Vec::new(), Vec::new());
+                match cascade_parent_update(db, def, &one, &mut puts, &mut deletes, &mut wcounts)
+                    .await
+                {
+                    Err(Error::ReferencedRow(_)) => *ok = false,
+                    other => other?,
+                }
+            }
+        }
+    }
+    let written = unique_in_row_order(db, def, &staged, &eligible, ignore).await?;
+    let staged: Vec<StagedUpdate> = staged
+        .into_iter()
+        .zip(written)
+        .filter_map(|(row, written)| written.then_some(row))
+        .collect();
 
+    // Width constraints apply even to a table with no keys or foreign keys,
+    // so every updated row goes through the common validation pass.
+    let batch: Vec<(Vec<u8>, Vec<Value>)> = staged
+        .iter()
+        .map(|row| (row.new_key.clone(), row.new_row.clone()))
+        .collect();
+    check_widths_batch(db, def, &batch).await?;
+    if check_fk && !ignore {
+        check_fk_batch(db, def, &batch).await?;
+    }
+
+    let mut fk_parent_changes: Vec<(Vec<Value>, Vec<Value>)> = Vec::with_capacity(staged.len());
+    for row in staged {
         // Index maintenance: drop old entries, write new ones. Deletes are
         // applied before puts, so unchanged index entries survive.
-        deletes.extend(index::entry_keys_for_row(&def, &old_row, &old_key)?);
-        let new_index_entries = index::entries_for_row(&def, &new_row, &new_key)?;
-        if new_key != old_key {
-            deletes.push(old_key);
+        writes
+            .deletes
+            .extend(index::entry_keys_for_row(def, &row.old_row, &row.old_key)?);
+        let new_index_entries = index::entries_for_row(def, &row.new_row, &row.new_key)?;
+        if row.new_key != row.old_key {
+            writes.deletes.push(row.old_key);
         }
-        let encoded = bincode::serialize(&new_row).map_err(|e| Error::Storage(e.to_string()))?;
-        if new_row != old_row {
-            affected += 1;
+        let encoded =
+            bincode::serialize(&row.new_row).map_err(|e| Error::Storage(e.to_string()))?;
+        if row.new_row != row.old_row {
+            writes.affected += 1;
         }
-        fk_parent_changes.push((old_row, new_row.clone()));
-        puts.push((new_key, encoded));
-        puts.extend(new_index_entries);
-    }
-
-    if check_uniq {
-        check_unique_batch(db, &def, &uniq_batch).await?;
-    }
-    check_widths_batch(db, &def, &uniq_batch).await?;
-    if check_fk {
-        check_fk_batch(db, &def, &uniq_batch).await?;
+        writes.puts.push((row.new_key, encoded));
+        writes.puts.extend(new_index_entries);
+        fk_parent_changes.push((row.old_row, row.new_row));
     }
 
     // Parent-side ON UPDATE referential actions for children referencing a
     // changed key (RESTRICT/CASCADE/SET NULL, single level).
-    let mut wcounts: Vec<String> = vec![name.clone()];
+    writes.wcounts.push(def.name.clone());
     if db.foreign_key_checks() {
         cascade_parent_update(
             db,
-            &def,
+            def,
             &fk_parent_changes,
-            &mut puts,
-            &mut deletes,
-            &mut wcounts,
+            &mut writes.puts,
+            &mut writes.deletes,
+            &mut writes.wcounts,
         )
         .await?;
     }
-    for t in wcounts {
-        puts.push(bump_wcount(db, &t).await?);
-    }
-    db.commit_write(puts, deletes).await?;
     if !after_upd.is_empty() {
-        for (old_row, new_row) in &fk_parent_changes {
-            queue_after(db, &after_upd, &def.schema, Some(new_row), Some(old_row))?;
+        for (old_row, new_row) in fk_parent_changes {
+            writes
+                .after
+                .push((after_upd.clone(), def.schema.clone(), old_row, new_row));
         }
     }
-    Ok(QueryResult::Affected(affected))
+    Ok(())
+}
+
+/// Check primary and unique keys the way MySQL changes rows: one at a time, in
+/// order. A row's new key values must not be held, at that moment, by another
+/// row -- a stored row the statement has not yet moved off them, or one it has
+/// already written. So `SET id = id + 1 ORDER BY id DESC` succeeds and `SET
+/// id = id + 1` fails, as in MySQL, where checking the whole set against the
+/// stored rows refused both.
+///
+/// Rows whose `eligible` is false are left out without claiming anything. A
+/// collision fails the statement with 1062, or with `skip` (`IGNORE`) leaves
+/// that row out. Returns which rows are written.
+async fn unique_in_row_order(
+    db: &Session,
+    def: &TableDef,
+    rows: &[StagedUpdate],
+    eligible: &[bool],
+    skip: bool,
+) -> Result<Vec<bool>> {
+    if !def.has_pk() && !index::has_unique(def) {
+        return Ok(eligible.to_vec());
+    }
+    let probes = |key: &[u8], row: &[Value]| -> Result<Vec<Vec<u8>>> {
+        let mut out = index::unique_probe_keys(def, row)?;
+        if def.has_pk() {
+            out.push(key.to_vec());
+        }
+        Ok(out)
+    };
+    // Per row: the key values it takes (that it did not already hold), and
+    // the ones it gives up.
+    let mut taken: Vec<Vec<Vec<u8>>> = Vec::with_capacity(rows.len());
+    let mut vacated: Vec<Vec<Vec<u8>>> = Vec::with_capacity(rows.len());
+    for row in rows {
+        let old = probes(&row.old_key, &row.old_row)?;
+        let new = probes(&row.new_key, &row.new_row)?;
+        taken.push(new.iter().filter(|p| !old.contains(p)).cloned().collect());
+        vacated.push(old.into_iter().filter(|p| !new.contains(p)).collect());
+    }
+    let wanted: Vec<Vec<u8>> = taken
+        .iter()
+        .flatten()
+        .cloned()
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    let stored: std::collections::HashSet<Vec<u8>> = if wanted.is_empty() {
+        Default::default()
+    } else {
+        wanted
+            .iter()
+            .cloned()
+            .zip(db.multi_get(wanted.clone()).await?)
+            .filter_map(|(probe, owner)| owner.map(|_| probe))
+            .collect()
+    };
+    let mut claimed: std::collections::HashSet<Vec<u8>> = Default::default();
+    let mut released: std::collections::HashSet<Vec<u8>> = Default::default();
+    let mut written = Vec::with_capacity(rows.len());
+    for ((taken, vacated), &ok) in taken.into_iter().zip(vacated).zip(eligible) {
+        if !ok {
+            written.push(false);
+            continue;
+        }
+        let collides = taken
+            .iter()
+            .any(|p| claimed.contains(p) || (stored.contains(p) && !released.contains(p)));
+        if collides {
+            if skip {
+                written.push(false);
+                continue;
+            }
+            return Err(Error::Duplicate(
+                DuplicateError::Entry,
+                "Duplicate entry for a unique key".into(),
+            ));
+        }
+        released.extend(vacated);
+        claimed.extend(taken);
+        written.push(true);
+    }
+    Ok(written)
+}
+
+/// The value an `IGNORE` statement stores when its column cannot hold the one
+/// given: MySQL downgrades the error to a warning and stores the implicit
+/// default for NULL in a NOT NULL column, the nearest bound for an integer out
+/// of its declared range, and the leading characters of a string longer than
+/// its declared length.
+struct Leniency {
+    widths: Option<catalog::ColumnWidths>,
+    declarations: Option<catalog::ColumnDeclarations>,
+}
+
+impl Leniency {
+    async fn load(db: &Session, def: &TableDef) -> Result<Self> {
+        Ok(Self {
+            widths: catalog::load_widths(db, &def.name).await?,
+            declarations: catalog::load_declarations(db, &def.name).await?,
+        })
+    }
+
+    fn fix(&self, def: &TableDef, row: &mut [Value]) {
+        for (i, col) in def.schema.columns.iter().enumerate() {
+            let Some(value) = row.get_mut(i) else {
+                continue;
+            };
+            if value.is_null() {
+                if !col.nullable {
+                    if let Some(implicit) = implicit_column_value(&col.ty) {
+                        *value = implicit;
+                    }
+                }
+                continue;
+            }
+            let bits = self
+                .widths
+                .as_ref()
+                .and_then(|widths| widths.bits.get(i).copied().flatten());
+            if let Some(bits) = bits {
+                let unsigned = matches!(col.ty, ColumnType::UInt);
+                let n: Option<i128> = match value {
+                    Value::Int(v) => Some(*v as i128),
+                    Value::UInt(v) => Some(*v as i128),
+                    _ => None,
+                };
+                if let Some(n) = n {
+                    let (lo, hi) = int_bounds(bits, unsigned);
+                    let clamped = n.clamp(lo, hi);
+                    if clamped != n {
+                        *value = if unsigned {
+                            Value::UInt(clamped as u64)
+                        } else {
+                            Value::Int(clamped as i64)
+                        };
+                    }
+                }
+            }
+            let declaration = self
+                .declarations
+                .as_ref()
+                .and_then(|declarations| declarations.columns.get(i));
+            if let (Some(declaration), Value::Text(text)) = (declaration, &mut *value) {
+                if matches!(declaration.data_type.as_str(), "char" | "varchar") {
+                    let maximum = declaration
+                        .character_maximum_length
+                        .and_then(|maximum| usize::try_from(maximum).ok());
+                    if let Some((cut, _)) = maximum.and_then(|m| text.char_indices().nth(m)) {
+                        text.truncate(cut);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The implicit default MySQL stores for NULL in a NOT NULL column when the
+/// error is downgraded to a warning, or `None` where it has none ElyraSQL can
+/// store.
+fn implicit_column_value(ty: &ColumnType) -> Option<Value> {
+    match ty {
+        ColumnType::Date => Some(Value::Text("0000-00-00".into())),
+        ColumnType::DateTime => Some(Value::Text("0000-00-00 00:00:00".into())),
+        other => mysql_implicit_alter_value(other),
+    }
 }
 
 pub async fn delete(
@@ -16066,10 +16513,7 @@ async fn cascade_one_level(
                         if child_rows.iter().all(|(key, _)| removed.contains(key)) {
                             continue;
                         }
-                        return Err(Error::ForeignKey(format!(
-                            "cannot delete from '{}': rows in '{}' reference it (constraint '{}')",
-                            parent.name, child.name, fk.name
-                        )));
+                        return Err(Error::ReferencedRow(foreign_key_text(child, fk)));
                     }
                 }
             }
@@ -16151,10 +16595,7 @@ async fn cascade_parent_update(
                         touched = true;
                     }
                     _ => {
-                        return Err(Error::ForeignKey(format!(
-                            "cannot update '{}': rows in '{}' reference it (constraint '{}')",
-                            parent.name, child.name, fk.name
-                        )));
+                        return Err(Error::ReferencedRow(foreign_key_text(child, fk)));
                     }
                 }
             }
@@ -16321,6 +16762,7 @@ async fn multi_update(
     table: &TableWithJoins,
     assignments: &[Assignment],
     selection: Option<&Expr>,
+    ignore: bool,
 ) -> Result<QueryResult> {
     let from = std::slice::from_ref(table);
     let (schema, rows) = build_from(db, vindex, from, &[]).await?;
@@ -16389,12 +16831,15 @@ async fn multi_update(
         });
     }
 
-    // Per target table: pk -> (old base row, new base row). A base row hit by
-    // multiple joined rows is updated once (first match).
-    type RowMap = std::collections::HashMap<Vec<u8>, (Vec<Value>, Vec<Value>)>;
-    let mut updated: std::collections::HashMap<Vec<String>, RowMap> =
-        std::collections::HashMap::new();
-    let mut affected = 0u64;
+    // Per target table, in the order the join first reaches it: its rows, in
+    // the order the join reaches them, with their assignments applied. A base
+    // row hit by several joined rows is updated once (first match).
+    struct TargetRows {
+        qual: Vec<String>,
+        seen: std::collections::HashSet<Vec<u8>>,
+        changes: Vec<RowUpdate>,
+    }
+    let mut per_target: Vec<TargetRows> = Vec::new();
     for joined in rows {
         if let Some(f) = &filter {
             if !predicate::matches(f, &schema, &joined)? {
@@ -16411,8 +16856,19 @@ async fn multi_update(
                 &info.def.storage_name(),
                 &keyenc::encode_key_coll(&pk_vals, &info.def.pk_collations())?,
             );
-            let entry = updated.entry(qual.clone()).or_default();
-            if entry.contains_key(&pk_key) {
+            let slot = match per_target.iter().position(|t| &t.qual == qual) {
+                Some(slot) => slot,
+                None => {
+                    per_target.push(TargetRows {
+                        qual: qual.clone(),
+                        seen: Default::default(),
+                        changes: Vec::new(),
+                    });
+                    per_target.len() - 1
+                }
+            };
+            let target = &mut per_target[slot];
+            if !target.seen.insert(pk_key.clone()) {
                 continue;
             }
             let mut new_base = base.clone();
@@ -16420,55 +16876,36 @@ async fn multi_update(
                 if &s.qual == qual {
                     let v = predicate::eval_row(s.expr, &schema, &joined)?;
                     let col = &info.def.schema.columns[s.col];
-                    new_base[s.col] = coerce_for_session(db, v, &col.ty, &col.name)?;
+                    new_base[s.col] = coerce_assigned(db, v, col, ignore)?;
                 }
             }
-            for (i, col) in info.def.schema.columns.iter().enumerate() {
-                if !col.nullable && new_base[i].is_null() {
-                    return Err(Error::Query(format!(
-                        "column '{}' cannot be NULL",
-                        col.name
-                    )));
-                }
-            }
-            entry.insert(pk_key, (base, new_base));
-            affected += 1;
+            target.changes.push(RowUpdate {
+                old_key: pk_key,
+                old_row: base,
+                new_row: new_base,
+            });
         }
     }
 
-    let mut puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-    let mut deletes: Vec<Vec<u8>> = Vec::new();
-    for (qual, rowsmap) in &updated {
-        let info = &targets[qual];
-        let batch = rowsmap
-            .iter()
-            .map(|(key, (_, new_base))| (key.clone(), new_base.clone()))
-            .collect::<Vec<_>>();
-        check_widths_batch(db, &info.def, &batch).await?;
-        for (pk_key, (old_base, new_base)) in rowsmap {
-            let new_pk: Vec<Value> = info
-                .def
-                .pk_cols
-                .iter()
-                .map(|&i| new_base[i].clone())
-                .collect();
-            let new_key = data_key(
-                &info.def.storage_name(),
-                &keyenc::encode_key_coll(&new_pk, &info.def.pk_collations())?,
-            );
-            deletes.extend(index::entry_keys_for_row(&info.def, old_base, pk_key)?);
-            let new_entries = index::entries_for_row(&info.def, new_base, &new_key)?;
-            if &new_key != pk_key {
-                deletes.push(pk_key.clone());
-            }
-            let enc = bincode::serialize(new_base).map_err(|e| Error::Storage(e.to_string()))?;
-            puts.push((new_key, enc));
-            puts.extend(new_entries);
-        }
-        puts.push(bump_wcount(db, &info.name).await?);
+    // Each table's rows go through the same validation as a single-table
+    // UPDATE -- keys, foreign keys and their ON UPDATE actions, CHECK
+    // constraints, triggers -- and the whole statement commits at once.
+    let mut writes = UpdateWrites::default();
+    for target in per_target {
+        let info = &targets[&target.qual];
+        stage_row_updates(db, &info.def, target.changes, ignore, &mut writes).await?;
     }
-    db.commit_write(puts, deletes).await?;
-    Ok(QueryResult::Affected(affected))
+    let mut wcounts = std::mem::take(&mut writes.wcounts);
+    wcounts.sort_by_key(|name| name.to_ascii_lowercase());
+    wcounts.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+    for t in wcounts {
+        writes.puts.push(bump_wcount(db, &t).await?);
+    }
+    db.commit_write(writes.puts, writes.deletes).await?;
+    for (triggers, schema, old_row, new_row) in &writes.after {
+        queue_after(db, triggers, schema, Some(new_row), Some(old_row))?;
+    }
+    Ok(QueryResult::Affected(writes.affected))
 }
 
 /// Multi-table DELETE: `DELETE t1 FROM t1 JOIN t2 ON ... WHERE ...`.

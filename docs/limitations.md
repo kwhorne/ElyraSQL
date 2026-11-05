@@ -32,8 +32,8 @@ judge fit before deploying.
   {INSERT|UPDATE|DELETE} ON t FOR EACH ROW <body>`, with `NEW.col`/`OLD.col`.
   BEFORE bodies support `SET NEW.col = expr`; AFTER bodies run arbitrary DML.
   Firing is depth-guarded against runaway recursion. Triggers fire on
-  single-table INSERT/UPDATE/DELETE (not on multi-table or the upsert variants
-  REPLACE/ON DUPLICATE/IGNORE).
+  INSERT, UPDATE and DELETE, multi-table UPDATE and DELETE included (not on
+  the upsert variants REPLACE/ON DUPLICATE/INSERT IGNORE).
 - **Materialized views**: `CREATE MATERIALIZED VIEW v AS <select>` stores the
   result as a real table; `REFRESH MATERIALIZED VIEW v` recomputes it; `DROP
   MATERIALIZED VIEW v` removes it. Views **auto-refresh on read** when a base
@@ -93,6 +93,15 @@ judge fit before deploying.
   hierarchies. Delete cascades run to a fixed point with cycle detection and a
   depth guard. `ON UPDATE` cascades are currently single-level, and deferred
   constraint checking is not yet supported.
+- `INSERT IGNORE` and `UPDATE IGNORE` downgrade errors as MySQL does: a row
+  that breaks a key, a foreign key or a `CHECK` is skipped, and a value its
+  column cannot hold is stored as the nearest one it can (the implicit default
+  for NULL in a NOT NULL column, the bound of an integer range, a truncated
+  string, `''` for an unknown `ENUM` member). `SHOW WARNINGS` is always empty,
+  so the warnings MySQL lists for those rows are not reported.
+- Constraint names in error messages: a `CHECK` is named `<table>_chk_<n>`
+  even when it was declared with `CONSTRAINT name`, and a foreign key declared
+  without a name is `fk_<table>_<n>` rather than MySQL's `<table>_ibfk_<n>`.
 
 ## Query planning
 

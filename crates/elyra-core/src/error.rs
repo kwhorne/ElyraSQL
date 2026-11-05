@@ -85,8 +85,33 @@ pub enum Error {
     #[error("duplicate entry: {1}")]
     Duplicate(DuplicateError, String),
 
-    #[error("foreign key constraint: {0}")]
+    /// A child row whose reference has no parent. MySQL 1452
+    /// (`ER_NO_REFERENCED_ROW_2`), with its text.
+    #[error("Cannot add or update a child row: a foreign key constraint fails ({0})")]
     ForeignKey(String),
+
+    /// An update or delete of a parent row that a child row still references
+    /// (`RESTRICT` / `NO ACTION`). MySQL 1451 (`ER_ROW_IS_REFERENCED_2`); the
+    /// child-side failure, a reference to a missing parent, is 1452
+    /// ([`Error::ForeignKey`]).
+    #[error("Cannot delete or update a parent row: a foreign key constraint fails ({0})")]
+    ReferencedRow(String),
+
+    /// NULL stored into a NOT NULL column. MySQL 1048 (`ER_BAD_NULL_ERROR`),
+    /// with its text.
+    #[error("Column '{0}' cannot be null")]
+    NotNull(String),
+
+    /// A row that fails a CHECK constraint. MySQL 3819
+    /// (`ER_CHECK_CONSTRAINT_VIOLATED`), with its text.
+    #[error("Check constraint '{0}' is violated.")]
+    CheckViolated(String),
+
+    /// A value its column cannot hold without losing part of it, such as an
+    /// `ENUM` non-member. MySQL 1265 (`WARN_DATA_TRUNCATED`), its text:
+    /// `(column, row number)`.
+    #[error("Data truncated for column '{0}' at row {1}")]
+    DataTruncated(String, usize),
 
     #[error("type error: {0}")]
     Type(String),
@@ -233,6 +258,10 @@ impl Error {
             Error::Duplicate(DuplicateError::ColumnName, _) => 1060, // ER_DUP_FIELDNAME
             Error::Duplicate(DuplicateError::Entry, _) => 1062, // ER_DUP_ENTRY
             Error::ForeignKey(_) => 1452,  // ER_NO_REFERENCED_ROW
+            Error::ReferencedRow(_) => 1451, // ER_ROW_IS_REFERENCED_2
+            Error::NotNull(_) => 1048,     // ER_BAD_NULL_ERROR
+            Error::CheckViolated(_) => 3819, // ER_CHECK_CONSTRAINT_VIOLATED
+            Error::DataTruncated(..) => 1265, // WARN_DATA_TRUNCATED
             Error::ReadOnlyTransaction => 1792, // ER_CANT_EXECUTE_IN_READ_ONLY_TRANSACTION
             Error::TransactionInProgress => 1568, // ER_CANT_CHANGE_TX_CHARACTERISTICS
             Error::DatabaseMissing(_) => 1008, // ER_DB_DROP_EXISTS
@@ -271,6 +300,11 @@ impl Error {
             Error::OutOfRange(_) => b"22003",
             Error::DataTooLong(_) => b"22001",
             Error::Duplicate(DuplicateError::ColumnName, _) => b"42S21",
+            Error::Duplicate(DuplicateError::Entry, _)
+            | Error::ForeignKey(_)
+            | Error::ReferencedRow(_)
+            | Error::NotNull(_) => b"23000",
+            Error::DataTruncated(..) => b"01000",
             Error::ReadOnlyTransaction => b"25006",
             Error::TransactionInProgress => b"25001",
             Error::IntoColumnCount => b"21000",
@@ -332,7 +366,9 @@ mod error_code_tests {
     fn duplicate_kinds_separate_data_from_schema_mistakes() {
         let entry = Error::Duplicate(DuplicateError::Entry, "key 'PRIMARY'".into());
         assert_eq!(entry.mysql_code(), 1062);
-        assert_eq!(entry.sqlstate(), b"HY000");
+        // MySQL's class for every integrity-constraint violation, which PDO
+        // turns into "Integrity constraint violation".
+        assert_eq!(entry.sqlstate(), b"23000");
         let column = Error::Duplicate(DuplicateError::ColumnName, "'a'".into());
         assert_eq!(column.mysql_code(), 1060);
         assert_eq!(column.sqlstate(), b"42S21");
