@@ -6,10 +6,13 @@ judge fit before deploying.
 
 ## SQL surface
 
-- Subqueries (`WHERE` and SELECT-list, uncorrelated **and** correlated,
-  including over joins), derived tables, CTEs (`WITH`, including
-  `WITH RECURSIVE`), `HAVING`, window functions with explicit `ROWS`/`RANGE`
-  frames, set operations, and `FROM`-less `SELECT` are supported.
+- Subqueries (`WHERE`, SELECT-list and the `SET` of an `UPDATE`,
+  uncorrelated **and** correlated, including over joins), derived tables, CTEs
+  (`WITH`, including `WITH RECURSIVE`), `HAVING`, window functions with
+  explicit `ROWS`/`RANGE` frames, set operations, and `FROM`-less `SELECT` are
+  supported. A subquery in a `JOIN ... ON` condition is not yet supported
+  (1235). As in MySQL, a write may not read its own table in a subquery
+  (1093, or 1443 through a view) except through a derived table or CTE.
 - Stored procedures support `IN`/`OUT`/`INOUT` parameters, session `@user`
   variables (`SET @x = ...`), local variables (`DECLARE`, `SET`, `SELECT ...
   INTO a, @b`, where no row raises `NOT FOUND` for a handler), and control

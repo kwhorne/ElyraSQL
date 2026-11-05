@@ -220,6 +220,21 @@ pub enum Error {
     #[error("Not unique table/alias: '{0}'")]
     NotUniqueTable(String),
 
+    /// A scalar subquery that returned more than one row. MySQL 1242
+    /// (`ER_SUBQUERY_NO_1_ROW`), with its text.
+    #[error("Subquery returns more than 1 row")]
+    SubqueryRows,
+
+    /// An `UPDATE`, `DELETE` or `INSERT ... VALUES` whose subquery reads the
+    /// table it writes. MySQL 1093 (`ER_UPDATE_TABLE_USED`), with its text.
+    #[error("You can't specify target table '{0}' for update in FROM clause")]
+    TargetInSubquery(String),
+
+    /// The same, through a view over the written table. MySQL 1443
+    /// (`ER_VIEW_PREVENT_UPDATE`), its text: `(view, operation, table)`.
+    #[error("The definition of table '{0}' prevents operation {1} on table '{2}'.")]
+    ViewPreventsOperation(String, &'static str, String),
+
     /// `SELECT ... INTO @var` that found more than one row. MySQL 1172
     /// (`ER_TOO_MANY_ROWS`), with its text.
     #[error("Result consisted of more than one row")]
@@ -267,6 +282,9 @@ impl Error {
             Error::DatabaseMissing(_) => 1008, // ER_DB_DROP_EXISTS
             Error::IntoColumnCount => 1222, // ER_WRONG_NUMBER_OF_COLUMNS_IN_SELECT
             Error::TooManyRows => 1172,    // ER_TOO_MANY_ROWS
+            Error::SubqueryRows => 1242,   // ER_SUBQUERY_NO_1_ROW
+            Error::TargetInSubquery(_) => 1093, // ER_UPDATE_TABLE_USED
+            Error::ViewPreventsOperation(..) => 1443, // ER_VIEW_PREVENT_UPDATE
             Error::UndeclaredVariable(_) => 1327, // ER_SP_UNDECLARED_VAR
             Error::RoutineMissing(..) => 1305, // ER_SP_DOES_NOT_EXIST
             Error::AccountOperation(..) => 1396, // ER_CANNOT_USER
@@ -307,7 +325,7 @@ impl Error {
             Error::DataTruncated(..) => b"01000",
             Error::ReadOnlyTransaction => b"25006",
             Error::TransactionInProgress => b"25001",
-            Error::IntoColumnCount => b"21000",
+            Error::IntoColumnCount | Error::SubqueryRows => b"21000",
             Error::TooManyRows => b"42000",
             Error::UndeclaredVariable(_) => b"42000",
             Error::RoutineMissing(..) => b"42000",

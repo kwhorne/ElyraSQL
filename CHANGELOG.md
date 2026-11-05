@@ -16,7 +16,19 @@ All notable changes to ElyraSQL are documented here. The format is based on
   now follow MySQL, as does `ALTER TABLE ... RENAME`. Triggers left behind by
   an earlier version are removed when a table is next created under their
   table's name.
-
+- **A subquery works in the `SET` of an `UPDATE`.** `UPDATE t SET total =
+  (SELECT SUM(...) FROM items WHERE items.order_id = t.id)` and every other
+  subquery in an assigned value -- correlated or not, single- or multi-table
+  -- was refused with 1235.
+- **A scalar subquery that returns more than one row is an error (1242).** It
+  used the first row instead, so `SELECT`s returned, and `UPDATE`s and
+  `DELETE`s changed, rows MySQL refuses to choose.
+- **A write that reads its own table in a subquery is refused, as in MySQL.**
+  `UPDATE t ... WHERE id IN (SELECT id FROM t)`, `DELETE FROM t WHERE x >
+  (SELECT AVG(x) FROM t)`, `INSERT INTO t VALUES ((SELECT MAX(x) FROM t))`
+  and the multi-table forms ran against ElyraSQL and failed against MySQL;
+  they now fail with 1093 (1443 through a view over the table). Reading it
+  through a derived table or CTE, and `INSERT ... SELECT`, still work.
 - **A multi-table `UPDATE` enforces constraints.** `UPDATE a JOIN b ... SET`
   (and the comma form `UPDATE a, b SET ...`) wrote values that broke a unique
   key, child rows whose parent did not exist, values that failed a `CHECK`,
