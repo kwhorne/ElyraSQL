@@ -6,6 +6,8 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.12.10] - 2026-11-05
+
 ### Fixed
 
 - **`INSERT IGNORE` and `REPLACE` honour unique keys.** Both checked only the
