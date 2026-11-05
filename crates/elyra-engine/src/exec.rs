@@ -15824,12 +15824,27 @@ pub async fn update(
     if let Some(limit) = limit {
         matches.truncate(limit);
     }
+    let quals = [qualifier.clone()];
+    let mut values = Vec::with_capacity(sets.len());
+    for (idx, expr) in &sets {
+        values.push((*idx, prepare_set_value(db, vindex, expr, &quals).await?));
+    }
     let mut changes = Vec::with_capacity(matches.len());
     for (old_key, old_row) in matches {
         let mut new_row = old_row.clone();
-        for (idx, expr) in &sets {
+        for (idx, value) in &values {
             // Assignment RHS may reference existing column values.
-            let v = predicate::eval_row(expr, &def.schema, &old_row)?;
+            let expr = match value {
+                SetValue::Fixed(expr) => std::borrow::Cow::Borrowed(expr),
+                SetValue::PerRow(expr) => {
+                    let bound = bind_outer(db, expr, &qualifier, &def.schema, &old_row);
+                    std::borrow::Cow::Owned(
+                        resolve_subqueries_with_outer(db, vindex, bound, &def.schema, &old_row)
+                            .await?,
+                    )
+                }
+            };
+            let v = predicate::eval_row(&expr, &def.schema, &old_row)?;
             let col = &def.schema.columns[*idx];
             new_row[*idx] = coerce_assigned(db, v, col, ignore)?;
         }
@@ -15849,6 +15864,38 @@ pub async fn update(
         queue_after(db, triggers, schema, Some(new_row), Some(old_row))?;
     }
     Ok(QueryResult::Affected(writes.affected))
+}
+
+/// An UPDATE assignment's value with its subqueries made ready to evaluate:
+/// run once when they do not depend on the row being updated, as the row
+/// evaluator has no notion of a query, or for each row when they do.
+enum SetValue {
+    Fixed(Expr),
+    PerRow(Expr),
+}
+
+/// Prepare an assignment's value (see [`SetValue`]). A subquery correlates when
+/// it names a column of one of `quals` -- the tables being updated or joined --
+/// or, after trying it on its own, when one of its bare names is not its own.
+async fn prepare_set_value(
+    db: &Session,
+    vindex: &VectorRegistry,
+    expr: &Expr,
+    quals: &[Vec<String>],
+) -> Result<SetValue> {
+    if !expr_has_subquery(expr) {
+        return Ok(SetValue::Fixed(expr.clone()));
+    }
+    if filter_correlated_any(expr, quals) {
+        return Ok(SetValue::PerRow(expr.clone()));
+    }
+    match resolve_subqueries(db, vindex, expr.clone()).await {
+        Ok(resolved) => Ok(SetValue::Fixed(resolved)),
+        Err(error) if bare_unknown_column(&error, expr).is_some() => {
+            Ok(SetValue::PerRow(expr.clone()))
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// Coerce an assigned value to its column. An `IGNORE` statement converts the
@@ -16813,11 +16860,12 @@ async fn multi_update(
             .collect::<Vec<_>>()
     });
 
-    struct SetOp<'a> {
+    struct SetOp {
         qual: Vec<String>,
         col: usize,
-        expr: &'a Expr,
+        value: SetValue,
     }
+    let quals = join_qualifiers(db, from);
     let mut sets: Vec<SetOp> = Vec::new();
     for a in assignments {
         let n = match &a.target {
@@ -16861,7 +16909,7 @@ async fn multi_update(
         sets.push(SetOp {
             qual,
             col,
-            expr: &a.value,
+            value: prepare_set_value(db, vindex, &a.value, &quals).await?,
         });
     }
 
@@ -16908,7 +16956,17 @@ async fn multi_update(
             let mut new_base = base.clone();
             for s in &sets {
                 if &s.qual == qual {
-                    let v = predicate::eval_row(s.expr, &schema, &joined)?;
+                    let expr = match &s.value {
+                        SetValue::Fixed(expr) => std::borrow::Cow::Borrowed(expr),
+                        SetValue::PerRow(expr) => {
+                            let bound = bind_row(db, expr, &schema, &joined)?;
+                            std::borrow::Cow::Owned(
+                                resolve_subqueries_with_outer(db, vindex, bound, &schema, &joined)
+                                    .await?,
+                            )
+                        }
+                    };
+                    let v = predicate::eval_row(&expr, &schema, &joined)?;
                     let col = &info.def.schema.columns[s.col];
                     new_base[s.col] = coerce_assigned(db, v, col, ignore)?;
                 }
@@ -22762,6 +22820,37 @@ async fn run_subquery(
     run_subquery_capped(db, vindex, q, usize::MAX).await
 }
 
+/// The value of a scalar subquery: its one row's first column, or NULL when it
+/// returns none. More than one row is MySQL's 1242; taking the first instead
+/// returned, or deleted, rows MySQL refuses to choose between. At most two rows
+/// are read.
+async fn scalar_subquery_value(
+    db: &Session,
+    vindex: &VectorRegistry,
+    q: &SqlQuery,
+) -> Result<Value> {
+    // Boxed to break the select -> resolve -> run -> select async cycle.
+    let QueryResult::Rows(mut stream) = Box::pin(select(db, vindex, q)).await? else {
+        return Ok(Value::Null);
+    };
+    let mut rows = stream.next_batch(2).await?;
+    while rows.len() < 2 {
+        let more = stream.next_batch(2 - rows.len()).await?;
+        if more.is_empty() {
+            break;
+        }
+        rows.extend(more);
+    }
+    if rows.len() > 1 {
+        return Err(Error::SubqueryRows);
+    }
+    Ok(rows
+        .into_iter()
+        .next()
+        .and_then(|row| row.into_iter().next())
+        .unwrap_or(Value::Null))
+}
+
 /// Like [`run_subquery`] but errors fail-safe if the result exceeds `cap` rows,
 /// so an `IN (SELECT ...)` over an enormous set cannot exhaust memory.
 async fn run_subquery_capped(
@@ -23189,15 +23278,7 @@ fn resolve_subqueries<'a>(
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Expr>> + Send + 'a>> {
     Box::pin(async move {
         Ok(match expr {
-            Expr::Subquery(q) => {
-                let rows = run_subquery(db, vindex, &q).await?;
-                let v = rows
-                    .first()
-                    .and_then(|r| r.first())
-                    .cloned()
-                    .unwrap_or(Value::Null);
-                value_to_expr(&v)
-            }
+            Expr::Subquery(q) => value_to_expr(&scalar_subquery_value(db, vindex, &q).await?),
             Expr::InSubquery {
                 expr,
                 subquery,

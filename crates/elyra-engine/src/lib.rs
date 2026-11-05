@@ -2256,6 +2256,12 @@ impl Engine {
         update_modifiers: Option<&UpdateModifiers>,
         dml_limit: Option<usize>,
     ) -> Result<QueryResult> {
+        if matches!(
+            stmt,
+            Statement::Insert(_) | Statement::Update { .. } | Statement::Delete(_)
+        ) {
+            check_subquery_targets(sess, &stmt).await?;
+        }
         match stmt {
             Statement::Query(q) => {
                 if query_has_from(&q) {
@@ -3971,6 +3977,174 @@ async fn base_tables(sess: &Session, names: &[String]) -> Result<Vec<String>> {
     Err(Error::Query(format!(
         "views nest more than {MAX_DEPTH} deep"
     )))
+}
+
+/// Refuse a write whose subquery reads a table the statement writes, as MySQL
+/// does: 1093 for the table itself, 1443 for a view over it. That covers the
+/// assigned values and `WHERE` of an `UPDATE` or `DELETE`, its `JOIN ... ON`
+/// conditions, and the `VALUES` and `ON DUPLICATE KEY UPDATE` of an `INSERT`.
+/// A derived table or a CTE is materialized before the write starts, so
+/// reading the table through one is allowed, as is `INSERT ... SELECT`.
+async fn check_subquery_targets(sess: &Session, stmt: &Statement) -> Result<()> {
+    use sqlparser::ast::{
+        Expr, FromTable, ObjectName, OnInsert, Query, SetExpr, TableFactor, TableWithJoins, Visit,
+        Visitor,
+    };
+    use std::ops::ControlFlow;
+
+    /// The relations read inside subqueries, outside derived tables and CTEs.
+    #[derive(Default)]
+    struct SubqueryReads {
+        subquery: usize,
+        materialized: usize,
+        /// The addresses of the CTE bodies met so far, to know one when it
+        /// is visited.
+        ctes: Vec<usize>,
+        out: Vec<ObjectName>,
+    }
+    impl Visitor for SubqueryReads {
+        type Break = ();
+        fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<()> {
+            if matches!(
+                expr,
+                Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists { .. }
+            ) {
+                self.subquery += 1;
+            }
+            ControlFlow::Continue(())
+        }
+        fn post_visit_expr(&mut self, expr: &Expr) -> ControlFlow<()> {
+            if matches!(
+                expr,
+                Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists { .. }
+            ) {
+                self.subquery -= 1;
+            }
+            ControlFlow::Continue(())
+        }
+        fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<()> {
+            if let Some(with) = &query.with {
+                self.ctes.extend(
+                    with.cte_tables
+                        .iter()
+                        .map(|cte| &*cte.query as *const Query as usize),
+                );
+            }
+            if self.ctes.contains(&(query as *const Query as usize)) {
+                self.materialized += 1;
+            }
+            ControlFlow::Continue(())
+        }
+        fn post_visit_query(&mut self, query: &Query) -> ControlFlow<()> {
+            if self.ctes.contains(&(query as *const Query as usize)) {
+                self.materialized -= 1;
+            }
+            ControlFlow::Continue(())
+        }
+        fn pre_visit_table_factor(&mut self, factor: &TableFactor) -> ControlFlow<()> {
+            if matches!(factor, TableFactor::Derived { .. }) {
+                self.materialized += 1;
+            }
+            ControlFlow::Continue(())
+        }
+        fn post_visit_table_factor(&mut self, factor: &TableFactor) -> ControlFlow<()> {
+            if matches!(factor, TableFactor::Derived { .. }) {
+                self.materialized -= 1;
+            }
+            ControlFlow::Continue(())
+        }
+        fn pre_visit_relation(&mut self, relation: &ObjectName) -> ControlFlow<()> {
+            if self.subquery > 0 && self.materialized == 0 {
+                self.out.push(relation.clone());
+            }
+            ControlFlow::Continue(())
+        }
+    }
+    fn join_conditions<'a>(twj: &'a TableWithJoins, out: &mut Vec<&'a Expr>) {
+        use sqlparser::ast::{JoinConstraint, JoinOperator};
+        for join in &twj.joins {
+            let constraint = match &join.join_operator {
+                JoinOperator::Inner(c)
+                | JoinOperator::LeftOuter(c)
+                | JoinOperator::RightOuter(c)
+                | JoinOperator::FullOuter(c) => Some(c),
+                _ => None,
+            };
+            if let Some(JoinConstraint::On(on)) = constraint {
+                out.push(on);
+            }
+            if let TableFactor::NestedJoin {
+                table_with_joins, ..
+            } = &join.relation
+            {
+                join_conditions(table_with_joins, out);
+            }
+        }
+    }
+
+    let (operation, exprs): (&'static str, Vec<&Expr>) = match stmt {
+        Statement::Update {
+            table,
+            assignments,
+            selection,
+            ..
+        } => {
+            let mut exprs: Vec<&Expr> = assignments.iter().map(|a| &a.value).collect();
+            exprs.extend(selection.iter());
+            join_conditions(table, &mut exprs);
+            ("UPDATE", exprs)
+        }
+        Statement::Delete(del) => {
+            let mut exprs: Vec<&Expr> = del.selection.iter().collect();
+            let (FromTable::WithFromKeyword(from) | FromTable::WithoutKeyword(from)) = &del.from;
+            for twj in from.iter().chain(del.using.iter().flatten()) {
+                join_conditions(twj, &mut exprs);
+            }
+            ("DELETE", exprs)
+        }
+        Statement::Insert(ins) => {
+            let mut exprs: Vec<&Expr> = Vec::new();
+            if let Some(source) = &ins.source {
+                if let SetExpr::Values(values) = source.body.as_ref() {
+                    exprs.extend(values.rows.iter().flatten());
+                }
+            }
+            if let Some(OnInsert::DuplicateKeyUpdate(assignments)) = &ins.on {
+                exprs.extend(assignments.iter().map(|a| &a.value));
+            }
+            ("INSERT", exprs)
+        }
+        _ => return Ok(()),
+    };
+    if !exprs.iter().any(|e| exec::expr_has_subquery(e)) {
+        return Ok(());
+    }
+    let targets = write_targets(stmt);
+    let is_target = |name: &str| targets.iter().find(|t| t.eq_ignore_ascii_case(name));
+    let mut reads = SubqueryReads::default();
+    for expr in exprs {
+        let _ = expr.visit(&mut reads);
+    }
+    for relation in reads.out {
+        let Some(name) = object_name_last(&relation) else {
+            continue;
+        };
+        if let Some(target) = is_target(&name) {
+            return Err(Error::TargetInSubquery(target.clone()));
+        }
+        if catalog::load_view(sess, &name).await?.is_some() {
+            for base in base_tables(sess, std::slice::from_ref(&name)).await? {
+                if let Some(target) = is_target(&base) {
+                    return Err(Error::ViewPreventsOperation(
+                        name,
+                        operation,
+                        target.clone(),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The tables a statement writes rows to or changes the definition of. A

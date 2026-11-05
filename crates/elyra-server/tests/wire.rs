@@ -15311,3 +15311,96 @@ async fn drop_and_rename_table_carry_their_triggers() {
     }
     c.query_drop("DROP TRIGGER tg2").await.unwrap();
 }
+
+/// A subquery in an `UPDATE`'s `SET` was refused with 1235; a scalar subquery
+/// with more than one row used the first instead of failing with 1242; and a
+/// write that reads its own table in a subquery ran, where MySQL refuses it
+/// with 1093 (1443 through a view). Every expectation below is MySQL 8.4's.
+#[tokio::test]
+async fn subqueries_in_writes_follow_mysql() {
+    // (statement, affected rows or error code, t after, o after)
+    let cases: &[(&str, Result<u64, u16>, &str, &str)] = &[
+        ("UPDATE t SET x=(SELECT MAX(id) FROM o) WHERE id=1", Ok(1), "1:2 2:2 3:3", "1:10 2:20"),
+        ("UPDATE t SET x=(SELECT MAX(id) FROM t) WHERE id=1", Err(1093), "1:1 2:2 3:3", "1:10 2:20"),
+        ("UPDATE t SET x=(SELECT MAX(id) FROM (SELECT id FROM t) d) WHERE id=1", Ok(1), "1:3 2:2 3:3", "1:10 2:20"),
+        ("UPDATE t SET x=(WITH c AS (SELECT x FROM t) SELECT MAX(x) FROM c)", Ok(2), "1:3 2:3 3:3", "1:10 2:20"),
+        ("UPDATE t SET x=1 WHERE id IN (SELECT id FROM t WHERE x>1)", Err(1093), "1:1 2:2 3:3", "1:10 2:20"),
+        ("UPDATE t SET x=1 WHERE id IN (SELECT id FROM t AS t2)", Err(1093), "1:1 2:2 3:3", "1:10 2:20"),
+        ("UPDATE t SET x=1 WHERE id IN (SELECT id FROM (SELECT id FROM t WHERE x>1) d)", Ok(2), "1:1 2:1 3:1", "1:10 2:20"),
+        ("UPDATE t SET x=1 WHERE id IN (SELECT id FROM o)", Ok(1), "1:1 2:1 3:3", "1:10 2:20"),
+        ("UPDATE t SET x=1 WHERE EXISTS (SELECT 1 FROM t t2 WHERE t2.x > t.x)", Err(1093), "1:1 2:2 3:3", "1:10 2:20"),
+        ("UPDATE t SET x=(SELECT COUNT(*) FROM o WHERE o.id <= t.id)", Ok(1), "1:1 2:2 3:2", "1:10 2:20"),
+        ("UPDATE t SET x=(SELECT v FROM o WHERE o.id=t.id)", Ok(3), "1:10 2:20 3:", "1:10 2:20"),
+        ("UPDATE t SET x=(SELECT v FROM o WHERE id=t.id) WHERE EXISTS (SELECT 1 FROM o WHERE o.id=t.id)", Ok(2), "1:10 2:20 3:3", "1:10 2:20"),
+        ("UPDATE t SET x=(SELECT id FROM o)", Err(1242), "1:1 2:2 3:3", "1:10 2:20"),
+        ("UPDATE t SET x=(SELECT v FROM o WHERE o.id=id)", Err(1242), "1:1 2:2 3:3", "1:10 2:20"),
+        ("UPDATE t SET x = x + (SELECT 1)", Ok(3), "1:2 2:3 3:4", "1:10 2:20"),
+        ("UPDATE t SET x=(SELECT MAX(id) FROM ui.t)", Err(1093), "1:1 2:2 3:3", "1:10 2:20"),
+        ("UPDATE t SET x=(SELECT MAX(id) FROM vo)", Ok(2), "1:2 2:2 3:2", "1:10 2:20"),
+        ("UPDATE t SET x=(SELECT MAX(id) FROM v) WHERE id=1", Err(1443), "1:1 2:2 3:3", "1:10 2:20"),
+        ("DELETE FROM t WHERE id IN (SELECT id FROM v)", Err(1443), "1:1 2:2 3:3", "1:10 2:20"),
+        ("DELETE FROM t WHERE id IN (SELECT id FROM t WHERE x>1)", Err(1093), "1:1 2:2 3:3", "1:10 2:20"),
+        ("DELETE FROM t WHERE id IN (SELECT id FROM (SELECT id FROM t WHERE x>1) d)", Ok(2), "1:1", "1:10 2:20"),
+        ("DELETE FROM t WHERE x > (SELECT AVG(x) FROM t)", Err(1093), "1:1 2:2 3:3", "1:10 2:20"),
+        ("DELETE FROM t WHERE id IN (SELECT id FROM o)", Ok(2), "3:3", "1:10 2:20"),
+        ("DELETE FROM t WHERE x = (SELECT id FROM o)", Err(1242), "1:1 2:2 3:3", "1:10 2:20"),
+        ("UPDATE t JOIN o ON t.id=o.id SET t.x=(SELECT MAX(x) FROM t)", Err(1093), "1:1 2:2 3:3", "1:10 2:20"),
+        ("UPDATE t JOIN o ON t.id=o.id SET o.v=(SELECT MAX(x) FROM t)", Ok(2), "1:1 2:2 3:3", "1:3 2:3"),
+        ("UPDATE t JOIN o ON t.id=o.id SET t.x=(SELECT MAX(v) FROM o)", Ok(2), "1:20 2:20 3:3", "1:10 2:20"),
+        ("UPDATE t JOIN o ON t.id=o.id SET t.x=(SELECT COUNT(*) FROM o o2 WHERE o2.v <= o.v)", Ok(0), "1:1 2:2 3:3", "1:10 2:20"),
+        ("UPDATE t JOIN o ON o.id=t.id AND o.id IN (SELECT id FROM t) SET t.x=5", Err(1093), "1:1 2:2 3:3", "1:10 2:20"),
+        ("DELETE t FROM t JOIN o ON t.id=o.id WHERE t.x IN (SELECT x FROM t)", Err(1093), "1:1 2:2 3:3", "1:10 2:20"),
+        ("INSERT INTO t SELECT id+10, x FROM t", Ok(3), "1:1 2:2 3:3 11:1 12:2 13:3", "1:10 2:20"),
+        ("INSERT INTO t VALUES (20, (SELECT MAX(x) FROM t))", Err(1093), "1:1 2:2 3:3", "1:10 2:20"),
+        ("INSERT INTO t VALUES (20, (SELECT MAX(v) FROM o))", Ok(1), "1:1 2:2 3:3 20:20", "1:10 2:20"),
+        ("INSERT INTO t VALUES (1, 1) ON DUPLICATE KEY UPDATE x=(SELECT MAX(x) FROM t)", Err(1093), "1:1 2:2 3:3", "1:10 2:20"),
+        ("INSERT INTO t SELECT 30, (SELECT MAX(x) FROM t)", Ok(1), "1:1 2:2 3:3 30:3", "1:10 2:20"),
+    ];
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    let rows =
+        "SELECT GROUP_CONCAT(CONCAT_WS(':', id, IFNULL(x, '')) ORDER BY id SEPARATOR ' ') FROM t";
+    let orows = "SELECT GROUP_CONCAT(CONCAT_WS(':', id, v) ORDER BY id SEPARATOR ' ') FROM o";
+    for (sql, want, want_t, want_o) in cases {
+        for s in [
+            "DROP VIEW IF EXISTS v",
+            "DROP VIEW IF EXISTS vo",
+            "DROP TABLE IF EXISTS t",
+            "DROP TABLE IF EXISTS o",
+            "CREATE TABLE t (id INT PRIMARY KEY, x INT)",
+            "INSERT INTO t VALUES (1,1),(2,2),(3,3)",
+            "CREATE TABLE o (id INT PRIMARY KEY, v INT)",
+            "INSERT INTO o VALUES (1,10),(2,20)",
+            "CREATE VIEW v AS SELECT id FROM t",
+            "CREATE VIEW vo AS SELECT id FROM o",
+        ] {
+            c.query_drop(s).await.unwrap();
+        }
+        let got = match c.query_drop(*sql).await {
+            Ok(()) => Ok(c.affected_rows()),
+            Err(mysql_async::Error::Server(e)) => Err(e.code),
+            Err(e) => panic!("{sql}: {e}"),
+        };
+        assert_eq!(got, *want, "{sql}");
+        let t: Option<String> = c.query_first(rows).await.unwrap().flatten();
+        assert_eq!(t.unwrap_or_default(), *want_t, "{sql}");
+        let o: Option<String> = c.query_first(orows).await.unwrap().flatten();
+        assert_eq!(o.unwrap_or_default(), *want_o, "{sql}");
+    }
+
+    // A scalar subquery reads one row or none; more is 1242, wherever it is.
+    for sql in [
+        "SELECT (SELECT id FROM o)",
+        "SELECT id FROM t WHERE x = (SELECT id FROM o)",
+    ] {
+        match c.query_drop(sql).await {
+            Err(mysql_async::Error::Server(e)) => assert_eq!(e.code, 1242, "{sql}"),
+            other => panic!("{sql}: expected 1242, got {other:?}"),
+        }
+    }
+    let none: Option<Option<i64>> = c
+        .query_first("SELECT (SELECT id FROM o WHERE id > 5)")
+        .await
+        .unwrap();
+    assert_eq!(none, Some(None));
+}
