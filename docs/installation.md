@@ -17,6 +17,21 @@ ElyraSQL release builds target **Ubuntu 24.04+** and **Apple Silicon macOS
     done, so an interrupted upgrade simply resumes on the next start. **Take a backup
     first, and note that downgrading to 1.4.x afterwards is not supported.**
 
+!!! warning "Upgrading to 1.12.12 — collation"
+
+    No on-disk format change; a 1.12.11 database opens in 1.12.12 unchanged.
+
+    - **`COLLATE` and the `BINARY` operator work in expressions**
+      (`WHERE BINARY s = 'x'`, `ORDER BY s COLLATE utf8mb4_bin`), where they
+      were refused.
+    - **Results that were wrong now follow MySQL**, so a query may return
+      different rows than before: on a `utf8mb4_bin` column, `LIKE` and `IN`
+      are case-sensitive and `COUNT(DISTINCT)` counts `a` and `A` apart; on the
+      default collation, `LIKE` folds accents (`'café' LIKE 'cafe'`); and
+      `CAST(s AS BINARY) = 'x'` compares bytes, where it matched nothing.
+    - **`MIN`/`MAX` of a text expression** (`MAX(UPPER(s))`) no longer ends
+      the connection.
+
 !!! warning "Upgrading to 1.12.11 — LOCK TABLES, cluster commit"
 
     No on-disk format change; a 1.12.10 database opens in 1.12.11 unchanged.
@@ -665,8 +680,8 @@ macOS).
 Multi-arch image (`amd64` + `arm64`) on the GitHub Container Registry:
 
 ```bash
-docker pull ghcr.io/kwhorne/elyrasql:1.12.11   # or :latest
-docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.12.11
+docker pull ghcr.io/kwhorne/elyrasql:1.12.12   # or :latest
+docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.12.12
 ```
 
 The image is ~15 MB, runs as a non-root user, stores data in the
