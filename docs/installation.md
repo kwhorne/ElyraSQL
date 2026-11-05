@@ -17,6 +17,26 @@ ElyraSQL release builds target **Ubuntu 24.04+** and **Apple Silicon macOS
     done, so an interrupted upgrade simply resumes on the next start. **Take a backup
     first, and note that downgrading to 1.4.x afterwards is not supported.**
 
+!!! warning "Upgrading to 1.12.10 — roles, INSERT IGNORE and REPLACE"
+
+    No on-disk format change; a 1.12.9 database opens in 1.12.10 unchanged.
+
+    - **`DROP ROLE` takes away what the role granted** (security fix). The
+      role's table and column grants and its members' memberships were left
+      behind, so its members kept every privilege it had given them, while
+      `SHOW GRANTS` showed only `USAGE`. A role dropped before 1.12.10 no
+      longer grants anything once you upgrade; nothing needs to be run.
+    - **`INSERT IGNORE` and `REPLACE` honour unique keys.** Both checked only
+      the primary key, so a `UNIQUE` column could be given a value it already
+      held. `INSERT IGNORE` now skips such a row and `REPLACE` deletes the row
+      it collides with. A table written this way before may hold duplicates;
+      `SELECT col, COUNT(*) FROM t GROUP BY col HAVING COUNT(*) > 1` finds them.
+    - **`REPLACE` applies foreign keys** to the rows it deletes, as `DELETE`
+      does: a `RESTRICT` child now refuses it, and `ON DELETE CASCADE` /
+      `SET NULL` act on the children -- also when the replacement has the same
+      primary key, or is identical. Code that `REPLACE`s a referenced parent
+      row will see this.
+
 !!! info "Upgrading to 1.12.9 — mysqldump, views in the catalog"
 
     No on-disk format change; a 1.12.8 database opens in 1.12.9 unchanged.
@@ -628,8 +648,8 @@ macOS).
 Multi-arch image (`amd64` + `arm64`) on the GitHub Container Registry:
 
 ```bash
-docker pull ghcr.io/kwhorne/elyrasql:1.12.9   # or :latest
-docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.12.9
+docker pull ghcr.io/kwhorne/elyrasql:1.12.10   # or :latest
+docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.12.10
 ```
 
 The image is ~15 MB, runs as a non-root user, stores data in the
