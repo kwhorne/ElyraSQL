@@ -6,6 +6,37 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **A multi-table `UPDATE` enforces constraints.** `UPDATE a JOIN b ... SET`
+  (and the comma form `UPDATE a, b SET ...`) wrote values that broke a unique
+  key, child rows whose parent did not exist, values that failed a `CHECK`,
+  and NULL into NOT NULL columns, and it skipped `ON UPDATE CASCADE`, stored
+  generated columns and `BEFORE`/`AFTER UPDATE` triggers. It now validates
+  each table it changes exactly as a single-table `UPDATE` does, and fails
+  with MySQL's error (1062, 1452, 1451, 3819, 1048) without writing anything.
+  If you ran multi-table updates against unique keys, check those keys for
+  duplicates.
+- **`UPDATE IGNORE` works.** It failed with 1146 "no such table: IGNORE": the
+  parser read the keyword as the table name (`UPDATE LOW_PRIORITY` likewise).
+  It now behaves as in MySQL, row by row: a row that would duplicate a key,
+  break a foreign key or fail a `CHECK` is left unchanged while the others are
+  updated, and a value its column cannot hold is stored as the nearest one it
+  can -- the implicit default for NULL in a NOT NULL column, the bound for an
+  integer out of range, a truncated string, `''` for an unknown `ENUM` value.
+  `INSERT IGNORE` now does the same for those values, `CHECK` failures and
+  rows without a parent, which it used to reject.
+- **`UPDATE` checks keys row by row, in order, as MySQL does.** `UPDATE t SET
+  id = id + 1 ORDER BY id DESC` was refused with 1062 because the new keys
+  were compared with the stored ones as a set; it now succeeds, while `SET id
+  = id + 1` without the `ORDER BY` still fails, as in MySQL.
+- **Constraint errors carry MySQL's codes.** A NULL in a NOT NULL column is
+  1048 (was 1105), a failed `CHECK` is 3819 naming the constraint (was 1105),
+  an `ENUM` or `SET` value outside its members is 1265 (was 1105), and
+  deleting or updating a parent row that is still referenced is 1451 (was
+  1452). The 1451 and 1452 texts now follow MySQL's. `information_schema`
+  no longer lists the internal `ENUM`/`SET` checks as `CHECK` constraints.
+
 ## [1.12.12] - 2026-11-05
 
 ### Fixed

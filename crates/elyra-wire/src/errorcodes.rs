@@ -1911,6 +1911,8 @@ pub enum ErrorKind {
     ER_GTID_UNSAFE_BINLOG_SPLITTABLE_STATEMENT_AND_GTID_GROUP = 1884,
     /// Slave has more GTIDs than the master has, using the master's SERVER_UUID. This may indicate that the end of the binary log was truncated or that the last binary log file was lost, e.g., after a power or disk failure when sync_binlog != 1. The master may or may not have rolled back transactions that were already replicated to the slave. Suggest to replicate any transactions that master has rolled back from slave to master, and/or commit empty transactions on master to account for transactions that have been committed on master but are not included in GTID_EXECUTED.
     ER_SLAVE_HAS_MORE_GTIDS_THAN_MASTER = 1885,
+    /// Check constraint '%s' is violated.
+    ER_CHECK_CONSTRAINT_VIOLATED = 3819,
 }
 
 impl From<u16> for ErrorKind {
@@ -2804,6 +2806,7 @@ impl From<u16> for ErrorKind {
             1883_u16 => ErrorKind::ER_PLUGIN_CANNOT_BE_UNINSTALLED,
             1884_u16 => ErrorKind::ER_GTID_UNSAFE_BINLOG_SPLITTABLE_STATEMENT_AND_GTID_GROUP,
             1885_u16 => ErrorKind::ER_SLAVE_HAS_MORE_GTIDS_THAN_MASTER,
+            3819_u16 => ErrorKind::ER_CHECK_CONSTRAINT_VIOLATED,
             _ => panic!("Unknown error type {}", x),
         }
     }
@@ -3699,7 +3702,8 @@ impl ErrorKind {
             | ErrorKind::ER_AES_INVALID_IV
             | ErrorKind::ER_PLUGIN_CANNOT_BE_UNINSTALLED
             | ErrorKind::ER_GTID_UNSAFE_BINLOG_SPLITTABLE_STATEMENT_AND_GTID_GROUP
-            | ErrorKind::ER_SLAVE_HAS_MORE_GTIDS_THAN_MASTER => b"HY000",
+            | ErrorKind::ER_SLAVE_HAS_MORE_GTIDS_THAN_MASTER
+            | ErrorKind::ER_CHECK_CONSTRAINT_VIOLATED => b"HY000",
             ErrorKind::ER_XAER_NOTA => b"XAE04",
             ErrorKind::ER_XA_RBROLLBACK => b"XA100",
             ErrorKind::ER_DATA_TOO_LONG => b"22001",

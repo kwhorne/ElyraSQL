@@ -1921,6 +1921,11 @@ impl Engine {
         if let Some(rewritten) = rewrite_insert_set(&subst_sql) {
             subst_sql = Cow::Owned(rewritten);
         }
+        // `UPDATE [LOW_PRIORITY] IGNORE` into the `UPDATE OR IGNORE` the parser
+        // knows (it read `IGNORE` as the table name).
+        if let Some(rewritten) = rewrite_update_ignore(&subst_sql) {
+            subst_sql = Cow::Owned(rewritten);
+        }
         // Rewrite comma-style multi-table `UPDATE t1, t2 SET ... WHERE ...` into
         // `UPDATE t1 CROSS JOIN t2 SET ... WHERE ...` (the WHERE supplies the
         // join condition, as in the comma form).
@@ -2297,8 +2302,19 @@ impl Engine {
                 table,
                 assignments,
                 selection,
+                or,
                 ..
             } => {
+                // `OR IGNORE` is only ever `rewrite_update_ignore`'s spelling of
+                // MySQL's `UPDATE IGNORE`; SQLite's other conflict clauses are not
+                // MySQL syntax.
+                let ignore = match or {
+                    None => false,
+                    Some(sqlparser::ast::SqliteOnConflict::Ignore) => true,
+                    Some(other) => {
+                        return Err(Error::Parse(format!("UPDATE {other} is not MySQL syntax")))
+                    }
+                };
                 let order_by = update_modifiers
                     .map(|modifiers| modifiers.order_by.as_slice())
                     .unwrap_or_default();
@@ -2313,6 +2329,7 @@ impl Engine {
                     selection.as_ref(),
                     order_by,
                     limit,
+                    ignore,
                 )
                 .await?;
                 self.fire_triggers(sess).await?;
@@ -6202,6 +6219,9 @@ pub fn fuzz_preprocess_parse(sql: &str) {
     if let Some(x) = rewrite_insert_set(&s) {
         s = x;
     }
+    if let Some(x) = rewrite_update_ignore(&s) {
+        s = x;
+    }
     if let Some(x) = rewrite_comma_update(&s) {
         s = x;
     }
@@ -6332,6 +6352,48 @@ fn rewrite_insert_set(sql: &str) -> Option<String> {
         out.push(' ');
         out.push_str(sfx);
     }
+    Some(out)
+}
+
+/// Rewrite MySQL's `UPDATE [LOW_PRIORITY] [IGNORE] ...` into the `UPDATE [OR
+/// IGNORE] ...` sqlparser 0.53 accepts. Without it the parser took `IGNORE` (or
+/// `LOW_PRIORITY`) for the table and the real table name for its alias, so
+/// every `UPDATE IGNORE t` failed with "no such table: IGNORE". `LOW_PRIORITY`
+/// only matters to table-locking engines and is dropped.
+fn rewrite_update_ignore(sql: &str) -> Option<String> {
+    let head = sql.trim_start();
+    if !head
+        .as_bytes()
+        .get(..6)
+        .is_some_and(|b| b.eq_ignore_ascii_case(b"UPDATE"))
+    {
+        return None;
+    }
+    let start = sql.len() - head.len();
+    let skip_space = |at: usize| at + sql[at..].len() - sql[at..].trim_start().len();
+    let mut at = skip_space(start + 6);
+    if at == start + 6 {
+        return None; // `UPDATEx`, not the keyword
+    }
+    let mut changed = false;
+    if crate::sqllex::keyword_at(sql, at, "LOW_PRIORITY") {
+        at = skip_space(at + "LOW_PRIORITY".len());
+        changed = true;
+    }
+    let ignore = crate::sqllex::keyword_at(sql, at, "IGNORE");
+    if ignore {
+        at = skip_space(at + "IGNORE".len());
+    } else if !changed {
+        return None;
+    }
+    let mut out = String::with_capacity(sql.len() + 4);
+    out.push_str(&sql[..start]);
+    out.push_str(if ignore {
+        "UPDATE OR IGNORE "
+    } else {
+        "UPDATE "
+    });
+    out.push_str(&sql[at..]);
     Some(out)
 }
 
@@ -7509,6 +7571,39 @@ mod set_operation_chain_tests {
         // The same protection for the other two set operators.
         assert!(guard_sql_complexity(&chain(50_000, " INTERSECT ")).is_err());
         assert!(guard_sql_complexity(&chain(50_000, " EXCEPT ")).is_err());
+    }
+}
+
+#[cfg(test)]
+mod update_ignore_tests {
+    use super::rewrite_update_ignore;
+
+    #[test]
+    fn the_modifiers_become_the_parser_spelling() {
+        for (sql, want) in [
+            (
+                "UPDATE IGNORE t SET x = 1",
+                Some("UPDATE OR IGNORE t SET x = 1"),
+            ),
+            (
+                "  update  ignore\n`t` SET x = 1",
+                Some("  UPDATE OR IGNORE `t` SET x = 1"),
+            ),
+            (
+                "UPDATE LOW_PRIORITY IGNORE t, u SET t.x = u.x",
+                Some("UPDATE OR IGNORE t, u SET t.x = u.x"),
+            ),
+            (
+                "UPDATE LOW_PRIORITY t SET x = 1",
+                Some("UPDATE t SET x = 1"),
+            ),
+            ("UPDATE t SET x = 1", None),
+            ("UPDATE ignored SET x = 1", None),
+            ("UPDATE `ignore` SET x = 1", None),
+            ("SELECT 1 FROM t WHERE s = 'UPDATE IGNORE'", None),
+        ] {
+            assert_eq!(rewrite_update_ignore(sql).as_deref(), want, "{sql}");
+        }
     }
 }
 

@@ -7080,7 +7080,7 @@ async fn delete_using_preserves_foreign_keys_and_after_triggers() {
         .await
         .unwrap_err()
         .to_string();
-    assert!(error.contains("reference"), "{error}");
+    assert!(error.contains("1451"), "{error}");
     let counts: (i64, i64) = c
         .query_first(
             "SELECT
@@ -15009,4 +15009,230 @@ async fn blob_values_as_mysqldump_writes_them() {
     }
     let still: i64 = c.query_first("SELECT 7").await.unwrap().unwrap();
     assert_eq!(still, 7);
+}
+
+/// `UPDATE IGNORE` failed with "no such table: IGNORE" (the parser read the
+/// keyword as the table), and a multi-table `UPDATE ... JOIN ... SET` wrote
+/// duplicate unique values, orphaned child rows, skipped `ON UPDATE CASCADE`,
+/// CHECK constraints and triggers. A single-table UPDATE checked its keys
+/// against the stored rows as a set, so `SET id = id + 1 ORDER BY id DESC` was
+/// refused. NOT NULL, CHECK, ENUM and parent-row errors answered 1105 or 1452.
+/// Every expectation below is MySQL 8.4's.
+#[tokio::test]
+async fn update_ignore_and_multi_table_update_follow_mysql() {
+    const UK: &[&str] = &[
+        "CREATE TABLE t (id INT PRIMARY KEY, x INT, UNIQUE KEY ux (x))",
+        "INSERT INTO t VALUES (1,1),(2,2),(3,3)",
+    ];
+    const NN: &[&str] = &[
+        "CREATE TABLE t (id INT PRIMARY KEY, n INT NOT NULL, s VARCHAR(4) NOT NULL, ti TINYINT)",
+        "INSERT INTO t VALUES (1,5,'ab',1)",
+    ];
+    const CK: &[&str] = &[
+        "CREATE TABLE t (id INT PRIMARY KEY, x INT, CHECK (x < 10))",
+        "INSERT INTO t VALUES (1,1),(2,2),(3,8)",
+    ];
+    const EN: &[&str] = &[
+        "CREATE TABLE t (id INT PRIMARY KEY, x ENUM('a','b'))",
+        "INSERT INTO t VALUES (1,'a')",
+    ];
+    const FK: &[&str] = &[
+        "CREATE TABLE p (id INT PRIMARY KEY, x INT, CHECK (x < 100))",
+        "INSERT INTO p VALUES (1,1),(2,2),(3,3)",
+        "CREATE TABLE c (id INT PRIMARY KEY, x INT, FOREIGN KEY (x) REFERENCES p(id))",
+        "INSERT INTO c VALUES (1,1),(2,2)",
+    ];
+    const FK_CASCADE: &[&str] = &[
+        "CREATE TABLE p (id INT PRIMARY KEY, x INT, CHECK (x < 100))",
+        "INSERT INTO p VALUES (1,1),(2,2),(3,3)",
+        "CREATE TABLE c (id INT PRIMARY KEY, x INT, FOREIGN KEY (x) REFERENCES p(id) ON UPDATE CASCADE)",
+        "INSERT INTO c VALUES (1,1),(2,2)",
+    ];
+    const AB: &[&str] = &[
+        "CREATE TABLE a (id INT PRIMARY KEY, x INT UNIQUE)",
+        "INSERT INTO a VALUES (1,1),(2,2),(3,3)",
+        "CREATE TABLE b (id INT PRIMARY KEY, x INT)",
+        "INSERT INTO b VALUES (1,2),(2,5),(3,5)",
+    ];
+    const TR: &[&str] = &[
+        "CREATE TABLE a (id INT PRIMARY KEY, x INT UNIQUE)",
+        "INSERT INTO a VALUES (1,1),(2,2),(3,3)",
+        "CREATE TABLE b (id INT PRIMARY KEY, x INT)",
+        "INSERT INTO b VALUES (1,2),(2,5),(3,5)",
+        "CREATE TABLE log (m VARCHAR(10))",
+        "CREATE TRIGGER au AFTER UPDATE ON a FOR EACH ROW INSERT INTO log VALUES (CONCAT('a', NEW.id))",
+    ];
+    const T: &str = "SELECT GROUP_CONCAT(CONCAT_WS(':', id, x) ORDER BY id SEPARATOR ' ') FROM t";
+    const N: &str = "SELECT CONCAT_WS(':', id, n, s, ti) FROM t";
+    const P: &str = "SELECT GROUP_CONCAT(CONCAT_WS(':', id, x) ORDER BY id SEPARATOR ' ') FROM p";
+    const C: &str = "SELECT GROUP_CONCAT(CONCAT_WS(':', id, x) ORDER BY id SEPARATOR ' ') FROM c";
+    const A: &str = "SELECT GROUP_CONCAT(CONCAT_WS(':', id, x) ORDER BY id SEPARATOR ' ') FROM a";
+    const PC: &str = "SELECT GROUP_CONCAT(CONCAT_WS(':', id, x) ORDER BY id SEPARATOR ' ') FROM p \
+         UNION ALL SELECT GROUP_CONCAT(CONCAT_WS(':', id, x) ORDER BY id SEPARATOR ' ') FROM c";
+    const AB_ROWS: &str =
+        "SELECT GROUP_CONCAT(CONCAT_WS(':', id, x) ORDER BY id SEPARATOR ' ') FROM a \
+         UNION ALL SELECT GROUP_CONCAT(CONCAT_WS(':', id, x) ORDER BY id SEPARATOR ' ') FROM b";
+    const LOG: &str = "SELECT GROUP_CONCAT(m ORDER BY m SEPARATOR ' ') FROM log";
+
+    // (setup, statement, affected rows or error code, check, rows after)
+    type Case = (
+        &'static [&'static str],
+        &'static str,
+        Result<u64, u16>,
+        &'static str,
+        &'static str,
+    );
+    let cases: &[Case] = &[
+        (UK, "UPDATE IGNORE t SET x=x+1", Ok(1), T, "1:1 2:2 3:4"),
+        (
+            UK,
+            "UPDATE IGNORE t SET x=x+1 ORDER BY id DESC",
+            Ok(3),
+            T,
+            "1:2 2:3 3:4",
+        ),
+        (
+            UK,
+            "UPDATE t SET x=x+1 ORDER BY id DESC",
+            Ok(3),
+            T,
+            "1:2 2:3 3:4",
+        ),
+        (UK, "UPDATE t SET x=x+1", Err(1062), T, "1:1 2:2 3:3"),
+        (UK, "UPDATE IGNORE t SET id=id+1", Ok(1), T, "1:1 2:2 4:3"),
+        (
+            UK,
+            "UPDATE t SET id=id+1 ORDER BY id DESC",
+            Ok(3),
+            T,
+            "2:1 3:2 4:3",
+        ),
+        (UK, "UPDATE t SET id=5 WHERE id=1", Ok(1), T, "2:2 3:3 5:1"),
+        (
+            UK,
+            "UPDATE LOW_PRIORITY IGNORE t SET x=7",
+            Ok(1),
+            T,
+            "1:7 2:2 3:3",
+        ),
+        (
+            NN,
+            "UPDATE IGNORE t SET n=NULL, s='toolong', ti=1000",
+            Ok(1),
+            N,
+            "1:0:tool:127",
+        ),
+        (NN, "UPDATE t SET n=NULL", Err(1048), N, "1:5:ab:1"),
+        (NN, "UPDATE t SET ti=1000", Err(1264), N, "1:5:ab:1"),
+        (CK, "UPDATE IGNORE t SET x=x+5", Ok(2), T, "1:6 2:7 3:8"),
+        (CK, "UPDATE t SET x=x+5", Err(3819), T, "1:1 2:2 3:8"),
+        (EN, "UPDATE t SET x='z'", Err(1265), T, "1:a"),
+        (EN, "UPDATE IGNORE t SET x='z'", Ok(1), T, "1:"),
+        (
+            FK,
+            "UPDATE IGNORE c SET x=99 WHERE id=1",
+            Ok(0),
+            C,
+            "1:1 2:2",
+        ),
+        (FK, "UPDATE IGNORE p SET id=id+10", Ok(1), P, "1:1 2:2 13:3"),
+        (
+            FK,
+            "UPDATE p SET id=id+10 WHERE id=1",
+            Err(1451),
+            P,
+            "1:1 2:2 3:3",
+        ),
+        (FK, "DELETE FROM p WHERE id=1", Err(1451), P, "1:1 2:2 3:3"),
+        (
+            FK,
+            "UPDATE c JOIN p ON c.x=p.id SET c.x=99",
+            Err(1452),
+            C,
+            "1:1 2:2",
+        ),
+        (
+            FK,
+            "UPDATE IGNORE p JOIN c ON c.x=p.id SET c.x=99, p.x=p.x+1",
+            Ok(2),
+            PC,
+            "1:2 2:3 3:3 | 1:1 2:2",
+        ),
+        (
+            FK,
+            "INSERT IGNORE INTO c VALUES (3,9),(4,3)",
+            Ok(1),
+            C,
+            "1:1 2:2 4:3",
+        ),
+        (
+            FK_CASCADE,
+            "UPDATE p JOIN c ON c.x=p.id SET p.id=p.id+10",
+            Ok(2),
+            C,
+            "1:11 2:12",
+        ),
+        (
+            FK,
+            "UPDATE p JOIN c ON c.x=p.id SET p.x=500",
+            Err(3819),
+            P,
+            "1:1 2:2 3:3",
+        ),
+        (
+            AB,
+            "UPDATE a JOIN b ON a.id=b.id SET a.x=b.x",
+            Err(1062),
+            A,
+            "1:1 2:2 3:3",
+        ),
+        (
+            AB,
+            "UPDATE IGNORE a, b SET a.x=b.x, b.x=b.x+100 WHERE a.id=b.id",
+            Ok(4),
+            AB_ROWS,
+            "1:1 2:5 3:3 | 1:102 2:105 3:105",
+        ),
+        (
+            TR,
+            "UPDATE a JOIN b ON a.id=b.id SET a.x=a.x+10",
+            Ok(3),
+            LOG,
+            "a1 a2 a3",
+        ),
+    ];
+
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    for (setup, sql, want, check, want_rows) in cases {
+        for drop in [
+            "DROP TRIGGER IF EXISTS au",
+            "DROP TABLE IF EXISTS c",
+            "DROP TABLE IF EXISTS p",
+            "DROP TABLE IF EXISTS a",
+            "DROP TABLE IF EXISTS b",
+            "DROP TABLE IF EXISTS t",
+            "DROP TABLE IF EXISTS log",
+        ] {
+            c.query_drop(drop).await.unwrap();
+        }
+        for s in *setup {
+            c.query_drop(*s)
+                .await
+                .unwrap_or_else(|e| panic!("{s}: {e}"));
+        }
+        let got = match c.query_drop(*sql).await {
+            Ok(()) => Ok(c.affected_rows()),
+            Err(mysql_async::Error::Server(e)) => Err(e.code),
+            Err(e) => panic!("{sql}: {e}"),
+        };
+        assert_eq!(got, *want, "{sql}");
+        let rows: Vec<Option<String>> = c.query(*check).await.unwrap();
+        let rows = rows
+            .into_iter()
+            .map(|row| row.unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert_eq!(rows, *want_rows, "{sql}");
+    }
 }
