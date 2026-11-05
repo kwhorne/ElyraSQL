@@ -6,6 +6,8 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.12.12] - 2026-11-05
+
 ### Fixed
 
 - **`COLLATE` and the `BINARY` operator work in expressions.** `WHERE s
