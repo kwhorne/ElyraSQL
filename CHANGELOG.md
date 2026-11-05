@@ -6,6 +6,17 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **`DROP ROLE` takes away what the role granted.** It removed the role but
+  left its table and column grants and its members' memberships, so every user
+  the role had been granted to kept reading and writing what it allowed, while
+  `SHOW GRANTS` showed only `USAGE`; a role created later under the same name
+  gave it all back. `DROP USER` of a role left the memberships too. Both now
+  remove every grant and membership of the account, as in MySQL. A role dropped
+  by an earlier version no longer grants anything, and creating an account
+  under its name clears what it left.
+
 ## [1.12.9] - 2026-10-26
 
 ### Fixed

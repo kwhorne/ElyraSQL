@@ -139,13 +139,81 @@ async fn scan_column_grants(sess: &Session, prefix: &[u8]) -> Result<Vec<String>
         .collect())
 }
 
-/// The role names granted (directly) to `user`.
+/// The role names granted (directly) to `user`. A membership in a role that no
+/// longer exists is skipped: before 1.12.10, `DROP ROLE` left its members'
+/// memberships (and its grants) behind, and they kept working.
 pub async fn roles_of(sess: &Session, user: &str) -> Result<Vec<String>> {
     let prefix = role_member_prefix(user);
-    Ok(crate::schemacache::keys(sess, &prefix)
+    let mut roles = Vec::new();
+    for key in crate::schemacache::keys(sess, &prefix).await?.iter() {
+        let role = String::from_utf8_lossy(&key[prefix.len()..]).into_owned();
+        if crate::schemacache::get(sess, role_flag_key(&role))
+            .await?
+            .is_some()
+            && crate::schemacache::get(sess, user_key(&role))
+                .await?
+                .is_some()
+        {
+            roles.push(role);
+        }
+    }
+    Ok(roles)
+}
+
+/// Every key stored under an account's name: the account, its role marker, its
+/// global, table and column grants, the roles granted to it, and its membership
+/// in other accounts as a role. Dropping an account deletes all of them, so
+/// nothing it was granted outlives it and an account created later under the
+/// same name starts with nothing.
+async fn account_keys(sess: &Session, name: &str) -> Result<Vec<Vec<u8>>> {
+    let mut keys = vec![
+        user_key(name),
+        role_flag_key(name),
+        elyra_core::users::ugrant_key(name),
+    ];
+    for prefix in [
+        table_grant_prefix(name),
+        format!("sys::colgrant::{name}::").into_bytes(),
+        role_member_prefix(name),
+    ] {
+        keys.extend(scan_keys(sess, prefix).await?);
+    }
+    let members = b"sys::rolemember::".to_vec();
+    for key in scan_keys(sess, members.clone()).await? {
+        let rest = String::from_utf8_lossy(&key[members.len()..]);
+        if rest.split_once("::").is_some_and(|(_, role)| role == name) {
+            keys.push(key);
+        }
+    }
+    Ok(keys)
+}
+
+async fn scan_keys(sess: &Session, prefix: Vec<u8>) -> Result<Vec<Vec<u8>>> {
+    let mut keys = Vec::new();
+    let mut after: Option<Vec<u8>> = None;
+    loop {
+        let batch = sess.scan_batch(prefix.clone(), after.clone(), 512).await?;
+        keys.extend(batch.iter().map(|(k, _)| k.clone()));
+        after = batch.last().map(|(k, _)| k.clone());
+        if batch.len() < 512 {
+            break;
+        }
+    }
+    Ok(keys)
+}
+
+/// What a version before 1.12.10 may have left under the name of an account
+/// that no longer exists, minus the keys `puts` is about to write. Deleted when
+/// an account of that name is created.
+async fn stale_account_keys(
+    sess: &Session,
+    name: &str,
+    puts: &[(Vec<u8>, Vec<u8>)],
+) -> Result<Vec<Vec<u8>>> {
+    Ok(account_keys(sess, name)
         .await?
-        .iter()
-        .map(|k| String::from_utf8_lossy(&k[prefix.len()..]).into_owned())
+        .into_iter()
+        .filter(|k| !puts.iter().any(|(p, _)| p == k))
         .collect())
 }
 
@@ -281,6 +349,7 @@ pub async fn execute(sql: &str, sess: &Session, privilege: Privilege) -> Result<
             i += 3; // IF NOT EXISTS
         }
         let mut puts = Vec::new();
+        let mut deletes = Vec::new();
         let mut named = false;
         while let Some((name, j)) = parse_userspec(&toks, i) {
             named = true;
@@ -303,13 +372,17 @@ pub async fn execute(sql: &str, sess: &Session, privilege: Privilege) -> Result<
                 digest: password_digest(b""),
                 privilege: Privilege::Read,
             };
-            puts.push((user_key(&name), encode_user(&rec)));
-            puts.push((role_flag_key(&name), vec![1]));
             // Like a new user, a new role grants nothing until granted some.
-            puts.push((
-                elyra_core::users::ugrant_key(&name),
-                elyra_core::users::encode_privset(0),
-            ));
+            let role_puts = vec![
+                (user_key(&name), encode_user(&rec)),
+                (role_flag_key(&name), vec![1]),
+                (
+                    elyra_core::users::ugrant_key(&name),
+                    elyra_core::users::encode_privset(0),
+                ),
+            ];
+            deletes.extend(stale_account_keys(sess, &name, &role_puts).await?);
+            puts.extend(role_puts);
             if matches!(toks.get(i), Some(Tok::Sym(','))) {
                 i += 1;
             } else {
@@ -319,7 +392,7 @@ pub async fn execute(sql: &str, sess: &Session, privilege: Privilege) -> Result<
         if !named {
             return Err(Error::Parse("CREATE ROLE: expected a role name".into()));
         }
-        sess.commit_write(puts, vec![]).await?;
+        sess.commit_write(puts, deletes).await?;
         return Ok(QueryResult::Affected(0));
     }
 
@@ -347,9 +420,7 @@ pub async fn execute(sql: &str, sess: &Session, privilege: Privilege) -> Result<
                 }
                 break;
             }
-            deletes.push(user_key(&name));
-            deletes.push(role_flag_key(&name));
-            deletes.push(elyra_core::users::ugrant_key(&name));
+            deletes.extend(account_keys(sess, &name).await?);
             i = j;
             if matches!(toks.get(i), Some(Tok::Sym(','))) {
                 i += 1;
@@ -415,17 +486,15 @@ pub async fn execute(sql: &str, sess: &Session, privilege: Privilege) -> Result<
         // A new account has no privileges until granted some (MySQL's USAGE):
         // an explicit empty set. An account created before this has none
         // stored and keeps the global SELECT that used to be the default.
-        sess.commit_write(
-            vec![
-                (user_key(&name), encode_user(&rec)),
-                (
-                    elyra_core::users::ugrant_key(&name),
-                    elyra_core::users::encode_privset(0),
-                ),
-            ],
-            vec![],
-        )
-        .await?;
+        let puts = vec![
+            (user_key(&name), encode_user(&rec)),
+            (
+                elyra_core::users::ugrant_key(&name),
+                elyra_core::users::encode_privset(0),
+            ),
+        ];
+        let deletes = stale_account_keys(sess, &name, &puts).await?;
+        sess.commit_write(puts, deletes).await?;
         return Ok(QueryResult::Affected(0));
     }
 
@@ -452,30 +521,7 @@ pub async fn execute(sql: &str, sess: &Session, privilege: Privilege) -> Result<
                 }
                 break;
             }
-            deletes.push(user_key(&name));
-            deletes.push(elyra_core::users::ugrant_key(&name));
-            // Purge every per-user grant so a later CREATE USER with the same
-            // name cannot inherit stale privileges.
-            for pfx in [
-                table_grant_prefix(&name),
-                format!("sys::colgrant::{name}::").into_bytes(),
-                role_member_prefix(&name),
-            ] {
-                let mut after: Option<Vec<u8>> = None;
-                loop {
-                    let batch = sess.scan_batch(pfx.clone(), after.clone(), 512).await?;
-                    if batch.is_empty() {
-                        break;
-                    }
-                    for (k, _) in &batch {
-                        deletes.push(k.clone());
-                    }
-                    after = batch.last().map(|(k, _)| k.clone());
-                    if batch.len() < 512 {
-                        break;
-                    }
-                }
-            }
+            deletes.extend(account_keys(sess, &name).await?);
             i = j;
             if matches!(toks.get(i), Some(Tok::Sym(','))) {
                 i += 1;
@@ -983,5 +1029,113 @@ mod auth_cache_tests {
                 & priv_bits::INSERT,
             0
         );
+    }
+}
+
+#[cfg(test)]
+mod drop_account_tests {
+    use super::*;
+
+    async fn run(engine: &crate::Engine, sess: &Session, sql: &str) {
+        engine
+            .execute(sql, Privilege::Admin, sess)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+
+    async fn setup() -> (crate::Engine, Session) {
+        let engine = crate::Engine::new(elyra_storage::Db::in_memory().unwrap());
+        let sess = engine.session();
+        for sql in [
+            "CREATE TABLE t (id INT PRIMARY KEY, secret INT)",
+            "INSERT INTO t VALUES (1, 10)",
+            "CREATE TABLE t2 (id INT PRIMARY KEY, v INT)",
+            "CREATE ROLE r",
+            "CREATE ROLE rc",
+            "GRANT SELECT, INSERT ON t TO r",
+            "GRANT SELECT (id) ON t2 TO rc",
+            "CREATE USER u IDENTIFIED BY 'passw0rd'",
+            "GRANT r, rc TO u",
+        ] {
+            run(&engine, &sess, sql).await;
+        }
+        (engine, sess)
+    }
+
+    /// What `u` may do: read `t`, insert into `t`, read `t2.id`.
+    async fn allowed(engine: &crate::Engine, sess: &Session) -> [bool; 3] {
+        let mut out = [false; 3];
+        for (i, sql) in [
+            "SELECT * FROM t",
+            "INSERT INTO t VALUES (2, 20)",
+            "SELECT id FROM t2",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            out[i] = engine
+                .execute_as(sql, Privilege::Read, "u", sess)
+                .await
+                .is_ok();
+        }
+        out
+    }
+
+    /// `DROP ROLE` took the role away but left its grants and its members'
+    /// memberships, so the members kept every privilege it had given them, and
+    /// a role created later under the same name gave them back.
+    #[tokio::test]
+    async fn a_dropped_role_takes_its_privileges_with_it() {
+        let (engine, sess) = setup().await;
+        assert_eq!(allowed(&engine, &sess).await, [true, true, true]);
+        run(&engine, &sess, "DELETE FROM t WHERE id = 2").await;
+        run(&engine, &sess, "DROP ROLE r, rc").await;
+        assert_eq!(allowed(&engine, &sess).await, [false, false, false]);
+        run(&engine, &sess, "CREATE ROLE r").await;
+        run(&engine, &sess, "GRANT r TO u").await;
+        assert_eq!(allowed(&engine, &sess).await, [false, false, false]);
+    }
+
+    /// A role is an account: `DROP USER` of one ends its members' privileges
+    /// too, and leaves no role behind to grant.
+    #[tokio::test]
+    async fn drop_user_of_a_role_takes_its_privileges_with_it() {
+        let (engine, sess) = setup().await;
+        run(&engine, &sess, "DROP USER r, rc").await;
+        assert_eq!(allowed(&engine, &sess).await, [false, false, false]);
+        assert!(engine
+            .execute("GRANT r TO u", Privilege::Admin, &sess)
+            .await
+            .is_err());
+    }
+
+    /// A role dropped before this fix left its grants and memberships stored.
+    /// They no longer give anything, and creating an account under that name
+    /// clears them.
+    #[tokio::test]
+    async fn what_an_earlier_drop_role_left_behind_gives_nothing() {
+        let (engine, sess) = setup().await;
+        // What `DROP ROLE r, rc` deleted before this fix.
+        let mut deletes = Vec::new();
+        for role in ["r", "rc"] {
+            deletes.push(user_key(role));
+            deletes.push(role_flag_key(role));
+            deletes.push(elyra_core::users::ugrant_key(role));
+        }
+        sess.commit_write(vec![], deletes).await.unwrap();
+        assert_eq!(allowed(&engine, &sess).await, [false, false, false]);
+
+        run(&engine, &sess, "CREATE ROLE r").await;
+        run(&engine, &sess, "CREATE USER rc IDENTIFIED BY 'passw0rd'").await;
+        assert!(scan_keys(&sess, table_grant_prefix("r"))
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(scan_keys(&sess, b"sys::colgrant::rc::".to_vec())
+            .await
+            .unwrap()
+            .is_empty());
+        run(&engine, &sess, "GRANT r TO u").await;
+        assert_eq!(allowed(&engine, &sess).await, [false, false, false]);
     }
 }
