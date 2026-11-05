@@ -8,6 +8,15 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ### Fixed
 
+- **`DROP TABLE` and `RENAME TABLE` take a table's triggers with them.** A
+  dropped table's triggers stayed behind and fired on the next table created
+  under the same name -- or broke its statements, when they named columns it
+  did not have -- and a renamed table's triggers stayed under the old name, so
+  they stopped firing on the table and fired on its successor instead. Both
+  now follow MySQL, as does `ALTER TABLE ... RENAME`. Triggers left behind by
+  an earlier version are removed when a table is next created under their
+  table's name.
+
 - **A multi-table `UPDATE` enforces constraints.** `UPDATE a JOIN b ... SET`
   (and the comma form `UPDATE a, b SET ...`) wrote values that broke a unique
   key, child rows whose parent did not exist, values that failed a `CHECK`,

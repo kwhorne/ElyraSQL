@@ -512,7 +512,8 @@ pub async fn create_table(
                 puts.push((key(&name), value));
             }
         }
-        db.commit_write(puts, vec![]).await?;
+        db.commit_write(puts, table_trigger_keys(db, &name).await?)
+            .await?;
         return Ok(QueryResult::Affected(0));
     }
 
@@ -830,8 +831,25 @@ pub async fn create_table(
             bincode::serialize(&declarations).map_err(|e| Error::Storage(e.to_string()))?,
         ),
     ];
-    db.commit_write(puts, vec![]).await?;
+    db.commit_write(puts, table_trigger_keys(db, &name).await?)
+        .await?;
     Ok(QueryResult::Affected(0))
+}
+
+/// The keys of every trigger stored under table `name`, and of the name index
+/// entries that point at it: what `DROP TABLE` deletes with the table. A
+/// `CREATE TABLE` deletes them too: before `DROP TABLE` took a table's
+/// triggers with it they were left behind, and the next table created under
+/// that name inherited them. A new table has none, so any found are those.
+async fn table_trigger_keys(db: &Session, name: &str) -> Result<Vec<Vec<u8>>> {
+    let mut deletes = Vec::new();
+    for (key, trigger) in catalog::stored_triggers(db, name).await? {
+        deletes.push(key);
+        if catalog::trigger_indexed_on(db, &trigger.name, name).await? {
+            deletes.push(catalog::trigname_key(&trigger.name));
+        }
+    }
+    Ok(deletes)
 }
 
 /// SHOW TABLES: one column of user table names.
@@ -3945,7 +3963,8 @@ async fn create_table_as(
         puts.push((rowid_key(name), rowid.to_le_bytes().to_vec()));
     }
     let affected = rows.len() as u64;
-    db.commit_write(puts, vec![]).await?;
+    db.commit_write(puts, table_trigger_keys(db, name).await?)
+        .await?;
     Ok(QueryResult::Affected(affected))
 }
 
@@ -5307,6 +5326,21 @@ async fn alter_rename_table(db: &Session, def: &mut TableDef, new: &str) -> Resu
         puts.push((
             catalog::generation_key(new),
             target_generation.to_le_bytes().to_vec(),
+        ));
+    }
+    // MySQL moves a table's triggers with it. Left under the old name, they
+    // stopped firing on the renamed table and fired on the next table created
+    // under the old name instead.
+    for (key, mut trigger) in catalog::stored_triggers(db, &old).await? {
+        deletes.push(key);
+        trigger.table = new.to_string();
+        puts.push((
+            catalog::trigger_key(new, &trigger.name),
+            bincode::serialize(&trigger).map_err(|e| Error::Storage(e.to_string()))?,
+        ));
+        puts.push((
+            catalog::trigname_key(&trigger.name),
+            new.as_bytes().to_vec(),
         ));
     }
     // MySQL carries referencing foreign keys across a table rename. Update
@@ -26139,6 +26173,9 @@ async fn table_delete_keys(db: &Session, name: &str) -> Result<Vec<Vec<u8>>> {
         catalog::colwidth_key(name),
         catalog::coldecl_key(name),
     ];
+    // A table's triggers go with it, as in MySQL. Left behind, they fired on
+    // the next table created under the same name.
+    deletes.extend(table_trigger_keys(db, name).await?);
     for prefix in [
         definition.data_prefix(),
         index_table_prefix(&storage_name),

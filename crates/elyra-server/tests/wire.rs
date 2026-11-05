@@ -15236,3 +15236,78 @@ async fn update_ignore_and_multi_table_update_follow_mysql() {
         assert_eq!(rows, *want_rows, "{sql}");
     }
 }
+
+/// A table's triggers belong to it, as in MySQL: `DROP TABLE` deleted the table
+/// but kept its triggers, which then fired on (or broke) the next table created
+/// under that name, and `RENAME TABLE` left them under the old name, so they
+/// stopped firing on the renamed table and fired on its successor instead.
+#[tokio::test]
+async fn drop_and_rename_table_carry_their_triggers() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    async fn triggers(c: &mut mysql_async::Conn) -> String {
+        let sql = "SELECT GROUP_CONCAT(CONCAT(trigger_name, '@', event_object_table) \
+                   ORDER BY trigger_name) FROM information_schema.triggers \
+                   WHERE trigger_schema = DATABASE()";
+        c.query_first::<Option<String>, _>(sql)
+            .await
+            .unwrap()
+            .flatten()
+            .unwrap_or_default()
+    }
+    let setup = [
+        "DROP TABLE IF EXISTS t",
+        "DROP TABLE IF EXISTS t2",
+        "DROP TABLE IF EXISTS log",
+        "CREATE TABLE log (m VARCHAR(20))",
+        "CREATE TABLE t (id INT PRIMARY KEY, v INT)",
+        "CREATE TRIGGER tg1 AFTER INSERT ON t FOR EACH ROW INSERT INTO log VALUES (CONCAT('ins', NEW.id))",
+        "CREATE TRIGGER tg2 BEFORE UPDATE ON t FOR EACH ROW SET NEW.v = NEW.v + 100",
+    ];
+
+    // DROP TABLE takes the triggers; a new `t` has none, and the names are free.
+    for s in setup {
+        c.query_drop(s).await.unwrap();
+    }
+    c.query_drop("DROP TABLE t").await.unwrap();
+    assert_eq!(triggers(&mut c).await, "");
+    c.query_drop("CREATE TABLE t (id INT PRIMARY KEY, w INT)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO t VALUES (1, 1)").await.unwrap();
+    c.query_drop("UPDATE t SET w = 5").await.unwrap();
+    let w: Option<i64> = c.query_first("SELECT w FROM t").await.unwrap();
+    assert_eq!(w, Some(5));
+    let fired: i64 = c
+        .query_first("SELECT COUNT(*) FROM log")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(fired, 0);
+    c.query_drop("CREATE TRIGGER tg1 AFTER INSERT ON t FOR EACH ROW INSERT INTO log VALUES ('x')")
+        .await
+        .unwrap();
+    assert_eq!(triggers(&mut c).await, "tg1@t");
+
+    // RENAME TABLE and ALTER TABLE ... RENAME move them with the table.
+    for rename in ["RENAME TABLE t TO t2", "ALTER TABLE t RENAME TO t2"] {
+        for s in setup {
+            c.query_drop(s).await.unwrap();
+        }
+        c.query_drop(rename).await.unwrap();
+        assert_eq!(triggers(&mut c).await, "tg1@t2,tg2@t2", "{rename}");
+        c.query_drop("INSERT INTO t2 VALUES (1, 1)").await.unwrap();
+        c.query_drop("UPDATE t2 SET v = 1").await.unwrap();
+        let v: Option<i64> = c.query_first("SELECT v FROM t2").await.unwrap();
+        assert_eq!(v, Some(101), "{rename}");
+        c.query_drop("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+            .await
+            .unwrap();
+        c.query_drop("INSERT INTO t VALUES (9, 9)").await.unwrap();
+        let log: Vec<String> = c.query("SELECT m FROM log ORDER BY m").await.unwrap();
+        assert_eq!(log, vec!["ins1".to_string()], "{rename}");
+        c.query_drop("DROP TRIGGER tg1").await.unwrap();
+        assert_eq!(triggers(&mut c).await, "tg2@t2", "{rename}");
+    }
+    c.query_drop("DROP TRIGGER tg2").await.unwrap();
+}
