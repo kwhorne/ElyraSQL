@@ -216,6 +216,8 @@ pub struct Session {
     locks: Arc<LockManager>,
     /// Explicit `LOCK TABLES` guards held until `UNLOCK TABLES` or disconnect.
     held_locks: Mutex<Vec<LockGuard>>,
+    /// The held locks are `FLUSH TABLES WITH READ LOCK`'s, not `LOCK TABLES`'.
+    global_read_lock: std::sync::atomic::AtomicBool,
     /// `LAST_INSERT_ID()` -- first auto-generated id of the last INSERT.
     last_insert_id: std::sync::atomic::AtomicI64,
     /// `ROW_COUNT()` -- rows changed by the last DML (-1 after a SELECT/DDL).
@@ -290,6 +292,7 @@ impl Session {
             user_vars: Mutex::new(std::collections::HashMap::new()),
             locks,
             held_locks: Mutex::new(Vec::new()),
+            global_read_lock: std::sync::atomic::AtomicBool::new(false),
             last_insert_id: std::sync::atomic::AtomicI64::new(0),
             row_count: std::sync::atomic::AtomicI64::new(-1),
             cancel: Arc::new(elyra_core::cancel::QueryCancel::new()),
@@ -549,33 +552,58 @@ impl Session {
         &self.locks
     }
 
-    /// Whether this session already holds an explicit lock on `table`.
-    pub fn holds_lock(&self, table: &str) -> bool {
-        self.held_locks
-            .lock()
-            .unwrap()
+    /// The explicit lock this session holds on `table`, if any.
+    pub fn held_lock(&self, table: &str) -> Option<LockMode> {
+        let held = self.held_locks.lock().unwrap();
+        let mut modes = held
             .iter()
-            .any(|g| g.table().eq_ignore_ascii_case(table))
+            .filter(|g| g.table().eq_ignore_ascii_case(table))
+            .map(|g| g.mode());
+        let first = modes.next()?;
+        Some(if modes.any(|m| m == LockMode::Exclusive) {
+            LockMode::Exclusive
+        } else {
+            first
+        })
     }
 
-    /// Acquire an explicit `LOCK TABLES` lock, held until `UNLOCK TABLES` or the
-    /// session ends.
-    pub async fn lock_table(&self, table: &str, mode: LockMode) -> Result<()> {
-        // Re-locking a table the session already holds is a no-op upgrade-free.
-        if self.holds_lock(table) {
-            return Ok(());
+    /// Whether this session is under `LOCK TABLES`, and so may use only the
+    /// tables it locked.
+    pub fn holds_table_locks(&self) -> bool {
+        !self.held_locks.lock().unwrap().is_empty() && !self.holds_global_read_lock()
+    }
+
+    /// Whether this session holds `FLUSH TABLES WITH READ LOCK`.
+    pub fn holds_global_read_lock(&self) -> bool {
+        self.global_read_lock
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// `LOCK TABLES` (or, `global`, `FLUSH TABLES WITH READ LOCK`): release
+    /// whatever this session holds, then take every lock, held until `UNLOCK
+    /// TABLES` or the session ends. All or nothing: if one cannot be taken, none
+    /// is held, as in MySQL.
+    pub async fn lock_tables(&self, locks: &[(String, LockMode)], global: bool) -> Result<()> {
+        self.unlock_tables();
+        let mut guards = Vec::with_capacity(locks.len());
+        for (table, mode) in locks {
+            guards.push(
+                self.locks
+                    .acquire(table, *mode, true, std::time::Duration::from_secs(10))
+                    .await?,
+            );
         }
-        let guard = self
-            .locks
-            .acquire(table, mode, true, std::time::Duration::from_secs(10))
-            .await?;
-        self.held_locks.lock().unwrap().push(guard);
+        *self.held_locks.lock().unwrap() = guards;
+        self.global_read_lock
+            .store(global, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
     /// Release all explicit locks held by this session (`UNLOCK TABLES`).
     pub fn unlock_tables(&self) {
         self.held_locks.lock().unwrap().clear();
+        self.global_read_lock
+            .store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Set a session user variable (`@name`).
@@ -666,6 +694,11 @@ impl Session {
             return Err(Error::Query("trigger/procedure recursion too deep".into()));
         }
         Ok(())
+    }
+
+    /// Whether a trigger body or a procedure is running.
+    pub fn in_routine(&self) -> bool {
+        self.call_depth.load(std::sync::atomic::Ordering::SeqCst) > 0
     }
 
     /// Leave a `CALL`.

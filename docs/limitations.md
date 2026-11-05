@@ -262,13 +262,21 @@ judge fit before deploying.
 - `SELECT ... FOR UPDATE` / `FOR SHARE` provide **optimistic** row locking: a
   locked row that another transaction changes aborts your commit. Row locking is
   applied to single-table locking selects.
-- **Pessimistic table locking** is also available: `LOCK TABLES t READ|WRITE` /
-  `UNLOCK TABLES` take blocking table locks (a `WRITE` lock blocks other readers
-  and writers; a `READ` lock blocks writers). While an explicit lock is held,
-  conflicting statements from other sessions block until it is released, or fail
-  with `1205` (lock wait timeout). `LOCK IN SHARE MODE` is accepted as a synonym
-  for `FOR SHARE`. MVCC reads are not blocked by table locks (they read a
-  consistent snapshot). When no explicit lock is held, locking adds no overhead.
+- **Pessimistic table locking** is also available, as in MySQL:
+  `LOCK TABLES t READ|WRITE` / `UNLOCK TABLES` and `FLUSH TABLES WITH READ
+  LOCK`. A `WRITE` lock blocks other sessions' reads and writes of the table; a
+  `READ` lock blocks their writes. That covers every table a statement uses --
+  a join, a subquery, the `SELECT` of an `INSERT ... SELECT`, the tables behind
+  a view -- and `CREATE`/`DROP TRIGGER` on it. A blocked statement waits until
+  the lock is released, or fails with `1205` (lock wait timeout). The session
+  holding `LOCK TABLES` may use only the tables it locked (`1100`), and write
+  only those it locked `WRITE` (`1099`); locking a view locks the tables it
+  reads. A new `LOCK TABLES` releases the previous one. Under `FLUSH TABLES
+  WITH READ LOCK` the session may read but not write (`1223`), and a table
+  created after it is not locked. Unlike MySQL, an alias (`FROM t AS a`) need
+  not be locked separately, and DDL by the locking session is not checked
+  against its locks. `LOCK IN SHARE MODE` is accepted as a synonym for `FOR
+  SHARE`. When no explicit lock is held, locking adds no overhead.
 - A single writer serializes all commits (an inherent property of the ACID
   single-file engine — there are no parallel writers or write sharding).
   Throughput under high write concurrency comes from **group commit**: many

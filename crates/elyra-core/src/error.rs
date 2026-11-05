@@ -160,6 +160,26 @@ pub enum Error {
     #[error("'{0}' is not VIEW")]
     NotView(String),
 
+    /// A write, under `LOCK TABLES`, to a table this session locked `READ`.
+    /// MySQL 1099 (`ER_TABLE_NOT_LOCKED_FOR_WRITE`), with its text.
+    #[error("Table '{0}' was locked with a READ lock and can't be updated")]
+    TableLockedForRead(String),
+
+    /// A table used under `LOCK TABLES` that this session did not lock. MySQL
+    /// 1100 (`ER_TABLE_NOT_LOCKED`), with its text.
+    #[error("Table '{0}' was not locked with LOCK TABLES")]
+    TableNotLocked(String),
+
+    /// A write while this session holds `FLUSH TABLES WITH READ LOCK`. MySQL
+    /// 1223 (`ER_CANT_UPDATE_WITH_READLOCK`), with its text.
+    #[error("Can't execute the query because you have a conflicting read lock")]
+    ConflictingReadLock,
+
+    /// A table named twice in one `LOCK TABLES`. MySQL 1066
+    /// (`ER_NONUNIQ_TABLE`), with its text.
+    #[error("Not unique table/alias: '{0}'")]
+    NotUniqueTable(String),
+
     /// `SELECT ... INTO @var` that found more than one row. MySQL 1172
     /// (`ER_TOO_MANY_ROWS`), with its text.
     #[error("Result consisted of more than one row")]
@@ -209,6 +229,10 @@ impl Error {
             Error::ViewRights(_) => 1356,  // ER_VIEW_INVALID
             Error::TriggerMissing => 1360, // ER_TRG_DOES_NOT_EXIST
             Error::NotView(_) => 1347,     // ER_WRONG_OBJECT
+            Error::TableLockedForRead(_) => 1099, // ER_TABLE_NOT_LOCKED_FOR_WRITE
+            Error::TableNotLocked(_) => 1100, // ER_TABLE_NOT_LOCKED
+            Error::ConflictingReadLock => 1223, // ER_CANT_UPDATE_WITH_READLOCK
+            Error::NotUniqueTable(_) => 1066, // ER_NONUNIQ_TABLE
             _ => 1105,
         }
     }
@@ -235,6 +259,7 @@ impl Error {
             Error::TooManyRows => b"42000",
             Error::UndeclaredVariable(_) => b"42000",
             Error::RoutineMissing(..) => b"42000",
+            Error::NotUniqueTable(_) => b"42000",
             _ => b"HY000",
         }
     }
