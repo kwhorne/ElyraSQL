@@ -6,6 +6,23 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **`LOCK TABLES` locks what MySQL locks.** Another session waited only for a
+  single-table write. A `SELECT` of a `WRITE`-locked table read it, and a
+  joined `UPDATE` or `DELETE`, the `SELECT` of an `INSERT ... SELECT`, a view
+  over the table and `CREATE TRIGGER` went straight through a `READ` or
+  `WRITE` lock and `FLUSH TABLES WITH READ LOCK`. They now wait, as in MySQL.
+  A second `LOCK TABLES` kept the first one's locks, so `READ` could not
+  become `WRITE` and a table no longer named stayed locked; it now replaces
+  them. The session holding the locks could write a table it locked `READ`
+  and use tables it had not locked; that is now MySQL's 1099 and 1100, and a
+  write under its own `FLUSH TABLES WITH READ LOCK` is 1223. Locking a view
+  locks the tables it reads, a table named twice is 1066, and a missing one
+  is 1146 with no lock left held. `UPDATE t JOIN t2 ... SET t.c = <value>`
+  without a `WHERE` now needs `SELECT` on `t2`, which decides the rows it
+  writes, as in MySQL.
+
 ## [1.12.10] - 2026-11-05
 
 ### Fixed

@@ -670,6 +670,30 @@ impl Engine {
         Ok(())
     }
 
+    /// Trigger DDL changes how its table is written, so it takes the table
+    /// exclusively: it waits for another session's lock on it, and under this
+    /// session's own LOCK TABLES needs the table locked WRITE.
+    async fn lock_trigger_table(
+        &self,
+        sess: &Session,
+        table: &str,
+    ) -> Result<Option<lockmgr::LockGuard>> {
+        if !self.locks.explicit_active() {
+            return Ok(None);
+        }
+        if sess.holds_global_read_lock() {
+            return Err(Error::ConflictingReadLock);
+        }
+        match sess.held_lock(table) {
+            Some(lockmgr::LockMode::Exclusive) => Ok(None),
+            Some(lockmgr::LockMode::Shared) => Err(Error::TableLockedForRead(table.to_string())),
+            None if sess.holds_table_locks() => Err(Error::TableNotLocked(table.to_string())),
+            None => Ok(Some(
+                lockmgr::transient(&self.locks, table, lockmgr::LockMode::Exclusive).await?,
+            )),
+        }
+    }
+
     async fn authorize_view_body(
         &self,
         user: &str,
@@ -1505,9 +1529,12 @@ impl Engine {
                     }
                     MysqlFlush::TablesWithReadLock => {
                         require_privilege(privilege, PrivilegedAction::LockTables)?;
-                        for table in catalog::list_tables(sess).await? {
-                            sess.lock_table(&table, lockmgr::LockMode::Shared).await?;
-                        }
+                        let tables = catalog::list_tables(sess)
+                            .await?
+                            .into_iter()
+                            .map(|table| (table, lockmgr::LockMode::Shared))
+                            .collect::<Vec<_>>();
+                        sess.lock_tables(&tables, true).await?;
                     }
                     MysqlFlush::Privileges => {
                         require_privilege(
@@ -1541,9 +1568,28 @@ impl Engine {
                 .into_iter()
                 .map(|(table, mode)| Ok((exec::stored_table_ident(sess, &table)?, mode)))
                 .collect::<Result<Vec<_>>>()?;
+            // A new LOCK TABLES first releases what the session held, as in
+            // MySQL; it used to keep the old locks, so READ could not become
+            // WRITE and a table no longer named stayed locked.
+            sess.unlock_tables();
+            let mut named: Vec<String> = Vec::new();
+            let mut all: Vec<(String, lockmgr::LockMode)> = Vec::new();
             for (table, mode) in locks {
-                sess.lock_table(&table, mode).await?;
+                if named.iter().any(|n| n.eq_ignore_ascii_case(&table)) {
+                    return Err(Error::NotUniqueTable(table));
+                }
+                named.push(table.clone());
+                // Locking a view locks the tables it reads, as in MySQL.
+                let is_view = catalog::load_view(sess, &table).await?.is_some();
+                if !is_view {
+                    catalog::load(sess, &table).await?;
+                }
+                for base in base_tables(sess, std::slice::from_ref(&table)).await? {
+                    all.push((base, mode));
+                }
+                all.push((table, mode));
             }
+            sess.lock_tables(&strongest_locks(all), false).await?;
             return Ok(vec![QueryResult::empty_ok()]);
         }
         if head.starts_with("unlock tables") || head.starts_with("unlock table") {
@@ -1559,6 +1605,7 @@ impl Engine {
             t.name = exec::stored_table_ident(sess, &trigger)?;
             let table = mysql_trigger_table(trimmed)?;
             t.table = exec::stored_table_ident(sess, &table)?;
+            let _guard = self.lock_trigger_table(sess, &t.table).await?;
             sess.commit_write(
                 vec![
                     (
@@ -1579,6 +1626,7 @@ impl Engine {
             let name = exec::stored_table_ident(sess, &trigger)?;
             match catalog::find_trigger(sess, &name).await? {
                 Some(t) => {
+                    let _guard = self.lock_trigger_table(sess, &t.table).await?;
                     sess.commit_write(
                         vec![],
                         vec![
@@ -2097,20 +2145,18 @@ impl Engine {
                     self.refresh_matview(table, privilege, user, sess).await?;
                 }
 
-                // Pessimistic locking: while another session holds an explicit
-                // LOCK TABLES, acquire a transient lock on this statement's target
-                // tables for the statement's duration (skipped entirely otherwise).
+                // Pessimistic locking, skipped entirely while no session holds
+                // an explicit lock. This session, under LOCK TABLES, may use
+                // only what it locked; every table it uses that it did not lock
+                // is locked for the statement's duration -- what it writes
+                // exclusively, what it reads (through views too) shared -- so
+                // it waits for another session's lock.
                 let mut _guards: Vec<lockmgr::LockGuard> = Vec::new();
                 if self.locks.explicit_active() {
-                    let mode = if need >= Privilege::Write {
-                        lockmgr::LockMode::Exclusive
-                    } else {
-                        lockmgr::LockMode::Shared
-                    };
-                    for t in stmt_targets(&stmt) {
-                        if !sess.holds_lock(&t) {
-                            _guards.push(lockmgr::transient(&self.locks, &t, mode).await?);
-                        }
+                    let access = lock_access(sess, &stmt).await?;
+                    check_own_locks(sess, &stmt, &access, need)?;
+                    for (t, mode) in transient_locks(sess, &access).await? {
+                        _guards.push(lockmgr::transient(&self.locks, &t, mode).await?);
                     }
                 }
                 self.execute_stmt(stmt, sess, update_modifiers.as_ref(), dml_limit)
@@ -3697,6 +3743,7 @@ fn read_relations(stmt: &Statement) -> Vec<String> {
             v
         }
         Statement::Update {
+            table,
             assignments,
             from,
             selection,
@@ -3706,7 +3753,8 @@ fn read_relations(stmt: &Statement) -> Vec<String> {
             let computes = assignments
                 .iter()
                 .any(|a| !matches!(a.value, Expr::Value(_)));
-            if selection.is_some() || from.is_some() || computes {
+            // A join decides which rows are written, so it is read.
+            if selection.is_some() || from.is_some() || !table.joins.is_empty() || computes {
                 all
             } else {
                 // `UPDATE t SET c = <literal>` reads nothing.
@@ -3752,6 +3800,247 @@ fn read_relations(stmt: &Statement) -> Vec<String> {
     tables.sort_unstable();
     tables.dedup();
     tables
+}
+
+/// The tables a statement uses, for table locks: those it writes, and those
+/// it reads besides (views by name, not yet expanded). Names that are no table
+/// or view -- a CTE, a system schema's -- are left out.
+struct LockAccess {
+    writes: Vec<String>,
+    reads: Vec<String>,
+}
+
+async fn lock_access(sess: &Session, stmt: &Statement) -> Result<LockAccess> {
+    let writes = write_targets(stmt);
+    let mut reads = Vec::new();
+    for t in read_relations(stmt) {
+        if writes.iter().any(|w| w.eq_ignore_ascii_case(&t)) {
+            continue;
+        }
+        let is_relation = crate::schemacache::get(sess, catalog::catalog_key(&t))
+            .await?
+            .is_some()
+            || catalog::load_view(sess, &t).await?.is_some();
+        if is_relation {
+            reads.push(t);
+        }
+    }
+    Ok(LockAccess { writes, reads })
+}
+
+/// Under this session's own locks: with `FLUSH TABLES WITH READ LOCK` it may
+/// read but not write (1223); under `LOCK TABLES` a query or DML statement may
+/// use only the tables it locked (1100), and write only those it locked
+/// `WRITE` (1099), as in MySQL. A table's alias need not be locked separately,
+/// where MySQL wants it locked under that alias, and a trigger body or a
+/// procedure is not checked: MySQL locks the tables a table's triggers use
+/// along with it.
+fn check_own_locks(
+    sess: &Session,
+    stmt: &Statement,
+    access: &LockAccess,
+    need: Privilege,
+) -> Result<()> {
+    if sess.holds_global_read_lock() {
+        return if need >= Privilege::Write {
+            Err(Error::ConflictingReadLock)
+        } else {
+            Ok(())
+        };
+    }
+    let dml = matches!(
+        stmt,
+        Statement::Query(_)
+            | Statement::Insert(_)
+            | Statement::Update { .. }
+            | Statement::Delete(_)
+    );
+    if !dml || !sess.holds_table_locks() || sess.in_routine() {
+        return Ok(());
+    }
+    for t in &access.writes {
+        match sess.held_lock(t) {
+            Some(lockmgr::LockMode::Exclusive) => {}
+            Some(lockmgr::LockMode::Shared) => return Err(Error::TableLockedForRead(t.clone())),
+            None => return Err(Error::TableNotLocked(t.clone())),
+        }
+    }
+    for t in &access.reads {
+        if sess.held_lock(t).is_none() {
+            return Err(Error::TableNotLocked(t.clone()));
+        }
+    }
+    Ok(())
+}
+
+/// The statement-long locks to wait for: every table written, exclusively, and
+/// every table read -- through views down to their tables -- shared, except
+/// those this session holds already. In name order, so two statements take
+/// them in the same order.
+async fn transient_locks(
+    sess: &Session,
+    access: &LockAccess,
+) -> Result<Vec<(String, lockmgr::LockMode)>> {
+    let mut locks: Vec<(String, lockmgr::LockMode)> = access
+        .writes
+        .iter()
+        .map(|t| (t.clone(), lockmgr::LockMode::Exclusive))
+        .collect();
+    for t in base_tables(sess, &access.reads).await? {
+        locks.push((t, lockmgr::LockMode::Shared));
+    }
+    locks.extend(
+        access
+            .reads
+            .iter()
+            .map(|t| (t.clone(), lockmgr::LockMode::Shared)),
+    );
+    Ok(strongest_locks(locks)
+        .into_iter()
+        .filter(|(t, _)| sess.held_lock(t).is_none())
+        .collect())
+}
+
+/// One lock per table, the strongest asked for, in name order.
+fn strongest_locks(locks: Vec<(String, lockmgr::LockMode)>) -> Vec<(String, lockmgr::LockMode)> {
+    let mut out: Vec<(String, lockmgr::LockMode)> = Vec::new();
+    for (table, mode) in locks {
+        match out.iter_mut().find(|(t, _)| t.eq_ignore_ascii_case(&table)) {
+            Some(existing) => {
+                if mode == lockmgr::LockMode::Exclusive {
+                    existing.1 = mode;
+                }
+            }
+            None => out.push((table, mode)),
+        }
+    }
+    out.sort_by_key(|(t, _)| t.to_ascii_lowercase());
+    out
+}
+
+/// The tables the views among `names` read, through nested views; the names
+/// that are tables are left out.
+async fn base_tables(sess: &Session, names: &[String]) -> Result<Vec<String>> {
+    const MAX_DEPTH: usize = 32;
+    let mut out = Vec::new();
+    let mut frontier = names.to_vec();
+    for _ in 0..MAX_DEPTH {
+        let mut next = Vec::new();
+        for name in &frontier {
+            let Some(sql) = catalog::load_view(sess, name).await? else {
+                continue;
+            };
+            let body = Statement::Query(Box::new(exec::parse_query(&sql)?));
+            for t in read_relations(&body) {
+                if catalog::load_view(sess, &t).await?.is_some() {
+                    next.push(t);
+                } else if crate::schemacache::get(sess, catalog::catalog_key(&t))
+                    .await?
+                    .is_some()
+                {
+                    out.push(t);
+                }
+            }
+        }
+        if next.is_empty() {
+            return Ok(out);
+        }
+        frontier = next;
+    }
+    Err(Error::Query(format!(
+        "views nest more than {MAX_DEPTH} deep"
+    )))
+}
+
+/// The tables a statement writes rows to or changes the definition of. A
+/// multi-table `UPDATE` writes the tables whose columns it assigns (every
+/// table, if a column is unqualified), and a multi-table `DELETE` the tables
+/// it names before `FROM`.
+fn write_targets(stmt: &Statement) -> Vec<String> {
+    use sqlparser::ast::{AssignmentTarget, FromTable, TableFactor, TableWithJoins};
+
+    /// `(alias or name, table)` for each table in `twj`, nested joins included.
+    fn factors(twj: &TableWithJoins, out: &mut Vec<(String, String)>) {
+        fn factor(tf: &TableFactor, out: &mut Vec<(String, String)>) {
+            match tf {
+                TableFactor::Table { name, alias, .. } => {
+                    if let Some(table) = object_name_last(name) {
+                        let key = alias
+                            .as_ref()
+                            .map(|a| a.name.value.clone())
+                            .unwrap_or_else(|| table.clone());
+                        out.push((key, table));
+                    }
+                }
+                TableFactor::NestedJoin {
+                    table_with_joins, ..
+                } => factors(table_with_joins, out),
+                _ => {}
+            }
+        }
+        factor(&twj.relation, out);
+        for join in &twj.joins {
+            factor(&join.relation, out);
+        }
+    }
+    fn resolve(names: &[(String, String)], qualifier: &str) -> Option<String> {
+        names
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(qualifier))
+            .map(|(_, table)| table.clone())
+    }
+
+    let mut out: Vec<String> = match stmt {
+        Statement::Update {
+            table,
+            from,
+            assignments,
+            ..
+        } if from.is_some() || !table.joins.is_empty() => {
+            let mut names = Vec::new();
+            factors(table, &mut names);
+            if let Some(from) = from {
+                factors(from, &mut names);
+            }
+            let mut out = Vec::new();
+            for a in assignments {
+                let qualified = match &a.target {
+                    AssignmentTarget::ColumnName(n) if n.0.len() >= 2 => {
+                        resolve(&names, &n.0[n.0.len() - 2].value)
+                    }
+                    _ => None,
+                };
+                match qualified {
+                    Some(t) => out.push(t),
+                    None => {
+                        out.extend(names.iter().map(|(_, t)| t.clone()));
+                        break;
+                    }
+                }
+            }
+            out
+        }
+        Statement::Delete(del) if !del.tables.is_empty() => {
+            let mut names = Vec::new();
+            match &del.from {
+                FromTable::WithFromKeyword(v) | FromTable::WithoutKeyword(v) => {
+                    v.iter().for_each(|t| factors(t, &mut names))
+                }
+            }
+            if let Some(using) = &del.using {
+                using.iter().for_each(|t| factors(t, &mut names));
+            }
+            del.tables
+                .iter()
+                .filter_map(object_name_last)
+                .map(|t| resolve(&names, &t).unwrap_or(t))
+                .collect()
+        }
+        _ => stmt_targets(stmt),
+    };
+    out.sort_unstable_by_key(|t| t.to_ascii_lowercase());
+    out.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+    out
 }
 
 /// The base tables a write/DDL statement targets (that must satisfy its

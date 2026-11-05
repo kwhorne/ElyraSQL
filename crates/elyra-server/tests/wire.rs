@@ -8431,6 +8431,170 @@ async fn rejected_multi_table_lock_does_not_retain_earlier_locks() {
     .unwrap();
 }
 
+/// `LOCK TABLES` as MySQL 8.4 runs it. Another session waited only when it
+/// wrote a locked table the plain way: a `SELECT` of a `WRITE`-locked table,
+/// an `UPDATE` / `DELETE` with a join, the `SELECT` of an `INSERT ... SELECT`,
+/// `CREATE TRIGGER`, and anything under `FLUSH TABLES WITH READ LOCK` but a
+/// single-table write went straight through. A second `LOCK TABLES` kept the
+/// first one's locks, so `READ` never became `WRITE`. And the session holding
+/// the locks could write what it had locked `READ` and use what it had not
+/// locked at all.
+#[tokio::test]
+async fn lock_tables_follow_mysql() {
+    let srv = TestServer::start().await;
+    let mut setup = srv.conn_to_database("locks").await;
+    for sql in [
+        "CREATE TABLE t (id INT PRIMARY KEY, s INT)",
+        "INSERT INTO t VALUES (1, 10), (2, 20)",
+        "CREATE TABLE t2 (id INT PRIMARY KEY, v INT)",
+        "INSERT INTO t2 VALUES (1, 1)",
+        "CREATE VIEW v AS SELECT id, s FROM t",
+    ] {
+        setup.query_drop(sql).await.unwrap();
+    }
+
+    // (locks taken by the holder, the other session's statement, waits?)
+    let others: &[(&[&str], &str, bool)] = &[
+        (&["LOCK TABLES t WRITE"], "SELECT * FROM t", true),
+        (&["LOCK TABLES t WRITE"], "SELECT * FROM v", true),
+        (
+            &["LOCK TABLES t WRITE"],
+            "SELECT (SELECT COUNT(*) FROM t)",
+            true,
+        ),
+        (&["LOCK TABLES t READ"], "SELECT * FROM t", false),
+        (
+            &["LOCK TABLES t READ"],
+            "UPDATE t SET s = s + 1 WHERE id = 1",
+            true,
+        ),
+        (
+            &["LOCK TABLES t READ"],
+            "UPDATE t JOIN t2 ON t.id = t2.id SET t.s = t.s + 1",
+            true,
+        ),
+        (
+            &["LOCK TABLES t READ"],
+            "DELETE t FROM t JOIN t2 ON t.id = t2.id WHERE t.id = 99",
+            true,
+        ),
+        (
+            &["LOCK TABLES t WRITE"],
+            "INSERT INTO t2 SELECT id + 100, s FROM t",
+            true,
+        ),
+        (
+            &["LOCK TABLES t READ"],
+            "CREATE TRIGGER tg BEFORE INSERT ON t FOR EACH ROW SET NEW.s = NEW.s",
+            true,
+        ),
+        (
+            &["LOCK TABLES v READ"],
+            "UPDATE t SET s = s + 1 WHERE id = 1",
+            true,
+        ),
+        (
+            &["LOCK TABLES t READ", "LOCK TABLES t2 READ"],
+            "UPDATE t SET s = s + 1 WHERE id = 1",
+            false,
+        ),
+        (
+            &["LOCK TABLES t READ", "LOCK TABLES t WRITE"],
+            "SELECT * FROM t",
+            true,
+        ),
+        (
+            &["FLUSH TABLES WITH READ LOCK"],
+            "UPDATE t JOIN t2 ON t.id = t2.id SET t.s = t.s + 1",
+            true,
+        ),
+        (&["FLUSH TABLES WITH READ LOCK"], "SELECT * FROM t", false),
+    ];
+    for (locks, sql, waits) in others {
+        let mut holder = srv.conn_to_database("locks").await;
+        let mut other = srv.conn_to_database("locks").await;
+        for lock in *locks {
+            holder.query_drop(*lock).await.unwrap();
+        }
+        let statement = sql.to_string();
+        let mut run = tokio::spawn(async move {
+            let result = other.query_drop(&statement).await;
+            (other, result)
+        });
+        let finished = tokio::time::timeout(std::time::Duration::from_millis(400), &mut run).await;
+        assert_eq!(finished.is_err(), *waits, "{locks:?}, then: {sql}");
+        holder.query_drop("UNLOCK TABLES").await.unwrap();
+        let (_, result) = match finished {
+            Ok(done) => done.unwrap(),
+            Err(_) => run.await.unwrap(),
+        };
+        result.unwrap_or_else(|e| panic!("{locks:?}: {e}"));
+        setup.query_drop("DROP TRIGGER IF EXISTS tg").await.unwrap();
+        setup
+            .query_drop("DELETE FROM t2 WHERE id >= 100")
+            .await
+            .unwrap();
+    }
+
+    // The session holding the locks.
+    let code = |e: mysql_async::Error| match e {
+        mysql_async::Error::Server(e) => e.code,
+        other => panic!("{other}"),
+    };
+    let mut c = srv.conn_to_database("locks").await;
+    c.query_drop("LOCK TABLES t READ").await.unwrap();
+    let wrote = c
+        .query_drop("INSERT INTO t VALUES (9, 9)")
+        .await
+        .unwrap_err();
+    assert_eq!(code(wrote), 1099, "a READ-locked table is not written");
+    let unlocked = c.query_drop("SELECT * FROM t2").await.unwrap_err();
+    assert_eq!(code(unlocked), 1100, "a table not locked is not read");
+    let view = c.query_drop("SELECT * FROM v").await.unwrap_err();
+    assert_eq!(code(view), 1100, "nor a view over a locked table");
+    c.query_drop("WITH x AS (SELECT * FROM t) SELECT * FROM x")
+        .await
+        .unwrap();
+    c.query_drop("SELECT COUNT(*) FROM information_schema.TABLES")
+        .await
+        .unwrap();
+
+    c.query_drop("LOCK TABLES t WRITE, t2 READ").await.unwrap();
+    c.query_drop("UPDATE t JOIN t2 ON t.id = t2.id SET t.s = t2.v")
+        .await
+        .unwrap();
+    let joined = c
+        .query_drop("UPDATE t JOIN t2 ON t.id = t2.id SET t2.v = 1")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        code(joined),
+        1099,
+        "the joined table locked READ is not written"
+    );
+
+    c.query_drop("LOCK TABLES v READ").await.unwrap();
+    c.query_drop("SELECT * FROM t").await.unwrap();
+
+    let twice = c
+        .query_drop("LOCK TABLES t READ, t WRITE")
+        .await
+        .unwrap_err();
+    assert_eq!(code(twice), 1066);
+    let missing = c
+        .query_drop("LOCK TABLES t READ, nosuch READ")
+        .await
+        .unwrap_err();
+    assert_eq!(code(missing), 1146);
+    c.query_drop("INSERT INTO t2 VALUES (5, 5)").await.unwrap();
+
+    c.query_drop("FLUSH TABLES WITH READ LOCK").await.unwrap();
+    c.query_drop("SELECT * FROM t").await.unwrap();
+    let read_lock = c.query_drop("UPDATE t SET s = 0").await.unwrap_err();
+    assert_eq!(code(read_lock), 1223);
+    c.query_drop("UNLOCK TABLES").await.unwrap();
+}
+
 #[tokio::test]
 async fn qualifier_preflight_review_regressions() {
     let srv = TestServer::start().await;
