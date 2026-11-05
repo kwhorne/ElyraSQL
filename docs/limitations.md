@@ -307,9 +307,14 @@ judge fit before deploying.
   case-sensitive `..._as_cs` collation to `utf8mb4_bin`, everything else --
   `utf8mb4_0900_as_ci`, `utf8mb4_unicode_ci`, `latin1_swedish_ci`, ... -- to
   `utf8mb4_0900_ai_ci`. An `_as_ci` column is therefore accent-insensitive,
-  where MySQL's is not. `COLLATE` or `BINARY` inside an expression
-  (`WHERE s COLLATE utf8mb4_bin = 'x'`, `ORDER BY s COLLATE ...`) is not
-  supported (1235).
+  where MySQL's is not. In an expression, `COLLATE` and the `BINARY` operator
+  work as in MySQL -- `WHERE s COLLATE utf8mb4_bin = 'x'`, `WHERE BINARY s =
+  'x'`, `ORDER BY s COLLATE utf8mb4_bin`, `GROUP BY`, `DISTINCT`, `LIKE`, `IN`,
+  `MIN`/`MAX` -- with the same mapping: a `_bin` or `_cs` collation compares
+  exactly, any other `utf8mb4` one as `utf8mb4_0900_ai_ci`. Another character
+  set's collation is 1253, an unknown name 1273, and two different explicit
+  collations in one comparison 1267. `LIKE` folds a character at a time, as
+  MySQL does: `'É' LIKE 'e'` matches, `'æ' LIKE 'ae'` does not.
 - Full-text search: `MATCH(col, ...) AGAINST('terms' [IN BOOLEAN MODE])`
   (natural-language OR-of-terms, or boolean `+`/`-`, with relevance scoring).
   `CREATE FULLTEXT INDEX` builds a persistent inverted index that is maintained

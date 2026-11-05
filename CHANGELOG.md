@@ -6,6 +6,32 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **`COLLATE` and the `BINARY` operator work in expressions.** `WHERE s
+  COLLATE utf8mb4_bin = 'x'`, `ORDER BY s COLLATE ...`, and `BINARY s`, the
+  usual way to compare a column exactly, were refused with 1235 (`BINARY w.s`
+  and `BINARY UPPER(s)` with 1064). They now compare as MySQL does in `WHERE`,
+  `ORDER BY`, `GROUP BY`, `DISTINCT`, `LIKE`, `IN`, `BETWEEN` and `MIN`/`MAX`;
+  an unknown collation is 1273, another character set's 1253, and two
+  different explicit collations in one comparison 1267.
+
+- **A binary string compares with text as bytes.** `CAST(s AS BINARY) =
+  'cafe'` and `CONVERT(s, BINARY) = 'cafe'` matched nothing, and a
+  `VARBINARY` column compared with a string literal fell through to a numeric
+  comparison.
+
+- **`LIKE`, `IN` and `COUNT(DISTINCT)` follow a `utf8mb4_bin` column's
+  collation.** All three compared case-insensitively whatever the column, so
+  `s LIKE 'caf%'` matched `CAFE`, `s NOT IN ('cafe')` returned nothing, and
+  `COUNT(DISTINCT s)` counted `cafe` and `CAFE` once. `MIN`/`MAX` and
+  `GROUP_CONCAT(DISTINCT ...)` follow it too. And `LIKE` on the default
+  collation now folds accents, as MySQL does: `'café' LIKE 'cafe'` was false.
+
+- **`MIN`/`MAX` of a text expression no longer ends the connection.**
+  `MAX(UPPER(s))` and `MIN(CONCAT(a, b))` were declared `DOUBLE`, and the
+  first string result closed the connection.
+
 ## [1.12.11] - 2026-11-05
 
 ### Fixed
