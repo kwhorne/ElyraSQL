@@ -19,11 +19,10 @@
 //! never applied — the property that makes pre-commit (2-phase) replication
 //! safe.
 //!
-//! NOTE: this module is the tested building block. Routing the live cluster
-//! write path through it (leader append -> quorum commit -> apply, with
-//! followers applying up to the leader's commit index) is the remaining
-//! integration work tracked for the full-consensus milestone; today's clusters
-//! use asynchronous replication with the LSN-aware election restriction.
+//! The live cluster write path runs through it (`cluster.rs`): the leader
+//! appends each write, replicates it with AppendEntries, commits it once a
+//! majority has it, and only then applies it and acknowledges the client;
+//! followers apply up to the leader's commit index.
 
 use std::io::{Read, Write};
 use std::path::PathBuf;

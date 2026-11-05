@@ -6,10 +6,10 @@ recommended connection settings per framework so a stock app runs cleanly.
 
 The one setting that matters across drivers: prefer **client-side (emulated)
 prepared statements**. ElyraSQL supports native (binary) prepared statements for
-common query shapes, but a few (e.g. `SELECT *` over `information_schema`) are
-not yet reliable with strict drivers such as PDO/mysqlnd; emulated prepares send
-fully-formed queries and are universally supported. Drivers that already bind
-client-side (PyMySQL, sqlx) need no change.
+common query shapes, but by default `PREPARE` reports no result columns (they
+arrive with each `EXECUTE`; see `ELYRASQL_STMT_DESCRIBE` below); emulated
+prepares send fully-formed queries and are universally supported. Drivers that
+bind client-side (PyMySQL) need no change.
 
 ---
 
