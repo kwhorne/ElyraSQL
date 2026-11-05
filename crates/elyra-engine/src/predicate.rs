@@ -93,9 +93,13 @@ pub(crate) fn unary_value(op: &UnaryOperator, v: Value) -> Result<Value> {
 
 /// Evaluate `expr` against a row. Column identifiers resolve via `schema`.
 pub fn eval_row(expr: &Expr, schema: &Schema, row: &[Value]) -> Result<Value> {
+    let expr_root = expr;
     match expr {
         Expr::Value(v) => literal(v),
         Expr::Nested(e) => eval_row(e, schema, row),
+        // `COLLATE` changes how a value compares, not the value; the comparison
+        // finds it through `cmp_collation`.
+        Expr::Collate { expr, .. } => eval_row(expr, schema, row),
         Expr::Identifier(id) => {
             // System variables: `@@var`, `@@session.var`, `@@global.var`.
             if id.value.starts_with("@@") {
@@ -169,13 +173,20 @@ pub fn eval_row(expr: &Expr, schema: &Schema, row: &[Value]) -> Result<Value> {
             // the result is NULL (UNKNOWN), not FALSE -- e.g. `1 IN (NULL, 2)`.
             let mut found = false;
             let mut saw_null = false;
+            // The column's collation, or an explicit COLLATE on either side: a
+            // `_bin` column compared every item case-insensitively.
+            let coll = list
+                .iter()
+                .map(|item| cmp_collation(expr, item, schema))
+                .find(|c| *c != Collation::Ci)
+                .unwrap_or(Collation::Ci);
             for item in list {
                 let rv = eval_row(item, schema, row)?;
                 if rv.is_null() {
                     saw_null = true;
                     continue;
                 }
-                if v.compare(&rv) == Some(std::cmp::Ordering::Equal) {
+                if v.compare_coll(&rv, coll) == Some(std::cmp::Ordering::Equal) {
                     found = true;
                     break;
                 }
@@ -213,7 +224,10 @@ pub fn eval_row(expr: &Expr, schema: &Schema, row: &[Value]) -> Result<Value> {
             let v = eval_row(expr, schema, row)?;
             let lo = eval_row(low, schema, row)?;
             let hi = eval_row(high, schema, row)?;
-            let coll = expr_collation(expr, schema).unwrap_or(Collation::Ci);
+            let coll = explicit_collation(low)
+                .or_else(|| explicit_collation(high))
+                .or_else(|| expr_collation(expr, schema))
+                .unwrap_or(Collation::Ci);
             // `x BETWEEN a AND b` is `x >= a AND x <= b` with three-valued logic:
             // a NULL bound yields NULL unless the other test already forces FALSE.
             let ge = cmp(&v, &lo, coll)?.map(|o| o.is_ge());
@@ -480,6 +494,7 @@ pub fn eval_row(expr: &Expr, schema: &Schema, row: &[Value]) -> Result<Value> {
             escape_char,
             ..
         } => {
+            let ilike = matches!(expr_root, Expr::ILike { .. });
             let text = eval_row(expr, schema, row)?;
             let pat = eval_row(pattern, schema, row)?;
             if text.is_null() || pat.is_null() {
@@ -492,13 +507,16 @@ pub fn eval_row(expr: &Expr, schema: &Schema, row: &[Value]) -> Result<Value> {
                 None => Some('\\'),
                 Some(s) => s.chars().next(),
             };
-            // Default collation is case-insensitive (utf8mb4_0900_ai_ci), as is
-            // ILIKE, so both match case-insensitively.
+            // The default collation (utf8mb4_0900_ai_ci) matches case- and
+            // accent-insensitively; a `_bin` column or an explicit `COLLATE
+            // utf8mb4_bin` exactly. ILIKE always folds. LIKE used to fold for
+            // every column, and only case.
+            let ci = ilike || cmp_collation(expr, pattern, schema) != Collation::Bin;
             let m = like_eval(
                 &text.to_wire_string().unwrap_or_default(),
                 &pat.to_wire_string().unwrap_or_default(),
                 esc,
-                true,
+                ci,
             );
             Ok(Value::Bool(m != *negated))
         }
@@ -536,7 +554,13 @@ enum LikeTok {
 /// insensitive when `ci` (the default collation). Iterative with `%`
 /// backtracking (no per-row regex compilation).
 fn like_eval(text: &str, pattern: &str, esc: Option<char>, ci: bool) -> bool {
-    let fold = |c: char| if ci { c.to_ascii_lowercase() } else { c };
+    let fold = |c: char| {
+        if ci {
+            elyra_core::value::fold_like_char(c)
+        } else {
+            c
+        }
+    };
     let t: Vec<char> = text.chars().map(fold).collect();
     let esc = esc.map(fold);
     let pchars: Vec<char> = pattern.chars().map(fold).collect();
@@ -3357,7 +3381,8 @@ fn cmp(l: &Value, r: &Value, coll: Collation) -> Result<Option<std::cmp::Orderin
     Ok(l.compare_coll(r, coll))
 }
 
-/// Collation of a bare/qualified column reference, if it is one.
+/// Collation of a bare/qualified column reference, or of an explicit
+/// `COLLATE`, if the expression is one.
 fn expr_collation(e: &Expr, schema: &Schema) -> Option<Collation> {
     let index = match e {
         Expr::Identifier(identifier) => {
@@ -3365,15 +3390,112 @@ fn expr_collation(e: &Expr, schema: &Schema) -> Option<Collation> {
         }
         Expr::CompoundIdentifier(parts) => resolve_index_parts(parts, schema),
         Expr::Nested(inner) => return expr_collation(inner, schema),
+        Expr::Collate { .. } => return explicit_collation(e),
         _ => return None,
     }
     .ok()?;
     schema.columns.get(index).map(|column| column.collation)
 }
 
-/// The comparison collation for two operands: case-sensitive if either is a
-/// binary-collation column, else the default case-insensitive collation.
+/// The collation an explicit `COLLATE` gives an expression, or a binary string
+/// -- `CAST(x AS BINARY)`, which is what `BINARY x` becomes -- compares by.
+/// A name that is no collation was refused before the statement ran
+/// ([`check_collations`]).
+pub(crate) fn explicit_collation(e: &Expr) -> Option<Collation> {
+    use sqlparser::ast::DataType;
+    match e {
+        Expr::Collate { collation, .. } => collation
+            .0
+            .last()
+            .and_then(|name| Collation::explicit(&name.value).ok()),
+        Expr::Cast {
+            data_type: DataType::Binary(_) | DataType::Varbinary(_),
+            ..
+        } => Some(Collation::Bin),
+        Expr::Nested(inner) => explicit_collation(inner),
+        _ => None,
+    }
+}
+
+/// Refuse a `COLLATE` that names no `utf8mb4` collation, as MySQL does before
+/// running the statement (1273, or 1253 for another character set's).
+pub(crate) fn check_collations(stmt: &sqlparser::ast::Statement) -> Result<()> {
+    use sqlparser::ast::Visit;
+    let mut bad = None;
+    let _ = stmt.visit(&mut CollateNames(&mut bad));
+    match bad {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+struct CollateNames<'a>(&'a mut Option<Error>);
+
+impl sqlparser::ast::Visitor for CollateNames<'_> {
+    type Break = ();
+    fn pre_visit_expr(&mut self, e: &Expr) -> std::ops::ControlFlow<()> {
+        if let Expr::Collate { collation, .. } = e {
+            if let Some(name) = collation.0.last() {
+                if let Err(error) = Collation::explicit(&name.value) {
+                    *self.0 = Some(error);
+                    return std::ops::ControlFlow::Break(());
+                }
+            }
+        }
+        // Two different explicit collations cannot be compared (MySQL 1267).
+        let pairs: Vec<(&Expr, &Expr, String)> = match e {
+            Expr::BinaryOp { left, op, right } if is_comparison(op) => {
+                vec![(left, right, op.to_string())]
+            }
+            Expr::Like { expr, pattern, .. } => vec![(expr, pattern, "like".into())],
+            Expr::InList { expr, list, .. } => list
+                .iter()
+                .map(|item| (&**expr, item, "=".into()))
+                .collect(),
+            _ => Vec::new(),
+        };
+        for (left, right, operation) in pairs {
+            if let (Some(l), Some(r)) = (collate_name(left), collate_name(right)) {
+                if !l.eq_ignore_ascii_case(&r) {
+                    *self.0 = Some(Error::CollationMix(l, r, operation));
+                    return std::ops::ControlFlow::Break(());
+                }
+            }
+        }
+        std::ops::ControlFlow::Continue(())
+    }
+}
+
+fn is_comparison(op: &BinaryOperator) -> bool {
+    matches!(
+        op,
+        BinaryOperator::Eq
+            | BinaryOperator::NotEq
+            | BinaryOperator::Lt
+            | BinaryOperator::LtEq
+            | BinaryOperator::Gt
+            | BinaryOperator::GtEq
+            | BinaryOperator::Spaceship
+    )
+}
+
+/// The collation name an explicit `COLLATE` gives, as written in lower case.
+fn collate_name(e: &Expr) -> Option<String> {
+    match e {
+        Expr::Collate { collation, .. } => collation.0.last().map(|n| n.value.to_ascii_lowercase()),
+        Expr::Nested(inner) => collate_name(inner),
+        _ => None,
+    }
+}
+
+/// The comparison collation for two operands. An explicit `COLLATE` on either
+/// decides it, as in MySQL, where it outranks a column's collation; otherwise
+/// case-sensitive if either is a binary-collation column, else the default
+/// case-insensitive collation.
 pub(crate) fn cmp_collation(l: &Expr, r: &Expr, schema: &Schema) -> Collation {
+    if let Some(explicit) = explicit_collation(l).or_else(|| explicit_collation(r)) {
+        return explicit;
+    }
     if matches!(expr_collation(l, schema), Some(Collation::Bin))
         || matches!(expr_collation(r, schema), Some(Collation::Bin))
     {

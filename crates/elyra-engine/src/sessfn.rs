@@ -335,6 +335,7 @@ impl Ctx<'_> {
             }
             Expr::UnaryOp { expr, .. }
             | Expr::Nested(expr)
+            | Expr::Collate { expr, .. }
             | Expr::Cast { expr, .. }
             | Expr::IsNull(expr)
             | Expr::IsNotNull(expr) => self.expr(expr),

@@ -1042,7 +1042,7 @@ impl Engine {
                     ColumnType::Text
                 }
                 Expr::Value(V::Boolean(_)) => ColumnType::Bool,
-                Expr::Nested(inner) => expr_type(inner, col),
+                Expr::Nested(inner) | Expr::Collate { expr: inner, .. } => expr_type(inner, col),
                 Expr::Function(f) => {
                     match f
                         .name
@@ -1943,6 +1943,9 @@ impl Engine {
         if let Some(rewritten) = strip_update_histogram(&subst_sql) {
             subst_sql = Cow::Owned(rewritten);
         }
+        if let Some(rewritten) = rewrite_binary_operator(&subst_sql) {
+            subst_sql = Cow::Owned(rewritten);
+        }
         // `\_` and `\%` keep their backslash, as in MySQL (see the function).
         if let Some(rewritten) = crate::sqllex::keep_like_escapes(&subst_sql) {
             subst_sql = Cow::Owned(rewritten);
@@ -2051,6 +2054,7 @@ impl Engine {
                 rewrite_pipes_to_or(&mut stmt);
             }
             rewrite_introducers(&mut stmt);
+            predicate::check_collations(&stmt)?;
             let need = required_privilege(&stmt);
             let effective = self
                 .effective_privilege(privilege, user, &stmt, sess)
@@ -4946,6 +4950,150 @@ fn strip_sql_no_cache(sql: &str) -> Option<String> {
     Some(out)
 }
 
+/// MySQL's `BINARY expr` operator as `CAST(expr AS BINARY)`, which is what it
+/// means. The parser reads `BINARY s` as a typed string literal whose text is
+/// `s`, losing the column, and `BINARY w.s` or `BINARY UPPER(s)` not at all.
+///
+/// Only in a query or DML statement, and only where an operand can stand: after
+/// an operator, `(`, `,` or a keyword like `WHERE`. The type -- `CAST(x AS
+/// BINARY)`, `CONVERT(x, BINARY)`, `CONVERT(x USING binary)`, `CHARACTER SET
+/// binary`, a `BINARY(16)` in `CONVERT` -- is left alone.
+fn rewrite_binary_operator(sql: &str) -> Option<String> {
+    if !contains_ci(sql, "binary") {
+        return None;
+    }
+    let head = sql.trim_start();
+    if ![
+        "select", "with", "insert", "replace", "update", "delete", "(",
+    ]
+    .iter()
+    .any(|w| head.len() >= w.len() && head[..w.len()].eq_ignore_ascii_case(w))
+    {
+        return None;
+    }
+    let bytes = sql.as_bytes();
+    let code: Vec<usize> = crate::sqllex::code_bytes(sql).map(|c| c.index).collect();
+    let is_code = |i: usize| code.binary_search(&i).is_ok();
+    let word = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$';
+    // End of a literal or quoted identifier starting at `i`: the next code byte.
+    let quoted_end = |i: usize| {
+        code.iter()
+            .find(|&&c| c > i)
+            .copied()
+            .unwrap_or(bytes.len())
+    };
+    let skip_ws = |mut i: usize| {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        i
+    };
+    // End of the operand starting at `i`, or None if it is not one.
+    let operand_end = |i: usize| -> Option<usize> {
+        let b = *bytes.get(i)?;
+        if b == b'(' {
+            return crate::sqllex::matching_paren_end(sql, i);
+        }
+        if b == b'\'' || b == b'"' {
+            return Some(quoted_end(i));
+        }
+        if b == b'@' && bytes.get(i + 1).is_some_and(|&c| word(c)) {
+            let mut j = i + 1;
+            while j < bytes.len() && word(bytes[j]) {
+                j += 1;
+            }
+            return Some(j);
+        }
+        // A name, a qualified name or a function call.
+        let mut j = i;
+        loop {
+            match bytes.get(j) {
+                Some(b'`') => j = quoted_end(j),
+                Some(&c) if word(c) => {
+                    while j < bytes.len() && word(bytes[j]) {
+                        j += 1;
+                    }
+                }
+                _ => return None,
+            }
+            if bytes.get(j) == Some(&b'.') {
+                j += 1;
+                continue;
+            }
+            break;
+        }
+        let after = skip_ws(j);
+        if bytes.get(after) == Some(&b'(') {
+            return crate::sqllex::matching_paren_end(sql, after);
+        }
+        Some(j)
+    };
+    const AFTER_WORDS: &[&str] = &[
+        "select", "where", "and", "or", "xor", "not", "on", "when", "then", "else", "by", "like",
+        "having", "distinct", "all", "between", "is", "regexp", "rlike", "case", "return",
+        "values", "in",
+    ];
+    let mut edits: Vec<(usize, usize, usize)> = Vec::new(); // (keyword, operand, end)
+    for &at in &code {
+        if !crate::sqllex::keyword_at(sql, at, "binary") {
+            continue;
+        }
+        // What precedes it decides whether it is the operator.
+        let mut p = at;
+        while p > 0 && bytes[p - 1].is_ascii_whitespace() {
+            p -= 1;
+        }
+        let operator_position = if p == 0 {
+            false
+        } else if word(bytes[p - 1]) {
+            let mut start = p;
+            while start > 0 && word(bytes[start - 1]) {
+                start -= 1;
+            }
+            is_code(start)
+                && AFTER_WORDS
+                    .iter()
+                    .any(|w| sql[start..p].eq_ignore_ascii_case(w))
+        } else {
+            b"=<>(,+-*/%!|&^~".contains(&bytes[p - 1]) && is_code(p - 1)
+        };
+        if !operator_position {
+            continue;
+        }
+        let start = skip_ws(at + "binary".len());
+        let Some(end) = operand_end(start) else {
+            continue;
+        };
+        // `BINARY(16)` is the type, as in `CONVERT(x, BINARY(16))`.
+        if bytes[start] == b'('
+            && sql[start + 1..end - 1]
+                .trim()
+                .bytes()
+                .all(|c| c.is_ascii_digit())
+        {
+            continue;
+        }
+        if edits.last().is_some_and(|&(_, _, e)| at < e) {
+            continue; // inside the previous rewrite's operand
+        }
+        edits.push((at, start, end));
+    }
+    if edits.is_empty() {
+        return None;
+    }
+    let mut out = String::with_capacity(sql.len() + edits.len() * 16);
+    let mut last = 0;
+    for (at, start, end) in edits {
+        out.push_str(&sql[last..at]);
+        out.push_str("CAST(");
+        out.push_str(&sql[start..end]);
+        out.push_str(" AS BINARY)");
+        last = end;
+    }
+    out.push_str(&sql[last..]);
+    Some(out)
+}
+
 /// `ANALYZE TABLE t UPDATE HISTOGRAM ON c [, ...] [WITH n BUCKETS]` as
 /// `ANALYZE TABLE t`: ElyraSQL's ANALYZE collects every column's statistics,
 /// histogram included, in a set number of buckets. mysqldump writes one for
@@ -6067,6 +6215,9 @@ pub fn fuzz_preprocess_parse(sql: &str) {
         s = x;
     }
     if let Some(x) = strip_update_histogram(&s) {
+        s = x;
+    }
+    if let Some(x) = rewrite_binary_operator(&s) {
         s = x;
     }
     let _ = mysql_show_tail(&s, 2);
@@ -7358,6 +7509,57 @@ mod set_operation_chain_tests {
         // The same protection for the other two set operators.
         assert!(guard_sql_complexity(&chain(50_000, " INTERSECT ")).is_err());
         assert!(guard_sql_complexity(&chain(50_000, " EXCEPT ")).is_err());
+    }
+}
+
+#[cfg(test)]
+mod binary_operator_tests {
+    use super::rewrite_binary_operator;
+
+    #[test]
+    fn the_operator_becomes_a_cast() {
+        for (sql, want) in [
+            (
+                "SELECT id FROM w WHERE BINARY s = 'x'",
+                "SELECT id FROM w WHERE CAST(s AS BINARY) = 'x'",
+            ),
+            (
+                "SELECT 1 FROM w WHERE BINARY w.s = 'x' AND binary `a b`.c = 'y'",
+                "SELECT 1 FROM w WHERE CAST(w.s AS BINARY) = 'x' AND CAST(`a b`.c AS BINARY) = 'y'",
+            ),
+            (
+                "SELECT BINARY UPPER(s), BINARY 'a' = 'A' FROM w",
+                "SELECT CAST(UPPER(s) AS BINARY), CAST('a' AS BINARY) = 'A' FROM w",
+            ),
+            (
+                "UPDATE w SET n = 1 WHERE s LIKE BINARY 'a%'",
+                "UPDATE w SET n = 1 WHERE s LIKE CAST('a%' AS BINARY)",
+            ),
+            (
+                "SELECT 1 FROM w WHERE BINARY (s) = @v",
+                "SELECT 1 FROM w WHERE CAST((s) AS BINARY) = @v",
+            ),
+        ] {
+            assert_eq!(rewrite_binary_operator(sql).as_deref(), Some(want), "{sql}");
+        }
+    }
+
+    #[test]
+    fn the_type_is_left_alone() {
+        for sql in [
+            "SELECT CAST(s AS BINARY) FROM w",
+            "SELECT CONVERT(s, BINARY) FROM w",
+            "SELECT CONVERT(s, BINARY(16)) FROM w",
+            "SELECT CONVERT(s USING binary) FROM w",
+            "SELECT CAST(s AS CHAR CHARACTER SET binary) FROM w",
+            "SELECT 'BINARY s' FROM w",
+            "SELECT `binary` FROM w",
+            "CREATE TABLE t (b BINARY(16), c VARCHAR(5) CHARACTER SET binary)",
+            "ALTER TABLE t MODIFY b BINARY(16)",
+            "SELECT 1 FROM w -- BINARY s",
+        ] {
+            assert_eq!(rewrite_binary_operator(sql), None, "{sql}");
+        }
     }
 }
 

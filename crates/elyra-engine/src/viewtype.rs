@@ -413,7 +413,7 @@ fn typed(expr: &Expr, column_of: &dyn Fn(&Expr) -> Option<ViewColumn>) -> Option
     let ty = |e: &Expr| typed(e, column_of);
     match expr {
         Expr::Identifier(_) | Expr::CompoundIdentifier(_) => column_of(expr),
-        Expr::Nested(inner) => ty(inner),
+        Expr::Nested(inner) | Expr::Collate { expr: inner, .. } => ty(inner),
         Expr::Value(value) => literal(value),
         Expr::UnaryOp { op, expr: inner } => match op {
             UnaryOperator::Not => Some(int(ty(inner)?.nullable)),

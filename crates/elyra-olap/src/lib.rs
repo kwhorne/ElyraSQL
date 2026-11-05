@@ -91,6 +91,10 @@ pub struct AggSpec {
     pub func: AggFunc,
     pub arg_col: Option<usize>,
     pub distinct: bool,
+    /// Collation of the argument: what `DISTINCT` counts as one value and how
+    /// `MIN`/`MAX` order text. A `_bin` column, or `COLLATE utf8mb4_bin`, is
+    /// exact; the default folds case and accents.
+    pub collation: elyra_core::Collation,
     /// GROUP_CONCAT separator (default ",").
     pub separator: Option<String>,
     /// Session `group_concat_max_len` captured when this aggregate plan is
@@ -270,7 +274,7 @@ impl GroupAggregator {
             match self.groups.get_mut(&key) {
                 Some((_, self_accs)) => {
                     for (i, (a, b)) in self_accs.iter_mut().zip(accs).enumerate() {
-                        merge_acc(a, b, self.aggs[i].func);
+                        merge_acc(a, b, &self.aggs[i]);
                     }
                 }
                 None => {
@@ -361,7 +365,7 @@ fn update(acc: &mut Acc, spec: &AggSpec, val: Option<Value>, row: &[Value]) {
             if let Some(v) = val {
                 if !v.is_null() {
                     if distinct {
-                        if acc.distinct.insert(v.collation_key()) {
+                        if acc.distinct.insert(v.collation_key_coll(spec.collation)) {
                             acc.count += 1;
                         }
                     } else {
@@ -373,7 +377,7 @@ fn update(acc: &mut Acc, spec: &AggSpec, val: Option<Value>, row: &[Value]) {
         AggFunc::Sum | AggFunc::Avg => {
             if let Some(v) = val {
                 if let Some(n) = num(&v) {
-                    if distinct && !acc.distinct.insert(v.collation_key()) {
+                    if distinct && !acc.distinct.insert(v.collation_key_coll(spec.collation)) {
                         return;
                     }
                     acc.sum += n;
@@ -424,7 +428,7 @@ fn update(acc: &mut Acc, spec: &AggSpec, val: Option<Value>, row: &[Value]) {
                 if !v.is_null() {
                     let s = v.to_wire_string().unwrap_or_default();
                     let keep = if distinct {
-                        acc.distinct.insert(v.collation_key())
+                        acc.distinct.insert(v.collation_key_coll(spec.collation))
                     } else {
                         true
                     };
@@ -492,7 +496,7 @@ fn update(acc: &mut Acc, spec: &AggSpec, val: Option<Value>, row: &[Value]) {
                 let replace = match &acc.extreme {
                     None => true,
                     Some(cur) => {
-                        let ord = value_cmp(&v, cur);
+                        let ord = v.total_cmp_coll(cur, spec.collation);
                         (func == AggFunc::Min && ord == Ordering::Less)
                             || (func == AggFunc::Max && ord == Ordering::Greater)
                     }
@@ -505,7 +509,8 @@ fn update(acc: &mut Acc, spec: &AggSpec, val: Option<Value>, row: &[Value]) {
     }
 }
 
-fn merge_acc(a: &mut Acc, b: Acc, func: AggFunc) {
+fn merge_acc(a: &mut Acc, b: Acc, spec: &AggSpec) {
+    let func = spec.func;
     a.count += b.count;
     a.sum += b.sum;
     a.sum_sq += b.sum_sq;
@@ -548,9 +553,10 @@ fn merge_acc(a: &mut Acc, b: Acc, func: AggFunc) {
         a.extreme = Some(match a.extreme.take() {
             None => bv,
             Some(av) => {
+                let ord = bv.total_cmp_coll(&av, spec.collation);
                 let keep_b = match func {
-                    AggFunc::Min => value_cmp(&bv, &av) == Ordering::Less,
-                    _ => value_cmp(&bv, &av) == Ordering::Greater, // MAX (others irrelevant)
+                    AggFunc::Min => ord == Ordering::Less,
+                    _ => ord == Ordering::Greater, // MAX (others irrelevant)
                 };
                 if keep_b {
                     bv

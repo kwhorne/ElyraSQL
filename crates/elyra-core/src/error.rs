@@ -175,6 +175,21 @@ pub enum Error {
     #[error("Can't execute the query because you have a conflicting read lock")]
     ConflictingReadLock,
 
+    /// `COLLATE` naming a collation MySQL does not have. MySQL 1273
+    /// (`ER_UNKNOWN_COLLATION`), with its text.
+    #[error("Unknown collation: '{0}'")]
+    UnknownCollation(String),
+
+    /// `COLLATE` naming another character set's collation. MySQL 1253
+    /// (`ER_COLLATION_CHARSET_MISMATCH`), with its text.
+    #[error("COLLATION '{0}' is not valid for CHARACTER SET 'utf8mb4'")]
+    CollationCharset(String),
+
+    /// Two operands with different explicit `COLLATE`s. MySQL 1267
+    /// (`ER_CANT_AGGREGATE_2COLLATIONS`), its text: (left, right, operation).
+    #[error("Illegal mix of collations ({0},EXPLICIT) and ({1},EXPLICIT) for operation '{2}'")]
+    CollationMix(String, String, String),
+
     /// A table named twice in one `LOCK TABLES`. MySQL 1066
     /// (`ER_NONUNIQ_TABLE`), with its text.
     #[error("Not unique table/alias: '{0}'")]
@@ -233,6 +248,9 @@ impl Error {
             Error::TableNotLocked(_) => 1100, // ER_TABLE_NOT_LOCKED
             Error::ConflictingReadLock => 1223, // ER_CANT_UPDATE_WITH_READLOCK
             Error::NotUniqueTable(_) => 1066, // ER_NONUNIQ_TABLE
+            Error::UnknownCollation(_) => 1273, // ER_UNKNOWN_COLLATION
+            Error::CollationCharset(_) => 1253, // ER_COLLATION_CHARSET_MISMATCH
+            Error::CollationMix(..) => 1267, // ER_CANT_AGGREGATE_2COLLATIONS
             _ => 1105,
         }
     }
@@ -260,6 +278,7 @@ impl Error {
             Error::UndeclaredVariable(_) => b"42000",
             Error::RoutineMissing(..) => b"42000",
             Error::NotUniqueTable(_) => b"42000",
+            Error::CollationCharset(_) => b"42000",
             _ => b"HY000",
         }
     }

@@ -70,6 +70,40 @@ impl Collation {
             Collation::Ci
         }
     }
+    /// The collation an explicit `COLLATE name` asks for. Every `utf8mb4`
+    /// collation is accepted -- a binary or case-sensitive one is `Bin`, the
+    /// rest `Ci` -- and `binary`; another character set's collation is MySQL's
+    /// 1253, and a name that is no collation 1273.
+    pub fn explicit(name: &str) -> crate::Result<Collation> {
+        let n = name.to_ascii_lowercase();
+        if n == "binary" {
+            return Ok(Collation::Bin);
+        }
+        if let Some(rest) = n.strip_prefix("utf8mb4_") {
+            let known = rest == "bin"
+                || ["_ci", "_cs", "_bin"].iter().any(|s| rest.ends_with(s))
+                    && rest.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+            return if known {
+                Ok(Collation::from_name(&n))
+            } else {
+                Err(crate::Error::UnknownCollation(name.to_string()))
+            };
+        }
+        const OTHER_CHARSETS: &[&str] = &[
+            "armscii8", "ascii", "big5", "cp1250", "cp1251", "cp1256", "cp1257", "cp850", "cp852",
+            "cp866", "cp932", "dec8", "eucjpms", "euckr", "gb18030", "gb2312", "gbk", "geostd8",
+            "greek", "hebrew", "hp8", "keybcs2", "koi8r", "koi8u", "latin1", "latin2", "latin5",
+            "latin7", "macce", "macroman", "sjis", "swe7", "tis620", "ucs2", "ujis", "utf16",
+            "utf16le", "utf32", "utf8mb3", "utf8",
+        ];
+        match n.split_once('_') {
+            Some((charset, _)) if OTHER_CHARSETS.contains(&charset) => {
+                Err(crate::Error::CollationCharset(name.to_string()))
+            }
+            _ => Err(crate::Error::UnknownCollation(name.to_string())),
+        }
+    }
+
     pub fn is_bin(self) -> bool {
         matches!(self, Collation::Bin)
     }

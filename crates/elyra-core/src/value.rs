@@ -33,6 +33,27 @@ pub fn fold(s: &str) -> String {
     }
 }
 
+/// One character as `LIKE` compares it under the default collation: lower-cased,
+/// and accent-folded where the fold is a single letter (`É` is `e`). MySQL
+/// matches `LIKE` a character at a time, so an expansion does not apply there:
+/// `'æ' LIKE 'ae'` is false and `'æ' LIKE '_'` true.
+pub fn fold_like_char(c: char) -> char {
+    if c.is_ascii() {
+        return c.to_ascii_lowercase();
+    }
+    if let Some(f) = crate::collfold::fold_char(c) {
+        let mut chars = f.chars();
+        if let (Some(single), None) = (chars.next(), chars.next()) {
+            return single;
+        }
+    }
+    let mut lower = c.to_lowercase();
+    match (lower.next(), lower.next()) {
+        (Some(single), None) => single,
+        _ => c,
+    }
+}
+
 /// Case-insensitive ordering of two strings under the default collation, with
 /// an allocation-free fast path for the common all-ASCII case.
 pub fn fold_cmp(a: &str, b: &str) -> Ordering {
@@ -155,6 +176,11 @@ impl Value {
             (Json(a), Text(b)) | (Text(b), Json(a)) => Some(fold_cmp(a, b)),
             (Bool(a), Bool(b)) => Some(a.cmp(b)),
             (Bytes(a), Bytes(b)) => Some(a.cmp(b)),
+            // A binary string against a text one compares as bytes, as in MySQL:
+            // `CAST(s AS BINARY) = 'cafe'` is an exact match. It fell through to
+            // the numeric comparison below and never matched.
+            (Bytes(a), Text(b)) | (Bytes(a), Json(b)) => Some(a.as_slice().cmp(b.as_bytes())),
+            (Text(a), Bytes(b)) | (Json(a), Bytes(b)) => Some(a.as_bytes().cmp(b.as_slice())),
             // Exact integer comparisons (avoid f64 precision loss above 2^53).
             (UInt(a), UInt(b)) => Some(a.cmp(b)),
             (Int(a), Int(b)) => Some(a.cmp(b)),

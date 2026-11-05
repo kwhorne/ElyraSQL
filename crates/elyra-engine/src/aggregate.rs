@@ -676,7 +676,7 @@ pub fn build_plan(
                     name: alias.unwrap_or_else(|| expr.to_string()),
                     ty: infer_computed_type(expr, schema),
                     nullable: true,
-                    collation: ci,
+                    collation: crate::predicate::explicit_collation(expr).unwrap_or(ci),
                     qualifier: Vec::new(),
                     result_metadata: Default::default(),
                 });
@@ -694,7 +694,7 @@ pub fn build_plan(
             name: alias.unwrap_or_else(|| expr.to_string()),
             ty: infer_computed_type(expr, schema),
             nullable: true,
-            collation: ci,
+            collation: crate::predicate::explicit_collation(expr).unwrap_or(ci),
             qualifier: Vec::new(),
             result_metadata: Default::default(),
         });
@@ -717,14 +717,14 @@ pub fn build_plan(
 
     let group_collations: Vec<elyra_core::Collation> = group_cols
         .iter()
-        .map(|&c| {
-            // Appended computed group columns (index past the base schema) have
-            // no stored collation; default to case-insensitive.
-            schema
-                .columns
-                .get(c)
-                .map(|col| col.collation)
-                .unwrap_or(elyra_core::Collation::Ci)
+        .map(|&c| match schema.columns.get(c) {
+            Some(col) => col.collation,
+            // An appended computed group column has no stored collation: an
+            // explicit `COLLATE` gives it one, else case-insensitive.
+            None => arg_exprs
+                .get(c - schema.columns.len())
+                .and_then(crate::predicate::explicit_collation)
+                .unwrap_or(elyra_core::Collation::Ci),
         })
         .collect();
     let out_tables = plan
@@ -851,7 +851,14 @@ fn register_agg(
             }
             other => other.unwrap_or(ColumnType::Float),
         },
-        AggFunc::Min | AggFunc::Max => arg_ty.unwrap_or(ColumnType::Float),
+        // MIN and MAX return one of their values, so they are typed as the
+        // argument. An expression that is not numeric was declared DOUBLE, and
+        // `MAX(UPPER(s))` ended the connection when a string came back.
+        AggFunc::Min | AggFunc::Max => arg_ty.unwrap_or_else(|| {
+            arg_expr
+                .map(|e| infer_computed_type(e, schema))
+                .unwrap_or(ColumnType::Float)
+        }),
     };
     let mut order = Vec::new();
     for (e, asc) in agg_order(f) {
@@ -865,11 +872,18 @@ fn register_agg(
         };
         order.push((idx, asc));
     }
+    let collation = arg_expr
+        .and_then(|e| {
+            crate::predicate::explicit_collation(e)
+                .or_else(|| ident_index(e, schema).map(|ci| schema.columns[ci].collation))
+        })
+        .unwrap_or_default();
     let slot = aggs.len();
     aggs.push(AggSpec {
         func,
         arg_col: arg,
         distinct,
+        collation,
         separator: agg_separator(f),
         group_concat_max_len: None,
         facet_top: facet_top_of(f),
@@ -887,6 +901,7 @@ fn contains_aggregate(expr: &Expr) -> bool {
     }
     match expr {
         Expr::Nested(e)
+        | Expr::Collate { expr: e, .. }
         | Expr::UnaryOp { expr: e, .. }
         | Expr::Cast { expr: e, .. }
         | Expr::IsNull(e)
@@ -972,6 +987,7 @@ fn rewrite_aggregates(
     let mut e = expr.clone();
     match &mut e {
         Expr::Nested(inner)
+        | Expr::Collate { expr: inner, .. }
         | Expr::UnaryOp { expr: inner, .. }
         | Expr::Cast { expr: inner, .. } => {
             **inner = rewrite_aggregates(inner, schema, aggs, arg_exprs, agg_types)?;
@@ -1043,7 +1059,7 @@ const MAX_DECIMAL_PRECISION: u8 = 65;
 fn is_integer_expr(expr: &Expr, schema: &Schema) -> bool {
     use sqlparser::ast::BinaryOperator::*;
     match expr {
-        Expr::Nested(e) => is_integer_expr(e, schema),
+        Expr::Nested(e) | Expr::Collate { expr: e, .. } => is_integer_expr(e, schema),
         Expr::UnaryOp {
             op: sqlparser::ast::UnaryOperator::Plus | sqlparser::ast::UnaryOperator::Minus,
             expr: e,
@@ -1078,7 +1094,7 @@ fn is_integer_expr(expr: &Expr, schema: &Schema) -> bool {
 fn decimal_scale_of(expr: &Expr, schema: &Schema) -> Option<u8> {
     use sqlparser::ast::BinaryOperator::*;
     match expr {
-        Expr::Nested(e) => decimal_scale_of(e, schema),
+        Expr::Nested(e) | Expr::Collate { expr: e, .. } => decimal_scale_of(e, schema),
         Expr::UnaryOp {
             op: sqlparser::ast::UnaryOperator::Plus | sqlparser::ast::UnaryOperator::Minus,
             expr: e,
@@ -1219,7 +1235,7 @@ fn infer_computed_type(expr: &Expr, schema: &Schema) -> ColumnType {
                 }
             }
         }
-        Expr::Nested(e) => infer_computed_type(e, schema),
+        Expr::Nested(e) | Expr::Collate { expr: e, .. } => infer_computed_type(e, schema),
         // A CASE is as exact as the branch it returns; take the first branch
         // that says anything definite, which is how the value will be typed too.
         Expr::Case {

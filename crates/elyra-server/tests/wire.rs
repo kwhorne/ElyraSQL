@@ -8431,6 +8431,131 @@ async fn rejected_multi_table_lock_does_not_retain_earlier_locks() {
     .unwrap();
 }
 
+/// Collation as MySQL 8.4 applies it. `COLLATE` in an expression and the
+/// `BINARY` operator were refused (1235, or 1064 for `BINARY w.s`); a binary
+/// string never equalled a text one, so `CAST(s AS BINARY) = 'cafe'` matched
+/// nothing; `LIKE`, `IN` and `COUNT(DISTINCT)` on a `utf8mb4_bin` column
+/// ignored case; `LIKE` on the default collation did not fold accents; and
+/// `MAX(UPPER(s))` ended the connection. Each answer is MySQL's.
+#[tokio::test]
+async fn collation_in_expressions_follows_mysql() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    for sql in [
+        "CREATE TABLE w (id INT PRIMARY KEY, s VARCHAR(20), KEY ks (s))",
+        "INSERT INTO w VALUES (1,'café'),(2,'cafe'),(3,'CAFE'),(4,'æble'),(5,'aeble')",
+        "CREATE TABLE wb (id INT PRIMARY KEY, s VARCHAR(20) COLLATE utf8mb4_bin)",
+        "INSERT INTO wb VALUES (1,'café'),(2,'cafe'),(3,'CAFE'),(4,'Cafe')",
+    ] {
+        c.query_drop(sql).await.unwrap();
+    }
+    let ids = |rows: Vec<i64>| {
+        rows.iter()
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    for (sql, want) in [
+        (
+            "SELECT id FROM w WHERE s COLLATE utf8mb4_bin = 'cafe' ORDER BY id",
+            "2",
+        ),
+        (
+            "SELECT id FROM w WHERE s = 'cafe' COLLATE utf8mb4_bin ORDER BY id",
+            "2",
+        ),
+        (
+            "SELECT id FROM w WHERE s > 'cafe' COLLATE utf8mb4_bin ORDER BY id",
+            "1,4",
+        ),
+        (
+            "SELECT id FROM w WHERE s IN ('cafe' COLLATE utf8mb4_bin) ORDER BY id",
+            "2",
+        ),
+        (
+            "SELECT id FROM w WHERE s COLLATE utf8mb4_bin LIKE 'caf%' ORDER BY id",
+            "1,2",
+        ),
+        ("SELECT id FROM w WHERE BINARY s = 'cafe' ORDER BY id", "2"),
+        (
+            "SELECT id FROM w WHERE BINARY w.s = 'cafe' ORDER BY id",
+            "2",
+        ),
+        (
+            "SELECT id FROM w WHERE BINARY UPPER(s) = 'CAFE' ORDER BY id",
+            "2,3",
+        ),
+        ("SELECT id FROM w WHERE s = BINARY 'cafe' ORDER BY id", "2"),
+        (
+            "SELECT id FROM w WHERE CAST(s AS BINARY) = 'cafe' ORDER BY id",
+            "2",
+        ),
+        ("SELECT id FROM w WHERE s LIKE 'CAF_' ORDER BY id", "1,2,3"),
+        (
+            "SELECT id FROM w ORDER BY s COLLATE utf8mb4_bin, id",
+            "3,5,2,1,4",
+        ),
+        (
+            "SELECT id FROM wb WHERE s COLLATE utf8mb4_0900_ai_ci = 'cafe' ORDER BY id",
+            "1,2,3,4",
+        ),
+        ("SELECT id FROM wb WHERE s LIKE 'caf%' ORDER BY id", "1,2"),
+        (
+            "SELECT id FROM wb WHERE s IN ('cafe', 'x') ORDER BY id",
+            "2",
+        ),
+        (
+            "SELECT id FROM wb WHERE s NOT IN ('cafe') ORDER BY id",
+            "1,3,4",
+        ),
+    ] {
+        let rows: Vec<i64> = c.query(sql).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+        assert_eq!(ids(rows), want, "{sql}");
+    }
+    for (sql, want) in [
+        ("SELECT COUNT(DISTINCT s) FROM wb", 4),
+        ("SELECT COUNT(DISTINCT s COLLATE utf8mb4_bin) FROM w", 5),
+        (
+            "SELECT COUNT(*) FROM (SELECT DISTINCT s COLLATE utf8mb4_bin AS k FROM w) d",
+            5,
+        ),
+        (
+            "SELECT COUNT(*) FROM (SELECT s COLLATE utf8mb4_bin AS k FROM w GROUP BY k) g",
+            5,
+        ),
+        ("SELECT CAST('a' AS BINARY) = 'a'", 1),
+        ("SELECT BINARY 'a' = 'A'", 0),
+    ] {
+        let n: Option<i64> = c
+            .query_first(sql)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+        assert_eq!(n, Some(want), "{sql}");
+    }
+    let max: Option<String> = c.query_first("SELECT MAX(UPPER(s)) FROM w").await.unwrap();
+    assert_eq!(max.as_deref(), Some("CAFÉ"));
+    let max: Option<String> = c
+        .query_first("SELECT MAX(s COLLATE utf8mb4_bin) FROM w")
+        .await
+        .unwrap();
+    assert_eq!(max.as_deref(), Some("æble"));
+
+    for (sql, code) in [
+        ("SELECT 'a' COLLATE nosuch_ci", 1273),
+        ("SELECT 'a' COLLATE latin1_bin", 1253),
+        (
+            "SELECT 'a' COLLATE utf8mb4_bin = 'a' COLLATE utf8mb4_0900_ai_ci",
+            1267,
+        ),
+    ] {
+        let error = c.query_drop(sql).await.unwrap_err();
+        assert!(
+            matches!(error, mysql_async::Error::Server(ref e) if e.code == code),
+            "{sql}: {error}"
+        );
+    }
+}
+
 /// `LOCK TABLES` as MySQL 8.4 runs it. Another session waited only when it
 /// wrote a locked table the plain way: a `SELECT` of a `WRITE`-locked table,
 /// an `UPDATE` / `DELETE` with a join, the `SELECT` of an `INSERT ... SELECT`,

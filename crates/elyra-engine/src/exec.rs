@@ -11423,6 +11423,11 @@ fn as_range(
     if !matches!(op, Gt | GtEq | Lt | LtEq) {
         return Ok(None);
     }
+    if predicate::explicit_collation(left).is_some()
+        || predicate::explicit_collation(right).is_some()
+    {
+        return Ok(None);
+    }
     let col_of = |n: &str| {
         def.schema
             .columns
@@ -11478,6 +11483,10 @@ fn as_between(def: &TableDef, expr: &Expr) -> Result<Option<(usize, Value, Value
     let Some(col) = ident_name(e).and_then(col_of) else {
         return Ok(None);
     };
+    if predicate::explicit_collation(low).is_some() || predicate::explicit_collation(high).is_some()
+    {
+        return Ok(None);
+    }
     let c = &def.schema.columns[col];
     match (eval_expr(low), eval_expr(high)) {
         (Ok(lo), Ok(hi)) => match (
@@ -13925,7 +13934,9 @@ fn collect_refs<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) -> bool {
             true
         }
         Expr::Value(_) => true,
-        Expr::Nested(e) | Expr::UnaryOp { expr: e, .. } => collect_refs(e, out),
+        Expr::Nested(e) | Expr::Collate { expr: e, .. } | Expr::UnaryOp { expr: e, .. } => {
+            collect_refs(e, out)
+        }
         Expr::IsNull(e) | Expr::IsNotNull(e) => collect_refs(e, out),
         Expr::BinaryOp { left, right, .. } => collect_refs(left, out) && collect_refs(right, out),
         Expr::Between {
@@ -13985,6 +13996,11 @@ fn eq_col_literal(def: &TableDef, filter: Option<&Expr>) -> Result<Option<(usize
         (None, Some(n)) => (n, left),
         _ => return Ok(None),
     };
+    // An index orders by the column's collation; a literal with another one
+    // is compared by the filter instead.
+    if predicate::explicit_collation(lit_expr).is_some() {
+        return Ok(None);
+    }
     let Some(idx) = def
         .schema
         .columns
@@ -14016,6 +14032,11 @@ fn eq_col_literal(def: &TableDef, filter: Option<&Expr>) -> Result<Option<(usize
 /// forms like `-5` (a unary minus over a literal) and `TRUE` are handled with the
 /// same semantics the interpreter uses.
 fn literal_value(e: &Expr) -> Option<Value> {
+    // A `COLLATE` literal is not looked up through an index built for the
+    // column's own collation; the filter compares it under the one it names.
+    if predicate::explicit_collation(e).is_some() {
+        return None;
+    }
     static EMPTY: std::sync::OnceLock<Schema> = std::sync::OnceLock::new();
     let schema = EMPTY.get_or_init(|| Schema::new(Vec::new()));
     predicate::eval_row(e, schema, &[]).ok()
@@ -16910,7 +16931,9 @@ fn project_exprs(
                         .map(infer_val)
                         .unwrap_or(ColumnType::Text),
                     true,
-                    elyra_core::Collation::Ci,
+                    // `x COLLATE utf8mb4_bin AS k` keeps its collation, so
+                    // `DISTINCT` and `ORDER BY k` compare it that way.
+                    predicate::explicit_collation(e).unwrap_or(elyra_core::Collation::Ci),
                 ),
             },
         };
@@ -17169,7 +17192,9 @@ fn collect_agg_exprs(e: &Expr, out: &mut Vec<Expr>) {
             collect_agg_exprs(left, out);
             collect_agg_exprs(right, out);
         }
-        Expr::Nested(x) | Expr::UnaryOp { expr: x, .. } => collect_agg_exprs(x, out),
+        Expr::Nested(x) | Expr::Collate { expr: x, .. } | Expr::UnaryOp { expr: x, .. } => {
+            collect_agg_exprs(x, out)
+        }
         _ => {}
     }
 }
@@ -17790,7 +17815,15 @@ async fn window_select(
             name: planned.name.clone(),
             ty,
             nullable: source.is_none_or(|column| column.nullable),
-            collation: source.map_or(elyra_core::Collation::Ci, |column| column.collation),
+            collation: source.map_or_else(
+                || match &planned.evaluator {
+                    Out::Plain(e) | Out::Mixed(e) => {
+                        predicate::explicit_collation(e).unwrap_or(elyra_core::Collation::Ci)
+                    }
+                    _ => elyra_core::Collation::Ci,
+                },
+                |column| column.collation,
+            ),
             qualifier: Vec::new(),
             result_metadata: source.map_or_else(Default::default, |column| column.result_metadata),
         });
@@ -17908,9 +17941,10 @@ fn resolve_over_in_expr(e: &mut Expr, defs: &WindowDefs) -> Result<()> {
             resolve_over_in_expr(left, defs)?;
             resolve_over_in_expr(right, defs)
         }
-        Expr::UnaryOp { expr, .. } | Expr::Nested(expr) | Expr::Cast { expr, .. } => {
-            resolve_over_in_expr(expr, defs)
-        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::Nested(expr)
+        | Expr::Collate { expr, .. }
+        | Expr::Cast { expr, .. } => resolve_over_in_expr(expr, defs),
         _ => Ok(()),
     }
 }
@@ -22725,6 +22759,10 @@ fn resolve_subqueries<'a>(
                 expr: Box::new(resolve_subqueries(db, vindex, *expr).await?),
             },
             Expr::Nested(e) => Expr::Nested(Box::new(resolve_subqueries(db, vindex, *e).await?)),
+            Expr::Collate { expr, collation } => Expr::Collate {
+                expr: Box::new(resolve_subqueries(db, vindex, *expr).await?),
+                collation,
+            },
             Expr::Between {
                 expr,
                 negated,
@@ -25036,6 +25074,7 @@ fn collect_col_refs(e: &Expr, schema: &Schema, out: &mut Vec<usize>) -> bool {
         }
         Expr::UnaryOp { expr, .. }
         | Expr::Nested(expr)
+        | Expr::Collate { expr, .. }
         | Expr::IsNull(expr)
         | Expr::IsNotNull(expr)
         | Expr::IsTrue(expr)
@@ -25331,6 +25370,9 @@ fn expr_collation(e: &Expr, schema: &Schema) -> elyra_core::Collation {
         Expr::Identifier(id) => predicate::resolve_index(&id.value, schema).ok(),
         Expr::CompoundIdentifier(parts) => predicate::resolve_index_parts(parts, schema).ok(),
         Expr::Nested(inner) => return expr_collation(inner, schema),
+        Expr::Collate { .. } => {
+            return predicate::explicit_collation(e).unwrap_or(elyra_core::Collation::Ci)
+        }
         _ => None,
     };
     index
