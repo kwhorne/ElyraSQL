@@ -11337,6 +11337,209 @@ async fn affected_rows_follow_mysql_changed_row_counts() {
     affected!("DELETE FROM ar WHERE id=4", 1, "deleted");
 }
 
+/// `INSERT IGNORE` and `REPLACE` checked only the primary key: `INSERT IGNORE`
+/// wrote a row that duplicated a unique key, and `REPLACE` wrote it beside the
+/// row it should have replaced, so the unique key held two rows. And `REPLACE`
+/// never applied a foreign key's `ON DELETE` to the row it replaced. Each case
+/// as MySQL 8.4 answers it: the affected rows, then the table.
+#[tokio::test]
+async fn insert_ignore_and_replace_honour_unique_keys() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    let cases: &[(&str, &str, &str, u64, &str)] = &[
+        // (table, seed, statement, affected, rows after)
+        (
+            "pk",
+            "(1,'a'),(2,'b')",
+            "INSERT IGNORE INTO t VALUES (3,'a')",
+            0,
+            "1a 2b",
+        ),
+        (
+            "pk",
+            "(1,'a'),(2,'b')",
+            "INSERT IGNORE INTO t VALUES (3,'c'),(4,'c'),(5,'d')",
+            2,
+            "1a 2b 3c 5d",
+        ),
+        (
+            "pk",
+            "(1,'a'),(2,'b')",
+            "INSERT IGNORE INTO t VALUES (3,'A')",
+            0,
+            "1a 2b",
+        ),
+        (
+            "pk",
+            "(1,'a'),(2,'b')",
+            "INSERT IGNORE INTO t VALUES (1,'z'),(9,'z')",
+            1,
+            "1a 2b 9z",
+        ),
+        (
+            "pk",
+            "(1,'a'),(2,'b')",
+            "INSERT IGNORE INTO t SELECT id + 10, e FROM t",
+            0,
+            "1a 2b",
+        ),
+        (
+            "pk",
+            "(1,'a'),(2,'b')",
+            "REPLACE INTO t VALUES (3,'a')",
+            2,
+            "2b 3a",
+        ),
+        (
+            "pk",
+            "(1,'a'),(2,'b')",
+            "REPLACE INTO t VALUES (1,'b')",
+            3,
+            "1b",
+        ),
+        (
+            "pk",
+            "(1,'a'),(2,'b')",
+            "REPLACE INTO t VALUES (1,'a')",
+            2,
+            "1a 2b",
+        ),
+        (
+            "pk",
+            "(1,'a'),(2,'b')",
+            "REPLACE INTO t VALUES (5,'a'),(1,'q')",
+            3,
+            "1q 2b 5a",
+        ),
+        (
+            "pk",
+            "(1,'a'),(2,'b')",
+            "REPLACE INTO t VALUES (3,'c'),(4,'c')",
+            3,
+            "1a 2b 4c",
+        ),
+        (
+            "nopk",
+            "(1,'a'),(2,'b')",
+            "INSERT IGNORE INTO t VALUES (3,'a')",
+            0,
+            "1a 2b",
+        ),
+        (
+            "nopk",
+            "(1,'a'),(2,'b')",
+            "INSERT IGNORE INTO t VALUES (3,'c'),(4,'c')",
+            1,
+            "1a 2b 3c",
+        ),
+        (
+            "nopk",
+            "(1,'a'),(2,'b')",
+            "REPLACE INTO t VALUES (3,'a')",
+            2,
+            "2b 3a",
+        ),
+        (
+            "nopk",
+            "(1,'a'),(2,'b')",
+            "REPLACE INTO t VALUES (3,NULL)",
+            1,
+            "1a 2b 3-",
+        ),
+    ];
+    for (shape, seed, sql, want_affected, want_rows) in cases {
+        c.query_drop("DROP TABLE IF EXISTS t").await.unwrap();
+        c.query_drop(match *shape {
+            "pk" => "CREATE TABLE t (id INT PRIMARY KEY, e VARCHAR(20), UNIQUE KEY ue (e))",
+            _ => "CREATE TABLE t (id INT, e VARCHAR(20), UNIQUE KEY ue (e))",
+        })
+        .await
+        .unwrap();
+        c.query_drop(format!("INSERT INTO t VALUES {seed}"))
+            .await
+            .unwrap();
+        c.query_drop(*sql)
+            .await
+            .unwrap_or_else(|e| panic!("{shape}: {sql}: {e}"));
+        assert_eq!(c.affected_rows(), *want_affected, "{shape}: {sql}");
+        let rows: Vec<(i64, Option<String>)> =
+            c.query("SELECT id, e FROM t ORDER BY id").await.unwrap();
+        let rows = rows
+            .iter()
+            .map(|(id, e)| format!("{id}{}", e.as_deref().unwrap_or("-")))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(rows, *want_rows, "{shape}: {sql}");
+    }
+
+    // A composite unique key, as reported: the duplicate was written.
+    c.query_drop(
+        "CREATE TABLE ab (id INT PRIMARY KEY AUTO_INCREMENT, a VARCHAR(32), b INT, \
+         UNIQUE KEY u (a, b))",
+    )
+    .await
+    .unwrap();
+    c.query_drop("INSERT INTO ab (a, b) VALUES ('x', 1)")
+        .await
+        .unwrap();
+    let dup = c
+        .query_drop("INSERT INTO ab (a, b) VALUES ('x', 1)")
+        .await
+        .unwrap_err();
+    assert!(matches!(dup, mysql_async::Error::Server(ref e) if e.code == 1062));
+    c.query_drop("INSERT IGNORE INTO ab (a, b) VALUES ('x', 1), ('x', 2), ('x', 2)")
+        .await
+        .unwrap();
+    assert_eq!(c.affected_rows(), 1);
+    let n: Option<i64> = c.query_first("SELECT COUNT(*) FROM ab").await.unwrap();
+    assert_eq!(n, Some(2));
+
+    // REPLACE deletes the replaced row as DELETE would: RESTRICT refuses it,
+    // CASCADE deletes its children, also when the replacement is identical.
+    for (action, sql, outcome) in [
+        ("RESTRICT", "REPLACE INTO p VALUES (9,'a')", "refused"),
+        ("RESTRICT", "REPLACE INTO p VALUES (1,'z')", "refused"),
+        ("CASCADE", "REPLACE INTO p VALUES (9,'a')", "10 gone"),
+        ("CASCADE", "REPLACE INTO p VALUES (1,'a')", "10 gone"),
+        ("SET NULL", "REPLACE INTO p VALUES (1,'z')", "10 orphaned"),
+    ] {
+        c.query_drop("DROP TABLE IF EXISTS ch").await.unwrap();
+        c.query_drop("DROP TABLE IF EXISTS p").await.unwrap();
+        c.query_drop("CREATE TABLE p (id INT PRIMARY KEY, e VARCHAR(10), UNIQUE KEY ue (e))")
+            .await
+            .unwrap();
+        c.query_drop(format!(
+            "CREATE TABLE ch (id INT PRIMARY KEY, pid INT, \
+             FOREIGN KEY (pid) REFERENCES p(id) ON DELETE {action})"
+        ))
+        .await
+        .unwrap();
+        c.query_drop("INSERT INTO p VALUES (1,'a'),(2,'b')")
+            .await
+            .unwrap();
+        c.query_drop("INSERT INTO ch VALUES (10,1),(20,2)")
+            .await
+            .unwrap();
+        let result = c.query_drop(sql).await;
+        let children: Vec<(i64, Option<i64>)> =
+            c.query("SELECT id, pid FROM ch ORDER BY id").await.unwrap();
+        match outcome {
+            "refused" => {
+                assert!(result.is_err(), "{action}: {sql}");
+                assert_eq!(children, vec![(10, Some(1)), (20, Some(2))]);
+            }
+            "10 gone" => {
+                result.unwrap();
+                assert_eq!(children, vec![(20, Some(2))], "{action}: {sql}");
+            }
+            _ => {
+                result.unwrap();
+                assert_eq!(children, vec![(10, None), (20, Some(2))], "{action}: {sql}");
+            }
+        }
+    }
+}
+
 // Prepared statements are capped server-wide (MySQL's max_prepared_stmt_count),
 // so the slot MUST be returned when a statement is closed. Preparing far more
 // distinct statements than the limit (the driver evicts and closes as it goes)

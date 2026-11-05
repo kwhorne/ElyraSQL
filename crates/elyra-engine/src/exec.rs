@@ -5899,6 +5899,50 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
     if on_dup && index::has_unique(&def) {
         remap_unique_upsert_conflicts(db, &def, &mut built).await?;
     }
+    // INSERT IGNORE skips a row that collides on any unique key, not only the
+    // primary key: checking the primary key alone wrote the duplicate.
+    if ignore && !on_dup && index::has_unique(&def) {
+        built = skip_unique_conflicts(db, &def, built).await?;
+    }
+    // REPLACE deletes every row the new row collides with, as a DELETE would,
+    // then writes it; it is resolved here, row by row, instead of in pass 2.
+    let mut replaced = None;
+    if replace {
+        let children = referencing_children(db, &name).await?;
+        let has_delete_triggers = trigs.iter().any(|t| t.event == catalog::TrigEvent::Delete);
+        let plan = replace_conflicts(
+            db,
+            &def,
+            std::mem::take(&mut built),
+            children.is_empty() && !has_delete_triggers,
+        )
+        .await?;
+        let mut cascade_puts = Vec::new();
+        let mut wcounts = vec![name.clone()];
+        if db.foreign_key_checks() && !plan.removed.is_empty() {
+            let scheduled = plan.removed.iter().map(|(k, _)| k.clone()).collect();
+            cascade_parent_delete(
+                db,
+                &def,
+                &plan.removed,
+                &mut cascade_puts,
+                &mut deletes,
+                &mut wcounts,
+                Some(&scheduled),
+            )
+            .await?;
+        }
+        for (key, row) in &plan.removed {
+            deletes.extend(index::entry_keys_for_row(&def, row, key)?);
+            deletes.push(key.clone());
+        }
+        for t in wcounts.iter().filter(|t| !t.eq_ignore_ascii_case(&name)) {
+            cascade_puts.push(bump_wcount(db, t).await?);
+        }
+        batch = plan.rows;
+        affected = plan.affected;
+        replaced = Some(cascade_puts);
+    }
 
     // Fast path: a plain INSERT (no IGNORE/REPLACE/ON DUPLICATE) into a PK
     // table outside a transaction detects duplicates inside the write
@@ -5958,7 +6002,7 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
 
     // One batched existence read for the whole statement (PK tables) instead of
     // a read per row — the bulk-insert hot path.
-    let clustered_conflicts = has_pk || (on_dup && index::has_unique(&def));
+    let clustered_conflicts = !replace && (has_pk || (on_dup && index::has_unique(&def)));
     let existing: Vec<Option<Vec<u8>>> = if clustered_conflicts {
         let keys: Vec<Vec<u8>> = built.iter().map(|(k, _)| k.clone()).collect();
         db.multi_get(keys).await?
@@ -6035,6 +6079,7 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
 
     // Materialise the batch into data + index puts.
     let mut puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(batch.len() + 2);
+    puts.extend(replaced.unwrap_or_default());
     for (key, row) in &batch {
         let encoded = bincode::serialize(row).map_err(|e| Error::Storage(e.to_string()))?;
         puts.push((key.clone(), encoded));
@@ -6154,6 +6199,167 @@ async fn remap_unique_upsert_conflicts(
         }
     }
     Ok(())
+}
+
+/// The rows of an `INSERT IGNORE` that are written: a row is skipped when its
+/// primary key or any unique key is already taken, in storage or by an earlier
+/// row of the statement. A NULL in a unique key never collides.
+async fn skip_unique_conflicts(
+    db: &Session,
+    def: &TableDef,
+    built: Vec<(Vec<u8>, Vec<Value>)>,
+) -> Result<Vec<(Vec<u8>, Vec<Value>)>> {
+    let probes = built
+        .iter()
+        .map(|(_, row)| index::unique_probe_keys(def, row))
+        .collect::<Result<Vec<_>>>()?;
+    let flat = probes.iter().flatten().cloned().collect::<Vec<_>>();
+    let taken: std::collections::HashSet<Vec<u8>> = flat
+        .iter()
+        .cloned()
+        .zip(db.multi_get(flat.clone()).await?)
+        .filter_map(|(probe, owner)| owner.map(|_| probe))
+        .collect();
+    let stored = if def.has_pk() {
+        db.multi_get(built.iter().map(|(key, _)| key.clone()).collect())
+            .await?
+    } else {
+        vec![None; built.len()]
+    };
+    let mut keys = std::collections::HashSet::new();
+    let mut claimed = std::collections::HashSet::new();
+    let mut kept = Vec::with_capacity(built.len());
+    for (((key, row), row_probes), stored) in built.into_iter().zip(probes).zip(stored) {
+        let collides = stored.is_some()
+            || (def.has_pk() && keys.contains(&key))
+            || row_probes
+                .iter()
+                .any(|p| taken.contains(p) || claimed.contains(p));
+        if collides {
+            continue;
+        }
+        if def.has_pk() {
+            keys.insert(key.clone());
+        }
+        claimed.extend(row_probes);
+        kept.push((key, row));
+    }
+    Ok(kept)
+}
+
+/// What a `REPLACE` writes, deletes and reports.
+struct ReplacePlan {
+    /// The rows to write.
+    rows: Vec<(Vec<u8>, Vec<Value>)>,
+    /// Stored rows it deletes, for their index entries and foreign keys.
+    removed: Vec<(Vec<u8>, Vec<Value>)>,
+    affected: u64,
+}
+
+/// Resolve a `REPLACE` the way MySQL runs it: each row, in order, first
+/// deletes every row it collides with -- on the primary key or any unique key,
+/// stored or written earlier by the statement -- and is then written. Each
+/// write and each delete is an affected row.
+///
+/// When the table has one unique key (the primary key, or a single unique key
+/// without one), nothing references it and it has no delete trigger, MySQL
+/// updates the colliding row in place instead, and a row replaced by an
+/// identical one counts 1, not 2 (`in_place`).
+async fn replace_conflicts(
+    db: &Session,
+    def: &TableDef,
+    built: Vec<(Vec<u8>, Vec<Value>)>,
+    no_delete_side_effects: bool,
+) -> Result<ReplacePlan> {
+    let unique_secondaries = def.indexes.iter().filter(|i| i.unique && !i.vector).count();
+    let unique_keys = unique_secondaries + usize::from(def.has_pk());
+    let in_place = no_delete_side_effects && unique_keys == 1;
+
+    let probes = built
+        .iter()
+        .map(|(_, row)| index::unique_probe_keys(def, row))
+        .collect::<Result<Vec<_>>>()?;
+    let flat = probes.iter().flatten().cloned().collect::<Vec<_>>();
+    let owners: std::collections::HashMap<Vec<u8>, Vec<u8>> = flat
+        .iter()
+        .cloned()
+        .zip(db.multi_get(flat.clone()).await?)
+        .filter_map(|(probe, owner)| owner.map(|owner| (probe, owner)))
+        .collect();
+    // Every stored row the statement may collide with, read once.
+    let mut wanted: Vec<Vec<u8>> = Vec::new();
+    if def.has_pk() {
+        wanted.extend(built.iter().map(|(key, _)| key.clone()));
+    }
+    wanted.extend(owners.values().cloned());
+    wanted.sort_unstable();
+    wanted.dedup();
+    let mut stored: std::collections::HashMap<Vec<u8>, Vec<Value>> =
+        std::collections::HashMap::new();
+    for (key, enc) in wanted
+        .iter()
+        .cloned()
+        .zip(db.multi_get(wanted.clone()).await?)
+    {
+        if let Some(enc) = enc {
+            stored.insert(key, rowdec::decode_row(&enc)?);
+        }
+    }
+
+    let mut out: Vec<Option<(Vec<u8>, Vec<Value>)>> = Vec::with_capacity(built.len());
+    let mut written: std::collections::HashMap<Vec<u8>, usize> = std::collections::HashMap::new();
+    let mut claims: std::collections::HashMap<Vec<u8>, Vec<u8>> = std::collections::HashMap::new();
+    let mut removed = Vec::new();
+    let mut affected = 0u64;
+    for ((key, row), row_probes) in built.into_iter().zip(probes) {
+        // The rows this one collides with, each once, primary key first.
+        let mut colliding: Vec<Vec<u8>> = Vec::new();
+        if written.contains_key(&key) || stored.contains_key(&key) {
+            colliding.push(key.clone());
+        }
+        for probe in &row_probes {
+            let owner = claims.get(probe).or_else(|| {
+                owners
+                    .get(probe)
+                    .filter(|owner| stored.contains_key(*owner) && !written.contains_key(*owner))
+            });
+            if let Some(owner) = owner {
+                if !colliding.contains(owner) {
+                    colliding.push(owner.clone());
+                }
+            }
+        }
+        let mut deleted = 0u64;
+        let mut unchanged = false;
+        for victim in colliding {
+            let old = if let Some(i) = written.remove(&victim) {
+                let (_, old) = out[i].take().expect("a written row is present");
+                old
+            } else {
+                let old = stored.remove(&victim).expect("a colliding stored row");
+                removed.push((victim.clone(), old.clone()));
+                old
+            };
+            for probe in index::unique_probe_keys(def, &old)? {
+                if claims.get(&probe) == Some(&victim) {
+                    claims.remove(&probe);
+                }
+            }
+            unchanged = in_place && old == row;
+            deleted += 1;
+        }
+        affected += if unchanged { 1 } else { deleted + 1 };
+        for probe in row_probes {
+            claims.insert(probe, key.clone());
+        }
+        written.insert(key.clone(), out.len());
+        out.push(Some((key, row)));
+    }
+    Ok(ReplacePlan {
+        rows: out.into_iter().flatten().collect(),
+        removed,
+        affected,
+    })
 }
 
 /// Replace `VALUES(col)` references (MySQL ON DUPLICATE KEY UPDATE) with the

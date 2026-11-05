@@ -8,6 +8,19 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ### Fixed
 
+- **`INSERT IGNORE` and `REPLACE` honour unique keys.** Both checked only the
+  primary key. `INSERT IGNORE` wrote a row whose unique key was already taken,
+  and `REPLACE` wrote it beside the row it should have replaced, so a `UNIQUE`
+  column could end up holding the same value twice -- including within one
+  statement, from `INSERT IGNORE ... SELECT`, and in a table without a primary
+  key. A plain `INSERT` was refused with 1062, as it should be. `INSERT IGNORE`
+  now skips such a row, and `REPLACE` deletes every row the new one collides
+  with, counting each as MySQL does. `REPLACE` also applies the foreign keys
+  that reference the rows it deletes, as `DELETE` does: `RESTRICT` refuses it
+  and `CASCADE` deletes the children, which it never did, not even for a
+  primary-key collision. A table written this way before may hold duplicates;
+  `SELECT col, COUNT(*) FROM t GROUP BY col HAVING COUNT(*) > 1` finds them.
+
 - **`DROP ROLE` takes away what the role granted.** It removed the role but
   left its table and column grants and its members' memberships, so every user
   the role had been granted to kept reading and writing what it allowed, while
