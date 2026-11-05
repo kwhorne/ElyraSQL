@@ -6,6 +6,8 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.12.11] - 2026-11-05
+
 ### Fixed
 
 - **A cluster commits as soon as a majority has a write.** The leader waited
