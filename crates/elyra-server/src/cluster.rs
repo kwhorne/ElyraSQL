@@ -522,9 +522,9 @@ impl Node {
     }
 
     async fn main_loop(self: Arc<Self>) {
-        // Persistent AppendEntries connections to followers, reused across rounds
-        // for batched throughput; cleared when we stop being leader.
-        let mut conns: HashMap<u64, PeerConn> = HashMap::new();
+        // Followers' connections and exchanges, kept across rounds for batched
+        // throughput; reset when we stop being leader.
+        let mut repl = Replication::new();
         loop {
             let (role, deadline) = {
                 let s = self.state.lock().unwrap();
@@ -532,14 +532,14 @@ impl Node {
             };
             match role {
                 Role::Leader => {
-                    self.replicate_round(&mut conns).await;
+                    self.replicate_round(&mut repl).await;
                     // Leader lease: if we haven't confirmed a quorum for the lease
                     // window, step down so writes fail fast and a healthy
                     // majority can elect a new leader (liveness).
                     if self.lease.lock().unwrap().elapsed() > Duration::from_millis(LEADER_LEASE_MS)
                     {
                         self.step_down("lost quorum contact (lease expired)");
-                        conns.clear();
+                        repl.reset();
                         continue;
                     }
                     tokio::select! {
@@ -548,7 +548,7 @@ impl Node {
                     }
                 }
                 _ => {
-                    conns.clear(); // stale once we're not leader
+                    repl.reset(); // stale once we're not leader
                     let now = Instant::now();
                     if now >= deadline {
                         self.start_election().await;
@@ -643,9 +643,16 @@ impl Node {
         }
     }
 
-    /// One leader replication round: push entries to every follower, collect
-    /// acks, advance the commit index, and apply newly committed entries.
-    async fn replicate_round(self: &Arc<Self>, conns: &mut HashMap<u64, PeerConn>) {
+    /// One leader replication round: push entries to every follower that is not
+    /// still answering an earlier round, and commit as soon as a majority has
+    /// them.
+    ///
+    /// Each exchange runs as its own task and answers on `repl.replies`. The
+    /// round used to wait for every follower, so one that was unreachable held
+    /// every write back until its deadline (`PEER_RPC_MS`) though the others
+    /// formed a majority within a millisecond. A follower still answering is
+    /// left to finish and is sent the next round's entries once it has.
+    async fn replicate_round(self: &Arc<Self>, repl: &mut Replication) {
         let term = {
             let s = self.state.lock().unwrap();
             if s.role != Role::Leader {
@@ -663,7 +670,7 @@ impl Node {
         let members = self.members();
         let peers = self.peer_snapshot();
         let live: std::collections::HashSet<u64> = peers.iter().map(|p| p.id).collect();
-        conns.retain(|id, _| live.contains(id));
+        repl.conns.retain(|id, _| live.contains(id));
         // Cluster-wide safe compaction point = the slowest follower's match
         // index (everyone has entries up to here, so they can be discarded);
         // for a single node it's simply what has been applied.
@@ -679,99 +686,146 @@ impl Node {
                     .unwrap_or(0)
             }
         };
-        // Every follower at once, each within one deadline: asked in turn, a
-        // peer that was down or slow held up the rest, and a reconnect had no
-        // deadline at all, so the round could outlast the leader lease.
-        let exchanges: Vec<_> = peers
-            .iter()
-            .map(|peer| {
-                let (prev_index, prev_term, entries) = {
-                    let log = self.log.lock().unwrap();
-                    let next = self
-                        .progress
-                        .lock()
-                        .unwrap()
-                        .get(&peer.id)
-                        .map(|p| p.next)
-                        .unwrap_or(1);
-                    let prev_index = next.saturating_sub(1);
-                    let prev_term = log.term_at(prev_index).unwrap_or(0);
-                    (prev_index, prev_term, log.entries_after(prev_index))
-                };
-                let m = Msg::AppendEntries {
-                    term,
-                    leader: self.cfg.id,
-                    repl_addr: self.cfg.replication_addr.clone(),
-                    members: members.clone(),
-                    prev_index,
-                    prev_term,
-                    entries,
-                    leader_commit,
-                    compact_index,
-                };
-                let conn = conns.remove(&peer.id);
-                let addr = peer.control_addr.clone();
-                async move {
-                    tokio::time::timeout(
-                        Duration::from_millis(PEER_RPC_MS),
-                        append_exchange(conn, &addr, &m),
-                    )
-                    .await
-                    .unwrap_or((None, None))
-                }
-            })
-            .collect();
-        let replies = futures_util::future::join_all(exchanges).await;
-
-        let mut quorum_acks = 1usize; // this leader counts itself
-        for (peer, (conn, reply)) in peers.iter().zip(replies) {
-            if let Some(conn) = conn {
-                conns.insert(peer.id, conn);
+        repl.round += 1;
+        let round = repl.round;
+        let mut launched = 0usize;
+        for peer in &peers {
+            if repl.inflight.contains_key(&peer.id) {
+                continue;
             }
-            match reply {
-                Some(Msg::AppendAck {
-                    term: t,
-                    success,
-                    match_index,
-                }) => {
-                    if t > term {
-                        let mut s = self.state.lock().unwrap();
-                        if t > s.term {
-                            s.term = t;
-                            s.role = Role::Follower;
-                            s.voted_for = None;
-                            persist_state(&self.cfg.state_path, s.term, s.voted_for);
-                            drop(s);
-                            self.drain_pending("stepped down during replication");
-                        }
-                        return;
-                    }
-                    let mut prog = self.progress.lock().unwrap();
-                    let p = prog
-                        .entry(peer.id)
-                        .or_insert(Progress { next: 1, match_: 0 });
-                    if success {
-                        p.match_ = match_index;
-                        p.next = match_index + 1;
-                        quorum_acks += 1;
-                    } else if p.next > 1 {
-                        p.next -= 1; // back off and retry with an earlier prefix
-                    }
-                }
-                Some(_) | None => {
-                    // Unreachable or unexpected reply: drop, retry next round.
-                    conns.remove(&peer.id);
-                }
+            let (prev_index, prev_term, entries) = {
+                let log = self.log.lock().unwrap();
+                let next = self
+                    .progress
+                    .lock()
+                    .unwrap()
+                    .get(&peer.id)
+                    .map(|p| p.next)
+                    .unwrap_or(1);
+                let prev_index = next.saturating_sub(1);
+                let prev_term = log.term_at(prev_index).unwrap_or(0);
+                (prev_index, prev_term, log.entries_after(prev_index))
+            };
+            let m = Msg::AppendEntries {
+                term,
+                leader: self.cfg.id,
+                repl_addr: self.cfg.replication_addr.clone(),
+                members: members.clone(),
+                prev_index,
+                prev_term,
+                entries,
+                leader_commit,
+                compact_index,
+            };
+            let conn = repl.conns.remove(&peer.id);
+            let addr = peer.control_addr.clone();
+            let tx = repl.tx.clone();
+            let peer_id = peer.id;
+            repl.inflight.insert(peer_id, round);
+            launched += 1;
+            tokio::spawn(async move {
+                let (conn, reply) = tokio::time::timeout(
+                    Duration::from_millis(PEER_RPC_MS),
+                    append_exchange(conn, &addr, &m),
+                )
+                .await
+                .unwrap_or((None, None));
+                let _ = tx.send(PeerReply {
+                    peer: peer_id,
+                    term,
+                    round,
+                    conn,
+                    reply,
+                });
+            });
+        }
+
+        // Collect replies until a majority of this round has acknowledged,
+        // every follower sent to has answered, or the deadline passes.
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(PEER_RPC_MS);
+        let mut acks = 1usize; // this leader counts itself
+        let mut answered = 0usize;
+        while acks < self.majority() && answered < launched {
+            let Ok(Some(reply)) = tokio::time::timeout_at(deadline, repl.replies.recv()).await
+            else {
+                break;
+            };
+            let this_round = reply.round == round;
+            match self.take_reply(repl, term, reply) {
+                ReplyOutcome::SteppedDown => return,
+                ReplyOutcome::Acked if this_round => acks += 1,
+                _ => {}
+            }
+            answered += usize::from(this_round);
+        }
+        // Whatever else has arrived only moves followers' progress on.
+        while let Ok(reply) = repl.replies.try_recv() {
+            if let ReplyOutcome::SteppedDown = self.take_reply(repl, term, reply) {
+                return;
             }
         }
 
         // Renew the leader lease if a quorum acknowledged this round.
-        if quorum_acks >= self.majority() {
+        if acks >= self.majority() {
             *self.lease.lock().unwrap() = Instant::now();
         }
         self.advance_commit_and_apply(term).await;
         // Compact the leader's own log up to the cluster-wide safe point.
         self.log.lock().unwrap().compact(compact_index);
+    }
+
+    /// Record one follower's answer: keep its connection, move its progress on,
+    /// or step down if it has seen a later term. An answer from an earlier
+    /// leadership is dropped.
+    fn take_reply(&self, repl: &mut Replication, term: u64, reply: PeerReply) -> ReplyOutcome {
+        if repl.inflight.get(&reply.peer) == Some(&reply.round) {
+            repl.inflight.remove(&reply.peer);
+        }
+        if reply.term != term {
+            return ReplyOutcome::Ignored;
+        }
+        if let Some(conn) = reply.conn {
+            repl.conns.insert(reply.peer, conn);
+        }
+        match reply.reply {
+            Some(Msg::AppendAck {
+                term: t,
+                success,
+                match_index,
+            }) => {
+                if t > term {
+                    let mut s = self.state.lock().unwrap();
+                    if t > s.term {
+                        s.term = t;
+                        s.role = Role::Follower;
+                        s.voted_for = None;
+                        persist_state(&self.cfg.state_path, s.term, s.voted_for);
+                        drop(s);
+                        self.drain_pending("stepped down during replication");
+                    }
+                    return ReplyOutcome::SteppedDown;
+                }
+                let mut prog = self.progress.lock().unwrap();
+                let p = prog
+                    .entry(reply.peer)
+                    .or_insert(Progress { next: 1, match_: 0 });
+                if success {
+                    p.match_ = match_index;
+                    p.next = match_index + 1;
+                    ReplyOutcome::Acked
+                } else {
+                    if p.next > 1 {
+                        p.next -= 1; // back off and retry with an earlier prefix
+                    }
+                    ReplyOutcome::Refused
+                }
+            }
+            Some(_) | None => {
+                // Unreachable or unexpected reply: drop, retry next round.
+                repl.conns.remove(&reply.peer);
+                ReplyOutcome::Refused
+            }
+        }
     }
 
     /// Relinquish leadership: become a follower, fail pending proposals fast, and
@@ -1013,6 +1067,54 @@ pub async fn auth_respond_to_peer<S: tokio::io::AsyncRead + tokio::io::AsyncWrit
 /// some peers never answer still renews it with the others' acks.
 const PEER_RPC_MS: u64 = 500;
 
+/// The leader's side of replication, kept across rounds: persistent
+/// AppendEntries connections to followers, the followers whose exchange is
+/// still under way (and from which round), and the channel their answers
+/// arrive on.
+struct Replication {
+    conns: HashMap<u64, PeerConn>,
+    inflight: HashMap<u64, u64>,
+    round: u64,
+    tx: tokio::sync::mpsc::UnboundedSender<PeerReply>,
+    replies: tokio::sync::mpsc::UnboundedReceiver<PeerReply>,
+}
+
+impl Replication {
+    fn new() -> Self {
+        let (tx, replies) = tokio::sync::mpsc::unbounded_channel();
+        Replication {
+            conns: HashMap::new(),
+            inflight: HashMap::new(),
+            round: 0,
+            tx,
+            replies,
+        }
+    }
+
+    /// Forget every follower's connection and exchange: no longer leader.
+    /// Answers still to come are from an earlier term and will be dropped.
+    fn reset(&mut self) {
+        self.conns.clear();
+        self.inflight.clear();
+    }
+}
+
+/// One follower's answer to an AppendEntries, with the connection to keep.
+struct PeerReply {
+    peer: u64,
+    term: u64,
+    round: u64,
+    conn: Option<PeerConn>,
+    reply: Option<Msg>,
+}
+
+enum ReplyOutcome {
+    Acked,
+    Refused,
+    Ignored,
+    SteppedDown,
+}
+
 /// Open a control-plane connection to a peer: plain TCP, or TLS (verifying the
 /// peer's certificate against `ELYRASQL_CLUSTER_TLS_CA`) when configured.
 async fn connect_peer(addr: &str) -> std::io::Result<PeerConn> {
@@ -1192,13 +1294,92 @@ mod tests {
             s.role = Role::Leader;
         }
         let started = Instant::now();
-        node.replicate_round(&mut HashMap::new()).await;
+        node.replicate_round(&mut Replication::new()).await;
         assert!(
             started.elapsed() < within,
             "round took {:?}",
             started.elapsed()
         );
         assert!(started.elapsed() < Duration::from_millis(LEADER_LEASE_MS));
+    }
+
+    /// A round commits once a majority has the entries: one follower that
+    /// answers is enough beside the leader of three, and one that never answers
+    /// no longer holds every write back until its deadline -- nor the next
+    /// round, which goes on without it while it is still being waited for.
+    #[tokio::test]
+    async fn a_round_commits_on_a_majority_without_waiting_for_a_silent_peer() {
+        let answering = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peers = vec![
+            Peer {
+                id: 2,
+                control_addr: answering.local_addr().unwrap().to_string(),
+            },
+            Peer {
+                id: 3,
+                control_addr: silent.local_addr().unwrap().to_string(),
+            },
+        ];
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = answering.accept().await {
+                tokio::spawn(async move {
+                    while let Ok(Some(Msg::AppendEntries {
+                        term,
+                        prev_index,
+                        entries,
+                        ..
+                    })) = recv(&mut stream).await
+                    {
+                        let ack = Msg::AppendAck {
+                            term,
+                            success: true,
+                            match_index: prev_index + entries.len() as u64,
+                        };
+                        if send(&mut stream, &ack).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        let node = Node::new(
+            ClusterConfig {
+                id: 1,
+                control_listen: String::new(),
+                replication_addr: String::new(),
+                peers,
+                state_path: None,
+                log_path: None,
+            },
+            Db::in_memory().unwrap(),
+        );
+        {
+            let mut s = node.state.lock().unwrap();
+            s.role = Role::Leader;
+            s.term = 1;
+        }
+        let write = bincode::serialize(&WriteOp::Plain {
+            puts: vec![(b"k".to_vec(), b"v".to_vec())],
+            deletes: vec![],
+        })
+        .unwrap();
+        let mut repl = Replication::new();
+        for round in 0..2 {
+            let index = node.log.lock().unwrap().leader_append(1, write.clone());
+            let started = Instant::now();
+            node.replicate_round(&mut repl).await;
+            assert!(
+                started.elapsed() < Duration::from_millis(PEER_RPC_MS / 2),
+                "round {round} took {:?}",
+                started.elapsed()
+            );
+            assert!(
+                node.log.lock().unwrap().commit_index() >= index,
+                "round {round} did not commit"
+            );
+        }
+        drop(silent);
     }
 
     // The control-plane framing must work over any AsyncRead+AsyncWrite transport

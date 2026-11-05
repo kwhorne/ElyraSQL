@@ -8,6 +8,16 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ### Fixed
 
+- **A cluster commits as soon as a majority has a write.** The leader waited
+  for every follower to answer each replication round, so a follower it
+  could not reach -- a network partition, a host that was down without
+  refusing connections -- added its 500 ms deadline to every write, though
+  the leader and the other follower were a majority within a millisecond. In a
+  three-node cluster with one node unreachable, a write took 513 ms and now
+  takes 24 ms; with all three up, 64 ms and now 47 ms, as the slowest follower
+  no longer sets the pace. A follower still answering is sent the next
+  entries once it has; acknowledged writes are on a majority as before.
+
 - **`LOCK TABLES` locks what MySQL locks.** Another session waited only for a
   single-table write. A `SELECT` of a `WRITE`-locked table read it, and a
   joined `UPDATE` or `DELETE`, the `SELECT` of an `INSERT ... SELECT`, a view
