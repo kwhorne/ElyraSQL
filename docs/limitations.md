@@ -78,6 +78,11 @@ judge fit before deploying.
   the `<=>` null-safe operator, `IS [NOT] TRUE/FALSE/UNKNOWN`,
   `LAST_INSERT_ID()`/`ROW_COUNT()`, `@@`system variables, `CONVERT()`,
   `MD5`/`SHA*`/`SOUNDEX`/`REGEXP_REPLACE`, and statistical/bitwise aggregates.
+- A join in parentheses is supported on the left of a join
+  (`FROM (a JOIN b ON ...) LEFT JOIN c ON ...`, as mysqldump writes a view's
+  definition). One on the right (`a JOIN (b LEFT JOIN c ON ...) ON ...`) is
+  not: it fails with 1054. Write it without the parentheses where the join
+  types allow, or as a derived table.
 
 ## Constraints & integrity
 
@@ -289,13 +294,22 @@ judge fit before deploying.
 
 ## Types & text
 
-- Text is **case-insensitive by default**. A column can opt into case-sensitive
-  behavior with `COLLATE ..._bin` / `BINARY`, which applies to equality/range
-  comparisons (`WHERE`), `UNIQUE`, `PRIMARY KEY`, secondary indexes, and now
-  **`ORDER BY`, `GROUP BY`, `DISTINCT` and equi-join keys** (a `_bin` column
-  sorts, groups, de-duplicates and joins by exact bytes, case-sensitively; the
-  default column stays case-insensitive). Accent sensitivity and alternate
-  charsets are not implemented.
+- Text compares as in MySQL 8.4's default collation, `utf8mb4_0900_ai_ci`:
+  **case- and accent-insensitive** (`'café' = 'cafe'`, `'Å' = 'A'`,
+  `'æ' = 'ae'`, `'ß' = 'ss'`). A column can opt into exact comparison with
+  `COLLATE utf8mb4_bin` / `BINARY` in its definition, which applies to
+  equality/range comparisons (`WHERE`), `UNIQUE`, `PRIMARY KEY`, secondary
+  indexes, `ORDER BY`, `GROUP BY`, `DISTINCT` and equi-join keys (a `_bin`
+  column sorts, groups, de-duplicates and joins by exact bytes). Those are the
+  only two collations, and `utf8mb4` the only character set. Any other
+  collation or character set a table declares is accepted and mapped, and
+  `information_schema` reports what it was mapped to: an accent- and
+  case-sensitive `..._as_cs` collation to `utf8mb4_bin`, everything else --
+  `utf8mb4_0900_as_ci`, `utf8mb4_unicode_ci`, `latin1_swedish_ci`, ... -- to
+  `utf8mb4_0900_ai_ci`. An `_as_ci` column is therefore accent-insensitive,
+  where MySQL's is not. `COLLATE` or `BINARY` inside an expression
+  (`WHERE s COLLATE utf8mb4_bin = 'x'`, `ORDER BY s COLLATE ...`) is not
+  supported (1235).
 - Full-text search: `MATCH(col, ...) AGAINST('terms' [IN BOOLEAN MODE])`
   (natural-language OR-of-terms, or boolean `+`/`-`, with relevance scoring).
   `CREATE FULLTEXT INDEX` builds a persistent inverted index that is maintained
@@ -376,7 +390,8 @@ judge fit before deploying.
   only read those columns of `t` — querying an ungranted column (including via
   `SELECT *` or a `WHERE`/`ORDER BY` reference) is denied. Enforcement covers
   single-base-table selects; a column-restricted table used in a join,
-  subquery, set operation or `INSERT ... SELECT` is denied (deny-safe).
+  subquery, set operation or `INSERT ... SELECT`, or read by an `UPDATE` or
+  `DELETE` (its `WHERE`, a join, a computed value), is denied (deny-safe).
   `SHOW TABLES` and `information_schema` still list every table, where MySQL
   lists only those the account has a privilege on.
 - An optional **audit log** (`--audit-log <path>`) appends one tab-separated
@@ -427,11 +442,12 @@ judge fit before deploying.
   replication / multi-primary).
   **Automatic failover** is available in `cluster` mode via Raft-style leader
   election (majority quorum, leader-only writes/fencing) with the **election
-  restriction**: a node only votes for a candidate at least as up-to-date (by
-  LSN) as itself, so an elected leader has every quorum-acknowledged write.
-  Together with `--sync-strict` this gives no-data-loss failover for
-  acknowledged writes (the sync barrier still runs after the local commit, so
-  it is not a pre-commit 2-phase protocol). A reconnecting replica catches up
+  restriction**: a node only votes for a candidate whose log is at least as
+  up-to-date (by last term, then index) as its own, so an elected leader has
+  every quorum-acknowledged write. Unlike primary → replica replication, a
+  cluster commits *before* it applies and acknowledges (see below), so its
+  failover loses no acknowledged write; `--sync-strict` belongs to
+  primary → replica mode and is not used. A reconnecting replica catches up
   **incrementally from the binlog** (streaming only the delta since its last
   applied LSN), falling back to a full snapshot only when the binlog is disabled
   or the needed segments were purged; the LSN counter resumes from the binlog
@@ -478,10 +494,11 @@ judge fit before deploying.
 - **Binary (native) prepared statements** work for the common shapes, including
   repeated prepares on one connection (a packet-reader desync that affected
   drivers pipelining commands — e.g. PDO/mysqlnd with
-  `PDO::ATTR_EMULATE_PREPARES => false` — is fixed). `describe_query` reports an
-  exact result-column count at `PREPARE` (enable with `ELYRASQL_STMT_DESCRIBE`)
-  for single **and** joined/multi-table SELECTs, so `SELECT *` over a join
-  resolves its columns. Qualified wildcards (`SELECT a.*`) and projections over
+  `PDO::ATTR_EMULATE_PREPARES => false` — is fixed). By default `PREPARE`
+  reports no result columns; with `ELYRASQL_STMT_DESCRIBE` on it reports the
+  exact columns for single **and** joined/multi-table SELECTs, so `SELECT *`
+  over a join resolves its columns (not a `USING`/`NATURAL` join or a set
+  operation). Qualified wildcards (`SELECT a.*`) and projections over
   `information_schema` are supported at both prepare and execution time.
   Client-side (emulated) prepared statements remain the widest-compatibility
   default; PyMySQL and sqlx bind client-side and are unaffected.

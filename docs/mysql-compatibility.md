@@ -31,9 +31,9 @@ relationships, the query builder, transactions, and pagination. Point the
 'port'     => env('DB_PORT', '3307'),
 'database' => env('DB_DATABASE', 'elyra'),
 'options'  => [
-    // Recommended: client-side prepared statements. Native prepares work for
-    // common shapes, but some (e.g. information_schema `SELECT *`) are not yet
-    // reliable with strict drivers; emulation sends fully-formed queries.
+    // Recommended: client-side prepared statements. Native prepares work, but
+    // PREPARE reports no result columns unless ELYRASQL_STMT_DESCRIBE is on
+    // (see below); emulation sends fully-formed queries.
     PDO::ATTR_EMULATE_PREPARES => true,
 ],
 ```
@@ -246,9 +246,13 @@ gaps:
 See [Limitations](limitations.md) for the full picture.
 
 !!! note "Prepared-statement caveat"
-    Binary (native) prepared statements work for common query shapes; a few
-    (e.g. `SELECT *` over `information_schema` or a joined source) report no
-    columns at `PREPARE`, which strict drivers may mishandle. For the widest
-    compatibility, prefer client-side (emulated) prepared statements —
-    `PDO::ATTR_EMULATE_PREPARES => true`, or the driver equivalent. Client-side-
-    binding drivers like PyMySQL and sqlx are unaffected.
+    Binary (native) prepared statements work, but by default `PREPARE` reports
+    only the parameters, not the result columns: those arrive with each
+    `EXECUTE`. That is what `libmysqlclient`-based clients expect. A driver that
+    resolves result columns by name from the prepare response (sqlx, for one)
+    needs `ELYRASQL_STMT_DESCRIBE=on`, which describes them for a single
+    `SELECT`, joins included -- not for a `USING`/`NATURAL` join or a set
+    operation, which still report none. For the widest compatibility, prefer
+    client-side (emulated) prepared statements — `PDO::ATTR_EMULATE_PREPARES =>
+    true`, or the driver equivalent. PyMySQL binds client-side and is
+    unaffected.
