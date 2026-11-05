@@ -17,6 +17,23 @@ ElyraSQL release builds target **Ubuntu 24.04+** and **Apple Silicon macOS
     done, so an interrupted upgrade simply resumes on the next start. **Take a backup
     first, and note that downgrading to 1.4.x afterwards is not supported.**
 
+!!! warning "Upgrading to 1.12.11 — LOCK TABLES, cluster commit"
+
+    No on-disk format change; a 1.12.10 database opens in 1.12.11 unchanged.
+
+    - **`LOCK TABLES` locks what MySQL locks.** Another session's `SELECT` of
+      a `WRITE`-locked table, a joined `UPDATE`/`DELETE`, the `SELECT` of an
+      `INSERT ... SELECT`, a view over the table and `CREATE TRIGGER` now wait
+      for the lock, where they went straight through. The session holding
+      `LOCK TABLES` may now use only the tables it locked (`1100`) and write
+      only those it locked `WRITE` (`1099`); code that locks one table and then
+      reads another must lock both, as MySQL requires. A second `LOCK TABLES`
+      replaces the first.
+    - **`UPDATE t JOIN t2 ... SET t.c = <value>`** without `WHERE` needs
+      `SELECT` on `t2`, as in MySQL.
+    - **A cluster commits as soon as a majority has a write.** One unreachable
+      follower no longer adds 500 ms to every write.
+
 !!! warning "Upgrading to 1.12.10 — roles, INSERT IGNORE and REPLACE"
 
     No on-disk format change; a 1.12.9 database opens in 1.12.10 unchanged.
@@ -648,8 +665,8 @@ macOS).
 Multi-arch image (`amd64` + `arm64`) on the GitHub Container Registry:
 
 ```bash
-docker pull ghcr.io/kwhorne/elyrasql:1.12.10   # or :latest
-docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.12.10
+docker pull ghcr.io/kwhorne/elyrasql:1.12.11   # or :latest
+docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.12.11
 ```
 
 The image is ~15 MB, runs as a non-root user, stores data in the
