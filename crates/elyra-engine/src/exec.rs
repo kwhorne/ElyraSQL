@@ -7831,6 +7831,11 @@ async fn select_inner(
     // relations. Normalize again under those final relation policies.
     let mut normalized_query = query.clone();
     normalize_query_qualifiers(&mut normalized_query, &db.database())?;
+    if let SetExpr::Select(select) = normalized_query.body.as_mut() {
+        if let Some(from) = resolve_join_on_subqueries(db, vindex, &select.from).await? {
+            select.from = from;
+        }
+    }
     let query = &normalized_query;
     let select = match query.body.as_ref() {
         SetExpr::Select(s) => s,
@@ -9000,7 +9005,11 @@ async fn streaming_nlj_select(
     limit: usize,
 ) -> Result<Option<QueryResult>> {
     // Reads inside a transaction must see the write overlay -> materialising path.
-    if db.in_txn() || select.distinct.is_some() || select.having.is_some() || select.from.len() != 1
+    if db.in_txn()
+        || select.distinct.is_some()
+        || select.having.is_some()
+        || select.from.len() != 1
+        || from_has_on_subquery(&select.from)
     {
         return Ok(None);
     }
@@ -9337,7 +9346,10 @@ async fn build_join_chain(
 ) -> Result<Option<JoinChain>> {
     // Something must be joined: either explicit JOINs on the first entry, or further
     // comma-separated tables.
-    if !stored_table_factor(&twj.relation) || (twj.joins.is_empty() && from.len() < 2) {
+    if !stored_table_factor(&twj.relation)
+        || (twj.joins.is_empty() && from.len() < 2)
+        || from_has_on_subquery(from)
+    {
         return Ok(None);
     }
     let (_ddef, dcols) = resolve_table(db, &twj.relation).await?;
@@ -9897,7 +9909,11 @@ async fn streaming_join_aggregate(
     // `from.len() > 1` is a comma cross join, which build_join_chain now streams via
     // unkeyed steps; it declines anything it cannot handle, so this only needs to
     // reject an empty FROM.
-    if db.in_txn() || select.distinct.is_some() || select.from.is_empty() {
+    if db.in_txn()
+        || select.distinct.is_some()
+        || select.from.is_empty()
+        || from_has_on_subquery(&select.from)
+    {
         return Ok(None);
     }
     // The grouped output holds only the projection; an ORDER BY key outside it
@@ -10076,7 +10092,11 @@ async fn streaming_join_order(
     // `from.len() > 1` is a comma cross join, which build_join_chain now streams via
     // unkeyed steps; it declines anything it cannot handle, so this only needs to
     // reject an empty FROM.
-    if db.in_txn() || select.distinct.is_some() || select.from.is_empty() {
+    if db.in_txn()
+        || select.distinct.is_some()
+        || select.from.is_empty()
+        || from_has_on_subquery(&select.from)
+    {
         return Ok(None);
     }
     // A two-table RIGHT join is streamed by rewriting it to `B LEFT JOIN A` and
@@ -11901,7 +11921,7 @@ async fn build_from(
                 .joins
                 .iter()
                 .all(|j| matches!(j.relation, TableFactor::Table { .. }));
-        if !twj.joins.is_empty() && all_inner && all_tables {
+        if !twj.joins.is_empty() && all_inner && all_tables && !from_has_on_subquery(from) {
             if let Some((columns, rows)) =
                 build_inner_join_reordered(db, vindex, twj, conjuncts).await?
             {
@@ -11979,6 +11999,25 @@ async fn build_from(
             let driving_schema = cur_schema.clone();
             let (kind, on) = join_kind(&join.join_operator)?;
             let left_outer = kind == JoinKind::Left;
+
+            // An ON whose subquery reads the joined row (an uncorrelated one was
+            // resolved to literals before planning) is evaluated per joined row.
+            if let Some(on) = on.as_ref().filter(|on| expr_has_subquery(on)) {
+                let (jc, jr) = load_relation(db, vindex, &join.relation, &[]).await?;
+                let partner_schema = Schema::new(jc);
+                (cur_schema, cur_rows) = join_on_row_subqueries(
+                    db,
+                    vindex,
+                    &cur_schema,
+                    std::mem::take(&mut cur_rows),
+                    &partner_schema,
+                    jr,
+                    kind,
+                    on,
+                )
+                .await?;
+                continue;
+            }
 
             // Index nested-loop join only applies to a plain (indexed) table
             // partner, not a derived table.
@@ -15886,7 +15925,7 @@ pub async fn update(
     let quals = [qualifier.clone()];
     let mut values = Vec::with_capacity(sets.len());
     for (idx, expr) in &sets {
-        values.push((*idx, prepare_set_value(db, vindex, expr, &quals).await?));
+        values.push((*idx, prepare_row_expr(db, vindex, expr, &quals).await?));
     }
     let mut changes = Vec::with_capacity(matches.len());
     for (old_key, old_row) in matches {
@@ -15894,8 +15933,8 @@ pub async fn update(
         for (idx, value) in &values {
             // Assignment RHS may reference existing column values.
             let expr = match value {
-                SetValue::Fixed(expr) => std::borrow::Cow::Borrowed(expr),
-                SetValue::PerRow(expr) => {
+                RowExpr::Fixed(expr) => std::borrow::Cow::Borrowed(expr),
+                RowExpr::PerRow(expr) => {
                     let bound = bind_outer(db, expr, &qualifier, &def.schema, &old_row);
                     std::borrow::Cow::Owned(
                         resolve_subqueries_with_outer(db, vindex, bound, &def.schema, &old_row)
@@ -15925,36 +15964,230 @@ pub async fn update(
     Ok(QueryResult::Affected(writes.affected))
 }
 
-/// An UPDATE assignment's value with its subqueries made ready to evaluate:
-/// run once when they do not depend on the row being updated, as the row
-/// evaluator has no notion of a query, or for each row when they do.
-enum SetValue {
+/// An expression evaluated per row -- an UPDATE's assigned value, a `JOIN ...
+/// ON` condition -- with its subqueries made ready: run once when they do not
+/// depend on the row, as the row evaluator has no notion of a query, or for
+/// each row when they do.
+enum RowExpr {
     Fixed(Expr),
     PerRow(Expr),
 }
 
-/// Prepare an assignment's value (see [`SetValue`]). A subquery correlates when
+/// Prepare a per-row expression (see [`RowExpr`]). A subquery correlates when
 /// it names a column of one of `quals` -- the tables being updated or joined --
 /// or, after trying it on its own, when one of its bare names is not its own.
-async fn prepare_set_value(
+async fn prepare_row_expr(
     db: &Session,
     vindex: &VectorRegistry,
     expr: &Expr,
     quals: &[Vec<String>],
-) -> Result<SetValue> {
+) -> Result<RowExpr> {
     if !expr_has_subquery(expr) {
-        return Ok(SetValue::Fixed(expr.clone()));
+        return Ok(RowExpr::Fixed(expr.clone()));
     }
     if filter_correlated_any(expr, quals) {
-        return Ok(SetValue::PerRow(expr.clone()));
+        return Ok(RowExpr::PerRow(expr.clone()));
     }
     match resolve_subqueries(db, vindex, expr.clone()).await {
-        Ok(resolved) => Ok(SetValue::Fixed(resolved)),
+        Ok(resolved) => Ok(RowExpr::Fixed(resolved)),
         Err(error) if bare_unknown_column(&error, expr).is_some() => {
-            Ok(SetValue::PerRow(expr.clone()))
+            Ok(RowExpr::PerRow(expr.clone()))
         }
         Err(error) => Err(error),
     }
+}
+
+/// The `ON` condition of a join, if it has one.
+fn join_on_mut(op: &mut JoinOperator) -> Option<&mut Expr> {
+    match op {
+        JoinOperator::Inner(JoinConstraint::On(on))
+        | JoinOperator::LeftOuter(JoinConstraint::On(on))
+        | JoinOperator::RightOuter(JoinConstraint::On(on))
+        | JoinOperator::FullOuter(JoinConstraint::On(on)) => Some(on),
+        _ => None,
+    }
+}
+
+/// Whether any `JOIN ... ON` in `from`, nested joins included, holds a
+/// subquery. The streaming and reordering join paths evaluate `ON` with the
+/// row evaluator, which has no notion of a query, so they decline such a FROM
+/// and leave it to `build_from`.
+fn from_has_on_subquery(from: &[TableWithJoins]) -> bool {
+    fn twj(t: &TableWithJoins) -> bool {
+        nested(&t.relation)
+            || t.joins.iter().any(|join| {
+                nested(&join.relation)
+                    || join_kind(&join.join_operator)
+                        .ok()
+                        .and_then(|(_, on)| on)
+                        .is_some_and(|on| expr_has_subquery(&on))
+            })
+    }
+    fn nested(factor: &TableFactor) -> bool {
+        matches!(factor, TableFactor::NestedJoin { table_with_joins, .. } if twj(table_with_joins))
+    }
+    from.iter().any(twj)
+}
+
+/// Resolve the subqueries in `from`'s `JOIN ... ON` conditions that do not
+/// depend on the joined rows into literals, as an uncorrelated `WHERE`
+/// subquery is. Those that do are left for `build_from` to run per joined row
+/// (see `join_on_row_subqueries`). Returns the rewritten FROM, or `None` when
+/// no `ON` holds a subquery.
+async fn resolve_join_on_subqueries(
+    db: &Session,
+    vindex: &VectorRegistry,
+    from: &[TableWithJoins],
+) -> Result<Option<Vec<TableWithJoins>>> {
+    fn resolve<'a>(
+        db: &'a Session,
+        vindex: &'a VectorRegistry,
+        twj: &'a mut TableWithJoins,
+        quals: &'a [Vec<String>],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            if let TableFactor::NestedJoin {
+                table_with_joins, ..
+            } = &mut twj.relation
+            {
+                resolve(db, vindex, table_with_joins, quals).await?;
+            }
+            for join in &mut twj.joins {
+                if let TableFactor::NestedJoin {
+                    table_with_joins, ..
+                } = &mut join.relation
+                {
+                    resolve(db, vindex, table_with_joins, quals).await?;
+                }
+                if let Some(on) = join_on_mut(&mut join.join_operator) {
+                    if let RowExpr::Fixed(resolved) =
+                        prepare_row_expr(db, vindex, on, quals).await?
+                    {
+                        *on = resolved;
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
+    if !from_has_on_subquery(from) {
+        return Ok(None);
+    }
+    let quals = join_qualifiers(db, from);
+    let mut out = from.to_vec();
+    for twj in &mut out {
+        resolve(db, vindex, twj, &quals).await?;
+    }
+    Ok(Some(out))
+}
+
+/// Join two relations on an `ON` that holds a subquery reading the joined row
+/// (`LEFT JOIN b ON b.a_id = a.id AND b.y = (SELECT MAX(y) FROM b b2 WHERE
+/// b2.a_id = a.id)`). The conjuncts without a subquery drive an ordinary inner
+/// join; the others are then evaluated for each joined row, binding its
+/// values into the subquery. Each side's rows carry their position through the
+/// join, so an outer join can then add the rows left without a match.
+#[allow(clippy::too_many_arguments)]
+async fn join_on_row_subqueries(
+    db: &Session,
+    vindex: &VectorRegistry,
+    left_schema: &Schema,
+    left_rows: Vec<Vec<Value>>,
+    right_schema: &Schema,
+    right_rows: Vec<Vec<Value>>,
+    kind: JoinKind,
+    on: &Expr,
+) -> Result<(Schema, Vec<Vec<Value>>)> {
+    let mut conjuncts = Vec::new();
+    split_and(on, &mut conjuncts);
+    let (per_row, plain): (Vec<Expr>, Vec<Expr>) =
+        conjuncts.into_iter().partition(expr_has_subquery);
+    let plain = plain.into_iter().reduce(|left, right| Expr::BinaryOp {
+        left: Box::new(left),
+        op: sqlparser::ast::BinaryOperator::And,
+        right: Box::new(right),
+    });
+
+    let tag = |schema: &Schema, rows: Vec<Vec<Value>>, name: &str| {
+        let mut columns = schema.columns.clone();
+        columns.push(ColumnDef::new(name, ColumnType::Int, false));
+        let rows = rows
+            .into_iter()
+            .enumerate()
+            .map(|(position, mut row)| {
+                row.push(Value::Int(position as i64));
+                row
+            })
+            .collect::<Vec<_>>();
+        (Schema::new(columns), rows)
+    };
+    let (left_len, right_len) = (left_schema.columns.len(), right_schema.columns.len());
+    let (tagged_left_schema, tagged_left) = tag(left_schema, left_rows, "__elyra_left_row");
+    let (tagged_right_schema, tagged_right) = tag(right_schema, right_rows, "__elyra_right_row");
+    let cancel = db.cancel_token();
+    let (joined_schema, joined) = cpu_bound(|| {
+        combine(
+            &tagged_left_schema,
+            &tagged_left,
+            &tagged_right_schema,
+            &tagged_right,
+            JoinKind::Inner,
+            plain.as_ref().map(JoinCondition::On),
+            &cancel,
+        )
+    })?;
+
+    let (left_tag, right_tag) = (left_len, left_len + 1 + right_len);
+    let mut left_matched = vec![false; tagged_left.len()];
+    let mut right_matched = vec![false; tagged_right.len()];
+    let mut out = Vec::new();
+    let mut check = db.cancel_check();
+    for row in joined {
+        check.tick()?;
+        let mut keep = true;
+        for conjunct in &per_row {
+            let bound = bind_row(db, conjunct, &joined_schema, &row)?;
+            let resolved =
+                resolve_subqueries_with_outer(db, vindex, bound, &joined_schema, &row).await?;
+            if !predicate::matches(&resolved, &joined_schema, &row)? {
+                keep = false;
+                break;
+            }
+        }
+        if !keep {
+            continue;
+        }
+        let position = |index: usize| match row[index] {
+            Value::Int(position) => position as usize,
+            _ => unreachable!("join position tags are integers"),
+        };
+        left_matched[position(left_tag)] = true;
+        right_matched[position(right_tag)] = true;
+        let mut values = row;
+        values.remove(right_tag);
+        values.remove(left_tag);
+        out.push(values);
+    }
+    if matches!(kind, JoinKind::Left | JoinKind::Full) {
+        for (row, matched) in tagged_left.into_iter().zip(&left_matched) {
+            if !matched {
+                let mut values = row;
+                values.pop();
+                values.extend(std::iter::repeat_n(Value::Null, right_len));
+                out.push(values);
+            }
+        }
+    }
+    if matches!(kind, JoinKind::Right | JoinKind::Full) {
+        for (row, matched) in tagged_right.into_iter().zip(&right_matched) {
+            if !matched {
+                let mut values = vec![Value::Null; left_len];
+                values.extend(row.into_iter().take(right_len));
+                out.push(values);
+            }
+        }
+    }
+    Ok((combined_join_schema(left_schema, right_schema), out))
 }
 
 /// Coerce an assigned value to its column. An `IGNORE` statement converts the
@@ -16904,7 +17137,10 @@ async fn multi_update(
     selection: Option<&Expr>,
     ignore: bool,
 ) -> Result<QueryResult> {
-    let from = std::slice::from_ref(table);
+    let resolved_from = resolve_join_on_subqueries(db, vindex, std::slice::from_ref(table)).await?;
+    let from = resolved_from
+        .as_deref()
+        .unwrap_or(std::slice::from_ref(table));
     let (schema, rows) = build_from(db, vindex, from, &[]).await?;
     let filter = match selection {
         Some(f) => Some(resolve_subqueries(db, vindex, f.clone()).await?),
@@ -16922,7 +17158,7 @@ async fn multi_update(
     struct SetOp {
         qual: Vec<String>,
         col: usize,
-        value: SetValue,
+        value: RowExpr,
     }
     let quals = join_qualifiers(db, from);
     let mut sets: Vec<SetOp> = Vec::new();
@@ -16968,7 +17204,7 @@ async fn multi_update(
         sets.push(SetOp {
             qual,
             col,
-            value: prepare_set_value(db, vindex, &a.value, &quals).await?,
+            value: prepare_row_expr(db, vindex, &a.value, &quals).await?,
         });
     }
 
@@ -17016,8 +17252,8 @@ async fn multi_update(
             for s in &sets {
                 if &s.qual == qual {
                     let expr = match &s.value {
-                        SetValue::Fixed(expr) => std::borrow::Cow::Borrowed(expr),
-                        SetValue::PerRow(expr) => {
+                        RowExpr::Fixed(expr) => std::borrow::Cow::Borrowed(expr),
+                        RowExpr::PerRow(expr) => {
                             let bound = bind_row(db, expr, &schema, &joined)?;
                             std::borrow::Cow::Owned(
                                 resolve_subqueries_with_outer(db, vindex, bound, &schema, &joined)
@@ -17067,6 +17303,8 @@ async fn multi_delete(
     relations: &[TableWithJoins],
 ) -> Result<QueryResult> {
     let source_relations = del.using.as_deref().unwrap_or(relations);
+    let resolved_sources = resolve_join_on_subqueries(db, vindex, source_relations).await?;
+    let source_relations = resolved_sources.as_deref().unwrap_or(source_relations);
     let (schema, rows) = build_from(db, vindex, source_relations, &[]).await?;
     let filter = match &del.selection {
         Some(f) => Some(resolve_subqueries(db, vindex, f.clone()).await?),

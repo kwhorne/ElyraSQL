@@ -142,8 +142,8 @@ unbounded width for character and binary columns.
 ElyraSQL implements a focused, growing subset of MySQL SQL. Notable current
 gaps:
 
-- Subqueries (`WHERE`, SELECT-list and `UPDATE ... SET`, correlated +
-  uncorrelated, **including over joins**), derived tables, CTEs including **`WITH RECURSIVE`**, `HAVING`,
+- Subqueries (`WHERE`, SELECT-list, `JOIN ... ON` and `UPDATE ... SET`,
+  correlated + uncorrelated, **including over joins**), derived tables, CTEs including **`WITH RECURSIVE`**, `HAVING`,
   window functions with **explicit `ROWS` frames** and named windows,
   `GROUP BY ... WITH ROLLUP`, set operations, numeric value-offset `RANGE`
   frames, and peer-offset `GROUPS` frames are supported. Temporal `RANGE`

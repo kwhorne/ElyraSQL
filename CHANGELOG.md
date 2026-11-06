@@ -8,6 +8,14 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ### Fixed
 
+- **A subquery works in a `JOIN ... ON` condition.** `JOIN b ON b.a_id = a.id
+  AND b.y IN (SELECT y FROM c)`, `LEFT JOIN b ON ... AND b.y = (SELECT
+  MAX(y) FROM b b2 WHERE b2.a_id = a.id)` and every other subquery in `ON`
+  was refused with 1235, in `SELECT` and in multi-table `UPDATE` and `DELETE`.
+  One that does not depend on the joined rows now runs once; one that does
+  runs for each joined row pair, and an outer join still keeps the rows left
+  without a match.
+
 - **A join whose `ON` adds a condition to its key is fast again.** `JOIN b ON
   b.a_id = a.id AND b.deleted_at IS NULL` -- every soft-deleting ORM's join --
   or `... AND b.status = 1` compared every pair of rows instead of hashing on
