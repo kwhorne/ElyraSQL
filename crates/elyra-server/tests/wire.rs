@@ -15404,3 +15404,108 @@ async fn subqueries_in_writes_follow_mysql() {
         .unwrap();
     assert_eq!(none, Some(None));
 }
+
+/// A subquery in a `JOIN ... ON` condition was refused with 1235, in SELECT,
+/// multi-table UPDATE and DELETE alike. An uncorrelated one is now resolved
+/// once; one that reads the joined row -- including the per-group maximum of a
+/// `LEFT JOIN` -- is evaluated per joined row, and an outer join still adds
+/// the rows left without a match. Every expectation below is MySQL 8.4's.
+#[tokio::test]
+async fn subqueries_in_join_on_follow_mysql() {
+    // (statement, rows as `col:col` separated by spaces, `-` for NULL; an
+    // error code as `E<code>`; or for a write `ok<affected>|a after|b after`)
+    let cases: &[(&str, &str)] = &[
+        ("SELECT a.id, b.id FROM a JOIN b ON b.a_id=a.id AND b.y=(SELECT MIN(y) FROM c) ORDER BY 1,2", "1:10 2:12"),
+        ("SELECT a.id, b.id FROM a JOIN b ON b.a_id=a.id AND b.y IN (SELECT y FROM c) ORDER BY 1,2", "1:10 2:12 3:13"),
+        ("SELECT a.id, b.id FROM a JOIN b ON b.a_id=a.id AND b.y NOT IN (SELECT y FROM c) ORDER BY 1,2", "1:11"),
+        ("SELECT a.id, b.id FROM a JOIN b ON b.a_id=a.id AND EXISTS (SELECT 1 FROM c WHERE c.y=b.y) ORDER BY 1,2", "1:10 2:12 3:13"),
+        ("SELECT a.id, b.id FROM a JOIN b ON b.a_id=a.id AND NOT EXISTS (SELECT 1 FROM c WHERE c.y=b.y) ORDER BY 1,2", "1:11"),
+        ("SELECT a.id, b.id FROM a LEFT JOIN b ON b.a_id=a.id AND b.y IN (SELECT y FROM c) ORDER BY 1,2", "1:10 2:12 3:13 4:-"),
+        ("SELECT a.id, b.id FROM a LEFT JOIN b ON b.a_id=a.id AND b.y=(SELECT MAX(y) FROM b b2 WHERE b2.a_id=a.id) ORDER BY 1,2", "1:11 2:12 3:13 4:-"),
+        ("SELECT a.id, b.id FROM a RIGHT JOIN b ON b.a_id=a.id AND a.x < (SELECT COUNT(*) FROM c) ORDER BY 2,1", "1:10 1:11 -:12 -:13 -:14"),
+        ("SELECT a.id, b.id FROM a JOIN b ON b.a_id=(SELECT MIN(id) FROM a) ORDER BY 1,2", "1:10 1:11 2:10 2:11 3:10 3:11 4:10 4:11"),
+        ("SELECT a.id, b.id FROM a JOIN b ON b.a_id=a.id JOIN c ON c.y=b.y AND c.id IN (SELECT id FROM c WHERE y>5) ORDER BY 1,2", "3:13"),
+        ("SELECT a.id, b.id FROM a JOIN b ON b.a_id=a.id AND b.y=(SELECT y FROM c) ORDER BY 1,2", "E1242"),
+        ("SELECT a.id, b.id FROM a JOIN b ON b.a_id=a.id AND b.y > (SELECT AVG(y) FROM b b2 WHERE b2.a_id=b.a_id) ORDER BY 1,2", "1:11"),
+        ("SELECT a.id, COUNT(b.id) FROM a LEFT JOIN b ON b.a_id=a.id AND b.y IN (SELECT y FROM c) GROUP BY a.id ORDER BY 1", "1:1 2:1 3:1 4:0"),
+        ("SELECT a.id FROM a WHERE a.id IN (SELECT b.a_id FROM b JOIN c ON c.y=b.y AND c.id=(SELECT MIN(id) FROM c))", "1 2"),
+        ("SELECT a.id, b.id FROM a JOIN b ON b.a_id=a.id AND b.y IN (SELECT y FROM c WHERE c.id=a.id) ORDER BY 1,2", "1:10"),
+        ("SELECT a.id, b.id FROM a, b WHERE b.a_id=a.id AND b.y IN (SELECT y FROM c) ORDER BY 1,2", "1:10 2:12 3:13"),
+        ("UPDATE a JOIN b ON b.a_id=a.id AND b.y IN (SELECT y FROM c) SET a.x=a.x+100", "ok3|1:101,2:102,3:103,4:-|10,11,12,13,14"),
+        ("DELETE b FROM b JOIN a ON b.a_id=a.id AND a.x=(SELECT MAX(x) FROM a a2)", "ok1|1:1,2:2,3:3,4:-|10,11,12,14"),
+        ("DELETE b FROM a JOIN b ON b.a_id=a.id AND b.y IN (SELECT y FROM c)", "ok3|1:1,2:2,3:3,4:-|11,14"),
+        ("SELECT a.id, (SELECT COUNT(*) FROM b JOIN c ON c.y=b.y AND b.a_id=a.id) FROM a ORDER BY 1", "1:1 2:1 3:1 4:0"),
+        ("SELECT a.id, b.id FROM a RIGHT JOIN b ON b.a_id=a.id AND EXISTS (SELECT 1 FROM c WHERE c.y=b.y) ORDER BY 2,1", "1:10 -:11 2:12 3:13 -:14"),
+        ("SELECT a.id, b.id FROM a JOIN b ON b.a_id=a.id AND b.y IN (SELECT y FROM c) ORDER BY b.id DESC LIMIT 2", "3:13 2:12"),
+        ("SELECT a.id, COUNT(*) FROM a JOIN b ON b.a_id=a.id AND EXISTS (SELECT 1 FROM c WHERE c.y=b.y) GROUP BY a.id ORDER BY 1", "1:1 2:1 3:1"),
+        ("SELECT a.id, b.id FROM a JOIN vb b ON b.a_id=a.id AND b.y=(SELECT MIN(y) FROM c) ORDER BY 1,2", "1:10 2:12"),
+        ("SELECT a.id, b.id FROM a LEFT JOIN b ON b.a_id=a.id AND b.y=(SELECT y FROM c WHERE c.y>=b.y) ORDER BY 1,2", "E1242"),
+        ("SELECT a.id, b.id FROM a LEFT JOIN b ON b.a_id=a.id AND b.y=(SELECT c.y FROM c WHERE c.id=a.id) WHERE a.x IS NOT NULL ORDER BY 1,2", "1:10 2:- 3:-"),
+        ("SELECT DISTINCT a.id FROM a JOIN b ON b.a_id=a.id AND b.y NOT IN (SELECT y FROM c) ORDER BY 1", "1"),
+        ("SELECT a.id, b.id, c.id FROM a JOIN b ON b.a_id=a.id LEFT JOIN c ON c.y=b.y AND c.id=(SELECT MAX(c2.id) FROM c c2 WHERE c2.y<=b.y) ORDER BY 1,2", "1:10:1 1:11:- 2:12:1 3:13:2"),
+        ("SELECT a.id FROM a LEFT JOIN b ON b.a_id=a.id AND b.y IN (SELECT y FROM c) WHERE b.id IS NULL ORDER BY 1", "4"),
+        ("SELECT * FROM a JOIN b USING (id) WHERE b.y IN (SELECT y FROM c)", ""),
+        ("SELECT a.id, b.id FROM a LEFT JOIN b ON b.a_id=a.id AND (b.y IN (SELECT y FROM c) OR a.x=3) ORDER BY 1,2", "1:10 2:12 3:13 4:-"),
+    ];
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    for s in [
+        "CREATE TABLE a (id INT PRIMARY KEY, x INT)",
+        "INSERT INTO a VALUES (1,1),(2,2),(3,3),(4,NULL)",
+        "CREATE TABLE b (id INT PRIMARY KEY, a_id INT, y INT, KEY (a_id))",
+        "INSERT INTO b VALUES (10,1,5),(11,1,7),(12,2,5),(13,3,9),(14,NULL,1)",
+        "CREATE TABLE c (id INT PRIMARY KEY, y INT)",
+        "INSERT INTO c VALUES (1,5),(2,9)",
+        "CREATE VIEW vb AS SELECT * FROM b WHERE y > 4",
+    ] {
+        c.query_drop(s).await.unwrap();
+    }
+    for (sql, want) in cases {
+        let write = sql.starts_with("UPDATE") || sql.starts_with("DELETE");
+        if write {
+            c.query_drop("BEGIN").await.unwrap();
+        }
+        let got = match c.query::<mysql_async::Row, _>(*sql).await {
+            Err(mysql_async::Error::Server(e)) => format!("E{}", e.code),
+            Err(e) => panic!("{sql}: {e}"),
+            Ok(_) if write => {
+                let affected = c.affected_rows();
+                let a: Option<String> = c
+                    .query_first(
+                        "SELECT GROUP_CONCAT(CONCAT_WS(':', id, IFNULL(x, '-')) ORDER BY id) FROM a",
+                    )
+                    .await
+                    .unwrap()
+                    .flatten();
+                let b: Option<String> = c
+                    .query_first("SELECT GROUP_CONCAT(id ORDER BY id) FROM b")
+                    .await
+                    .unwrap()
+                    .flatten();
+                format!(
+                    "ok{affected}|{}|{}",
+                    a.unwrap_or_default(),
+                    b.unwrap_or_default()
+                )
+            }
+            Ok(rows) => rows
+                .iter()
+                .map(|row| {
+                    (0..row.len())
+                        .map(|i| {
+                            row.get::<Option<String>, _>(i)
+                                .flatten()
+                                .unwrap_or_else(|| "-".into())
+                        })
+                        .collect::<Vec<_>>()
+                        .join(":")
+                })
+                .collect::<Vec<_>>()
+                .join(" "),
+        };
+        if write {
+            c.query_drop("ROLLBACK").await.unwrap();
+        }
+        assert_eq!(got, *want, "{sql}");
+    }
+}
