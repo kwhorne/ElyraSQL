@@ -15509,3 +15509,96 @@ async fn subqueries_in_join_on_follow_mysql() {
         assert_eq!(got, *want, "{sql}");
     }
 }
+
+/// A join in parentheses on the right of another join -- `a LEFT JOIN (b JOIN
+/// c ON ...) ON ...`, which mysqldump writes for views and MySQL keeps when
+/// an outer join makes the nesting matter -- failed with 1054, because the
+/// tables inside the parentheses were never brought into scope. Every
+/// expectation below is MySQL 8.4's.
+#[tokio::test]
+async fn joins_in_parentheses_follow_mysql() {
+    // (statement, rows as `col:col` separated by spaces, `-` for NULL; an
+    // error code as `E<code>`; or for a write `ok<affected>|a|b|c after`)
+    let cases: &[(&str, &str)] = &[
+        ("SELECT a.id, b.id, c.id FROM a LEFT JOIN (b JOIN c ON c.y=b.y) ON b.a_id=a.id ORDER BY 1,2,3", "1:10:1 2:12:1 3:13:2 4:-:-"),
+        ("SELECT a.id, b.id, c.id FROM a JOIN (b LEFT JOIN c ON c.y=b.y) ON b.a_id=a.id ORDER BY 1,2,3", "1:10:1 1:11:- 2:12:1 3:13:2"),
+        ("SELECT a.id, b.id, c.id FROM a LEFT JOIN (b LEFT JOIN c ON c.y=b.y) ON b.a_id=a.id ORDER BY 1,2,3", "1:10:1 1:11:- 2:12:1 3:13:2 4:-:-"),
+        ("SELECT a.id, b.id, c.id FROM a RIGHT JOIN (b JOIN c ON c.y=b.y) ON b.a_id=a.id ORDER BY 2,3,1", "1:10:1 2:12:1 3:13:2"),
+        ("SELECT a.id, b.id, c.id, d.id FROM a LEFT JOIN (b JOIN (c LEFT JOIN d ON d.c_id=c.id) ON c.y=b.y) ON b.a_id=a.id ORDER BY 1,2,3,4", "1:10:1:100 2:12:1:100 3:13:2:- 4:-:-:-"),
+        ("SELECT a.id, bb.id, cc.id FROM a LEFT JOIN (b AS bb JOIN c AS cc ON cc.y=bb.y) ON bb.a_id=a.id ORDER BY 1,2,3", "1:10:1 2:12:1 3:13:2 4:-:-"),
+        ("SELECT * FROM a LEFT JOIN (b JOIN c ON c.y=b.y) ON b.a_id=a.id ORDER BY a.id, b.id", "1:1:10:1:5:1:5 2:2:12:2:5:1:5 3:3:13:3:9:2:9 4:-:-:-:-:-:-"),
+        ("SELECT b.*, a.id FROM a LEFT JOIN (b JOIN c ON c.y=b.y) ON b.a_id=a.id ORDER BY a.id, b.id", "10:1:5:1 12:2:5:2 13:3:9:3 -:-:-:4"),
+        ("SELECT a.id, COUNT(c.id) FROM a LEFT JOIN (b JOIN c ON c.y=b.y) ON b.a_id=a.id GROUP BY a.id ORDER BY 1", "1:1 2:1 3:1 4:0"),
+        ("SELECT a.id, c.id FROM a LEFT JOIN (b JOIN c ON c.y=b.y) ON b.a_id=a.id ORDER BY c.id DESC, a.id LIMIT 2", "3:2 1:1"),
+        ("SELECT a.id, c.id FROM a LEFT JOIN (b JOIN c ON c.y=b.y) ON b.a_id=a.id WHERE c.id IS NULL ORDER BY 1", "4:-"),
+        ("SELECT a.id, c.id FROM a LEFT JOIN (b JOIN c USING (y)) ON b.a_id=a.id ORDER BY 1,2", "1:1 2:1 3:2 4:-"),
+        ("SELECT a.id, b.id FROM a LEFT JOIN (b JOIN c ON c.y=b.y AND c.id > 1) ON b.a_id=a.id AND a.x > 1 ORDER BY 1,2", "1:- 2:- 3:13 4:-"),
+        ("SELECT a.id, b.id, d.id FROM a, (b LEFT JOIN c ON c.y=b.y) LEFT JOIN d ON d.c_id=c.id WHERE b.a_id=a.id ORDER BY 1,2,3", "1:10:100 1:11:- 2:12:100 3:13:-"),
+        ("SELECT * FROM vn ORDER BY aid, bid, cid", "1:10:1 2:12:1 3:13:2 4:-:-"),
+        ("SELECT a.id FROM a WHERE EXISTS (SELECT 1 FROM b LEFT JOIN (c JOIN d ON d.c_id=c.id) ON c.y=b.y WHERE b.a_id=a.id AND d.id IS NOT NULL) ORDER BY 1", "1 2"),
+        ("SELECT a.id, b.id FROM a LEFT JOIN (b JOIN c ON c.y=b.y) ON b.a_id=a.id AND c.id=(SELECT MIN(id) FROM c) ORDER BY 1,2", "1:10 2:12 3:- 4:-"),
+        ("UPDATE a LEFT JOIN (b JOIN c ON c.y=b.y) ON b.a_id=a.id SET a.x = IFNULL(c.id, -1)", "ok3|1:1,2:1,3:2,4:-1|10:1,11:1,12:2,13:3,14:-|1,2,3"),
+        ("DELETE b FROM a JOIN (b LEFT JOIN c ON c.y=b.y) ON b.a_id=a.id WHERE c.id IS NULL", "ok1|1:1,2:2,3:3,4:-|10:1,12:2,13:3,14:-|1,2,3"),
+        ("UPDATE a JOIN (b LEFT JOIN c ON c.y=b.y) ON b.a_id=a.id SET b.a_id = NULL WHERE c.id IS NULL", "ok1|1:1,2:2,3:3,4:-|10:1,11:-,12:2,13:3,14:-|1,2,3"),
+        ("DELETE b, c FROM a JOIN (b JOIN c ON c.y=b.y) ON b.a_id=a.id WHERE a.id=3", "ok2|1:1,2:2,3:3,4:-|10:1,11:1,12:2,14:-|1,3"),
+        ("SELECT a.id, bb.id FROM a LEFT JOIN (b AS bb JOIN c ON c.y=bb.y) ON bb.a_id=a.id WHERE b.id = 1", "E1054"),
+        ("SELECT a.id FROM a LEFT JOIN (b JOIN b ON 1=1) ON 1=1", "E1066"),
+    ];
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    for s in [
+        "CREATE TABLE a (id INT PRIMARY KEY, x INT)",
+        "INSERT INTO a VALUES (1,1),(2,2),(3,3),(4,NULL)",
+        "CREATE TABLE b (id INT PRIMARY KEY, a_id INT, y INT)",
+        "INSERT INTO b VALUES (10,1,5),(11,1,7),(12,2,5),(13,3,9),(14,NULL,1)",
+        "CREATE TABLE c (id INT PRIMARY KEY, y INT)",
+        "INSERT INTO c VALUES (1,5),(2,9),(3,8)",
+        "CREATE TABLE d (id INT PRIMARY KEY, c_id INT, z INT)",
+        "INSERT INTO d VALUES (100,1,0),(101,3,1)",
+        "CREATE VIEW vn AS SELECT a.id AS aid, b.id AS bid, c.id AS cid \
+         FROM a LEFT JOIN (b JOIN c ON c.y=b.y) ON b.a_id=a.id",
+    ] {
+        c.query_drop(s).await.unwrap();
+    }
+    for (sql, want) in cases {
+        let write = sql.starts_with("UPDATE") || sql.starts_with("DELETE");
+        if write {
+            c.query_drop("BEGIN").await.unwrap();
+        }
+        let got = match c.query::<mysql_async::Row, _>(*sql).await {
+            Err(mysql_async::Error::Server(e)) => format!("E{}", e.code),
+            Err(e) => panic!("{sql}: {e}"),
+            Ok(_) if write => {
+                let affected = c.affected_rows();
+                let mut state = Vec::new();
+                for check in [
+                    "SELECT GROUP_CONCAT(CONCAT_WS(':', id, IFNULL(x, '-')) ORDER BY id) FROM a",
+                    "SELECT GROUP_CONCAT(CONCAT_WS(':', id, IFNULL(a_id, '-')) ORDER BY id) FROM b",
+                    "SELECT GROUP_CONCAT(id ORDER BY id) FROM c",
+                ] {
+                    let v: Option<String> = c.query_first(check).await.unwrap().flatten();
+                    state.push(v.unwrap_or_default());
+                }
+                format!("ok{affected}|{}", state.join("|"))
+            }
+            Ok(rows) => rows
+                .iter()
+                .map(|row| {
+                    (0..row.len())
+                        .map(|i| {
+                            row.get::<Option<String>, _>(i)
+                                .flatten()
+                                .unwrap_or_else(|| "-".into())
+                        })
+                        .collect::<Vec<_>>()
+                        .join(":")
+                })
+                .collect::<Vec<_>>()
+                .join(" "),
+        };
+        if write {
+            c.query_drop("ROLLBACK").await.unwrap();
+        }
+        assert_eq!(got, *want, "{sql}");
+    }
+}

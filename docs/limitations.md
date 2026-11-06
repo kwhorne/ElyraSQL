@@ -82,11 +82,11 @@ judge fit before deploying.
   the `<=>` null-safe operator, `IS [NOT] TRUE/FALSE/UNKNOWN`,
   `LAST_INSERT_ID()`/`ROW_COUNT()`, `@@`system variables, `CONVERT()`,
   `MD5`/`SHA*`/`SOUNDEX`/`REGEXP_REPLACE`, and statistical/bitwise aggregates.
-- A join in parentheses is supported on the left of a join
-  (`FROM (a JOIN b ON ...) LEFT JOIN c ON ...`, as mysqldump writes a view's
-  definition). One on the right (`a JOIN (b LEFT JOIN c ON ...) ON ...`) is
-  not: it fails with 1054. Write it without the parentheses where the join
-  types allow, or as a derived table.
+- Joins in parentheses are supported on either side of a join (`FROM (a
+  JOIN b ON ...) LEFT JOIN c ON ...`, as mysqldump writes a view's
+  definition, and `a LEFT JOIN (b JOIN c ON ...) ON ...`). One that changes
+  the result when flattened -- an outer join around or inside it -- is joined
+  on its own first.
 
 ## Constraints & integrity
 
