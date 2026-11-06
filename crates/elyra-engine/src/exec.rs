@@ -10262,13 +10262,29 @@ fn join_qualifier_bindings(db: &Session, from: &[TableWithJoins]) -> Vec<(Vec<St
         };
         bindings.push((object_name_parts(&qualifier), explicit_alias));
     };
-    for table in from {
-        push(&table.relation);
-        for join in &table.joins {
-            push(&join.relation);
+    for_each_relation(from, &mut push);
+    bindings
+}
+
+/// Visit every relation of a FROM clause, those inside a join in parentheses
+/// included: `a LEFT JOIN (b JOIN c ON ...) ON ...` brings `b` and `c` into
+/// scope as much as `a`.
+fn for_each_relation<'a>(from: &'a [TableWithJoins], f: &mut dyn FnMut(&'a TableFactor)) {
+    fn factor<'a>(relation: &'a TableFactor, f: &mut dyn FnMut(&'a TableFactor)) {
+        match relation {
+            TableFactor::NestedJoin {
+                table_with_joins,
+                alias: None,
+            } => for_each_relation(std::slice::from_ref(&**table_with_joins), f),
+            other => f(other),
         }
     }
-    bindings
+    for table in from {
+        factor(&table.relation, f);
+        for join in &table.joins {
+            factor(&join.relation, f);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -10335,17 +10351,9 @@ fn collect_query_relation_qualifiers(
     qualifiers: &mut Vec<RelationQualifier>,
 ) {
     match body {
-        SetExpr::Select(select) => {
-            for table in &select.from {
-                qualifiers.extend(relation_qualifier(&table.relation, selected_database));
-                qualifiers.extend(
-                    table
-                        .joins
-                        .iter()
-                        .filter_map(|join| relation_qualifier(&join.relation, selected_database)),
-                );
-            }
-        }
+        SetExpr::Select(select) => for_each_relation(&select.from, &mut |relation| {
+            qualifiers.extend(relation_qualifier(relation, selected_database));
+        }),
         SetExpr::SetOperation { left, right, .. } => {
             collect_query_relation_qualifiers(left, selected_database, qualifiers);
             collect_query_relation_qualifiers(right, selected_database, qualifiers);
@@ -10555,12 +10563,11 @@ fn hidden_source_qualifier(relation: &TableFactor) -> Option<Vec<String>> {
 }
 
 fn hidden_source_qualifiers(from: &[TableWithJoins]) -> Vec<Vec<String>> {
-    from.iter()
-        .flat_map(|table| {
-            std::iter::once(&table.relation).chain(table.joins.iter().map(|join| &join.relation))
-        })
-        .filter_map(hidden_source_qualifier)
-        .collect()
+    let mut out = Vec::new();
+    for_each_relation(from, &mut |relation| {
+        out.extend(hidden_source_qualifier(relation));
+    });
+    out
 }
 
 fn qualifier_components_equal(left: &[String], right: &[String]) -> bool {
@@ -10573,10 +10580,11 @@ fn qualifier_short_names_equal(left: &[String], right: &[String]) -> bool {
         .is_some_and(|(left, right)| left == right)
 }
 
+/// The qualifiers of `from`'s relations, refusing one named twice (MySQL 1066,
+/// "Not unique table/alias").
 fn validate_unique_relation_qualifiers(
     db: &Session,
     from: &[TableWithJoins],
-    operation: &str,
 ) -> Result<Vec<Vec<String>>> {
     let bindings = join_qualifier_bindings(db, from);
     for (index, (qualifier, explicit_alias)) in bindings.iter().enumerate() {
@@ -10588,10 +10596,9 @@ fn validate_unique_relation_qualifiers(
                         && qualifier_short_names_equal(other, qualifier))
             })
         {
-            return Err(Error::Query(format!(
-                "duplicate table alias in {operation}: {}",
-                qualifier.join(".")
-            )));
+            return Err(Error::NotUniqueTable(
+                qualifier.last().cloned().unwrap_or_default(),
+            ));
         }
     }
     Ok(bindings
@@ -10744,7 +10751,7 @@ fn validate_select_alias_hiding(db: &Session, query: &SqlQuery) -> Result<()> {
     let SetExpr::Select(select) = query.body.as_ref() else {
         return Ok(());
     };
-    let visible = validate_unique_relation_qualifiers(db, &select.from, "SELECT")?;
+    let visible = validate_unique_relation_qualifiers(db, &select.from)?;
     let hidden = hidden_source_qualifiers(&select.from);
     validate_ast_alias_hiding(select.as_ref(), &hidden, &visible)?;
     if let Some(order_by) = &query.order_by {
@@ -10818,13 +10825,8 @@ fn bind_qualified_wildcards(db: &Session, query: &SqlQuery) -> Result<Option<Sql
     let SetExpr::Select(select) = query.body.as_ref() else {
         return Ok(None);
     };
-    let relations = select
-        .from
-        .iter()
-        .flat_map(|table| {
-            std::iter::once(&table.relation).chain(table.joins.iter().map(|join| &join.relation))
-        })
-        .collect::<Vec<_>>();
+    let mut relations = Vec::new();
+    for_each_relation(&select.from, &mut |relation| relations.push(relation));
     if let Some(name) = relations
         .iter()
         .find_map(|relation| malformed_virtual_source(relation))
@@ -11228,6 +11230,24 @@ async fn load_relation(
         return Err(Error::Query(
             "a derived table (FROM (SELECT ...)) needs an alias".into(),
         ));
+    }
+
+    // A join in parentheses that `nestjoin::flatten` could not take apart --
+    // the right operand of an outer join, or one holding an outer join -- is
+    // joined on its own first, and its columns keep their tables' qualifiers.
+    if let TableFactor::NestedJoin {
+        table_with_joins,
+        alias: None,
+    } = tf
+    {
+        let (schema, rows) = Box::pin(build_from(
+            db,
+            vindex,
+            std::slice::from_ref(table_with_joins),
+            &[],
+        ))
+        .await?;
+        return Ok((schema.columns, rows));
     }
 
     let (def, cols) = resolve_table(db, tf).await?;
@@ -15815,7 +15835,7 @@ pub async fn update(
     ignore: bool,
 ) -> Result<QueryResult> {
     let hidden = hidden_source_qualifiers(std::slice::from_ref(table));
-    let visible = validate_unique_relation_qualifiers(db, std::slice::from_ref(table), "mutation")?;
+    let visible = validate_unique_relation_qualifiers(db, std::slice::from_ref(table))?;
     if let Some(selection) = selection {
         validate_ast_alias_hiding(selection, &hidden, &visible)?;
     }
@@ -16612,7 +16632,7 @@ pub async fn delete(
     // sources`, the source scope is carried directly in `from`.
     let scope = del.using.as_deref().unwrap_or(relations);
     let hidden = hidden_source_qualifiers(scope);
-    let visible = validate_unique_relation_qualifiers(db, scope, "mutation")?;
+    let visible = validate_unique_relation_qualifiers(db, scope)?;
     if let Some(selection) = &del.selection {
         validate_ast_alias_hiding(selection, &hidden, &visible)?;
     }
@@ -17064,12 +17084,7 @@ async fn collect_targets(
     schema: &Schema,
 ) -> Result<std::collections::HashMap<Vec<String>, TargetInfo>> {
     let mut factors: Vec<&TableFactor> = Vec::new();
-    for twj in from {
-        factors.push(&twj.relation);
-        for j in &twj.joins {
-            factors.push(&j.relation);
-        }
-    }
+    for_each_relation(from, &mut |relation| factors.push(relation));
     let mut map: std::collections::HashMap<Vec<String>, TargetInfo> =
         std::collections::HashMap::new();
     for tf in factors {
@@ -17087,10 +17102,9 @@ async fn collect_targets(
                 .keys()
                 .any(|existing| qualifier_short_names_equal(existing, &qualifier))
             {
-                return Err(Error::Query(format!(
-                    "duplicate table alias in mutation: {}",
-                    qualifier.join(".")
-                )));
+                return Err(Error::NotUniqueTable(
+                    qualifier.last().cloned().unwrap_or_default(),
+                ));
             }
             let def = catalog::load(db, &tname).await?;
             let mut col_idx = Vec::with_capacity(def.schema.columns.len());

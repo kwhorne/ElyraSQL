@@ -8,6 +8,14 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ### Fixed
 
+- **A join in parentheses works on the right of another join.** `a LEFT JOIN
+  (b JOIN c ON c.y = b.y) ON b.a_id = a.id`, `a JOIN (b LEFT JOIN c ON ...)
+  ON ...` and deeper nestings failed with 1054 ("unknown column: c.y"): the
+  tables inside the parentheses were never brought into scope. They now
+  answer as in MySQL, in `SELECT`, `b.*`, views, and multi-table `UPDATE` and
+  `DELETE` whose targets are inside the parentheses. A table or alias named
+  twice in one `FROM` is now MySQL's 1066 (was 1105).
+
 - **A subquery works in a `JOIN ... ON` condition.** `JOIN b ON b.a_id = a.id
   AND b.y IN (SELECT y FROM c)`, `LEFT JOIN b ON ... AND b.y = (SELECT
   MAX(y) FROM b b2 WHERE b2.a_id = a.id)` and every other subquery in `ON`
