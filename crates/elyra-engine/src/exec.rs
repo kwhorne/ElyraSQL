@@ -13353,9 +13353,17 @@ fn combine(
     // INNER equi-joins whose inputs are already sorted on the join key (e.g.
     // clustered primary-key scans), use a streaming merge join instead — no hash
     // table, and the output stays ordered.
-    let inferred_keys = match condition {
-        Some(JoinCondition::On(expression)) => equi_key_pairs(expression, lschema, rschema),
-        Some(JoinCondition::ResolvedKeys(_)) | None => None,
+    // An `ON` that pairs columns of the two sides and also tests something
+    // else (`b.a_id = a.id AND b.deleted_at IS NULL`) hashes on the pairs and
+    // checks the rest on each candidate pair. It used to fall through to the
+    // nested loop below, comparing every pair: 98 s for two 20,000-row tables
+    // that the pure equi-join answered in 0.07 s.
+    let (inferred_keys, residual) = match condition {
+        Some(JoinCondition::On(expression)) => match equi_key_split(expression, lschema, rschema) {
+            Some((keys, residual)) => (Some(keys), residual),
+            None => (None, None),
+        },
+        Some(JoinCondition::ResolvedKeys(_)) | None => (None, None),
     };
     let key_pairs = match condition {
         Some(JoinCondition::On(_)) => inferred_keys.as_deref(),
@@ -13367,7 +13375,7 @@ fn combine(
             .filter(|keys| !keys.is_empty() && hash_key_pairs_compatible(keys, lschema, rschema))
         {
             const MERGE_MIN: usize = 2048;
-            if let [(lkey, rkey)] = keys {
+            if let ([(lkey, rkey)], None) = (keys, &residual) {
                 // The merge join compares keys under the default collation,
                 // so skip it for a `_bin` join key (fall through to the
                 // collation-aware hash join below).
@@ -13387,7 +13395,8 @@ fn combine(
                     }
                 }
             }
-            let rows = hash_join(lrows, rrows, lschema, rschema, keys, kind, cancel)?;
+            let residual = residual.as_ref().map(|expr| (expr, &schema));
+            let rows = hash_join(lrows, rrows, lschema, rschema, keys, residual, kind, cancel)?;
             return Ok((schema, rows));
         }
     }
@@ -13566,6 +13575,10 @@ std::thread_local! {
 /// Equi hash join for INNER / LEFT / RIGHT, always emitting `[left.., right..]`.
 /// The build side is chosen by cost: an outer join must build on its
 /// non-preserved side; an INNER join builds on the smaller relation.
+///
+/// `residual` is the rest of the join condition, tested on each pair whose
+/// keys match (against the combined schema): a pair it rejects is not a
+/// match, so an outer join NULL-extends a row whose every candidate fails it.
 #[allow(clippy::too_many_arguments)]
 fn hash_join(
     lrows: &[Vec<Value>],
@@ -13573,6 +13586,7 @@ fn hash_join(
     lschema: &Schema,
     rschema: &Schema,
     keys: &[(Expr, Expr)],
+    residual: Option<(&Expr, &Schema)>,
     kind: JoinKind,
     cancel: &std::sync::Arc<elyra_core::cancel::QueryCancel>,
 ) -> Result<Vec<Vec<Value>>> {
@@ -13622,6 +13636,9 @@ fn hash_join(
                         budget.account(out.len())?;
                         let mut combined = lrows[i].clone();
                         combined.extend_from_slice(r);
+                        if !residual_matches(residual, &combined)? {
+                            continue;
+                        }
                         budget.sample(&combined);
                         out.push(combined);
                         matched = true;
@@ -13654,6 +13671,9 @@ fn hash_join(
                         budget.account(out.len())?;
                         let mut combined = l.clone();
                         combined.extend_from_slice(&rrows[i]);
+                        if !residual_matches(residual, &combined)? {
+                            continue;
+                        }
                         budget.sample(&combined);
                         out.push(combined);
                         matched = true;
@@ -13669,6 +13689,14 @@ fn hash_join(
         }
     }
     Ok(out)
+}
+
+/// Whether a joined pair satisfies the rest of its join condition.
+fn residual_matches(residual: Option<(&Expr, &Schema)>, combined: &[Value]) -> Result<bool> {
+    match residual {
+        Some((expr, schema)) => predicate::matches(expr, schema, combined),
+        None => Ok(true),
+    }
 }
 
 /// A join key paired with its source row (for merge join).
@@ -14025,13 +14053,44 @@ fn simple_conjunct(expr: &Expr, schema: &Schema) -> Option<SimpleConjunct> {
 /// Extract every cross-relation equality from a predicate made entirely of
 /// `AND`-connected equi predicates. These become one composite hash key, so a
 /// multi-column USING/NATURAL join does not fall through to a quadratic scan.
-fn equi_key_pairs(on: &Expr, lschema: &Schema, rschema: &Schema) -> Option<Vec<(Expr, Expr)>> {
+/// A left-side and a right-side expression a join is equal on.
+type JoinKeyPair = (Expr, Expr);
+
+/// Split a join condition into the column pairs a hash join can key on and the
+/// rest, ANDed back together. `None` when no conjunct pairs two columns of the
+/// two sides.
+fn equi_key_split(
+    on: &Expr,
+    lschema: &Schema,
+    rschema: &Schema,
+) -> Option<(Vec<JoinKeyPair>, Option<Expr>)> {
     let mut conjuncts = Vec::new();
     split_and(on, &mut conjuncts);
-    conjuncts
-        .iter()
-        .map(|conjunct| equi_keys(conjunct, lschema, rschema))
-        .collect()
+    let mut keys = Vec::new();
+    let mut rest = Vec::new();
+    for conjunct in conjuncts {
+        // Only a pair of columns whose values hash alike is a key. `bc.z = 1`
+        // also has the shape of an equi-pair (a literal belongs to either
+        // side); taken as a key, it failed the hash check and sent the whole
+        // join to the nested loop.
+        match equi_keys(&conjunct, lschema, rschema) {
+            Some(pair)
+                if hash_key_pairs_compatible(std::slice::from_ref(&pair), lschema, rschema) =>
+            {
+                keys.push(pair)
+            }
+            _ => rest.push(conjunct),
+        }
+    }
+    if keys.is_empty() {
+        return None;
+    }
+    let residual = rest.into_iter().reduce(|left, right| Expr::BinaryOp {
+        left: Box::new(left),
+        op: sqlparser::ast::BinaryOperator::And,
+        right: Box::new(right),
+    });
+    Some((keys, residual))
 }
 
 /// Hash only direct-column pairs whose type-tagged keys preserve every equality
@@ -28289,5 +28348,62 @@ mod composite_join_tests {
             comparisons <= left_rows.len() * 4,
             "multi-key equality used {comparisons} pairwise comparisons"
         );
+    }
+
+    /// `ON l.id = r.id AND r.code = 1`: the key hashes, and the rest -- a
+    /// test against a literal, which also has the shape of an equi-pair -- is
+    /// checked on each candidate. It used to send the join to the nested loop.
+    /// A LEFT join still NULL-extends a row whose candidates all fail the rest.
+    #[test]
+    fn a_key_with_a_residual_condition_still_hashes() {
+        let qualified = |table: &str, column: &str| {
+            ColumnDef::new(format!("{table}.{column}"), ColumnType::Int, true)
+                .with_qualifier(vec![table.into()])
+        };
+        let left_schema = Schema::new(vec![qualified("l", "id")]);
+        let right_schema = Schema::new(vec![qualified("r", "id"), qualified("r", "code")]);
+        let left_rows = (0..512).map(|id| vec![Value::Int(id)]).collect::<Vec<_>>();
+        let right_rows = (0..512)
+            .map(|id| vec![Value::Int(id), Value::Int(id % 4)])
+            .collect::<Vec<_>>();
+        let predicate = Expr::BinaryOp {
+            left: Box::new(Expr::BinaryOp {
+                left: Box::new(column_def_expr(&left_schema.columns[0])),
+                op: BinaryOperator::Eq,
+                right: Box::new(column_def_expr(&right_schema.columns[0])),
+            }),
+            op: BinaryOperator::And,
+            right: Box::new(Expr::BinaryOp {
+                left: Box::new(column_def_expr(&right_schema.columns[1])),
+                op: BinaryOperator::Eq,
+                right: Box::new(Expr::Value(sqlparser::ast::Value::Number(
+                    "1".into(),
+                    false,
+                ))),
+            }),
+        };
+        for (kind, want_rows, want_matched) in
+            [(JoinKind::Inner, 128, 128), (JoinKind::Left, 512, 128)]
+        {
+            NESTED_JOIN_COMPARISONS.with(|comparisons| comparisons.set(0));
+            let (_, rows) = combine(
+                &left_schema,
+                &left_rows,
+                &right_schema,
+                &right_rows,
+                kind,
+                Some(JoinCondition::On(&predicate)),
+                &Arc::new(QueryCancel::new()),
+            )
+            .unwrap();
+            assert_eq!(NESTED_JOIN_COMPARISONS.with(std::cell::Cell::get), 0);
+            assert_eq!(rows.len(), want_rows);
+            let matched = rows.iter().filter(|row| !row[1].is_null()).count();
+            assert_eq!(matched, want_matched);
+            assert!(rows
+                .iter()
+                .filter(|row| !row[1].is_null())
+                .all(|row| row[0] == row[1] && row[2] == Value::Int(1)));
+        }
     }
 }

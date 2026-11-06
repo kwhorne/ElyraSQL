@@ -8,6 +8,13 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ### Fixed
 
+- **A join whose `ON` adds a condition to its key is fast again.** `JOIN b ON
+  b.a_id = a.id AND b.deleted_at IS NULL` -- every soft-deleting ORM's join --
+  or `... AND b.status = 1` compared every pair of rows instead of hashing on
+  the key: 98 s for two 20,000-row tables that the bare `ON b.a_id = a.id`
+  joined in 0.07 s. The key now hashes and the rest is checked on each
+  candidate pair, in inner, left and right joins alike.
+
 - **`DROP TABLE` and `RENAME TABLE` take a table's triggers with them.** A
   dropped table's triggers stayed behind and fired on the next table created
   under the same name -- or broke its statements, when they named columns it
