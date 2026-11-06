@@ -6,6 +6,8 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.12.13] - 2026-11-06
+
 ### Fixed
 
 - **A join in parentheses works on the right of another join.** `a LEFT JOIN

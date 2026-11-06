@@ -17,6 +17,32 @@ ElyraSQL release builds target **Ubuntu 24.04+** and **Apple Silicon macOS
     done, so an interrupted upgrade simply resumes on the next start. **Take a backup
     first, and note that downgrading to 1.4.x afterwards is not supported.**
 
+!!! warning "Upgrading to 1.12.13 — writes that MySQL refuses are refused"
+
+    No on-disk format change; a 1.12.12 database opens in 1.12.13 unchanged.
+    Three fixes **refuse statements 1.12.12 accepted**, as MySQL does:
+
+    - **A multi-table `UPDATE`** (`UPDATE a JOIN b ... SET`, `UPDATE a, b SET`)
+      now enforces unique keys, foreign keys, `CHECK`, `NOT NULL` and `ON
+      UPDATE CASCADE`, and fires triggers. It used to write past all of them:
+      **if you ran multi-table updates against unique keys, check those keys
+      for duplicates** (`SELECT k, COUNT(*) FROM t GROUP BY k HAVING
+      COUNT(*) > 1`) before upgrading.
+    - **A scalar subquery that returns more than one row** is 1242. It used the
+      first row instead, so `SELECT`s returned, and `UPDATE`s and `DELETE`s
+      changed, rows MySQL refuses to choose.
+    - **A write that reads its own table in a subquery** (`DELETE FROM t WHERE
+      x > (SELECT AVG(x) FROM t)`) is 1093, or 1443 through a view. Read it
+      through a derived table (`FROM (SELECT ...) AS d`) instead.
+
+    Also new: `UPDATE IGNORE` works (it failed with 1146), subqueries work in
+    `UPDATE ... SET` and in `JOIN ... ON`, and a join in parentheses works on
+    the right of another join. `DROP TABLE` and `RENAME TABLE` take the
+    table's triggers with them. A join whose `ON` adds a condition to its key
+    (`... AND b.deleted_at IS NULL`) is no longer quadratic: 98 s became 0.07 s
+    on two 20,000-row tables. Some errors now carry MySQL's code instead of
+    1105 or 1452: 1048, 3819, 1265, 1451, 1066.
+
 !!! warning "Upgrading to 1.12.12 — collation"
 
     No on-disk format change; a 1.12.11 database opens in 1.12.12 unchanged.
@@ -680,8 +706,8 @@ macOS).
 Multi-arch image (`amd64` + `arm64`) on the GitHub Container Registry:
 
 ```bash
-docker pull ghcr.io/kwhorne/elyrasql:1.12.12   # or :latest
-docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.12.12
+docker pull ghcr.io/kwhorne/elyrasql:1.12.13   # or :latest
+docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.12.13
 ```
 
 The image is ~15 MB, runs as a non-root user, stores data in the
