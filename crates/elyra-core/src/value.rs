@@ -163,6 +163,17 @@ impl Value {
                 .zip(to_micros(other))
                 .map(|(a, b)| a.cmp(&b)),
             (Decimal(au, asc), Decimal(bu, bsc)) => Some(cmp_decimal(*au, *asc, *bu, *bsc)),
+            // An integer against a decimal compares as decimals, as in MySQL --
+            // exactly. Through `f64`, `9007199254740993 = 9007199254740992.0`
+            // held, and a BIGINT column matched its neighbour's DECIMAL.
+            (Int(a), Decimal(bu, bsc)) => Some(cmp_int_decimal(i128::from(*a), *bu, *bsc)),
+            (UInt(a), Decimal(bu, bsc)) => Some(cmp_int_decimal(i128::from(*a), *bu, *bsc)),
+            (Decimal(au, asc), Int(b)) => {
+                Some(cmp_int_decimal(i128::from(*b), *au, *asc).reverse())
+            }
+            (Decimal(au, asc), UInt(b)) => {
+                Some(cmp_int_decimal(i128::from(*b), *au, *asc).reverse())
+            }
             (Decimal(..), _) | (_, Decimal(..)) => self
                 .as_mysql_f64()
                 .zip(other.as_mysql_f64())
@@ -481,6 +492,20 @@ fn to_micros_of_day(v: &Value) -> Option<i64> {
         Value::Time(t) => Some(*t),
         Value::Text(s) => crate::datetime::parse_time(s),
         _ => None,
+    }
+}
+
+/// An integer against a decimal (`units` scaled by 10^`scale`), exactly: the
+/// integer is compared with the decimal's whole part, and a remainder breaks a
+/// tie. Scaling the integer up instead could overflow `i128` and saturate.
+fn cmp_int_decimal(a: i128, units: i128, scale: u8) -> Ordering {
+    let Some(unit) = 10i128.checked_pow(u32::from(scale)) else {
+        return cmp_decimal(a, 0, units, scale);
+    };
+    let (whole, rest) = (units.div_euclid(unit), units.rem_euclid(unit));
+    match a.cmp(&whole) {
+        Ordering::Equal if rest != 0 => Ordering::Less,
+        other => other,
     }
 }
 
@@ -987,6 +1012,54 @@ mod value_props {
         fn collation_key_deterministic(v in any_value()) {
             prop_assert_eq!(v.collation_key(), v.collation_key());
         }
+    }
+}
+
+#[cfg(test)]
+mod integer_decimal_tests {
+    use super::Value;
+    use std::cmp::Ordering;
+
+    /// An integer against a decimal compares as decimals, exactly, as in MySQL:
+    /// through `f64` 9007199254740993 equalled 9007199254740992.00.
+    #[test]
+    fn an_integer_and_a_decimal_compare_exactly() {
+        let n = 9_007_199_254_740_993i64;
+        let dec = |units: i128, scale: u8| Value::Decimal(units, scale);
+        assert_eq!(
+            Value::Int(n).compare(&dec(900_719_925_474_099_200, 2)),
+            Some(Ordering::Greater)
+        );
+        assert_eq!(
+            Value::Int(n).compare(&dec(900_719_925_474_099_300, 2)),
+            Some(Ordering::Equal)
+        );
+        assert_eq!(
+            Value::Int(n).compare(&dec(90_071_992_547_409_925, 1)),
+            Some(Ordering::Greater)
+        );
+        assert_eq!(
+            Value::Int(n).compare(&dec(90_071_992_547_409_935, 1)),
+            Some(Ordering::Less)
+        );
+        assert_eq!(
+            dec(90_071_992_547_409_935, 1).compare(&Value::Int(n)),
+            Some(Ordering::Greater)
+        );
+        assert_eq!(Value::Int(-3).compare(&dec(-25, 1)), Some(Ordering::Less));
+        assert_eq!(
+            Value::Int(-2).compare(&dec(-25, 1)),
+            Some(Ordering::Greater)
+        );
+        assert_eq!(
+            Value::UInt(u64::MAX).compare(&dec(i128::from(u64::MAX) * 10, 1)),
+            Some(Ordering::Equal)
+        );
+        // A scale too large to scale the integer up still compares correctly.
+        assert_eq!(
+            Value::Int(i64::MAX).compare(&dec(1, 30)),
+            Some(Ordering::Greater)
+        );
     }
 }
 

@@ -7,9 +7,14 @@
 //! resolution and expression walk dominate a filtered aggregation.
 //!
 //! [`CompiledPredicate`] pre-resolves each column to an index once and evaluates
-//! with native `f64` comparisons. It only accepts that common shape; anything
-//! else returns `None` from [`compile`] and the caller falls back to the full
-//! interpreter, so semantics never diverge.
+//! with native comparisons: an integer column against an integer literal as
+//! integers, a floating-point column as `f64`. It only accepts that common
+//! shape; anything else returns `None` from [`compile`] and the caller falls
+//! back to the full interpreter, so semantics never diverge.
+//!
+//! An integer column was compared as `f64` too, which cannot tell integers
+//! apart above 2^53: `cust = 9007199254740993` counted the rows holding
+//! 9007199254740992 as well.
 
 use std::collections::HashSet;
 
@@ -29,6 +34,19 @@ enum Op {
 }
 
 impl Op {
+    #[inline]
+    fn test_ord(self, ord: std::cmp::Ordering) -> bool {
+        use std::cmp::Ordering::*;
+        match self {
+            Op::Eq => ord == Equal,
+            Op::Ne => ord != Equal,
+            Op::Lt => ord == Less,
+            Op::Le => ord != Greater,
+            Op::Gt => ord == Greater,
+            Op::Ge => ord != Less,
+        }
+    }
+
     #[inline]
     fn test(self, a: f64, b: f64) -> bool {
         match self {
@@ -51,11 +69,27 @@ impl Op {
     }
 }
 
+/// The literal side of a comparison: exact for an integer column, `f64` for a
+/// floating-point one.
+#[derive(Clone, Copy)]
+enum Lit {
+    Int(i128),
+    Float(f64),
+}
+
 #[derive(Clone, Copy)]
 struct Cmp {
     col: usize,
     op: Op,
-    rhs: f64,
+    rhs: Lit,
+}
+
+/// The members of an `IN` list: integers for an integer column, `f64` bits
+/// (canonical, so `0.0`/`-0.0` agree) for a floating-point one.
+#[derive(Clone)]
+enum Members {
+    Ints(HashSet<i128>),
+    Floats(HashSet<u64>),
 }
 
 /// `column IN (numeric literals)` as an O(1) membership test.
@@ -67,7 +101,7 @@ struct Cmp {
 #[derive(Clone)]
 struct InSet {
     col: usize,
-    set: HashSet<u64>,
+    set: Members,
     negated: bool,
     /// Range spanned by the set, so a zone map can still skip chunks that cannot
     /// contain any listed value. Unused when `negated` (the complement of a set is
@@ -116,9 +150,13 @@ impl CompiledPredicate {
         let mut out = Vec::with_capacity(self.conj.len());
         for t in &self.conj {
             match t {
-                Term::Cmp(c) => out.push(ColBound {
-                    col: c.col,
-                    op: match c.op {
+                Term::Cmp(Cmp {
+                    col,
+                    op,
+                    rhs: Lit::Float(rhs),
+                }) => out.push(ColBound {
+                    col: *col,
+                    op: match op {
                         Op::Eq => BoundOp::Eq,
                         Op::Ne => BoundOp::Ne,
                         Op::Lt => BoundOp::Lt,
@@ -126,8 +164,50 @@ impl CompiledPredicate {
                         Op::Gt => BoundOp::Gt,
                         Op::Ge => BoundOp::Ge,
                     },
-                    rhs: c.rhs,
+                    rhs: *rhs,
                 }),
+                // An integer bound may have no exact `f64`, so it is widened the
+                // safe way for each operator: a chunk is only skipped when it
+                // certainly holds no match (the zone map widens its min/max
+                // outward to the same end).
+                Term::Cmp(Cmp {
+                    col,
+                    op,
+                    rhs: Lit::Int(rhs),
+                }) => {
+                    let (below, above) = (f64_at_most(*rhs), f64_at_least(*rhs));
+                    let col = *col;
+                    match op {
+                        Op::Gt | Op::Ge => out.push(ColBound {
+                            col,
+                            op: BoundOp::Ge,
+                            rhs: below,
+                        }),
+                        Op::Lt | Op::Le => out.push(ColBound {
+                            col,
+                            op: BoundOp::Le,
+                            rhs: above,
+                        }),
+                        Op::Eq => {
+                            out.push(ColBound {
+                                col,
+                                op: BoundOp::Ge,
+                                rhs: below,
+                            });
+                            out.push(ColBound {
+                                col,
+                                op: BoundOp::Le,
+                                rhs: above,
+                            });
+                        }
+                        Op::Ne if below == above => out.push(ColBound {
+                            col,
+                            op: BoundOp::Ne,
+                            rhs: below,
+                        }),
+                        Op::Ne => {}
+                    }
+                }
                 // `IN` constrains the column to the span of its values, which is
                 // enough for chunk skipping. `NOT IN` constrains nothing.
                 Term::In(s) if !s.negated => {
@@ -153,15 +233,29 @@ impl CompiledPredicate {
     #[inline]
     pub fn matches(&self, row: &[Value]) -> bool {
         self.conj.iter().all(|t| match t {
-            Term::Cmp(c) => match row.get(c.col).and_then(|v| v.as_f64()) {
-                Some(x) => c.op.test(x, c.rhs),
-                None => false,
+            Term::Cmp(c) => match (row.get(c.col), c.rhs) {
+                (Some(v), Lit::Int(rhs)) => match int_value(v) {
+                    Some(x) => c.op.test_ord(x.cmp(&rhs)),
+                    None => false,
+                },
+                (Some(v), Lit::Float(rhs)) => match v.as_f64() {
+                    Some(x) => c.op.test(x, rhs),
+                    None => false,
+                },
+                (None, _) => false,
             },
-            Term::In(s) => match row.get(s.col).and_then(|v| v.as_f64()) {
-                // A NULL operand makes `IN` and `NOT IN` alike UNKNOWN, so the row
-                // is excluded either way -- the same as the interpreter.
-                Some(x) => s.set.contains(&canonical_f64_bits(x)) != s.negated,
-                None => false,
+            // A NULL operand makes `IN` and `NOT IN` alike UNKNOWN, so the row
+            // is excluded either way -- the same as the interpreter.
+            Term::In(s) => match (row.get(s.col), &s.set) {
+                (Some(v), Members::Ints(set)) => match int_value(v) {
+                    Some(x) => set.contains(&x) != s.negated,
+                    None => false,
+                },
+                (Some(v), Members::Floats(set)) => match v.as_f64() {
+                    Some(x) => set.contains(&canonical_f64_bits(x)) != s.negated,
+                    None => false,
+                },
+                (None, _) => false,
             },
         })
     }
@@ -191,10 +285,12 @@ fn collect(e: &Expr, schema: &Schema, out: &mut Vec<Term>) -> Option<()> {
         }
         Expr::BinaryOp { left, op, right } => {
             let cmp = cmp_op(op)?;
-            if let (Some(col), Some(rhs)) = (numeric_col(left, schema), num_lit(right)) {
+            if let Some((col, int)) = numeric_col(left, schema) {
+                let rhs = lit_for(right, int)?;
                 out.push(Term::Cmp(Cmp { col, op: cmp, rhs }));
                 Some(())
-            } else if let (Some(rhs), Some(col)) = (num_lit(left), numeric_col(right, schema)) {
+            } else if let Some((col, int)) = numeric_col(right, schema) {
+                let rhs = lit_for(left, int)?;
                 out.push(Term::Cmp(Cmp {
                     col,
                     op: cmp.flip(),
@@ -213,27 +309,38 @@ fn collect(e: &Expr, schema: &Schema, out: &mut Vec<Term>) -> Option<()> {
             list,
             negated,
         } => {
-            let col = numeric_col(expr, schema)?;
+            let (col, int) = numeric_col(expr, schema)?;
             if list.is_empty() {
                 return None;
             }
-            let mut set = HashSet::with_capacity(list.len());
+            let mut ints = HashSet::new();
+            let mut floats = HashSet::new();
             let mut lo = f64::INFINITY;
             let mut hi = f64::NEG_INFINITY;
             for item in list {
-                let v = num_lit(item)?;
-                // NaN can never equal anything, so it contributes no membership and
-                // must not widen the bounds either.
-                if v.is_nan() {
-                    continue;
+                match lit_for(item, int)? {
+                    Lit::Int(v) => {
+                        ints.insert(v);
+                        lo = lo.min(f64_at_most(v));
+                        hi = hi.max(f64_at_least(v));
+                    }
+                    // NaN can never equal anything, so it contributes no
+                    // membership and must not widen the bounds either.
+                    Lit::Float(v) if v.is_nan() => {}
+                    Lit::Float(v) => {
+                        floats.insert(canonical_f64_bits(v));
+                        lo = lo.min(v);
+                        hi = hi.max(v);
+                    }
                 }
-                set.insert(canonical_f64_bits(v));
-                lo = lo.min(v);
-                hi = hi.max(v);
             }
-            if set.is_empty() {
+            let set = if int && !ints.is_empty() {
+                Members::Ints(ints)
+            } else if !int && !floats.is_empty() {
+                Members::Floats(floats)
+            } else {
                 return None;
-            }
+            };
             out.push(Term::In(InSet {
                 col,
                 set,
@@ -259,9 +366,10 @@ fn cmp_op(op: &BinaryOperator) -> Option<Op> {
     })
 }
 
-/// Resolve an identifier to a column index, but only if it is an `Int`/`Float`
-/// column (so native f64 comparison matches the interpreter's semantics).
-fn numeric_col(e: &Expr, schema: &Schema) -> Option<usize> {
+/// Resolve an identifier to a column index, but only if it is an `Int` or
+/// `Float` column (so a native comparison matches the interpreter's
+/// semantics), with whether it is the integer one.
+fn numeric_col(e: &Expr, schema: &Schema) -> Option<(usize, bool)> {
     let name = match e {
         Expr::Identifier(id) => id.value.clone(),
         Expr::CompoundIdentifier(parts) => parts.last()?.value.clone(),
@@ -272,19 +380,70 @@ fn numeric_col(e: &Expr, schema: &Schema) -> Option<usize> {
         .iter()
         .position(|c| predicate::identifier_eq(&c.name, &name))?;
     match schema.columns[i].ty {
-        ColumnType::Int | ColumnType::Float => Some(i),
+        ColumnType::Int => Some((i, true)),
+        ColumnType::Float => Some((i, false)),
         _ => None,
     }
 }
 
-fn num_lit(e: &Expr) -> Option<f64> {
+/// The literal `e` as compared against an integer column (`int`) or a
+/// floating-point one: an integer column takes only an integer literal
+/// (compared exactly); a decimal or exponent literal there is left to the
+/// interpreter, which compares it as MySQL does. A floating-point column takes
+/// any numeric literal as `f64`.
+fn lit_for(e: &Expr, int: bool) -> Option<Lit> {
+    let (text, negative) = num_text(e)?;
+    if int {
+        if !text.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let v = text.parse::<i128>().ok()?;
+        Some(Lit::Int(if negative { -v } else { v }))
+    } else {
+        let v = text.parse::<f64>().ok()?;
+        Some(Lit::Float(if negative { -v } else { v }))
+    }
+}
+
+/// The digits of a numeric literal and whether it is negated.
+fn num_text(e: &Expr) -> Option<(&str, bool)> {
     match e {
-        Expr::Value(SqlValue::Number(n, _)) => n.parse::<f64>().ok(),
+        Expr::Value(SqlValue::Number(n, _)) => Some((n.as_str(), false)),
         Expr::UnaryOp {
             op: sqlparser::ast::UnaryOperator::Minus,
             expr,
-        } => num_lit(expr).map(|v| -v),
+        } => num_text(expr).map(|(text, negative)| (text, !negative)),
         _ => None,
+    }
+}
+
+/// An integer column's value as an exact integer.
+fn int_value(v: &Value) -> Option<i128> {
+    match v {
+        Value::Int(i) => Some(i128::from(*i)),
+        Value::UInt(u) => Some(i128::from(*u)),
+        Value::Bool(b) => Some(i128::from(*b)),
+        _ => None,
+    }
+}
+
+/// The largest `f64` that is not above `v`.
+pub(crate) fn f64_at_most(v: i128) -> f64 {
+    let f = v as f64;
+    if (f as i128) > v {
+        f.next_down()
+    } else {
+        f
+    }
+}
+
+/// The smallest `f64` that is not below `v`.
+pub(crate) fn f64_at_least(v: i128) -> f64 {
+    let f = v as f64;
+    if (f as i128) < v {
+        f.next_up()
+    } else {
+        f
     }
 }
 
@@ -297,6 +456,7 @@ mod in_tests {
         Schema::new(vec![
             ColumnDef::new("g", ColumnType::Int, true),
             ColumnDef::new("s", ColumnType::Text, true),
+            ColumnDef::new("f", ColumnType::Float, true),
         ])
     }
 
@@ -316,7 +476,11 @@ mod in_tests {
     }
 
     fn row(g: Option<i64>) -> Vec<Value> {
-        vec![g.map_or(Value::Null, Value::Int), Value::Null]
+        vec![g.map_or(Value::Null, Value::Int), Value::Null, Value::Null]
+    }
+
+    fn float_row(f: f64) -> Vec<Value> {
+        vec![Value::Null, Value::Null, Value::Float(f)]
     }
 
     #[test]
@@ -370,10 +534,60 @@ mod in_tests {
     fn zero_and_negative_literals_compare_by_value() {
         let sc = schema();
         let p = compile(&parse("g IN (0, -3)"), &sc).unwrap();
-        // -0.0 and 0.0 must be the same member.
-        assert!(p.matches(&[Value::Float(-0.0), Value::Null]));
         assert!(p.matches(&row(Some(0))));
         assert!(p.matches(&row(Some(-3))));
         assert!(!p.matches(&row(Some(3))));
+        // -0.0 and 0.0 must be the same member of a floating-point column.
+        let p = compile(&parse("f IN (0, -3)"), &sc).unwrap();
+        assert!(p.matches(&float_row(-0.0)));
+        assert!(p.matches(&float_row(-3.0)));
+    }
+
+    /// Above 2^53 neighbouring integers share an `f64`: an integer column
+    /// compared as `f64` counted 9007199254740992 as `= 9007199254740993`.
+    #[test]
+    fn an_integer_column_compares_exactly_above_two_to_the_fifty_third() {
+        let sc = schema();
+        const N: i64 = 9_007_199_254_740_993;
+        for (sql, want) in [
+            ("g = 9007199254740993", [false, true, false]),
+            ("g <> 9007199254740993", [true, false, true]),
+            ("g < 9007199254740993", [true, false, false]),
+            ("g >= 9007199254740993", [false, true, true]),
+            ("9007199254740993 < g", [false, false, true]),
+            ("g IN (9007199254740993)", [false, true, false]),
+            ("g NOT IN (9007199254740993)", [true, false, true]),
+        ] {
+            let p = compile(&parse(sql), &sc).expect(sql);
+            for (value, want) in [N - 1, N, N + 1].into_iter().zip(want) {
+                assert_eq!(p.matches(&row(Some(value))), want, "{sql} for {value}");
+            }
+        }
+        // A decimal or exponent literal against an integer column is left to
+        // the interpreter, which compares it as MySQL does.
+        assert!(compile(&parse("g = 9007199254740992.5"), &sc).is_none());
+        assert!(compile(&parse("g = 9007199254740993e0"), &sc).is_none());
+        assert!(compile(&parse("g IN (1, 2.5)"), &sc).is_none());
+    }
+
+    /// Zone-map bounds for an integer with no exact `f64` are widened so a chunk
+    /// holding the value is never skipped.
+    #[test]
+    fn integer_bounds_round_outward() {
+        let sc = schema();
+        const N: i128 = 9_007_199_254_740_993;
+        let p = compile(&parse("g = 9007199254740993"), &sc).unwrap();
+        let bounds = p.bounds();
+        let ge = bounds.iter().find(|b| b.op == BoundOp::Ge).unwrap();
+        let le = bounds.iter().find(|b| b.op == BoundOp::Le).unwrap();
+        assert!((ge.rhs as i128) <= N && (le.rhs as i128) >= N);
+        assert_eq!(f64_at_most(N) as i128, N - 1);
+        assert_eq!(f64_at_least(N) as i128, N + 1);
+        assert_eq!(f64_at_most(N - 1), f64_at_least(N - 1));
+        // `<>` an inexact integer constrains no chunk.
+        assert!(compile(&parse("g <> 9007199254740993"), &sc)
+            .unwrap()
+            .bounds()
+            .is_empty());
     }
 }

@@ -82,13 +82,19 @@ impl Builder {
             if !self.numeric[c] {
                 continue;
             }
-            let v = match self.buf.get(c) {
-                Some(Value::Int(i)) => *i as f64,
-                Some(Value::Float(f)) => *f,
+            // An integer above 2^53 has no exact `f64`, so the bounds are
+            // rounded outward: a chunk's min/max always contain its values, and
+            // a chunk is never skipped for a value that rounded past a bound.
+            let (lo, hi) = match self.buf.get(c) {
+                Some(Value::Int(i)) => (
+                    crate::cpred::f64_at_most(i128::from(*i)),
+                    crate::cpred::f64_at_least(i128::from(*i)),
+                ),
+                Some(Value::Float(f)) => (*f, *f),
                 _ => continue, // NULL / other: does not widen numeric min/max
             };
-            self.cur_min[c] = Some(self.cur_min[c].map_or(v, |m| m.min(v)));
-            self.cur_max[c] = Some(self.cur_max[c].map_or(v, |m| m.max(v)));
+            self.cur_min[c] = Some(self.cur_min[c].map_or(lo, |m| m.min(lo)));
+            self.cur_max[c] = Some(self.cur_max[c].map_or(hi, |m| m.max(hi)));
         }
         self.rows_in_chunk += 1;
         if self.rows_in_chunk >= CHUNK_ROWS {

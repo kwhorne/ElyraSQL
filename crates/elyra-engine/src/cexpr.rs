@@ -76,10 +76,29 @@ impl CExpr {
                 }
             }
             Expr::BinaryOp { left, op, right } if compilable_binary(op, left, right) => {
+                let mut l = CExpr::compile(left, schema);
+                let mut r = CExpr::compile(right, schema);
+                // An integer column against a constant compares as integers
+                // when the constant converts without loss, as in the
+                // interpreter (`predicate::against_integer_column`): the
+                // constant is converted once, here.
+                if matches!(
+                    op,
+                    BinaryOperator::Eq
+                        | BinaryOperator::NotEq
+                        | BinaryOperator::Lt
+                        | BinaryOperator::LtEq
+                        | BinaryOperator::Gt
+                        | BinaryOperator::GtEq
+                        | BinaryOperator::Spaceship
+                ) {
+                    integer_column_constant(&l, right, &mut r, schema);
+                    integer_column_constant(&r, left, &mut l, schema);
+                }
                 CExpr::Binary {
                     op: op.clone(),
-                    left: Box::new(CExpr::compile(left, schema)),
-                    right: Box::new(CExpr::compile(right, schema)),
+                    left: Box::new(l),
+                    right: Box::new(r),
                     collation: cmp_collation(left, right, schema),
                 }
             }
@@ -126,6 +145,26 @@ impl CExpr {
     /// Whether the row passes, as a `WHERE`/`ON` clause: NULL is false.
     pub(crate) fn matches(&self, schema: &Schema, row: &[Value]) -> Result<bool> {
         Ok(predicate::truthy(&self.eval(schema, row)?))
+    }
+}
+
+/// If `column` is an integer column and `constant` a literal, replace its
+/// compiled form with the constant as the column compares it.
+fn integer_column_constant(column: &CExpr, constant: &Expr, compiled: &mut CExpr, schema: &Schema) {
+    let CExpr::Col(index) = column else {
+        return;
+    };
+    let integer = schema.columns.get(*index).is_some_and(|c| {
+        matches!(
+            c.ty,
+            elyra_core::ColumnType::Int | elyra_core::ColumnType::UInt
+        )
+    });
+    if !integer || !predicate::is_constant(constant) {
+        return;
+    }
+    if let Ok(value) = predicate::eval_row(constant, schema, &[]) {
+        *compiled = CExpr::Lit(predicate::int_constant(value));
     }
 }
 
