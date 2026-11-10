@@ -6648,10 +6648,11 @@ fn query_has_from(q: &sqlparser::ast::Query) -> bool {
         sqlparser::ast::SetExpr::Select(s) => {
             // A FROM-less SELECT still needs the full engine when its projection
             // or WHERE contains a subquery (scalar / EXISTS / IN), or when it
-            // has row-filtering/paging clauses, which the lightweight literal
+            // has row-filtering (WHERE, HAVING) or paging clauses, which the lightweight literal
             // evaluator does not apply.
             !s.from.is_empty()
                 || s.selection.is_some()
+                || s.having.is_some()
                 || q.limit.is_some()
                 || q.offset.is_some()
                 || select_has_subquery(s)

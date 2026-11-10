@@ -8028,6 +8028,18 @@ async fn select_inner(
         }
     }
 
+    // HAVING without GROUP BY. With an aggregate anywhere the whole result is one
+    // implicit group; without one, HAVING filters the result rows by their
+    // select-list columns. Neither shape reaches the paths below, which only
+    // apply HAVING to grouped output.
+    if let SetExpr::Select(s) = query.body.as_ref() {
+        if let Some(result) =
+            Box::pin(ungrouped_having(db, vindex, query_before_binding, s)).await?
+        {
+            return Ok(result);
+        }
+    }
+
     // Normalise an INNER comma-join (`FROM a, b WHERE a.k = b.k`) into an explicit
     // JOIN chain so it gets cost-based reordering and streaming. Done before the
     // `select` local shadows the function name below.
@@ -8050,6 +8062,16 @@ async fn select_inner(
     if let SetExpr::Select(select) = normalized_query.body.as_mut() {
         if let Some(from) = resolve_join_on_subqueries(db, vindex, &select.from).await? {
             select.from = from;
+        }
+        // An uncorrelated subquery in HAVING is one value for every group:
+        // resolve it once. One that names the grouped row cannot run
+        // standalone (1054) and is left for the evaluator to refuse.
+        if let Some(having) = select.having.as_ref().filter(|h| expr_has_subquery(h)) {
+            match resolve_subqueries(db, vindex, having.clone()).await {
+                Ok(resolved) => select.having = Some(resolved),
+                Err(error) if error.mysql_code() == 1054 => {}
+                Err(error) => return Err(error),
+            }
         }
     }
     let query = &normalized_query;
@@ -18266,6 +18288,217 @@ fn collect_agg_exprs(e: &Expr, out: &mut Vec<Expr>) {
     }
 }
 
+/// HAVING on a SELECT without GROUP BY, which MySQL accepts in two shapes:
+///
+/// * an aggregate in HAVING but none in the select list
+///   (`SELECT 1 FROM t HAVING COUNT(*) > 0`): the whole result is one implicit
+///   group, as if the select list had held the aggregate;
+/// * no aggregate at all (`SELECT id FROM t HAVING id > 2`): HAVING filters the
+///   result rows after ORDER BY and before LIMIT, and may name only select-list
+///   columns and aliases (1054 for anything else).
+///
+/// Returns `None` for every other query, including an aggregate select list,
+/// which the grouped paths already handle.
+async fn ungrouped_having(
+    db: &Session,
+    vindex: &VectorRegistry,
+    query: &SqlQuery,
+    outer: &Select,
+) -> Result<Option<QueryResult>> {
+    use sqlparser::ast::{GroupByExpr, Ident, SelectItem};
+    let Some(having) = &outer.having else {
+        return Ok(None);
+    };
+    if !matches!(&outer.group_by, GroupByExpr::Expressions(exprs, _) if exprs.is_empty())
+        || aggregate::projection_has_aggregate(&outer.projection)
+        || projection_has_window(&outer.projection)
+    {
+        return Ok(None);
+    }
+    let mut inner = query.clone();
+    let SetExpr::Select(inner_select) = inner.body.as_mut() else {
+        return Ok(None);
+    };
+
+    let mut aggregates = Vec::new();
+    collect_agg_exprs(having, &mut aggregates);
+    if let Some(first) = aggregates.into_iter().next() {
+        // One hidden aggregate turns the query into an implicit group; the
+        // grouped path then evaluates HAVING (and any further aggregate in it).
+        inner_select.projection.push(SelectItem::ExprWithAlias {
+            expr: first,
+            alias: Ident::new("__elyra_implicit_group"),
+        });
+        let QueryResult::Rows(mut stream) = Box::pin(select(db, vindex, &inner)).await? else {
+            return Err(Error::Query("implicit group returned no rows".into()));
+        };
+        let mut rows = Vec::new();
+        loop {
+            let batch = stream.next_batch(8192).await?;
+            if batch.is_empty() {
+                break;
+            }
+            rows.extend(batch.into_iter().map(|mut row| {
+                row.pop();
+                row
+            }));
+        }
+        let mut columns = stream.schema.columns.clone();
+        columns.pop();
+        let mut tables = stream.schema.tables.clone();
+        tables.pop();
+        return Ok(Some(QueryResult::Rows(RowStream::literal(
+            Schema::with_tables(columns, tables),
+            rows,
+        ))));
+    }
+
+    let offset = match &query.offset {
+        Some(o) => eval_usize(&o.value)?,
+        None => 0,
+    };
+    let limit = match &query.limit {
+        Some(e) => Some(eval_usize(e)?),
+        None => None,
+    };
+    inner_select.having = None;
+    inner.limit = None;
+    inner.offset = None;
+    let QueryResult::Rows(mut stream) = Box::pin(select(db, vindex, &inner)).await? else {
+        return Ok(None);
+    };
+    let schema = stream.schema.clone();
+    let having = resolve_subqueries(db, vindex, having.clone()).await?;
+    let filter = having_over_output(&having, &schema, &outer.projection)?;
+    let positional = Schema::new(
+        schema
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(i, column)| elyra_core::ColumnDef {
+                name: format!("__elyra_having_{i}"),
+                qualifier: Vec::new(),
+                ..column.clone()
+            })
+            .collect(),
+    );
+
+    let mut out = Vec::new();
+    let mut skipped = 0usize;
+    'scan: loop {
+        let batch = stream.next_batch(8192).await?;
+        if batch.is_empty() {
+            break;
+        }
+        for row in batch {
+            if limit.is_some_and(|l| out.len() >= l) {
+                break 'scan;
+            }
+            if !predicate::matches(&filter, &positional, &row)? {
+                continue;
+            }
+            if skipped < offset {
+                skipped += 1;
+                continue;
+            }
+            out.push(row);
+        }
+    }
+    Ok(Some(QueryResult::Rows(RowStream::literal(schema, out))))
+}
+
+/// Rewrite a HAVING clause of a non-aggregate query so every column reference
+/// names a result column by position (`__elyra_having_<i>`). MySQL resolves
+/// such references against the select list only: a source column that is not
+/// selected is 1054, and two different items sharing a name are ambiguous.
+fn having_over_output(
+    having: &Expr,
+    schema: &Schema,
+    projection: &[sqlparser::ast::SelectItem],
+) -> Result<Expr> {
+    use sqlparser::ast::{Ident, SelectItem};
+    // Item expression per result column, when the select list maps 1:1.
+    let items: Option<Vec<String>> = (projection.len() == schema.columns.len())
+        .then(|| {
+            projection
+                .iter()
+                .map(|item| match item {
+                    SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
+                        Some(e.to_string())
+                    }
+                    _ => None,
+                })
+                .collect()
+        })
+        .flatten();
+    let resolve = |parts: &[Ident]| -> Result<Expr> {
+        let last = parts.last().map(|p| p.value.as_str()).unwrap_or_default();
+        let qualifier = parts.len().checked_sub(2).map(|i| parts[i].value.as_str());
+        let hits: Vec<usize> = schema
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(i, column)| {
+                let name = if column.qualifier.is_empty() {
+                    column.name.as_str()
+                } else {
+                    column.name.rsplit('.').next().unwrap_or(&column.name)
+                };
+                predicate::identifier_eq(name, last)
+                    && match qualifier {
+                        None => true,
+                        Some(q) => match schema.tables.get(*i) {
+                            Some(table) => table == q,
+                            None => schema.tables.is_empty(),
+                        },
+                    }
+            })
+            .map(|(i, _)| i)
+            .collect();
+        let dotted = parts
+            .iter()
+            .map(|p| p.value.as_str())
+            .collect::<Vec<_>>()
+            .join(".");
+        let Some(&first) = hits.first() else {
+            return Err(Error::UnknownColumn(format!(
+                "'{dotted}' in 'having clause'"
+            )));
+        };
+        if let Some(items) = &items {
+            if hits.iter().any(|&i| items[i] != items[first]) {
+                return Err(Error::Query(format!(
+                    "Column '{dotted}' in having clause is ambiguous"
+                )));
+            }
+        }
+        Ok(Expr::Identifier(Ident::new(format!(
+            "__elyra_having_{first}"
+        ))))
+    };
+    let failure = std::cell::RefCell::new(None);
+    let rewritten = map_expr(having, &|e| {
+        let resolved = match e {
+            Expr::Identifier(id) if id.quote_style != Some('"') => {
+                resolve(std::slice::from_ref(id))
+            }
+            Expr::CompoundIdentifier(parts) => resolve(parts),
+            _ => return None,
+        };
+        match resolved {
+            Ok(expr) => Some(expr),
+            Err(error) => {
+                failure.borrow_mut().get_or_insert(error);
+                Some(e.clone())
+            }
+        }
+    });
+    match failure.into_inner() {
+        Some(error) => Err(error),
+        None => Ok(rewritten),
+    }
+}
+
 fn apply_having(
     having: Option<&Expr>,
     projection: &[sqlparser::ast::SelectItem],
@@ -21117,10 +21350,39 @@ async fn static_select_schema(
         }
     }
     if let Some(having) = &select.having {
+        // The same item selected twice (`SELECT id, id ... HAVING id`) is one
+        // column to MySQL, not an ambiguous pair: hide the repeats.
+        let mut having_visible = visible.clone();
+        if select.projection.len() == output.columns.len() {
+            let items: Vec<Option<String>> = select
+                .projection
+                .iter()
+                .map(|item| match item {
+                    sqlparser::ast::SelectItem::UnnamedExpr(e)
+                    | sqlparser::ast::SelectItem::ExprWithAlias { expr: e, .. } => {
+                        Some(e.to_string())
+                    }
+                    _ => None,
+                })
+                .collect();
+            for later in 1..items.len() {
+                let repeated = (0..later).any(|earlier| {
+                    items[later].is_some()
+                        && items[earlier] == items[later]
+                        && predicate::identifier_eq(
+                            &output.columns[earlier].name,
+                            &output.columns[later].name,
+                        )
+                });
+                if repeated {
+                    having_visible.hide_from_unqualified(later);
+                }
+            }
+        }
         Box::pin(validate_expression_columns(
             db,
             having,
-            &visible,
+            &having_visible,
             outer,
             ctes,
             AGGREGATE_FUNCTIONS,

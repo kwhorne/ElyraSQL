@@ -6,6 +6,18 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **`HAVING` without `GROUP BY` filters.** Unless the select list held an
+  aggregate, it was ignored and every row came back: `SELECT id FROM t HAVING
+  id > 2` returned all of `t`, and so did `SELECT 5 HAVING 0`. As in MySQL, it
+  now filters the result rows (after `ORDER BY`, before `LIMIT`) and may name
+  only select-list columns and aliases (1054 otherwise). An aggregate only in
+  `HAVING` (`SELECT 1 FROM t HAVING COUNT(*) > 0`) makes the query one group,
+  as it does in MySQL, instead of returning one row per row.
+- **An uncorrelated subquery in `HAVING` works**, with or without `GROUP BY`
+  (`HAVING COUNT(*) > (SELECT ...)`); it was refused with 1235.
+
 ## [1.12.15] - 2026-11-10
 
 ### Fixed
