@@ -773,7 +773,9 @@ pub async fn create_table(
                 }
                 // Index the referencing columns so parent-side checks (RESTRICT
                 // / CASCADE / SET NULL) can find child rows efficiently.
-                if !indexes.iter().any(|ix| ix.cols == fk_cols) && pk_cols != fk_cols {
+                // An index that starts with the key's columns serves it, as in
+                // MySQL; only a key no index leads with gets its own.
+                if !indexes.iter().any(|ix| fk_index_serves(ix, &fk_cols)) && pk_cols != fk_cols {
                     let fkcolls: Vec<elyra_core::Collation> =
                         fk_cols.iter().map(|&i| columns[i].collation).collect();
                     indexes.push(IndexDef {
@@ -4389,7 +4391,9 @@ async fn alter_table_inner(
                             })?;
                         fk_cols.push(i);
                     }
-                    if !def.indexes.iter().any(|ix| ix.cols == fk_cols) && def.pk_cols != fk_cols {
+                    if !def.indexes.iter().any(|ix| fk_index_serves(ix, &fk_cols))
+                        && def.pk_cols != fk_cols
+                    {
                         let ci = CreateIndex {
                             name: None,
                             table_name: name.clone(),
@@ -17213,19 +17217,31 @@ async fn cascade_parent_update(
 
 /// Child rows whose columns `cols` equal `vals` (via an index if present, else
 /// a scan).
+/// Whether index `ix` can find a foreign key's rows: it is a B-tree whose
+/// leading columns are the key's.
+fn fk_index_serves(ix: &IndexDef, fk_cols: &[usize]) -> bool {
+    !ix.vector && !ix.fulltext && ix.cols.starts_with(fk_cols)
+}
+
 async fn lookup_child_rows(
     db: &Session,
     child: &TableDef,
     cols: &[usize],
     vals: &[Value],
 ) -> Result<Vec<(Vec<u8>, Vec<Value>)>> {
-    // Prefer an index on exactly these columns.
-    if let Some(idx) = child
+    // Prefer an index on exactly these columns, then one that starts with
+    // them (a foreign key shares a leading composite index, as in MySQL).
+    let exact = child
         .indexes
         .iter()
-        .find(|ix| !ix.vector && ix.cols == cols)
-    {
-        let data_keys = index::lookup_eq(db, &child.storage_name(), idx, vals).await?;
+        .find(|ix| !ix.vector && ix.cols == cols);
+    let leading = || child.indexes.iter().find(|ix| fk_index_serves(ix, cols));
+    if let Some(idx) = exact.or_else(leading) {
+        let data_keys = if idx.cols.len() == cols.len() {
+            index::lookup_eq(db, &child.storage_name(), idx, vals).await?
+        } else {
+            index::lookup_prefix_range(db, &child.storage_name(), idx, vals, None, None).await?
+        };
         let blobs = db.multi_get(data_keys.clone()).await?;
         let mut out = Vec::new();
         for (k, b) in data_keys.into_iter().zip(blobs) {

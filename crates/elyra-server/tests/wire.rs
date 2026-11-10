@@ -16034,3 +16034,116 @@ async fn div_mod_and_xor_follow_mysql_precedence() {
         .unwrap();
     assert_eq!(rows, vec![(3, 4)]);
 }
+
+/// MySQL index definitions sqlparser 0.53 rejected with 1064 -- `USING BTREE`
+/// after the key parts (every Navicat and `SHOW CREATE TABLE` index), `ASC` /
+/// `DESC` key parts, `COMMENT` / `VISIBLE` / `KEY_BLOCK_SIZE` options, and
+/// `ALGORITHM` / `LOCK` -- so a Navicat dump could not be restored. All are
+/// accepted by MySQL 8.4 and here. A foreign key also shares an index that
+/// leads with its columns, as in MySQL, instead of adding one of its own.
+#[tokio::test]
+async fn mysql_index_definitions_are_accepted() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    for def in [
+        "PRIMARY KEY (id) USING BTREE",
+        "PRIMARY KEY USING BTREE (id)",
+        "PRIMARY KEY (id ASC)",
+        "PRIMARY KEY (id DESC)",
+        "PRIMARY KEY (id), KEY k (a) USING BTREE",
+        "PRIMARY KEY (id), KEY k (a) USING HASH",
+        "PRIMARY KEY (id), KEY k USING BTREE (a)",
+        "PRIMARY KEY (id), KEY k (a DESC, b ASC) USING BTREE",
+        "PRIMARY KEY (id), UNIQUE KEY u (a DESC)",
+        "PRIMARY KEY (id), UNIQUE INDEX u (a, c) USING BTREE",
+        "PRIMARY KEY (id), INDEX k (b(10) DESC) USING BTREE",
+        "PRIMARY KEY (id), KEY k (a) USING BTREE COMMENT 'x'",
+        "PRIMARY KEY (id), KEY k (a) INVISIBLE",
+        "PRIMARY KEY (id), KEY k (a) KEY_BLOCK_SIZE=8",
+        "PRIMARY KEY (id), CONSTRAINT u2 UNIQUE (a) USING BTREE",
+        "PRIMARY KEY (id) COMMENT 'pk'",
+    ] {
+        c.query_drop("DROP TABLE IF EXISTS ix").await.unwrap();
+        c.query_drop(format!(
+            "CREATE TABLE ix (id INT NOT NULL, a INT, b VARCHAR(40), c INT, {def})"
+        ))
+        .await
+        .unwrap_or_else(|e| panic!("{def}: {e}"));
+    }
+    c.query_drop("DROP TABLE IF EXISTS ix").await.unwrap();
+    c.query_drop("CREATE TABLE ix (id INT PRIMARY KEY, a INT, b VARCHAR(40), c INT)")
+        .await
+        .unwrap();
+    for sql in [
+        "CREATE INDEX i1 ON ix (a) USING BTREE",
+        "CREATE INDEX i2 USING BTREE ON ix (a)",
+        "CREATE UNIQUE INDEX i4 ON ix (c ASC) USING BTREE",
+        "CREATE INDEX i5 ON ix (b(10) DESC)",
+        "ALTER TABLE ix ADD INDEX i6 (a) USING BTREE",
+        "ALTER TABLE ix ADD INDEX i7 (a DESC, c)",
+        "ALTER TABLE ix ADD KEY i9 USING BTREE (c)",
+        "ALTER TABLE ix ADD INDEX i10 (a) COMMENT 'x' INVISIBLE",
+        "CREATE INDEX i11 ON ix (a) ALGORITHM=INPLACE LOCK=NONE",
+        "ALTER TABLE ix ADD COLUMN d INT, ALGORITHM=INPLACE, LOCK=NONE",
+    ] {
+        c.query_drop(sql)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    // A unique index normalised this way still enforces uniqueness.
+    c.query_drop("INSERT INTO ix (id, c) VALUES (1, 5)")
+        .await
+        .unwrap();
+    match c.query_drop("INSERT INTO ix (id, c) VALUES (2, 5)").await {
+        Err(mysql_async::Error::Server(e)) => assert_eq!(e.code, 1062),
+        other => panic!("UNIQUE (c ASC) USING BTREE: {other:?}"),
+    }
+
+    // A Navicat dump's table: the foreign key shares the composite index that
+    // leads with its column, as in MySQL, and still cascades and restricts.
+    for s in [
+        "SET FOREIGN_KEY_CHECKS = 0",
+        "DROP TABLE IF EXISTS `lines`",
+        "DROP TABLE IF EXISTS `orders`",
+        "CREATE TABLE `orders` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  \
+         PRIMARY KEY (`id`) USING BTREE\n) ENGINE=InnoDB AUTO_INCREMENT=3 \
+         DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
+        "CREATE TABLE `lines` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  \
+         `order_id` bigint unsigned NOT NULL,\n  `pos` int NOT NULL,\n  \
+         PRIMARY KEY (`id`) USING BTREE,\n  \
+         UNIQUE KEY `lines_order_pos` (`order_id`,`pos`) USING BTREE,\n  \
+         CONSTRAINT `lines_order_fk` FOREIGN KEY (`order_id`) REFERENCES `orders` (`id`) \
+         ON DELETE CASCADE ON UPDATE RESTRICT\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 \
+         COLLATE=utf8mb4_unicode_ci",
+        "BEGIN",
+        "INSERT INTO `orders` VALUES (1)",
+        "INSERT INTO `orders` VALUES (2)",
+        "INSERT INTO `lines` VALUES (1, 1, 1)",
+        "INSERT INTO `lines` VALUES (2, 1, 2)",
+        "INSERT INTO `lines` VALUES (3, 2, 1)",
+        "COMMIT",
+        "SET FOREIGN_KEY_CHECKS = 1",
+    ] {
+        c.query_drop(s).await.unwrap_or_else(|e| panic!("{s}: {e}"));
+    }
+    let indexes: Vec<String> = c
+        .query(
+            "SELECT DISTINCT INDEX_NAME FROM information_schema.STATISTICS \
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'lines' ORDER BY INDEX_NAME",
+        )
+        .await
+        .unwrap();
+    assert_eq!(indexes, vec!["lines_order_pos", "PRIMARY"]);
+    match c
+        .query_drop("UPDATE `orders` SET id = 9 WHERE id = 1")
+        .await
+    {
+        Err(mysql_async::Error::Server(e)) => assert_eq!(e.code, 1451),
+        other => panic!("ON UPDATE RESTRICT: {other:?}"),
+    }
+    c.query_drop("DELETE FROM `orders` WHERE id = 1")
+        .await
+        .unwrap();
+    let left: Vec<i64> = c.query("SELECT id FROM `lines` ORDER BY id").await.unwrap();
+    assert_eq!(left, vec![3]);
+}

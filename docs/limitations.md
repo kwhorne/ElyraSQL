@@ -92,7 +92,15 @@ judge fit before deploying.
 
 - Enforced: `PRIMARY KEY`, `UNIQUE`, `NOT NULL`, `CHECK`, and `FOREIGN KEY`.
 - Foreign keys reference a primary key or unique index; both `ON DELETE` and
-  `ON UPDATE` `RESTRICT`/`NO ACTION`/`CASCADE`/`SET NULL` are enforced.
+  `ON UPDATE` `RESTRICT`/`NO ACTION`/`CASCADE`/`SET NULL` are enforced. As in
+  MySQL, a foreign key uses an index that starts with its columns, and gets an
+  index of its own only when none does.
+- Index definitions are accepted as MySQL writes them -- `USING BTREE` /
+  `USING HASH`, `ASC` / `DESC` key parts, prefix lengths, `COMMENT`,
+  `VISIBLE` / `INVISIBLE`, `KEY_BLOCK_SIZE`, and `ALGORITHM` / `LOCK` -- but
+  every index is a full-value B-tree read in either direction: the type,
+  direction, prefix length and options are not stored, so `SHOW CREATE TABLE`
+  does not echo them.
 - Multi-level `ON DELETE` cascades are supported, including self-referencing
   hierarchies. Delete cascades run to a fixed point with cycle detection and a
   depth guard. `ON UPDATE` cascades are currently single-level, and deferred
