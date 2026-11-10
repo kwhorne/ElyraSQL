@@ -119,6 +119,14 @@ pub enum Error {
     #[error("out of range: {0}")]
     OutOfRange(String),
 
+    /// An expression whose result its type cannot hold: integer or DOUBLE
+    /// arithmetic that overflows. MySQL 1690 (`ER_DATA_OUT_OF_RANGE`), raised
+    /// even under `IGNORE`; its text, e.g. `BIGINT value is out of range in
+    /// '(9223372036854775807 + 1)'`. A value too big for its *column* is
+    /// [`Error::OutOfRange`] (1264) instead.
+    #[error("{0}")]
+    ValueOutOfRange(String),
+
     #[error("data too long: {0}")]
     DataTooLong(String),
 
@@ -280,36 +288,37 @@ impl Error {
             // MySQL answers 1264 for a value that does not fit the *column* and
             // 1690 for an expression that overflows its type. Storing a value is
             // by far the common case here, and both share SQLSTATE 22003.
-            Error::OutOfRange(_) => 1264,  // ER_WARN_DATA_OUT_OF_RANGE
+            Error::OutOfRange(_) => 1264, // ER_WARN_DATA_OUT_OF_RANGE
+            Error::ValueOutOfRange(_) => 1690, // ER_DATA_OUT_OF_RANGE
             Error::DataTooLong(_) => 1406, // ER_DATA_TOO_LONG
             Error::Unsupported(_) => 1235, // ER_NOT_SUPPORTED_YET
-            Error::Conflict(_) => 1213,    // ER_LOCK_DEADLOCK (serialization failure)
+            Error::Conflict(_) => 1213,   // ER_LOCK_DEADLOCK (serialization failure)
             Error::StorageLocked(_) => 1015, // ER_CANT_LOCK
             Error::InvalidGroupFunction(_) => 1111, // ER_INVALID_GROUP_FUNC_USE
             Error::Duplicate(DuplicateError::ColumnName, _) => 1060, // ER_DUP_FIELDNAME
             Error::Duplicate(DuplicateError::Entry, _) => 1062, // ER_DUP_ENTRY
-            Error::ForeignKey(_) => 1452,  // ER_NO_REFERENCED_ROW
+            Error::ForeignKey(_) => 1452, // ER_NO_REFERENCED_ROW
             Error::ReferencedRow(_) => 1451, // ER_ROW_IS_REFERENCED_2
-            Error::NotNull(_) => 1048,     // ER_BAD_NULL_ERROR
+            Error::NotNull(_) => 1048,    // ER_BAD_NULL_ERROR
             Error::CheckViolated(_) => 3819, // ER_CHECK_CONSTRAINT_VIOLATED
             Error::DataTruncated(..) => 1265, // WARN_DATA_TRUNCATED
             Error::ReadOnlyTransaction => 1792, // ER_CANT_EXECUTE_IN_READ_ONLY_TRANSACTION
             Error::TransactionInProgress => 1568, // ER_CANT_CHANGE_TX_CHARACTERISTICS
             Error::DatabaseMissing(_) => 1008, // ER_DB_DROP_EXISTS
             Error::IntoColumnCount => 1222, // ER_WRONG_NUMBER_OF_COLUMNS_IN_SELECT
-            Error::TooManyRows => 1172,    // ER_TOO_MANY_ROWS
-            Error::SubqueryRows => 1242,   // ER_SUBQUERY_NO_1_ROW
-            Error::InvalidNull => 1138,    // ER_INVALID_USE_OF_NULL
-            Error::NoDefault(_) => 1364,   // ER_NO_DEFAULT_FOR_FIELD
+            Error::TooManyRows => 1172,   // ER_TOO_MANY_ROWS
+            Error::SubqueryRows => 1242,  // ER_SUBQUERY_NO_1_ROW
+            Error::InvalidNull => 1138,   // ER_INVALID_USE_OF_NULL
+            Error::NoDefault(_) => 1364,  // ER_NO_DEFAULT_FOR_FIELD
             Error::IncorrectValue(_) => 1292, // ER_TRUNCATED_WRONG_VALUE
             Error::TargetInSubquery(_) => 1093, // ER_UPDATE_TABLE_USED
             Error::ViewPreventsOperation(..) => 1443, // ER_VIEW_PREVENT_UPDATE
             Error::UndeclaredVariable(_) => 1327, // ER_SP_UNDECLARED_VAR
             Error::RoutineMissing(..) => 1305, // ER_SP_DOES_NOT_EXIST
             Error::AccountOperation(..) => 1396, // ER_CANNOT_USER
-            Error::ViewRights(_) => 1356,  // ER_VIEW_INVALID
+            Error::ViewRights(_) => 1356, // ER_VIEW_INVALID
             Error::TriggerMissing => 1360, // ER_TRG_DOES_NOT_EXIST
-            Error::NotView(_) => 1347,     // ER_WRONG_OBJECT
+            Error::NotView(_) => 1347,    // ER_WRONG_OBJECT
             Error::TableLockedForRead(_) => 1099, // ER_TABLE_NOT_LOCKED_FOR_WRITE
             Error::TableNotLocked(_) => 1100, // ER_TABLE_NOT_LOCKED
             Error::ConflictingReadLock => 1223, // ER_CANT_UPDATE_WITH_READLOCK
@@ -334,7 +343,7 @@ impl Error {
             Error::UnknownDatabase(_) => b"42000",
             Error::UnknownTable(_) => b"42S02",
             Error::UnknownColumn(_) => b"42S22",
-            Error::OutOfRange(_) => b"22003",
+            Error::OutOfRange(_) | Error::ValueOutOfRange(_) => b"22003",
             Error::DataTooLong(_) => b"22001",
             Error::Duplicate(DuplicateError::ColumnName, _) => b"42S21",
             Error::Duplicate(DuplicateError::Entry, _)

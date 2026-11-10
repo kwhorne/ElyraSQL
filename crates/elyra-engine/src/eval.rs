@@ -63,7 +63,7 @@ pub fn eval_expr(expr: &Expr) -> Result<Value> {
             match (op, v) {
                 (UnaryOperator::Minus, Value::Int(i)) => {
                     i.checked_neg().map(Value::Int).ok_or_else(|| {
-                        Error::OutOfRange(format!("BIGINT value is out of range in '-({i})'"))
+                        Error::ValueOutOfRange(format!("BIGINT value is out of range in '-({i})'"))
                     })
                 }
                 (UnaryOperator::Minus, Value::Float(f)) => Ok(Value::Float(-f)),

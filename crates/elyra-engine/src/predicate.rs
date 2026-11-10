@@ -57,10 +57,9 @@ pub(crate) fn unary_value(op: &UnaryOperator, v: Value) -> Result<Value> {
         }),
         // Same reason as in `arith`: `-!0` is -1, not -1.0.
         (UnaryOperator::Minus, Value::Bool(b)) => Ok(Value::Int(-i64::from(b))),
-        (UnaryOperator::Minus, Value::Int(i)) => i
-            .checked_neg()
-            .map(Value::Int)
-            .ok_or_else(|| Error::OutOfRange(format!("BIGINT value is out of range in '-({i})'"))),
+        (UnaryOperator::Minus, Value::Int(i)) => i.checked_neg().map(Value::Int).ok_or_else(|| {
+            Error::ValueOutOfRange(format!("BIGINT value is out of range in '-({i})'"))
+        }),
         (UnaryOperator::Minus, Value::Float(f)) => Ok(Value::Float(-f)),
         (UnaryOperator::Minus, Value::Decimal(units, scale)) => units
             .checked_neg()
@@ -73,7 +72,7 @@ pub(crate) fn unary_value(op: &UnaryOperator, v: Value) -> Result<Value> {
             if u <= (i64::MAX as u64) + 1 {
                 Ok(Value::Int((u as i128).wrapping_neg() as i64))
             } else {
-                Err(Error::OutOfRange(format!(
+                Err(Error::ValueOutOfRange(format!(
                     "BIGINT value is out of range in '-({u})'"
                 )))
             }
@@ -1238,6 +1237,42 @@ fn math1i(a: &[Value], f: impl Fn(f64) -> f64) -> Value {
         None => Value::Null,
     }
 }
+/// EXP and POW overflow to infinity where MySQL refuses with 1690
+/// (`DOUBLE value is out of range in 'exp(1000)'`). `math1` has already turned
+/// the infinity into NULL, so look again at the arguments; a NaN (POW of a
+/// negative base to a fractional power) stays NULL.
+fn double_in_range(v: Value, name: &str, a: &[Value]) -> Result<Value> {
+    let overflowed = match (&v, name) {
+        (Value::Float(f), _) => f.is_infinite(),
+        (Value::Null, "exp") => nnum(a, 0).is_some_and(|x| x.exp().is_infinite()),
+        _ => false,
+    };
+    if !overflowed {
+        return Ok(match v {
+            Value::Float(f) if f.is_nan() => Value::Null,
+            v => v,
+        });
+    }
+    let args = a.iter().map(sql_number_text).collect::<Vec<_>>().join(",");
+    Err(Error::ValueOutOfRange(format!(
+        "DOUBLE value is out of range in '{name}({args})'"
+    )))
+}
+
+/// A number as it appears in a 1690 message.
+fn sql_number_text(v: &Value) -> String {
+    match v {
+        Value::Int(i) => i.to_string(),
+        Value::UInt(u) => u.to_string(),
+        Value::Float(f) => format!("{f:?}"),
+        Value::Text(t) => format!("'{t}'"),
+        other => other
+            .as_mysql_f64()
+            .map(|f| format!("{f:?}"))
+            .unwrap_or_else(|| "NULL".into()),
+    }
+}
+
 fn math2(a: &[Value], f: impl Fn(f64, f64) -> f64) -> Value {
     match (nnum(a, 0), nnum(a, 1)) {
         (Some(x), Some(y)) => Value::Float(f(x, y)),
@@ -1522,7 +1557,10 @@ fn eval_scalar(name: &str, a: &[Value]) -> Result<Option<Value>> {
         },
         // ---- math ----
         "abs" => match a.first() {
-            Some(Value::Int(i)) => Value::Int(i.abs()),
+            Some(Value::Int(i)) => Value::Int(i.checked_abs().ok_or_else(|| {
+                Error::ValueOutOfRange(format!("BIGINT value is out of range in 'abs({i})'"))
+            })?),
+            Some(Value::UInt(u)) => Value::UInt(*u),
             // ABS keeps DECIMAL exact, scale and all, as MySQL does. Routing it
             // through f64 would quietly undo the exactness of whatever produced
             // the value -- ABS(SUM(x)) being the common shape.
@@ -1546,12 +1584,12 @@ fn eval_scalar(name: &str, a: &[Value]) -> Result<Option<Value>> {
             None => Value::Null,
         },
         "sqrt" => math1(a, f64::sqrt),
-        "exp" => math1(a, f64::exp),
+        "exp" => double_in_range(math1(a, f64::exp), "exp", a)?,
         "ln" | "log" if a.len() == 1 => math1(a, f64::ln),
         "log10" => math1(a, f64::log10),
         "log2" => math1(a, f64::log2),
         "pi" => Value::Float(std::f64::consts::PI),
-        "power" | "pow" => math2(a, f64::powf),
+        "power" | "pow" => double_in_range(math2(a, f64::powf), "pow", a)?,
         // MOD(a, b) is the `%` operator spelled as a call, so it has to answer
         // the same thing -- including the exact DECIMAL remainder.
         "mod" => match (a.first(), a.get(1)) {
@@ -1590,10 +1628,14 @@ fn eval_scalar(name: &str, a: &[Value]) -> Result<Option<Value>> {
                     match round_decimal_digits(i128::from(*i), 0, digits, half_away) {
                         // An integer argument stays an integer, whatever the digits.
                         Some((u, _)) => i64::try_from(u).map(Value::Int).map_err(|_| {
-                            Error::OutOfRange("BIGINT value is out of range".into())
+                            Error::ValueOutOfRange(format!(
+                                "BIGINT value is out of range in 'round({i},{digits})'"
+                            ))
                         })?,
                         None => {
-                            return Err(Error::OutOfRange("BIGINT value is out of range".into()))
+                            return Err(Error::ValueOutOfRange(format!(
+                                "BIGINT value is out of range in 'round({i},{digits})'"
+                            )))
                         }
                     }
                 }
@@ -3333,8 +3375,14 @@ fn bitwise(l: Value, op: &BinaryOperator, r: Value) -> Result<Value> {
         BitwiseAnd => a & b,
         BitwiseOr => a | b,
         BitwiseXor => a ^ b,
-        PGBitwiseShiftLeft => a.wrapping_shl((b & 63) as u32),
-        PGBitwiseShiftRight => a.wrapping_shr((b & 63) as u32),
+        // A shift by the width or more empties the value (MySQL), where Rust's
+        // shift would take the count modulo 64: `1 << 64` is 0, not 1.
+        PGBitwiseShiftLeft => a
+            .checked_shl(u32::try_from(b).unwrap_or(u32::MAX))
+            .unwrap_or(0),
+        PGBitwiseShiftRight => a
+            .checked_shr(u32::try_from(b).unwrap_or(u32::MAX))
+            .unwrap_or(0),
         _ => return Err(Error::Unsupported(format!("operator not supported: {op}"))),
     }))
 }
@@ -3363,10 +3411,16 @@ fn arith(l: Value, op: &BinaryOperator, r: Value) -> Result<Value> {
             }
             return match a.checked_div(*b) {
                 Some(v) => Ok(Value::Int(v)),
-                None => Err(Error::OutOfRange(format!(
+                None => Err(Error::ValueOutOfRange(format!(
                     "BIGINT value is out of range in '({a} DIV {b})'"
                 ))),
             };
+        }
+        if let Some((a, b)) = unsigned_operands(&l, &r) {
+            if b == 0 {
+                return Ok(Value::Null);
+            }
+            return unsigned_result(a / b, a, "DIV", b);
         }
         let (Some(a), Some(b)) = (num(&l), num(&r)) else {
             return Err(Error::Type("arithmetic on non-numeric value".into()));
@@ -3389,31 +3443,31 @@ fn arith(l: Value, op: &BinaryOperator, r: Value) -> Result<Value> {
     // integer-typed (MySQL: any unsigned operand makes the operation unsigned).
     // Division stays float (like signed integer `/`), which MySQL renders as a
     // decimal.
-    if matches!(l, Value::UInt(_)) || matches!(r, Value::UInt(_)) {
-        let as_u64 = |v: &Value| -> Option<u64> {
-            match v {
-                Value::UInt(u) => Some(*u),
-                Value::Int(i) => Some(*i as u64),
-                Value::Bool(b) => Some(*b as u64),
-                _ => None,
+    //
+    // The operation is exact in i128 and the result must fit BIGINT UNSIGNED,
+    // or it is 1690: `CAST(0 AS UNSIGNED) - 1` is refused, not 2^64-1, while a
+    // negative operand is fine when the result is not (`CAST(5 AS UNSIGNED) +
+    // -1` is 4). A remainder takes its dividend's sign, as MySQL's does.
+    if let Some((a, b)) = unsigned_operands(&l, &r) {
+        let symbol = arith_symbol(op);
+        match op {
+            Plus => return unsigned_result(a + b, a, symbol, b),
+            Minus => return unsigned_result(a - b, a, symbol, b),
+            // u64::MAX squared is past i128 too; that is out of range all the same.
+            Multiply => {
+                return unsigned_result(a.checked_mul(b).unwrap_or(i128::MAX), a, symbol, b)
             }
-        };
-        if let (Some(a), Some(b)) = (as_u64(&l), as_u64(&r)) {
-            let v = match op {
-                Plus => Some(a.wrapping_add(b)),
-                Minus => Some(a.wrapping_sub(b)),
-                Multiply => Some(a.wrapping_mul(b)),
-                Modulo => {
-                    if b == 0 {
-                        return Ok(Value::Null);
-                    }
-                    Some(a % b)
+            Modulo => {
+                if b == 0 {
+                    return Ok(Value::Null);
                 }
-                _ => None, // Divide -> fall through to float
-            };
-            if let Some(v) = v {
-                return Ok(Value::UInt(v));
+                let rem = a % b;
+                return Ok(match i64::try_from(rem) {
+                    Ok(v) if v < 0 => Value::Int(v),
+                    _ => Value::UInt(rem as u64),
+                });
             }
+            _ => {} // Divide -> fall through to float
         }
     }
     // Exact signed 64-bit integer arithmetic. MySQL raises an out-of-range error
@@ -3439,7 +3493,7 @@ fn arith(l: Value, op: &BinaryOperator, r: Value) -> Result<Value> {
             };
             return match res {
                 Some(v) => Ok(Value::Int(v)),
-                None => Err(Error::OutOfRange(format!(
+                None => Err(Error::ValueOutOfRange(format!(
                     "BIGINT value is out of range in '({ai} {} {bi})'",
                     arith_symbol(op)
                 ))),
@@ -3468,12 +3522,45 @@ fn arith(l: Value, op: &BinaryOperator, r: Value) -> Result<Value> {
         }
         _ => unreachable!(),
     };
-    // A non-finite result (DOUBLE overflow to +/-inf, or e.g. inf-inf -> NaN) is
-    // out of range; MySQL yields NULL rather than inf/NaN.
-    if !res.is_finite() {
+    // DOUBLE overflow to +/-inf is 1690 in MySQL (`1e308 * 10`), not NULL.
+    // A NaN cannot come from finite operands; keep it NULL.
+    if res.is_infinite() {
+        return Err(Error::ValueOutOfRange(format!(
+            "DOUBLE value is out of range in '({} {} {})'",
+            sql_number_text(&l),
+            arith_symbol(op),
+            sql_number_text(&r)
+        )));
+    }
+    if res.is_nan() {
         return Ok(Value::Null);
     }
     Ok(Value::Float(res))
+}
+
+/// Both operands as i128 when the operation is unsigned: both are integers
+/// and at least one is BIGINT UNSIGNED.
+fn unsigned_operands(l: &Value, r: &Value) -> Option<(i128, i128)> {
+    if !matches!(l, Value::UInt(_)) && !matches!(r, Value::UInt(_)) {
+        return None;
+    }
+    let wide = |v: &Value| match v {
+        Value::UInt(u) => Some(i128::from(*u)),
+        Value::Int(i) => Some(i128::from(*i)),
+        Value::Bool(b) => Some(i128::from(*b)),
+        _ => None,
+    };
+    Some((wide(l)?, wide(r)?))
+}
+
+/// An unsigned operation's exact result, or 1690 when BIGINT UNSIGNED cannot
+/// hold it.
+fn unsigned_result(v: i128, a: i128, symbol: &str, b: i128) -> Result<Value> {
+    u64::try_from(v).map(Value::UInt).map_err(|_| {
+        Error::ValueOutOfRange(format!(
+            "BIGINT UNSIGNED value is out of range in '({a} {symbol} {b})'"
+        ))
+    })
 }
 
 /// The operator symbol for an arithmetic op, for error messages.
