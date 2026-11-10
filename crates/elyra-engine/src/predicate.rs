@@ -3243,6 +3243,15 @@ pub(crate) fn binary(
                 _ => Value::Null,
             });
         }
+        // Logical XOR: true when exactly one side is true, NULL when either is
+        // NULL. It was refused as unsupported.
+        Xor => {
+            let r = eval_right()?;
+            return Ok(match (bool3(&l), bool3(&r)) {
+                (Some(a), Some(b)) => Value::Bool(a != b),
+                _ => Value::Null,
+            });
+        }
         // `<=>` null-safe equality: NULL<=>NULL is true, NULL<=>x is false.
         Spaceship => {
             let r = eval_right()?;

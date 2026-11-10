@@ -23,6 +23,7 @@ mod index;
 mod keyenc;
 pub mod lockmgr;
 mod nestjoin;
+mod opprec;
 mod predicate;
 mod proc;
 mod rowdec;
@@ -960,7 +961,7 @@ impl Engine {
         // Never parse a pathologically deep expression (stack-overflow guard).
         guard_sql_complexity(sql).ok()?;
         let sql = crate::sqllex::keep_like_escapes(sql).unwrap_or_else(|| sql.to_string());
-        let stmts = Parser::parse_sql(&MySqlDialect {}, &sql).ok()?;
+        let stmts = opprec::parse_sql(&MySqlDialect {}, &sql).ok()?;
         if stmts.len() != 1 {
             return None;
         }
@@ -1418,7 +1419,7 @@ impl Engine {
                     .trim()
                     .trim_end_matches(';');
                 let spec = exec::parse_partition_clause(clause)?;
-                let statements = Parser::parse_sql(&MySqlDialect {}, &base)
+                let statements = opprec::parse_sql(&MySqlDialect {}, &base)
                     .map_err(|error| Error::Parse(error.to_string()))?;
                 let table = match statements.as_slice() {
                     [Statement::CreateTable(table)] => table.name.clone(),
@@ -1955,7 +1956,7 @@ impl Engine {
         if let Some(rewritten) = crate::sqllex::keep_like_escapes(&subst_sql) {
             subst_sql = Cow::Owned(rewritten);
         }
-        let statements = match Parser::parse_sql(&dialect, subst_sql.as_ref()) {
+        let statements = match opprec::parse_sql(&dialect, subst_sql.as_ref()) {
             Ok(s) => s,
             Err(e) => {
                 // The MySQL dialect rejects `GROUP BY ... WITH ROLLUP` and the
@@ -1967,7 +1968,7 @@ impl Engine {
                     || subst_sql.contains("<<")
                     || subst_sql.contains(">>")
                 {
-                    Parser::parse_sql(&sqlparser::dialect::GenericDialect {}, subst_sql.as_ref())
+                    opprec::parse_sql(&sqlparser::dialect::GenericDialect {}, subst_sql.as_ref())
                         .map_err(|_| Error::Parse(e.to_string()))?
                 } else {
                     return Err(Error::Parse(e.to_string()));
@@ -4930,6 +4931,8 @@ fn mysql_show_tail(
 )> {
     use sqlparser::ast::ShowStatementFilter;
     let sql = crate::sqllex::keep_like_escapes(sql).map_or(Cow::Borrowed(sql), Cow::Owned);
+    // A `WHERE` filter may use `DIV` / `MOD` (see `opprec`).
+    let sql = opprec::rewrite(&sql).map_or(sql, Cow::Owned);
     let dialect = MySqlDialect {};
     let parse_error = |e: sqlparser::parser::ParserError| Error::Parse(e.to_string());
     let mut parser = Parser::new(&dialect)
@@ -4948,9 +4951,9 @@ fn mysql_show_tail(
             parser.parse_literal_string().map_err(parse_error)?,
         ))
     } else if parser.parse_keyword(Keyword::WHERE) {
-        Some(ShowStatementFilter::Where(
-            parser.parse_expr().map_err(parse_error)?,
-        ))
+        let mut filter = parser.parse_expr().map_err(parse_error)?;
+        opprec::restore(&mut filter);
+        Some(ShowStatementFilter::Where(filter))
     } else {
         None
     };
@@ -5756,7 +5759,7 @@ fn parse_update_modifiers(sql: &str) -> Result<Option<UpdateModifiers>> {
         }
         None => format!("SELECT * FROM __elyra_update_order ORDER BY {order_sql}"),
     };
-    let mut statements = Parser::parse_sql(&MySqlDialect {}, &wrapper)
+    let mut statements = opprec::parse_sql(&MySqlDialect {}, &wrapper)
         .map_err(|error| Error::Parse(error.to_string()))?;
     let Statement::Query(mut query) = statements
         .pop()
@@ -6421,9 +6424,9 @@ pub fn fuzz_preprocess_parse(sql: &str) {
     let _ = split_top_level(&s, ',');
     let _ = split_top_level(&s, '=');
     // Parse both dialects (the generic one is the ROLLUP / shift fallback).
-    let _ = Parser::parse_sql(&MySqlDialect {}, &s);
+    let _ = opprec::parse_sql(&MySqlDialect {}, &s);
     if s.to_ascii_lowercase().contains("rollup") || s.contains("<<") || s.contains(">>") {
-        let _ = Parser::parse_sql(&sqlparser::dialect::GenericDialect {}, &s);
+        let _ = opprec::parse_sql(&sqlparser::dialect::GenericDialect {}, &s);
     }
 }
 
