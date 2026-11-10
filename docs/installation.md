@@ -17,6 +17,34 @@ ElyraSQL release builds target **Ubuntu 24.04+** and **Apple Silicon macOS
     done, so an interrupted upgrade simply resumes on the next start. **Take a backup
     first, and note that downgrading to 1.4.x afterwards is not supported.**
 
+!!! danger "Upgrade to 1.12.14 promptly — a query could stop the server"
+
+    No on-disk format change; a 1.12.13 database opens in 1.12.14 unchanged.
+
+    - **Any client could end the server** with a query such as `SELECT 1 DIV 2
+      << 1`: the SQL parser panicked on what followed `DIV`, and the server
+      aborts on a panic. A read-only account was enough. It is now a syntax
+      error.
+    - **Results that were wrong now follow MySQL**, so some queries return
+      different rows or values than before:
+        - `DIV` binds like `*` and `/`: `7 DIV 2 + 1` is 4 (was 2), and `a DIV b
+          = 3` compares the quotient (it used to divide by the comparison).
+        - A BIGINT compared above 9007199254740992 is exact: `COUNT(*) WHERE
+          cust = 9007199254740993` no longer counts its neighbours, and an
+          integer column against a string or float constant
+          (`cust = '9007199254740992'`) or a DECIMAL compares exactly.
+    - **`ALTER TABLE` refuses changes the existing rows break** (strict mode),
+      with MySQL's error: `MODIFY ... NOT NULL` over NULLs (1138), a narrower
+      integer type over larger values (1264), an `ENUM` over other values
+      (1265), `ADD UNIQUE` / `CREATE UNIQUE INDEX` over duplicates (1062),
+      `ADD FOREIGN KEY` over orphans (1452). These used to succeed and leave
+      the rows in place: **if you ran such ALTERs, check those columns** —
+      for duplicates under a unique index, and for values outside an `ENUM`
+      or a column's NOT NULL.
+    - Also new: `ADD CHECK`, the `MOD` operator, logical `XOR`, and `INSERT
+      INTO t () VALUES ()`; an omitted NOT NULL column without a default is
+      1364.
+
 !!! warning "Upgrading to 1.12.13 — writes that MySQL refuses are refused"
 
     No on-disk format change; a 1.12.12 database opens in 1.12.13 unchanged.
@@ -706,8 +734,8 @@ macOS).
 Multi-arch image (`amd64` + `arm64`) on the GitHub Container Registry:
 
 ```bash
-docker pull ghcr.io/kwhorne/elyrasql:1.12.13   # or :latest
-docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.12.13
+docker pull ghcr.io/kwhorne/elyrasql:1.12.14   # or :latest
+docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.12.14
 ```
 
 The image is ~15 MB, runs as a non-root user, stores data in the

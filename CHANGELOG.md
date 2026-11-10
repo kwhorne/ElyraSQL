@@ -6,6 +6,8 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.12.14] - 2026-11-10
+
 ### Fixed
 
 - **`SELECT 1 DIV 2 << 1` no longer ends the server.** sqlparser read the
