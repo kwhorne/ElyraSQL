@@ -20,6 +20,7 @@ mod eval;
 mod exec;
 mod ft;
 mod index;
+mod indexddl;
 mod keyenc;
 pub mod lockmgr;
 mod nestjoin;
@@ -1889,6 +1890,12 @@ impl Engine {
         // dumps and ORM-emitted DDL parse.
         if let Some(stripped) = strip_create_table_options(&subst_sql) {
             subst_sql = Cow::Owned(stripped);
+        }
+        // Index types, key-part directions and index options sqlparser 0.53
+        // rejects (`KEY k (a DESC) USING BTREE COMMENT 'x'`), as mysqldump,
+        // Navicat and SHOW CREATE TABLE write them; see `indexddl`.
+        if let Some(normalized) = indexddl::normalize(&subst_sql) {
+            subst_sql = Cow::Owned(normalized);
         }
         // sqlparser 0.53 represents inline key parts as bare identifiers and
         // rejects MySQL's optional `(length)` suffix. ElyraSQL's B-tree index
@@ -6384,6 +6391,9 @@ pub fn fuzz_preprocess_parse(sql: &str) {
         s = x;
     }
     if let Some(x) = strip_create_table_options(&s) {
+        s = x;
+    }
+    if let Some(x) = indexddl::normalize(&s) {
         s = x;
     }
     if let Some(x) = strip_index_prefix_lengths(&s) {

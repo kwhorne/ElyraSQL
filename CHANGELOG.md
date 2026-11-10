@@ -6,6 +6,21 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **A Navicat or mysqldump dump restores.** Index definitions as MySQL writes
+  them were refused with 1064, so every table with such an index failed to be
+  created and its rows with it: `KEY k (a) USING BTREE` (how Navicat and `SHOW
+  CREATE TABLE` write every index), `PRIMARY KEY USING BTREE (id)`, `ASC` /
+  `DESC` key parts, `COMMENT`, `VISIBLE` / `INVISIBLE` and `KEY_BLOCK_SIZE`
+  options, and `ALGORITHM` / `LOCK` on `CREATE INDEX` and `ALTER TABLE`. They
+  are now accepted in `CREATE TABLE`, `CREATE INDEX` and `ALTER TABLE ... ADD`;
+  a prefix length now works in `CREATE INDEX` too.
+- **A foreign key shares an index that leads with its columns**, as in MySQL.
+  It used to get an extra index of its own whenever no index had exactly its
+  columns -- next to a `UNIQUE (order_id, pos)` for `order_id`, say -- which
+  cost every write and showed up in `SHOW INDEX`.
+
 ## [1.12.14] - 2026-11-10
 
 ### Fixed
