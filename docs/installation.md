@@ -17,6 +17,24 @@ ElyraSQL release builds target **Ubuntu 24.04+** and **Apple Silicon macOS
     done, so an interrupted upgrade simply resumes on the next start. **Take a backup
     first, and note that downgrading to 1.4.x afterwards is not supported.**
 
+!!! warning "Upgrading to 1.12.16 — HAVING and arithmetic overflow"
+
+    No on-disk format change; a 1.12.15 database opens in 1.12.16 unchanged.
+    Some queries now answer differently, as they do in MySQL:
+
+    - **`HAVING` without `GROUP BY` filters.** It was ignored unless the select
+      list held an aggregate, so `SELECT id FROM t HAVING id > 2` returned every
+      row. A query that relied on that now returns fewer rows, or 1054 when
+      `HAVING` names a column the select list does not.
+    - **Arithmetic overflow is 1690**, not 1264. Code that matched on 1264 for
+      `9223372036854775807 + 1` should match 1690; 1264 now means only a value
+      too big for its column.
+    - **Unsigned arithmetic and DOUBLE overflow are errors.**
+      `CAST(0 AS UNSIGNED) - 1` returned 18446744073709551615, `1e308 * 10`
+      returned NULL and `POW(10, 400)` returned `inf`; all three are 1690 now.
+      A query or a write that produced such a value now fails instead of
+      returning or storing it.
+
 !!! info "Upgrading to 1.12.15 — MySQL index definitions"
 
     No on-disk format change; a 1.12.14 database opens in 1.12.15 unchanged.
@@ -750,8 +768,8 @@ macOS).
 Multi-arch image (`amd64` + `arm64`) on the GitHub Container Registry:
 
 ```bash
-docker pull ghcr.io/kwhorne/elyrasql:1.12.15   # or :latest
-docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.12.15
+docker pull ghcr.io/kwhorne/elyrasql:1.12.16   # or :latest
+docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.12.16
 ```
 
 The image is ~15 MB, runs as a non-root user, stores data in the
