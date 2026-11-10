@@ -12766,9 +12766,8 @@ pub fn load_insert(spec: &LoadSpec, rows: Vec<Vec<Expr>>) -> Result<sqlparser::a
         spec.table,
         load_column_list(spec)
     );
-    let mut stmts =
-        sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::MySqlDialect {}, &sql)
-            .map_err(|e| Error::Parse(format!("LOAD DATA: {e}")))?;
+    let mut stmts = crate::opprec::parse_sql(&sqlparser::dialect::MySqlDialect {}, &sql)
+        .map_err(|e| Error::Parse(format!("LOAD DATA: {e}")))?;
     match (stmts.pop(), stmts.is_empty()) {
         (Some(sqlparser::ast::Statement::Insert(mut ins)), true) => {
             match ins.source.as_mut().map(|q| q.body.as_mut()) {
@@ -21484,8 +21483,7 @@ pub(crate) fn parse_query(sql: &str) -> Result<SqlQuery> {
     let kept = crate::sqllex::keep_like_escapes(sql);
     let sql = kept.as_deref().unwrap_or(sql);
     let dialect = sqlparser::dialect::MySqlDialect {};
-    let stmts = sqlparser::parser::Parser::parse_sql(&dialect, sql)
-        .map_err(|e| Error::Parse(e.to_string()))?;
+    let stmts = crate::opprec::parse_sql(&dialect, sql).map_err(|e| Error::Parse(e.to_string()))?;
     match stmts.into_iter().next() {
         Some(sqlparser::ast::Statement::Query(mut q)) => {
             crate::nestjoin::flatten(&mut q);

@@ -8,6 +8,18 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ### Fixed
 
+- **`SELECT 1 DIV 2 << 1` no longer ends the server.** sqlparser read the
+  right side of `DIV` with the lowest precedence and unwrapped the result, so
+  a rest it could not parse panicked -- and the server aborts on a panic.
+  Any client that could run a query could stop it. It is now a syntax error,
+  or the right answer where MySQL has one.
+- **`DIV` binds like `*` and `/`, as in MySQL.** `7 DIV 2 + 1` was `7 DIV 3`
+  (2, not 4), `a DIV b = 3` was `a DIV (b = 3)`, and `7 DIV 2 * 2` was 1, not
+  6: wrong answers with no error wherever `DIV` met another operator.
+- **The `MOD` operator and logical `XOR` work.** `7 MOD 4` was a syntax error
+  and `a XOR b` refused with 1235; `XOR` binds between `AND` and `OR`, as in
+  MySQL (sqlparser would have bound it above `=`).
+
 - **BIGINT comparisons are exact above 2^53.** A filtered aggregate over a
   BIGINT column without an index compared the column as a double, which
   cannot tell neighbouring integers apart above 9007199254740992: `SELECT

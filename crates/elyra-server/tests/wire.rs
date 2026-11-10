@@ -15910,3 +15910,127 @@ async fn alter_table_refuses_changes_existing_rows_break() {
     let rows: Vec<(i64, i64)> = c.query("SELECT id, b FROM dd ORDER BY id").await.unwrap();
     assert_eq!(rows, vec![(1, 3), (2, 3), (3, 3)]);
 }
+
+/// sqlparser 0.53 read the right side of `DIV` at the lowest precedence, so
+/// `7 DIV 2 + 1` was `7 DIV 3` and `a DIV b = 3` was `a DIV (b = 3)`, and it
+/// unwrapped that parse: `SELECT 1 DIV 2 << 1` panicked and, with
+/// `panic = "abort"`, ended the server. The binary `MOD` was a syntax error and
+/// `XOR` unsupported. Every expectation below is MySQL 8.4's.
+#[tokio::test]
+async fn div_mod_and_xor_follow_mysql_precedence() {
+    // (expression, `SELECT` result; `None` for NULL)
+    let cases: &[(&str, &str)] = &[
+        ("7 DIV 2 = 3", "1"),
+        ("7 DIV 2 + 1", "4"),
+        ("1 + 7 DIV 2", "4"),
+        ("7 DIV 2 - 1", "2"),
+        ("7 DIV 2 * 2", "6"),
+        ("2 * 7 DIV 2", "7"),
+        ("7 DIV 2 / 2", "1.5000"),
+        ("7 DIV 2 % 2", "1"),
+        ("7 DIV 2 DIV 2", "1"),
+        ("7 DIV (2 + 1)", "2"),
+        ("7 DIV 2 < 4", "1"),
+        ("7 DIV 2 <> 3", "0"),
+        ("7 DIV 2 = 3 AND 1", "1"),
+        ("7 DIV 2 = 3 OR 0", "1"),
+        ("7 DIV 2 IS NULL", "0"),
+        ("7 DIV 2 IS NOT NULL", "1"),
+        ("7 DIV 2 BETWEEN 3 AND 4", "1"),
+        ("7 DIV 2 IN (3, 9)", "1"),
+        ("7 DIV 2 NOT IN (3)", "0"),
+        ("7 DIV 2 LIKE '3'", "1"),
+        ("7 DIV -2", "-3"),
+        ("-7 DIV 2", "-3"),
+        ("7 DIV 2 ^ 1", "2"),
+        ("7 DIV 2 | 8", "11"),
+        ("7 DIV 2 & 2", "2"),
+        ("7 DIV 2 << 1", "6"),
+        ("NOT 7 DIV 2 = 3", "0"),
+        ("7 DIV 2 = 3 XOR 1", "0"),
+        ("7 DIV 2 IS TRUE", "1"),
+        ("7 DIV 2 <=> 3", "1"),
+        ("7 DIV 0 + 1", "None"),
+        ("7 MOD 4", "3"),
+        ("7 MOD 4 = 3", "1"),
+        ("7 MOD 4 + 1", "4"),
+        ("1 + 7 MOD 4", "4"),
+        ("7 MOD 4 * 2", "6"),
+        ("7 MOD 4 DIV 2", "1"),
+        ("MOD(7, 4)", "3"),
+        ("7 % 4 = 3", "1"),
+        ("CASE WHEN 7 DIV 2 = 3 THEN 'y' ELSE 'n' END", "y"),
+        ("ABS(7 DIV 2 - 9)", "6"),
+        ("(7 DIV 2) + 1", "4"),
+        ("1 XOR 0", "1"),
+        ("1 XOR 1", "0"),
+        ("1 XOR NULL", "None"),
+        ("0 XOR 0 XOR 1", "1"),
+        ("1 = 1 XOR 1 = 2", "1"),
+        ("1 = 1 XOR 1 = 1", "0"),
+        ("1 OR 1 XOR 1", "1"),
+        ("1 XOR 1 OR 1", "1"),
+        ("0 AND 1 XOR 1", "1"),
+        ("1 XOR 1 AND 0", "1"),
+        ("NOT 1 XOR 1", "1"),
+        ("NOT (1 XOR 1)", "1"),
+        ("1 XOR NOT 1", "1"),
+        ("(1 XOR 1) = 0", "1"),
+        ("1 XOR 1 = 0", "1"),
+        ("2 XOR 0", "1"),
+        ("'a' XOR 0", "0"),
+        ("1 OR 0 XOR 1 OR 0", "1"),
+        ("0 XOR 1 AND 1 XOR 1", "0"),
+    ];
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    for (expr, want) in cases {
+        let got: Option<Option<String>> = c
+            .query_first(format!("SELECT {expr}"))
+            .await
+            .unwrap_or_else(|e| panic!("{expr}: {e}"));
+        let got = got.flatten().unwrap_or_else(|| "None".into());
+        assert_eq!(got, *want, "{expr}");
+    }
+
+    // What used to end the server is a syntax error, and the server stays up.
+    for sql in ["SELECT 1 DIV", "SELECT 1 XOR", "SELECT 1 MOD"] {
+        match c.query_drop(sql).await {
+            Err(mysql_async::Error::Server(e)) => assert_eq!(e.code, 1064, "{sql}"),
+            other => panic!("{sql}: {other:?}"),
+        }
+    }
+    let shifted: Option<i64> = c.query_first("SELECT 1 DIV 2 << 1").await.unwrap();
+    assert_eq!(shifted, Some(0));
+
+    // Over columns, and in SQL that is stored and parsed again: a view, a CHECK
+    // constraint, a trigger, and the ORDER BY of an UPDATE.
+    for s in [
+        "CREATE TABLE sd (id INT PRIMARY KEY, a INT, b INT, c INT, CHECK (a DIV 2 + 1 > 1))",
+        "CREATE TABLE sl (m INT)",
+        "CREATE VIEW vd AS SELECT id, a DIV b + 1 AS q, a = 1 XOR b = 1 AS x FROM sd",
+        "CREATE TRIGGER td AFTER INSERT ON sd FOR EACH ROW INSERT INTO sl VALUES (NEW.a DIV 2 + 1)",
+        "INSERT INTO sd VALUES (1,7,2,0)",
+        "INSERT INTO sd VALUES (3,9,3,0)",
+    ] {
+        c.query_drop(s).await.unwrap_or_else(|e| panic!("{s}: {e}"));
+    }
+    match c.query_drop("INSERT INTO sd VALUES (2,1,1,0)").await {
+        Err(mysql_async::Error::Server(e)) => assert_eq!(e.code, 3819),
+        other => panic!("CHECK (a DIV 2 + 1 > 1): {other:?}"),
+    }
+    let view: Vec<(i64, i64, i64)> = c.query("SELECT * FROM vd ORDER BY id").await.unwrap();
+    assert_eq!(view, vec![(1, 4, 0), (3, 4, 0)]);
+    let logged: Vec<i64> = c.query("SELECT m FROM sl ORDER BY m").await.unwrap();
+    assert_eq!(logged, vec![4, 5]);
+    c.query_drop("UPDATE sd SET c = 1 ORDER BY a DIV b + 1 DESC LIMIT 1")
+        .await
+        .unwrap();
+    let updated: Vec<(i64, i64)> = c.query("SELECT id, c FROM sd ORDER BY id").await.unwrap();
+    assert_eq!(updated, vec![(1, 1), (3, 0)]);
+    let rows: Vec<(i64, i64)> = c
+        .query("SELECT id, a DIV b + 1 FROM sd WHERE a DIV b = 3 XOR c = 1 ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![(3, 4)]);
+}
