@@ -6,6 +6,26 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **BIGINT comparisons are exact above 2^53.** A filtered aggregate over a
+  BIGINT column without an index compared the column as a double, which
+  cannot tell neighbouring integers apart above 9007199254740992: `SELECT
+  COUNT(*) ... WHERE cust = 9007199254740993` also counted the rows holding
+  9007199254740992, and `>=`, `<>`, `IN` and `SUM` were off the same way. The
+  zone maps that let a scan skip chunks rounded the same values, so a chunk
+  could be skipped. An integer column is now compared as an integer, and its
+  chunk bounds are rounded outward.
+- **An integer compared with a DECIMAL compares exactly**, as in MySQL:
+  `9007199254740993 = 9007199254740992.0` was true, and a BIGINT column
+  matched the neighbouring value of a DECIMAL column.
+- **An integer column compared with a constant takes MySQL's integer
+  comparison** when the constant converts without loss: `cust =
+  '9007199254740992'`, `cust = 9007199254740992e0`, `cust IN ('...')` and
+  `BETWEEN` with string bounds matched the neighbouring integers too. Other
+  strings (`' 5'`, `'5x'`, `'5.5'`), and a column against another column,
+  still compare as doubles, as in MySQL.
+
 ## [1.12.13] - 2026-11-06
 
 ### Fixed

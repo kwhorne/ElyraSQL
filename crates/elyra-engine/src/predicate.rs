@@ -181,7 +181,7 @@ pub fn eval_row(expr: &Expr, schema: &Schema, row: &[Value]) -> Result<Value> {
                 .find(|c| *c != Collation::Ci)
                 .unwrap_or(Collation::Ci);
             for item in list {
-                let rv = eval_row(item, schema, row)?;
+                let rv = against_integer_column(expr, &v, item, eval_row(item, schema, row)?);
                 if rv.is_null() {
                     saw_null = true;
                     continue;
@@ -222,8 +222,8 @@ pub fn eval_row(expr: &Expr, schema: &Schema, row: &[Value]) -> Result<Value> {
             high,
         } => {
             let v = eval_row(expr, schema, row)?;
-            let lo = eval_row(low, schema, row)?;
-            let hi = eval_row(high, schema, row)?;
+            let lo = against_integer_column(expr, &v, low, eval_row(low, schema, row)?);
+            let hi = against_integer_column(expr, &v, high, eval_row(high, schema, row)?);
             let coll = explicit_collation(low)
                 .or_else(|| explicit_collation(high))
                 .or_else(|| expr_collation(expr, schema))
@@ -286,6 +286,19 @@ pub fn eval_row(expr: &Expr, schema: &Schema, row: &[Value]) -> Result<Value> {
                     .map(|u| u.to_string().to_ascii_uppercase())
                     .unwrap_or_else(|| "DAY".into());
                 Ok(apply_interval(base, n, &unit))
+            }
+            BinaryOperator::Eq
+            | BinaryOperator::NotEq
+            | BinaryOperator::Lt
+            | BinaryOperator::LtEq
+            | BinaryOperator::Gt
+            | BinaryOperator::GtEq
+            | BinaryOperator::Spaceship => {
+                let l = eval_row(left, schema, row)?;
+                let r = eval_row(right, schema, row)?;
+                let r = against_integer_column(left, &l, right, r);
+                let l = against_integer_column(right, &r, left, l);
+                binary(l, op, || Ok(r), || cmp_collation(left, right, schema))
             }
             _ => binary(
                 eval_row(left, schema, row)?,
@@ -3098,6 +3111,97 @@ fn resolve_bare(name: &str, schema: &Schema) -> (bool, Result<usize>) {
 
 fn literal(v: &SqlValue) -> Result<Value> {
     crate::eval::literal(v)
+}
+
+/// The constant `value` (of expression `constant`) as compared with `column`,
+/// whose value is `column_value`. MySQL compares an integer column with a
+/// constant as integers when the constant converts to one without loss --
+/// `cust = '9007199254740993'`, `cust = 9007199254740992e0`, `cust IN
+/// ('...')` -- where the general rule would compare them as `f64` and match
+/// the neighbouring integers above 2^53. Any other pair is left alone: two
+/// constants, or a column against another column, follow the general rule.
+pub(crate) fn against_integer_column(
+    column: &Expr,
+    column_value: &Value,
+    constant: &Expr,
+    value: Value,
+) -> Value {
+    if matches!(column_value, Value::Int(_) | Value::UInt(_))
+        && is_column_ref(column)
+        && is_constant(constant)
+    {
+        int_constant(value)
+    } else {
+        value
+    }
+}
+
+fn is_column_ref(e: &Expr) -> bool {
+    match e {
+        Expr::Nested(inner) => is_column_ref(inner),
+        Expr::Identifier(id) => !id.value.starts_with('@'),
+        Expr::CompoundIdentifier(parts) => parts.first().is_some_and(|p| !p.value.starts_with('@')),
+        _ => false,
+    }
+}
+
+/// A literal, possibly signed or parenthesised.
+pub(crate) fn is_constant(e: &Expr) -> bool {
+    match e {
+        Expr::Nested(inner) => is_constant(inner),
+        Expr::Value(v) => !matches!(v, SqlValue::Null | SqlValue::Placeholder(_)),
+        Expr::UnaryOp {
+            op: sqlparser::ast::UnaryOperator::Minus | sqlparser::ast::UnaryOperator::Plus,
+            expr,
+        } => is_constant(expr),
+        _ => false,
+    }
+}
+
+/// A constant converted, without loss, to the integer an integer column
+/// compares it as; unchanged when it does not convert. A string
+/// converts only when it is exactly a number -- MySQL leaves `' 5'` and `'5x'`
+/// to the `f64` comparison.
+pub(crate) fn int_constant(value: Value) -> Value {
+    match &value {
+        Value::Text(s) => exact_number(s).unwrap_or(value),
+        Value::Float(f)
+            if f.is_finite()
+                && f.fract() == 0.0
+                && *f >= -9_223_372_036_854_775_808.0
+                && *f < 18_446_744_073_709_551_616.0 =>
+        {
+            whole_number(*f as i128).unwrap_or(value)
+        }
+        _ => value,
+    }
+}
+
+/// `[+-]digits[.zeros]` as an integer. A string with a non-zero fraction does
+/// not convert to an integer without loss, so MySQL compares it as `f64`.
+fn exact_number(s: &str) -> Option<Value> {
+    let (negative, body) = match s.as_bytes().first()? {
+        b'-' => (true, &s[1..]),
+        b'+' => (false, &s[1..]),
+        _ => (false, s),
+    };
+    let (whole, fraction) = body.split_once('.').unwrap_or((body, ""));
+    let digits = |t: &str| !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit());
+    if !digits(whole) || !(fraction.is_empty() || digits(fraction)) {
+        return None;
+    }
+    if !fraction.bytes().all(|b| b == b'0') {
+        return None;
+    }
+    let v = whole.parse::<i128>().ok()?;
+    whole_number(if negative { -v } else { v })
+}
+
+fn whole_number(v: i128) -> Option<Value> {
+    i64::try_from(v)
+        .map(Value::Int)
+        .ok()
+        .or_else(|| u64::try_from(v).ok().map(Value::UInt))
 }
 
 #[allow(clippy::too_many_arguments)]

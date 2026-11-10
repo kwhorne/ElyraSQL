@@ -15602,3 +15602,123 @@ async fn joins_in_parentheses_follow_mysql() {
         assert_eq!(got, *want, "{sql}");
     }
 }
+
+/// A BIGINT column without an index compared as `f64` on the aggregation
+/// path, so above 2^53 a value matched its neighbours: `COUNT(*) ... WHERE
+/// cust = 9007199254740993` counted the 9007199254740992 rows too. An integer
+/// against a DECIMAL also went through `f64`, and an integer column against a
+/// string or float constant did not take MySQL's exact integer comparison.
+/// Every expectation below is MySQL 8.4's.
+#[tokio::test]
+async fn bigint_comparisons_are_exact_above_two_to_the_fifty_third() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop("CREATE TABLE bl (id INT PRIMARY KEY, cust BIGINT, name VARCHAR(20))")
+        .await
+        .unwrap();
+    for start in (0..20_000).step_by(5_000) {
+        let values = (start..start + 5_000)
+            .map(|j: i64| format!("({j},{},'n{j}')", 9_007_199_254_740_992 + j % 4))
+            .collect::<Vec<_>>()
+            .join(",");
+        c.query_drop(format!("INSERT INTO bl VALUES {values}"))
+            .await
+            .unwrap();
+    }
+    for s in [
+        "CREATE TABLE bt (id INT PRIMARY KEY, cust BIGINT, s VARCHAR(30), \
+         d DECIMAL(30,2), f DOUBLE, u BIGINT UNSIGNED)",
+        "INSERT INTO bt VALUES \
+         (1,9007199254740993,'9007199254740992',9007199254740992.00,9007199254740992,18446744073709551614), \
+         (2,9007199254740993,'9007199254740993',9007199254740993.00,9007199254740994,18446744073709551615)",
+    ] {
+        c.query_drop(s).await.unwrap();
+    }
+
+    let cases: &[(&str, &str)] = &[
+        (
+            "SELECT COUNT(*) FROM bl WHERE cust = 9007199254740993",
+            "5000",
+        ),
+        (
+            "SELECT COUNT(*) FROM bl WHERE cust > 9007199254740993",
+            "10000",
+        ),
+        (
+            "SELECT COUNT(*) FROM bl WHERE cust >= 9007199254740993",
+            "15000",
+        ),
+        (
+            "SELECT COUNT(*) FROM bl WHERE cust <> 9007199254740993",
+            "15000",
+        ),
+        (
+            "SELECT COUNT(*) FROM bl WHERE cust IN (9007199254740993)",
+            "5000",
+        ),
+        (
+            "SELECT COUNT(*) FROM bl WHERE cust BETWEEN 9007199254740993 AND 9007199254740994",
+            "10000",
+        ),
+        (
+            "SELECT SUM(id) FROM bl WHERE cust = 9007199254740993",
+            "49995000",
+        ),
+        (
+            "SELECT COUNT(*) FROM bl WHERE cust = 9007199254740993 AND name LIKE 'n1%'",
+            "2778",
+        ),
+        ("SELECT COUNT(DISTINCT cust) FROM bl", "4"),
+        // An integer column against a constant that converts without loss
+        // compares as integers; anything else follows the general rule.
+        ("SELECT id FROM bt WHERE cust = '9007199254740992'", ""),
+        ("SELECT id FROM bt WHERE cust = '9007199254740992.0'", ""),
+        ("SELECT id FROM bt WHERE '9007199254740992' = cust", ""),
+        ("SELECT id FROM bt WHERE cust <=> '9007199254740992'", ""),
+        ("SELECT id FROM bt WHERE cust = 9007199254740992e0", ""),
+        ("SELECT id FROM bt WHERE cust IN ('9007199254740992')", ""),
+        (
+            "SELECT id FROM bt WHERE cust BETWEEN '9007199254740992' AND '9007199254740992'",
+            "",
+        ),
+        (
+            "SELECT COUNT(*) FROM bt WHERE cust = '9007199254740992'",
+            "0",
+        ),
+        ("SELECT id FROM bt WHERE u = '18446744073709551614'", "1"),
+        (
+            "SELECT id FROM bt WHERE cust = ' 9007199254740993' ORDER BY id",
+            "1 2",
+        ),
+        (
+            "SELECT id FROM bt WHERE cust = '9007199254740993abc' ORDER BY id",
+            "1 2",
+        ),
+        (
+            "SELECT id FROM bt WHERE cust = '9007199254740992.5' ORDER BY id",
+            "1 2",
+        ),
+        ("SELECT id FROM bt WHERE cust = s ORDER BY id", "1 2"),
+        (
+            "SELECT id FROM bt WHERE s = 9007199254740993 ORDER BY id",
+            "1 2",
+        ),
+        ("SELECT id FROM bt WHERE cust = f", "1"),
+        ("SELECT 9007199254740993 = '9007199254740992'", "1"),
+        // An integer against a DECIMAL compares as decimals, exactly.
+        ("SELECT id FROM bt WHERE cust = d", "2"),
+        ("SELECT id FROM bt WHERE cust = 9007199254740993.00", "1 2"),
+        ("SELECT id FROM bt WHERE cust = 9007199254740992.50", ""),
+        ("SELECT 9007199254740993 = 9007199254740992.0", "0"),
+    ];
+    for (sql, want) in cases {
+        let rows: Vec<mysql_async::Row> =
+            c.query(*sql).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+        let got = rows
+            .iter()
+            .map(|row| row.get::<String, _>(0).unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(got, *want, "{sql}");
+    }
+}
