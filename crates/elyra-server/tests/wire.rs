@@ -16147,3 +16147,109 @@ async fn mysql_index_definitions_are_accepted() {
     let left: Vec<i64> = c.query("SELECT id FROM `lines` ORDER BY id").await.unwrap();
     assert_eq!(left, vec![3]);
 }
+
+#[tokio::test]
+async fn having_without_group_by_follows_mysql() {
+    // (query, rows as `a,b;c,d`, NULL as `NULL`; `E<code>` for an error),
+    // measured on MySQL 8.4.
+    let cases: &[(&str, &str)] = &[
+        ("SELECT COUNT(*) FROM t HAVING COUNT(*) > 3", "4"),
+        ("SELECT COUNT(*) FROM t HAVING COUNT(*) > 4", ""),
+        ("SELECT COUNT(*) AS n FROM t HAVING n > 3", "4"),
+        ("SELECT COUNT(*) AS n FROM t HAVING n > 4", ""),
+        ("SELECT SUM(a) FROM t HAVING SUM(a) = 70", "70"),
+        ("SELECT SUM(a) FROM t HAVING SUM(a) < 70", ""),
+        ("SELECT SUM(a) FROM t HAVING MAX(a) > 30", "70"),
+        ("SELECT SUM(a) FROM t HAVING MAX(a) > 50", ""),
+        ("SELECT MIN(a), MAX(a) FROM t HAVING MIN(a) = 10 AND MAX(a) = 40", "10,40"),
+        ("SELECT 1 FROM t HAVING COUNT(*) > 0", "1"),
+        ("SELECT 1 FROM t HAVING COUNT(*) > 10", ""),
+        ("SELECT COUNT(*) FROM e HAVING COUNT(*) > 0", ""),
+        ("SELECT COUNT(*) FROM e HAVING COUNT(*) = 0", "0"),
+        ("SELECT SUM(a) FROM e HAVING SUM(a) IS NULL", "NULL"),
+        ("SELECT COUNT(*) FROM t WHERE a > 15 HAVING COUNT(*) = 2", "2"),
+        ("SELECT COUNT(*) FROM t WHERE a > 15 HAVING COUNT(*) = 3", ""),
+        ("SELECT COUNT(*) FROM t HAVING 1", "4"),
+        ("SELECT COUNT(*) FROM t HAVING 0", ""),
+        ("SELECT COUNT(*) FROM t HAVING NULL", ""),
+        ("SELECT id FROM t HAVING id > 2 ORDER BY id", "3;4"),
+        ("SELECT id, a FROM t HAVING a > 15 ORDER BY id", "2,20;4,40"),
+        ("SELECT id AS x FROM t HAVING x > 2 ORDER BY id", "3;4"),
+        ("SELECT a FROM t HAVING a IS NULL", "NULL"),
+        ("SELECT id FROM t HAVING 0", ""),
+        ("SELECT id FROM t HAVING 1 ORDER BY id", "1;2;3;4"),
+        ("SELECT a*2 AS d FROM t HAVING d > 30 ORDER BY d", "40;80"),
+        ("SELECT id FROM t HAVING a > 15 ORDER BY id", "E1054"),
+        ("SELECT id FROM t WHERE b = 'x' HAVING id > 1", "3"),
+        ("SELECT COUNT(*) FROM t HAVING id > 0", "E1054"),
+        ("SELECT COUNT(DISTINCT b) FROM t HAVING COUNT(DISTINCT b) = 2", "2"),
+        ("SELECT AVG(a) FROM t HAVING AVG(a) > 20", "23.3333"),
+        ("SELECT COUNT(*) c FROM t HAVING c > 3 ORDER BY c LIMIT 1", "4"),
+        ("SELECT COUNT(*) c FROM t HAVING c > 3 LIMIT 0", ""),
+        ("SELECT COUNT(*) FROM t HAVING COUNT(*) > (SELECT COUNT(*) FROM e)", "4"),
+        ("SELECT COUNT(*) FROM t HAVING COUNT(*) > (SELECT 10)", ""),
+        ("SELECT * FROM (SELECT COUNT(*) n FROM t HAVING n > 10) d", ""),
+        ("SELECT * FROM (SELECT COUNT(*) n FROM t HAVING n > 1) d", "4"),
+        ("SELECT (SELECT COUNT(*) FROM t HAVING COUNT(*) > 10)", "NULL"),
+        ("SELECT EXISTS (SELECT COUNT(*) FROM t HAVING COUNT(*) > 10)", "0"),
+        ("SELECT COUNT(*) FROM t HAVING COUNT(*) > 3 UNION ALL SELECT 99", "4;99"),
+        ("SELECT COUNT(*) FROM t HAVING COUNT(*) > 4 UNION ALL SELECT 99", "99"),
+        ("SELECT DISTINCT b FROM t HAVING b = 'x'", "x"),
+        ("SELECT t.id, t2.id FROM t JOIN t t2 ON t.id = t2.id HAVING COUNT(*) > 10 E1140", "E1064"),
+        ("SELECT COUNT(*) FROM t JOIN t t2 ON t.id = t2.id HAVING COUNT(*) = 4", "4"),
+        ("SELECT COUNT(*) FROM t JOIN t t2 ON t.id = t2.id HAVING COUNT(*) > 4", ""),
+        ("SELECT GROUP_CONCAT(id ORDER BY id) FROM t HAVING COUNT(*) > 10", ""),
+        ("SELECT COUNT(*) FROM t HAVING SUM(a) > 100", ""),
+        ("SELECT COUNT(*) FROM t HAVING COUNT(*) > 3 AND SUM(a) > 100", ""),
+        ("SELECT 5 HAVING 1", "5"),
+        ("SELECT 5 HAVING 0", ""),
+        ("SELECT 5 AS x HAVING x > 3", "5"),
+        ("SELECT id FROM t HAVING t.id > 2 ORDER BY id", "3;4"),
+        ("SELECT t.id FROM t HAVING id > 2 ORDER BY id", "3;4"),
+        ("SELECT id FROM t AS q HAVING q.id > 3", "4"),
+        ("SELECT id, id FROM t HAVING id > 3", "4,4"),
+        ("SELECT id+0 FROM t HAVING id+0 > 3", "E1054"),
+        ("SELECT id FROM t HAVING id IN (SELECT 1 UNION SELECT 3) ORDER BY id", "1;3"),
+        ("SELECT id FROM t o WHERE EXISTS (SELECT 1 FROM t i HAVING o.id > 3)", "4"),
+        ("SELECT id FROM t o WHERE EXISTS (SELECT i.id FROM t i HAVING i.id = o.id + 2) ORDER BY id", "1;2"),
+        ("SELECT * FROM t HAVING a > 15 ORDER BY id", "2,20,y;4,40,NULL"),
+        ("SELECT id FROM t HAVING id > 1 ORDER BY a DESC LIMIT 1 OFFSET 1", "2"),
+        ("SELECT DISTINCT b FROM t HAVING b IS NOT NULL ORDER BY b", "x;y"),
+        ("SELECT a, COUNT(*) FROM t GROUP BY a HAVING COUNT(*) > (SELECT 0) ORDER BY a", "NULL,1;10,1;20,1;40,1"),
+        ("SELECT 5 WHERE 1 HAVING 0", ""),
+        ("SELECT COUNT(*) FROM t HAVING a > 0", "E1054"),
+        ("SELECT id FROM t HAVING id > 1 UNION SELECT id FROM t HAVING id < 2 ORDER BY id", "1;2;3;4"),
+        ("SELECT b AS id FROM t HAVING id = 'x'", "x;x"),
+    ];
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    for sql in [
+        "CREATE TABLE t (id INT PRIMARY KEY, a INT, b VARCHAR(5))",
+        "INSERT INTO t VALUES (1,10,'x'),(2,20,'y'),(3,NULL,'x'),(4,40,NULL)",
+        "CREATE TABLE e (id INT PRIMARY KEY, a INT)",
+    ] {
+        c.query_drop(sql).await.unwrap();
+    }
+    for (sql, want) in cases {
+        let got = match c.query::<mysql_async::Row, _>(*sql).await {
+            Ok(rows) => rows
+                .into_iter()
+                .map(|row| {
+                    row.unwrap()
+                        .into_iter()
+                        .map(|v| match v {
+                            mysql_async::Value::NULL => "NULL".to_string(),
+                            mysql_async::Value::Bytes(b) => String::from_utf8(b).unwrap(),
+                            other => format!("{other:?}"),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
+                .collect::<Vec<_>>()
+                .join(";"),
+            Err(mysql_async::Error::Server(e)) => format!("E{}", e.code),
+            Err(e) => panic!("{sql}: {e}"),
+        };
+        assert_eq!(got, *want, "{sql}");
+    }
+}
