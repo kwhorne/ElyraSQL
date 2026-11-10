@@ -17,6 +17,22 @@ ElyraSQL release builds target **Ubuntu 24.04+** and **Apple Silicon macOS
     done, so an interrupted upgrade simply resumes on the next start. **Take a backup
     first, and note that downgrading to 1.4.x afterwards is not supported.**
 
+!!! info "Upgrading to 1.12.15 — MySQL index definitions"
+
+    No on-disk format change; a 1.12.14 database opens in 1.12.15 unchanged.
+
+    - **Navicat and mysqldump dumps restore.** Index definitions as MySQL
+      writes them -- `KEY k (a) USING BTREE`, `ASC` / `DESC` key parts,
+      `COMMENT` / `VISIBLE` / `KEY_BLOCK_SIZE` options, `ALGORITHM` / `LOCK` --
+      were refused with 1064, and with them every table that had one.
+    - **A foreign key shares an index that leads with its columns**, as in
+      MySQL. Tables created from now on get no extra `fk_<table>_N` index
+      where a composite index already serves the key; existing tables keep
+      theirs.
+
+    If you are upgrading from 1.12.13 or earlier, read the 1.12.14 note below
+    first: that release fixes a query that could stop the server.
+
 !!! danger "Upgrade to 1.12.14 promptly — a query could stop the server"
 
     No on-disk format change; a 1.12.13 database opens in 1.12.14 unchanged.
@@ -734,8 +750,8 @@ macOS).
 Multi-arch image (`amd64` + `arm64`) on the GitHub Container Registry:
 
 ```bash
-docker pull ghcr.io/kwhorne/elyrasql:1.12.14   # or :latest
-docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.12.14
+docker pull ghcr.io/kwhorne/elyrasql:1.12.15   # or :latest
+docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.12.15
 ```
 
 The image is ~15 MB, runs as a non-root user, stores data in the
