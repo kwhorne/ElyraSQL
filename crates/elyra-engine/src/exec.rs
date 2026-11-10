@@ -155,6 +155,38 @@ fn declared_int_bits(dt: &DataType) -> Option<u8> {
     }
 }
 
+/// The CHECK an `ENUM` or `SET` column of type `data_type` stores its
+/// membership as: `` `col` IN ('a', 'b') `` for an ENUM, a REGEXP over the
+/// members for a SET. `None` for any other type.
+fn member_check(column: &str, data_type: &DataType) -> Option<String> {
+    match data_type {
+        DataType::Enum(members, _) if !members.is_empty() => {
+            let list = members
+                .iter()
+                .map(|m| match m {
+                    sqlparser::ast::EnumMember::Name(s) => s,
+                    sqlparser::ast::EnumMember::NamedValue(s, _) => s,
+                })
+                .map(|v| format!("'{}'", v.replace('\'', "''")))
+                .collect::<Vec<_>>()
+                .join(", ");
+            Some(format!("`{column}` IN ({list})"))
+        }
+        DataType::Set(members) if !members.is_empty() => {
+            let group = members
+                .iter()
+                .map(|m| regex_escape(m))
+                .collect::<Vec<_>>()
+                .join("|");
+            let pattern = format!("^({group})(,({group}))*$").replace('\'', "''");
+            Some(format!(
+                "`{column}` IS NULL OR `{column}` = '' OR `{column}` REGEXP '{pattern}'"
+            ))
+        }
+        _ => None,
+    }
+}
+
 /// Inclusive range a value must fall in for a column of `bits` width.
 fn int_bounds(bits: u8, unsigned: bool) -> (i128, i128) {
     if unsigned {
@@ -549,38 +581,10 @@ pub async fn create_table(
         // No on-disk format change (checks already live in TableDef); NULL passes
         // the CHECK, matching a nullable ENUM. (SET subset-membership is not yet
         // validated.)
-        if let sqlparser::ast::DataType::Enum(members, _) = &col.data_type {
-            let vals: Vec<String> = members
-                .iter()
-                .map(|m| match m {
-                    sqlparser::ast::EnumMember::Name(s) => s.clone(),
-                    sqlparser::ast::EnumMember::NamedValue(s, _) => s.clone(),
-                })
-                .collect();
-            if !vals.is_empty() {
-                let list = vals
-                    .iter()
-                    .map(|v| format!("'{}'", v.replace('\'', "''")))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                checks.push(format!("`{}` IN ({list})", col.name.value));
-            }
-        }
         // SET: a value is a comma-separated subset of the declared members (or
-        // empty). Validate with a synthesized REGEXP CHECK `^(m1|m2|...)(,(...))*$`
-        // (plus the empty string). NULL passes the CHECK automatically.
-        if let sqlparser::ast::DataType::Set(members) = &col.data_type {
-            let alts: Vec<String> = members.iter().map(|m| regex_escape(m)).collect();
-            if !alts.is_empty() {
-                let group = alts.join("|");
-                let pattern = format!("^({group})(,({group}))*$");
-                let pat_sql = pattern.replace('\'', "''");
-                let cn = &col.name.value;
-                checks.push(format!(
-                    "`{cn}` IS NULL OR `{cn}` = '' OR `{cn}` REGEXP '{pat_sql}'"
-                ));
-            }
-        }
+        // empty), validated with a synthesized REGEXP CHECK. NULL passes either
+        // CHECK, matching a nullable ENUM / SET.
+        checks.extend(member_check(&col.name.value, &col.data_type));
         let mut nullable = true;
         let mut meta = ColMeta::default();
         let collation = col
@@ -4200,9 +4204,7 @@ async fn alter_add_primary_key_shadow(
                     .iter()
                     .any(|&column| row[column].is_null())
                 {
-                    return Err(Error::Query(
-                        "primary key columns cannot contain NULL".into(),
-                    ));
+                    return Err(Error::InvalidNull);
                 }
                 let clustered =
                     keyenc::encode_columns_coll(&row, &definition.pk_cols, &primary_collations)?;
@@ -4423,6 +4425,38 @@ async fn alter_table_inner(
                         on_delete: map_ref_action(on_delete),
                         on_update: map_ref_action(on_update),
                     });
+                    // Existing rows must satisfy the new key, as in MySQL (1452);
+                    // they used to be left orphaned while later writes were
+                    // checked.
+                    if db.foreign_key_checks() {
+                        let added = TableDef {
+                            foreign_keys: def.foreign_keys.last().cloned().into_iter().collect(),
+                            ..def.clone()
+                        };
+                        let rows = collect_matches(db, &def, None, None).await?;
+                        check_fk_batch(db, &added, &rows).await?;
+                    }
+                    continue;
+                }
+                // ADD [CONSTRAINT name] CHECK (expr): every existing row must
+                // pass it (3819), as in MySQL; it was refused as unsupported.
+                if let TC::Check {
+                    name: check_name,
+                    expr,
+                } = tc
+                {
+                    let parsed = parse_scalar_expr(&expr.to_string())?;
+                    let ordinal = declared_checks(&def).len();
+                    let display = check_name
+                        .as_ref()
+                        .map(|n| n.value.clone())
+                        .unwrap_or_else(|| check_constraint_name(&def.name, ordinal));
+                    for (_, row) in collect_matches(db, &def, None, None).await? {
+                        if check_fails(&predicate::eval_row(&parsed, &def.schema, &row)?) {
+                            return Err(Error::CheckViolated(display));
+                        }
+                    }
+                    def.checks.push(expr.to_string());
                     continue;
                 }
                 let (idx_name, columns, unique) = match tc {
@@ -4548,9 +4582,7 @@ async fn alter_add_primary_key(db: &Session, def: &mut TableDef, columns: &[Iden
         for (old_key, encoded_row) in batch {
             let row = rowdec::decode_row(&encoded_row)?;
             if def.pk_cols.iter().any(|&column| row[column].is_null()) {
-                return Err(Error::Query(
-                    "primary key columns cannot contain NULL".into(),
-                ));
+                return Err(Error::InvalidNull);
             }
             let clustered = keyenc::encode_columns_coll(&row, &def.pk_cols, &pk_collations)?;
             if !clustered_keys.insert(clustered.clone()) {
@@ -4695,12 +4727,33 @@ async fn alter_change_column(
             "cannot change the collation of a primary key column".into(),
         ));
     }
-    let check_name = new_name.unwrap_or(&def.schema.columns[i].name);
-    check_existing_character_length(db, def, i, &declared_type, check_name).await?;
+    let (nullable, meta) = options_to_meta(options);
+    let column_name = new_name.unwrap_or(&def.schema.columns[i].name).to_string();
+    validate_column_change(
+        db,
+        def,
+        i,
+        &ColumnChange {
+            name: &column_name,
+            ty: &new_ty,
+            data_type,
+            declaration: &declared_type,
+            nullable,
+        },
+    )
+    .await?;
     if let Some(nn) = new_name {
         def.schema.columns[i].name = nn.to_string();
     }
-    let (nullable, meta) = options_to_meta(options);
+    // An ENUM / SET column's membership is a CHECK: replace the column's old
+    // one (if it had one) with the new type's, so `MODIFY e ENUM('a','b')`
+    // enforces it like `CREATE TABLE` does -- it used to enforce nothing.
+    let old_checks = std::mem::take(&mut def.checks);
+    def.checks = old_checks
+        .into_iter()
+        .filter(|check| member_check_column(def, check) != Some(i))
+        .collect();
+    def.checks.extend(member_check(&column_name, data_type));
     def.schema.columns[i].nullable = nullable;
     def.schema.columns[i].ty = new_ty.clone();
     def.col_meta[i] = meta;
@@ -4784,7 +4837,20 @@ async fn alter_column_op(
             def.col_meta[i].default = Some(value.to_string())
         }
         AlterColumnOperation::DropDefault => def.col_meta[i].default = None,
-        AlterColumnOperation::SetNotNull => def.schema.columns[i].nullable = false,
+        AlterColumnOperation::SetNotNull => {
+            let column = def.schema.columns[i].clone();
+            if db.strict_sql_mode() {
+                for (_, row) in collect_matches(db, def, None, None).await? {
+                    if row.get(i).is_none_or(Value::is_null) {
+                        return Err(Error::InvalidNull);
+                    }
+                }
+            }
+            def.schema.columns[i] = ColumnDef {
+                nullable: false,
+                ..column
+            };
+        }
         AlterColumnOperation::DropNotNull => def.schema.columns[i].nullable = true,
         AlterColumnOperation::SetDataType { data_type, .. } => {
             let new_ty = map_type(data_type)?;
@@ -4795,12 +4861,19 @@ async fn alter_column_op(
                     "cannot change the type of a primary key column".into(),
                 ));
             }
-            check_existing_character_length(
+            let column_name = def.schema.columns[i].name.clone();
+            let nullable = def.schema.columns[i].nullable;
+            validate_column_change(
                 db,
                 def,
                 i,
-                &declared_type,
-                &def.schema.columns[i].name,
+                &ColumnChange {
+                    name: &column_name,
+                    ty: &new_ty,
+                    data_type,
+                    declaration: &declared_type,
+                    nullable,
+                },
             )
             .await?;
             def.schema.columns[i].ty = new_ty.clone();
@@ -4819,23 +4892,115 @@ async fn alter_column_op(
     Ok(())
 }
 
-/// Reject an ALTER that would leave existing character data too wide for its
-/// new declaration. The calling ALTER runs behind a private checkpoint, so an
-/// error leaves both rows and catalog metadata unchanged.
-async fn check_existing_character_length(
+/// What a `MODIFY` / `CHANGE` / `ALTER COLUMN ... SET DATA TYPE` makes a
+/// column.
+struct ColumnChange<'a> {
+    name: &'a str,
+    ty: &'a ColumnType,
+    data_type: &'a DataType,
+    declaration: &'a catalog::ColumnDeclaration,
+    nullable: bool,
+}
+
+/// Refuse a column change that existing rows do not satisfy, as MySQL does in
+/// strict mode, with MySQL's error for the first offending row:
+///
+/// - NULL in a column made NOT NULL: 1138;
+/// - a value its new type cannot hold: 1264 out of an integer's range; for a
+///   string too long, 1265 kept in its type or 1406 converted from another; 1265
+///   for a value that is not an ENUM / SET member; 1292 for an invalid date or
+///   time.
+///
+/// It used to accept all of them and leave the rows breaking the new rule,
+/// which was then enforced only on later writes. The calling ALTER runs behind
+/// a private checkpoint, so an error leaves rows and catalog unchanged.
+async fn validate_column_change(
     db: &Session,
     def: &TableDef,
     column: usize,
-    declaration: &catalog::ColumnDeclaration,
-    column_name: &str,
+    change: &ColumnChange<'_>,
 ) -> Result<()> {
     if !db.strict_sql_mode() {
         return Ok(());
     }
-    let rows = collect_matches(db, def, None, None).await?;
-    for (row_number, (_, row)) in rows.iter().enumerate() {
-        if let Some(value) = row.get(column) {
-            check_declared_character_length(declaration, value, column_name, row_number + 1)?;
+    let width = declared_int_bits(change.data_type)
+        .map(|bits| int_bounds(bits, matches!(change.ty, ColumnType::UInt)));
+    let member = member_check(change.name, change.data_type)
+        .map(|check| parse_scalar_expr(&check))
+        .transpose()?;
+    let member_schema = Schema::new(vec![ColumnDef::new(change.name, change.ty.clone(), true)]);
+    // MySQL truncates a string kept in the same type (`VARCHAR(10)` to
+    // `VARCHAR(3)`) with 1265, and refuses one converted from another type
+    // (`INT`, `TEXT`, `CHAR` to `VARCHAR`) with 1406.
+    let same_string_type = catalog::load_declarations(db, &def.name)
+        .await?
+        .and_then(|declarations| declarations.columns.get(column).cloned())
+        .is_some_and(|old| old.data_type == change.declaration.data_type);
+    let temporal = match change.ty {
+        ColumnType::Date => Some("date"),
+        ColumnType::DateTime => Some("datetime"),
+        ColumnType::Time => Some("time"),
+        _ => None,
+    };
+    for (row_index, (_, row)) in collect_matches(db, def, None, None)
+        .await?
+        .iter()
+        .enumerate()
+    {
+        let row_number = row_index + 1;
+        let value = row.get(column).cloned().unwrap_or(Value::Null);
+        if value.is_null() {
+            if !change.nullable {
+                return Err(Error::InvalidNull);
+            }
+            continue;
+        }
+        let coerced = match coerce(value.clone(), change.ty, change.name) {
+            Ok(coerced) => coerced,
+            Err(Error::Type(_)) if temporal.is_some() => {
+                return Err(Error::IncorrectValue(format!(
+                    "Incorrect {} value: '{}' for column '{}' at row {row_number}",
+                    temporal.unwrap_or_default(),
+                    value.to_wire_string().unwrap_or_default(),
+                    change.name
+                )))
+            }
+            Err(Error::OutOfRange(_)) => {
+                return Err(Error::OutOfRange(format!(
+                    "Out of range value for column '{}' at row {row_number}",
+                    change.name
+                )))
+            }
+            Err(other) => return Err(other),
+        };
+        if let Some((lo, hi)) = width {
+            let n = match &coerced {
+                Value::Int(v) => Some(i128::from(*v)),
+                Value::UInt(v) => Some(i128::from(*v)),
+                _ => None,
+            };
+            if n.is_some_and(|n| n < lo || n > hi) {
+                return Err(Error::OutOfRange(format!(
+                    "Out of range value for column '{}' at row {row_number}",
+                    change.name
+                )));
+            }
+        }
+        match check_declared_character_length(change.declaration, &coerced, change.name, row_number)
+        {
+            Err(Error::DataTooLong(_)) if same_string_type => {
+                return Err(Error::DataTruncated(change.name.to_string(), row_number))
+            }
+            other => other?,
+        }
+        if let Some(member) = &member {
+            let row = [coerced];
+            if matches!(
+                predicate::eval_row(member, &member_schema, &row)?,
+                Value::Bool(false)
+            ) {
+                return Err(Error::DataTruncated(change.name.to_string(), row_number));
+            }
         }
     }
     Ok(())
@@ -5528,7 +5693,16 @@ pub async fn create_index(db: &Session, ci: CreateIndex) -> Result<QueryResult> 
         indexes_nulls,
     });
 
-    // Persist the new catalog and backfill index entries for existing rows.
+    // Persist the new catalog and backfill index entries for existing rows. A
+    // UNIQUE index over rows that already repeat a value is refused, as in
+    // MySQL (1062); it used to be built over the duplicates, which then stayed
+    // while the index refused only later ones.
+    let new_index = def.indexes.last().cloned().filter(|index| index.unique);
+    let unique_only = new_index.as_ref().map(|index| TableDef {
+        indexes: vec![index.clone()],
+        ..def.clone()
+    });
+    let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
     let mut puts: Vec<(Vec<u8>, Vec<u8>)> = vec![(catalog_key(&table), def.encode()?)];
     let prefix = def.data_prefix();
     let mut cursor: Option<Vec<u8>> = None;
@@ -5541,6 +5715,26 @@ pub async fn create_index(db: &Session, ci: CreateIndex) -> Result<QueryResult> 
         cursor = chunk.last().map(|(k, _)| k.clone());
         for (k, v) in chunk {
             let row: Vec<Value> = rowdec::decode_row(&v)?;
+            if let (Some(index), Some(unique_only)) = (&new_index, &unique_only) {
+                for probe in index::unique_probe_keys(unique_only, &row)? {
+                    if !seen.insert(probe) {
+                        return Err(Error::Duplicate(
+                            DuplicateError::Entry,
+                            format!(
+                                "Duplicate entry '{}' for key '{}.{}'",
+                                index
+                                    .cols
+                                    .iter()
+                                    .map(|&c| row[c].to_wire_string().unwrap_or_default())
+                                    .collect::<Vec<_>>()
+                                    .join("-"),
+                                table,
+                                index.name
+                            ),
+                        ));
+                    }
+                }
+            }
             puts.extend(index::entries_for_row(&def, &row, &k)?);
         }
         if last {
@@ -5670,7 +5864,16 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
     let def = catalog::load(db, &name).await?;
 
     // Resolve target column order.
-    let target: Vec<usize> = if ins.columns.is_empty() {
+    // `INSERT INTO t () VALUES ()` and `INSERT INTO t VALUES ()` write a row
+    // of defaults, as in MySQL: an empty value list names no column. It was
+    // read as a value for every column, and refused for having none.
+    let only_empty_rows = ins.source.as_ref().is_some_and(|source| {
+        matches!(source.body.as_ref(), SetExpr::Values(values)
+            if values.rows.iter().all(|row| row.is_empty()))
+    });
+    let target: Vec<usize> = if ins.columns.is_empty() && only_empty_rows {
+        Vec::new()
+    } else if ins.columns.is_empty() {
         (0..def.schema.columns.len()).collect()
     } else {
         ins.columns
@@ -5939,6 +6142,11 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
 
         for (i, col) in def.schema.columns.iter().enumerate() {
             if !col.nullable && row[i].is_null() {
+                // Left out of the column list with nothing to fill it: MySQL's
+                // 1364, not the 1048 of an explicit NULL.
+                if !provided[i] && default_exprs[i].is_none() && generated_exprs[i].is_none() {
+                    return Err(Error::NoDefault(col.name.clone()));
+                }
                 return Err(Error::NotNull(col.name.clone()));
             }
         }
@@ -6954,6 +7162,17 @@ fn parse_checks(def: &TableDef) -> Result<Vec<RowCheck>> {
         .collect()
 }
 
+/// Whether a CHECK's value fails it: only FALSE (or a zero) does; NULL /
+/// UNKNOWN passes.
+fn check_fails(value: &Value) -> bool {
+    match value {
+        Value::Bool(b) => !b,
+        Value::Int(i) => *i == 0,
+        Value::Float(f) => *f == 0.0,
+        _ => false,
+    }
+}
+
 /// A CHECK is satisfied unless it evaluates to FALSE (NULL/UNKNOWN passes).
 ///
 /// `old` is the row an UPDATE replaces: MySQL validates an `ENUM` / `SET`
@@ -6974,14 +7193,7 @@ fn check_row(
                 continue;
             }
         }
-        let fails = match predicate::eval_row(&c.expr, &def.schema, row)? {
-            Value::Null => false,
-            Value::Bool(b) => !b,
-            Value::Int(i) => i == 0,
-            Value::Float(f) => f == 0.0,
-            _ => false,
-        };
-        if !fails {
+        if !check_fails(&predicate::eval_row(&c.expr, &def.schema, row)?) {
             continue;
         }
         match &c.rule {

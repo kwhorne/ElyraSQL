@@ -25,6 +25,22 @@ All notable changes to ElyraSQL are documented here. The format is based on
   `BETWEEN` with string bounds matched the neighbouring integers too. Other
   strings (`' 5'`, `'5x'`, `'5.5'`), and a column against another column,
   still compare as doubles, as in MySQL.
+- **`ALTER TABLE` checks the existing rows.** `MODIFY n INT NOT NULL` over
+  NULLs, `MODIFY v TINYINT` over 300, `MODIFY e ENUM(...)` over other values,
+  `ADD UNIQUE KEY` / `CREATE UNIQUE INDEX` over duplicates and `ADD FOREIGN
+  KEY` over orphan rows were all accepted: the rows that broke the new rule
+  stayed, and only later writes were refused. In strict mode each is now
+  refused with MySQL's error -- 1138, 1264, 1265, 1062, 1452 -- and the table
+  is left as it was. A string shortened in its own type is 1265 and one
+  converted from another type 1406; an invalid date or time is 1292; NULL in a
+  new primary key is 1138 (was 1105).
+- **`MODIFY` to an `ENUM` or `SET` enforces its members.** Values outside them
+  were accepted afterwards, as if the column were still a string.
+- **`ADD [CONSTRAINT name] CHECK (...)` works.** It was refused with 1235; it
+  now checks the existing rows (3819) and is enforced from then on.
+- **`INSERT INTO t () VALUES ()` writes a row of defaults**, as does `INSERT
+  INTO t VALUES ()`; both were refused. Leaving out a NOT NULL column that has
+  no default is MySQL's 1364 (was 1048).
 
 ## [1.12.13] - 2026-11-06
 
