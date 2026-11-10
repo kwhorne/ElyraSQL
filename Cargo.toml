@@ -17,7 +17,7 @@ members = [
 exclude = ["fuzz", "testbench/sql-dump"]
 
 [workspace.package]
-version = "1.12.15"
+version = "1.12.16"
 edition = "2021"
 rust-version = "1.88"
 license = "MIT"

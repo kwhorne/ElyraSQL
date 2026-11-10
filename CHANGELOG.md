@@ -6,6 +6,8 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.12.16] - 2026-11-10
+
 ### Fixed
 
 - **Arithmetic overflow is 1690, as in MySQL.** It was 1264, the code for a
