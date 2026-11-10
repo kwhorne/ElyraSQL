@@ -6,6 +6,8 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.12.15] - 2026-11-10
+
 ### Fixed
 
 - **A Navicat or mysqldump dump restores.** Index definitions as MySQL writes
