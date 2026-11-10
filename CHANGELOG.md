@@ -8,6 +8,22 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ### Fixed
 
+- **Arithmetic overflow is 1690, as in MySQL.** It was 1264, the code for a
+  value too big for its *column*, so a client could not tell the two apart.
+  `9223372036854775807 + 1`, `-9223372036854775808 DIV -1`,
+  `ABS(-9223372036854775808)`, `ROUND(9223372036854775807, -1)`, and DOUBLE
+  overflow (`1e308 * 10`, `EXP(1000)`, `POW(10, 400)`) are all 1690 now -- the
+  DOUBLE cases used to return NULL, or `inf` from `POW`, and `ABS` returned the
+  negative number. A value its column cannot hold is still 1264.
+- **Unsigned arithmetic no longer wraps around.** `CAST(0 AS UNSIGNED) - 1`
+  returned 18446744073709551615 and `18446744073709551615 + 1` returned 0; both
+  are 1690, as in MySQL, and so is any result outside BIGINT UNSIGNED. A
+  negative operand is fine when the result is not (`CAST(5 AS UNSIGNED) + -1`
+  is 4), a remainder takes its dividend's sign (`CAST(7 AS UNSIGNED) % -3` is 1,
+  not 7), and `18446744073709551615 DIV 1` is exact instead of capped at
+  BIGINT's maximum.
+- **A shift by 64 or more is 0.** `1 << 64` was 1 and `256 >> 64` was 256: the
+  count was taken modulo 64.
 - **`HAVING` without `GROUP BY` filters.** Unless the select list held an
   aggregate, it was ignored and every row came back: `SELECT id FROM t HAVING
   id > 2` returned all of `t`, and so did `SELECT 5 HAVING 0`. As in MySQL, it

@@ -10240,7 +10240,7 @@ async fn deep_expression_does_not_crash_server() {
 }
 
 // Regression for #15: integer arithmetic must not silently saturate/wrap, `% 0`
-// must be NULL, and DOUBLE overflow must be NULL (MySQL semantics), instead of
+// must be NULL, and DOUBLE overflow must be 1690 (MySQL semantics), instead of
 // returning silently-wrong values.
 #[tokio::test]
 async fn integer_overflow_and_division_semantics() {
@@ -10266,9 +10266,11 @@ async fn integer_overflow_and_division_semantics() {
         assert_eq!(v, Some(None), "`{sql}` should be NULL");
     }
 
-    // DOUBLE overflow is NULL, not +inf.
-    let v: Option<Option<f64>> = c.query_first("SELECT POW(10,308) * 10").await.unwrap();
-    assert_eq!(v, Some(None), "double overflow should be NULL");
+    // DOUBLE overflow is 1690 (measured on MySQL 8.4), not NULL or +inf.
+    match c.query_drop("SELECT POW(10,308) * 10").await {
+        Err(mysql_async::Error::Server(e)) => assert_eq!(e.code, 1690),
+        other => panic!("double overflow should be 1690: {other:?}"),
+    }
 
     // Exact large integer arithmetic (no f64 precision loss) still works.
     let n: i64 = c
@@ -16252,4 +16254,157 @@ async fn having_without_group_by_follows_mysql() {
         };
         assert_eq!(got, *want, "{sql}");
     }
+}
+
+#[tokio::test]
+async fn arithmetic_overflow_is_1690_as_in_mysql() {
+    // (query, rows as `a,b;c,d`, NULL as `NULL`; `E<code>` for an error),
+    // measured on MySQL 8.4.
+    let cases: &[(&str, &str)] = &[
+        ("SELECT 9223372036854775807 + 1", "E1690"),
+        ("SELECT -9223372036854775808 - 1", "E1690"),
+        ("SELECT 9223372036854775807 * 2", "E1690"),
+        ("SELECT 18446744073709551615 + 1", "E1690"),
+        ("SELECT 0 - 18446744073709551615", "E1690"),
+        ("SELECT CAST(0 AS UNSIGNED) - 1", "E1690"),
+        ("SELECT CAST(1 AS UNSIGNED) - 2", "E1690"),
+        ("SELECT 1 - CAST(2 AS UNSIGNED)", "E1690"),
+        ("SELECT -9223372036854775808 * -1", "E1690"),
+        ("SELECT ABS(-9223372036854775808)", "E1690"),
+        ("SELECT -9223372036854775808 DIV -1", "E1690"),
+        ("SELECT 9223372036854775807 + 1.0", "9223372036854775808.0"),
+        ("SELECT 4294967296 * 4294967296", "E1690"),
+        ("SELECT b + 1 FROM t WHERE id = 1", "E1690"),
+        ("SELECT b - 1 FROM t WHERE id = 2", "E1690"),
+        ("SELECT b * 2 FROM t WHERE id = 1", "E1690"),
+        ("SELECT u + 1 FROM t WHERE id = 1", "E1690"),
+        ("SELECT u - 1 FROM t WHERE id = 2", "E1690"),
+        ("SELECT i + 1 FROM t WHERE id = 1", "2147483648"),
+        ("SELECT ti + 1 FROM t WHERE id = 1", "128"),
+        ("SELECT -b FROM t WHERE id = 2", "E1690"),
+        ("SELECT b + 1 FROM t", "E1690"),
+        ("SELECT COUNT(*) FROM t WHERE b + 1 > 0", "E1690"),
+        ("SELECT SUM(b) FROM t WHERE id = 1 OR id = 1", "9223372036854775807"),
+        ("SELECT b + b FROM t WHERE id = 1", "E1690"),
+        ("SELECT 2 << 64", "0"),
+        ("SELECT CAST(9223372036854775807 AS SIGNED) + 1", "E1690"),
+        ("SELECT 9223372036854775807 + CAST(1 AS UNSIGNED)", "9223372036854775808"),
+        ("SELECT 18446744073709551615 * 1", "18446744073709551615"),
+        ("SELECT 1e308 * 10", "E1690"),
+        ("SELECT EXP(1000)", "E1690"),
+        ("SELECT 1e308 + 1e308", "E1690"),
+        ("SELECT -1e308 * 10", "E1690"),
+        ("SELECT 1e308 * -10", "E1690"),
+        ("SELECT 1e300 / 1e-300", "E1690"),
+        ("SELECT POW(10, 400)", "E1690"),
+        ("SELECT POWER(2, 2000)", "E1690"),
+        ("SELECT POW(-10, 401)", "E1690"),
+        ("SELECT POW(0, -1)", "E1690"),
+        ("SELECT LOG(0)", "NULL"),
+        ("SELECT SQRT(-1)", "NULL"),
+        ("SELECT CAST(7 AS UNSIGNED) % -3", "1"),
+        ("SELECT -7 % CAST(3 AS UNSIGNED)", "-1"),
+        ("SELECT CAST(5 AS UNSIGNED) + -1", "4"),
+        ("SELECT CAST(5 AS UNSIGNED) + -6", "E1690"),
+        ("SELECT CAST(5 AS UNSIGNED) * -1", "E1690"),
+        ("SELECT CAST(0 AS UNSIGNED) * -1", "0"),
+        ("SELECT -1 * CAST(0 AS UNSIGNED)", "0"),
+        ("SELECT CAST(5 AS UNSIGNED) - -1", "6"),
+        ("SELECT -5 + CAST(3 AS UNSIGNED)", "E1690"),
+        ("SELECT -5 + CAST(9 AS UNSIGNED)", "4"),
+        ("SELECT CAST(18446744073709551615 AS UNSIGNED) - CAST(18446744073709551615 AS UNSIGNED)", "0"),
+        ("SELECT CAST(10 AS UNSIGNED) - CAST(11 AS UNSIGNED)", "E1690"),
+        ("SELECT CAST(4294967296 AS UNSIGNED) * CAST(4294967296 AS UNSIGNED)", "E1690"),
+        ("SELECT CAST(7 AS UNSIGNED) DIV -2", "E1690"),
+        ("SELECT 18446744073709551615 DIV 1", "18446744073709551615"),
+        ("SELECT 18446744073709551615 / 1", "18446744073709551615.0000"),
+        ("SELECT 1.5 + CAST(1 AS UNSIGNED)", "2.5"),
+        ("SELECT CAST(-1 AS UNSIGNED)", "18446744073709551615"),
+        ("SELECT ABS(-9223372036854775807)", "9223372036854775807"),
+        ("SELECT ABS(CAST(18446744073709551615 AS UNSIGNED))", "18446744073709551615"),
+        ("SELECT -CAST(1 AS UNSIGNED)", "-1"),
+        ("SELECT -CAST(0 AS UNSIGNED)", "0"),
+        ("SELECT 1 << 63", "9223372036854775808"),
+        ("SELECT 1 << 64", "0"),
+        ("SELECT 2 << 64", "0"),
+        ("SELECT 1 << 65", "0"),
+        ("SELECT 256 >> 64", "0"),
+        ("SELECT 1 << -1", "0"),
+        ("SELECT ROUND(9223372036854775807, -1)", "E1690"),
+        ("SELECT TRUNCATE(9223372036854775807, -1)", "9223372036854775800"),
+        ("SELECT SUM(b) FROM t", "-1"),
+        ("SELECT SUM(b) + 0 FROM t WHERE id = 1", "9223372036854775807"),
+        ("SELECT b + 1 FROM t WHERE id = 99", ""),
+        ("SELECT IF(b > 0, 0, b + 1) FROM t WHERE id = 1", "0"),
+        ("SELECT b + 1 > 0 OR 1 FROM t WHERE id = 1", "E1690"),
+        ("SELECT u * 1 FROM t WHERE id = 1", "18446744073709551615"),
+    ];
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    for sql in [
+        "CREATE TABLE t (id INT PRIMARY KEY, b BIGINT, u BIGINT UNSIGNED, i INT, ti TINYINT, \
+         dc DECIMAL(65,0))",
+        "INSERT INTO t VALUES (1, 9223372036854775807, 18446744073709551615, 2147483647, 127, 1), \
+         (2, -9223372036854775808, 0, -2147483648, -128, 2)",
+        "CREATE TABLE d (id INT PRIMARY KEY, b BIGINT, i INT, ti TINYINT, u INT UNSIGNED)",
+        "INSERT INTO d VALUES (1, 1, 1, 1, 1)",
+    ] {
+        c.query_drop(sql).await.unwrap();
+    }
+    let code = |r: Result<(), mysql_async::Error>| match r {
+        Ok(()) => 0,
+        Err(mysql_async::Error::Server(e)) => e.code,
+        Err(e) => panic!("{e}"),
+    };
+    for (sql, want) in cases {
+        let got = match c.query::<mysql_async::Row, _>(*sql).await {
+            Ok(rows) => rows
+                .into_iter()
+                .map(|row| {
+                    row.unwrap()
+                        .into_iter()
+                        .map(|v| match v {
+                            mysql_async::Value::NULL => "NULL".to_string(),
+                            mysql_async::Value::Bytes(b) => String::from_utf8(b).unwrap(),
+                            other => format!("{other:?}"),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
+                .collect::<Vec<_>>()
+                .join(";"),
+            Err(mysql_async::Error::Server(e)) => format!("E{}", e.code),
+            Err(e) => panic!("{sql}: {e}"),
+        };
+        assert_eq!(got, *want, "{sql}");
+    }
+
+    // Writes: an overflowing expression is 1690 even under IGNORE; a value
+    // its column cannot hold stays 1264.
+    for (sql, want) in [
+        ("UPDATE d SET b = 9223372036854775807 + 1", 1690),
+        ("UPDATE d SET b = b + 9223372036854775807", 1690),
+        ("UPDATE d SET u = u - 2", 1690),
+        ("UPDATE IGNORE d SET b = 9223372036854775807 + 1", 1690),
+        ("UPDATE d SET i = 2147483648", 1264),
+        ("UPDATE d SET ti = ti + 200", 1264),
+        (
+            "INSERT INTO d VALUES (2, 9223372036854775807 + 1, 0, 0, 0)",
+            1690,
+        ),
+        (
+            "INSERT INTO d VALUES (6, 0, 0, 0, CAST(0 AS UNSIGNED) - 1)",
+            1690,
+        ),
+        (
+            "INSERT IGNORE INTO d VALUES (7, 9223372036854775807 + 1, 0, 0, 0)",
+            1690,
+        ),
+        ("INSERT INTO d VALUES (3, 0, 2147483647 + 1, 0, 0)", 1264),
+        ("INSERT INTO d VALUES (5, 0, 0, 0, 0 - 1)", 1264),
+    ] {
+        assert_eq!(code(c.query_drop(sql).await), want, "{sql}");
+    }
+    let rows: Vec<(i64, i64, i64, i64, u64)> = c.query("SELECT * FROM d").await.unwrap();
+    assert_eq!(rows, vec![(1, 1, 1, 1, 1)]);
 }
