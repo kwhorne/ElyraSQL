@@ -220,6 +220,22 @@ pub enum Error {
     #[error("Not unique table/alias: '{0}'")]
     NotUniqueTable(String),
 
+    /// An `INSERT` that leaves out a NOT NULL column with no default. MySQL
+    /// 1364 (`ER_NO_DEFAULT_FOR_FIELD`), with its text.
+    #[error("Field '{0}' doesn't have a default value")]
+    NoDefault(String),
+
+    /// An `ALTER` that would leave NULL in a column it makes NOT NULL (or in a
+    /// new primary key). MySQL 1138 (`ER_INVALID_USE_OF_NULL`), with its text.
+    #[error("Invalid use of NULL value")]
+    InvalidNull,
+
+    /// A stored value that does not convert to a column's new type, such as
+    /// `'not-a-date'` for `MODIFY d DATE`. MySQL 1292
+    /// (`ER_TRUNCATED_WRONG_VALUE`), with its text.
+    #[error("{0}")]
+    IncorrectValue(String),
+
     /// A scalar subquery that returned more than one row. MySQL 1242
     /// (`ER_SUBQUERY_NO_1_ROW`), with its text.
     #[error("Subquery returns more than 1 row")]
@@ -283,6 +299,9 @@ impl Error {
             Error::IntoColumnCount => 1222, // ER_WRONG_NUMBER_OF_COLUMNS_IN_SELECT
             Error::TooManyRows => 1172,    // ER_TOO_MANY_ROWS
             Error::SubqueryRows => 1242,   // ER_SUBQUERY_NO_1_ROW
+            Error::InvalidNull => 1138,    // ER_INVALID_USE_OF_NULL
+            Error::NoDefault(_) => 1364,   // ER_NO_DEFAULT_FOR_FIELD
+            Error::IncorrectValue(_) => 1292, // ER_TRUNCATED_WRONG_VALUE
             Error::TargetInSubquery(_) => 1093, // ER_UPDATE_TABLE_USED
             Error::ViewPreventsOperation(..) => 1443, // ER_VIEW_PREVENT_UPDATE
             Error::UndeclaredVariable(_) => 1327, // ER_SP_UNDECLARED_VAR
@@ -323,6 +342,8 @@ impl Error {
             | Error::ReferencedRow(_)
             | Error::NotNull(_) => b"23000",
             Error::DataTruncated(..) => b"01000",
+            Error::InvalidNull => b"22004",
+            Error::IncorrectValue(_) => b"22007",
             Error::ReadOnlyTransaction => b"25006",
             Error::TransactionInProgress => b"25001",
             Error::IntoColumnCount | Error::SubqueryRows => b"21000",

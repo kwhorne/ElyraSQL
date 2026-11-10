@@ -154,7 +154,10 @@ gaps:
   scheduled events are not.
 - `ALTER TABLE` supports add/drop/rename/`MODIFY`/`CHANGE` column, rename table,
   `ADD INDEX`/`KEY`/`UNIQUE` (with backfill), **`ADD PRIMARY KEY`** (with an
-  atomic table recluster), and **`ADD FOREIGN KEY`**. `SHOW CREATE TABLE` echoes
+  atomic table recluster), **`ADD FOREIGN KEY`** and **`ADD CHECK`**. In strict
+  mode each change is checked against the existing rows, and refused with
+  MySQL's error when one breaks it (1138 for NULL, 1264, 1265, 1406, 1292,
+  1062, 1452, 3819). `SHOW CREATE TABLE` echoes
   `CHECK` and `FOREIGN KEY` constraints (with their referential actions) since
   1.8.0, so its output can be replayed without losing them.
 - A broad scalar function library (string, math, date/time, JSON, `MD5`/`SHA1`/

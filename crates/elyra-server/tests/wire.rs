@@ -1473,11 +1473,12 @@ async fn declared_types_survive_catalog_metadata_and_strict_character_limits() {
         .await
         .unwrap_err()
     {
+        // MySQL truncates a string kept in its type with 1265, not 1406.
         mysql_async::Error::Server(error) => {
-            assert_eq!(error.code, 1406);
-            assert_eq!(error.state, "22001");
+            assert_eq!(error.code, 1265);
+            assert_eq!(error.state, "01000");
         }
-        other => panic!("expected data-too-long from strict ALTER, got {other:?}"),
+        other => panic!("expected data-truncated from strict ALTER, got {other:?}"),
     }
     c.query_drop("CREATE TABLE declared_numeric_width (v INT)")
         .await
@@ -15721,4 +15722,191 @@ async fn bigint_comparisons_are_exact_above_two_to_the_fifty_third() {
             .join(" ");
         assert_eq!(got, *want, "{sql}");
     }
+}
+
+/// ALTER TABLE accepted changes that existing rows broke -- NOT NULL over
+/// NULLs, TINYINT over 300, a UNIQUE key over duplicates, a foreign key over
+/// orphans, an ENUM over non-members -- and left those rows in place while the
+/// new rule refused only later writes. Each is now refused with MySQL's error,
+/// and the table is left as it was. Every expectation below is MySQL 8.4's.
+#[tokio::test]
+async fn alter_table_refuses_changes_existing_rows_break() {
+    // (ALTER, its outcome, a later write, its outcome); `ok<n>` or `E<code>`.
+    let cases: &[(&str, &str, &str, &str)] = &[
+        (
+            "ALTER TABLE ac MODIFY n INT NOT NULL",
+            "E1138",
+            "INSERT INTO ac (id,n) VALUES (9,NULL)",
+            "ok1",
+        ),
+        (
+            "ALTER TABLE ac MODIFY v TINYINT",
+            "E1264",
+            "INSERT INTO ac (id,v) VALUES (9,300)",
+            "ok1",
+        ),
+        (
+            "ALTER TABLE ac MODIFY v INT UNSIGNED",
+            "E1264",
+            "INSERT INTO ac (id,v) VALUES (9,-5)",
+            "ok1",
+        ),
+        (
+            "ALTER TABLE ac MODIFY s VARCHAR(3)",
+            "E1265",
+            "INSERT INTO ac (id,s) VALUES (9,'abcd')",
+            "ok1",
+        ),
+        (
+            "ALTER TABLE ac MODIFY e ENUM('a','b')",
+            "E1265",
+            "INSERT INTO ac (id,e) VALUES (9,'zz')",
+            "ok1",
+        ),
+        (
+            "ALTER TABLE ac MODIFY dt DATE",
+            "E1292",
+            "INSERT INTO ac (id,dt) VALUES (9,'bad')",
+            "ok1",
+        ),
+        (
+            "ALTER TABLE ac CHANGE n n2 INT NOT NULL",
+            "E1138",
+            "INSERT INTO ac (id) VALUES (9)",
+            "ok1",
+        ),
+        (
+            "ALTER TABLE ac ADD UNIQUE KEY u (id)",
+            "E1062",
+            "INSERT INTO ac (id) VALUES (1)",
+            "ok1",
+        ),
+        (
+            "ALTER TABLE ac ADD PRIMARY KEY (id)",
+            "E1062",
+            "INSERT INTO ac (id) VALUES (1)",
+            "ok1",
+        ),
+        (
+            "ALTER TABLE ac ADD PRIMARY KEY (p)",
+            "E1138",
+            "INSERT INTO ac (p) VALUES (NULL)",
+            "ok1",
+        ),
+        (
+            "ALTER TABLE ac ADD CONSTRAINT ck CHECK (v < 100)",
+            "E3819",
+            "INSERT INTO ac (id,v) VALUES (9,500)",
+            "ok1",
+        ),
+        (
+            "ALTER TABLE ac ADD FOREIGN KEY (p) REFERENCES ap(id)",
+            "E1452",
+            "INSERT INTO ac (id,p) VALUES (9,77)",
+            "ok1",
+        ),
+        (
+            "ALTER TABLE ac ADD COLUMN z INT NOT NULL",
+            "ok0",
+            "INSERT INTO ac (id) VALUES (9)",
+            "E1364",
+        ),
+        (
+            "CREATE UNIQUE INDEX ux ON ac (n)",
+            "E1062",
+            "INSERT INTO ac (id,n) VALUES (9,5)",
+            "ok1",
+        ),
+    ];
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    let outcome = |result: std::result::Result<(), mysql_async::Error>, affected: u64| match result
+    {
+        Ok(()) => format!("ok{affected}"),
+        Err(mysql_async::Error::Server(e)) => format!("E{}", e.code),
+        Err(e) => panic!("{e}"),
+    };
+    for (alter, want_alter, after, want_after) in cases {
+        for s in [
+            "DROP TABLE IF EXISTS ac",
+            "DROP TABLE IF EXISTS ap",
+            "CREATE TABLE ap (id INT PRIMARY KEY)",
+            "INSERT INTO ap VALUES (1),(2)",
+            "CREATE TABLE ac (id INT, n INT, v INT, s VARCHAR(10), e VARCHAR(10), dt VARCHAR(20), p INT)",
+            "INSERT INTO ac VALUES (1,NULL,300,'abcdef','a','2020-01-01',1), \
+             (2,5,-1,'xy','zz','not-a-date',9),(2,5,7,'q','b','2021-02-03',NULL)",
+        ] {
+            c.query_drop(s).await.unwrap();
+        }
+        let result = c.query_drop(*alter).await;
+        let got = outcome(result, c.affected_rows());
+        assert_eq!(got, *want_alter, "{alter}");
+        let rows: Vec<mysql_async::Row> = c.query("SELECT * FROM ac").await.unwrap();
+        assert_eq!(rows.len(), 3, "{alter} must leave the rows in place");
+        let result = c.query_drop(*after).await;
+        let got = outcome(result, c.affected_rows());
+        assert_eq!(got, *want_after, "{alter}, then {after}");
+    }
+
+    // A string shortened in its own type is truncated (1265); one converted
+    // from another type is too long (1406).
+    for (from, to, want) in [
+        ("VARCHAR(4)", "VARCHAR(3)", 1265),
+        ("CHAR(4)", "CHAR(3)", 1265),
+        ("CHAR(4)", "VARCHAR(3)", 1406),
+        ("TEXT", "VARCHAR(3)", 1406),
+    ] {
+        c.query_drop("DROP TABLE IF EXISTS dz").await.unwrap();
+        c.query_drop(format!("CREATE TABLE dz (s {from})"))
+            .await
+            .unwrap();
+        c.query_drop("INSERT INTO dz VALUES ('abcd')")
+            .await
+            .unwrap();
+        match c.query_drop(format!("ALTER TABLE dz MODIFY s {to}")).await {
+            Err(mysql_async::Error::Server(e)) => assert_eq!(e.code, want, "{from} -> {to}"),
+            other => panic!("{from} -> {to}: {other:?}"),
+        }
+    }
+
+    // A later ENUM really is enforced, and an ALTER that rows satisfy passes.
+    c.query_drop("DROP TABLE IF EXISTS en").await.unwrap();
+    c.query_drop("CREATE TABLE en (id INT, e VARCHAR(5) NOT NULL DEFAULT 'a', n INT)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO en VALUES (1,'a',1),(2,'b',2)")
+        .await
+        .unwrap();
+    for ok in [
+        "ALTER TABLE en MODIFY e ENUM('a','b') NOT NULL",
+        "ALTER TABLE en MODIFY n TINYINT NOT NULL",
+        "ALTER TABLE en ADD UNIQUE KEY (id)",
+        "ALTER TABLE en ADD CONSTRAINT pos CHECK (n > 0)",
+    ] {
+        c.query_drop(ok)
+            .await
+            .unwrap_or_else(|e| panic!("{ok}: {e}"));
+    }
+    for (sql, want) in [
+        ("INSERT INTO en VALUES (3,'zz',3)", 1265),
+        ("INSERT INTO en VALUES (3,'a',0)", 3819),
+        ("INSERT INTO en VALUES (1,'a',3)", 1062),
+        ("INSERT INTO en (id) VALUES (3)", 1364),
+    ] {
+        match c.query_drop(sql).await {
+            Err(mysql_async::Error::Server(e)) => assert_eq!(e.code, want, "{sql}"),
+            other => panic!("{sql}: {other:?}"),
+        }
+    }
+
+    // `() VALUES ()` writes a row of defaults.
+    c.query_drop("CREATE TABLE dd (id INT PRIMARY KEY AUTO_INCREMENT, b INT DEFAULT 3)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO dd () VALUES (), ()")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO dd VALUES ()").await.unwrap();
+    let rows: Vec<(i64, i64)> = c.query("SELECT id, b FROM dd ORDER BY id").await.unwrap();
+    assert_eq!(rows, vec![(1, 3), (2, 3), (3, 3)]);
 }
