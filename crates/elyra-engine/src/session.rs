@@ -1242,7 +1242,7 @@ impl Session {
                         // Record the scanned range for phantom validation.
                         tx.ranges.push((start.clone(), end.clone()));
                     }
-                    let mut overlay: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::new();
+                    let mut overlay: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
                     let upper = end.clone();
                     let in_range =
                         |k: &Vec<u8>| k >= &start && upper.as_ref().is_none_or(|e| k < e);
@@ -1250,13 +1250,13 @@ impl Session {
                         if !in_range(k) {
                             break;
                         }
-                        overlay.push((k.clone(), Some(v.clone())));
+                        overlay.insert(k.clone(), Some(v.clone()));
                     }
                     for k in tx.deletes.range(start.clone()..) {
                         if !in_range(k) {
                             break;
                         }
-                        overlay.push((k.clone(), None));
+                        overlay.insert(k.clone(), None);
                     }
                     Some((tx.snapshot.clone(), overlay))
                 }
@@ -1265,9 +1265,15 @@ impl Session {
         match plan {
             None => self.db.scan_range(start, end, limit).await,
             Some((snap, overlay)) => {
-                let (s, e) = (start.clone(), end.clone());
-                let committed = spawn(move || snap.scan_range(&s, e.as_deref(), limit)).await?;
-                Ok(merge(committed, overlay, limit))
+                spawn(move || {
+                    merge_overlay(
+                        |from, n| snap.scan_range(from, end.as_deref(), n),
+                        start,
+                        &overlay,
+                        limit,
+                    )
+                })
+                .await
             }
         }
     }
@@ -1383,25 +1389,60 @@ impl Session {
     }
 }
 
-/// Merge a committed window with in-range overlay entries (puts override,
-/// deletes remove), returning the first `limit` rows in key order.
-fn merge(
-    committed: Vec<(Vec<u8>, Vec<u8>)>,
-    overlay: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+/// The first `limit` rows from `start` of the snapshot as a transaction sees it:
+/// committed rows with its overlay applied (puts override, deletes remove).
+///
+/// `fetch(from, n)` reads up to `n` committed rows from `from`, in key order.
+/// Callers treat a short result as the end of the range, so this must return
+/// `limit` rows whenever that many exist: when the overlay deletes rows from a
+/// committed window, it reads the next window rather than returning short.
+/// Only overlay entries inside the window read so far are merged: an overlay
+/// put past it would otherwise land in the result ahead of the committed rows
+/// that precede it, and the next batch, starting after that put, would skip them.
+fn merge_overlay<F>(
+    mut fetch: F,
+    start: Vec<u8>,
+    overlay: &BTreeMap<Vec<u8>, Option<Vec<u8>>>,
     limit: usize,
-) -> Vec<(Vec<u8>, Vec<u8>)> {
-    let mut map: BTreeMap<Vec<u8>, Vec<u8>> = committed.into_iter().collect();
-    for (k, v) in overlay {
-        match v {
-            Some(val) => {
-                map.insert(k, val);
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>>
+where
+    F: FnMut(&[u8], usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>>,
+{
+    use std::ops::Bound;
+    let mut out = Vec::new();
+    if limit == 0 {
+        return Ok(out);
+    }
+    let mut from = start;
+    loop {
+        let committed = fetch(&from, limit)?;
+        let exhausted = committed.len() < limit;
+        // The window is [from, last committed key] -- or everything from
+        // `from` once the snapshot has no more rows.
+        let last = (!exhausted).then(|| committed[committed.len() - 1].0.clone());
+        let upper = match &last {
+            Some(last) => Bound::Included(last.as_slice()),
+            None => Bound::Unbounded,
+        };
+        let mut window: BTreeMap<Vec<u8>, Vec<u8>> = committed.into_iter().collect();
+        for (k, v) in overlay.range::<[u8], _>((Bound::Included(from.as_slice()), upper)) {
+            match v {
+                Some(val) => window.insert(k.clone(), val.clone()),
+                None => window.remove(k),
+            };
+        }
+        out.extend(window);
+        match last {
+            Some(mut last) if out.len() < limit => {
+                last.push(0);
+                from = last;
             }
-            None => {
-                map.remove(&k);
+            _ => {
+                out.truncate(limit);
+                return Ok(out);
             }
         }
     }
-    map.into_iter().take(limit).collect()
 }
 
 fn prefix_upper_bound(prefix: &[u8]) -> Vec<u8> {
@@ -1428,7 +1469,8 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::coalesce_ranges;
+    use super::{coalesce_ranges, merge_overlay};
+    use std::collections::BTreeMap;
 
     fn bytes(value: &str) -> Vec<u8> {
         value.as_bytes().to_vec()
@@ -1467,6 +1509,87 @@ mod tests {
             coalesce_ranges(ranges),
             vec![(bytes("a"), Some(bytes("e"))), (bytes("x"), None)]
         );
+    }
+
+    /// Committed keys `k00`..`k{n-1}`, each valued by its own key.
+    fn committed(n: usize) -> BTreeMap<Vec<u8>, Vec<u8>> {
+        (0..n)
+            .map(|i| (bytes(&format!("k{i:02}")), bytes(&format!("k{i:02}"))))
+            .collect()
+    }
+
+    /// Scan the whole range in batches of `limit`, the way the executor does:
+    /// continue after the last key, stop at the first short batch.
+    fn scan_all(
+        rows: &BTreeMap<Vec<u8>, Vec<u8>>,
+        overlay: &BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+        limit: usize,
+    ) -> Vec<String> {
+        let fetch = |from: &[u8], n: usize| {
+            Ok(rows
+                .range::<[u8], _>((std::ops::Bound::Included(from), std::ops::Bound::Unbounded))
+                .take(n)
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect())
+        };
+        let mut out = Vec::new();
+        let mut from = bytes("k");
+        loop {
+            let batch = merge_overlay(fetch, from.clone(), overlay, limit).unwrap();
+            let last = batch.len() < limit;
+            out.extend(
+                batch
+                    .iter()
+                    .map(|(k, _)| String::from_utf8(k.clone()).unwrap()),
+            );
+            match batch.last() {
+                Some((k, _)) if !last => {
+                    from = k.clone();
+                    from.push(0);
+                }
+                _ => return out,
+            }
+        }
+    }
+
+    fn keys(range: std::ops::Range<usize>) -> Vec<String> {
+        range.map(|i| format!("k{i:02}")).collect()
+    }
+
+    #[test]
+    fn deleted_rows_do_not_end_the_scan() {
+        let rows = committed(20);
+        let overlay = BTreeMap::from([(bytes("k00"), None), (bytes("k01"), None)]);
+        let mut want = keys(2..20);
+        assert_eq!(scan_all(&rows, &overlay, 4), want);
+        // A window emptied entirely by deletes is skipped too.
+        let overlay: BTreeMap<_, _> = (0..8).map(|i| (bytes(&format!("k{i:02}")), None)).collect();
+        want = keys(8..20);
+        assert_eq!(scan_all(&rows, &overlay, 4), want);
+    }
+
+    #[test]
+    fn a_put_past_the_window_waits_for_its_turn() {
+        let rows = committed(20);
+        let overlay = BTreeMap::from([(bytes("k00"), None), (bytes("k50"), Some(bytes("new")))]);
+        let mut want = keys(1..20);
+        want.push("k50".into());
+        assert_eq!(scan_all(&rows, &overlay, 4), want);
+    }
+
+    #[test]
+    fn puts_and_deletes_merge_in_key_order() {
+        let rows = committed(6);
+        let overlay = BTreeMap::from([
+            (bytes("k01"), None),
+            (bytes("k02"), Some(bytes("changed"))),
+            (bytes("k03x"), Some(bytes("inserted"))),
+        ]);
+        assert_eq!(
+            scan_all(&rows, &overlay, 2),
+            ["k00", "k02", "k03", "k03x", "k04", "k05"]
+        );
+        assert_eq!(scan_all(&rows, &overlay, 100), scan_all(&rows, &overlay, 2));
     }
 }
 

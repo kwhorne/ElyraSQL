@@ -9815,3 +9815,104 @@ mod subquery_inside_an_expression_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod transaction_scan_after_write_tests {
+    //! A table scan inside a transaction must see every row the transaction
+    //! can see. Scans read the table in batches and stop at the first short
+    //! one; a batch that came back short because the transaction had deleted
+    //! rows from it ended the scan early, so `COUNT(*)` after deleting one row
+    //! of 10 000 was 8191 and an `UPDATE` of every row changed 4095. A row the
+    //! transaction wrote past the batch also hid the committed rows before it.
+    //! Expected values are what MySQL 8.4 answers.
+    use super::{Engine, Privilege, QueryResult, Session};
+
+    const ROWS: i64 = 10_000;
+
+    async fn engine() -> (Engine, Session) {
+        let engine = Engine::new(elyra_storage::Db::in_memory().unwrap());
+        let session = engine.session();
+        run(
+            &engine,
+            &session,
+            "CREATE TABLE t (id INT PRIMARY KEY, v INT)",
+        )
+        .await;
+        let values = (1..=ROWS)
+            .map(|i| format!("({i},{i})"))
+            .collect::<Vec<_>>()
+            .join(",");
+        run(&engine, &session, &format!("INSERT INTO t VALUES {values}")).await;
+        (engine, session)
+    }
+
+    async fn run(engine: &Engine, session: &Session, sql: &str) -> Vec<QueryResult> {
+        engine
+            .execute(sql, Privilege::Admin, session)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}\n  -> {e}"))
+    }
+
+    async fn scalar(engine: &Engine, session: &Session, sql: &str) -> String {
+        let QueryResult::Rows(mut rows) = run(engine, session, sql).await.remove(0) else {
+            panic!("expected rows for {sql}");
+        };
+        rows.next_batch(1)
+            .await
+            .unwrap()
+            .remove(0)
+            .remove(0)
+            .to_wire_string()
+            .unwrap_or_else(|| "NULL".into())
+    }
+
+    async fn affected(engine: &Engine, session: &Session, sql: &str) -> u64 {
+        match run(engine, session, sql).await.remove(0) {
+            QueryResult::Affected(n) => n,
+            _ => panic!("expected an affected-row count for {sql}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn reads_after_a_delete_see_the_whole_table() {
+        let (e, s) = engine().await;
+        run(&e, &s, "BEGIN").await;
+        assert_eq!(affected(&e, &s, "DELETE FROM t WHERE id = 1").await, 1);
+        assert_eq!(scalar(&e, &s, "SELECT COUNT(*) FROM t").await, "9999");
+        assert_eq!(
+            scalar(&e, &s, "SELECT COUNT(*) FROM t WHERE v > 0").await,
+            "9999"
+        );
+        assert_eq!(scalar(&e, &s, "SELECT MAX(id) FROM t").await, "10000");
+        assert_eq!(scalar(&e, &s, "SELECT SUM(v) FROM t").await, "50004999");
+        run(&e, &s, "ROLLBACK").await;
+        assert_eq!(scalar(&e, &s, "SELECT COUNT(*) FROM t").await, "10000");
+    }
+
+    #[tokio::test]
+    async fn writes_after_a_delete_reach_every_row() {
+        let (e, s) = engine().await;
+        run(&e, &s, "BEGIN").await;
+        // Spread deletes over several batches, not only the first.
+        assert_eq!(
+            affected(&e, &s, "DELETE FROM t WHERE id % 1000 = 7").await,
+            10
+        );
+        assert_eq!(affected(&e, &s, "UPDATE t SET v = -1").await, 9990);
+        assert_eq!(affected(&e, &s, "DELETE FROM t WHERE v = -1").await, 9990);
+        assert_eq!(scalar(&e, &s, "SELECT COUNT(*) FROM t").await, "0");
+        run(&e, &s, "COMMIT").await;
+        assert_eq!(scalar(&e, &s, "SELECT COUNT(*) FROM t").await, "0");
+    }
+
+    #[tokio::test]
+    async fn a_row_written_past_the_batch_does_not_hide_rows_before_it() {
+        let (e, s) = engine().await;
+        run(&e, &s, "BEGIN").await;
+        run(&e, &s, "DELETE FROM t WHERE id = 1").await;
+        run(&e, &s, "INSERT INTO t VALUES (20000, 20000)").await;
+        assert_eq!(scalar(&e, &s, "SELECT COUNT(*) FROM t").await, "10000");
+        assert_eq!(scalar(&e, &s, "SELECT SUM(v) FROM t").await, "50024999");
+        run(&e, &s, "ROLLBACK").await;
+    }
+}
