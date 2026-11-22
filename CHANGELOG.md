@@ -8,6 +8,20 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ### Fixed
 
+- **Concurrent autocommit updates of the same row no longer overwrite each
+  other.** An autocommit `UPDATE`, `DELETE`, `REPLACE`, `INSERT IGNORE` or
+  `INSERT ... ON DUPLICATE KEY UPDATE` read its rows outside any transaction
+  and wrote them back unchecked, so two sessions running
+  `UPDATE konto SET saldo = saldo + 1 WHERE id = 1` both read the old value
+  and one increment was lost, with no error. Eight sessions adding 1 to a row
+  200 times each left it at about 200 instead of 1600. Such a statement now
+  runs as its own transaction; when another session changed its rows first,
+  it re-runs on the new values, queued behind other re-runs on the same
+  table, as MySQL's row lock would make it wait. Only a statement that loses
+  64 times in a row reports 1213. Plain `INSERT` keeps its faster path.
+  Because the statement's writes are now buffered until it commits, a single
+  autocommit statement is bounded by `ELYRASQL_TXN_MAX_BYTES` (1 GiB by
+  default), like a transaction.
 - **A table scan inside a transaction no longer stops early after a write.**
   Scans read a table in batches and end at the first short one. A batch that
   came back short because the transaction had deleted rows from it ended the
