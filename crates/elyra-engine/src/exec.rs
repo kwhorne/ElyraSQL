@@ -5981,11 +5981,11 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
     let pk_colls = def.pk_collations();
     let clustered_prefix = def.data_prefix();
 
-    // Load rowid counter once for tables without a PK.
-    let mut next_rowid = if has_pk {
-        0
+    // Row ids for a table without a PK, from the shared allocator.
+    let rowids = if has_pk {
+        None
     } else {
-        read_rowid(db, &name).await?
+        Some(crate::idalloc::counter(db, rowid_key(&name)).await?)
     };
 
     // Column defaults, AUTO_INCREMENT, and (stored) generated columns.
@@ -6016,10 +6016,10 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
             }
         }
     }
-    let mut autoinc: i64 = if auto_col.is_some() {
-        read_autoinc(db, &name).await?
+    let autoinc = if auto_col.is_some() {
+        Some(crate::idalloc::counter(db, autoinc_key(&name)).await?)
     } else {
-        0
+        None
     };
     let stored_auto_id = |row: &[Value]| {
         let value = row.get(auto_col?)?;
@@ -6102,13 +6102,16 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
                 let need =
                     !provided[ai] || row[ai].is_null() || (is_zero && !db.no_auto_value_on_zero());
                 let col = &def.schema.columns[ai];
+                let counter = autoinc
+                    .as_ref()
+                    .expect("an AUTO_INCREMENT column has a counter");
                 if need {
-                    autoinc += 1;
+                    let id = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                     // Coerce to the column type so a UInt (BIGINT UNSIGNED) PK
                     // stores/looks up with the same key encoding as the value.
-                    row[ai] = coerce(Value::Int(autoinc), &col.ty, &col.name)?;
+                    row[ai] = coerce(Value::Int(id), &col.ty, &col.name)?;
                     if first_generated_id == 0 {
-                        first_generated_id = autoinc;
+                        first_generated_id = id;
                     }
                 } else {
                     let explicit_id = match &row[ai] {
@@ -6118,9 +6121,7 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
                     };
                     if let Some(explicit_id) = explicit_id {
                         if let Ok(n) = i64::try_from(explicit_id) {
-                            if n > autoinc {
-                                autoinc = n;
-                            }
+                            counter.fetch_max(n, std::sync::atomic::Ordering::SeqCst);
                         }
                     }
                 }
@@ -6166,9 +6167,13 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
             key.extend_from_slice(&encoded);
             key
         } else {
-            next_rowid += 1;
+            let rowid = rowids
+                .as_ref()
+                .expect("a table without a PK has a row-id counter")
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
             let mut key = clustered_prefix.clone();
-            key.extend_from_slice(&keyenc::encode_rowid(next_rowid));
+            key.extend_from_slice(&keyenc::encode_rowid(rowid as u64));
             key
         };
         built.push((key, row));
@@ -6256,8 +6261,9 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
         aux_puts.push(bump_wcount(db, &name).await?);
         // Persist the advanced AUTO_INCREMENT counter (otherwise a later insert
         // would reuse ids).
-        if auto_col.is_some() {
-            aux_puts.push((autoinc_key(&name), autoinc.to_le_bytes().to_vec()));
+        if let Some(counter) = &autoinc {
+            let high = counter.load(std::sync::atomic::Ordering::SeqCst);
+            aux_puts.push((autoinc_key(&name), high.to_le_bytes().to_vec()));
         }
         // redb's B-tree writer benefits materially from monotonic key order.
         // These sets have order-independent semantics: every `new` key must be
@@ -6375,11 +6381,15 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
     }
 
     // Persist the advanced rowid / auto-increment counters in the same commit.
-    if !def.has_pk() {
-        puts.push((rowid_key(&name), next_rowid.to_le_bytes().to_vec()));
+    // The counters' high-water marks, which cover every id this statement
+    // took; storage keeps the stored value from moving backwards.
+    if let Some(counter) = &rowids {
+        let high = counter.load(std::sync::atomic::Ordering::SeqCst) as u64;
+        puts.push((rowid_key(&name), high.to_le_bytes().to_vec()));
     }
-    if auto_col.is_some() {
-        puts.push((autoinc_key(&name), autoinc.to_le_bytes().to_vec()));
+    if let Some(counter) = &autoinc {
+        let high = counter.load(std::sync::atomic::Ordering::SeqCst);
+        puts.push((autoinc_key(&name), high.to_le_bytes().to_vec()));
     }
     puts.push(bump_wcount(db, &name).await?);
 
@@ -27076,15 +27086,6 @@ async fn table_delete_keys(db: &Session, name: &str) -> Result<Vec<Vec<u8>>> {
         }
     }
     Ok(deletes)
-}
-
-async fn read_rowid(db: &Session, table: &str) -> Result<u64> {
-    Ok(match db.get(rowid_key(table)).await? {
-        Some(bytes) if bytes.len() == 8 => {
-            u64::from_le_bytes(bytes.try_into().expect("checked length"))
-        }
-        _ => 0,
-    })
 }
 
 /// Extract literal value rows from an `INSERT ... VALUES` source.
