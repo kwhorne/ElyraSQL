@@ -166,6 +166,7 @@ impl Engine {
     /// half-migrated keyspace.
     pub async fn migrate_collation(&self) -> elyra_core::Result<()> {
         crate::collmig::migrate(&self.session()).await?;
+        crate::collmig::migrate_index_keys(&self.session()).await?;
         crate::exec::resume_generation_cleanup(&self.db).await
     }
 
@@ -10221,5 +10222,272 @@ mod autocommit_lost_update_tests {
         assert!(!s.in_txn());
         run(&engine, &s, "UPDATE t SET v = 2").await;
         assert_eq!(scalar(&engine, "SELECT v FROM t").await, "2");
+    }
+}
+
+#[cfg(test)]
+mod float_and_binary_index_tests {
+    //! Indexes over FLOAT/DOUBLE and BINARY/VARBINARY/BLOB columns. Their values
+    //! had no key encoding and every row was silently left out of the index, so
+    //! a query the planner answered from it found nothing (`ORDER BY price
+    //! LIMIT 10` returned no rows) and a UNIQUE index accepted any duplicate.
+    //!
+    //! Every query runs against the same rows twice, once in an indexed table
+    //! and once in an unindexed one, and must answer the same; the unindexed
+    //! table is always scanned, so it is the reference.
+    use super::{Engine, Privilege, QueryResult, Session};
+
+    async fn run(e: &Engine, s: &Session, sql: &str) -> elyra_core::Result<Vec<QueryResult>> {
+        e.execute(sql, Privilege::Admin, s).await
+    }
+
+    async fn rows(e: &Engine, s: &Session, sql: &str) -> Vec<Vec<String>> {
+        let mut results = run(e, s, sql)
+            .await
+            .unwrap_or_else(|err| panic!("{sql}\n  -> {err}"));
+        let QueryResult::Rows(mut stream) = results.remove(0) else {
+            panic!("expected rows for {sql}");
+        };
+        let mut out = Vec::new();
+        loop {
+            let batch = stream.next_batch(1024).await.unwrap();
+            if batch.is_empty() {
+                return out;
+            }
+            out.extend(batch.into_iter().map(|row| {
+                row.into_iter()
+                    .map(|v| v.to_wire_string().unwrap_or_else(|| "NULL".into()))
+                    .collect()
+            }));
+        }
+    }
+
+    async fn setup(column: &str, values: &[&str]) -> (Engine, Session) {
+        let e = Engine::new(elyra_storage::Db::in_memory().unwrap());
+        let s = e.session();
+        for table in ["ix", "plain"] {
+            run(
+                &e,
+                &s,
+                &format!("CREATE TABLE {table} (id INT PRIMARY KEY, c {column})"),
+            )
+            .await
+            .unwrap();
+            let rows = values
+                .iter()
+                .enumerate()
+                .map(|(i, v)| format!("({}, {v})", i + 1))
+                .collect::<Vec<_>>()
+                .join(",");
+            run(&e, &s, &format!("INSERT INTO {table} VALUES {rows}"))
+                .await
+                .unwrap();
+        }
+        run(&e, &s, "CREATE INDEX ix_c ON ix (c)").await.unwrap();
+        (e, s)
+    }
+
+    async fn same_answers(e: &Engine, s: &Session, queries: &[&str]) {
+        for q in queries {
+            let indexed = rows(e, s, &q.replace("{t}", "ix")).await;
+            let reference = rows(e, s, &q.replace("{t}", "plain")).await;
+            assert_eq!(indexed, reference, "{q}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_double_index_answers_like_a_scan() {
+        let (e, s) = setup(
+            "DOUBLE",
+            &[
+                "1.5", "-2.25", "0", "-0.0", "1e300", "-1e-300", "NULL", "2", "1.5", "-7",
+            ],
+        )
+        .await;
+        same_answers(
+            &e,
+            &s,
+            &[
+                "SELECT id FROM {t} ORDER BY c, id LIMIT 10",
+                "SELECT id FROM {t} ORDER BY c DESC, id LIMIT 10",
+                "SELECT id, c FROM {t} ORDER BY c LIMIT 3",
+                "SELECT id FROM {t} WHERE c = 1.5 ORDER BY id",
+                "SELECT id FROM {t} WHERE c = 2 ORDER BY id",
+                "SELECT id FROM {t} WHERE c = '2' ORDER BY id",
+                "SELECT id FROM {t} WHERE c = 0 ORDER BY id",
+                "SELECT id FROM {t} WHERE c > 0 ORDER BY id",
+                "SELECT id FROM {t} WHERE c < 0 ORDER BY id",
+                "SELECT id FROM {t} WHERE c BETWEEN -3 AND 1.5 ORDER BY id",
+                "SELECT id FROM {t} WHERE c >= -2.25 AND c < 2 ORDER BY id",
+                "SELECT id FROM {t} WHERE c IN (2, -7, 3) ORDER BY id",
+                "SELECT id FROM {t} WHERE c IS NULL",
+                "SELECT MIN(c), MAX(c), COUNT(c) FROM {t}",
+                "SELECT c, COUNT(*) FROM {t} GROUP BY c ORDER BY c",
+            ],
+        )
+        .await;
+        assert_eq!(
+            rows(&e, &s, "SELECT id FROM ix ORDER BY c LIMIT 10")
+                .await
+                .len(),
+            10
+        );
+    }
+
+    #[tokio::test]
+    async fn a_varbinary_index_answers_like_a_scan() {
+        let (e, s) = setup(
+            "VARBINARY(16)",
+            &[
+                "'b'", "'a'", "'A'", "X'00'", "X'0001'", "''", "NULL", "'ab'", "X'FF'", "'a'",
+            ],
+        )
+        .await;
+        same_answers(
+            &e,
+            &s,
+            &[
+                "SELECT id FROM {t} ORDER BY c, id",
+                "SELECT id FROM {t} ORDER BY c DESC, id LIMIT 5",
+                "SELECT id FROM {t} WHERE c = 'a' ORDER BY id",
+                "SELECT id FROM {t} WHERE c = X'00' ORDER BY id",
+                "SELECT id FROM {t} WHERE c = '' ORDER BY id",
+                "SELECT id FROM {t} WHERE c > 'a' ORDER BY id",
+                "SELECT id FROM {t} WHERE c >= 'a' AND c < 'b' ORDER BY id",
+                "SELECT id FROM {t} WHERE c IN ('a', 'b') ORDER BY id",
+                "SELECT HEX(MIN(c)), HEX(MAX(c)) FROM {t}",
+            ],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_unique_index_rejects_duplicates() {
+        let e = Engine::new(elyra_storage::Db::in_memory().unwrap());
+        let s = e.session();
+        for (column, a, b) in [
+            ("DOUBLE", "1.5", "1.5"),
+            ("DOUBLE", "0.0", "-0.0"),
+            ("FLOAT", "2", "2.0"),
+            ("VARBINARY(8)", "'z'", "'z'"),
+            ("BLOB", "X'0102'", "X'0102'"),
+        ] {
+            run(&e, &s, "DROP TABLE IF EXISTS u").await.unwrap();
+            run(
+                &e,
+                &s,
+                &format!("CREATE TABLE u (id INT PRIMARY KEY, c {column} UNIQUE)"),
+            )
+            .await
+            .unwrap();
+            run(&e, &s, &format!("INSERT INTO u VALUES (1, {a})"))
+                .await
+                .unwrap();
+            let Err(err) = run(&e, &s, &format!("INSERT INTO u VALUES (2, {b})")).await else {
+                panic!("{column}: {b} duplicates {a}");
+            };
+            assert_eq!(err.mysql_code(), 1062, "{column}: {err}");
+            // A different value is still accepted, and case matters in binary.
+            let other = if column.contains("BINARY") || column == "BLOB" {
+                "'Z'"
+            } else {
+                "3"
+            };
+            run(&e, &s, &format!("INSERT INTO u VALUES (3, {other})"))
+                .await
+                .unwrap();
+        }
+        // An index created over existing duplicates is refused.
+        run(&e, &s, "CREATE TABLE d (id INT PRIMARY KEY, c DOUBLE)")
+            .await
+            .unwrap();
+        run(&e, &s, "INSERT INTO d VALUES (1, 4.5), (2, 4.5)")
+            .await
+            .unwrap();
+        let Err(err) = run(&e, &s, "CREATE UNIQUE INDEX ud ON d (c)").await else {
+            panic!("a unique index over duplicates must be refused");
+        };
+        assert_eq!(err.mysql_code(), 1062, "{err}");
+    }
+
+    #[tokio::test]
+    async fn an_index_built_by_an_earlier_version_is_filled_in_at_open() {
+        let e = Engine::new(elyra_storage::Db::in_memory().unwrap());
+        let s = e.session();
+        run(
+            &e,
+            &s,
+            "CREATE TABLE p (id INT PRIMARY KEY, price DOUBLE, b BLOB)",
+        )
+        .await
+        .unwrap();
+        run(
+            &e,
+            &s,
+            "INSERT INTO p VALUES (1, 1.5, 'x'), (2, 2.5, 'y'), (3, 0.5, 'x'), (4, NULL, 'z')",
+        )
+        .await
+        .unwrap();
+        run(&e, &s, "CREATE INDEX ix_price ON p (price)")
+            .await
+            .unwrap();
+        run(&e, &s, "CREATE INDEX ix_b ON p (b)").await.unwrap();
+        // Leave the database as 1.12.16 did: no entries for non-NULL values
+        // (the NULL row's `indexnull::` entry was written), no version marker.
+        let def = crate::catalog::load(&s, "p").await.unwrap();
+        let prefix = crate::catalog::index_table_prefix_generation("p", def.storage_generation);
+        let entries: Vec<Vec<u8>> = s
+            .scan_batch(prefix, None, 1000)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(entries.len(), 7);
+        s.commit_write(vec![], entries).await.unwrap();
+        s.commit_write(vec![], vec![b"meta::index_key_version".to_vec()])
+            .await
+            .unwrap();
+        assert_eq!(
+            rows(&e, &s, "SELECT id FROM p ORDER BY price LIMIT 10").await,
+            [["4"]]
+        );
+
+        e.migrate_collation().await.unwrap();
+        assert_eq!(
+            rows(&e, &s, "SELECT id FROM p ORDER BY price LIMIT 10").await,
+            [["4"], ["3"], ["1"], ["2"]]
+        );
+        assert_eq!(
+            rows(&e, &s, "SELECT id FROM p WHERE b = 'x' ORDER BY id").await,
+            [["1"], ["3"]]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_double_or_binary_primary_key_works() {
+        let e = Engine::new(elyra_storage::Db::in_memory().unwrap());
+        let s = e.session();
+        run(&e, &s, "CREATE TABLE p (k DOUBLE PRIMARY KEY, v INT)")
+            .await
+            .unwrap();
+        run(&e, &s, "INSERT INTO p VALUES (2.5, 1), (-1, 2), (0, 3)")
+            .await
+            .unwrap();
+        assert_eq!(
+            rows(&e, &s, "SELECT v FROM p ORDER BY k").await,
+            [["2"], ["3"], ["1"]]
+        );
+        assert_eq!(rows(&e, &s, "SELECT v FROM p WHERE k = 2.5").await, [["1"]]);
+        run(&e, &s, "CREATE TABLE b (k VARBINARY(8) PRIMARY KEY, v INT)")
+            .await
+            .unwrap();
+        run(&e, &s, "INSERT INTO b VALUES ('b', 1), ('a', 2), ('B', 3)")
+            .await
+            .unwrap();
+        assert_eq!(
+            rows(&e, &s, "SELECT v FROM b ORDER BY k").await,
+            [["3"], ["2"], ["1"]]
+        );
     }
 }

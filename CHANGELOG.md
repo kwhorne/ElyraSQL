@@ -30,6 +30,27 @@ All notable changes to ElyraSQL are documented here. The format is based on
   4095 rows -- with no error. A row the transaction wrote past the batch also
   hid the committed rows before it: after a `DELETE` and an `INSERT` of a high
   key, `COUNT(*)` was 0. Autocommit statements were not affected.
+- **Indexes over FLOAT/DOUBLE and BINARY/VARBINARY/BLOB columns hold their
+  rows.** These values had no key encoding, so `CREATE INDEX` on such a column
+  succeeded but left every row with a non-NULL value out of the index, without
+  an error. A query the planner answered from it was wrong:
+  `SELECT * FROM products ORDER BY price LIMIT 10` returned only the rows whose
+  price is NULL, and `WHERE b = 'x'` on an indexed VARBINARY column failed with
+  1235. A UNIQUE index on such a column accepted any number of duplicates.
+  Floats now encode in numeric order, with `-0.0` equal to `0.0`, and binary
+  strings in byte order, never case-folded, so these indexes and UNIQUE
+  constraints work, and so does a DOUBLE or VARBINARY primary key. A value
+  that still has no key encoding is now an error instead of a row silently
+  left out.
+
+### Upgrading
+
+- On first start, the indexes over FLOAT/DOUBLE and binary columns that an
+  earlier version left empty are filled in, before connections are accepted.
+  A UNIQUE one may already hold duplicates it could not refuse: the first row
+  keeps the index entry, and each duplicate is logged as an error naming the
+  table, the index and the row. Remove the duplicates, then rebuild the index
+  with `DROP INDEX` and `CREATE UNIQUE INDEX`.
 
 ## [1.12.16] - 2026-11-10
 

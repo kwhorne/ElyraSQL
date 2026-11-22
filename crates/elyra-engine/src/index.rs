@@ -174,9 +174,15 @@ pub fn partition_entries_for_row(
             continue;
         }
         let has_null = idx.cols.iter().any(|&column| row[column].is_null());
-        let encoded = (!has_null)
-            .then(|| keyenc::encode_columns_coll(row, &idx.cols, &idx.col_collations).ok())
-            .flatten();
+        let encoded = if has_null {
+            None
+        } else {
+            Some(keyenc::encode_columns_coll(
+                row,
+                &idx.cols,
+                &idx.col_collations,
+            )?)
+        };
         let Some(encoded) = encoded else {
             // Single-column NULL-indexing: record the NULL-keyed row under the
             // `indexnull::` keyspace (never unique -- NULLs don't collide).
@@ -217,9 +223,15 @@ pub fn unique_probe_keys(def: &TableDef, row: &[Value]) -> Result<Vec<Vec<u8>>> 
             continue;
         }
         let has_null = idx.cols.iter().any(|&column| row[column].is_null());
-        let encoded = (!has_null)
-            .then(|| keyenc::encode_columns_coll(row, &idx.cols, &idx.col_collations).ok())
-            .flatten();
+        let encoded = if has_null {
+            None
+        } else {
+            Some(keyenc::encode_columns_coll(
+                row,
+                &idx.cols,
+                &idx.col_collations,
+            )?)
+        };
         let Some(encoded) = encoded else {
             continue;
         };
@@ -237,7 +249,8 @@ pub fn has_unique(def: &TableDef) -> bool {
 }
 
 /// Index entries (key, value) for one row. Skips an index when any of its
-/// columns is NULL or non-encodable.
+/// columns is NULL; a value with no key encoding is an error, never a row
+/// silently left out of the index.
 pub fn entries_for_row(
     def: &TableDef,
     row: &[Value],
@@ -257,9 +270,15 @@ pub fn entries_for_row(
             continue;
         }
         let has_null = idx.cols.iter().any(|&column| row[column].is_null());
-        let encoded = (!has_null)
-            .then(|| keyenc::encode_columns_coll(row, &idx.cols, &idx.col_collations).ok())
-            .flatten();
+        let encoded = if has_null {
+            None
+        } else {
+            Some(keyenc::encode_columns_coll(
+                row,
+                &idx.cols,
+                &idx.col_collations,
+            )?)
+        };
         let Some(encoded) = encoded else {
             // Single-column NULL-indexing (see `partition_entries_for_row`).
             if idx.indexes_nulls && idx.cols.len() == 1 && row[idx.cols[0]].is_null() {
