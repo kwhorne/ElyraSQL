@@ -211,3 +211,143 @@ pub async fn migrate(db: &Session) -> Result<()> {
     }
     Ok(())
 }
+
+/// Bumped when a value type gains a key encoding that existing indexes were
+/// built without.
+///
+/// 2: FLOAT/DOUBLE and BINARY/VARBINARY/BLOB values are encodable. Before, an
+/// index over such a column was created and maintained with no entry for any
+/// row whose indexed values were all non-NULL, so it has to be filled in.
+pub const INDEX_KEY_VERSION: u64 = 2;
+
+const INDEX_KEY_VERSION_KEY: &[u8] = b"meta::index_key_version";
+
+/// Fill in the entries that indexes over FLOAT/DOUBLE and binary columns are
+/// missing (see [`INDEX_KEY_VERSION`]).
+///
+/// Like [`migrate`] it runs at open, before any connection, and is resumable:
+/// entries are derived and written idempotently, and the version marker is
+/// written only after every table is done.
+///
+/// A UNIQUE index may already hold duplicates, which it could not refuse while
+/// it had no entries. The first row keeps the index entry and every duplicate
+/// is reported in the log with the table and index to fix, rather than refusing
+/// to start: the data stays reachable over SQL to clean up.
+pub async fn migrate_index_keys(db: &Session) -> Result<()> {
+    use elyra_core::ColumnType;
+
+    let stored = match db.get(INDEX_KEY_VERSION_KEY.to_vec()).await? {
+        Some(v) if v.len() == 8 => u64::from_be_bytes(v[..8].try_into().unwrap()),
+        Some(_) | None => 1,
+    };
+    if stored >= INDEX_KEY_VERSION {
+        return Ok(());
+    }
+
+    let mut rebuilt = 0usize;
+    let mut duplicates = 0u64;
+    for table in &catalog::list_tables(db).await? {
+        let mut def = match catalog::load(db, table).await {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        let schema = def.schema.clone();
+        def.indexes.retain(|idx| {
+            !idx.vector
+                && !idx.fulltext
+                && idx.cols.iter().any(|&c| {
+                    matches!(
+                        schema.columns.get(c).map(|col| &col.ty),
+                        Some(ColumnType::Float | ColumnType::Bytes)
+                    )
+                })
+        });
+        if def.indexes.is_empty() {
+            continue;
+        }
+
+        let prefix = def.data_prefix();
+        let mut cursor: Option<Vec<u8>> = None;
+        loop {
+            let chunk = db.scan_batch(prefix.clone(), cursor.clone(), 4096).await?;
+            if chunk.is_empty() {
+                break;
+            }
+            let last = chunk.len() < 4096;
+            cursor = chunk.last().map(|(k, _)| k.clone());
+            let mut puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+            // Unique entry key -> the row that took it in this batch; earlier
+            // batches are committed and found by the storage probe.
+            let mut claimed: std::collections::HashMap<Vec<u8>, Vec<u8>> =
+                std::collections::HashMap::new();
+            for (key, value) in chunk {
+                let row: Vec<Value> = crate::rowdec::decode_row(&value)?;
+                let (plain, unique) = index::partition_entries_for_row(&def, &row, &key)?;
+                puts.extend(plain);
+                for (entry, owner) in unique {
+                    let holder = match claimed.get(&entry) {
+                        Some(other) => Some(other.clone()),
+                        None => db.get(entry.clone()).await?,
+                    };
+                    match holder {
+                        Some(other) if other != owner => {
+                            duplicates += 1;
+                            let index = def
+                                .indexes
+                                .iter()
+                                .find(|idx| {
+                                    entry
+                                        .windows(idx.name.len() + 4)
+                                        .any(|w| w == format!("::{}::", idx.name).as_bytes())
+                                })
+                                .map_or("?", |idx| idx.name.as_str());
+                            let duplicate_pk: Vec<String> = def
+                                .pk_cols
+                                .iter()
+                                .map(|&c| format!("{:?}", row.get(c).unwrap_or(&Value::Null)))
+                                .collect();
+                            tracing::error!(
+                                table = %table,
+                                index,
+                                duplicate_primary_key = %duplicate_pk.join(", "),
+                                kept_row_key = %other.escape_ascii(),
+                                "a UNIQUE index over a FLOAT/DOUBLE or binary column holds a \
+                                 duplicate value that earlier versions could not refuse; the \
+                                 index finds only the kept row. Remove the duplicate, then \
+                                 rebuild the index (DROP INDEX, CREATE UNIQUE INDEX)"
+                            );
+                        }
+                        _ => {
+                            claimed.insert(entry.clone(), owner.clone());
+                            puts.push((entry, owner));
+                        }
+                    }
+                }
+            }
+            if !puts.is_empty() {
+                db.commit_write(puts, vec![]).await?;
+            }
+            if last {
+                break;
+            }
+        }
+        rebuilt += def.indexes.len();
+    }
+
+    db.commit_write(
+        vec![(
+            INDEX_KEY_VERSION_KEY.to_vec(),
+            INDEX_KEY_VERSION.to_be_bytes().to_vec(),
+        )],
+        vec![],
+    )
+    .await?;
+    if rebuilt > 0 {
+        tracing::info!(
+            indexes = rebuilt,
+            duplicates,
+            "built the missing entries of indexes over FLOAT/DOUBLE and binary columns"
+        );
+    }
+    Ok(())
+}

@@ -70,6 +70,31 @@ fn encode_component(value: &Value, coll: Collation, out: &mut Vec<u8>) -> Result
         Value::Decimal(u, _) => out.extend_from_slice(&(*u as u128 ^ (1u128 << 127)).to_be_bytes()),
         Value::Time(t) => out.extend_from_slice(&(*t as u64 ^ 0x8000_0000_0000_0000).to_be_bytes()),
         Value::Bool(b) => out.push(*b as u8),
+        // IEEE-754 made memcomparable: a positive number sorts by its bits with
+        // the sign bit set, a negative one by its bits all flipped (larger
+        // magnitude first). -0.0 is canonicalized so it equals 0.0, as in SQL.
+        Value::Float(f) => {
+            let f = if *f == 0.0 { 0.0f64 } else { *f };
+            let bits = f.to_bits();
+            let ordered = if bits >> 63 == 1 {
+                !bits
+            } else {
+                bits | 0x8000_0000_0000_0000
+            };
+            out.extend_from_slice(&ordered.to_be_bytes());
+        }
+        // Binary strings compare byte by byte, never folded; escaped and
+        // terminated like text so a key stays self-delimiting.
+        Value::Bytes(b) => {
+            for &byte in b {
+                if byte == 0x00 {
+                    out.extend_from_slice(&[0x00, 0x01]);
+                } else {
+                    out.push(byte);
+                }
+            }
+            out.extend_from_slice(&[0x00, 0x00]);
+        }
         // Escape 0x00 as 0x00 0x01, terminate with 0x00 0x00 (< any 0x00 0x01),
         // making text self-delimiting while preserving byte order. Text is
         // case-folded so index/PK order and uniqueness match the default
