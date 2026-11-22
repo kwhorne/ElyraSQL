@@ -2197,98 +2197,17 @@ impl Engine {
                         .take()
                         .expect("a statement without a retry runs once")
                 };
-                if statement_transaction {
-                    sess.begin()?;
-                }
-                // Refreshes and the query that consumes them are one atomic unit.
-                // Autocommit uses a temporary transaction; an explicit transaction
-                // uses a private checkpoint outside the client's savepoint namespace.
-                // Refreshing a stale materialized view is a write; a read-only
-                // transaction reads it as last refreshed.
-                let stale_matviews = if !sess.read_only_now() && catalog::matviews_exist(sess).await
-                {
-                    match self.stale_matviews(&stmt, sess).await {
-                        Ok(views) => views,
-                        Err(error) => {
-                            if statement_transaction {
-                                sess.rollback();
-                            }
-                            return Err(error);
-                        }
-                    }
-                } else {
-                    Vec::new()
-                };
-                let mut refresh_transaction = false;
-                let refresh_checkpoint = if stale_matviews.is_empty() {
-                    None
-                } else if sess.in_txn() {
-                    match sess.transaction_checkpoint() {
-                        Ok(checkpoint) => Some(checkpoint),
-                        Err(error) => {
-                            if statement_transaction {
-                                sess.rollback();
-                            }
-                            return Err(error);
-                        }
-                    }
-                } else {
-                    sess.begin()?;
-                    refresh_transaction = true;
-                    None
-                };
-                let own_transaction = refresh_transaction || statement_transaction;
-
-                let statement_result: Result<QueryResult> = async {
-                    for table in &stale_matviews {
-                        self.refresh_matview(table, privilege, user, sess).await?;
-                    }
-
-                    // Pessimistic locking, skipped entirely while no session holds
-                    // an explicit lock. This session, under LOCK TABLES, may use
-                    // only what it locked; every table it uses that it did not lock
-                    // is locked for the statement's duration -- what it writes
-                    // exclusively, what it reads (through views too) shared -- so
-                    // it waits for another session's lock.
-                    let mut _guards: Vec<lockmgr::LockGuard> = Vec::new();
-                    if self.locks.explicit_active() {
-                        let access = lock_access(sess, &stmt).await?;
-                        check_own_locks(sess, &stmt, &access, need)?;
-                        for (t, mode) in transient_locks(sess, &access).await? {
-                            _guards.push(lockmgr::transient(&self.locks, &t, mode).await?);
-                        }
-                    }
-                    self.execute_stmt(stmt, sess, update_modifiers.as_ref(), dml_limit)
-                        .await
-                }
+                let outcome = Box::pin(self.run_statement_attempt(
+                    stmt,
+                    sess,
+                    privilege,
+                    user,
+                    need,
+                    update_modifiers.as_ref(),
+                    dml_limit,
+                    statement_transaction,
+                ))
                 .await;
-
-                let outcome = match statement_result {
-                    Ok(result) => {
-                        let released = match refresh_checkpoint {
-                            Some(checkpoint) => sess.release_transaction_checkpoint(checkpoint),
-                            None => Ok(()),
-                        };
-                        match released {
-                            Err(error) => {
-                                if own_transaction {
-                                    sess.rollback();
-                                }
-                                Err(error)
-                            }
-                            Ok(()) if own_transaction => sess.commit().await.map(|()| result),
-                            Ok(()) => Ok(result),
-                        }
-                    }
-                    Err(error) => {
-                        if own_transaction {
-                            sess.rollback();
-                        } else if let Some(checkpoint) = refresh_checkpoint {
-                            sess.rollback_transaction_checkpoint(checkpoint)?;
-                        }
-                        Err(error)
-                    }
-                };
                 match outcome {
                     Err(Error::Conflict(_))
                         if statement_transaction && attempt < STATEMENT_CONFLICT_RETRIES =>
@@ -2317,6 +2236,117 @@ impl Engine {
             out.push(r);
         }
         Ok(out)
+    }
+
+    /// One attempt at a statement, in its own transaction when
+    /// `statement_transaction` (see `run_statements`), committed or rolled
+    /// back before it returns.
+    ///
+    /// Called boxed: inlined into `run_statements`, the extra state of the
+    /// retry loop grew its future past what small thread stacks hold.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_statement_attempt(
+        &self,
+        stmt: Statement,
+        sess: &Session,
+        privilege: Privilege,
+        user: &str,
+        need: Privilege,
+        update_modifiers: Option<&UpdateModifiers>,
+        dml_limit: Option<usize>,
+        statement_transaction: bool,
+    ) -> Result<QueryResult> {
+        if statement_transaction {
+            sess.begin()?;
+        }
+        // Refreshes and the query that consumes them are one atomic unit.
+        // Autocommit uses a temporary transaction; an explicit transaction
+        // uses a private checkpoint outside the client's savepoint namespace.
+        // Refreshing a stale materialized view is a write; a read-only
+        // transaction reads it as last refreshed.
+        let stale_matviews = if !sess.read_only_now() && catalog::matviews_exist(sess).await {
+            match self.stale_matviews(&stmt, sess).await {
+                Ok(views) => views,
+                Err(error) => {
+                    if statement_transaction {
+                        sess.rollback();
+                    }
+                    return Err(error);
+                }
+            }
+        } else {
+            Vec::new()
+        };
+        let mut refresh_transaction = false;
+        let refresh_checkpoint = if stale_matviews.is_empty() {
+            None
+        } else if sess.in_txn() {
+            match sess.transaction_checkpoint() {
+                Ok(checkpoint) => Some(checkpoint),
+                Err(error) => {
+                    if statement_transaction {
+                        sess.rollback();
+                    }
+                    return Err(error);
+                }
+            }
+        } else {
+            sess.begin()?;
+            refresh_transaction = true;
+            None
+        };
+        let own_transaction = refresh_transaction || statement_transaction;
+
+        let statement_result: Result<QueryResult> = async {
+            for table in &stale_matviews {
+                self.refresh_matview(table, privilege, user, sess).await?;
+            }
+
+            // Pessimistic locking, skipped entirely while no session holds
+            // an explicit lock. This session, under LOCK TABLES, may use
+            // only what it locked; every table it uses that it did not lock
+            // is locked for the statement's duration -- what it writes
+            // exclusively, what it reads (through views too) shared -- so
+            // it waits for another session's lock.
+            let mut _guards: Vec<lockmgr::LockGuard> = Vec::new();
+            if self.locks.explicit_active() {
+                let access = lock_access(sess, &stmt).await?;
+                check_own_locks(sess, &stmt, &access, need)?;
+                for (t, mode) in transient_locks(sess, &access).await? {
+                    _guards.push(lockmgr::transient(&self.locks, &t, mode).await?);
+                }
+            }
+            self.execute_stmt(stmt, sess, update_modifiers, dml_limit)
+                .await
+        }
+        .await;
+
+        match statement_result {
+            Ok(result) => {
+                let released = match refresh_checkpoint {
+                    Some(checkpoint) => sess.release_transaction_checkpoint(checkpoint),
+                    None => Ok(()),
+                };
+                match released {
+                    Err(error) => {
+                        if own_transaction {
+                            sess.rollback();
+                        }
+                        Err(error)
+                    }
+                    Ok(()) if own_transaction => sess.commit().await.map(|()| result),
+                    Ok(()) => Ok(result),
+                }
+            }
+            Err(error) => {
+                if own_transaction {
+                    sess.rollback();
+                } else if let Some(checkpoint) = refresh_checkpoint {
+                    sess.rollback_transaction_checkpoint(checkpoint)?;
+                }
+                Err(error)
+            }
+        }
     }
 
     /// Effective privilege for a statement: the global level, raised by any
