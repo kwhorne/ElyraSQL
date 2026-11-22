@@ -6,6 +6,17 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **A table scan inside a transaction no longer stops early after a write.**
+  Scans read a table in batches and end at the first short one. A batch that
+  came back short because the transaction had deleted rows from it ended the
+  scan, so after `BEGIN; DELETE FROM t WHERE id = 1` on a 10 000-row table,
+  `COUNT(*)` was 8191, `MAX(id)` was wrong and `UPDATE t SET ...` changed only
+  4095 rows -- with no error. A row the transaction wrote past the batch also
+  hid the committed rows before it: after a `DELETE` and an `INSERT` of a high
+  key, `COUNT(*)` was 0. Autocommit statements were not affected.
+
 ## [1.12.16] - 2026-11-10
 
 ### Fixed
