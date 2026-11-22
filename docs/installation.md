@@ -17,6 +17,32 @@ ElyraSQL release builds target **Ubuntu 24.04+** and **Apple Silicon macOS
     done, so an interrupted upgrade simply resumes on the next start. **Take a backup
     first, and note that downgrading to 1.4.x afterwards is not supported.**
 
+!!! warning "Upgrading to 1.12.17 — concurrency, binary indexes and AUTO_INCREMENT"
+
+    A 1.12.16 database opens in 1.12.17. **On first start, indexes over
+    FLOAT/DOUBLE and BINARY/VARBINARY/BLOB columns are filled in** before any
+    connection is accepted: earlier versions left every row with a non-NULL
+    value out of them. Like the 1.5.0 migration it is idempotent and resumes if
+    interrupted. A UNIQUE index of this kind may already hold duplicates it
+    could not refuse; the first row keeps the index entry, and each duplicate is
+    logged as an error naming the table, the index and the row. Remove the
+    duplicates, then rebuild the index with `DROP INDEX` and
+    `CREATE UNIQUE INDEX`.
+
+    Some statements now behave differently:
+
+    - **Concurrent autocommit `UPDATE`, `DELETE`, `REPLACE`, `INSERT IGNORE` and
+      upserts no longer overwrite each other.** Each runs as its own
+      transaction and re-runs on fresh data when another session changed its
+      rows first. One that loses 64 times in a row reports 1213. A single such
+      statement is now bounded by `ELYRASQL_TXN_MAX_BYTES` (1 GiB by default).
+    - **Concurrent INSERTs get distinct AUTO_INCREMENT values and row ids.**
+      They failed with a false `Duplicate entry` error, or, in a table without a
+      primary key, replaced each other's rows. As in MySQL, a value taken by an
+      INSERT that is rolled back is not handed out again.
+    - **A UNIQUE constraint on a FLOAT/DOUBLE or binary column is enforced**, so
+      a write that inserts a duplicate now fails with 1062.
+
 !!! warning "Upgrading to 1.12.16 — HAVING and arithmetic overflow"
 
     No on-disk format change; a 1.12.15 database opens in 1.12.16 unchanged.
@@ -768,8 +794,8 @@ macOS).
 Multi-arch image (`amd64` + `arm64`) on the GitHub Container Registry:
 
 ```bash
-docker pull ghcr.io/kwhorne/elyrasql:1.12.16   # or :latest
-docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.12.16
+docker pull ghcr.io/kwhorne/elyrasql:1.12.17   # or :latest
+docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.12.17
 ```
 
 The image is ~15 MB, runs as a non-root user, stores data in the

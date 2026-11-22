@@ -6,6 +6,8 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.12.17] - 2026-11-22
+
 ### Fixed
 
 - **Concurrent autocommit updates of the same row no longer overwrite each
