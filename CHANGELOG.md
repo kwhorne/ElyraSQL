@@ -42,6 +42,16 @@ All notable changes to ElyraSQL are documented here. The format is based on
   constraints work, and so does a DOUBLE or VARBINARY primary key. A value
   that still has no key encoding is now an error instead of a row silently
   left out.
+- **Concurrent INSERTs get distinct AUTO_INCREMENT values and row ids.** Each
+  statement read the stored counter and counted up from it on its own, so
+  sessions inserting at once took the same values. Into an AUTO_INCREMENT
+  table, 1747 of 2000 inserts from eight sessions failed with a false
+  `Duplicate entry for key 'PRIMARY'`. Into a table without a primary key,
+  whose hidden row id is the key, rows silently replaced each other: 250 of
+  2000 were kept, with no error. Every value now comes from one counter per
+  table shared by all sessions, and the stored counter can no longer be wound
+  back by a slower commit. As in MySQL, a value taken by an INSERT that is
+  rolled back is not handed out again.
 
 ### Upgrading
 

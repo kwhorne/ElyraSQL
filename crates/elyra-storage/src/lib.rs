@@ -276,6 +276,46 @@ fn touches_schema<'a>(mut keys: impl Iterator<Item = &'a [u8]>) -> bool {
     keys.any(|k| SCHEMA_PREFIXES.iter().any(|p| k.starts_with(p)))
 }
 
+/// Counters that hand out row identities: the AUTO_INCREMENT counter and the
+/// hidden row id of a table without a primary key.
+const COUNTER_PREFIXES: [&[u8]; 2] = [b"meta::autoinc::", b"meta::rowid::"];
+
+/// Write `value` at `key` -- except that a counter (see [`COUNTER_PREFIXES`])
+/// never moves backwards unless the same write deletes it first.
+///
+/// Concurrent statements take ids from one in-memory counter and each persists
+/// its view of it, but their commits can land in either order. A later commit
+/// of a smaller value would wind the stored counter back, and after a restart
+/// it would hand out ids that rows already hold. A deliberate reset (TRUNCATE,
+/// DROP, a rebuild) deletes the key, which still works.
+fn put_kv(
+    t: &mut redb::Table<'_, &[u8], &[u8]>,
+    key: &[u8],
+    value: &[u8],
+    deletes: &[Vec<u8>],
+) -> Result<()> {
+    if value.len() == 8
+        && COUNTER_PREFIXES.iter().any(|p| key.starts_with(p))
+        && !deletes.iter().any(|d| d.as_slice() == key)
+    {
+        let stored_is_ahead = match t.get(key).map_err(|e| Error::Storage(e.to_string()))? {
+            Some(current) => {
+                let current = current.value();
+                current.len() == 8
+                    && u64::from_le_bytes(current.try_into().expect("checked length"))
+                        >= u64::from_le_bytes(value.try_into().expect("checked length"))
+            }
+            None => false,
+        };
+        if stored_is_ahead {
+            return Ok(());
+        }
+    }
+    t.insert(key, value)
+        .map_err(|e| Error::Storage(e.to_string()))?;
+    Ok(())
+}
+
 /// One plain or `INSERT` write for [`Storage::apply_jobs`]: `new` keys must
 /// not exist yet (an `INSERT`), `puts` may overwrite, `deletes` go first.
 pub struct PlainJob<'a> {
@@ -1073,8 +1113,7 @@ impl Storage {
                             .map_err(|e| Error::Storage(e.to_string()))?;
                     }
                     for (k, v) in job.puts {
-                        t.insert(k.as_slice(), v.as_slice())
-                            .map_err(|e| Error::Storage(e.to_string()))?;
+                        put_kv(&mut t, k, v, job.deletes)?;
                     }
                     results.push(Ok(()));
                 } else {
@@ -1147,8 +1186,7 @@ impl Storage {
                     .map_err(|e| Error::Storage(e.to_string()))?;
             }
             for (k, v) in puts {
-                t.insert(k.as_slice(), v.as_slice())
-                    .map_err(|e| Error::Storage(e.to_string()))?;
+                put_kv(&mut t, k, v, deletes)?;
             }
             t.insert(WSEQ_KEY, self.next_wseq().to_le_bytes().as_slice())
                 .map_err(|e| Error::Storage(e.to_string()))?;
@@ -1178,8 +1216,7 @@ impl Storage {
                     .map_err(|e| Error::Storage(e.to_string()))?;
             }
             for (k, v) in puts {
-                t.insert(k.as_slice(), v.as_slice())
-                    .map_err(|e| Error::Storage(e.to_string()))?;
+                put_kv(&mut t, k, v, deletes)?;
             }
             t.insert(WSEQ_KEY, self.next_wseq().to_le_bytes().as_slice())
                 .map_err(|e| Error::Storage(e.to_string()))?;
@@ -1245,8 +1282,7 @@ impl Storage {
                         .map_err(|e| Error::Storage(e.to_string()))?;
                 }
                 for (k, v) in job.new.unwrap_or_default().iter().chain(job.puts) {
-                    t.insert(k.as_slice(), v.as_slice())
-                        .map_err(|e| Error::Storage(e.to_string()))?;
+                    put_kv(&mut t, k, v, job.deletes)?;
                 }
                 schema |= touches_schema(
                     job.new
@@ -1300,8 +1336,7 @@ impl Storage {
                 }
             }
             for (k, v) in aux {
-                t.insert(k.as_slice(), v.as_slice())
-                    .map_err(|e| Error::Storage(e.to_string()))?;
+                put_kv(&mut t, k, v, deletes)?;
             }
             t.insert(WSEQ_KEY, self.next_wseq().to_le_bytes().as_slice())
                 .map_err(|e| Error::Storage(e.to_string()))?;

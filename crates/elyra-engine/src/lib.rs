@@ -19,6 +19,7 @@ pub mod embedix;
 mod eval;
 mod exec;
 mod ft;
+mod idalloc;
 mod index;
 mod indexddl;
 mod keyenc;
@@ -10489,5 +10490,179 @@ mod float_and_binary_index_tests {
             rows(&e, &s, "SELECT v FROM b ORDER BY k").await,
             [["3"], ["2"], ["1"]]
         );
+    }
+}
+
+#[cfg(test)]
+mod concurrent_insert_id_tests {
+    //! Concurrent INSERTs must get distinct AUTO_INCREMENT values and row ids.
+    //! Each statement read the stored counter and counted up from it on its
+    //! own, so sessions inserting at once took the same values: into an
+    //! AUTO_INCREMENT table 1386 of 1600 inserts failed with a false
+    //! duplicate-key error, and into a table without a primary key, whose
+    //! hidden row id is the key, one row silently replaced another.
+    use super::{Engine, Privilege, QueryResult, Session};
+
+    const SESSIONS: usize = 8;
+    const EACH: usize = 40;
+
+    async fn run(e: &Engine, s: &Session, sql: &str) -> Vec<QueryResult> {
+        e.execute(sql, Privilege::Admin, s)
+            .await
+            .unwrap_or_else(|err| panic!("{sql}\n  -> {err}"))
+    }
+
+    async fn scalar(e: &Engine, sql: &str) -> String {
+        let s = e.session();
+        let QueryResult::Rows(mut rows) = run(e, &s, sql).await.remove(0) else {
+            panic!("expected rows for {sql}");
+        };
+        rows.next_batch(1)
+            .await
+            .unwrap()
+            .remove(0)
+            .remove(0)
+            .to_wire_string()
+            .unwrap_or_else(|| "NULL".into())
+    }
+
+    /// Insert from `SESSIONS` concurrent sessions, `EACH` statements each.
+    async fn insert_concurrently(e: &Engine, sql: &'static str) {
+        let tasks: Vec<_> = (0..SESSIONS)
+            .map(|_| {
+                let e = e.clone();
+                tokio::spawn(async move {
+                    let s = e.session();
+                    for _ in 0..EACH {
+                        run(&e, &s, sql).await;
+                    }
+                })
+            })
+            .collect();
+        for task in tasks {
+            task.await.unwrap();
+        }
+    }
+
+    fn engine() -> Engine {
+        Engine::new(elyra_storage::Db::in_memory().unwrap())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn auto_increment_values_are_distinct() {
+        let e = engine();
+        let s = e.session();
+        run(
+            &e,
+            &s,
+            "CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, v INT)",
+        )
+        .await;
+        insert_concurrently(&e, "INSERT INTO t (v) VALUES (1), (2)").await;
+        let n = SESSIONS * EACH * 2;
+        assert_eq!(scalar(&e, "SELECT COUNT(*) FROM t").await, n.to_string());
+        assert_eq!(
+            scalar(&e, "SELECT COUNT(DISTINCT id) FROM t").await,
+            n.to_string()
+        );
+        // Every id handed out was used, and the next continues after them.
+        assert_eq!(scalar(&e, "SELECT MAX(id) FROM t").await, n.to_string());
+        run(&e, &s, "INSERT INTO t (v) VALUES (3)").await;
+        assert_eq!(
+            scalar(&e, "SELECT MAX(id) FROM t").await,
+            (n + 1).to_string()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rows_without_a_primary_key_are_all_kept() {
+        let e = engine();
+        let s = e.session();
+        run(&e, &s, "CREATE TABLE logg (melding VARCHAR(20))").await;
+        insert_concurrently(&e, "INSERT INTO logg VALUES ('a')").await;
+        assert_eq!(
+            scalar(&e, "SELECT COUNT(*) FROM logg").await,
+            (SESSIONS * EACH).to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_explicit_id_moves_the_counter_on_and_truncate_resets_it() {
+        let e = engine();
+        let s = e.session();
+        run(
+            &e,
+            &s,
+            "CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, v INT)",
+        )
+        .await;
+        run(&e, &s, "INSERT INTO t (v) VALUES (1)").await;
+        run(&e, &s, "INSERT INTO t VALUES (100, 2)").await;
+        run(&e, &s, "INSERT INTO t (v) VALUES (3)").await;
+        assert_eq!(scalar(&e, "SELECT MAX(id) FROM t").await, "101");
+        run(&e, &s, "TRUNCATE TABLE t").await;
+        run(&e, &s, "INSERT INTO t (v) VALUES (4)").await;
+        assert_eq!(scalar(&e, "SELECT id FROM t").await, "1");
+        run(&e, &s, "DROP TABLE t").await;
+        run(
+            &e,
+            &s,
+            "CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, v INT)",
+        )
+        .await;
+        run(&e, &s, "INSERT INTO t (v) VALUES (5)").await;
+        assert_eq!(scalar(&e, "SELECT id FROM t").await, "1");
+    }
+
+    #[tokio::test]
+    async fn a_rolled_back_insert_leaves_a_gap_not_a_reuse() {
+        // As in MySQL: the id is consumed even though the row is not kept.
+        let e = engine();
+        let s = e.session();
+        run(
+            &e,
+            &s,
+            "CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, v INT)",
+        )
+        .await;
+        run(&e, &s, "BEGIN").await;
+        run(&e, &s, "INSERT INTO t (v) VALUES (1)").await;
+        run(&e, &s, "ROLLBACK").await;
+        run(&e, &s, "INSERT INTO t (v) VALUES (2)").await;
+        assert_eq!(scalar(&e, "SELECT id FROM t").await, "2");
+    }
+
+    #[test]
+    fn a_stored_counter_never_moves_backwards_unless_deleted() {
+        let db = elyra_storage::Db::in_memory().unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let key = b"meta::autoinc::t".to_vec();
+            let value = |n: i64| n.to_le_bytes().to_vec();
+            db.commit(vec![(key.clone(), value(20))], vec![])
+                .await
+                .unwrap();
+            // A slower statement commits its smaller view of the counter.
+            db.commit(vec![(key.clone(), value(10))], vec![])
+                .await
+                .unwrap();
+            assert_eq!(db.get(key.clone()).await.unwrap(), Some(value(20)));
+            // A reset deletes it, and may set it in the same write.
+            db.commit(vec![(key.clone(), value(3))], vec![key.clone()])
+                .await
+                .unwrap();
+            assert_eq!(db.get(key.clone()).await.unwrap(), Some(value(3)));
+            // Other keys are written as given.
+            db.commit(vec![(b"data::t::x".to_vec(), value(9))], vec![])
+                .await
+                .unwrap();
+            db.commit(vec![(b"data::t::x".to_vec(), value(1))], vec![])
+                .await
+                .unwrap();
+            assert_eq!(
+                db.get(b"data::t::x".to_vec()).await.unwrap(),
+                Some(value(1))
+            );
+        });
     }
 }

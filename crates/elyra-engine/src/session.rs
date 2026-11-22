@@ -1133,6 +1133,11 @@ impl Session {
 
         let put_vec: Vec<(Vec<u8>, Vec<u8>)> = puts.into_iter().collect();
         let del_vec: Vec<Vec<u8>> = deletes.into_iter().collect();
+        let forget: Vec<Vec<u8>> = del_vec
+            .iter()
+            .filter(|k| k.starts_with(b"meta::autoinc::") || k.starts_with(b"meta::rowid::"))
+            .cloned()
+            .collect();
         // On conflict the transaction is already cleared above -> aborted.
         let result = self
             .db
@@ -1145,6 +1150,9 @@ impl Session {
                 del_vec,
             )
             .await;
+        if result.is_ok() {
+            crate::idalloc::forget_deleted(self.db_id(), &forget);
+        }
         if result.is_ok() && catalog_changed {
             crate::catalog::bump_epoch();
         }
@@ -1381,7 +1389,15 @@ impl Session {
                 return Ok(());
             }
         }
+        let forget: Vec<Vec<u8>> = deletes
+            .iter()
+            .filter(|k| k.starts_with(b"meta::autoinc::") || k.starts_with(b"meta::rowid::"))
+            .cloned()
+            .collect();
         let result = self.db.commit(puts, deletes).await;
+        if result.is_ok() {
+            crate::idalloc::forget_deleted(self.db_id(), &forget);
+        }
         if result.is_ok() && catalog_changed {
             crate::catalog::bump_epoch();
         }
