@@ -104,7 +104,14 @@ pub struct Engine {
     db: Db,
     vindex: vindex::VectorRegistry,
     locks: std::sync::Arc<lockmgr::LockManager>,
+    retry_gates: RetryGates,
 }
+
+/// One queue per table for autocommit statements re-run after losing a write
+/// conflict (see [`Engine::acquire_retry_gates`]).
+type RetryGates = std::sync::Arc<
+    std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+>;
 
 impl Engine {
     pub fn new(db: Db) -> Self {
@@ -112,7 +119,41 @@ impl Engine {
             db,
             vindex: vindex::VectorRegistry::new(),
             locks: std::sync::Arc::new(lockmgr::LockManager::new()),
+            retry_gates: RetryGates::default(),
         }
+    }
+
+    /// Queue behind the other statements re-running on the tables `stmt` writes.
+    ///
+    /// The first attempt at a statement never waits here. One that lost a
+    /// conflict re-runs holding its tables' gates, so retriers on a hot row go
+    /// one at a time instead of all re-reading at once and all but one losing
+    /// again -- with 32 sessions on one row, pure retrying left some losing
+    /// every attempt. Gates are taken in name order, so two statements never
+    /// wait for each other's.
+    async fn acquire_retry_gates(&self, stmt: &Statement) -> Vec<tokio::sync::OwnedMutexGuard<()>> {
+        let mut tables: Vec<String> = stmt_targets(stmt)
+            .into_iter()
+            .map(|t| t.to_ascii_lowercase())
+            .collect();
+        if tables.is_empty() {
+            // A multi-table statement: no single table to queue on.
+            tables.push(String::new());
+        }
+        tables.sort();
+        tables.dedup();
+        let gates: Vec<_> = {
+            let mut map = self.retry_gates.lock().unwrap();
+            tables
+                .into_iter()
+                .map(|t| map.entry(t).or_default().clone())
+                .collect()
+        };
+        let mut held = Vec::with_capacity(gates.len());
+        for gate in gates {
+            held.push(gate.lock_owned().await);
+        }
+        held
     }
 
     /// Parse and execute one or more `;`-separated statements, enforcing that
@@ -2136,69 +2177,134 @@ impl Engine {
             if statement_starts_implicit_transaction(&stmt) {
                 sess.begin_implicit_transaction()?;
             }
-            // Refreshes and the query that consumes them are one atomic unit.
-            // Autocommit uses a temporary transaction; an explicit transaction
-            // uses a private checkpoint outside the client's savepoint namespace.
-            // Refreshing a stale materialized view is a write; a read-only
-            // transaction reads it as last refreshed.
-            let stale_matviews = if !sess.read_only_now() && catalog::matviews_exist(sess).await {
-                self.stale_matviews(&stmt, sess).await?
-            } else {
-                Vec::new()
-            };
-            let mut refresh_transaction = false;
-            let refresh_checkpoint = if stale_matviews.is_empty() {
-                None
-            } else if sess.in_txn() {
-                Some(sess.transaction_checkpoint()?)
-            } else {
-                sess.begin()?;
-                refresh_transaction = true;
-                None
-            };
-
-            let statement_result: Result<QueryResult> = async {
-                for table in &stale_matviews {
-                    self.refresh_matview(table, privilege, user, sess).await?;
+            // An autocommit statement that reads rows and writes them back
+            // (`UPDATE t SET n = n + 1`) runs in its own transaction, so the
+            // commit checks that no other session changed those rows since they
+            // were read. Without it, two such statements on the same row both
+            // read the old value and the second silently overwrote the first.
+            // A conflict re-runs the statement on fresh data, as MySQL's row
+            // lock would have made it wait for the first; only a statement that
+            // keeps losing reports 1213.
+            let statement_transaction = !sess.in_txn() && reads_then_writes_rows(&stmt);
+            let mut attempt: u32 = 0;
+            let mut retry_gates = Vec::new();
+            let mut pending = Some(stmt);
+            let r = loop {
+                let stmt = if statement_transaction {
+                    pending.clone().expect("the statement is kept for a retry")
+                } else {
+                    pending
+                        .take()
+                        .expect("a statement without a retry runs once")
+                };
+                if statement_transaction {
+                    sess.begin()?;
                 }
-
-                // Pessimistic locking, skipped entirely while no session holds
-                // an explicit lock. This session, under LOCK TABLES, may use
-                // only what it locked; every table it uses that it did not lock
-                // is locked for the statement's duration -- what it writes
-                // exclusively, what it reads (through views too) shared -- so
-                // it waits for another session's lock.
-                let mut _guards: Vec<lockmgr::LockGuard> = Vec::new();
-                if self.locks.explicit_active() {
-                    let access = lock_access(sess, &stmt).await?;
-                    check_own_locks(sess, &stmt, &access, need)?;
-                    for (t, mode) in transient_locks(sess, &access).await? {
-                        _guards.push(lockmgr::transient(&self.locks, &t, mode).await?);
+                // Refreshes and the query that consumes them are one atomic unit.
+                // Autocommit uses a temporary transaction; an explicit transaction
+                // uses a private checkpoint outside the client's savepoint namespace.
+                // Refreshing a stale materialized view is a write; a read-only
+                // transaction reads it as last refreshed.
+                let stale_matviews = if !sess.read_only_now() && catalog::matviews_exist(sess).await
+                {
+                    match self.stale_matviews(&stmt, sess).await {
+                        Ok(views) => views,
+                        Err(error) => {
+                            if statement_transaction {
+                                sess.rollback();
+                            }
+                            return Err(error);
+                        }
                     }
-                }
-                self.execute_stmt(stmt, sess, update_modifiers.as_ref(), dml_limit)
-                    .await
-            }
-            .await;
+                } else {
+                    Vec::new()
+                };
+                let mut refresh_transaction = false;
+                let refresh_checkpoint = if stale_matviews.is_empty() {
+                    None
+                } else if sess.in_txn() {
+                    match sess.transaction_checkpoint() {
+                        Ok(checkpoint) => Some(checkpoint),
+                        Err(error) => {
+                            if statement_transaction {
+                                sess.rollback();
+                            }
+                            return Err(error);
+                        }
+                    }
+                } else {
+                    sess.begin()?;
+                    refresh_transaction = true;
+                    None
+                };
+                let own_transaction = refresh_transaction || statement_transaction;
 
-            let r = match statement_result {
-                Ok(result) => {
-                    if refresh_transaction {
-                        sess.commit().await?;
-                    } else if let Some(checkpoint) = refresh_checkpoint {
-                        sess.release_transaction_checkpoint(checkpoint)?;
+                let statement_result: Result<QueryResult> = async {
+                    for table in &stale_matviews {
+                        self.refresh_matview(table, privilege, user, sess).await?;
                     }
-                    result
+
+                    // Pessimistic locking, skipped entirely while no session holds
+                    // an explicit lock. This session, under LOCK TABLES, may use
+                    // only what it locked; every table it uses that it did not lock
+                    // is locked for the statement's duration -- what it writes
+                    // exclusively, what it reads (through views too) shared -- so
+                    // it waits for another session's lock.
+                    let mut _guards: Vec<lockmgr::LockGuard> = Vec::new();
+                    if self.locks.explicit_active() {
+                        let access = lock_access(sess, &stmt).await?;
+                        check_own_locks(sess, &stmt, &access, need)?;
+                        for (t, mode) in transient_locks(sess, &access).await? {
+                            _guards.push(lockmgr::transient(&self.locks, &t, mode).await?);
+                        }
+                    }
+                    self.execute_stmt(stmt, sess, update_modifiers.as_ref(), dml_limit)
+                        .await
                 }
-                Err(error) => {
-                    if refresh_transaction {
-                        sess.rollback();
-                    } else if let Some(checkpoint) = refresh_checkpoint {
-                        sess.rollback_transaction_checkpoint(checkpoint)?;
+                .await;
+
+                let outcome = match statement_result {
+                    Ok(result) => {
+                        let released = match refresh_checkpoint {
+                            Some(checkpoint) => sess.release_transaction_checkpoint(checkpoint),
+                            None => Ok(()),
+                        };
+                        match released {
+                            Err(error) => {
+                                if own_transaction {
+                                    sess.rollback();
+                                }
+                                Err(error)
+                            }
+                            Ok(()) if own_transaction => sess.commit().await.map(|()| result),
+                            Ok(()) => Ok(result),
+                        }
                     }
-                    return Err(error);
+                    Err(error) => {
+                        if own_transaction {
+                            sess.rollback();
+                        } else if let Some(checkpoint) = refresh_checkpoint {
+                            sess.rollback_transaction_checkpoint(checkpoint)?;
+                        }
+                        Err(error)
+                    }
+                };
+                match outcome {
+                    Err(Error::Conflict(_))
+                        if statement_transaction && attempt < STATEMENT_CONFLICT_RETRIES =>
+                    {
+                        attempt += 1;
+                        if retry_gates.is_empty() {
+                            let stmt = pending.as_ref().expect("the statement is kept for a retry");
+                            retry_gates = self.acquire_retry_gates(stmt).await;
+                        } else {
+                            conflict_backoff(attempt).await;
+                        }
+                    }
+                    outcome => break outcome?,
                 }
             };
+            drop(retry_gates);
             // Track ROW_COUNT(): rows changed by DML, or -1 after a result set
             // (matches MySQL).
             match &r {
@@ -3170,6 +3276,35 @@ fn split_select_into(sql: &str) -> Option<Result<(String, Vec<IntoTarget>)>> {
         }
         let query = format!("{} {}", sql[..into].trim_end(), sql[end..].trim_start());
         return Some(Ok((query.trim().to_string(), targets)));
+    }
+}
+
+/// How many times an autocommit statement that lost a write conflict is re-run
+/// before 1213 is reported. Each retry reads fresh data; it loses again only if
+/// yet another session committed to the same rows in between.
+const STATEMENT_CONFLICT_RETRIES: u32 = 64;
+
+/// A short, growing, jittered pause before re-running a statement that lost a
+/// write conflict again while holding its retry gates (see
+/// [`Engine::acquire_retry_gates`]): only first attempts compete with it then.
+async fn conflict_backoff(attempt: u32) {
+    use std::hash::{BuildHasher, Hasher};
+    let ceiling_us = 50u64 << attempt.min(6); // 100 us .. 3.2 ms
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u32(attempt);
+    let jitter_us = hasher.finish() % ceiling_us;
+    tokio::time::sleep(std::time::Duration::from_micros(ceiling_us / 2 + jitter_us)).await;
+}
+
+/// Whether an autocommit statement reads rows and writes back values derived
+/// from them, and so must run as a transaction to notice a concurrent write to
+/// the same rows. A plain `INSERT` only adds rows, and its write already fails
+/// on a duplicate key, so it keeps the faster path.
+fn reads_then_writes_rows(statement: &Statement) -> bool {
+    match statement {
+        Statement::Update { .. } | Statement::Delete(_) => true,
+        Statement::Insert(insert) => insert.replace_into || insert.ignore || insert.on.is_some(),
+        _ => false,
     }
 }
 
@@ -9914,5 +10049,147 @@ mod transaction_scan_after_write_tests {
         assert_eq!(scalar(&e, &s, "SELECT COUNT(*) FROM t").await, "10000");
         assert_eq!(scalar(&e, &s, "SELECT SUM(v) FROM t").await, "50024999");
         run(&e, &s, "ROLLBACK").await;
+    }
+}
+
+#[cfg(test)]
+mod autocommit_lost_update_tests {
+    //! Concurrent autocommit statements that read a row and write it back must
+    //! not overwrite each other. Each read the row on its own, outside any
+    //! transaction, and committed without checking it was still what it read,
+    //! so with eight sessions adding 1 to the same row 200 times each, the
+    //! row ended near 200 instead of 1600, with no error. MySQL serializes
+    //! them on the row lock; every expected value here is what it gives.
+    use super::{Engine, Privilege, QueryResult};
+
+    const SESSIONS: usize = 8;
+    const EACH: usize = 50;
+
+    async fn run(engine: &Engine, session: &crate::Session, sql: &str) -> Vec<QueryResult> {
+        engine
+            .execute(sql, Privilege::Admin, session)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}\n  -> {e}"))
+    }
+
+    async fn scalar(engine: &Engine, sql: &str) -> String {
+        let session = engine.session();
+        let QueryResult::Rows(mut rows) = run(engine, &session, sql).await.remove(0) else {
+            panic!("expected rows for {sql}");
+        };
+        rows.next_batch(1)
+            .await
+            .unwrap()
+            .remove(0)
+            .remove(0)
+            .to_wire_string()
+            .unwrap_or_else(|| "NULL".into())
+    }
+
+    /// Run `sql` `EACH` times from each of `SESSIONS` concurrent sessions.
+    async fn hammer(engine: &Engine, sql: &'static str) {
+        let tasks: Vec<_> = (0..SESSIONS)
+            .map(|_| {
+                let engine = engine.clone();
+                tokio::spawn(async move {
+                    let session = engine.session();
+                    for _ in 0..EACH {
+                        run(&engine, &session, sql).await;
+                    }
+                })
+            })
+            .collect();
+        for task in tasks {
+            task.await.unwrap();
+        }
+    }
+
+    fn engine() -> Engine {
+        Engine::new(elyra_storage::Db::in_memory().unwrap())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_increments_of_one_row_all_count() {
+        let engine = engine();
+        let s = engine.session();
+        run(
+            &engine,
+            &s,
+            "CREATE TABLE konto (id INT PRIMARY KEY, saldo INT)",
+        )
+        .await;
+        run(&engine, &s, "INSERT INTO konto VALUES (1, 0), (2, 0)").await;
+        hammer(&engine, "UPDATE konto SET saldo = saldo + 1 WHERE id = 1").await;
+        assert_eq!(
+            scalar(&engine, "SELECT saldo FROM konto WHERE id = 1").await,
+            (SESSIONS * EACH).to_string()
+        );
+        assert_eq!(
+            scalar(&engine, "SELECT saldo FROM konto WHERE id = 2").await,
+            "0"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_upserts_of_one_key_all_count() {
+        let engine = engine();
+        let s = engine.session();
+        run(
+            &engine,
+            &s,
+            "CREATE TABLE hits (k VARCHAR(10) PRIMARY KEY, n INT)",
+        )
+        .await;
+        // The first statements race to insert the row; the rest update it.
+        hammer(
+            &engine,
+            "INSERT INTO hits VALUES ('a', 1) ON DUPLICATE KEY UPDATE n = n + 1",
+        )
+        .await;
+        assert_eq!(
+            scalar(&engine, "SELECT n FROM hits WHERE k = 'a'").await,
+            (SESSIONS * EACH).to_string()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_conditional_update_sees_the_other_sessions_writes() {
+        // Each session takes one unit of stock while any is left. Reading a
+        // stale row let two sessions take the last unit.
+        let engine = engine();
+        let s = engine.session();
+        run(
+            &engine,
+            &s,
+            "CREATE TABLE lager (id INT PRIMARY KEY, antall INT)",
+        )
+        .await;
+        run(&engine, &s, "INSERT INTO lager VALUES (1, 100)").await;
+        hammer(
+            &engine,
+            "UPDATE lager SET antall = antall - 1 WHERE id = 1 AND antall > 0",
+        )
+        .await;
+        assert_eq!(scalar(&engine, "SELECT antall FROM lager").await, "0");
+    }
+
+    #[tokio::test]
+    async fn a_failing_autocommit_statement_leaves_no_transaction_open() {
+        let engine = engine();
+        let s = engine.session();
+        run(
+            &engine,
+            &s,
+            "CREATE TABLE t (id INT PRIMARY KEY, v TINYINT)",
+        )
+        .await;
+        run(&engine, &s, "INSERT INTO t VALUES (1, 1)").await;
+        assert!(engine
+            .execute("UPDATE t SET v = 1000", Privilege::Admin, &s)
+            .await
+            .is_err());
+        assert!(!s.in_txn());
+        run(&engine, &s, "UPDATE t SET v = 2").await;
+        assert_eq!(scalar(&engine, "SELECT v FROM t").await, "2");
     }
 }
