@@ -65,42 +65,52 @@ fn start(args: &[&str], log: &Path) -> Proc {
     Proc(child)
 }
 
-async fn connect(port: u16) -> mysql_async::Conn {
+/// Connect to the server on `port`. A loaded CI runner can take a while to
+/// start one, so this waits up to 30 s, and then fails with every process's
+/// log: the bare "could not connect" it used to give said nothing about why.
+async fn connect(f: &Files, port: u16) -> mysql_async::Conn {
     let opts = mysql_async::OptsBuilder::default()
         .ip_or_hostname("127.0.0.1")
         .tcp_port(port)
         .user(Some("root"))
         .pass(Some("rootpw"))
         .prefer_socket(false);
-    for _ in 0..200 {
-        if let Ok(c) = mysql_async::Conn::new(opts.clone()).await {
-            return c;
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let mut last = None;
+    while std::time::Instant::now() < deadline {
+        match mysql_async::Conn::new(opts.clone()).await {
+            Ok(c) => return c,
+            Err(e) => last = Some(e),
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    panic!("could not connect to 127.0.0.1:{port}");
+    panic!(
+        "could not connect to 127.0.0.1:{port} within 30 s (last error: {last:?})\n{}",
+        f.logs()
+    );
 }
 
 /// `(rows, sum of ids)` of `t`, or `None` while the table is not there yet.
-async fn shape(port: u16) -> Option<(i64, i64)> {
-    let mut c = connect(port).await;
+async fn shape(f: &Files, port: u16) -> Option<(i64, i64)> {
+    let mut c = connect(f, port).await;
     c.query_first("SELECT COUNT(*), COALESCE(SUM(id), 0) FROM t")
         .await
         .ok()
         .flatten()
 }
 
-async fn until_same(primary: u16, replica: u16) -> (i64, i64) {
-    let want = shape(primary).await.unwrap();
+async fn until_same(f: &Files, primary: u16, replica: u16) -> (i64, i64) {
+    let want = shape(f, primary).await.unwrap();
     for _ in 0..200 {
-        if shape(replica).await == Some(want) {
+        if shape(f, replica).await == Some(want) {
             return want;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     panic!(
-        "replica never matched the primary: primary {want:?}, replica {:?}",
-        shape(replica).await
+        "replica never matched the primary: primary {want:?}, replica {:?}\n{}",
+        shape(f, replica).await,
+        f.logs()
     );
 }
 
@@ -120,6 +130,14 @@ impl Files {
     }
     fn log(&self, name: &str) -> String {
         std::fs::read_to_string(self.dir.join(name)).unwrap_or_default()
+    }
+    /// The primary's and the replica's logs, for a failure message.
+    fn logs(&self) -> String {
+        format!(
+            "--- primary log ---\n{}--- replica log ---\n{}",
+            self.log("p.log"),
+            self.log("r.log")
+        )
     }
 }
 
@@ -174,7 +192,7 @@ async fn a_restarted_replica_catches_up_from_where_it_stopped() {
         &strs(&primary_args(&f, &pm_a, &pr_a, true)),
         &f.dir.join("p.log"),
     );
-    let mut p = connect(pm).await;
+    let mut p = connect(&f, pm).await;
     p.query_drop("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
         .await
         .unwrap();
@@ -184,7 +202,7 @@ async fn a_restarted_replica_catches_up_from_where_it_stopped() {
             .unwrap();
     }
     let replica = start(&strs(&replica_args(&f, &pr_a, &rm_a)), &f.dir.join("r.log"));
-    assert_eq!(until_same(pm, rm).await, (100, 5050));
+    assert_eq!(until_same(&f, pm, rm).await, (100, 5050));
     drop(replica);
 
     // Writes the stopped replica misses, deletes among them.
@@ -195,7 +213,7 @@ async fn a_restarted_replica_catches_up_from_where_it_stopped() {
             .unwrap();
     }
     let _replica = start(&strs(&replica_args(&f, &pr_a, &rm_a)), &f.dir.join("r.log"));
-    assert_eq!(until_same(pm, rm).await, (140, 11270));
+    assert_eq!(until_same(&f, pm, rm).await, (140, 11270));
 
     let log = f.log("r.log");
     assert!(
@@ -231,7 +249,7 @@ async fn a_replica_starts_over_when_the_primary_cannot_continue_it() {
         &strs(&primary_args(&f, &pm_a, &pr_a, false)),
         &f.dir.join("p.log"),
     );
-    let mut p = connect(pm).await;
+    let mut p = connect(&f, pm).await;
     p.query_drop("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
         .await
         .unwrap();
@@ -241,7 +259,7 @@ async fn a_replica_starts_over_when_the_primary_cannot_continue_it() {
             .unwrap();
     }
     let mut replica = start(&strs(&replica_args(&f, &pr_a, &rm_a)), &f.dir.join("r.log"));
-    assert_eq!(until_same(pm, rm).await, (100, 5050));
+    assert_eq!(until_same(&f, pm, rm).await, (100, 5050));
 
     drop(p);
     drop(primary);
@@ -249,7 +267,7 @@ async fn a_replica_starts_over_when_the_primary_cannot_continue_it() {
         &strs(&primary_args(&f, &pm_a, &pr_a, false)),
         &f.dir.join("p.log"),
     );
-    let mut p = connect(pm).await;
+    let mut p = connect(&f, pm).await;
     p.query_drop("DELETE FROM t WHERE id > 50").await.unwrap();
 
     // The replica gives up on its data and exits for its supervisor...
@@ -264,6 +282,6 @@ async fn a_replica_starts_over_when_the_primary_cannot_continue_it() {
     assert!(Path::new(&format!("{}.resync", f.path("replica.edb"))).exists());
     // ...which restarts it: it bootstraps from scratch and matches.
     let _replica = start(&strs(&replica_args(&f, &pr_a, &rm_a)), &f.dir.join("r.log"));
-    assert_eq!(until_same(pm, rm).await, (50, 1275));
+    assert_eq!(until_same(&f, pm, rm).await, (50, 1275));
     assert!(!Path::new(&format!("{}.resync", f.path("replica.edb"))).exists());
 }
