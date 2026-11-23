@@ -24,6 +24,7 @@
 //! majority has it, and only then applies it and acknowledges the client;
 //! followers apply up to the leader's commit index.
 
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -40,12 +41,16 @@ pub struct LogEntry {
 /// A persistent Raft log with commit/apply cursors.
 #[derive(Default)]
 pub struct RaftLog {
-    /// Entries in index order. `entries[0].index` may be > 1 after compaction
-    /// (not implemented yet), so always index via `at`/`term_at`.
-    entries: Vec<LogEntry>,
+    /// Entries in index order, without a hole, starting right after
+    /// `snapshot_index`: the entry for index `i` is at `i - snapshot_index - 1`
+    /// (see [`RaftLog::pos`]). Lookups used to search the whole log, which made
+    /// taking a long run of entries to apply quadratic.
+    entries: VecDeque<LogEntry>,
     /// Highest index known to be committed (present on a quorum).
     commit_index: u64,
-    /// Highest index applied to the state machine.
+    /// Highest index applied to the state machine: the caller records it with
+    /// [`RaftLog::mark_applied`] once the entries are stored, and restores it
+    /// at start with [`RaftLog::restore_applied`].
     last_applied: u64,
     /// Optional backing file for durability (append-only records).
     path: Option<PathBuf>,
@@ -70,9 +75,10 @@ impl RaftLog {
 
     /// Open a log backed by `path`, loading any persisted entries. The log is an
     /// append-only sequence of length-prefixed entry records. `commit_index` and
-    /// `last_applied` are **not** persisted: on restart they start at 0 and the
-    /// node re-applies the committed prefix (apply is idempotent for final
-    /// state), or re-learns commit from the current leader via AppendEntries.
+    /// `last_applied` start at the compaction boundary: the state machine
+    /// records how far it has applied, and the caller passes that on with
+    /// [`RaftLog::restore_applied`]; the rest of the commit index is learnt
+    /// from the leader.
     ///
     /// Loading stops at the first record that is cut off, cannot be decoded or
     /// does not continue the log: the tail of a write a crash interrupted. It
@@ -126,7 +132,7 @@ impl RaftLog {
         }
         let durable = entries.last().map_or(snapshot_index, |e| e.index);
         Ok(RaftLog {
-            entries,
+            entries: entries.into(),
             commit_index: snapshot_index,
             last_applied: snapshot_index,
             path: Some(path),
@@ -156,7 +162,9 @@ impl RaftLog {
         if let Some(p) = &self.path {
             write_snapshot_meta(p, up_to, term)?;
         }
-        self.entries.retain(|e| e.index > up_to);
+        while self.entries.front().is_some_and(|e| e.index <= up_to) {
+            self.entries.pop_front();
+        }
         self.snapshot_index = up_to;
         self.snapshot_term = term;
         self.durable = self.durable.max(up_to);
@@ -215,7 +223,7 @@ impl RaftLog {
     /// Append the entries after `durable` to the file; the common, O(new) path.
     fn append_new(&self, p: &Path) -> std::io::Result<()> {
         let from = self.entries.partition_point(|e| e.index <= self.durable);
-        let buf = encode(&self.entries[from..])?;
+        let buf = encode(self.entries.range(from..))?;
         let mut f = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -230,10 +238,16 @@ impl RaftLog {
         atomic_write(p, &encode(&self.entries)?)
     }
 
+    /// Where the entry for `index` is in `entries`, if this log holds it.
+    fn pos(&self, index: u64) -> Option<usize> {
+        let i = usize::try_from(index.checked_sub(self.snapshot_index + 1)?).ok()?;
+        (i < self.entries.len()).then_some(i)
+    }
+
     /// Index of the last entry (the snapshot index if the log is empty).
     pub fn last_index(&self) -> u64 {
         self.entries
-            .last()
+            .back()
             .map(|e| e.index)
             .unwrap_or(self.snapshot_index)
     }
@@ -241,7 +255,7 @@ impl RaftLog {
     /// Term of the last entry (the snapshot term if the log is empty).
     pub fn last_term(&self) -> u64 {
         self.entries
-            .last()
+            .back()
             .map(|e| e.term)
             .unwrap_or(self.snapshot_term)
     }
@@ -260,13 +274,7 @@ impl RaftLog {
         if index == self.snapshot_index {
             return Some(self.snapshot_term); // 0/0 for an un-compacted log
         }
-        if index < self.snapshot_index {
-            return None; // compacted away
-        }
-        self.entries
-            .iter()
-            .find(|e| e.index == index)
-            .map(|e| e.term)
+        self.pos(index).map(|i| self.entries[i].term)
     }
 
     /// Leader path: append a new entry for `term` in memory, returning its
@@ -274,7 +282,7 @@ impl RaftLog {
     /// proposals share a single fsync per replication round (batched throughput).
     pub fn leader_append(&mut self, term: u64, data: Vec<u8>) -> u64 {
         let index = self.last_index() + 1;
-        self.entries.push(LogEntry { term, index, data });
+        self.entries.push_back(LogEntry { term, index, data });
         index
     }
 
@@ -317,20 +325,20 @@ impl RaftLog {
             return Ok(false);
         }
         for ne in new_entries {
-            match self.entries.iter().position(|e| e.index == ne.index) {
+            match self.pos(ne.index) {
                 Some(pos) => {
                     if self.entries[pos].term != ne.term {
                         // Conflict: drop this entry and everything after it.
                         // What the file holds from here on is no longer this
                         // log, so it is rewritten.
                         self.entries.truncate(pos);
-                        self.entries.push(ne.clone());
+                        self.entries.push_back(ne.clone());
                         self.durable = self.durable.min(ne.index - 1);
                         self.dirty = true;
                     }
                     // Same term at this index: already have it (idempotent).
                 }
-                None => self.entries.push(ne.clone()),
+                None => self.entries.push_back(ne.clone()),
             }
         }
         self.persist()?;
@@ -363,18 +371,42 @@ impl RaftLog {
         }
     }
 
-    /// Take the next batch of committed-but-unapplied entries, advancing
-    /// `last_applied`. The caller applies them to the state machine in order.
+    /// Up to `max` committed entries not applied yet, in order. Nothing moves:
+    /// the caller applies them and then calls [`RaftLog::mark_applied`]. This
+    /// used to advance `last_applied` as the entries were handed out, so an
+    /// entry the state machine then failed to store counted as applied.
+    pub fn applicable(&self, max: usize) -> Vec<LogEntry> {
+        let Some(from) = self.pos(self.last_applied + 1) else {
+            return Vec::new();
+        };
+        let n = usize::try_from(self.commit_index - self.last_applied)
+            .unwrap_or(usize::MAX)
+            .min(max);
+        self.entries.range(from..).take(n).cloned().collect()
+    }
+
+    /// Record that every entry up to `index` is applied (stored in the state
+    /// machine). Never moves backwards.
+    pub fn mark_applied(&mut self, index: u64) {
+        self.last_applied = self.last_applied.max(index.min(self.commit_index));
+    }
+
+    /// At start: the state machine already holds every entry up to `index`,
+    /// which is therefore committed. Without this a restarted node applied
+    /// everything since the last compaction again, on top of newer state.
+    pub fn restore_applied(&mut self, index: u64) {
+        if index > self.last_applied {
+            self.last_applied = index;
+            self.commit_index = self.commit_index.max(index);
+        }
+    }
+
+    /// Take the committed entries not applied yet and count them as applied.
+    #[cfg(test)]
     pub fn take_applicable(&mut self) -> Vec<LogEntry> {
-        let mut out = Vec::new();
-        while self.last_applied < self.commit_index {
-            let next = self.last_applied + 1;
-            if let Some(e) = self.entries.iter().find(|e| e.index == next) {
-                out.push(e.clone());
-                self.last_applied = next;
-            } else {
-                break;
-            }
+        let out = self.applicable(usize::MAX);
+        if let Some(last) = out.last() {
+            self.mark_applied(last.index);
         }
         out
     }
@@ -390,11 +422,8 @@ impl RaftLog {
 
     /// Entries strictly after `index` (what a leader sends a lagging follower).
     pub fn entries_after(&self, index: u64) -> Vec<LogEntry> {
-        self.entries
-            .iter()
-            .filter(|e| e.index > index)
-            .cloned()
-            .collect()
+        let from = self.entries.partition_point(|e| e.index <= index);
+        self.entries.range(from..).cloned().collect()
     }
 }
 
@@ -431,7 +460,7 @@ fn write_snapshot_meta(path: &Path, index: u64, term: u64) -> std::io::Result<()
 }
 
 /// Length-prefixed records for `entries`, as the log file holds them.
-fn encode(entries: &[LogEntry]) -> std::io::Result<Vec<u8>> {
+fn encode<'a>(entries: impl IntoIterator<Item = &'a LogEntry>) -> std::io::Result<Vec<u8>> {
     let mut buf = Vec::new();
     for e in entries {
         let bytes = bincode::serialize(e)

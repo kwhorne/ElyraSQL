@@ -62,6 +62,29 @@ pub struct ClusterConfig {
 /// that never stored one. The file is written whole (`atomic_write`), so one
 /// that cannot be read is an error. It used to count as "never voted": a
 /// restarted node could then vote a second time in a term it had voted in.
+/// The index of the last Raft entry the database holds, stored in the same
+/// transaction as the entries it covers.
+pub const APPLIED_KEY: &[u8] = b"meta::raft::applied";
+
+/// Most committed entries applied in one transaction.
+const APPLY_BATCH: usize = 1024;
+
+/// The index of the last entry `db` holds (0 if none was ever applied).
+fn applied_index(db: &Db) -> std::io::Result<u64> {
+    let stored = db
+        .snapshot()
+        .and_then(|s| s.get(APPLIED_KEY))
+        .map_err(|e| Error::other(format!("cannot read the applied Raft index: {e}")))?;
+    match stored {
+        None => Ok(0),
+        Some(v) => v
+            .as_slice()
+            .try_into()
+            .map(u64::from_le_bytes)
+            .map_err(|_| Error::new(ErrorKind::InvalidData, "the applied Raft index is damaged")),
+    }
+}
+
 fn load_state(path: &Option<PathBuf>) -> std::io::Result<(u64, Option<u64>)> {
     let Some(p) = path else { return Ok((0, None)) };
     let s = match std::fs::read_to_string(p) {
@@ -216,6 +239,13 @@ pub struct Node {
     log_failing: AtomicBool,
     /// The election state could not be written the last time it was tried.
     state_failing: AtomicBool,
+    /// Committed entries could not be stored in the database the last time
+    /// it was tried.
+    apply_failing: AtomicBool,
+    /// Held while committed entries are applied, so two appliers -- a
+    /// follower's AppendEntries and a leader's round across a change of role
+    /// -- never apply the same entries twice or out of order.
+    apply_lock: tokio::sync::Mutex<()>,
 }
 
 impl Node {
@@ -233,7 +263,7 @@ impl Node {
                 format!("cannot load the Raft election state: {e}"),
             )
         })?;
-        let log = match &cfg.log_path {
+        let mut log = match &cfg.log_path {
             Some(p) => RaftLog::open(p.clone()).map_err(|e| {
                 Error::new(
                     e.kind(),
@@ -242,6 +272,16 @@ impl Node {
             })?,
             None => RaftLog::new(),
         };
+        // Go on from the last entry the database holds rather than applying
+        // everything since the last compaction again.
+        let applied = applied_index(&db)?;
+        if applied > 0 {
+            info!(
+                id = cfg_id,
+                applied, "resuming from the last applied Raft entry"
+            );
+        }
+        log.restore_applied(applied);
         Ok(Arc::new(Node {
             cfg: Arc::new(cfg),
             peers,
@@ -263,18 +303,20 @@ impl Node {
             leader_rx,
             log_failing: AtomicBool::new(false),
             state_failing: AtomicBool::new(false),
+            apply_failing: AtomicBool::new(false),
+            apply_lock: tokio::sync::Mutex::new(()),
         }))
     }
 
     /// Report a write of the Raft log or election state: an error once when
     /// writes start failing, and once more when they work again, rather than
     /// on every heartbeat in between.
-    fn disk<T>(
+    fn disk<T, E: std::fmt::Display>(
         &self,
         failing: &AtomicBool,
         what: &str,
-        r: std::io::Result<T>,
-    ) -> std::io::Result<T> {
+        r: Result<T, E>,
+    ) -> Result<T, E> {
         match &r {
             Err(e) => {
                 if !failing.swap(true, Ordering::Relaxed) {
@@ -576,26 +618,20 @@ impl Node {
             repl_addr,
         }));
 
-        // Append + advance commit under the log lock, collecting entries to apply.
-        let (success, match_index, to_apply) = {
+        // Append + advance commit under the log lock.
+        let (success, match_index) = {
             let mut log = self.log.lock().unwrap();
             let appended = log.append_entries(prev_index, prev_term, &entries);
             if self.disk(&self.log_failing, "log", appended)? {
                 log.advance_commit(leader_commit);
-                (true, log.last_index(), log.take_applicable())
+                (true, log.last_index())
             } else {
-                (false, 0, Vec::new())
+                (false, 0)
             }
         };
-        // Apply committed entries in log order, but submit them together so the
-        // DB group-commit folds them into few fsyncs (batched throughput).
-        let ops: Vec<WriteOp> = to_apply
-            .iter()
-            .filter_map(|e| bincode::deserialize::<WriteOp>(&e.data).ok())
-            .collect();
-        let _ =
-            futures_util::future::join_all(ops.into_iter().map(|op| self.db.apply_op_local(op)))
-                .await;
+        if success {
+            self.apply_committed().await;
+        }
         // Compact applied entries up to the cluster-wide safe point.
         if success {
             let compacted = self.log.lock().unwrap().compact(compact_index);
@@ -964,9 +1000,62 @@ impl Node {
         warn!(id = self.cfg.id, reason, "stepped down");
     }
 
+    /// Store every committed entry the database does not hold yet, in order,
+    /// a batch at a time: each batch in one transaction together with the
+    /// index of its last entry ([`APPLIED_KEY`]). Returns each applied entry's
+    /// result -- a write refused as a conflict or duplicate is applied too, as
+    /// a refusal, the same on every node.
+    ///
+    /// Entries used to be submitted as separate writes, their results ignored
+    /// on a follower and `last_applied` advanced before they were stored: an
+    /// entry the database failed to store counted as applied, and when one
+    /// group of writes failed a later one could still land, out of order. Now
+    /// a batch that cannot be stored leaves nothing behind, and the next round
+    /// or heartbeat tries it again.
+    async fn apply_committed(&self) -> Vec<(u64, elyra_core::Result<()>)> {
+        let _serial = self.apply_lock.lock().await;
+        let mut done = Vec::new();
+        loop {
+            let batch = self.log.lock().unwrap().applicable(APPLY_BATCH);
+            let Some(last) = batch.last().map(|e| e.index) else {
+                break;
+            };
+            // An entry that does not decode is the same bytes on every node:
+            // it is applied as nothing, and its proposer told so.
+            let mut undecodable = HashMap::new();
+            let ops: Vec<WriteOp> = batch
+                .iter()
+                .map(|e| {
+                    bincode::deserialize::<WriteOp>(&e.data).unwrap_or_else(|err| {
+                        undecodable.insert(e.index, err.to_string());
+                        WriteOp::Plain {
+                            puts: vec![],
+                            deletes: vec![],
+                        }
+                    })
+                })
+                .collect();
+            let meta = vec![(APPLIED_KEY.to_vec(), last.to_le_bytes().to_vec())];
+            let stored = self.db.apply_ordered(ops, meta).await;
+            let results = match self.disk(&self.apply_failing, "applied entries", stored) {
+                Ok(results) => results,
+                Err(_) => break,
+            };
+            self.log.lock().unwrap().mark_applied(last);
+            for (e, r) in batch.iter().zip(results) {
+                let r = match undecodable.remove(&e.index) {
+                    Some(err) => Err(elyra_core::Error::Storage(err)),
+                    None => r,
+                };
+                done.push((e.index, r));
+            }
+        }
+        done
+    }
+
     /// Compute the quorum commit index and apply newly committed entries.
     async fn advance_commit_and_apply(self: &Arc<Self>, term: u64) {
-        let to_apply = {
+        {
             let mut log = self.log.lock().unwrap();
             // The leader counts itself only with what is on its disk: entries
             // proposed since its last sync may already be on the followers, but
@@ -976,27 +1065,10 @@ impl Node {
                 match_indexes.push(p.match_);
             }
             log.maybe_commit(&mut match_indexes, term);
-            log.take_applicable()
-        };
-        if to_apply.is_empty() {
-            return;
         }
-        // Apply in log order but submit together: the DB group-commit folds the
-        // batch into few fsyncs. join_all polls in order, so jobs reach the
-        // writer in order (deterministic apply, matching followers).
-        let indexes: Vec<u64> = to_apply.iter().map(|e| e.index).collect();
-        let futs = to_apply.into_iter().map(|e| {
-            let db = self.db.clone();
-            async move {
-                match bincode::deserialize::<WriteOp>(&e.data) {
-                    Ok(op) => db.apply_op_local(op).await,
-                    Err(err) => Err(elyra_core::Error::Storage(err.to_string())),
-                }
-            }
-        });
-        let results = futures_util::future::join_all(futs).await;
+        let applied = self.apply_committed().await;
         let mut pending = self.pending.lock().unwrap();
-        for (index, result) in indexes.into_iter().zip(results) {
+        for (index, result) in applied {
             if let Some(tx) = pending.remove(&index) {
                 let _ = tx.send(result);
             }
@@ -1514,6 +1586,87 @@ mod tests {
 
     // The control-plane framing must work over any AsyncRead+AsyncWrite transport
     // (this is what lets it run over a TLS stream, not just a raw TcpStream).
+    fn single_node(dir: &std::path::Path) -> (Arc<Node>, Db) {
+        let db = Db::open(dir.join("n.edb")).unwrap();
+        let node = Node::new(
+            ClusterConfig {
+                id: 1,
+                control_listen: String::new(),
+                replication_addr: String::new(),
+                peers: Vec::new(),
+                state_path: Some(dir.join("n.raftstate")),
+                log_path: Some(dir.join("n.raftlog")),
+            },
+            db.clone(),
+        )
+        .unwrap();
+        (node, db)
+    }
+
+    fn entry(op: &WriteOp) -> Vec<u8> {
+        bincode::serialize(op).unwrap()
+    }
+
+    /// A restarted node goes on from the last entry its database holds. It used
+    /// to start at the last compaction and apply the entries after it again,
+    /// on top of the newer state they had produced -- where a write that had
+    /// been refused could now succeed, so the node diverged from the others.
+    #[tokio::test]
+    async fn a_restarted_node_does_not_apply_entries_again() {
+        let dir = std::env::temp_dir().join(format!("elyra-raft-applied-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (y, z) = (b"data::t::y".to_vec(), b"data::t::z".to_vec());
+        let put = |k: &[u8], v: &[u8]| WriteOp::Plain {
+            puts: vec![(k.to_vec(), v.to_vec())],
+            deletes: vec![],
+        };
+        {
+            let (node, db) = single_node(&dir);
+            {
+                let mut log = node.log.lock().unwrap();
+                // 1: y = 6. 2: a transaction that read y = 5, so it is refused,
+                // and would have written z. 3: y = 5.
+                log.leader_append(1, entry(&put(&y, b"6")));
+                log.leader_append(
+                    1,
+                    entry(&WriteOp::Validated {
+                        keys: vec![(y.clone(), Some(b"5".to_vec()))],
+                        ranges: vec![],
+                        puts: vec![(z.clone(), b"1".to_vec())],
+                        deletes: vec![],
+                    }),
+                );
+                log.leader_append(1, entry(&put(&y, b"5")));
+                log.sync().unwrap();
+                log.advance_commit(3);
+            }
+            let results = node.apply_committed().await;
+            assert_eq!(results.len(), 3);
+            assert!(matches!(results[1].1, Err(elyra_core::Error::Conflict(_))));
+            // The first entry is compacted away; 2 and 3 stay in the log.
+            node.log.lock().unwrap().compact(1).unwrap();
+            assert_eq!(applied_index(&db).unwrap(), 3);
+            let closed = db.close_waiter();
+            drop(node);
+            drop(db);
+            assert!(closed.wait(Duration::from_secs(10)));
+        }
+        let (node, db) = single_node(&dir);
+        assert_eq!(node.log.lock().unwrap().last_applied(), 3);
+        // The leader tells it the commit index, as after any restart.
+        node.log.lock().unwrap().advance_commit(3);
+        assert!(node.apply_committed().await.is_empty());
+        // Applied again on top of y = 5, entry 2 would now pass and write z.
+        assert_eq!(db.get(z.clone()).await.unwrap(), None);
+        assert_eq!(db.get(y.clone()).await.unwrap(), Some(b"5".to_vec()));
+        let closed = db.close_waiter();
+        drop(node);
+        drop(db);
+        closed.wait(Duration::from_secs(10));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn a_damaged_election_state_is_an_error_not_a_blank_one() {
         let dir = std::env::temp_dir().join(format!("elyra-raftstate-{}", std::process::id()));

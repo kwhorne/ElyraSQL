@@ -8,6 +8,25 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ### Fixed
 
+- **A restarted Raft node no longer applies entries a second time.** Only
+  the log was kept across a restart, not how far the database had applied
+  it: a node started at the last compaction and applied every entry after it
+  again, on top of the state those entries had already produced. A write
+  that had been refused as a conflict could then succeed, and the node
+  diverged from the others. The index of the last applied entry is now
+  stored in the same transaction as the entries (`meta::raft::applied`), and
+  a node goes on from there.
+- **A Raft node no longer counts an entry as applied before it is stored.**
+  Committed entries were handed out and counted as applied before the
+  database had them, and a follower ignored the results: an entry the
+  database failed to store was lost on that node. They were also submitted
+  as separate writes, so when one group of writes failed a later one could
+  still land, out of order. Now a batch of entries is stored in one
+  transaction, in order, with the applied index; one that cannot be stored
+  leaves nothing behind and is tried again at the next round or heartbeat.
+- **Looking up an entry in the Raft log no longer searches the whole log.**
+  Applying a long run of entries, as a node does catching up, was quadratic
+  in the length of the log.
 - **A Raft node no longer acknowledges what it could not write to disk.**
   Writes of the Raft log, its compaction boundary and the election state were
   best effort: a failed one was logged at most, and the node went on as if
