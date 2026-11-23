@@ -1178,6 +1178,10 @@ impl Engine {
         // guard so every exit path clears it, and nesting-aware so a trigger or
         // procedure body inherits the outer deadline instead of resetting it.
         let _cancel = CancelGuard::new(sess);
+        // A Raft node installing a snapshot holds part old, part new data.
+        if let Some(why) = self.db.fence() {
+            return Err(Error::Storage(why));
+        }
         // Reject pathologically deep expressions before any parsing/evaluation so
         // a hostile query can't overflow the worker stack and abort the process.
         guard_sql_complexity(sql)?;
@@ -9980,6 +9984,41 @@ mod subquery_inside_an_expression_tests {
                 "the expression is in the projection: {message}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod fence_tests {
+    use super::*;
+
+    /// A Raft node installing a snapshot holds part old, part new data: no
+    /// statement runs until it is done.
+    #[tokio::test]
+    async fn a_fenced_database_refuses_every_statement() {
+        let db = Db::in_memory().unwrap();
+        let engine = Engine::new(db.clone());
+        let sess = engine.session();
+        engine
+            .execute(
+                "CREATE TABLE t (id INT PRIMARY KEY)",
+                Privilege::Admin,
+                &sess,
+            )
+            .await
+            .unwrap();
+        db.set_fence(Some("installing a snapshot".into()));
+        match engine
+            .execute("SELECT * FROM t", Privilege::Admin, &sess)
+            .await
+        {
+            Err(err) => assert!(err.to_string().contains("installing a snapshot"), "{err}"),
+            Ok(_) => panic!("a fenced database ran a statement"),
+        }
+        db.set_fence(None);
+        engine
+            .execute("SELECT * FROM t", Privilege::Admin, &sess)
+            .await
+            .unwrap();
     }
 }
 

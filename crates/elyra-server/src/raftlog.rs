@@ -66,6 +66,8 @@ pub struct RaftLog {
     /// at the boundary.
     snapshot_index: u64,
     snapshot_term: u64,
+    /// Total size of the entries' data, for the compaction policy.
+    data_bytes: usize,
 }
 
 impl RaftLog {
@@ -131,7 +133,9 @@ impl RaftLog {
             dirty = true;
         }
         let durable = entries.last().map_or(snapshot_index, |e| e.index);
+        let data_bytes = entries.iter().map(|e| e.data.len()).sum();
         Ok(RaftLog {
+            data_bytes,
             entries: entries.into(),
             commit_index: snapshot_index,
             last_applied: snapshot_index,
@@ -163,7 +167,9 @@ impl RaftLog {
             write_snapshot_meta(p, up_to, term)?;
         }
         while self.entries.front().is_some_and(|e| e.index <= up_to) {
-            self.entries.pop_front();
+            if let Some(e) = self.entries.pop_front() {
+                self.data_bytes -= e.data.len();
+            }
         }
         self.snapshot_index = up_to;
         self.snapshot_term = term;
@@ -282,6 +288,7 @@ impl RaftLog {
     /// proposals share a single fsync per replication round (batched throughput).
     pub fn leader_append(&mut self, term: u64, data: Vec<u8>) -> u64 {
         let index = self.last_index() + 1;
+        self.data_bytes += data.len();
         self.entries.push_back(LogEntry { term, index, data });
         index
     }
@@ -306,11 +313,6 @@ impl RaftLog {
         prev_term: u64,
         new_entries: &[LogEntry],
     ) -> std::io::Result<bool> {
-        // Consistency check: our log must match the leader's at prev_index.
-        match self.term_at(prev_index) {
-            Some(t) if t == prev_term => {}
-            _ => return Ok(false),
-        }
         // The entries must continue the log right after `prev_index`, without a
         // hole. A leader that has compacted the entries a new node needs used to
         // send just its log's tail with `prev_index` 0: the node accepted it,
@@ -324,6 +326,20 @@ impl RaftLog {
         if !contiguous {
             return Ok(false);
         }
+        let new_entries = if prev_index < self.snapshot_index {
+            // This log has compacted past `prev_index`: what it compacted was
+            // applied, so committed, so the same as the leader's. Only the
+            // entries after the compaction point are left to check.
+            let skip = usize::try_from(self.snapshot_index - prev_index).unwrap_or(usize::MAX);
+            &new_entries[skip.min(new_entries.len())..]
+        } else {
+            // Consistency check: our log must match the leader's at prev_index.
+            match self.term_at(prev_index) {
+                Some(t) if t == prev_term => {}
+                _ => return Ok(false),
+            }
+            new_entries
+        };
         for ne in new_entries {
             match self.pos(ne.index) {
                 Some(pos) => {
@@ -331,18 +347,101 @@ impl RaftLog {
                         // Conflict: drop this entry and everything after it.
                         // What the file holds from here on is no longer this
                         // log, so it is rewritten.
-                        self.entries.truncate(pos);
+                        for gone in self.entries.drain(pos..) {
+                            self.data_bytes -= gone.data.len();
+                        }
+                        self.data_bytes += ne.data.len();
                         self.entries.push_back(ne.clone());
                         self.durable = self.durable.min(ne.index - 1);
                         self.dirty = true;
                     }
                     // Same term at this index: already have it (idempotent).
                 }
-                None => self.entries.push_back(ne.clone()),
+                None => {
+                    self.data_bytes += ne.data.len();
+                    self.entries.push_back(ne.clone());
+                }
             }
         }
         self.persist()?;
         Ok(true)
+    }
+
+    /// Replace everything up to `index` with a snapshot of the state machine
+    /// taken there (Raft's InstallSnapshot): the state machine now holds every
+    /// entry up to `index`, whose term is `term`. Entries after it are kept if
+    /// this log agrees with the snapshot at `index`, as they continue it;
+    /// otherwise the whole log is discarded.
+    pub fn install_snapshot(&mut self, index: u64, term: u64) -> std::io::Result<()> {
+        if let Some(p) = &self.path {
+            write_snapshot_meta(p, index, term)?;
+        }
+        if self.term_at(index) == Some(term) {
+            while self.entries.front().is_some_and(|e| e.index <= index) {
+                if let Some(e) = self.entries.pop_front() {
+                    self.data_bytes -= e.data.len();
+                }
+            }
+        } else {
+            self.entries.clear();
+            self.data_bytes = 0;
+        }
+        self.snapshot_index = index;
+        self.snapshot_term = term;
+        self.commit_index = self.commit_index.max(index);
+        self.last_applied = index;
+        self.durable = self.durable.max(index).min(self.last_index());
+        self.dirty = true;
+        self.persist()
+    }
+
+    /// Forget every entry and the compaction point: the state machine was
+    /// emptied (an interrupted snapshot install), and this node starts again
+    /// as a new one.
+    pub fn reset(&mut self) -> std::io::Result<()> {
+        if let Some(p) = &self.path {
+            write_snapshot_meta(p, 0, 0)?;
+        }
+        self.entries.clear();
+        self.data_bytes = 0;
+        self.snapshot_index = 0;
+        self.snapshot_term = 0;
+        self.commit_index = 0;
+        self.last_applied = 0;
+        self.durable = 0;
+        self.dirty = true;
+        self.persist()
+    }
+
+    /// Where to compact this log to, if it is due: it keeps the last
+    /// `keep_entries` applied entries, and at most about `keep_bytes` of them,
+    /// and is compacted only once it holds twice that, so each compaction --
+    /// a rewrite of the file -- is paid for by as many new entries as it keeps.
+    ///
+    /// Compaction used to follow the slowest follower, so one node that was
+    /// down held every log back from compacting at all. A follower that needs
+    /// entries a leader no longer has is now sent a snapshot instead.
+    pub fn compaction_target(&self, keep_entries: u64, keep_bytes: usize) -> Option<u64> {
+        let applied = self.last_applied.min(self.last_index());
+        let held = applied.checked_sub(self.snapshot_index)?;
+        let by_count = held > keep_entries.saturating_mul(2);
+        let by_bytes = self.data_bytes > keep_bytes.saturating_mul(2);
+        if !by_count && !by_bytes {
+            return None;
+        }
+        let mut target = applied.saturating_sub(keep_entries);
+        if by_bytes {
+            // The first entry from which on the log is at most `keep_bytes`.
+            let mut tail = self.data_bytes;
+            for e in &self.entries {
+                if tail <= keep_bytes || e.index > applied {
+                    break;
+                }
+                tail -= e.data.len();
+                target = target.max(e.index);
+            }
+        }
+        (target > self.snapshot_index).then_some(target.min(applied))
     }
 
     /// Advance the commit index (followers: to `min(leader_commit, last_index)`).
@@ -762,6 +861,93 @@ mod tests {
         let log = RaftLog::open(path).unwrap();
         assert_eq!(log.last_index(), 2);
         assert_eq!(log.term_at(2), Some(2));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_snapshot_replaces_the_log_up_to_its_index() {
+        // The log agrees with the snapshot at its index: what follows stays.
+        let mut log = RaftLog::new();
+        log.append_entries(0, 0, &[e(1, 1), e(1, 2), e(2, 3), e(2, 4)])
+            .unwrap();
+        log.install_snapshot(3, 2).unwrap();
+        assert_eq!(log.snapshot_index(), 3);
+        assert_eq!(log.last_applied(), 3);
+        assert_eq!(log.commit_index(), 3);
+        assert_eq!(
+            log.entries_after(0)
+                .iter()
+                .map(|e| e.index)
+                .collect::<Vec<_>>(),
+            [4]
+        );
+        // It does not: everything goes.
+        let mut log = RaftLog::new();
+        log.append_entries(0, 0, &[e(1, 1), e(1, 2)]).unwrap();
+        log.install_snapshot(9, 3).unwrap();
+        assert_eq!(log.last_index(), 9);
+        assert_eq!(log.term_at(9), Some(3));
+        assert!(log.entries_after(0).is_empty());
+        // And the next entries continue it.
+        assert!(log.append_entries(9, 3, &[e(3, 10)]).unwrap());
+    }
+
+    #[test]
+    fn entries_a_log_has_compacted_count_as_matching() {
+        let mut log = RaftLog::new();
+        for i in 1..=6 {
+            log.leader_append(1, vec![i as u8]);
+        }
+        log.advance_commit(6);
+        log.take_applicable();
+        log.compact(5).unwrap();
+        // The leader is behind this log's compaction point (it was told less
+        // than this node holds): the compacted entries are skipped, the rest
+        // checked and appended.
+        assert!(log
+            .append_entries(3, 1, &[e(1, 4), e(1, 5), e(1, 6), e(1, 7)])
+            .unwrap());
+        assert_eq!(log.last_index(), 7);
+        assert!(log.append_entries(2, 1, &[e(1, 3)]).unwrap());
+        assert_eq!(log.last_index(), 7);
+    }
+
+    #[test]
+    fn the_log_is_compacted_once_it_holds_twice_what_it_keeps() {
+        let mut log = RaftLog::new();
+        for i in 1..=20 {
+            log.leader_append(1, vec![0; 10]);
+            let _ = i;
+        }
+        log.advance_commit(20);
+        log.take_applicable();
+        assert_eq!(log.compaction_target(10, usize::MAX), None);
+        log.leader_append(1, vec![0; 10]);
+        log.advance_commit(21);
+        log.take_applicable();
+        assert_eq!(log.compaction_target(10, usize::MAX), Some(11));
+        // Unapplied entries are never compacted.
+        log.leader_append(1, vec![0; 10]);
+        assert_eq!(log.compaction_target(1, usize::MAX), Some(20));
+        // By size: 220 bytes, keep about 50 -- entries 18..=22.
+        assert_eq!(log.compaction_target(1_000, 50), Some(17));
+    }
+
+    #[test]
+    fn a_reset_log_starts_over_and_stays_so() {
+        let (dir, path) = temp_log("reset");
+        {
+            let mut log = RaftLog::open(path.clone()).unwrap();
+            log.append_entries(0, 0, &[e(1, 1), e(1, 2), e(1, 3)])
+                .unwrap();
+            log.advance_commit(3);
+            log.take_applicable();
+            log.compact(2).unwrap();
+            log.reset().unwrap();
+            assert_eq!((log.last_index(), log.last_applied()), (0, 0));
+        }
+        let log = RaftLog::open(path).unwrap();
+        assert_eq!((log.last_index(), log.snapshot_index()), (0, 0));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

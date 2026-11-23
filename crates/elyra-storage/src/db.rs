@@ -390,6 +390,9 @@ pub struct Db {
     /// Optional consensus layer: when installed (cluster mode), the leader
     /// routes mutations through it (Raft) instead of committing locally.
     consensus: Arc<Mutex<Option<Arc<dyn Consensus>>>>,
+    /// Why this database cannot be queried right now, if it cannot: a Raft
+    /// node installing a snapshot holds part old, part new data meanwhile.
+    fence: Arc<Mutex<Option<String>>>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -526,6 +529,7 @@ impl Db {
             binlog_dir,
             binlog_sync: binlog_sync.clone(),
             consensus: Arc::new(Mutex::new(None)),
+            fence: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -557,6 +561,18 @@ impl Db {
     /// through it (on the leader) rather than committed directly.
     pub fn set_consensus(&self, c: Arc<dyn Consensus>) {
         *self.consensus.lock().unwrap() = Some(c);
+    }
+
+    /// Refuse queries with `why` until called again with `None` (see
+    /// [`Db::fence`]).
+    pub fn set_fence(&self, why: Option<String>) {
+        *self.fence.lock().unwrap() = why;
+    }
+
+    /// Why queries are refused right now, if they are: the engine checks this
+    /// before every statement.
+    pub fn fence(&self) -> Option<String> {
+        self.fence.lock().unwrap().clone()
     }
 
     fn consensus(&self) -> Option<Arc<dyn Consensus>> {

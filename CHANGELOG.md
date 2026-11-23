@@ -8,6 +8,11 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ### Fixed
 
+- **A Raft follower no longer reports entries it does not share with the
+  leader as matched.** After appending, it reported the end of its log, so a
+  tail left from an earlier term, beyond what the leader had sent, counted
+  as the leader's entries: the leader could count the follower toward a
+  quorum for entries it did not hold. It now reports what it was sent.
 - **A restarted Raft node no longer applies entries a second time.** Only
   the log was kept across a restart, not how far the database had applied
   it: a node started at the last compaction and applied every entry after it
@@ -61,8 +66,7 @@ All notable changes to ElyraSQL are documented here. The format is based on
   members and one down, writes were acknowledged by "three" nodes, one of
   them empty, and that node could later be elected leader. A follower now
   refuses entries that do not continue its log without a hole, and the
-  leader logs which node is stranded. Such a node cannot catch up until
-  snapshot transfer exists (see Limitations).
+  leader sends it a snapshot instead (see Added).
 - **`cluster-ctl` membership changes sent to a follower are refused.** A
   follower acknowledged them and then overwrote them with the leader's
   member list at the next heartbeat, so the change was lost while
@@ -70,6 +74,22 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ### Added
 
+- **Raft snapshots: a cluster node that is far behind catches up.** A node
+  that needs entries the leader has compacted -- one added to a running
+  cluster, or one down for long -- could not catch up at all. The leader
+  now sends it its database instead, a part at a time from one consistent
+  snapshot, on a connection of its own; the node replaces its data range by
+  range and continues with entries from there. It refuses queries and does
+  not stand for election until the snapshot is installed, and discards an
+  install that was interrupted, starting over as a new member. All nodes
+  must be upgraded together: older ones do not understand the new message.
+- **Each Raft node compacts its own log.** Compaction followed the slowest
+  follower, so one node that was down kept every log growing, in memory and
+  on disk. Now a node keeps the last 10 000 applied entries (or 64 MiB) and
+  compacts once it holds twice that, so a compaction -- a rewrite of the log
+  file -- is paid for by as many new entries; it used to happen every round.
+  New settings: `ELYRASQL_RAFT_LOG_KEEP_ENTRIES`,
+  `ELYRASQL_RAFT_LOG_KEEP_BYTES`, `ELYRASQL_RAFT_SNAPSHOT_CHUNK_BYTES`.
 - Raft cluster tests that run real `elyrasql cluster` processes: start, kill,
   restart and add nodes (`crates/elyra-cli/tests/raft_cluster.rs`).
 
