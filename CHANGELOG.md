@@ -19,6 +19,12 @@ All notable changes to ElyraSQL are documented here. The format is based on
   position is now written durably at open, before any commit. An empty data
   file whose binlog holds the whole history from LSN 1 -- what that loss left
   behind -- gets it back at the next start.
+- **`elyrasql cluster` and `elyrasql replica` migrate their data at start, as
+  `serve` does.** They skipped the migrations a new version runs on an
+  existing file before accepting connections, so a cluster node or a resumed
+  replica upgraded from before 1.12.17 kept indexes over FLOAT/DOUBLE and
+  binary columns that held none of their rows: `ORDER BY price LIMIT 10`
+  returned nothing there, while it worked on a server started with `serve`.
 
 ## [1.12.18] - 2026-11-23
 
