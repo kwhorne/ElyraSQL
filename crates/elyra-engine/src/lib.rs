@@ -10533,6 +10533,91 @@ mod float_and_binary_index_tests {
 }
 
 #[cfg(test)]
+mod replicated_counter_reset_tests {
+    //! A TRUNCATE (or DROP) resets a table's AUTO_INCREMENT. On a node that
+    //! applies it for another -- a Raft follower, a replica -- the write
+    //! arrives through storage, not through a statement here, and the
+    //! in-memory allocator did not hear of it: once that node led, it went on
+    //! from the old values.
+    use super::{Engine, Privilege, QueryResult};
+    use elyra_storage::Db;
+
+    async fn ids(e: &Engine, sql: &str) -> Vec<String> {
+        let s = e.session();
+        let QueryResult::Rows(mut rows) = e
+            .execute(sql, Privilege::Admin, &s)
+            .await
+            .unwrap()
+            .remove(0)
+        else {
+            panic!("expected rows for {sql}");
+        };
+        rows.next_batch(1000)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r[0].to_wire_string().unwrap_or_default())
+            .collect()
+    }
+
+    async fn exec(e: &Engine, sql: &str) {
+        let s = e.session();
+        e.execute(sql, Privilege::Admin, &s)
+            .await
+            .unwrap_or_else(|err| panic!("{sql}\n  -> {err}"));
+    }
+
+    /// What a replicated `TRUNCATE TABLE <table>` writes: its rows and its
+    /// counter deleted, applied straight to storage.
+    async fn truncate_from_elsewhere(db: &Db, table: &str) {
+        let prefix = format!("data::{table}::").into_bytes();
+        let mut end = prefix.clone();
+        *end.last_mut().unwrap() += 1;
+        let mut deletes: Vec<Vec<u8>> = db
+            .snapshot()
+            .unwrap()
+            .scan_range(&prefix, Some(&end), 10_000)
+            .unwrap()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        deletes.push(format!("meta::autoinc::{table}").into_bytes());
+        db.commit(vec![], deletes).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_reset_applied_for_another_node_restarts_the_allocator() {
+        let db = Db::in_memory().unwrap();
+        let e = Engine::new(db.clone());
+        exec(
+            &e,
+            "CREATE TABLE a (id INT AUTO_INCREMENT PRIMARY KEY, v INT)",
+        )
+        .await;
+        exec(
+            &e,
+            "CREATE TABLE b (id INT AUTO_INCREMENT PRIMARY KEY, v INT)",
+        )
+        .await;
+        exec(&e, "INSERT INTO a (v) VALUES (1), (2), (3)").await;
+        exec(&e, "INSERT INTO b (v) VALUES (1), (2), (3)").await;
+        truncate_from_elsewhere(&db, "a").await;
+        exec(&e, "INSERT INTO a (v) VALUES (9)").await;
+        exec(&e, "INSERT INTO b (v) VALUES (9)").await;
+        assert_eq!(
+            ids(&e, "SELECT id FROM a").await,
+            ["1"],
+            "a's counter was not reset"
+        );
+        // Another table's reset leaves this one alone.
+        assert_eq!(
+            ids(&e, "SELECT id FROM b ORDER BY id").await,
+            ["1", "2", "3", "4"]
+        );
+    }
+}
+
+#[cfg(test)]
 mod concurrent_insert_id_tests {
     //! Concurrent INSERTs must get distinct AUTO_INCREMENT values and row ids.
     //! Each statement read the stored counter and counted up from it on its

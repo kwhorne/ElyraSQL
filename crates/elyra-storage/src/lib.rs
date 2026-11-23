@@ -280,6 +280,12 @@ fn touches_schema<'a>(mut keys: impl Iterator<Item = &'a [u8]>) -> bool {
 /// hidden row id of a table without a primary key.
 const COUNTER_PREFIXES: [&[u8]; 2] = [b"meta::autoinc::", b"meta::rowid::"];
 
+/// Whether `key` is an id counter (see [`COUNTER_PREFIXES`]): a write that
+/// must set one exactly -- not only move it on -- deletes it in the same write.
+pub fn is_id_counter(key: &[u8]) -> bool {
+    COUNTER_PREFIXES.iter().any(|p| key.starts_with(p))
+}
+
 /// Write `value` at `key` -- except that a counter (see [`COUNTER_PREFIXES`])
 /// never moves backwards unless the same write deletes it first.
 ///
@@ -459,6 +465,9 @@ pub struct Storage {
     /// Monotonic marker so a forced [`flush`](Self::flush) is always a real
     /// (non-empty) `Immediate` commit that persists queued `Eventual` writes.
     flush_seq: std::sync::atomic::AtomicU64,
+    /// How many committed writes deleted each id counter (see
+    /// [`COUNTER_PREFIXES`]), on any path: see [`Storage::counter_resets`].
+    counter_resets: std::sync::Mutex<std::collections::HashMap<Vec<u8>, u64>>,
     /// The last write sequence handed out (see [`WSEQ_KEY`]).
     wseq: std::sync::atomic::AtomicU64,
 }
@@ -527,6 +536,7 @@ impl Storage {
             durability: configured_durability(),
             flush_seq: std::sync::atomic::AtomicU64::new(0),
             wseq: std::sync::atomic::AtomicU64::new(wseq),
+            counter_resets: Default::default(),
         })
     }
 
@@ -560,6 +570,35 @@ impl Storage {
     /// from the binlog at open.
     pub(crate) fn defer_data_sync(&mut self) {
         self.durability = Durability::Eventual;
+    }
+
+    /// How many committed writes have deleted the id counter at `key` since
+    /// this file was opened -- a TRUNCATE, a DROP, a rebuild, however the
+    /// write arrived: a statement, or a write applied from a Raft leader, a
+    /// primary, a binlog or a snapshot. The engine's in-memory id allocator
+    /// for `key` starts again from what is stored when it has moved.
+    pub fn counter_resets(&self, key: &[u8]) -> u64 {
+        self.counter_resets
+            .lock()
+            .unwrap()
+            .get(key)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Record that a committed write deleted `keys`, counting the id counters
+    /// among them.
+    fn note_counter_deletes<'a>(&self, keys: impl Iterator<Item = &'a [u8]>) {
+        let mut counters = keys
+            .filter(|k| COUNTER_PREFIXES.iter().any(|p| k.starts_with(p)))
+            .peekable();
+        if counters.peek().is_none() {
+            return;
+        }
+        let mut resets = self.counter_resets.lock().unwrap();
+        for k in counters {
+            *resets.entry(k.to_vec()).or_insert(0) += 1;
+        }
     }
 
     pub fn is_relaxed_durability(&self) -> bool {
@@ -622,6 +661,7 @@ impl Storage {
             durability: Durability::Immediate,
             flush_seq: std::sync::atomic::AtomicU64::new(0),
             wseq: std::sync::atomic::AtomicU64::new(0),
+            counter_resets: Default::default(),
         })
     }
 
@@ -698,6 +738,7 @@ impl Storage {
                 .map_err(|e| Error::Storage(e.to_string()))?;
         }
         wtx.commit().map_err(|e| Error::Storage(e.to_string()))?;
+        self.note_counter_deletes(std::iter::once(key));
         if touches_schema(std::iter::once(key)) {
             bump_schema_generation();
         }
@@ -1214,6 +1255,10 @@ impl Storage {
             record_binlog_lsn(&mut t, &outcomes, before_commit)?;
         }
         wtx.commit().map_err(|e| Error::Storage(e.to_string()))?;
+        self.note_counter_deletes(
+            jobs.iter()
+                .flat_map(|j| j.deletes.iter().map(Vec::as_slice)),
+        );
         if jobs.iter().any(|j| {
             touches_schema(j.puts.iter().map(|(k, _)| k.as_slice()))
                 || touches_schema(j.deletes.iter().map(Vec::as_slice))
@@ -1280,6 +1325,7 @@ impl Storage {
                 .map_err(|e| Error::Storage(e.to_string()))?;
         }
         wtx.commit().map_err(|e| Error::Storage(e.to_string()))?;
+        self.note_counter_deletes(deletes.iter().map(Vec::as_slice));
         if touches_schema(puts.iter().map(|(k, _)| k.as_slice()))
             || touches_schema(deletes.iter().map(Vec::as_slice))
         {
@@ -1310,6 +1356,7 @@ impl Storage {
                 .map_err(|e| Error::Storage(e.to_string()))?;
         }
         wtx.commit().map_err(|e| Error::Storage(e.to_string()))?;
+        self.note_counter_deletes(deletes.iter().map(Vec::as_slice));
         if touches_schema(puts.iter().map(|(k, _)| k.as_slice()))
             || touches_schema(deletes.iter().map(Vec::as_slice))
         {
@@ -1379,6 +1426,10 @@ impl Storage {
             record_binlog_lsn(&mut t, &outcomes, before_commit)?;
         }
         wtx.commit().map_err(|e| Error::Storage(e.to_string()))?;
+        self.note_counter_deletes(
+            jobs.iter()
+                .flat_map(|j| j.deletes.iter().map(Vec::as_slice)),
+        );
         if schema {
             bump_schema_generation();
         }
@@ -1448,6 +1499,10 @@ impl Storage {
             record_binlog_lsn(&mut t, &outcomes, before_commit)?;
         }
         wtx.commit().map_err(|e| Error::Storage(e.to_string()))?;
+        self.note_counter_deletes(
+            jobs.iter()
+                .flat_map(|j| j.deletes.iter().map(Vec::as_slice)),
+        );
         if schema {
             bump_schema_generation();
         }
@@ -1493,6 +1548,7 @@ impl Storage {
                 .map_err(|e| Error::Storage(e.to_string()))?;
         }
         wtx.commit().map_err(|e| Error::Storage(e.to_string()))?;
+        self.note_counter_deletes(deletes.iter().map(Vec::as_slice));
         if touches_schema(new.iter().chain(aux).map(|(k, _)| k.as_slice()))
             || touches_schema(deletes.iter().map(Vec::as_slice))
         {

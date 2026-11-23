@@ -8,6 +8,21 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ### Fixed
 
+- **A Raft snapshot sets AUTO_INCREMENT counters to the leader's.** A write
+  only moves an id counter forward unless it deletes it, so a follower that
+  installed a snapshot kept its own counter where the leader's was lower --
+  a `TRUNCATE` on the leader since the follower fell behind -- and the two
+  nodes went on with different counters.
+- **A TRUNCATE or DROP applied for another node resets the AUTO_INCREMENT
+  allocator too.** On a Raft follower or a replica the write arrives through
+  storage, not through a statement, and the in-memory allocator did not hear
+  of it: once that node led, it went on from the table's old values -- which
+  a `TINYINT` or `SMALLINT` key could overflow. Storage now counts every
+  deletion of an id counter, however the write arrived, and an allocator
+  whose counter was reset starts again from what is stored.
+
+### Fixed
+
 - **A new database with a binlog no longer loses its first commits in a power
   loss.** With `--binlog` the data file is synced only by the periodic flush
   (`ELYRASQL_SYNC_INTERVAL_MS`), and what it lacks after a crash is replayed
