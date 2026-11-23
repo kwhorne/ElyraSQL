@@ -24,8 +24,6 @@ ignore = [
     # non-compiling protest release); a bump is a deliberate data-format
     # migration, not a routine update.
     "RUSTSEC-2025-0141", # bincode unmaintained
-    # Transitive via a proc-macro dependency; build-time only, not shipped.
-    "RUSTSEC-2026-0173", # proc-macro-error2 unmaintained
     # Transitive via tokio-rustls 0.25; leaves with the rustls 0.23 upgrade.
     "RUSTSEC-2025-0134", # rustls-pemfile unmaintained
 
