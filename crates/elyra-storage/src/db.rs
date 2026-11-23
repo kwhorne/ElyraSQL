@@ -206,10 +206,27 @@ fn flush_durably(storage: &Storage, binlog: Option<&crate::binlog::BinlogSync>) 
 /// is taken as is.
 fn recover_from_binlog(storage: &Storage, dir: &std::path::Path) -> Result<u64> {
     let logged = crate::binlog::max_lsn(dir)?;
-    let held = storage
+    let stored = storage
         .get(crate::BINLOG_LSN_KEY)?
         .filter(|v| v.len() == 8)
         .map(|v| u64::from_le_bytes(v[..8].try_into().unwrap()));
+    let held = match stored {
+        Some(held) => Some(held),
+        // A database that never recorded how far it holds the binlog: a new
+        // file, or one from before 1.12.18. The data file is synced only by
+        // the periodic flush, so the first commits used to be lost for good
+        // when the machine went down before that flush: the file came back
+        // without the key and nothing was replayed. The key is now written,
+        // durably, before any commit -- and an empty file whose binlog holds
+        // the whole history from LSN 1 (left so by that loss) gets it back.
+        None if logged > 0 && storage.write_epoch()? == 0 && history_complete(dir, logged)? => {
+            Some(0)
+        }
+        None => {
+            record_binlog_lsn_durably(storage, logged)?;
+            None
+        }
+    };
     match held {
         Some(held) if logged > held => {
             let missing = crate::binlog::read_since(dir, held, logged)?;
@@ -245,6 +262,23 @@ fn recover_from_binlog(storage: &Storage, dir: &std::path::Path) -> Result<u64> 
         }
         _ => Ok(logged),
     }
+}
+
+/// Whether the binlog in `dir` holds every record from LSN 1 to `logged`.
+fn history_complete(dir: &std::path::Path, logged: u64) -> Result<bool> {
+    let records = crate::binlog::read_since(dir, 0, logged)?;
+    Ok(records
+        .iter()
+        .zip(1..)
+        .all(|(rec, expected)| rec.lsn == expected)
+        && records.len() as u64 == logged)
+}
+
+/// Record that the database holds the binlog up to `lsn`, and make it durable
+/// at once rather than at the next periodic flush.
+fn record_binlog_lsn_durably(storage: &Storage, lsn: u64) -> Result<()> {
+    storage.apply_jobs_with(&[], &mut |_| Ok(Some(lsn)))?;
+    storage.flush()
 }
 
 /// Bound on the writer queue → backpressure under write storms.

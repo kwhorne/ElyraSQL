@@ -6,6 +6,20 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **A new database with a binlog no longer loses its first commits in a power
+  loss.** With `--binlog` the data file is synced only by the periodic flush
+  (`ELYRASQL_SYNC_INTERVAL_MS`), and what it lacks after a crash is replayed
+  from the binlog -- from the position the database records with its data.
+  A new database recorded that position only with its first commit, so when
+  the machine went down before the first flush the file came back empty and
+  without it, and nothing was replayed: up to 200 ms of acknowledged commits
+  were lost. The same held for a database from before 1.12.18, once. The
+  position is now written durably at open, before any commit. An empty data
+  file whose binlog holds the whole history from LSN 1 -- what that loss left
+  behind -- gets it back at the next start.
+
 ## [1.12.18] - 2026-11-23
 
 Durability of the binlog, replicas and Raft clusters (P0-5 of the technical
