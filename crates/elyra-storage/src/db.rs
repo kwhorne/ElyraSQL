@@ -597,6 +597,11 @@ impl Db {
         *self.consensus.lock().unwrap() = Some(c);
     }
 
+    /// See [`crate::Storage::counter_resets`].
+    pub fn counter_resets(&self, key: &[u8]) -> u64 {
+        self.storage.counter_resets(key)
+    }
+
     /// Refuse queries with `why` until called again with `None` (see
     /// [`Db::fence`]).
     pub fn set_fence(&self, why: Option<String>) {

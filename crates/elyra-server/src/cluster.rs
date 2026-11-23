@@ -1083,12 +1083,20 @@ impl Node {
             .into_iter()
             .filter(|(k, _)| k.as_slice() != INSTALLING_KEY)
             .collect();
+        // An id counter is written only forward, unless the same write deletes
+        // it: the leader's may be lower than this node's -- a TRUNCATE since --
+        // and used to be refused, so the node kept its own.
+        let counters: Vec<Vec<u8>> = puts
+            .iter()
+            .filter(|(k, _)| elyra_storage::is_id_counter(k))
+            .map(|(k, _)| k.clone())
+            .collect();
         if !puts.is_empty() {
             self.db
                 .apply_ordered(
                     vec![WriteOp::Plain {
                         puts,
-                        deletes: Vec::new(),
+                        deletes: counters,
                     }],
                     Vec::new(),
                 )
@@ -2430,6 +2438,44 @@ mod tests {
         let (node, db) = single_node(&dir);
         assert!(!node.discard_install.load(Ordering::SeqCst));
         assert_eq!(node.log.lock().unwrap().last_applied(), 50);
+        close(node, db).await;
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// An id counter becomes the leader's even where that is lower -- a
+    /// TRUNCATE on the leader since this node fell behind. It used to keep its
+    /// own: writes only move a counter forward unless they delete it.
+    #[tokio::test]
+    async fn a_snapshot_sets_id_counters_exactly() {
+        let dir = temp_dir("install-counter");
+        let (node, db) = single_node(&dir);
+        db.commit(
+            vec![(
+                b"meta::autoinc::orders".to_vec(),
+                1000u64.to_le_bytes().to_vec(),
+            )],
+            vec![],
+        )
+        .await
+        .unwrap();
+        let chunk = vec![(
+            b"meta::autoinc::orders".to_vec(),
+            5u64.to_le_bytes().to_vec(),
+        )];
+        let ack = snapshot_part(&node, 1, 0, chunk, true).await.unwrap();
+        assert!(matches!(
+            ack,
+            Msg::SnapshotAck {
+                ok: true,
+                done: true,
+                ..
+            }
+        ));
+        assert_eq!(
+            db.get(b"meta::autoinc::orders".to_vec()).await.unwrap(),
+            Some(5u64.to_le_bytes().to_vec())
+        );
+        assert_eq!(db.counter_resets(b"meta::autoinc::orders"), 1);
         close(node, db).await;
         std::fs::remove_dir_all(&dir).unwrap();
     }

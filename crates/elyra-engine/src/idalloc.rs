@@ -10,7 +10,10 @@
 //!
 //! The stored counter is only what an allocator resumes from: the first time a
 //! table is used after start, and after a write that deletes the counter
-//! (TRUNCATE, DROP, a rebuild), which is how a reset reaches the allocator.
+//! (TRUNCATE, DROP, a rebuild), which is how a reset reaches the allocator --
+//! whichever way that write arrived: a statement here, or a write applied from
+//! a Raft leader, a primary, a binlog or a snapshot (see
+//! `elyra_storage::Storage::counter_resets`).
 //! Storage keeps the stored value from moving backwards when commits that
 //! persist it land out of order (see `put_kv` in `elyra-storage`).
 
@@ -24,7 +27,9 @@ use crate::session::Session;
 
 const COUNTER_PREFIXES: [&[u8]; 2] = [b"meta::autoinc::", b"meta::rowid::"];
 
-type Counters = HashMap<(u64, Vec<u8>), Arc<AtomicI64>>;
+/// Each allocator, with how many resets of its counter storage had seen when
+/// it was loaded.
+type Counters = HashMap<(u64, Vec<u8>), (Arc<AtomicI64>, u64)>;
 
 fn counters() -> &'static Mutex<Counters> {
     static COUNTERS: OnceLock<Mutex<Counters>> = OnceLock::new();
@@ -34,6 +39,9 @@ fn counters() -> &'static Mutex<Counters> {
 /// The allocator for the counter stored at `key`: `fetch_add(1) + 1` is the
 /// next value, and `fetch_max(n)` records an explicitly inserted one.
 pub async fn counter(db: &Session, key: Vec<u8>) -> Result<Arc<AtomicI64>> {
+    // Read before the stored value: a reset committed in between moves it on
+    // again, and the next call starts over.
+    let resets = db.raw_db().counter_resets(&key);
     // The committed value, not a transaction's snapshot: ids are not
     // transactional, as in MySQL.
     let stored = match db.raw_db().get(key.clone()).await? {
@@ -42,12 +50,20 @@ pub async fn counter(db: &Session, key: Vec<u8>) -> Result<Arc<AtomicI64>> {
         }
         _ => 0,
     };
-    let counter = counters()
-        .lock()
-        .unwrap()
-        .entry((db.db_id(), key))
-        .or_insert_with(|| Arc::new(AtomicI64::new(stored)))
-        .clone();
+    let counter = {
+        let mut counters = counters().lock().unwrap();
+        let entry = counters
+            .entry((db.db_id(), key))
+            .or_insert_with(|| (Arc::new(AtomicI64::new(stored)), resets));
+        // A counter was deleted since this allocator was loaded, maybe by a
+        // write this node applied for another: a TRUNCATE on a Raft leader used
+        // to leave a follower's allocator at the old values, which it went on
+        // from once it led.
+        if entry.1 < resets {
+            *entry = (Arc::new(AtomicI64::new(stored)), resets);
+        }
+        entry.0.clone()
+    };
     // Another node may have advanced it (a former Raft leader), or it was
     // never loaded; never hand out a value the stored counter already covers.
     counter.fetch_max(stored, Ordering::SeqCst);
