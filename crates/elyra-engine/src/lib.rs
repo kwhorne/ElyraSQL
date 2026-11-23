@@ -10712,6 +10712,109 @@ mod schema_cache_in_transaction_tests {
 }
 
 #[cfg(test)]
+mod n6_tests {
+    use super::{Engine, Privilege, QueryResult, Session};
+    use elyra_storage::Db;
+
+    async fn run(e: &Engine, s: &Session, sql: &str) -> Vec<QueryResult> {
+        e.execute(sql, Privilege::Admin, s)
+            .await
+            .unwrap_or_else(|err| panic!("{sql}\n  -> {err}"))
+    }
+
+    async fn rows(e: &Engine, s: &Session, sql: &str) -> Vec<Vec<String>> {
+        let QueryResult::Rows(mut rows) = run(e, s, sql).await.remove(0) else {
+            panic!("expected rows for {sql}");
+        };
+        let mut out = Vec::new();
+        loop {
+            let batch = rows.next_batch(4096).await.unwrap();
+            if batch.is_empty() {
+                break;
+            }
+            out.extend(batch.into_iter().map(|r| {
+                r.into_iter()
+                    .map(|v| v.to_wire_string().unwrap_or_else(|| "NULL".into()))
+                    .collect()
+            }));
+        }
+        out
+    }
+
+    /// A streamed SELECT reads one state of the table, whatever commits land
+    /// while its rows are sent.
+    #[tokio::test]
+    async fn a_streamed_scan_reads_one_snapshot() {
+        let e = Engine::new(Db::in_memory().unwrap());
+        let s = e.session();
+        run(&e, &s, "CREATE TABLE t (id INT PRIMARY KEY, bal INT)").await;
+        let values: Vec<String> = (1..=5000).map(|i| format!("({i}, 1)")).collect();
+        run(
+            &e,
+            &s,
+            &format!("INSERT INTO t VALUES {}", values.join(", ")),
+        )
+        .await;
+        let QueryResult::Rows(mut stream) = run(&e, &s, "SELECT id, bal FROM t").await.remove(0)
+        else {
+            panic!("expected rows");
+        };
+        let mut total = 0i64;
+        let first = stream.next_batch(100).await.unwrap();
+        total += first
+            .iter()
+            .map(|r| r[1].to_wire_string().unwrap().parse::<i64>().unwrap())
+            .sum::<i64>();
+        // A transfer from the first row, already sent, to the last, not yet.
+        let other = e.session();
+        run(&e, &other, "START TRANSACTION").await;
+        run(&e, &other, "UPDATE t SET bal = bal - 1 WHERE id = 1").await;
+        run(&e, &other, "UPDATE t SET bal = bal + 1 WHERE id = 5000").await;
+        run(&e, &other, "COMMIT").await;
+        loop {
+            let batch = stream.next_batch(4096).await.unwrap();
+            if batch.is_empty() {
+                break;
+            }
+            total += batch
+                .iter()
+                .map(|r| r[1].to_wire_string().unwrap().parse::<i64>().unwrap())
+                .sum::<i64>();
+        }
+        assert_eq!(total, 5000, "the scan saw part of a transfer");
+    }
+
+    /// DROP TABLE takes the table's partitioning and statistics with it: a
+    /// table created under the same name used to inherit them.
+    #[tokio::test]
+    async fn a_dropped_table_leaves_no_partitioning_or_statistics_behind() {
+        let e = Engine::new(Db::in_memory().unwrap());
+        let s = e.session();
+        run(
+            &e,
+            &s,
+            "CREATE TABLE p (id INT PRIMARY KEY) PARTITION BY RANGE (id) \
+             (PARTITION p0 VALUES LESS THAN (10), PARTITION p1 VALUES LESS THAN MAXVALUE)",
+        )
+        .await;
+        run(&e, &s, "INSERT INTO p VALUES (1), (20)").await;
+        run(&e, &s, "ANALYZE TABLE p").await;
+        run(&e, &s, "DROP TABLE p").await;
+        run(&e, &s, "CREATE TABLE p (id INT PRIMARY KEY)").await;
+        let create = rows(&e, &s, "SHOW CREATE TABLE p").await[0][1].clone();
+        assert!(!create.contains("PARTITION"), "{create}");
+        let db = s.raw_db();
+        for key in ["partmeta::p", "stats::p"] {
+            assert_eq!(
+                db.get(key.as_bytes().to_vec()).await.unwrap(),
+                None,
+                "{key}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod concurrent_insert_id_tests {
     //! Concurrent INSERTs must get distinct AUTO_INCREMENT values and row ids.
     //! Each statement read the stored counter and counted up from it on its

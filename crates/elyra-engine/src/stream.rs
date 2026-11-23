@@ -41,8 +41,12 @@ struct Spill {
 }
 
 struct Scan {
-    db: Db,
+    /// The committed state the statement reads, taken when it began: every
+    /// part of the scan comes from it.
+    snapshot: elyra_storage::Snapshot,
     prefix: Vec<u8>,
+    /// The first key after the table's rows.
+    end: Vec<u8>,
     cursor: Option<Vec<u8>>,
     /// Full table schema — needed to evaluate the predicate on whole rows.
     full_schema: Schema,
@@ -128,13 +132,24 @@ impl RowStream {
         }
     }
 
-    /// Stream a clustered table scan.
-    pub fn scan(db: Db, table: &TableDef, spec: ScanSpec) -> Self {
-        Self {
+    /// Stream a clustered table scan, from one snapshot of the committed state.
+    ///
+    /// Each part of the scan used to be read in a read transaction of its own,
+    /// so a statement over more than one part saw commits that landed while it
+    /// ran: a row moved from the start of the table to the end could be read
+    /// twice, and a sum over the rows could match no state the table was ever
+    /// in.
+    pub fn scan(db: Db, table: &TableDef, spec: ScanSpec) -> Result<Self> {
+        let prefix = table.data_prefix();
+        let mut end = prefix.clone();
+        // Data prefixes end in `::`, so the next byte value bounds the table.
+        *end.last_mut().expect("a data prefix is not empty") += 1;
+        Ok(Self {
             schema: spec.out_schema,
             src: Source::Scan(Scan {
-                db,
-                prefix: table.data_prefix(),
+                snapshot: db.snapshot()?,
+                prefix,
+                end,
                 cursor: None,
                 full_schema: table.schema.clone(),
                 projection_unique: {
@@ -151,7 +166,7 @@ impl RowStream {
                 limit: spec.limit,
                 done: false,
             }),
-        }
+        })
     }
 
     /// Build a stream over an already-open spill file.
@@ -249,10 +264,20 @@ impl Scan {
                 break;
             }
 
-            let chunk = self
-                .db
-                .scan_batch(self.prefix.clone(), self.cursor.clone(), SCAN_CHUNK)
-                .await?;
+            let from = match &self.cursor {
+                Some(last) => {
+                    let mut next = last.clone();
+                    next.push(0);
+                    next
+                }
+                None => self.prefix.clone(),
+            };
+            let (snapshot, end) = (self.snapshot.clone(), self.end.clone());
+            let chunk = tokio::task::spawn_blocking(move || {
+                snapshot.scan_range(&from, Some(&end), SCAN_CHUNK)
+            })
+            .await
+            .map_err(|e| Error::Storage(format!("scan task failed: {e}")))??;
 
             if chunk.len() < SCAN_CHUNK {
                 self.done = true;
