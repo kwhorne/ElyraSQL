@@ -468,6 +468,96 @@ mod tests {
         dir.join(segment_name(*list_seqs(dir).unwrap().last().unwrap()))
     }
 
+    fn binlog_lsn(data: &Path) -> Option<u64> {
+        let s = crate::Storage::open(data).unwrap();
+        s.get(crate::BINLOG_LSN_KEY)
+            .unwrap()
+            .map(|v| u64::from_le_bytes(v[..8].try_into().unwrap()))
+    }
+
+    /// The data file of a database with a binlog is synced only by the
+    /// periodic flush. A new database recorded how far it held the binlog only
+    /// with its first commit, so when the machine went down before the first
+    /// flush the file came back empty and without that record -- and the
+    /// commits in the binlog were never replayed.
+    #[tokio::test]
+    async fn a_new_database_records_its_binlog_position_before_any_commit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (data, log) = (tmp.path().join("d.edb"), tmp.path().join("log"));
+        let db = Db::open_with_binlog(&data, Some(log.clone())).unwrap();
+        let closed = db.close_waiter();
+        drop(db);
+        assert!(closed.wait(std::time::Duration::from_secs(5)));
+        assert_eq!(binlog_lsn(&data), Some(0), "recorded, and durably, at open");
+    }
+
+    /// What that loss left behind: an empty data file and a binlog with the
+    /// whole history. The commits are replayed.
+    #[tokio::test]
+    async fn an_empty_database_gets_back_a_complete_binlog() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("log");
+        session(
+            &tmp.path().join("first.edb"),
+            &log,
+            &[("data::a", "1"), ("data::b", "2"), ("data::c", "3")],
+        )
+        .await;
+        // The same binlog with a data file that lost every commit.
+        let data = tmp.path().join("d.edb");
+        let db = Db::open_with_binlog(&data, Some(log.clone())).unwrap();
+        for k in ["data::a", "data::b", "data::c"] {
+            assert!(
+                db.get(k.as_bytes().to_vec()).await.unwrap().is_some(),
+                "{k}"
+            );
+        }
+        assert_eq!(db.current_lsn(), 3);
+        let closed = db.close_waiter();
+        drop(db);
+        assert!(closed.wait(std::time::Duration::from_secs(5)));
+
+        // A binlog that no longer starts at LSN 1 cannot rebuild a database:
+        // nothing is replayed into an empty one.
+        session(&data, &log, &[("data::d", "4")]).await;
+        let first = log.join(segment_name(list_seqs(&log).unwrap()[0]));
+        std::fs::remove_file(first).unwrap();
+        assert_eq!(max_lsn(&log).unwrap(), 4);
+        let data = tmp.path().join("e.edb");
+        let db = Db::open_with_binlog(&data, Some(log.clone())).unwrap();
+        assert!(db.get(b"data::d".to_vec()).await.unwrap().is_none());
+        let closed = db.close_waiter();
+        drop(db);
+        assert!(closed.wait(std::time::Duration::from_secs(5)));
+    }
+
+    /// A database from before 1.12.18 that already holds its data: it records
+    /// the binlog's end, and nothing is applied twice.
+    #[tokio::test]
+    async fn a_database_with_data_but_no_position_takes_the_binlogs_end() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (data, log) = (tmp.path().join("d.edb"), tmp.path().join("log"));
+        session(&data, &log, &[("data::a", "1"), ("data::b", "2")]).await;
+        {
+            let s = crate::Storage::open(&data).unwrap();
+            s.apply(
+                &[(b"data::a".to_vec(), b"changed".to_vec())],
+                &[crate::BINLOG_LSN_KEY.to_vec()],
+            )
+            .unwrap();
+        }
+        let db = Db::open_with_binlog(&data, Some(log.clone())).unwrap();
+        assert_eq!(
+            db.get(b"data::a".to_vec()).await.unwrap(),
+            Some(b"changed".to_vec()),
+            "the binlog was applied over newer data"
+        );
+        let closed = db.close_waiter();
+        drop(db);
+        assert!(closed.wait(std::time::Duration::from_secs(5)));
+        assert_eq!(binlog_lsn(&data), Some(2));
+    }
+
     /// Open, write, close: what a server start, some commits and a stop leave.
     async fn session(data: &Path, log: &Path, writes: &[(&str, &str)]) -> u64 {
         let db = Db::open_with_binlog(data, Some(log.to_path_buf())).unwrap();
