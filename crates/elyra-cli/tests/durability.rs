@@ -114,3 +114,86 @@ async fn committed_rows_survive_sigkill() {
     let _ = child2.wait();
     let _ = std::fs::remove_file(&data);
 }
+
+/// With `--binlog` the binlog is the write-ahead log: each commit is synced
+/// there, and the data file only by the periodic flush. Killed before that
+/// flush, the data file lacks the commits, and the next start replays them
+/// from the binlog -- every acknowledged one.
+#[tokio::test]
+async fn committed_rows_survive_sigkill_with_a_binlog_and_no_flush() {
+    let port = free_port();
+    let dir = std::env::temp_dir().join(format!("elyrasql-binlog-kill-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let data = dir.join("d.edb");
+    let log = dir.join("server.log");
+    let start = |port: u16| {
+        let out = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log)
+            .unwrap();
+        Command::new(BIN)
+            .args(["serve", "--data"])
+            .arg(&data)
+            .arg("--binlog")
+            .arg(dir.join("binlog"))
+            .args(["--listen", &format!("127.0.0.1:{port}")])
+            .env("ELYRASQL_SYNC", "full")
+            // The data file is not flushed while the test runs.
+            .env("ELYRASQL_SYNC_INTERVAL_MS", "10000")
+            .env("RUST_LOG", "warn")
+            .env("NO_COLOR", "1")
+            .stdout(out.try_clone().unwrap())
+            .stderr(out)
+            .spawn()
+            .expect("spawn elyrasql")
+    };
+
+    let mut child = start(port);
+    wait_ready(port).await;
+    conn(port)
+        .await
+        .query_drop("CREATE TABLE t (id INT PRIMARY KEY, w INT)")
+        .await
+        .unwrap();
+    // Wait out the flush that follows the table's creation.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let writers: Vec<_> = (0..4)
+        .map(|w| {
+            tokio::spawn(async move {
+                let mut c = conn(port).await;
+                for i in 0..100 {
+                    c.query_drop(format!("INSERT INTO t VALUES ({}, {w})", w * 1000 + i))
+                        .await
+                        .unwrap();
+                }
+            })
+        })
+        .collect();
+    for w in writers {
+        w.await.unwrap();
+    }
+    child.kill().expect("kill");
+    let _ = child.wait();
+
+    let port = free_port();
+    let mut child = start(port);
+    wait_ready(port).await;
+    let mut c = conn(port).await;
+    let n: i64 = c
+        .query_first("SELECT COUNT(*) FROM t")
+        .await
+        .unwrap()
+        .unwrap();
+    let _ = child.kill();
+    let _ = child.wait();
+    let server_log = std::fs::read_to_string(&log).unwrap_or_default();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(n, 400, "acknowledged commits were lost\n{server_log}");
+    // They came from the binlog: the data file was not synced for them.
+    assert!(
+        server_log.contains("applied binlog records the database did not hold"),
+        "the data file held the commits already; the test did not exercise the replay\n{server_log}"
+    );
+}
