@@ -487,6 +487,12 @@ async fn run() -> anyhow::Result<()> {
         } => {
             let db = Db::open(&data)?;
             let engine = Engine::new(db.clone());
+            // The same migrations `serve` runs at open, before any connection
+            // and before Raft is wired in: each node brings its own data up to
+            // the current format, as the others do theirs. A cluster node used
+            // to skip them, so one upgraded from before 1.12.17 kept indexes
+            // over FLOAT/DOUBLE and binary columns that held no rows.
+            engine.migrate_collation().await?;
             let read_only = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
             let peers = peers
                 .iter()
@@ -556,6 +562,10 @@ async fn run() -> anyhow::Result<()> {
             tracing::info!(?data, %primary, "starting ElyraSQL replica");
             let db = open_replica(&data).await?;
             let engine = Engine::new(db.clone());
+            // Resumed data is in the format of the version that wrote it:
+            // migrate it, as `serve` does, before the primary's stream -- in
+            // the current format -- is applied on top of it.
+            engine.migrate_collation().await?;
 
             // Apply the primary's stream in the background. `run_replica`
             // reconnects transparently on stream drops and returns when it
