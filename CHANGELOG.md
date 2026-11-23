@@ -8,6 +8,23 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ### Fixed
 
+- **A Raft follower far behind is reached in one step, not one entry per
+  round.** A leader whose entries a follower refused went back one entry at
+  a time. When that follower was needed for the quorum -- with another one
+  receiving a snapshot -- the leader lost its lease before it got there, and
+  each new leader started over from the end of its log: writes stalled for
+  good (found by the new chaos test). A follower now says how far back the
+  logs may still agree -- the end of its log, or the entry before the term
+  they disagree on -- and the leader goes there at once.
+- **A Raft node that hears from no leader no longer deposes the one there
+  is.** A node not yet added to the cluster, or cut off from it, stood for
+  election every timeout, each time in a higher term; every peer took that
+  term on, and the leader stepped down for it. One such node deposed the
+  leader every second or two, so a membership change could be lost and a
+  snapshot transfer to the new node never finished (found by the new chaos
+  test). A node now asks first whether a majority would vote for it
+  (Raft's PreVote), which nodes refuse while they have a leader, and stands
+  only then.
 - **A Raft follower no longer reports entries it does not share with the
   leader as matched.** After appending, it reported the end of its log, so a
   tail left from an earlier term, beyond what the leader had sent, counted
@@ -92,6 +109,12 @@ All notable changes to ElyraSQL are documented here. The format is based on
   `ELYRASQL_RAFT_LOG_KEEP_BYTES`, `ELYRASQL_RAFT_SNAPSHOT_CHUNK_BYTES`.
 - Raft cluster tests that run real `elyrasql cluster` processes: start, kill,
   restart and add nodes (`crates/elyra-cli/tests/raft_cluster.rs`).
+- A Raft chaos test (`crates/elyra-cli/tests/raft_chaos.rs`, run in CI's
+  durability job): clients write all along while nodes are killed and
+  restarted, a follower needs a snapshot, the leader dies and a node joins
+  after compaction; every node must end with the same data, every
+  acknowledged write in it, nothing no client wrote, and transfers between
+  accounts must keep their total.
 
 ### Fixed
 

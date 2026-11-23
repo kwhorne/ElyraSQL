@@ -91,6 +91,16 @@ jobs:
         run: |
           python3 tests/scenarios/s2_robustness.py 3400 /tmp/rb.edb ./target/release/elyrasql
 
+      # A three-node Raft cluster written to all along while nodes are killed
+      # and restarted, a follower needs a snapshot, the leader dies and a node
+      # joins after compaction: every node must end with the same data, every
+      # acknowledged write in it and nothing no client wrote. The seed it
+      # prints replays a failed run (ELYRASQL_RAFT_CHAOS_SEED).
+      - name: Raft chaos
+        env:
+          ELYRASQL_RAFT_CHAOS_SECS: "45"
+        run: cargo test -p elyra-cli --release --test raft_chaos -- --ignored --nocapture
+
   security:
     name: Privilege enforcement & hostile input
     runs-on: ubuntu-24.04
