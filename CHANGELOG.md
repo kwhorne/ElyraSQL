@@ -27,6 +27,18 @@ All notable changes to ElyraSQL are documented here. The format is based on
   to the operating system per commit and replayed at the next start. Pages
   that commits between two flushes replace are freed only by the next flush,
   so under a heavy update load the file can hold a few tens of MB more.
+- **A SELECT streamed outside a transaction reads one state of the table.**
+  Its rows were read a part at a time (1024 rows), each part in a read
+  transaction of its own, so commits that landed while the rows were sent
+  showed in the later parts: a transfer from a row already sent to one not
+  yet sent was counted twice, and the rows added up to a state the table was
+  never in. The scan now reads every part from one snapshot taken when the
+  statement began, as a transaction does.
+- **DROP TABLE takes the table's partitioning and statistics with it.** They
+  stayed behind, and a table created later under the same name inherited
+  them: `SHOW CREATE TABLE`, `information_schema.PARTITIONS` and mysqldump
+  gave it the dropped table's `PARTITION BY`, and the planner its
+  statistics.
 
 - **A Raft snapshot sets AUTO_INCREMENT counters to the leader's.** A write
   only moves an id counter forward unless it deletes it, so a follower that

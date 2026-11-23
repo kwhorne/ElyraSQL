@@ -9133,7 +9133,7 @@ async fn select_inner(
             offset,
             limit,
         },
-    )))
+    )?))
 }
 
 /// Execute a multi-table / JOIN SELECT: materialise the joined row set, then
@@ -27058,6 +27058,11 @@ async fn table_delete_keys(db: &Session, name: &str) -> Result<Vec<Vec<u8>>> {
     // The generation watermark deliberately survives DROP. Deferred cleanup
     // for this logical name may still be running, and a recreated table must
     // use a keyspace newer than anything cleanup can target.
+    // So do its partitioning and its statistics: a table created later under
+    // the same name inherited both, and `SHOW CREATE TABLE` and mysqldump gave
+    // it the old `PARTITION BY`. The write counter (`wcount_key`) stays, like
+    // the generation: cached vector indexes are keyed by it, and a counter
+    // started over could match one built for the dropped table.
     let mut deletes = vec![
         catalog_key(name),
         rowid_key(name),
@@ -27065,6 +27070,8 @@ async fn table_delete_keys(db: &Session, name: &str) -> Result<Vec<Vec<u8>>> {
         temp_owner_key(name),
         catalog::colwidth_key(name),
         catalog::coldecl_key(name),
+        partmeta_key(name),
+        stats_key(name),
     ];
     // A table's triggers go with it, as in MySQL. Left behind, they fired on
     // the next table created under the same name.
