@@ -6,7 +6,73 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.12.19] - 2026-11-23
+
+Fixes from a second review of 1.12.17–1.12.18, and two performance problems
+found while fixing them: writes with `ELYRASQL_SYNC=normal` or `--binlog`
+are 2–7x faster on Linux, and autocommit UPDATE/DELETE up to 6x faster in a
+database with many tables.
+
 ### Fixed
+
+- **A new database with a binlog no longer loses its first commits in a power
+  loss.** With `--binlog` the data file is synced only by the periodic flush
+  (`ELYRASQL_SYNC_INTERVAL_MS`), and what it lacks after a crash is replayed
+  from the binlog -- from the position the database records with its data.
+  A new database recorded that position only with its first commit, so when
+  the machine went down before the first flush the file came back empty and
+  without it, and nothing was replayed: up to 200 ms of acknowledged commits
+  were lost. The same held for a database from before 1.12.18, once. The
+  position is now written durably at open, before any commit. An empty data
+  file whose binlog holds the whole history from LSN 1 -- what that loss left
+  behind -- gets it back at the next start.
+- **`elyrasql cluster` and `elyrasql replica` migrate their data at start, as
+  `serve` does.** They skipped the migrations a new version runs on an
+  existing file before accepting connections, so a cluster node or a resumed
+  replica upgraded from before 1.12.17 kept indexes over FLOAT/DOUBLE and
+  binary columns that held none of their rows: `ORDER BY price LIMIT 10`
+  returned nothing there, while it worked on a server started with `serve`.
+- **A SELECT streamed outside a transaction reads one state of the table.**
+  Its rows were read a part at a time (1024 rows), each part in a read
+  transaction of its own, so commits that landed while the rows were sent
+  showed in the later parts: a transfer from a row already sent to one not
+  yet sent was counted twice, and the rows added up to a state the table was
+  never in. The scan now reads every part from one snapshot taken when the
+  statement began, as a transaction does.
+- **A new replica is copied from one state of the primary, and refuses
+  queries until the copy is complete.** The primary sent its keyspace page by
+  page, each page read in a read transaction of its own, so the copy mixed
+  states the database went through while it was sent (the writes streamed
+  afterwards made it right in the end). It now sends one snapshot. And the
+  replica answered queries from empty or partly filled tables meanwhile, as
+  if the primary held no rows; it now refuses them ("this replica is copying
+  the primary's data"), clients' connection setup included, until the copy
+  ends.
+- **A Raft snapshot sets AUTO_INCREMENT counters to the leader's.** A write
+  only moves an id counter forward unless it deletes it, so a follower that
+  installed a snapshot kept its own counter where the leader's was lower --
+  a `TRUNCATE` on the leader since the follower fell behind -- and the two
+  nodes went on with different counters.
+- **A TRUNCATE or DROP applied for another node resets the AUTO_INCREMENT
+  allocator too.** On a Raft follower or a replica the write arrives through
+  storage, not through a statement, and the in-memory allocator did not hear
+  of it: once that node led, it went on from the table's old values -- which
+  a `TINYINT` or `SMALLINT` key could overflow. Storage now counts every
+  deletion of an id counter, however the write arrived, and an allocator
+  whose counter was reset starts again from what is stored.
+- **DROP TABLE takes the table's partitioning and statistics with it.** They
+  stayed behind, and a table created later under the same name inherited
+  them: `SHOW CREATE TABLE`, `information_schema.PARTITIONS` and mysqldump
+  gave it the dropped table's `PARTITION BY`, and the planner its
+  statistics.
+- **A replica's catch-up and a restart's binlog recovery read only the
+  segments they need.** They read every binlog segment into memory to keep
+  the last few records; they now read back from the newest segment as far as
+  the first record they need, so a damaged segment far back no longer stops
+  them either. `elyrasql replay` reads one segment at a time and applies
+  1000 records per transaction instead of one commit per record.
+
+### Changed
 
 - **`ELYRASQL_SYNC=normal`, and `--binlog`, no longer sync the data file on
   every commit on Linux.** Commits meant to be made durable by the periodic
@@ -27,47 +93,6 @@ All notable changes to ElyraSQL are documented here. The format is based on
   to the operating system per commit and replayed at the next start. Pages
   that commits between two flushes replace are freed only by the next flush,
   so under a heavy update load the file can hold a few tens of MB more.
-- **A SELECT streamed outside a transaction reads one state of the table.**
-  Its rows were read a part at a time (1024 rows), each part in a read
-  transaction of its own, so commits that landed while the rows were sent
-  showed in the later parts: a transfer from a row already sent to one not
-  yet sent was counted twice, and the rows added up to a state the table was
-  never in. The scan now reads every part from one snapshot taken when the
-  statement began, as a transaction does.
-- **DROP TABLE takes the table's partitioning and statistics with it.** They
-  stayed behind, and a table created later under the same name inherited
-  them: `SHOW CREATE TABLE`, `information_schema.PARTITIONS` and mysqldump
-  gave it the dropped table's `PARTITION BY`, and the planner its
-  statistics.
-- **A new replica is copied from one state of the primary, and refuses
-  queries until the copy is complete.** The primary sent its keyspace page by
-  page, each page read in a read transaction of its own, so the copy mixed
-  states the database went through while it was sent (the writes streamed
-  afterwards made it right in the end). It now sends one snapshot. And the
-  replica answered queries from empty or partly filled tables meanwhile, as
-  if the primary held no rows; it now refuses them ("this replica is copying
-  the primary's data"), clients' connection setup included, until the copy
-  ends.
-- **A replica's catch-up and a restart's binlog recovery read only the
-  segments they need.** They read every binlog segment into memory to keep
-  the last few records; they now read back from the newest segment as far as
-  the first record they need, so a damaged segment far back no longer stops
-  them either. `elyrasql replay` reads one segment at a time and applies
-  1000 records per transaction instead of one commit per record.
-
-- **A Raft snapshot sets AUTO_INCREMENT counters to the leader's.** A write
-  only moves an id counter forward unless it deletes it, so a follower that
-  installed a snapshot kept its own counter where the leader's was lower --
-  a `TRUNCATE` on the leader since the follower fell behind -- and the two
-  nodes went on with different counters.
-- **A TRUNCATE or DROP applied for another node resets the AUTO_INCREMENT
-  allocator too.** On a Raft follower or a replica the write arrives through
-  storage, not through a statement, and the in-memory allocator did not hear
-  of it: once that node led, it went on from the table's old values -- which
-  a `TINYINT` or `SMALLINT` key could overflow. Storage now counts every
-  deletion of an id counter, however the write arrived, and an allocator
-  whose counter was reset starts again from what is stored.
-
 - **An autocommit UPDATE or DELETE no longer reads every table's definition.**
   Since 1.12.17 such a statement runs as a transaction of its own, and the
   schema caches -- table definitions, triggers, the foreign keys referencing
@@ -78,23 +103,21 @@ All notable changes to ElyraSQL are documented here. The format is based on
   transaction now uses the caches while no schema change was committed
   since it began and it made none itself; a SERIALIZABLE one still reads
   past them.
-- **A new database with a binlog no longer loses its first commits in a power
-  loss.** With `--binlog` the data file is synced only by the periodic flush
-  (`ELYRASQL_SYNC_INTERVAL_MS`), and what it lacks after a crash is replayed
-  from the binlog -- from the position the database records with its data.
-  A new database recorded that position only with its first commit, so when
-  the machine went down before the first flush the file came back empty and
-  without it, and nothing was replayed: up to 200 ms of acknowledged commits
-  were lost. The same held for a database from before 1.12.18, once. The
-  position is now written durably at open, before any commit. An empty data
-  file whose binlog holds the whole history from LSN 1 -- what that loss left
-  behind -- gets it back at the next start.
-- **`elyrasql cluster` and `elyrasql replica` migrate their data at start, as
-  `serve` does.** They skipped the migrations a new version runs on an
-  existing file before accepting connections, so a cluster node or a resumed
-  replica upgraded from before 1.12.17 kept indexes over FLOAT/DOUBLE and
-  binary columns that held none of their rows: `ORDER BY price LIMIT 10`
-  returned nothing there, while it worked on a server started with `serve`.
+
+### Upgrading
+
+- No change to the database file; a 1.12.18 database opens in 1.12.19
+  unchanged.
+- `ELYRASQL_SYNC=normal` without a binlog: a crash of the process, not only
+  of the machine, can now lose the commits since the last background flush
+  (up to `ELYRASQL_SYNC_INTERVAL_MS`). Use `full`, or add `--binlog`, where
+  that matters. Under a heavy update load the file can hold a few tens of MB
+  more between flushes.
+- A replica refuses queries -- client connection setup included -- while it
+  copies the primary's data, instead of answering from empty tables.
+- `elyrasql cluster` and `elyrasql replica` run the start-up migrations: a
+  node or replica upgraded from before 1.12.17 fills in its FLOAT/DOUBLE and
+  binary indexes at its first start.
 
 ## [1.12.18] - 2026-11-23
 
