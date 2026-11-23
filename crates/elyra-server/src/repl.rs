@@ -398,7 +398,8 @@ pub async fn run_replica(primary: String, db: Db) -> std::io::Result<()> {
         warn!(%primary, "replication transport is UNENCRYPTED - set ELYRASQL_CLUSTER_TLS_CA, or run it on a private network/VPN");
     }
     loop {
-        let last_lsn = read_applied_lsn(&db).await;
+        let applied = applied_lsn(&db).await;
+        let last_lsn = applied.unwrap_or(0);
         let tcp = match TcpStream::connect(&primary).await {
             Ok(s) => s,
             Err(e) => {
@@ -448,14 +449,45 @@ pub async fn run_replica(primary: String, db: Db) -> std::io::Result<()> {
         send_msg(&mut wr, &ReplMsg::Hello { last_lsn }).await?;
 
         let mut snap_pairs = 0u64;
-        while let Some(msg) = recv_msg(&mut rd).await? {
+        // A full snapshot is being applied and has not finished: until it has,
+        // the data is part old, part new and cannot be continued.
+        let mut in_snapshot = false;
+        loop {
+            let msg = match recv_msg(&mut rd).await {
+                Ok(Some(msg)) => msg,
+                Ok(None) if in_snapshot => {
+                    return Err(rebootstrap(
+                        &db,
+                        "the primary closed the stream mid-snapshot",
+                    ));
+                }
+                Ok(None) => break,
+                Err(e) if in_snapshot => {
+                    return Err(rebootstrap(
+                        &db,
+                        &format!("the snapshot stream failed: {e}"),
+                    ));
+                }
+                Err(e) => return Err(e),
+            };
             match msg {
                 ReplMsg::Resync => {
-                    return Err(io(
-                        "primary requested resync (binlog gap); restart replica to re-bootstrap",
+                    return Err(rebootstrap(
+                        &db,
+                        "the primary cannot stream what this replica is missing (its binlog \
+                         no longer covers this replica's LSN)",
+                    ));
+                }
+                ReplMsg::Snap(_) if applied.is_some() && !in_snapshot => {
+                    return Err(rebootstrap(
+                        &db,
+                        "the primary sent a full snapshot to a replica that already has data: \
+                         its history does not continue this replica's (did it restart \
+                         without a binlog?)",
                     ));
                 }
                 ReplMsg::Snap(pairs) => {
+                    in_snapshot = true;
                     snap_pairs += pairs.len() as u64;
                     db.commit(pairs, Vec::new()).await.map_err(io)?;
                 }
@@ -463,6 +495,7 @@ pub async fn run_replica(primary: String, db: Db) -> std::io::Result<()> {
                     db.commit(vec![lsn_bytes(lsn)], Vec::new())
                         .await
                         .map_err(io)?;
+                    in_snapshot = false;
                     info!(lsn, rows = snap_pairs, "caught up; streaming writes");
                     send_msg(&mut wr, &ReplMsg::Ack { lsn }).await?;
                 }
@@ -486,11 +519,43 @@ pub async fn run_replica(primary: String, db: Db) -> std::io::Result<()> {
     }
 }
 
-/// Read the replica's persisted highest-applied LSN (0 if none).
-async fn read_applied_lsn(db: &Db) -> u64 {
+/// The file whose presence tells the next start of a replica on `data` to
+/// discard its data and bootstrap from the primary again.
+pub fn resync_marker(data: &std::path::Path) -> std::path::PathBuf {
+    let mut name = data.as_os_str().to_owned();
+    name.push(".resync");
+    std::path::PathBuf::from(name)
+}
+
+/// Stop replicating and have the next start bootstrap again from scratch.
+///
+/// Used only when this replica's data can no longer be continued: the primary
+/// cannot stream what it is missing, or what it would send does not build on
+/// it. A full snapshot is applied onto an empty file only: applied over
+/// existing data it would add and update keys but never remove one the primary
+/// deleted in the meantime.
+fn rebootstrap(db: &Db, why: &str) -> Error {
+    match db.data_path() {
+        Some(data) => {
+            if let Err(e) = std::fs::write(resync_marker(&data), why) {
+                warn!(error = %e, "could not mark the replica for a new bootstrap");
+            }
+        }
+        None => warn!("in-memory replica cannot be marked for a new bootstrap"),
+    }
+    io(format!(
+        "{why}; the replica bootstraps again on its next start"
+    ))
+}
+
+/// The replica's persisted highest-applied LSN, or `None` before a bootstrap
+/// has completed. It is written with the end of the bootstrap, which can be
+/// LSN 0: a primary without a binlog counts writes only while a replica is
+/// attached, so 0 does not mean "never bootstrapped".
+pub async fn applied_lsn(db: &Db) -> Option<u64> {
     match db.get(REPL_LSN_KEY.to_vec()).await {
-        Ok(Some(b)) if b.len() == 8 => u64::from_le_bytes(b.try_into().unwrap()),
-        _ => 0,
+        Ok(Some(b)) if b.len() == 8 => Some(u64::from_le_bytes(b.try_into().unwrap())),
+        _ => None,
     }
 }
 

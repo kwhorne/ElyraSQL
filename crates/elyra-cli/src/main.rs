@@ -144,13 +144,14 @@ enum Command {
         #[arg(long = "peer", value_name = "ID@HOST:PORT")]
         peers: Vec<String>,
     },
-    /// Run as a read-only replica of a primary. The --data file is disposable:
-    /// it is recreated and re-bootstrapped from the primary on start.
+    /// Run as a read-only replica of a primary. The --data file resumes from the
+    /// last write it applied, catching up from the primary's binlog; it is
+    /// recreated and bootstrapped from the primary when it cannot be continued.
     Replica {
         /// Address of the primary's replication endpoint.
         #[arg(long, env = "ELYRASQL_PRIMARY")]
         primary: String,
-        /// Local database file (recreated on start).
+        /// Local database file (resumed on start when it can be).
         #[arg(long, env = "ELYRASQL_DATA", default_value = "elyra-replica.edb")]
         data: PathBuf,
         /// Address to bind the (read-only) MySQL listener to.
@@ -237,6 +238,44 @@ fn parse_auth_spec(spec: &str) -> anyhow::Result<(String, String, elyra_core::Pr
 /// and Kubernetes send to stop a service. Only SIGINT used to be handled, and
 /// as PID 1 in a container a process ignores a signal it has no handler for:
 /// `docker stop` waited out its timeout and then killed the server.
+/// Open a replica's data file: resume it if it holds a completed bootstrap,
+/// otherwise start it empty.
+///
+/// A replica used to delete its file on every start, so every restart -- an
+/// upgrade, a reboot, a dropped connection -- copied the whole database from
+/// the primary again, although it records the last LSN it applied and the
+/// primary can stream just what it missed from its binlog. The file is still
+/// discarded when there is nothing to resume: no completed bootstrap (a new
+/// replica, or one stopped mid-snapshot), or a marker from `run_replica`
+/// saying the data cannot be continued.
+async fn open_replica(data: &std::path::Path) -> anyhow::Result<Db> {
+    let marker = elyra_server::repl::resync_marker(data);
+    let db = Db::open(data)?;
+    if let Some(applied) = elyra_server::repl::applied_lsn(&db).await {
+        if !marker.exists() {
+            tracing::info!(
+                applied_lsn = applied,
+                "resuming replica from its applied LSN"
+            );
+            return Ok(db);
+        }
+    }
+    let reason =
+        std::fs::read_to_string(&marker).unwrap_or_else(|_| "no completed bootstrap".to_string());
+    let closed = db.close_waiter();
+    drop(db);
+    if !closed.wait(std::time::Duration::from_secs(10)) {
+        anyhow::bail!("the replica's data file is still in use; cannot reset it");
+    }
+    match std::fs::remove_file(data) {
+        Ok(()) => tracing::info!(%reason, "bootstrapping the replica from scratch"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    let _ = std::fs::remove_file(&marker);
+    Ok(Db::open(data)?)
+}
+
 async fn shutdown_signal() -> &'static str {
     #[cfg(unix)]
     {
@@ -514,26 +553,24 @@ async fn run() -> anyhow::Result<()> {
                      credential-less replica."
                 );
             }
-            // Fresh local file: a replica re-bootstraps its whole state.
-            let _ = std::fs::remove_file(&data);
             tracing::info!(?data, %primary, "starting ElyraSQL replica");
-            let db = Db::open(&data)?;
+            let db = open_replica(&data).await?;
             let engine = Engine::new(db.clone());
 
             // Apply the primary's stream in the background. `run_replica`
-            // reconnects transparently on stream drops and only returns when the
-            // primary requests a full resync (binlog gap) -- which needs a fresh
-            // re-bootstrap, i.e. a process restart (the file is wiped on startup
-            // above). Exit with EX_TEMPFAIL (75) so a supervisor treats it as a
-            // restartable transient condition rather than a crash.
+            // reconnects transparently on stream drops and returns when it
+            // cannot go on in-process. Exit with EX_TEMPFAIL (75) so a
+            // supervisor treats it as a restartable transient condition rather
+            // than a crash: the next start resumes from the applied LSN, or
+            // bootstraps again if `run_replica` marked the data for it.
             let rdb = db.clone();
             tokio::spawn(async move {
                 match elyra_server::run_replica(primary, rdb).await {
                     Ok(()) => {
-                        tracing::info!("replication ended; restarting to re-bootstrap");
+                        tracing::info!("replication ended; restarting");
                     }
                     Err(e) => {
-                        tracing::error!(error = %e, "replication stopped; restarting to re-bootstrap");
+                        tracing::error!(error = %e, "replication stopped; restarting");
                     }
                 }
                 // Flush tracing output before terminating the process.

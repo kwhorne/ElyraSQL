@@ -8,6 +8,24 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ### Fixed
 
+- **A restarted replica resumes instead of copying the whole database
+  again.** It deleted its data file on every start, although it records the
+  last LSN it applied and the primary can stream what it missed from its
+  binlog. It now resumes, and bootstraps from scratch only when its data
+  cannot be continued.
+- **A replica no longer keeps rows its primary deleted.** When a reconnecting
+  replica received a full snapshot, it applied it over its existing data.
+  That happened whenever the primary could not stream what it missed: the
+  primary restarted without a binlog, or the replica had been bootstrapped at
+  LSN 0. The snapshot added and updated rows but removed none, so rows deleted
+  on the primary in between stayed on the replica for good: 100 rows against
+  the primary's 50, with no error. A full snapshot is now applied only to an
+  empty file. A replica that needs one while running marks its data
+  (`<data>.resync`) and exits with code 75, and the next start bootstraps it
+  again. So does a replica whose snapshot stream breaks halfway.
+
+### Fixed
+
 - **The binlog can no longer miss a committed write.** It was appended after
   the data commit and only flushed, not fsynced, so a crash at the wrong
   moment could keep a write in the database that the binlog never recorded.
