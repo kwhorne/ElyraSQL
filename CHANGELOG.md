@@ -6,8 +6,46 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.12.18] - 2026-11-23
+
+Durability of the binlog, replicas and Raft clusters (P0-5 of the technical
+review): no acknowledged write is lost or invented on a crash, a restart or a
+failing disk, a restarted replica resumes, and a Raft node that is far behind
+catches up from a snapshot. Raft cluster writes are 2-2.7x faster.
+
 ### Fixed
 
+- **The binlog can no longer miss a committed write.** It was appended after
+  the data commit and only flushed, not fsynced, so a crash at the wrong
+  moment could keep a write in the database that the binlog never recorded.
+  Replicas catching up from the binlog and point-in-time restores would then
+  silently miss it. If an append failed, the error was only logged, and the
+  client was told the commit succeeded. Each group is now written to the
+  binlog before its data commit and is durable no later than it. A binlog
+  error fails the commit. Records the database lacks after a crash are
+  applied at the next start.
+- **A crash during a binlog write no longer breaks the binlog.** A partial
+  record at the end of a segment made the binlog unreadable for replay and
+  replica catch-up, and it reset the LSN counter to 0. Records now carry a
+  CRC32, and a partial record at the end is cut off at start.
+- **The LSN counter no longer restarts at 0 after two restarts without a
+  write.** Every start opens a new segment, and the counter was read from the
+  newest segment only, which was empty.
+- **A restarted replica resumes instead of copying the whole database
+  again.** It deleted its data file on every start, although it records the
+  last LSN it applied and the primary can stream what it missed from its
+  binlog. It now resumes, and bootstraps from scratch only when its data
+  cannot be continued.
+- **A replica no longer keeps rows its primary deleted.** When a reconnecting
+  replica received a full snapshot, it applied it over its existing data.
+  That happened whenever the primary could not stream what it missed: the
+  primary restarted without a binlog, or the replica had been bootstrapped at
+  LSN 0. The snapshot added and updated rows but removed none, so rows deleted
+  on the primary in between stayed on the replica for good: 100 rows against
+  the primary's 50, with no error. A full snapshot is now applied only to an
+  empty file. A replica that needs one while running marks its data
+  (`<data>.resync`) and exits with code 75, and the next start bootstraps it
+  again. So does a replica whose snapshot stream breaks halfway.
 - **A Raft follower far behind is reached in one step, not one entry per
   round.** A leader whose entries a follower refused went back one entry at
   a time. When that follower was needed for the quorum -- with another one
@@ -116,49 +154,38 @@ All notable changes to ElyraSQL are documented here. The format is based on
   acknowledged write in it, nothing no client wrote, and transfers between
   accounts must keep their total.
 
-### Fixed
-
-- **A restarted replica resumes instead of copying the whole database
-  again.** It deleted its data file on every start, although it records the
-  last LSN it applied and the primary can stream what it missed from its
-  binlog. It now resumes, and bootstraps from scratch only when its data
-  cannot be continued.
-- **A replica no longer keeps rows its primary deleted.** When a reconnecting
-  replica received a full snapshot, it applied it over its existing data.
-  That happened whenever the primary could not stream what it missed: the
-  primary restarted without a binlog, or the replica had been bootstrapped at
-  LSN 0. The snapshot added and updated rows but removed none, so rows deleted
-  on the primary in between stayed on the replica for good: 100 rows against
-  the primary's 50, with no error. A full snapshot is now applied only to an
-  empty file. A replica that needs one while running marks its data
-  (`<data>.resync`) and exits with code 75, and the next start bootstraps it
-  again. So does a replica whose snapshot stream breaks halfway.
-
-### Fixed
-
-- **The binlog can no longer miss a committed write.** It was appended after
-  the data commit and only flushed, not fsynced, so a crash at the wrong
-  moment could keep a write in the database that the binlog never recorded.
-  Replicas catching up from the binlog and point-in-time restores would then
-  silently miss it. If an append failed, the error was only logged, and the
-  client was told the commit succeeded. Each group is now written to the
-  binlog before its data commit and is durable no later than it. A binlog
-  error fails the commit. Records the database lacks after a crash are
-  applied at the next start.
-- **A crash during a binlog write no longer breaks the binlog.** A partial
-  record at the end of a segment made the binlog unreadable for replay and
-  replica catch-up, and it reset the LSN counter to 0. Records now carry a
-  CRC32, and a partial record at the end is cut off at start.
-- **The LSN counter no longer restarts at 0 after two restarts without a
-  write.** Every start opens a new segment, and the counter was read from the
-  newest segment only, which was empty.
-
 ### Changed
 
 - With `--binlog` and the default `ELYRASQL_SYNC=full`, the binlog is the
   write-ahead log. It is fsynced on every commit, and the data file is flushed
   in the background, so a commit costs one fsync as before. Binlog segments
   written from this version carry a checksum; older segments are still read.
+- Raft cluster writes are 2-2.7x faster (3 nodes, 1-32 clients): the log
+  file is no longer rewritten and fsynced every replication round, nor the
+  election state on every `AppendEntries`.
+- **All nodes of a Raft cluster must be upgraded together**: 1.12.18 nodes
+  send messages (`InstallSnapshot`, `PreVote`) that earlier ones do not
+  understand.
+
+### Security
+
+- `cookie` 0.18.3 (RUSTSEC-2026-0594). It is not built into ElyraSQL, but the
+  audit covers the whole lock file.
+
+### Upgrading
+
+- No change to the database file. Binlog segments written from this version
+  carry a checksum; older segments are still read.
+- With `--binlog` and `ELYRASQL_SYNC=full`, the data file can trail the
+  binlog by up to `ELYRASQL_SYNC_INTERVAL_MS` after a crash; the next start
+  applies the missing records from the binlog. Keep the binlog directory on
+  storage as reliable as the data file's.
+- A replica now keeps its data file across restarts and resumes from it. One
+  that cannot be continued exits with code 75 and bootstraps again on its
+  next start, so run it under a supervisor that restarts it.
+- Raft clusters: upgrade every node together. On first start a node applies
+  the entries after its last compaction once more, as before; from then on it
+  records how far it has applied.
 
 ## [1.12.17] - 2026-11-22
 
