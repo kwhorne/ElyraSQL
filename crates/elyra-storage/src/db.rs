@@ -275,6 +275,22 @@ struct WriteJob {
     ack: oneshot::Sender<Result<()>>,
 }
 
+/// Writes applied in order in one transaction of their own, with `meta` (see
+/// [`Db::apply_ordered`]).
+struct OrderedBatch {
+    ops: Vec<WriteOp>,
+    meta: Vec<(Vec<u8>, Vec<u8>)>,
+    ack: oneshot::Sender<Result<Vec<Result<()>>>>,
+}
+
+/// What the writer thread is sent.
+enum Job {
+    /// Grouped with its neighbours of the same kind (group commit).
+    Write(WriteJob),
+    /// Applied alone.
+    Ordered(OrderedBatch),
+}
+
 /// Set by the writer thread as it exits, after its `Arc<Storage>` is gone.
 #[derive(Default)]
 struct WriterExit {
@@ -347,7 +363,7 @@ pub struct Db {
     /// cache) key by database so multiple `Db`s in one process never collide.
     id: u64,
     storage: Arc<Storage>,
-    writer: mpsc::Sender<WriteJob>,
+    writer: mpsc::Sender<Job>,
     /// Signalled once the writer thread has exited and released its handle on
     /// the storage. See [`Db::close_waiter`].
     writer_exit: Arc<WriterExit>,
@@ -417,7 +433,7 @@ impl Db {
             storage.defer_data_sync();
         }
         let storage = Arc::new(storage);
-        let (tx, rx) = mpsc::channel::<WriteJob>(WRITE_QUEUE_DEPTH);
+        let (tx, rx) = mpsc::channel::<Job>(WRITE_QUEUE_DEPTH);
         // Opening the binlog cuts off a partial record left by a crash.
         let binlog_dir = binlog.clone();
         let binlog = match binlog {
@@ -545,6 +561,28 @@ impl Db {
 
     fn consensus(&self) -> Option<Arc<dyn Consensus>> {
         self.consensus.lock().unwrap().clone()
+    }
+
+    /// Apply `ops` in order, in one write transaction of their own, together
+    /// with the `meta` puts, bypassing consensus: a result per op (a refused
+    /// validation or a duplicate `INSERT` key), or an error with nothing
+    /// applied at all (see [`crate::Storage::apply_ordered_with`]).
+    ///
+    /// A Raft node applies committed entries this way, storing the index of the
+    /// last one in `meta`, so the database never holds an entry without the
+    /// ones before it, nor an index past an entry it lacks.
+    pub async fn apply_ordered(
+        &self,
+        ops: Vec<WriteOp>,
+        meta: Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> Result<Vec<Result<()>>> {
+        let (ack, wait) = oneshot::channel();
+        self.writer
+            .send(Job::Ordered(OrderedBatch { ops, meta, ack }))
+            .await
+            .map_err(|_| Error::Storage("writer thread stopped".into()))?;
+        wait.await
+            .map_err(|_| Error::Storage("write acknowledgement lost".into()))?
     }
 
     /// Apply a [`WriteOp`] to the local store via the group-commit writer,
@@ -960,13 +998,13 @@ impl Db {
     ) -> Result<()> {
         let (ack, wait) = oneshot::channel();
         self.writer
-            .send(WriteJob {
+            .send(Job::Write(WriteJob {
                 puts: aux,
                 deletes,
                 validation: None,
                 insert_new: Some(new),
                 ack,
-            })
+            }))
             .await
             .map_err(|_| Error::Storage("writer thread stopped".into()))?;
         wait.await
@@ -981,13 +1019,13 @@ impl Db {
     ) -> Result<()> {
         let (ack, wait) = oneshot::channel();
         self.writer
-            .send(WriteJob {
+            .send(Job::Write(WriteJob {
                 puts,
                 deletes,
                 validation,
                 insert_new: None,
                 ack,
-            })
+            }))
             .await
             .map_err(|_| Error::Storage("writer thread stopped".into()))?;
         wait.await
@@ -1009,10 +1047,10 @@ where
 
 /// The writer thread: block for one job, then greedily drain the queue and
 /// commit everything in a single transaction (group commit).
-fn writer_loop(storage: Arc<Storage>, mut rx: mpsc::Receiver<WriteJob>, mut repl: Repl) {
+fn writer_loop(storage: Arc<Storage>, mut rx: mpsc::Receiver<Job>, mut repl: Repl) {
     // A job pulled from the queue that belongs to the *other* batch kind is
     // carried to the next iteration instead of being pushed back.
-    let mut carry: Option<WriteJob> = None;
+    let mut carry: Option<Job> = None;
     loop {
         let first = match carry.take() {
             Some(j) => j,
@@ -1020,6 +1058,13 @@ fn writer_loop(storage: Arc<Storage>, mut rx: mpsc::Receiver<WriteJob>, mut repl
                 Some(j) => j,
                 None => break,
             },
+        };
+        let first = match first {
+            Job::Write(j) => j,
+            Job::Ordered(batch) => {
+                apply_ordered_batch(&storage, batch, &mut repl);
+                continue;
+            }
         };
 
         if first.validation.is_some() {
@@ -1030,9 +1075,9 @@ fn writer_loop(storage: Arc<Storage>, mut rx: mpsc::Receiver<WriteJob>, mut repl
             let mut jobs = vec![first];
             while jobs.len() < GROUP_COMMIT_MAX {
                 match rx.try_recv() {
-                    Ok(job) if job.validation.is_some() => jobs.push(job),
+                    Ok(Job::Write(job)) if job.validation.is_some() => jobs.push(job),
                     Ok(job) => {
-                        carry = Some(job); // plain/insert: next iteration
+                        carry = Some(job); // another kind: next iteration
                         break;
                     }
                     Err(_) => break,
@@ -1048,9 +1093,9 @@ fn writer_loop(storage: Arc<Storage>, mut rx: mpsc::Receiver<WriteJob>, mut repl
         let mut jobs = vec![first];
         while jobs.len() < GROUP_COMMIT_MAX {
             match rx.try_recv() {
-                Ok(job) if job.validation.is_none() => jobs.push(job),
+                Ok(Job::Write(job)) if job.validation.is_none() => jobs.push(job),
                 Ok(job) => {
-                    carry = Some(job); // validated: next iteration
+                    carry = Some(job); // another kind: next iteration
                     break;
                 }
                 Err(_) => break,
@@ -1121,6 +1166,83 @@ fn apply_validated_group(storage: &Arc<Storage>, jobs: Vec<WriteJob>, repl: &mut
             }
         }
     }
+}
+
+/// Apply an [`OrderedBatch`] in one transaction, logging or publishing each op
+/// that was applied, in order.
+fn apply_ordered_batch(storage: &Arc<Storage>, batch: OrderedBatch, repl: &mut Repl) {
+    let OrderedBatch { ops, meta, ack } = batch;
+    let jobs: Vec<crate::OrderedJob<'_>> = ops
+        .iter()
+        .map(|op| match op {
+            WriteOp::Plain { puts, deletes } => crate::OrderedJob {
+                keys: &[],
+                ranges: &[],
+                new: None,
+                puts,
+                deletes,
+            },
+            WriteOp::Validated {
+                keys,
+                ranges,
+                puts,
+                deletes,
+            } => crate::OrderedJob {
+                keys,
+                ranges,
+                new: None,
+                puts,
+                deletes,
+            },
+            WriteOp::Insert { new, aux, deletes } => crate::OrderedJob {
+                keys: &[],
+                ranges: &[],
+                new: Some(new),
+                puts: aux,
+                deletes,
+            },
+        })
+        .collect();
+    let writes: Vec<WriteSet> = if repl.active() {
+        ops.iter()
+            .map(|op| match op {
+                WriteOp::Plain { puts, deletes } | WriteOp::Validated { puts, deletes, .. } => {
+                    (puts.clone(), deletes.clone())
+                }
+                WriteOp::Insert { new, aux, deletes } => {
+                    let mut p = new.clone();
+                    p.extend_from_slice(aux);
+                    (p, deletes.clone())
+                }
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let outcome = if repl.binlog.is_some() {
+        let (mut lsns, mut mark) = (Vec::new(), None);
+        let gate = repl.relaxed_gate.clone();
+        let held = gate.as_ref().map(|g| g.hold());
+        let outcome = storage.apply_ordered_with(&jobs, &meta, &mut |applied| {
+            repl.log_group(&writes, applied, &mut lsns, &mut mark)
+        });
+        drop(held);
+        drop(jobs);
+        repl.finish_group(outcome.is_ok(), writes, &lsns, mark);
+        outcome
+    } else {
+        let outcome = storage.apply_ordered_with(&jobs, &meta, &mut |_| Ok(None));
+        drop(jobs);
+        if let Ok(results) = &outcome {
+            for ((puts, deletes), r) in writes.into_iter().zip(results) {
+                if r.is_ok() {
+                    repl.publish(puts, deletes);
+                }
+            }
+        }
+        outcome
+    };
+    let _ = ack.send(outcome);
 }
 
 /// Acknowledge each job of a group with its own result, or all of them with the

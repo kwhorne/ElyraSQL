@@ -504,7 +504,9 @@ judge fit before deploying.
   leader, and the node neither grants votes nor stands for election. Once
   writes work again it rewrites its log file whole and takes part again. A
   Raft log or election state that cannot be read stops the node from
-  starting. The replication path is
+  starting. Committed entries are applied in batches, each in one
+  transaction together with the index of its last entry, so a restarted node
+  goes on from the last entry its database holds. The replication path is
   **batched for throughput**: the leader holds persistent `AppendEntries`
   connections to followers, appends are fsynced once per round (not per write),
   and committed entries are applied together through the DB's group commit — so

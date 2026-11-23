@@ -348,6 +348,82 @@ pub struct PlainJob<'a> {
     pub deletes: &'a [Vec<u8>],
 }
 
+/// One write of any kind for [`Storage::apply_ordered_with`]: validated
+/// against `keys` and `ranges` (a transactional commit; both empty for any
+/// other write), an `INSERT` when `new` is set, plain otherwise.
+pub struct OrderedJob<'a> {
+    pub keys: &'a [(Vec<u8>, Option<Vec<u8>>)],
+    pub ranges: &'a [RangeSnapshot],
+    pub new: Option<&'a [(Vec<u8>, Vec<u8>)]>,
+    pub puts: &'a [(Vec<u8>, Vec<u8>)],
+    pub deletes: &'a [Vec<u8>],
+}
+
+/// Whether every `(key, value)` in `keys` and every range in `ranges` still
+/// holds what the transaction read: false means another write changed it.
+fn validation_holds(
+    t: &redb::Table<'_, &[u8], &[u8]>,
+    keys: &[(Vec<u8>, Option<Vec<u8>>)],
+    ranges: &[RangeSnapshot],
+) -> Result<bool> {
+    use std::ops::Bound;
+    for (k, exp) in keys {
+        let current = t
+            .get(k.as_slice())
+            .map_err(|e| Error::Storage(e.to_string()))?
+            .map(|v| v.value().to_vec());
+        if &current != exp {
+            return Ok(false);
+        }
+    }
+    for r in ranges {
+        let upper = match &r.end {
+            Some(e) => Bound::Excluded(e.as_slice()),
+            None => Bound::Unbounded,
+        };
+        let mut current = Vec::with_capacity(r.content.len());
+        for item in t
+            .range::<&[u8]>((Bound::Included(r.start.as_slice()), upper))
+            .map_err(|e| Error::Storage(e.to_string()))?
+        {
+            let (k, v) = item.map_err(|e| Error::Storage(e.to_string()))?;
+            current.push((k.value().to_vec(), v.value().to_vec()));
+        }
+        if current != r.content {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Whether an `INSERT` of `new` collides: a key present after the job's own
+/// `deletes`, or one it inserts twice.
+fn insert_collides(
+    t: &redb::Table<'_, &[u8], &[u8]>,
+    new: &[(Vec<u8>, Vec<u8>)],
+    deletes: &[Vec<u8>],
+) -> Result<bool> {
+    let deleted: std::collections::HashSet<&[u8]> = deletes.iter().map(Vec::as_slice).collect();
+    let mut seen = std::collections::HashSet::with_capacity(new.len());
+    for (k, _) in new {
+        let present = !deleted.contains(k.as_slice())
+            && t.get(k.as_slice())
+                .map_err(|e| Error::Storage(e.to_string()))?
+                .is_some();
+        if present || !seen.insert(k.as_slice()) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn duplicate_entry() -> Error {
+    Error::Duplicate(
+        DuplicateError::Entry,
+        "Duplicate entry for key 'PRIMARY'".into(),
+    )
+}
+
 /// Smallest key strictly greater than every key starting with `prefix`
 /// (`None` when the prefix is all `0xFF`). Used to bound prefix range scans to
 /// a single keyspace instead of the whole database.
@@ -1110,7 +1186,6 @@ impl Storage {
         jobs: &[ValidatedCommit],
         before_commit: BeforeCommit<'_>,
     ) -> Result<Vec<Result<()>>> {
-        use std::ops::Bound;
         let wtx = self.raw_begin_write()?;
         let mut results = Vec::with_capacity(jobs.len());
         {
@@ -1118,38 +1193,7 @@ impl Storage {
                 .open_table(KV)
                 .map_err(|e| Error::Storage(e.to_string()))?;
             for job in jobs {
-                let mut ok = true;
-                for (k, exp) in job.keys {
-                    let current = t
-                        .get(k.as_slice())
-                        .map_err(|e| Error::Storage(e.to_string()))?
-                        .map(|v| v.value().to_vec());
-                    if &current != exp {
-                        ok = false;
-                        break;
-                    }
-                }
-                if ok {
-                    for r in job.ranges {
-                        let upper = match &r.end {
-                            Some(e) => Bound::Excluded(e.as_slice()),
-                            None => Bound::Unbounded,
-                        };
-                        let mut current = Vec::with_capacity(r.content.len());
-                        for item in t
-                            .range::<&[u8]>((Bound::Included(r.start.as_slice()), upper))
-                            .map_err(|e| Error::Storage(e.to_string()))?
-                        {
-                            let (k, v) = item.map_err(|e| Error::Storage(e.to_string()))?;
-                            current.push((k.value().to_vec(), v.value().to_vec()));
-                        }
-                        if current != r.content {
-                            ok = false;
-                            break;
-                        }
-                    }
-                }
-                if ok {
+                if validation_holds(&t, job.keys, job.ranges)? {
                     for k in job.deletes {
                         t.remove(k.as_slice())
                             .map_err(|e| Error::Storage(e.to_string()))?;
@@ -1307,27 +1351,9 @@ impl Storage {
                 .map_err(|e| Error::Storage(e.to_string()))?;
             for job in jobs {
                 if let Some(new) = job.new {
-                    // What `apply_insert` would find: a key present after this
-                    // job's own deletes, or one it inserts twice.
-                    let deleted: std::collections::HashSet<&[u8]> =
-                        job.deletes.iter().map(Vec::as_slice).collect();
-                    let mut seen = std::collections::HashSet::with_capacity(new.len());
-                    let mut duplicate = false;
-                    for (k, _) in new {
-                        let present = !deleted.contains(k.as_slice())
-                            && t.get(k.as_slice())
-                                .map_err(|e| Error::Storage(e.to_string()))?
-                                .is_some();
-                        if present || !seen.insert(k.as_slice()) {
-                            duplicate = true;
-                            break;
-                        }
-                    }
-                    if duplicate {
-                        results.push(Err(Error::Duplicate(
-                            DuplicateError::Entry,
-                            "Duplicate entry for key 'PRIMARY'".into(),
-                        )));
+                    // What `apply_insert` would find.
+                    if insert_collides(&t, new, job.deletes)? {
+                        results.push(Err(duplicate_entry()));
                         continue;
                     }
                 }
@@ -1346,6 +1372,75 @@ impl Storage {
                         .map(|(k, _)| k.as_slice()),
                 ) || touches_schema(job.deletes.iter().map(Vec::as_slice));
                 results.push(Ok(()));
+            }
+            t.insert(WSEQ_KEY, self.next_wseq().to_le_bytes().as_slice())
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            let outcomes: Vec<bool> = results.iter().map(Result::is_ok).collect();
+            record_binlog_lsn(&mut t, &outcomes, before_commit)?;
+        }
+        wtx.commit().map_err(|e| Error::Storage(e.to_string()))?;
+        if schema {
+            bump_schema_generation();
+        }
+        Ok(results)
+    }
+
+    /// Apply writes of any kind in **one** write transaction, each in turn
+    /// against the state the earlier ones left, then `meta` -- puts written
+    /// whatever the jobs' outcomes. A job that fails validation or inserts a
+    /// key that exists is refused (a result per job, in order) and leaves no
+    /// trace; any other error commits nothing at all.
+    ///
+    /// This is how a Raft node applies committed entries: the entries and the
+    /// index of the last one (in `meta`) are stored together or not at all.
+    /// Applied as separate writes, one group could fail while a later one was
+    /// committed, so entries landed out of order and the stored index could
+    /// pass an entry that was never applied.
+    pub fn apply_ordered_with(
+        &self,
+        jobs: &[OrderedJob<'_>],
+        meta: &[(Vec<u8>, Vec<u8>)],
+        before_commit: BeforeCommit<'_>,
+    ) -> Result<Vec<Result<()>>> {
+        let wtx = self.raw_begin_write()?;
+        let mut results = Vec::with_capacity(jobs.len());
+        let mut schema = false;
+        {
+            let mut t = wtx
+                .open_table(KV)
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            for job in jobs {
+                if !validation_holds(&t, job.keys, job.ranges)? {
+                    results.push(Err(Error::Conflict(
+                        "row modified by another transaction since snapshot".into(),
+                    )));
+                    continue;
+                }
+                if let Some(new) = job.new {
+                    if insert_collides(&t, new, job.deletes)? {
+                        results.push(Err(duplicate_entry()));
+                        continue;
+                    }
+                }
+                for k in job.deletes {
+                    t.remove(k.as_slice())
+                        .map_err(|e| Error::Storage(e.to_string()))?;
+                }
+                for (k, v) in job.new.unwrap_or_default().iter().chain(job.puts) {
+                    put_kv(&mut t, k, v, job.deletes)?;
+                }
+                schema |= touches_schema(
+                    job.new
+                        .unwrap_or_default()
+                        .iter()
+                        .chain(job.puts)
+                        .map(|(k, _)| k.as_slice()),
+                ) || touches_schema(job.deletes.iter().map(Vec::as_slice));
+                results.push(Ok(()));
+            }
+            for (k, v) in meta {
+                t.insert(k.as_slice(), v.as_slice())
+                    .map_err(|e| Error::Storage(e.to_string()))?;
             }
             t.insert(WSEQ_KEY, self.next_wseq().to_le_bytes().as_slice())
                 .map_err(|e| Error::Storage(e.to_string()))?;
@@ -1415,6 +1510,90 @@ impl Storage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn text_kv(k: &str, v: &str) -> (Vec<u8>, Vec<u8>) {
+        (k.as_bytes().to_vec(), v.as_bytes().to_vec())
+    }
+
+    fn plain<'a>(puts: &'a [(Vec<u8>, Vec<u8>)], deletes: &'a [Vec<u8>]) -> OrderedJob<'a> {
+        OrderedJob {
+            keys: &[],
+            ranges: &[],
+            new: None,
+            puts,
+            deletes,
+        }
+    }
+
+    /// Raft entries are applied this way: in order, a refusal per entry, the
+    /// applied index stored whatever the outcomes, and nothing at all when the
+    /// transaction fails.
+    #[test]
+    fn ordered_jobs_apply_in_turn_in_one_transaction() {
+        let s = Storage::in_memory().unwrap();
+        let row = text_kv("data::t::1", "a");
+        let insert_new = [row.clone()];
+        let del = [b"data::t::1".to_vec()];
+        let stale = [(b"data::t::1".to_vec(), Some(b"a".to_vec()))];
+        let z = [text_kv("data::t::z", "1")];
+        let jobs = [
+            // An INSERT, then a DELETE of the same row.
+            OrderedJob {
+                keys: &[],
+                ranges: &[],
+                new: Some(&insert_new),
+                puts: &[],
+                deletes: &[],
+            },
+            plain(&[], &del),
+            // Validated against the row the DELETE removed: refused.
+            OrderedJob {
+                keys: &stale,
+                ranges: &[],
+                new: None,
+                puts: &z,
+                deletes: &[],
+            },
+        ];
+        let meta = [text_kv("meta::raft::applied", "3")];
+        let results = s
+            .apply_ordered_with(&jobs, &meta, &mut |_| Ok(None))
+            .unwrap();
+        assert!(results[0].is_ok() && results[1].is_ok());
+        assert!(matches!(results[2], Err(Error::Conflict(_))));
+        assert_eq!(s.get(b"data::t::1").unwrap(), None);
+        assert_eq!(s.get(b"data::t::z").unwrap(), None);
+        // Stored although the last job was refused.
+        assert_eq!(s.get(b"meta::raft::applied").unwrap(), Some(b"3".to_vec()));
+
+        // An INSERT of a key that is there is refused, and only that job.
+        let a = [text_kv("data::t::a", "x")];
+        let b = [text_kv("data::t::b", "x")];
+        let jobs = [
+            plain(&a, &[]),
+            OrderedJob {
+                keys: &[],
+                ranges: &[],
+                new: Some(&a),
+                puts: &b,
+                deletes: &[],
+            },
+        ];
+        let results = s.apply_ordered_with(&jobs, &[], &mut |_| Ok(None)).unwrap();
+        assert!(results[0].is_ok());
+        assert!(matches!(results[1], Err(Error::Duplicate(..))));
+        assert_eq!(s.get(b"data::t::b").unwrap(), None);
+
+        // A failure before the commit leaves no trace of any job or of `meta`.
+        let c = [text_kv("data::t::c", "x")];
+        let meta = [text_kv("meta::raft::applied", "9")];
+        let failed = s.apply_ordered_with(&[plain(&c, &[])], &meta, &mut |_| {
+            Err(Error::Storage("disk gone".into()))
+        });
+        assert!(failed.is_err());
+        assert_eq!(s.get(b"data::t::c").unwrap(), None);
+        assert_eq!(s.get(b"meta::raft::applied").unwrap(), Some(b"3".to_vec()));
+    }
 
     /// Every write path that commits a schema key moves the generation on,
     /// after the commit. (Other tests run concurrently and may bump it too, so
