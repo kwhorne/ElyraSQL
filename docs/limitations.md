@@ -498,7 +498,13 @@ judge fit before deploying.
   conflicting-suffix truncation) and apply up to the leader's commit index. With
   the §5.4.1 election restriction this is **no-data-loss failover**: an
   acknowledged write is on a quorum's durable log and any new leader has it.
-  A write cannot be acknowledged without a quorum. The replication path is
+  A write cannot be acknowledged without a quorum. A node that cannot write
+  its Raft log or election state (a full or failing disk) acknowledges
+  nothing until it can: a leader steps down, a follower stops answering the
+  leader, and the node neither grants votes nor stands for election. Once
+  writes work again it rewrites its log file whole and takes part again. A
+  Raft log or election state that cannot be read stops the node from
+  starting. The replication path is
   **batched for throughput**: the leader holds persistent `AppendEntries`
   connections to followers, appends are fsynced once per round (not per write),
   and committed entries are applied together through the DB's group commit — so

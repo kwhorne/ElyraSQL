@@ -8,6 +8,31 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ### Fixed
 
+- **A Raft node no longer acknowledges what it could not write to disk.**
+  Writes of the Raft log, its compaction boundary and the election state were
+  best effort: a failed one was logged at most, and the node went on as if
+  it had succeeded. A follower acknowledged entries it had not stored, a
+  leader counted itself toward their quorum, and a vote lost in a failed
+  write let a restarted node vote twice in one term. With one of three nodes
+  down, a write was acknowledged with only one node holding it on disk. Now
+  a leader that cannot write its log steps down, a follower that cannot
+  store entries or its term does not answer, and a node votes and stands for
+  election only once its vote and log are on disk. After a failed write the
+  log file is rewritten whole, as a failed fsync can leave pages the kernel
+  will not write again.
+- **A leader counts itself toward a quorum only with entries on its disk.**
+  Entries proposed after its last sync were already counted, so an entry
+  could be committed with fewer durable copies than a majority.
+- **A Raft log cut off by a crash loses only the cut-off write.** The
+  partial record stayed in the file and the next entries were appended after
+  it; on the next start its length swallowed them, and the log read back as
+  a few entries and garbage. The tail is now dropped and the file rewritten.
+- **A Raft log or election state that cannot be read stops the node.** It
+  started with an empty log or no vote instead, and could vote and
+  acknowledge as if it had never stored anything.
+- **An unchanged term is no longer written on every `AppendEntries`.** Each
+  heartbeat and replication round rewrote and fsynced the election state
+  on every follower.
 - **A cluster node that needs compacted log entries no longer counts toward
   a quorum.** The Raft log is compacted once every member has an entry, so a
   node added later needs entries that no node still has. The leader sent it
