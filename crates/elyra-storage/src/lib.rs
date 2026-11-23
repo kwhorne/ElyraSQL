@@ -316,6 +316,30 @@ fn put_kv(
     Ok(())
 }
 
+/// The LSN of the last binlog record whose write-set the database holds,
+/// written in the same transaction as that write-set. At open, binlog records
+/// past it are write-sets the binlog made durable but the database did not.
+pub const BINLOG_LSN_KEY: &[u8] = b"meta::binlog_lsn";
+
+/// Runs inside a group's write transaction, after every job is applied and
+/// before the commit, with each job's outcome (`true` = applied). Returns the
+/// LSN to record under [`BINLOG_LSN_KEY`], if any. An error aborts the whole
+/// transaction: nothing of the group is committed.
+pub type BeforeCommit<'a> = &'a mut dyn FnMut(&[bool]) -> Result<Option<u64>>;
+
+/// Record the LSN the [`BeforeCommit`] hook returned, in the open transaction.
+fn record_binlog_lsn(
+    t: &mut redb::Table<'_, &[u8], &[u8]>,
+    outcomes: &[bool],
+    before_commit: BeforeCommit<'_>,
+) -> Result<()> {
+    if let Some(lsn) = before_commit(outcomes)? {
+        t.insert(BINLOG_LSN_KEY, lsn.to_le_bytes().as_slice())
+            .map_err(|e| Error::Storage(e.to_string()))?;
+    }
+    Ok(())
+}
+
 /// One plain or `INSERT` write for [`Storage::apply_jobs`]: `new` keys must
 /// not exist yet (an `INSERT`), `puts` may overwrite, `deletes` go first.
 pub struct PlainJob<'a> {
@@ -454,6 +478,14 @@ impl Storage {
 
     /// True when running in the relaxed (`Eventual`) durability mode, so the
     /// group-commit writer knows it must force periodic durable flushes.
+    /// Commit data writes without an fsync each, for a database whose binlog
+    /// is the durable log (see `Db::open_with_binlog`): the periodic flush
+    /// makes the file durable, and records it lacks after a crash are replayed
+    /// from the binlog at open.
+    pub(crate) fn defer_data_sync(&mut self) {
+        self.durability = Durability::Eventual;
+    }
+
     pub fn is_relaxed_durability(&self) -> bool {
         matches!(self.durability, Durability::Eventual)
     }
@@ -1068,6 +1100,16 @@ impl Storage {
     /// This amortises the single writer's fsync across many concurrent
     /// transactions, which is the throughput win under high write concurrency.
     pub fn apply_validated_batch(&self, jobs: &[ValidatedCommit]) -> Result<Vec<Result<()>>> {
+        self.apply_validated_batch_with(jobs, &mut |_| Ok(None))
+    }
+
+    /// [`Storage::apply_validated_batch`], running `before_commit` just before
+    /// the commit (see [`BeforeCommit`]).
+    pub fn apply_validated_batch_with(
+        &self,
+        jobs: &[ValidatedCommit],
+        before_commit: BeforeCommit<'_>,
+    ) -> Result<Vec<Result<()>>> {
         use std::ops::Bound;
         let wtx = self.raw_begin_write()?;
         let mut results = Vec::with_capacity(jobs.len());
@@ -1124,6 +1166,8 @@ impl Storage {
             }
             t.insert(WSEQ_KEY, self.next_wseq().to_le_bytes().as_slice())
                 .map_err(|e| Error::Storage(e.to_string()))?;
+            let outcomes: Vec<bool> = results.iter().map(Result::is_ok).collect();
+            record_binlog_lsn(&mut t, &outcomes, before_commit)?;
         }
         wtx.commit().map_err(|e| Error::Storage(e.to_string()))?;
         if jobs.iter().any(|j| {
@@ -1244,6 +1288,16 @@ impl Storage {
     /// `apply_insert` returns; the other jobs are unaffected. Returns a result
     /// per job, in order.
     pub fn apply_jobs(&self, jobs: &[PlainJob<'_>]) -> Result<Vec<Result<()>>> {
+        self.apply_jobs_with(jobs, &mut |_| Ok(None))
+    }
+
+    /// [`Storage::apply_jobs`], running `before_commit` just before the commit
+    /// (see [`BeforeCommit`]).
+    pub fn apply_jobs_with(
+        &self,
+        jobs: &[PlainJob<'_>],
+        before_commit: BeforeCommit<'_>,
+    ) -> Result<Vec<Result<()>>> {
         let wtx = self.raw_begin_write()?;
         let mut results = Vec::with_capacity(jobs.len());
         let mut schema = false;
@@ -1295,6 +1349,8 @@ impl Storage {
             }
             t.insert(WSEQ_KEY, self.next_wseq().to_le_bytes().as_slice())
                 .map_err(|e| Error::Storage(e.to_string()))?;
+            let outcomes: Vec<bool> = results.iter().map(Result::is_ok).collect();
+            record_binlog_lsn(&mut t, &outcomes, before_commit)?;
         }
         wtx.commit().map_err(|e| Error::Storage(e.to_string()))?;
         if schema {

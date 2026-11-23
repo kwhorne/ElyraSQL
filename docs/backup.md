@@ -81,6 +81,30 @@ PURGE BINARY LOGS TO 'binlog.000010';   -- delete segments before this one
 
 Prune segments that predate your most recent full backup.
 
+### Durability
+
+The binlog never holds less than the database. Each group commit is written to
+the binlog **before** it is committed to the data file, and is durable no later
+than it:
+
+- With `ELYRASQL_SYNC=full` (the default) the binlog is fsynced before the
+  commit is acknowledged, and serves as the write-ahead log. The data file
+  is then flushed in the background, so a commit still costs one fsync, not
+  two. After a crash, records the data file is missing are replayed from the
+  binlog at the next start, before any connection is accepted.
+- With `ELYRASQL_SYNC=normal` the binlog is fsynced by the background flush,
+  right before the data file. The crash-loss window is the one that mode
+  already has.
+
+Every record carries a CRC32. A partial record left by a crash at the end of
+the newest segment is cut off at the next start. Damage anywhere else is
+reported as an error, not skipped. Segments written before 1.12.18 have no
+checksums and are still read.
+
+Keep the binlog directory on storage as reliable as the data file. With the
+default durability it holds the most recent commits until the next flush, up to
+`ELYRASQL_SYNC_INTERVAL_MS`. `PURGE BINARY LOGS` flushes the data file first.
+
 Each record carries an LSN and a millisecond timestamp. Because write-sets are
 absolute key/value changes, replaying the log in order onto a base is
 idempotent. To recover:

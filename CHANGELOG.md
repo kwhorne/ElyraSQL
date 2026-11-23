@@ -6,6 +6,32 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **The binlog can no longer miss a committed write.** It was appended after
+  the data commit and only flushed, not fsynced, so a crash at the wrong
+  moment could keep a write in the database that the binlog never recorded.
+  Replicas catching up from the binlog and point-in-time restores would then
+  silently miss it. If an append failed, the error was only logged, and the
+  client was told the commit succeeded. Each group is now written to the
+  binlog before its data commit and is durable no later than it. A binlog
+  error fails the commit. Records the database lacks after a crash are
+  applied at the next start.
+- **A crash during a binlog write no longer breaks the binlog.** A partial
+  record at the end of a segment made the binlog unreadable for replay and
+  replica catch-up, and it reset the LSN counter to 0. Records now carry a
+  CRC32, and a partial record at the end is cut off at start.
+- **The LSN counter no longer restarts at 0 after two restarts without a
+  write.** Every start opens a new segment, and the counter was read from the
+  newest segment only, which was empty.
+
+### Changed
+
+- With `--binlog` and the default `ELYRASQL_SYNC=full`, the binlog is the
+  write-ahead log. It is fsynced on every commit, and the data file is flushed
+  in the background, so a commit costs one fsync as before. Binlog segments
+  written from this version carry a checksum; older segments are still read.
+
 ## [1.12.17] - 2026-11-22
 
 ### Fixed
