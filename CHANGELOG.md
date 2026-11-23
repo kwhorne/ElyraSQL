@@ -21,8 +21,6 @@ All notable changes to ElyraSQL are documented here. The format is based on
   deletion of an id counter, however the write arrived, and an allocator
   whose counter was reset starts again from what is stored.
 
-### Fixed
-
 - **A new database with a binlog no longer loses its first commits in a power
   loss.** With `--binlog` the data file is synced only by the periodic flush
   (`ELYRASQL_SYNC_INTERVAL_MS`), and what it lacks after a crash is replayed
