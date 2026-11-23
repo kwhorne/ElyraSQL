@@ -250,6 +250,10 @@ impl Node {
         })
     }
 
+    fn is_leader(&self) -> bool {
+        self.state.lock().unwrap().role == Role::Leader
+    }
+
     fn peer_snapshot(&self) -> Vec<Peer> {
         self.peers.lock().unwrap().clone()
     }
@@ -355,6 +359,17 @@ impl Node {
         // message and close, ending the loop at EOF.
         while let Some(msg) = recv(&mut stream).await? {
             let reply = match msg {
+                // Membership is the leader's: it sends its member list with
+                // every AppendEntries, and followers adopt it. A change made on
+                // a follower was acknowledged and then overwritten by the next
+                // heartbeat, so it is refused there.
+                Msg::AddPeer { .. } | Msg::RemovePeer { .. } if !self.is_leader() => {
+                    warn!(
+                        id = self.cfg.id,
+                        "membership change refused: not the leader"
+                    );
+                    Msg::CtlAck { ok: false }
+                }
                 Msg::AddPeer { id, control_addr } => {
                     {
                         let mut p = self.peers.lock().unwrap();
@@ -703,6 +718,24 @@ impl Node {
                     .map(|p| p.next)
                     .unwrap_or(1);
                 let prev_index = next.saturating_sub(1);
+                // The follower needs entries this log no longer has. It refuses
+                // the tail (see `RaftLog::append_entries`), so it is not counted
+                // toward a quorum, but it cannot catch up either: that takes a
+                // snapshot transfer, which does not exist yet.
+                if prev_index < log.snapshot_index() {
+                    if repl.stranded.insert(peer.id) {
+                        warn!(
+                            peer = peer.id,
+                            needs_from = next,
+                            log_starts_at = log.snapshot_index() + 1,
+                            "a follower needs log entries that were compacted away; it \
+                             cannot catch up and does not count toward the quorum \
+                             (snapshot transfer is not supported yet)"
+                        );
+                    }
+                } else {
+                    repl.stranded.remove(&peer.id);
+                }
                 let prev_term = log.term_at(prev_index).unwrap_or(0);
                 (prev_index, prev_term, log.entries_after(prev_index))
             };
@@ -1077,6 +1110,8 @@ struct Replication {
     round: u64,
     tx: tokio::sync::mpsc::UnboundedSender<PeerReply>,
     replies: tokio::sync::mpsc::UnboundedReceiver<PeerReply>,
+    /// Followers already reported as needing entries this log has compacted.
+    stranded: std::collections::HashSet<u64>,
 }
 
 impl Replication {
@@ -1088,6 +1123,7 @@ impl Replication {
             round: 0,
             tx,
             replies,
+            stranded: std::collections::HashSet::new(),
         }
     }
 
@@ -1200,7 +1236,9 @@ pub async fn send_membership(
     };
     match rpc(node_addr, &m).await? {
         Msg::CtlAck { ok: true } => Ok(()),
-        _ => Err(Error::other("membership change was not acknowledged")),
+        _ => Err(Error::other(
+            "membership change was not acknowledged (send it to the current leader)",
+        )),
     }
 }
 

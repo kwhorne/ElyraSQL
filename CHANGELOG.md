@@ -8,6 +8,29 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ### Fixed
 
+- **A cluster node that needs compacted log entries no longer counts toward
+  a quorum.** The Raft log is compacted once every member has an entry, so a
+  node added later needs entries that no node still has. The leader sent it
+  the log's tail. The node accepted it but could apply none of it, since it
+  had no first entry, and still reported the tail as matched. The leader then
+  counted a node with an empty database toward its majority: with four
+  members and one down, writes were acknowledged by "three" nodes, one of
+  them empty, and that node could later be elected leader. A follower now
+  refuses entries that do not continue its log without a hole, and the
+  leader logs which node is stranded. Such a node cannot catch up until
+  snapshot transfer exists (see Limitations).
+- **`cluster-ctl` membership changes sent to a follower are refused.** A
+  follower acknowledged them and then overwrote them with the leader's
+  member list at the next heartbeat, so the change was lost while
+  `cluster-ctl` reported success.
+
+### Added
+
+- Raft cluster tests that run real `elyrasql cluster` processes: start, kill,
+  restart and add nodes (`crates/elyra-cli/tests/raft_cluster.rs`).
+
+### Fixed
+
 - **A restarted replica resumes instead of copying the whole database
   again.** It deleted its data file on every start, although it records the
   last LSN it applied and the primary can stream what it missed from its

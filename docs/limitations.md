@@ -478,9 +478,16 @@ judge fit before deploying.
   applied LSN), falling back to a full snapshot only when the binlog is disabled
   or the needed segments were purged; the LSN counter resumes from the binlog
   across restarts. **Cluster membership is dynamic**: `elyrasql cluster-ctl
-  --action add|remove` changes membership at runtime (send to the leader, which
-  propagates it to followers via heartbeats); add one node at a time and start a
-  new node before adding it. An even-node cluster can, rarely, need an extra
+  --action add|remove` changes membership at runtime (send it to the leader,
+  which propagates it to followers via heartbeats; a follower refuses it); add
+  one node at a time and start a new node before adding it. **A node cannot
+  yet catch up once the entries it needs have been compacted away**, because
+  snapshots are not transferred. That applies to a node added to a running
+  cluster, or one down long enough for its peers to compact past it. Such a
+  node is refused the log's tail and does not count toward a quorum. Until
+  snapshot transfer lands, adding a node to a cluster that has taken writes is
+  not supported. A membership change also reaches followers only with the leader's
+  heartbeats, so one made just before the leader fails can be lost. An even-node cluster can, rarely, need an extra
   election round to break a tie — run an odd number of nodes. Election state
   (current term + vote) is persisted to a `<data>.raftstate` file so a restarted
   node never double-votes in a term (a Raft safety requirement). In `cluster`
