@@ -274,18 +274,27 @@ where
             }
         }
     } else {
-        // Full bootstrap snapshot: page the entire keyspace.
-        let mut cursor: Option<Vec<u8>> = None;
+        // Full bootstrap: the whole keyspace, page by page, from one snapshot
+        // taken after `snap_lsn` was read, so it holds every write up to it.
+        // Each page used to be read in a read transaction of its own, so the
+        // copy mixed states the database was in while it was sent.
+        let snapshot = db.snapshot().map_err(io)?;
+        let mut from: Vec<u8> = Vec::new();
         loop {
-            let batch = db
-                .scan_batch(Vec::new(), cursor.clone(), SNAP_CHUNK)
-                .await
-                .map_err(io)?;
+            let (snap, start) = (snapshot.clone(), from.clone());
+            let batch =
+                tokio::task::spawn_blocking(move || snap.scan_range(&start, None, SNAP_CHUNK))
+                    .await
+                    .map_err(io)?
+                    .map_err(io)?;
             if batch.is_empty() {
                 break;
             }
             let last = batch.len() < SNAP_CHUNK;
-            cursor = batch.last().map(|(k, _)| k.clone());
+            if let Some((k, _)) = batch.last() {
+                from = k.clone();
+                from.push(0);
+            }
             send_msg(&mut stream, &ReplMsg::Snap(batch)).await?;
             if last {
                 break;
@@ -487,6 +496,9 @@ pub async fn run_replica(primary: String, db: Db) -> std::io::Result<()> {
                     ));
                 }
                 ReplMsg::Snap(pairs) => {
+                    if !in_snapshot {
+                        db.set_fence(Some(COPYING.into()));
+                    }
                     in_snapshot = true;
                     snap_pairs += pairs.len() as u64;
                     db.commit(pairs, Vec::new()).await.map_err(io)?;
@@ -496,6 +508,7 @@ pub async fn run_replica(primary: String, db: Db) -> std::io::Result<()> {
                         .await
                         .map_err(io)?;
                     in_snapshot = false;
+                    db.set_fence(None);
                     info!(lsn, rows = snap_pairs, "caught up; streaming writes");
                     send_msg(&mut wr, &ReplMsg::Ack { lsn }).await?;
                 }
@@ -518,6 +531,10 @@ pub async fn run_replica(primary: String, db: Db) -> std::io::Result<()> {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
 }
+
+/// Why a replica refuses queries while it copies the primary's data: until the
+/// copy is complete its tables are empty or partly filled.
+pub const COPYING: &str = "this replica is copying the primary's data and cannot be queried yet";
 
 /// The file whose presence tells the next start of a replica on `data` to
 /// discard its data and bootstrap from the primary again.

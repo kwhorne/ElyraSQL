@@ -323,27 +323,6 @@ fn read_segment(path: &Path) -> Result<SegmentRead> {
     })
 }
 
-/// Every record, in order, across all segments. Only the newest segment may
-/// end in a partial record (a write in progress); anywhere else it is damage.
-fn read_all(dir: &Path) -> Result<Vec<BinlogRecord>> {
-    let seqs = list_seqs(dir)?;
-    let mut out = Vec::new();
-    for (i, seq) in seqs.iter().enumerate() {
-        let path = dir.join(segment_name(*seq));
-        let read = read_segment(&path)?;
-        if let Some(at) = read.torn_at {
-            if i + 1 != seqs.len() {
-                return Err(Error::Storage(format!(
-                    "binlog segment {} is damaged at byte {at}",
-                    path.display()
-                )));
-            }
-        }
-        out.extend(read.records);
-    }
-    Ok(out)
-}
-
 /// `(segment_name, size_bytes)` for every segment, in order (for
 /// `SHOW BINARY LOGS`).
 pub fn list_segments(dir: impl AsRef<Path>) -> Result<Vec<(String, u64)>> {
@@ -411,16 +390,49 @@ pub fn read_since(
     after_lsn: u64,
     up_to_lsn: u64,
 ) -> Result<Vec<BinlogRecord>> {
-    Ok(read_all(dir.as_ref())?
+    // Newest segment first, back to the one that holds the first record
+    // needed. Every segment used to be read, so a replica's short catch-up or
+    // a restart's recovery read the whole binlog into memory to keep its end.
+    let dir = dir.as_ref();
+    let seqs = list_seqs(dir)?;
+    let mut parts = Vec::new();
+    for (i, seq) in seqs.iter().enumerate().rev() {
+        let path = dir.join(segment_name(*seq));
+        let read = read_segment(&path)?;
+        if let Some(at) = read.torn_at {
+            if i + 1 != seqs.len() {
+                return Err(Error::Storage(format!(
+                    "binlog segment {} is damaged at byte {at}",
+                    path.display()
+                )));
+            }
+        }
+        let starts_in_time = read
+            .records
+            .first()
+            .is_some_and(|rec| rec.lsn <= after_lsn.saturating_add(1));
+        parts.push(read.records);
+        if starts_in_time {
+            break;
+        }
+    }
+    Ok(parts
         .into_iter()
+        .rev()
+        .flatten()
         .filter(|rec| rec.lsn > after_lsn && rec.lsn <= up_to_lsn)
         .collect())
 }
 
-/// Apply one write-set, blocking on the async commit (used by the offline replay
-/// tool).
-fn futures_apply(db: &Db, puts: Vec<(Vec<u8>, Vec<u8>)>, deletes: Vec<Vec<u8>>) -> Result<()> {
-    tokio::runtime::Handle::current().block_on(db.commit(puts, deletes))
+/// Records replayed per transaction.
+const REPLAY_BATCH: usize = 1000;
+
+/// Apply write-sets in order in one transaction, blocking on the async
+/// commit (used by the offline replay tool).
+fn apply_batch(db: &Db, batch: Vec<crate::WriteOp>) -> Result<()> {
+    let results =
+        tokio::runtime::Handle::current().block_on(db.apply_ordered(batch, Vec::new()))?;
+    results.into_iter().collect()
 }
 
 /// Replay all segments in `dir` in order onto `db`, up to `until_lsn` and/or
@@ -434,14 +446,41 @@ pub async fn replay(
     let dirp = dir.as_ref().to_path_buf();
     let db = db.clone();
     // Run the blocking file IO + apply on a blocking thread.
+    // A segment at a time, applied in batches: the whole binlog used to be
+    // read into memory first, then applied one commit -- one sync -- per
+    // record.
     tokio::task::spawn_blocking(move || -> Result<u64> {
+        let seqs = list_seqs(&dirp)?;
         let mut applied = 0u64;
-        for rec in read_all(&dirp)? {
-            if until_lsn.is_some_and(|l| rec.lsn > l) || until_ts.is_some_and(|t| rec.ts_ms > t) {
-                break;
+        let mut batch = Vec::with_capacity(REPLAY_BATCH);
+        'segments: for (i, seq) in seqs.iter().enumerate() {
+            let path = dirp.join(segment_name(*seq));
+            let read = read_segment(&path)?;
+            if let Some(at) = read.torn_at {
+                if i + 1 != seqs.len() {
+                    return Err(Error::Storage(format!(
+                        "binlog segment {} is damaged at byte {at}",
+                        path.display()
+                    )));
+                }
             }
-            futures_apply(&db, rec.puts, rec.deletes)?;
-            applied += 1;
+            for rec in read.records {
+                if until_lsn.is_some_and(|l| rec.lsn > l) || until_ts.is_some_and(|t| rec.ts_ms > t)
+                {
+                    break 'segments;
+                }
+                batch.push(crate::WriteOp::Plain {
+                    puts: rec.puts,
+                    deletes: rec.deletes,
+                });
+                applied += 1;
+                if batch.len() == REPLAY_BATCH {
+                    apply_batch(&db, std::mem::take(&mut batch))?;
+                }
+            }
+        }
+        if !batch.is_empty() {
+            apply_batch(&db, batch)?;
         }
         Ok(applied)
     })
@@ -730,6 +769,74 @@ mod tests {
             .map(|r| r.lsn)
             .collect();
         assert_eq!(lsns, [1, 2, 3]);
+    }
+
+    /// A catch-up reads back from the newest segment only as far as it
+    /// needs: a damaged old segment it does not need does not stop it. It used
+    /// to read every segment, into memory, to keep the end.
+    #[test]
+    fn a_catch_up_reads_only_the_segments_it_needs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut w = BinlogWriter::open(tmp.path(), false).unwrap();
+        w.segment_max = 1; // every group starts a new segment
+        for lsn in 1..=5 {
+            let puts = vec![kv(&format!("k{lsn}"), "v")];
+            w.append_group(&[(lsn, puts.as_slice(), &[])]).unwrap();
+        }
+        drop(w);
+        let first = tmp
+            .path()
+            .join(segment_name(list_seqs(tmp.path()).unwrap()[0]));
+        let mut bytes = std::fs::read(&first).unwrap();
+        let at = bytes.len() - 3;
+        bytes[at] ^= 0xff;
+        std::fs::write(&first, bytes).unwrap();
+        let lsns: Vec<u64> = read_since(tmp.path(), 3, u64::MAX)
+            .unwrap()
+            .iter()
+            .map(|r| r.lsn)
+            .collect();
+        assert_eq!(lsns, [4, 5]);
+        // A read that needs the damaged segment still reports it.
+        assert!(read_since(tmp.path(), 0, u64::MAX).is_err());
+    }
+
+    /// Replay applies records in batches, in order, and stops where told --
+    /// in the middle of a batch too.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn replay_applies_in_order_and_stops_where_told() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("log");
+        let data = tmp.path().join("d.edb");
+        let db = Db::open_with_binlog(&data, Some(log.clone())).unwrap();
+        for i in 0..1200u32 {
+            // Each key is written, then the previous one deleted: order matters.
+            let mut deletes = vec![];
+            if i > 0 {
+                deletes.push(format!("data::k{}", i - 1).into_bytes());
+            }
+            db.commit(vec![kv(&format!("data::k{i}"), "v")], deletes)
+                .await
+                .unwrap();
+        }
+        let closed = db.close_waiter();
+        drop(db);
+        assert!(closed.wait(std::time::Duration::from_secs(5)));
+
+        let restored = Db::open(tmp.path().join("r.edb")).unwrap();
+        assert_eq!(
+            replay(&log, &restored, Some(1100), None).await.unwrap(),
+            1100
+        );
+        let keys: Vec<Vec<u8>> = restored
+            .snapshot()
+            .unwrap()
+            .scan_range(b"data::", Some(b"data:;"), 10)
+            .unwrap()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(keys, [b"data::k1099".to_vec()]);
     }
 
     #[test]
