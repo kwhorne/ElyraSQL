@@ -17,6 +17,35 @@ ElyraSQL release builds target **Ubuntu 24.04+** and **Apple Silicon macOS
     done, so an interrupted upgrade simply resumes on the next start. **Take a backup
     first, and note that downgrading to 1.4.x afterwards is not supported.**
 
+!!! warning "Upgrading to 1.12.18 — binlog, replicas and Raft clusters"
+
+    No change to the database file; a 1.12.17 database opens in 1.12.18
+    unchanged. What changes is how the binlog, replicas and clusters behave:
+
+    - **Binlog (`--binlog`).** Each commit is now in the binlog before it is in
+      the database, and a binlog error fails the commit. With the default
+      `ELYRASQL_SYNC=full` the binlog is fsynced on every commit and the data
+      file flushed in the background, so after a crash the data file can trail
+      the binlog by up to `ELYRASQL_SYNC_INTERVAL_MS`; the next start applies
+      what it lacks from the binlog. **Keep the binlog directory on storage as
+      reliable as the data file's.** New segments carry a checksum; older ones
+      are still read.
+    - **Replicas keep their data across restarts** and resume from the last
+      write they applied, instead of copying the whole database again. A
+      replica that cannot be continued -- its primary lost the history it
+      needs -- marks its data (`<data>.resync`) and exits with code 75; the
+      next start bootstraps it again. Run replicas under a supervisor that
+      restarts them.
+    - **Raft clusters: upgrade every node together.** Nodes now send each
+      other snapshots and PreVotes, which 1.12.17 nodes do not understand. A
+      node far behind -- added to a running cluster, or down for long -- now
+      catches up from a snapshot of the leader's database, refusing queries
+      while it installs it. Each node keeps its last 10 000 applied log
+      entries (`ELYRASQL_RAFT_LOG_KEEP_ENTRIES`, see
+      [configuration](configuration.md)). A node that cannot write its Raft
+      log or election state now steps down and stops acknowledging, and one
+      whose log or election state cannot be read refuses to start.
+
 !!! warning "Upgrading to 1.12.17 — concurrency, binary indexes and AUTO_INCREMENT"
 
     A 1.12.16 database opens in 1.12.17. **On first start, indexes over
@@ -794,8 +823,8 @@ macOS).
 Multi-arch image (`amd64` + `arm64`) on the GitHub Container Registry:
 
 ```bash
-docker pull ghcr.io/kwhorne/elyrasql:1.12.17   # or :latest
-docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.12.17
+docker pull ghcr.io/kwhorne/elyrasql:1.12.18   # or :latest
+docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.12.18
 ```
 
 The image is ~15 MB, runs as a non-root user, stores data in the
