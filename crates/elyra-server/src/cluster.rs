@@ -33,9 +33,9 @@ use crate::repl::{cluster_client_tls_cached, cluster_server_tls, DuplexStream};
 /// A boxed, possibly-TLS control-plane connection to a peer.
 type PeerConn = Box<dyn DuplexStream>;
 use tokio::sync::{oneshot, watch, Notify};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
-use crate::raftlog::{LogEntry, RaftLog};
+use crate::raftlog::{atomic_write, LogEntry, RaftLog};
 
 /// A peer node in the cluster.
 #[derive(Clone)]
@@ -58,48 +58,39 @@ pub struct ClusterConfig {
     pub log_path: Option<PathBuf>,
 }
 
-fn load_state(path: &Option<PathBuf>) -> (u64, Option<u64>) {
-    let Some(p) = path else { return (0, None) };
-    let Ok(s) = std::fs::read_to_string(p) else {
-        return (0, None);
+/// The persisted election state: `(term, voted_for)`, `(0, None)` for a node
+/// that never stored one. The file is written whole (`atomic_write`), so one
+/// that cannot be read is an error. It used to count as "never voted": a
+/// restarted node could then vote a second time in a term it had voted in.
+fn load_state(path: &Option<PathBuf>) -> std::io::Result<(u64, Option<u64>)> {
+    let Some(p) = path else { return Ok((0, None)) };
+    let s = match std::fs::read_to_string(p) {
+        Ok(s) => s,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok((0, None)),
+        Err(e) => return Err(e),
     };
-    let mut lines = s.lines();
-    let term = lines
-        .next()
-        .and_then(|l| l.trim().parse().ok())
-        .unwrap_or(0);
-    let voted_for = lines.next().and_then(|l| {
-        l.trim()
-            .parse::<u64>()
-            .ok()
-            .filter(|_| !l.trim().is_empty())
-    });
-    (term, voted_for)
+    let bad = || {
+        Error::new(
+            ErrorKind::InvalidData,
+            format!("{} is not a Raft election state", p.display()),
+        )
+    };
+    let mut lines = s.lines().map(str::trim);
+    let term = lines.next().and_then(|l| l.parse().ok()).ok_or_else(bad)?;
+    let voted_for = match lines.next() {
+        None | Some("") => None,
+        Some(l) => Some(l.parse::<u64>().map_err(|_| bad())?),
+    };
+    Ok((term, voted_for))
 }
 
-fn persist_state(path: &Option<PathBuf>, term: u64, voted_for: Option<u64>) {
-    if let Some(p) = path {
-        let body = format!(
-            "{term}\n{}\n",
-            voted_for.map(|v| v.to_string()).unwrap_or_default()
-        );
-        if let Err(e) = atomic_write(p, body.as_bytes()) {
-            warn!(error = %e, "failed to persist election state");
-        }
-    }
-}
-
-/// Durably write `bytes` to `path`: write a sibling `<path>.tmp`, fsync it, then
-/// rename over `path` (atomic on the same filesystem) — so a crash mid-write
-/// never leaves a corrupt/partial file. The `.tmp` name appends the suffix (not
-/// `with_extension`) so distinct files never share a temp path.
-fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    let tmp = std::path::PathBuf::from(format!("{}.tmp", path.display()));
-    let mut f = std::fs::File::create(&tmp)?;
-    f.write_all(bytes)?;
-    f.sync_all()?;
-    std::fs::rename(&tmp, path)
+fn persist_state(path: &Option<PathBuf>, term: u64, voted_for: Option<u64>) -> std::io::Result<()> {
+    let Some(p) = path else { return Ok(()) };
+    let body = format!(
+        "{term}\n{}\n",
+        voted_for.map(|v| v.to_string()).unwrap_or_default()
+    );
+    atomic_write(p, body.as_bytes())
 }
 
 #[derive(Serialize, Deserialize)]
@@ -155,6 +146,10 @@ enum Role {
 struct State {
     term: u64,
     voted_for: Option<u64>,
+    /// The `(term, voted_for)` last made durable. A node may learn of a later
+    /// term without storing it (it only steps down), but it neither votes nor
+    /// acknowledges entries until its term and vote are on disk.
+    saved: (u64, Option<u64>),
     role: Role,
     leader: Option<u64>,
     election_deadline: Instant,
@@ -217,24 +212,43 @@ pub struct Node {
     lease: Mutex<Instant>,
     leader_tx: watch::Sender<Option<Leader>>,
     pub leader_rx: watch::Receiver<Option<Leader>>,
+    /// The Raft log could not be written the last time it was tried.
+    log_failing: AtomicBool,
+    /// The election state could not be written the last time it was tried.
+    state_failing: AtomicBool,
 }
 
 impl Node {
-    pub fn new(cfg: ClusterConfig, db: Db) -> Arc<Self> {
+    /// A node with its election state and log loaded from `cfg`'s files. A file
+    /// that exists but cannot be read is an error: starting without what it
+    /// holds would let the node vote and acknowledge as if it had never
+    /// stored a thing.
+    pub fn new(cfg: ClusterConfig, db: Db) -> std::io::Result<Arc<Self>> {
         let cfg_id = cfg.id;
         let peers = Mutex::new(cfg.peers.clone());
         let (leader_tx, leader_rx) = watch::channel(None);
-        let (term, voted_for) = load_state(&cfg.state_path);
+        let (term, voted_for) = load_state(&cfg.state_path).map_err(|e| {
+            Error::new(
+                e.kind(),
+                format!("cannot load the Raft election state: {e}"),
+            )
+        })?;
         let log = match &cfg.log_path {
-            Some(p) => RaftLog::open(p.clone()).unwrap_or_default(),
+            Some(p) => RaftLog::open(p.clone()).map_err(|e| {
+                Error::new(
+                    e.kind(),
+                    format!("cannot load the Raft log {}: {e}", p.display()),
+                )
+            })?,
             None => RaftLog::new(),
         };
-        Arc::new(Node {
+        Ok(Arc::new(Node {
             cfg: Arc::new(cfg),
             peers,
             state: Arc::new(Mutex::new(State {
                 term,
                 voted_for,
+                saved: (term, voted_for),
                 role: Role::Follower,
                 leader: None,
                 election_deadline: Instant::now() + election_timeout(cfg_id),
@@ -247,7 +261,55 @@ impl Node {
             lease: Mutex::new(Instant::now()),
             leader_tx,
             leader_rx,
-        })
+            log_failing: AtomicBool::new(false),
+            state_failing: AtomicBool::new(false),
+        }))
+    }
+
+    /// Report a write of the Raft log or election state: an error once when
+    /// writes start failing, and once more when they work again, rather than
+    /// on every heartbeat in between.
+    fn disk<T>(
+        &self,
+        failing: &AtomicBool,
+        what: &str,
+        r: std::io::Result<T>,
+    ) -> std::io::Result<T> {
+        match &r {
+            Err(e) => {
+                if !failing.swap(true, Ordering::Relaxed) {
+                    error!(
+                        id = self.cfg.id,
+                        error = %e,
+                        "cannot write the Raft {what}: this node acknowledges, votes for \
+                         and leads nothing that would depend on it until it can"
+                    );
+                }
+            }
+            Ok(_) => {
+                if failing.swap(false, Ordering::Relaxed) {
+                    info!(id = self.cfg.id, "the Raft {what} can be written again");
+                }
+            }
+        }
+        r
+    }
+
+    /// Make `s`'s term and vote durable if they changed since they last were.
+    fn save_state(&self, s: &mut State) -> std::io::Result<()> {
+        if (s.term, s.voted_for) == s.saved {
+            return Ok(());
+        }
+        let r = persist_state(&self.cfg.state_path, s.term, s.voted_for);
+        self.disk(&self.state_failing, "election state", r)?;
+        s.saved = (s.term, s.voted_for);
+        Ok(())
+    }
+
+    /// Make the whole log durable.
+    fn sync_log(&self) -> std::io::Result<()> {
+        let r = self.log.lock().unwrap().sync();
+        self.disk(&self.log_failing, "log", r)
     }
 
     fn is_leader(&self) -> bool {
@@ -401,6 +463,9 @@ impl Node {
                     leader_commit,
                     compact_index,
                 } => {
+                    // An error closes the connection without an answer: the
+                    // leader treats this node as unreachable, which it is for
+                    // as long as it cannot store what it would acknowledge.
                     self.on_append_entries(
                         term,
                         leader,
@@ -412,7 +477,7 @@ impl Node {
                         leader_commit,
                         compact_index,
                     )
-                    .await
+                    .await?
                 }
                 _ => Msg::CtlAck { ok: false },
             };
@@ -429,14 +494,13 @@ impl Node {
         last_log_term: u64,
     ) -> Msg {
         let mut s = self.state.lock().unwrap();
-        let mut changed = false;
         if term > s.term {
             s.term = term;
             s.voted_for = None;
             if s.role != Role::Follower {
                 s.role = Role::Follower;
             }
-            changed = true;
+            let _ = self.save_state(&mut s);
         }
         // Election restriction: only vote for an at-least-as-up-to-date log.
         let up_to_date = self
@@ -444,18 +508,21 @@ impl Node {
             .lock()
             .unwrap()
             .is_up_to_date(last_log_term, last_log_index);
-        let granted = term == s.term
+        let mut granted = term == s.term
             && (s.voted_for.is_none() || s.voted_for == Some(candidate))
             && up_to_date;
+        let voted_before = s.voted_for;
         if granted {
             s.voted_for = Some(candidate);
             s.election_deadline = Instant::now() + election_timeout(self.cfg.id);
-            changed = true;
+        }
+        // A vote counts only once it is on disk: one granted and then lost in
+        // a restart lets this node vote a second time in the same term.
+        if granted && self.save_state(&mut s).is_err() {
+            s.voted_for = voted_before;
+            granted = false;
         }
         let reply_term = s.term;
-        if changed {
-            persist_state(&self.cfg.state_path, s.term, s.voted_for);
-        }
         Msg::Vote {
             term: reply_term,
             granted,
@@ -474,15 +541,15 @@ impl Node {
         entries: Vec<LogEntry>,
         leader_commit: u64,
         compact_index: u64,
-    ) -> Msg {
+    ) -> std::io::Result<Msg> {
         {
             let mut s = self.state.lock().unwrap();
             if term < s.term {
-                return Msg::AppendAck {
+                return Ok(Msg::AppendAck {
                     term: s.term,
                     success: false,
                     match_index: 0,
-                };
+                });
             }
             if term > s.term {
                 s.term = term;
@@ -492,11 +559,15 @@ impl Node {
             s.role = Role::Follower;
             s.leader = Some(leader);
             s.election_deadline = Instant::now() + election_timeout(self.cfg.id);
-            persist_state(&self.cfg.state_path, s.term, s.voted_for);
+            // The term must be on disk before anything in it is acknowledged:
+            // restarted with an earlier one, this node would take entries from
+            // a deposed leader and could drop ones already committed.
+            let saved = self.save_state(&mut s);
             if was_leader {
                 drop(s);
                 self.drain_pending("stepped down: no longer leader");
             }
+            saved?;
         }
         self.adopt_members(&members);
         self.publish(Some(Leader {
@@ -508,7 +579,8 @@ impl Node {
         // Append + advance commit under the log lock, collecting entries to apply.
         let (success, match_index, to_apply) = {
             let mut log = self.log.lock().unwrap();
-            if log.append_entries(prev_index, prev_term, &entries) {
+            let appended = log.append_entries(prev_index, prev_term, &entries);
+            if self.disk(&self.log_failing, "log", appended)? {
                 log.advance_commit(leader_commit);
                 (true, log.last_index(), log.take_applicable())
             } else {
@@ -526,14 +598,15 @@ impl Node {
                 .await;
         // Compact applied entries up to the cluster-wide safe point.
         if success {
-            self.log.lock().unwrap().compact(compact_index);
+            let compacted = self.log.lock().unwrap().compact(compact_index);
+            let _ = self.disk(&self.log_failing, "log", compacted);
         }
         let reply_term = self.state.lock().unwrap().term;
-        Msg::AppendAck {
+        Ok(Msg::AppendAck {
             term: reply_term,
             success,
             match_index,
-        }
+        })
     }
 
     async fn main_loop(self: Arc<Self>) {
@@ -576,14 +649,25 @@ impl Node {
     }
 
     async fn start_election(self: &Arc<Self>) {
+        // A candidate is elected on the log it presents, so that log -- and the
+        // vote for itself -- must be on disk first. A node that cannot write
+        // them does not stand.
+        let log_ok = self.sync_log().is_ok();
         let (term, last_index, last_term) = {
             let mut s = self.state.lock().unwrap();
-            s.term += 1;
-            s.role = Role::Candidate;
-            s.voted_for = Some(self.cfg.id);
-            s.leader = None;
             s.election_deadline = Instant::now() + election_timeout(self.cfg.id);
-            persist_state(&self.cfg.state_path, s.term, s.voted_for);
+            if !log_ok {
+                return;
+            }
+            let before = (s.term, s.voted_for);
+            s.term += 1;
+            s.voted_for = Some(self.cfg.id);
+            if self.save_state(&mut s).is_err() {
+                (s.term, s.voted_for) = before;
+                return;
+            }
+            s.role = Role::Candidate;
+            s.leader = None;
             let log = self.log.lock().unwrap();
             (s.term, log.last_index(), log.last_term())
         };
@@ -606,7 +690,7 @@ impl Node {
                     s.term = t;
                     s.role = Role::Follower;
                     s.voted_for = None;
-                    persist_state(&self.cfg.state_path, s.term, s.voted_for);
+                    let _ = self.save_state(&mut s);
                     return;
                 }
                 if granted && s.role == Role::Candidate && s.term == term {
@@ -676,12 +760,13 @@ impl Node {
             s.term
         };
         // Durably persist all newly-appended entries once (batched fsync) before
-        // they are replicated and counted toward commit.
-        let leader_commit = {
-            let mut log = self.log.lock().unwrap();
-            log.sync();
-            log.commit_index()
-        };
+        // they are replicated and counted toward commit. A leader that cannot
+        // store its log steps down: a node that can should lead.
+        if let Err(e) = self.sync_log() {
+            self.step_down(&format!("cannot write the Raft log: {e}"));
+            return;
+        }
+        let leader_commit = self.log.lock().unwrap().commit_index();
         let members = self.members();
         let peers = self.peer_snapshot();
         let live: std::collections::HashSet<u64> = peers.iter().map(|p| p.id).collect();
@@ -804,7 +889,8 @@ impl Node {
         }
         self.advance_commit_and_apply(term).await;
         // Compact the leader's own log up to the cluster-wide safe point.
-        self.log.lock().unwrap().compact(compact_index);
+        let compacted = self.log.lock().unwrap().compact(compact_index);
+        let _ = self.disk(&self.log_failing, "log", compacted);
     }
 
     /// Record one follower's answer: keep its connection, move its progress on,
@@ -832,7 +918,7 @@ impl Node {
                         s.term = t;
                         s.role = Role::Follower;
                         s.voted_for = None;
-                        persist_state(&self.cfg.state_path, s.term, s.voted_for);
+                        let _ = self.save_state(&mut s);
                         drop(s);
                         self.drain_pending("stepped down during replication");
                     }
@@ -882,7 +968,10 @@ impl Node {
     async fn advance_commit_and_apply(self: &Arc<Self>, term: u64) {
         let to_apply = {
             let mut log = self.log.lock().unwrap();
-            let mut match_indexes = vec![log.last_index()]; // the leader itself
+            // The leader counts itself only with what is on its disk: entries
+            // proposed since its last sync may already be on the followers, but
+            // they are not on this node until the next round syncs them.
+            let mut match_indexes = vec![log.durable_index()];
             for p in self.progress.lock().unwrap().values() {
                 match_indexes.push(p.match_);
             }
@@ -1280,6 +1369,7 @@ mod tests {
                 },
                 db.clone(),
             )
+            .unwrap()
             .majority()
         };
         assert_eq!(mk(0), 1);
@@ -1315,7 +1405,8 @@ mod tests {
                 log_path: None,
             },
             Db::in_memory().unwrap(),
-        );
+        )
+        .unwrap();
         let within = Duration::from_millis(PEER_RPC_MS * 8 / 5);
 
         let started = Instant::now();
@@ -1391,7 +1482,8 @@ mod tests {
                 log_path: None,
             },
             Db::in_memory().unwrap(),
-        );
+        )
+        .unwrap();
         {
             let mut s = node.state.lock().unwrap();
             s.role = Role::Leader;
@@ -1422,6 +1514,25 @@ mod tests {
 
     // The control-plane framing must work over any AsyncRead+AsyncWrite transport
     // (this is what lets it run over a TLS stream, not just a raw TcpStream).
+    #[test]
+    fn a_damaged_election_state_is_an_error_not_a_blank_one() {
+        let dir = std::env::temp_dir().join(format!("elyra-raftstate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = Some(dir.join("n.raftstate"));
+        assert_eq!(load_state(&path).unwrap(), (0, None));
+        persist_state(&path, 7, Some(3)).unwrap();
+        assert_eq!(load_state(&path).unwrap(), (7, Some(3)));
+        persist_state(&path, 8, None).unwrap();
+        assert_eq!(load_state(&path).unwrap(), (8, None));
+        // Read as "never voted", this let a restarted node vote twice in a term.
+        std::fs::write(path.as_ref().unwrap(), b"8\nnobody\n").unwrap();
+        assert!(load_state(&path).is_err());
+        std::fs::write(path.as_ref().unwrap(), b"").unwrap();
+        assert!(load_state(&path).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[tokio::test]
     async fn send_recv_roundtrip_over_generic_stream() {
         let (mut a, mut b) = tokio::io::duplex(4096);

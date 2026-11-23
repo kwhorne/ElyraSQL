@@ -502,7 +502,7 @@ async fn run() -> anyhow::Result<()> {
                     log_path: Some(data.with_extension("raftlog")),
                 },
                 db.clone(),
-            );
+            )?;
             // Route all writes through the Raft log (leader proposes; commit +
             // apply before the client is acknowledged).
             db.set_consensus(node.clone());

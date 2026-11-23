@@ -1,9 +1,9 @@
 //! Raft clusters of real `elyrasql cluster` processes: nodes are started,
 //! killed and restarted like a deployment would see them.
 //!
-//! `Cluster` is the harness. It starts nodes on free ports with their data in
-//! a temporary directory, finds the leader by trying a write on every running
-//! node, and keeps each node's log for the failure message.
+//! `Cluster` is the harness. It starts nodes on free ports, each with its data
+//! in a directory of its own, finds the leader by trying a write on every
+//! running node, and keeps each node's log for the failure message.
 
 use mysql_async::prelude::*;
 use std::path::PathBuf;
@@ -64,6 +64,11 @@ impl Cluster {
         &self.nodes[(id - 1) as usize]
     }
 
+    /// The directory node `id` keeps its data, Raft log and election state in.
+    fn data_dir(&self, id: u64) -> PathBuf {
+        self.dir.join(format!("n{id}"))
+    }
+
     fn control_addr(&self, id: u64) -> String {
         format!("127.0.0.1:{}", self.node(id).control)
     }
@@ -82,10 +87,11 @@ impl Cluster {
             .append(true)
             .open(self.dir.join(format!("n{id}.log")))
             .unwrap();
+        std::fs::create_dir_all(self.data_dir(id)).unwrap();
         let mut cmd = Command::new(BIN);
         cmd.args(["cluster", "--id", &id.to_string()])
             .arg("--data")
-            .arg(self.dir.join(format!("n{id}.edb")))
+            .arg(self.data_dir(id).join("data.edb"))
             .args(["--listen", &format!("127.0.0.1:{}", n.mysql)])
             .args(["--control-listen", &format!("127.0.0.1:{}", n.control)])
             .args([
@@ -117,6 +123,45 @@ impl Cluster {
         if let Some(mut c) = self.nodes[(id - 1) as usize].child.take() {
             c.kill().ok();
             c.wait().ok();
+        }
+    }
+
+    /// Stop node `id` from writing anything but its database file: its Raft log
+    /// and election state can be neither written nor replaced. `false` if the
+    /// permissions do not stop this user (root), and nothing changed.
+    #[cfg(unix)]
+    fn deny_disk(&self, id: u64) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = self.data_dir(id);
+        let set = |p: &std::path::Path, mode| {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap()
+        };
+        for f in ["data.raftlog", "data.raftstate"] {
+            if dir.join(f).exists() {
+                set(&dir.join(f), 0o444);
+            }
+        }
+        set(&dir, 0o555);
+        if std::fs::write(dir.join("probe"), b"x").is_ok() {
+            let _ = std::fs::remove_file(dir.join("probe"));
+            self.allow_disk(id);
+            return false;
+        }
+        true
+    }
+
+    #[cfg(unix)]
+    fn allow_disk(&self, id: u64) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = self.data_dir(id);
+        let set = |p: &std::path::Path, mode| {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap()
+        };
+        set(&dir, 0o755);
+        for f in ["data.raftlog", "data.raftstate"] {
+            if dir.join(f).exists() {
+                set(&dir.join(f), 0o644);
+            }
         }
     }
 
@@ -236,6 +281,10 @@ impl Drop for Cluster {
     fn drop(&mut self) {
         for id in self.running() {
             self.kill(id);
+        }
+        #[cfg(unix)]
+        for n in &self.nodes {
+            self.allow_disk(n.id);
         }
         let _ = std::fs::remove_dir_all(&self.dir);
     }
@@ -373,4 +422,87 @@ async fn a_node_that_needs_compacted_entries_never_counts_toward_a_quorum() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
     assert!(rows == 21 || rows == 22, "{rows} rows\n{}", c.logs());
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_leader_that_cannot_write_its_log_acknowledges_nothing() {
+    // The Raft log used to be written best effort: a failed write was dropped
+    // without a word, and the leader counted itself toward the quorum of
+    // entries it did not have. With one follower down, a write was then
+    // acknowledged with a single node holding it on disk.
+    let mut c = Cluster::new("nodisk", 3);
+    c.start_all();
+    let leader = c
+        .write(
+            "CREATE TABLE t (id INT PRIMARY KEY)",
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap_or_else(|| panic!("no leader accepted a write\n{}", c.logs()));
+    for i in 1..=5 {
+        c.write(
+            &format!("INSERT INTO t VALUES ({i})"),
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("write");
+    }
+    for id in 1..=3 {
+        c.until_count(id, "t", 5).await;
+    }
+    // The leader's write must land on it: only the leader and one follower
+    // are up, and both are needed.
+    let down = (1..=3).find(|&id| id != leader).unwrap();
+    c.kill(down);
+    let leader = c
+        .write("INSERT INTO t VALUES (6)", Duration::from_secs(20))
+        .await
+        .unwrap_or_else(|| panic!("the remaining two nodes took no write\n{}", c.logs()));
+    if !c.deny_disk(leader) {
+        eprintln!("skipped: file permissions do not stop this user from writing");
+        return;
+    }
+    let accepted = c
+        .write("INSERT INTO t VALUES (7)", Duration::from_secs(8))
+        .await;
+    assert_eq!(
+        accepted,
+        None,
+        "a write was acknowledged while only one of three nodes could store it\n{}",
+        c.logs()
+    );
+    assert!(
+        c.log(leader).contains("cannot write the Raft log"),
+        "the leader did not report its disk\n{}",
+        c.logs()
+    );
+    // With its disk back and the third node up, the cluster takes writes again
+    // and every node ends up with the same rows. The refused write may have been
+    // committed since (its outcome was unknown, not failed): 7 rows or 8.
+    c.allow_disk(leader);
+    c.start(down);
+    c.write("INSERT INTO t VALUES (8)", Duration::from_secs(30))
+        .await
+        .unwrap_or_else(|| panic!("the cluster did not recover\n{}", c.logs()));
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let rows = loop {
+        let mut counts = Vec::new();
+        for id in 1..=3 {
+            counts.push(c.count(id, "t").await);
+        }
+        if counts.iter().all(|n| *n == counts[0]) && counts[0].is_some() {
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            if c.count(leader, "t").await == counts[0] {
+                break counts[0].unwrap();
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the nodes never agreed: {counts:?}\n{}",
+            c.logs()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert!(rows == 7 || rows == 8, "{rows} rows\n{}", c.logs());
 }
