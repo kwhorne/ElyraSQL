@@ -17,6 +17,25 @@ ElyraSQL release builds target **Ubuntu 24.04+** and **Apple Silicon macOS
     done, so an interrupted upgrade simply resumes on the next start. **Take a backup
     first, and note that downgrading to 1.4.x afterwards is not supported.**
 
+!!! warning "Upgrading to 1.12.19 — relaxed durability and replicas"
+
+    No change to the database file; a 1.12.18 database opens in 1.12.19
+    unchanged.
+
+    - **`ELYRASQL_SYNC=normal` now commits without syncing**, as documented:
+      it synced every commit on Linux and was no faster than `full` there.
+      Without a binlog, a crash of the **process** can now lose the commits
+      since the last background flush (up to `ELYRASQL_SYNC_INTERVAL_MS`), as
+      a crash of the machine already could. Use `full`, or add `--binlog`,
+      where that matters. With `--binlog` nothing acknowledged is lost: the
+      binlog is replayed at the next start.
+    - **A replica refuses queries while it copies the primary's data** --
+      including a client's connection setup -- instead of answering from
+      empty tables. It answers again once the copy is complete.
+    - **`elyrasql cluster` and `elyrasql replica` migrate their data at
+      start**, as `serve` does: a node or replica upgraded from before 1.12.17
+      fills in its FLOAT/DOUBLE and binary indexes at its first start.
+
 !!! warning "Upgrading to 1.12.18 — binlog, replicas and Raft clusters"
 
     No change to the database file; a 1.12.17 database opens in 1.12.18
@@ -823,8 +842,8 @@ macOS).
 Multi-arch image (`amd64` + `arm64`) on the GitHub Container Registry:
 
 ```bash
-docker pull ghcr.io/kwhorne/elyrasql:1.12.18   # or :latest
-docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.12.18
+docker pull ghcr.io/kwhorne/elyrasql:1.12.19   # or :latest
+docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.12.19
 ```
 
 The image is ~15 MB, runs as a non-root user, stores data in the
