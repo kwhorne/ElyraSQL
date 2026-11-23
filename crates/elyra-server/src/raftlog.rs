@@ -256,6 +256,19 @@ impl RaftLog {
             Some(t) if t == prev_term => {}
             _ => return false,
         }
+        // The entries must continue the log right after `prev_index`, without a
+        // hole. A leader that has compacted the entries a new node needs used to
+        // send just its log's tail with `prev_index` 0: the node accepted it,
+        // could apply none of it (it has no entry 1), and still reported the
+        // tail as matched -- so the leader counted an empty node toward its
+        // quorum, and the node could later be elected with an empty database.
+        let contiguous = new_entries
+            .iter()
+            .zip(prev_index + 1..)
+            .all(|(e, expected)| e.index == expected);
+        if !contiguous {
+            return false;
+        }
         let mut truncated = false;
         for ne in new_entries {
             match self.entries.iter().position(|e| e.index == ne.index) {
@@ -467,6 +480,29 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("snap"));
         let _ = std::fs::remove_file(path.with_extension("tmp"));
+    }
+
+    #[test]
+    fn a_new_node_refuses_a_log_tail_it_cannot_apply() {
+        let mut leader = RaftLog::new();
+        for i in 1..=10 {
+            leader.leader_append(1, vec![i as u8]);
+        }
+        leader.advance_commit(10);
+        assert_eq!(leader.take_applicable().len(), 10);
+        leader.compact(8);
+        // What the leader sends a brand-new follower (next = 1, prev = 0).
+        let prev_term = leader.term_at(0).unwrap_or(0);
+        let tail = leader.entries_after(0);
+        assert_eq!(tail.iter().map(|e| e.index).collect::<Vec<_>>(), [9, 10]);
+        let mut follower = RaftLog::new();
+        assert!(!follower.append_entries(0, prev_term, &tail));
+        assert_eq!(follower.last_index(), 0, "nothing to report as matched");
+        // A hole inside a batch is refused too.
+        let gappy = vec![e(1, 1), e(1, 3)];
+        assert!(!RaftLog::new().append_entries(0, 0, &gappy));
+        // The ordinary case still works.
+        assert!(RaftLog::new().append_entries(0, 0, &[e(1, 1), e(1, 2)]));
     }
 
     #[test]
