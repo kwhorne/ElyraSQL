@@ -69,6 +69,68 @@ pub const APPLIED_KEY: &[u8] = b"meta::raft::applied";
 /// Most committed entries applied in one transaction.
 const APPLY_BATCH: usize = 1024;
 
+/// Set while this node installs a snapshot, in the same transaction as the
+/// first part of it, and removed with the last: its data is part old, part new
+/// meanwhile. Found at start, it means an install was interrupted.
+pub const INSTALLING_KEY: &[u8] = b"meta::raft::installing";
+
+/// Why a node installing a snapshot refuses queries.
+const INSTALLING: &str =
+    "this node is installing a snapshot from the Raft leader and cannot be queried yet";
+
+/// How long a follower may take to store one part of a snapshot.
+const SNAPSHOT_CHUNK_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Wait this long before sending a follower a snapshot again after a failed
+/// transfer.
+const SNAPSHOT_RETRY: Duration = Duration::from_secs(2);
+
+/// Keys deleted or scanned per transaction while installing or discarding a
+/// snapshot.
+const INSTALL_BATCH: usize = 4096;
+
+fn env_number(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(default)
+}
+
+/// Applied entries each node keeps in its log beyond what it compacts, so a
+/// follower that is a little behind is sent entries rather than a snapshot
+/// (`ELYRASQL_RAFT_LOG_KEEP_ENTRIES`, default 10 000).
+fn keep_entries() -> u64 {
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *N.get_or_init(|| env_number("ELYRASQL_RAFT_LOG_KEEP_ENTRIES", 10_000))
+}
+
+/// At most about this much entry data is kept (`ELYRASQL_RAFT_LOG_KEEP_BYTES`,
+/// default 64 MiB).
+fn keep_bytes() -> usize {
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let n = *N.get_or_init(|| env_number("ELYRASQL_RAFT_LOG_KEEP_BYTES", 64 << 20));
+    usize::try_from(n).unwrap_or(usize::MAX)
+}
+
+/// Size of one part of a snapshot sent to a follower
+/// (`ELYRASQL_RAFT_SNAPSHOT_CHUNK_BYTES`, default 1 MiB).
+fn snapshot_chunk_bytes() -> usize {
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let n = *N.get_or_init(|| env_number("ELYRASQL_RAFT_SNAPSHOT_CHUNK_BYTES", 1 << 20));
+    usize::try_from(n.max(1)).unwrap_or(usize::MAX)
+}
+
+/// The smallest key after `k`.
+fn successor(k: &[u8]) -> Vec<u8> {
+    let mut s = k.to_vec();
+    s.push(0);
+    s
+}
+
+fn storage_io(e: elyra_core::Error) -> Error {
+    Error::other(e.to_string())
+}
+
 /// The index of the last entry `db` holds (0 if none was ever applied).
 fn applied_index(db: &Db) -> std::io::Result<u64> {
     let stored = db
@@ -83,6 +145,14 @@ fn applied_index(db: &Db) -> std::io::Result<u64> {
             .map(u64::from_le_bytes)
             .map_err(|_| Error::new(ErrorKind::InvalidData, "the applied Raft index is damaged")),
     }
+}
+
+/// Whether an interrupted snapshot install left its marker in `db`.
+fn install_interrupted(db: &Db) -> std::io::Result<bool> {
+    db.snapshot()
+        .and_then(|s| s.get(INSTALLING_KEY))
+        .map(|v| v.is_some())
+        .map_err(storage_io)
 }
 
 fn load_state(path: &Option<PathBuf>) -> std::io::Result<(u64, Option<u64>)> {
@@ -139,7 +209,8 @@ enum Msg {
         prev_term: u64,
         entries: Vec<LogEntry>,
         leader_commit: u64,
-        /// Highest index safe to compact on all nodes (min follower match).
+        /// No longer used: each node compacts its own log. Kept so the
+        /// message is laid out as older nodes expect it.
         compact_index: u64,
     },
     AppendAck {
@@ -157,6 +228,39 @@ enum Msg {
     CtlAck {
         ok: bool,
     },
+    /// Leader → follower that needs entries the leader has compacted: one part
+    /// of a snapshot of the leader's database, taken where it had applied
+    /// `last_index`. Parts are numbered from 0 and cover the keyspace in order;
+    /// `done` marks the last.
+    InstallSnapshot {
+        term: u64,
+        leader: u64,
+        repl_addr: String,
+        members: Vec<(u64, String)>,
+        last_index: u64,
+        last_term: u64,
+        seq: u64,
+        chunk: Vec<(Vec<u8>, Vec<u8>)>,
+        done: bool,
+    },
+    /// The follower stored a part (`ok`), and needs no more (`done`: it was
+    /// the last, or the follower already holds everything up to `last_index`).
+    SnapshotAck {
+        term: u64,
+        ok: bool,
+        done: bool,
+    },
+}
+
+/// A snapshot this node is installing.
+struct Install {
+    term: u64,
+    last_index: u64,
+    last_term: u64,
+    /// The part expected next.
+    seq: u64,
+    /// The last key the parts so far covered.
+    covered: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -246,6 +350,11 @@ pub struct Node {
     /// follower's AppendEntries and a leader's round across a change of role
     /// -- never apply the same entries twice or out of order.
     apply_lock: tokio::sync::Mutex<()>,
+    /// The snapshot being installed, if any. Held while a part is stored.
+    install: tokio::sync::Mutex<Option<Install>>,
+    /// The data holds part of a snapshot whose install will not be finished:
+    /// it is discarded before this node takes part again.
+    discard_install: AtomicBool,
 }
 
 impl Node {
@@ -282,6 +391,15 @@ impl Node {
             );
         }
         log.restore_applied(applied);
+        let interrupted = install_interrupted(&db)?;
+        if interrupted {
+            warn!(
+                id = cfg_id,
+                "a snapshot install was interrupted; its data is discarded before this \
+                 node takes part again"
+            );
+            db.set_fence(Some(INSTALLING.into()));
+        }
         Ok(Arc::new(Node {
             cfg: Arc::new(cfg),
             peers,
@@ -305,6 +423,8 @@ impl Node {
             state_failing: AtomicBool::new(false),
             apply_failing: AtomicBool::new(false),
             apply_lock: tokio::sync::Mutex::new(()),
+            install: tokio::sync::Mutex::new(None),
+            discard_install: AtomicBool::new(interrupted),
         }))
     }
 
@@ -401,6 +521,10 @@ impl Node {
 
     /// Start the control listener and the election / replication loops.
     pub async fn run(self: Arc<Self>) -> std::io::Result<()> {
+        if self.discard_install.load(Ordering::SeqCst) {
+            let mut install = self.install.lock().await;
+            self.discard_partial_install(&mut install).await?;
+        }
         if crate::listen_is_exposed(&self.cfg.control_listen)
             && !has_cluster_secret()
             && !crate::env_flag("ELYRASQL_ALLOW_OPEN_AUTH")
@@ -508,6 +632,7 @@ impl Node {
                     // An error closes the connection without an answer: the
                     // leader treats this node as unreachable, which it is for
                     // as long as it cannot store what it would acknowledge.
+                    let _ = compact_index;
                     self.on_append_entries(
                         term,
                         leader,
@@ -517,7 +642,29 @@ impl Node {
                         prev_term,
                         entries,
                         leader_commit,
-                        compact_index,
+                    )
+                    .await?
+                }
+                Msg::InstallSnapshot {
+                    term,
+                    leader,
+                    repl_addr,
+                    members,
+                    last_index,
+                    last_term,
+                    seq,
+                    chunk,
+                    done,
+                } => {
+                    self.on_install_snapshot(
+                        term,
+                        leader,
+                        repl_addr,
+                        members,
+                        (last_index, last_term),
+                        seq,
+                        chunk,
+                        done,
                     )
                     .await?
                 }
@@ -582,16 +729,65 @@ impl Node {
         prev_term: u64,
         entries: Vec<LogEntry>,
         leader_commit: u64,
-        compact_index: u64,
     ) -> std::io::Result<Msg> {
+        if let Some(current) = self.follow(term, leader, repl_addr, &members)? {
+            return Ok(Msg::AppendAck {
+                term: current,
+                success: false,
+                match_index: 0,
+            });
+        }
+        // Entries arrive only from a leader that is not sending this node a
+        // snapshot: one being installed will not be finished.
+        {
+            let mut install = self.install.lock().await;
+            if install.is_some() || self.discard_install.load(Ordering::SeqCst) {
+                self.discard_partial_install(&mut install).await?;
+            }
+        }
+
+        // Append + advance commit under the log lock.
+        let (success, match_index) = {
+            let mut log = self.log.lock().unwrap();
+            let appended = log.append_entries(prev_index, prev_term, &entries);
+            if self.disk(&self.log_failing, "log", appended)? {
+                log.advance_commit(leader_commit);
+                // What this node now holds as the leader does: the entries it
+                // was sent, not the end of its log. A tail left from an earlier
+                // term beyond them is not the leader's, and was reported as
+                // matched -- so the leader could count this node toward a
+                // quorum for entries it did not have.
+                (true, prev_index + entries.len() as u64)
+            } else {
+                (false, 0)
+            }
+        };
+        if success {
+            self.apply_committed().await;
+            self.compact_log();
+        }
+        let reply_term = self.state.lock().unwrap().term;
+        Ok(Msg::AppendAck {
+            term: reply_term,
+            success,
+            match_index,
+        })
+    }
+
+    /// Take `leader` as the leader for `term`, if `term` is current: become
+    /// its follower, store the term, adopt its membership. Returns this node's
+    /// term instead when `term` is an earlier one.
+    fn follow(
+        &self,
+        term: u64,
+        leader: u64,
+        repl_addr: String,
+        members: &[(u64, String)],
+    ) -> std::io::Result<Option<u64>> {
         {
             let mut s = self.state.lock().unwrap();
             if term < s.term {
-                return Ok(Msg::AppendAck {
-                    term: s.term,
-                    success: false,
-                    match_index: 0,
-                });
+                return Ok(Some(s.term));
             }
             if term > s.term {
                 s.term = term;
@@ -611,38 +807,236 @@ impl Node {
             }
             saved?;
         }
-        self.adopt_members(&members);
+        self.adopt_members(members);
         self.publish(Some(Leader {
             id: leader,
             is_self: leader == self.cfg.id,
             repl_addr,
         }));
+        Ok(None)
+    }
 
-        // Append + advance commit under the log lock.
-        let (success, match_index) = {
-            let mut log = self.log.lock().unwrap();
-            let appended = log.append_entries(prev_index, prev_term, &entries);
-            if self.disk(&self.log_failing, "log", appended)? {
-                log.advance_commit(leader_commit);
-                (true, log.last_index())
-            } else {
-                (false, 0)
-            }
-        };
-        if success {
-            self.apply_committed().await;
-        }
-        // Compact applied entries up to the cluster-wide safe point.
-        if success {
-            let compacted = self.log.lock().unwrap().compact(compact_index);
+    /// Compact the log if it holds enough applied entries (see
+    /// [`RaftLog::compaction_target`]).
+    fn compact_log(&self) {
+        let mut log = self.log.lock().unwrap();
+        if let Some(to) = log.compaction_target(keep_entries(), keep_bytes()) {
+            let compacted = log.compact(to);
             let _ = self.disk(&self.log_failing, "log", compacted);
         }
-        let reply_term = self.state.lock().unwrap().term;
-        Ok(Msg::AppendAck {
-            term: reply_term,
-            success,
-            match_index,
+    }
+
+    /// Store one part of a snapshot from the leader.
+    ///
+    /// A follower that needs entries the leader has compacted used to be left
+    /// behind for good. Now the leader sends it its database instead, a part
+    /// at a time. Each part covers the keys from where the previous one ended
+    /// up to its own last key, so this node deletes what it holds in that
+    /// range and the part does not, and writes the part: its data becomes the
+    /// leader's without being emptied first, and a transfer that starts over
+    /// simply goes through the keys again. Until the last part is stored the
+    /// data is part old, part new: a marker says so (see [`INSTALLING_KEY`])
+    /// and queries are refused.
+    #[allow(clippy::too_many_arguments)]
+    async fn on_install_snapshot(
+        &self,
+        term: u64,
+        leader: u64,
+        repl_addr: String,
+        members: Vec<(u64, String)>,
+        (last_index, last_term): (u64, u64),
+        seq: u64,
+        chunk: Vec<(Vec<u8>, Vec<u8>)>,
+        done: bool,
+    ) -> std::io::Result<Msg> {
+        let refused = |term| Msg::SnapshotAck {
+            term,
+            ok: false,
+            done: false,
+        };
+        if let Some(current) = self.follow(term, leader, repl_addr, &members)? {
+            return Ok(refused(current));
+        }
+        let mut install = self.install.lock().await;
+        if seq == 0 {
+            let partial = install.is_some() || self.discard_install.load(Ordering::SeqCst);
+            if !partial && self.log.lock().unwrap().last_applied() >= last_index {
+                // Already holds all of it: nothing to install.
+                return Ok(Msg::SnapshotAck {
+                    term,
+                    ok: true,
+                    done: true,
+                });
+            }
+            if !partial {
+                info!(
+                    id = self.cfg.id,
+                    leader, last_index, "installing a snapshot from the leader"
+                );
+            }
+            self.db.set_fence(Some(INSTALLING.into()));
+            self.db
+                .apply_ordered(
+                    Vec::new(),
+                    vec![(INSTALLING_KEY.to_vec(), last_index.to_le_bytes().to_vec())],
+                )
+                .await
+                .map_err(storage_io)?;
+            *install = Some(Install {
+                term,
+                last_index,
+                last_term,
+                seq: 0,
+                covered: None,
+            });
+        }
+        let Some(st) = install.as_mut() else {
+            return Ok(refused(term));
+        };
+        if (st.term, st.last_index, st.last_term, st.seq) != (term, last_index, last_term, seq) {
+            // Not the part this install needs next: the leader starts over.
+            return Ok(refused(term));
+        }
+        let from = st.covered.as_deref().map(successor).unwrap_or_default();
+        let to = if done {
+            None
+        } else {
+            chunk.last().map(|(k, _)| successor(k))
+        };
+        self.replace_range(from, to, chunk.clone()).await?;
+        st.covered = chunk.last().map(|(k, _)| k.clone()).or(st.covered.take());
+        st.seq += 1;
+        if done {
+            // The log first: should this node stop between the two, the marker
+            // is still there and the install is discarded at its next start.
+            let installed = self
+                .log
+                .lock()
+                .unwrap()
+                .install_snapshot(last_index, last_term);
+            self.disk(&self.log_failing, "log", installed)?;
+            self.db
+                .apply_ordered(
+                    vec![WriteOp::Plain {
+                        puts: vec![(APPLIED_KEY.to_vec(), last_index.to_le_bytes().to_vec())],
+                        deletes: vec![INSTALLING_KEY.to_vec()],
+                    }],
+                    Vec::new(),
+                )
+                .await
+                .map_err(storage_io)?;
+            *install = None;
+            self.discard_install.store(false, Ordering::SeqCst);
+            self.db.set_fence(None);
+            info!(
+                id = self.cfg.id,
+                last_index, "installed a snapshot from the leader"
+            );
+        }
+        Ok(Msg::SnapshotAck {
+            term,
+            ok: true,
+            done,
         })
+    }
+
+    /// Make the keys in `[from, to)` (`to` = `None`: to the end) exactly
+    /// `chunk`: delete every other key in the range, then write `chunk`. The
+    /// install marker is left alone.
+    async fn replace_range(
+        &self,
+        from: Vec<u8>,
+        to: Option<Vec<u8>>,
+        chunk: Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> std::io::Result<()> {
+        let keep: std::collections::HashSet<&[u8]> =
+            chunk.iter().map(|(k, _)| k.as_slice()).collect();
+        let mut start = from;
+        loop {
+            let snap = self.db.snapshot().map_err(storage_io)?;
+            let (s, t) = (start.clone(), to.clone());
+            let held = tokio::task::spawn_blocking(move || {
+                snap.scan_range(&s, t.as_deref(), INSTALL_BATCH)
+            })
+            .await
+            .map_err(Error::other)?
+            .map_err(storage_io)?;
+            let Some((last, _)) = held.last() else {
+                break;
+            };
+            start = successor(last);
+            let full = held.len() == INSTALL_BATCH;
+            let deletes: Vec<Vec<u8>> = held
+                .into_iter()
+                .map(|(k, _)| k)
+                .filter(|k| !keep.contains(k.as_slice()) && k.as_slice() != INSTALLING_KEY)
+                .collect();
+            if !deletes.is_empty() {
+                self.db
+                    .apply_ordered(
+                        vec![WriteOp::Plain {
+                            puts: Vec::new(),
+                            deletes,
+                        }],
+                        Vec::new(),
+                    )
+                    .await
+                    .map_err(storage_io)?;
+            }
+            if !full {
+                break;
+            }
+        }
+        let puts: Vec<(Vec<u8>, Vec<u8>)> = chunk
+            .into_iter()
+            .filter(|(k, _)| k.as_slice() != INSTALLING_KEY)
+            .collect();
+        if !puts.is_empty() {
+            self.db
+                .apply_ordered(
+                    vec![WriteOp::Plain {
+                        puts,
+                        deletes: Vec::new(),
+                    }],
+                    Vec::new(),
+                )
+                .await
+                .map_err(storage_io)?;
+        }
+        Ok(())
+    }
+
+    /// Discard a snapshot install that will not be finished: delete every key,
+    /// forget the log, and only then the marker -- this node starts again as a
+    /// new one, which the leader brings up to date. Its data was part old, part
+    /// new, and could not be continued with entries.
+    ///
+    /// A node lagging so far behind that it needed a snapshot holds nothing a
+    /// majority lacks, so forgetting its log loses no committed entry.
+    async fn discard_partial_install(&self, install: &mut Option<Install>) -> std::io::Result<()> {
+        warn!(
+            id = self.cfg.id,
+            "discarding a snapshot install that was not finished; this node starts \
+             over as a new member"
+        );
+        self.db.set_fence(Some(INSTALLING.into()));
+        self.replace_range(Vec::new(), None, Vec::new()).await?;
+        let reset = self.log.lock().unwrap().reset();
+        self.disk(&self.log_failing, "log", reset)?;
+        self.db
+            .apply_ordered(
+                vec![WriteOp::Plain {
+                    puts: Vec::new(),
+                    deletes: vec![INSTALLING_KEY.to_vec()],
+                }],
+                Vec::new(),
+            )
+            .await
+            .map_err(storage_io)?;
+        *install = None;
+        self.discard_install.store(false, Ordering::SeqCst);
+        self.db.set_fence(None);
+        Ok(())
     }
 
     async fn main_loop(self: Arc<Self>) {
@@ -692,7 +1086,8 @@ impl Node {
         let (term, last_index, last_term) = {
             let mut s = self.state.lock().unwrap();
             s.election_deadline = Instant::now() + election_timeout(self.cfg.id);
-            if !log_ok {
+            // Nor does a node whose data is part of a snapshot install.
+            if !log_ok || self.db.fence().is_some() {
                 return;
             }
             let before = (s.term, s.voted_for);
@@ -807,21 +1202,6 @@ impl Node {
         let peers = self.peer_snapshot();
         let live: std::collections::HashSet<u64> = peers.iter().map(|p| p.id).collect();
         repl.conns.retain(|id, _| live.contains(id));
-        // Cluster-wide safe compaction point = the slowest follower's match
-        // index (everyone has entries up to here, so they can be discarded);
-        // for a single node it's simply what has been applied.
-        let compact_index = {
-            let prog = self.progress.lock().unwrap();
-            if peers.is_empty() {
-                self.log.lock().unwrap().last_applied()
-            } else {
-                peers
-                    .iter()
-                    .map(|p| prog.get(&p.id).map(|x| x.match_).unwrap_or(0))
-                    .min()
-                    .unwrap_or(0)
-            }
-        };
         repl.round += 1;
         let round = repl.round;
         let mut launched = 0usize;
@@ -829,36 +1209,59 @@ impl Node {
             if repl.inflight.contains_key(&peer.id) {
                 continue;
             }
-            let (prev_index, prev_term, entries) = {
-                let log = self.log.lock().unwrap();
-                let next = self
-                    .progress
-                    .lock()
-                    .unwrap()
+            let next = self
+                .progress
+                .lock()
+                .unwrap()
+                .get(&peer.id)
+                .map(|p| p.next)
+                .unwrap_or(1);
+            let prev_index = next.saturating_sub(1);
+            if prev_index < self.log.lock().unwrap().snapshot_index() {
+                // The follower needs entries this log has compacted: it is sent
+                // the database instead, on a connection of its own, for as long
+                // as that takes. It is skipped until then.
+                if repl
+                    .snapshot_retry
                     .get(&peer.id)
-                    .map(|p| p.next)
-                    .unwrap_or(1);
-                let prev_index = next.saturating_sub(1);
-                // The follower needs entries this log no longer has. It refuses
-                // the tail (see `RaftLog::append_entries`), so it is not counted
-                // toward a quorum, but it cannot catch up either: that takes a
-                // snapshot transfer, which does not exist yet.
-                if prev_index < log.snapshot_index() {
-                    if repl.stranded.insert(peer.id) {
-                        warn!(
-                            peer = peer.id,
-                            needs_from = next,
-                            log_starts_at = log.snapshot_index() + 1,
-                            "a follower needs log entries that were compacted away; it \
-                             cannot catch up and does not count toward the quorum \
-                             (snapshot transfer is not supported yet)"
-                        );
-                    }
-                } else {
-                    repl.stranded.remove(&peer.id);
+                    .is_some_and(|at| Instant::now() < *at)
+                {
+                    continue;
                 }
+                info!(
+                    peer = peer.id,
+                    needs_from = next,
+                    "sending a snapshot to a follower"
+                );
+                repl.inflight.insert(peer.id, round);
+                let send = SnapshotSend {
+                    db: self.db.clone(),
+                    log: self.log.clone(),
+                    addr: peer.control_addr.clone(),
+                    term,
+                    leader: self.cfg.id,
+                    repl_addr: self.cfg.replication_addr.clone(),
+                    members: members.clone(),
+                };
+                let tx = repl.tx.clone();
+                let peer_id = peer.id;
+                tokio::spawn(async move {
+                    let reply = send.run().await;
+                    let _ = tx.send(PeerReply {
+                        peer: peer_id,
+                        term,
+                        round,
+                        conn: None,
+                        reply,
+                        snapshot: true,
+                    });
+                });
+                continue;
+            }
+            let (prev_term, entries) = {
+                let log = self.log.lock().unwrap();
                 let prev_term = log.term_at(prev_index).unwrap_or(0);
-                (prev_index, prev_term, log.entries_after(prev_index))
+                (prev_term, log.entries_after(prev_index))
             };
             let m = Msg::AppendEntries {
                 term,
@@ -869,7 +1272,7 @@ impl Node {
                 prev_term,
                 entries,
                 leader_commit,
-                compact_index,
+                compact_index: 0,
             };
             let conn = repl.conns.remove(&peer.id);
             let addr = peer.control_addr.clone();
@@ -890,6 +1293,7 @@ impl Node {
                     round,
                     conn,
                     reply,
+                    snapshot: false,
                 });
             });
         }
@@ -924,9 +1328,7 @@ impl Node {
             *self.lease.lock().unwrap() = Instant::now();
         }
         self.advance_commit_and_apply(term).await;
-        // Compact the leader's own log up to the cluster-wide safe point.
-        let compacted = self.log.lock().unwrap().compact(compact_index);
-        let _ = self.disk(&self.log_failing, "log", compacted);
+        self.compact_log();
     }
 
     /// Record one follower's answer: keep its connection, move its progress on,
@@ -938,6 +1340,15 @@ impl Node {
         }
         if reply.term != term {
             return ReplyOutcome::Ignored;
+        }
+        if reply.snapshot {
+            let sent = matches!(reply.reply, Some(Msg::AppendAck { success: true, .. }));
+            if sent {
+                repl.snapshot_retry.remove(&reply.peer);
+            } else {
+                repl.snapshot_retry
+                    .insert(reply.peer, Instant::now() + SNAPSHOT_RETRY);
+            }
         }
         if let Some(conn) = reply.conn {
             repl.conns.insert(reply.peer, conn);
@@ -1271,8 +1682,9 @@ struct Replication {
     round: u64,
     tx: tokio::sync::mpsc::UnboundedSender<PeerReply>,
     replies: tokio::sync::mpsc::UnboundedReceiver<PeerReply>,
-    /// Followers already reported as needing entries this log has compacted.
-    stranded: std::collections::HashSet<u64>,
+    /// Followers not to be sent a snapshot again before then: their last
+    /// transfer failed.
+    snapshot_retry: HashMap<u64, Instant>,
 }
 
 impl Replication {
@@ -1284,7 +1696,7 @@ impl Replication {
             round: 0,
             tx,
             replies,
-            stranded: std::collections::HashSet::new(),
+            snapshot_retry: HashMap::new(),
         }
     }
 
@@ -1303,6 +1715,137 @@ struct PeerReply {
     round: u64,
     conn: Option<PeerConn>,
     reply: Option<Msg>,
+    /// The answer to a snapshot transfer, not to an AppendEntries.
+    snapshot: bool,
+}
+
+/// A snapshot of the leader's database to send to one follower.
+struct SnapshotSend {
+    db: Db,
+    log: Arc<Mutex<RaftLog>>,
+    addr: String,
+    term: u64,
+    leader: u64,
+    repl_addr: String,
+    members: Vec<(u64, String)>,
+}
+
+impl SnapshotSend {
+    /// Send the snapshot, a part at a time, over a connection of its own: a
+    /// large database takes far longer than a replication round may.
+    ///
+    /// Returns the answer to hand to the replication loop as if it were an
+    /// AppendEntries': matched up to the snapshot's index once the follower
+    /// holds it, a later term if the follower knows one, nothing on failure.
+    async fn run(self) -> Option<Msg> {
+        match self.transfer().await {
+            Ok(reply) => Some(reply),
+            Err(e) => {
+                warn!(addr = %self.addr, error = %e, "snapshot transfer failed; it is retried");
+                None
+            }
+        }
+    }
+
+    async fn transfer(&self) -> std::io::Result<Msg> {
+        // One MVCC snapshot: the data and the index of the last entry applied
+        // to it, read together.
+        let snap = self.db.snapshot().map_err(storage_io)?;
+        let last_index = match snap.get(APPLIED_KEY).map_err(storage_io)? {
+            Some(v) => v
+                .as_slice()
+                .try_into()
+                .map(u64::from_le_bytes)
+                .map_err(|_| Error::new(ErrorKind::InvalidData, "damaged applied index"))?,
+            None => 0,
+        };
+        let last_term = self
+            .log
+            .lock()
+            .unwrap()
+            .term_at(last_index)
+            .ok_or_else(|| Error::other("the snapshot's last entry is no longer in the log"))?;
+        let mut stream = connect_peer(&self.addr).await?;
+        auth_connect(&mut stream).await?;
+        let limit = snapshot_chunk_bytes();
+        let mut from = Vec::new();
+        for seq in 0.. {
+            let (s, f) = (snap.clone(), from.clone());
+            let (chunk, done) = tokio::task::spawn_blocking(move || read_chunk(&s, f, limit))
+                .await
+                .map_err(Error::other)??;
+            if let Some((k, _)) = chunk.last() {
+                from = successor(k);
+            }
+            let m = Msg::InstallSnapshot {
+                term: self.term,
+                leader: self.leader,
+                repl_addr: self.repl_addr.clone(),
+                members: self.members.clone(),
+                last_index,
+                last_term,
+                seq,
+                chunk,
+                done,
+            };
+            send(&mut stream, &m).await?;
+            let reply = tokio::time::timeout(SNAPSHOT_CHUNK_TIMEOUT, recv(&mut stream))
+                .await
+                .map_err(|_| Error::new(ErrorKind::TimedOut, "the follower took too long"))??;
+            match reply {
+                Some(Msg::SnapshotAck { term, .. }) if term > self.term => {
+                    return Ok(Msg::AppendAck {
+                        term,
+                        success: false,
+                        match_index: 0,
+                    });
+                }
+                Some(Msg::SnapshotAck {
+                    ok: true,
+                    done: true,
+                    ..
+                }) => {
+                    return Ok(Msg::AppendAck {
+                        term: self.term,
+                        success: true,
+                        match_index: last_index,
+                    });
+                }
+                Some(Msg::SnapshotAck { ok: true, .. }) if !done => {}
+                _ => return Err(Error::other("the follower refused a part of the snapshot")),
+            }
+        }
+        unreachable!("the loop returns")
+    }
+}
+
+/// Keys and their values.
+type Pairs = Vec<(Vec<u8>, Vec<u8>)>;
+
+/// The keys from `from` on, up to about `limit` bytes of them, and whether
+/// they are the last.
+fn read_chunk(
+    snap: &elyra_storage::Snapshot,
+    mut from: Vec<u8>,
+    limit: usize,
+) -> std::io::Result<(Pairs, bool)> {
+    let mut chunk = Vec::new();
+    let mut bytes = 0usize;
+    loop {
+        let batch = snap.scan_range(&from, None, 256).map_err(storage_io)?;
+        let full = batch.len() == 256;
+        for (k, v) in batch {
+            bytes += k.len() + v.len();
+            from = successor(&k);
+            chunk.push((k, v));
+            if bytes >= limit {
+                return Ok((chunk, false));
+            }
+        }
+        if !full {
+            return Ok((chunk, true));
+        }
+    }
 }
 
 enum ReplyOutcome {
@@ -1664,6 +2207,204 @@ mod tests {
         drop(node);
         drop(db);
         closed.wait(Duration::from_secs(10));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn snapshot_part(
+        node: &Node,
+        term: u64,
+        seq: u64,
+        chunk: Vec<(Vec<u8>, Vec<u8>)>,
+        done: bool,
+    ) -> impl std::future::Future<Output = std::io::Result<Msg>> + '_ {
+        node.on_install_snapshot(
+            term,
+            2,
+            String::new(),
+            vec![(1, String::new()), (2, String::new())],
+            (50, term),
+            seq,
+            chunk,
+            done,
+        )
+    }
+
+    fn pair(k: &str, v: &str) -> (Vec<u8>, Vec<u8>) {
+        (k.as_bytes().to_vec(), v.as_bytes().to_vec())
+    }
+
+    /// The keys `db` holds, but for the write sequence every write stores.
+    async fn keys(db: &Db) -> Vec<Vec<u8>> {
+        db.snapshot()
+            .unwrap()
+            .scan_range(b"", None, 1000)
+            .unwrap()
+            .into_iter()
+            .map(|(k, _)| k)
+            .filter(|k| k.as_slice() != b"meta::wseq")
+            .collect()
+    }
+
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("elyra-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    async fn close(node: Arc<Node>, db: Db) {
+        let closed = db.close_waiter();
+        drop(node);
+        drop(db);
+        assert!(closed.wait(Duration::from_secs(10)));
+    }
+
+    /// A snapshot replaces what the node held in each range the parts cover,
+    /// and queries are refused until the last part is stored.
+    #[tokio::test]
+    async fn a_snapshot_install_replaces_the_data_part_by_part() {
+        let dir = temp_dir("install");
+        let (node, db) = single_node(&dir);
+        db.commit(
+            vec![
+                pair("data::a", "old"),
+                pair("data::c", "old"),
+                pair("data::z", "old"),
+            ],
+            vec![],
+        )
+        .await
+        .unwrap();
+        let ack = snapshot_part(&node, 1, 0, vec![pair("data::b", "new")], false)
+            .await
+            .unwrap();
+        assert!(matches!(
+            ack,
+            Msg::SnapshotAck {
+                ok: true,
+                done: false,
+                ..
+            }
+        ));
+        assert!(db.fence().is_some(), "queries are refused mid-install");
+        // A part out of order is refused.
+        let ack = snapshot_part(&node, 1, 5, vec![], true).await.unwrap();
+        assert!(matches!(ack, Msg::SnapshotAck { ok: false, .. }));
+        let ack = snapshot_part(&node, 1, 1, vec![pair("data::y", "new")], true)
+            .await
+            .unwrap();
+        assert!(matches!(
+            ack,
+            Msg::SnapshotAck {
+                ok: true,
+                done: true,
+                ..
+            }
+        ));
+        assert_eq!(db.fence(), None);
+        assert_eq!(
+            keys(&db).await,
+            [
+                b"data::b".to_vec(),
+                b"data::y".to_vec(),
+                APPLIED_KEY.to_vec()
+            ]
+        );
+        assert_eq!(applied_index(&db).unwrap(), 50);
+        {
+            let log = node.log.lock().unwrap();
+            assert_eq!((log.snapshot_index(), log.last_applied()), (50, 50));
+        }
+        close(node, db).await;
+        // At the next start nothing is discarded.
+        let (node, db) = single_node(&dir);
+        assert!(!node.discard_install.load(Ordering::SeqCst));
+        assert_eq!(node.log.lock().unwrap().last_applied(), 50);
+        close(node, db).await;
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// An install that will not be finished -- a new leader sends entries, or
+    /// the node restarts in the middle -- is discarded with all the data: the
+    /// node starts over as a new one.
+    #[tokio::test]
+    async fn an_unfinished_snapshot_install_is_discarded() {
+        let dir = temp_dir("abandoned");
+        let (node, db) = single_node(&dir);
+        db.commit(vec![pair("data::a", "old")], vec![])
+            .await
+            .unwrap();
+        snapshot_part(&node, 1, 0, vec![pair("data::b", "new")], false)
+            .await
+            .unwrap();
+        // A leader of a later term sends entries instead.
+        let ack = node
+            .on_append_entries(2, 3, String::new(), vec![], 0, 0, vec![], 0)
+            .await
+            .unwrap();
+        assert!(matches!(ack, Msg::AppendAck { success: true, .. }));
+        assert!(keys(&db).await.is_empty(), "{:?}", keys(&db).await);
+        assert_eq!(db.fence(), None);
+
+        // Interrupted by a restart this time.
+        snapshot_part(&node, 3, 0, vec![pair("data::b", "new")], false)
+            .await
+            .unwrap();
+        close(node, db).await;
+        let (node, db) = single_node(&dir);
+        assert!(
+            db.fence().is_some(),
+            "queries are refused until it is discarded"
+        );
+        assert!(node.discard_install.load(Ordering::SeqCst));
+        {
+            let mut install = node.install.lock().await;
+            node.discard_partial_install(&mut install).await.unwrap();
+        }
+        assert!(keys(&db).await.is_empty());
+        assert_eq!(db.fence(), None);
+        close(node, db).await;
+        let (node, db) = single_node(&dir);
+        assert!(!node.discard_install.load(Ordering::SeqCst));
+        close(node, db).await;
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A follower reports as matched what the leader sent it, not the end of
+    /// its log: a tail from an earlier term is not the leader's.
+    #[tokio::test]
+    async fn a_follower_reports_only_what_it_was_sent_as_matched() {
+        let dir = temp_dir("matched");
+        let (node, db) = single_node(&dir);
+        {
+            let mut log = node.log.lock().unwrap();
+            for _ in 1..=5 {
+                log.leader_append(
+                    1,
+                    entry(&WriteOp::Plain {
+                        puts: vec![],
+                        deletes: vec![],
+                    }),
+                );
+            }
+            log.sync().unwrap();
+        }
+        let ack = node
+            .on_append_entries(2, 2, String::new(), vec![], 2, 1, vec![], 0)
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                ack,
+                Msg::AppendAck {
+                    success: true,
+                    match_index: 2,
+                    ..
+                }
+            ),
+            "entries 3..=5 of term 1 were reported as the leader's"
+        );
+        close(node, db).await;
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

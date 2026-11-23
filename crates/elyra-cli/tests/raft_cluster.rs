@@ -29,6 +29,8 @@ struct Node {
 struct Cluster {
     dir: PathBuf,
     nodes: Vec<Node>,
+    /// Environment every node is started with.
+    env: Vec<(String, String)>,
 }
 
 impl Cluster {
@@ -40,11 +42,18 @@ impl Cluster {
         let mut c = Cluster {
             dir,
             nodes: Vec::new(),
+            env: Vec::new(),
         };
         for _ in 0..n {
             c.add_node();
         }
         c
+    }
+
+    /// Start every node with `name` set to `value`.
+    fn with_env(mut self, name: &str, value: &str) -> Self {
+        self.env.push((name.into(), value.into()));
+        self
     }
 
     /// Configure one more node (ids count from 1); returns its id.
@@ -100,6 +109,9 @@ impl Cluster {
             ]);
         for p in &peers {
             cmd.args(["--peer", p]);
+        }
+        for (k, v) in &self.env {
+            cmd.env(k, v);
         }
         let child = cmd
             .env("ELYRASQL_CLUSTER_SECRET", SECRET)
@@ -331,15 +343,39 @@ async fn a_cluster_replicates_writes_and_survives_losing_its_leader() {
     c.until_count(leader, "t", 30).await;
 }
 
+/// Keep only a few entries in each log, so a node that is behind needs a
+/// snapshot; send it in small parts, so it takes several.
+fn compacting(c: Cluster) -> Cluster {
+    c.with_env("ELYRASQL_RAFT_LOG_KEEP_ENTRIES", "3")
+        .with_env("ELYRASQL_RAFT_SNAPSHOT_CHUNK_BYTES", "64")
+}
+
+async fn insert(c: &Cluster, ids: impl IntoIterator<Item = i64>) {
+    for i in ids {
+        c.write(
+            &format!("INSERT INTO t VALUES ({i})"),
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap_or_else(|| panic!("insert {i} was not accepted\n{}", c.logs()));
+    }
+}
+
+async fn sum(c: &Cluster, id: u64) -> Option<i64> {
+    let mut conn = c.conn(id).await?;
+    conn.query_first("SELECT COALESCE(SUM(id), 0) FROM t")
+        .await
+        .ok()
+        .flatten()
+}
+
 #[tokio::test(flavor = "multi_thread")]
-async fn a_node_that_needs_compacted_entries_never_counts_toward_a_quorum() {
-    // The log is compacted as soon as every member has an entry, so a node
-    // added later needs entries no node still has. It used to accept the log's
-    // tail, apply none of it, and report it as matched: the leader counted a
-    // node with an empty database toward its quorum. Until snapshots can be
-    // transferred such a node cannot catch up -- but it must not make up a
-    // majority.
-    let mut c = Cluster::new("stranded", 3);
+async fn a_node_added_after_compaction_catches_up_from_a_snapshot() {
+    // A node added later needs entries no node keeps. It used to accept the
+    // log's tail and report it matched with an empty database, and once that
+    // was refused it could not catch up at all. Now it is sent a snapshot,
+    // holds what the others do, and counts toward the quorum.
+    let mut c = compacting(Cluster::new("joiner", 3));
     c.start_all();
     c.write(
         "CREATE TABLE t (id INT PRIMARY KEY)",
@@ -347,14 +383,7 @@ async fn a_node_that_needs_compacted_entries_never_counts_toward_a_quorum() {
     )
     .await
     .unwrap_or_else(|| panic!("no leader accepted a write\n{}", c.logs()));
-    for i in 1..=20 {
-        c.write(
-            &format!("INSERT INTO t VALUES ({i})"),
-            Duration::from_secs(10),
-        )
-        .await
-        .expect("write");
-    }
+    insert(&c, 1..=20).await;
     for id in 1..=3 {
         c.until_count(id, "t", 20).await;
     }
@@ -362,66 +391,53 @@ async fn a_node_that_needs_compacted_entries_never_counts_toward_a_quorum() {
     let new = c.add_node();
     c.start(new);
     let leader = c.join(new);
-    // Membership travels with the leader's heartbeats: wait until it has tried
-    // the new node, and its followers have heard of it.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !c
-        .log(leader)
-        .contains("needs log entries that were compacted away")
-    {
-        assert!(
-            Instant::now() < deadline,
-            "the leader never tried the new node\n{}",
-            c.logs()
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    // Four members need three for a majority. Without one follower that is the
-    // leader, the other follower and the new node -- which has nothing.
-    let follower = (1..=3).find(|&id| id != leader).unwrap();
-    c.kill(follower);
-    let accepted = c
-        .write("INSERT INTO t VALUES (100)", Duration::from_secs(8))
-        .await;
-    assert_eq!(
-        accepted,
-        None,
-        "a write was acknowledged by a majority that counted the empty new node \
-         (new node has {:?} rows)\n{}",
-        c.count(new, "t").await,
+    c.until_count(new, "t", 20).await;
+    assert!(
+        c.log(new).contains("installed a snapshot from the leader"),
+        "the new node did not install a snapshot\n{}",
         c.logs()
     );
-    // With the follower back, a real majority exists again.
-    c.start(follower);
-    c.write("INSERT INTO t VALUES (101)", Duration::from_secs(30))
+    // Four members need three: with a follower down, the new node is one.
+    let follower = (1..=3).find(|&id| id != leader).unwrap();
+    c.kill(follower);
+    insert(&c, 21..=25).await;
+    c.until_count(new, "t", 25).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_follower_down_past_compaction_catches_up_deletes_included() {
+    let mut c = compacting(Cluster::new("behind", 3));
+    c.start_all();
+    let leader = c
+        .write(
+            "CREATE TABLE t (id INT PRIMARY KEY)",
+            Duration::from_secs(30),
+        )
         .await
-        .unwrap_or_else(|| panic!("the cluster did not recover its majority\n{}", c.logs()));
-    // The refused write stayed in the leader's log, and may be committed now
-    // that a majority is back: an error after a step-down means "unknown", as in
-    // Raft generally. Either way, the three nodes agree.
-    let deadline = Instant::now() + Duration::from_secs(20);
-    let rows = loop {
-        let mut counts = Vec::new();
-        for id in 1..=3 {
-            counts.push(c.count(id, "t").await);
-        }
-        let settled = counts.iter().all(|n| *n == counts[0]) && counts[0].is_some();
-        if settled {
-            // Stable across a few heartbeats, not just equal for an instant.
-            tokio::time::sleep(Duration::from_millis(600)).await;
-            if c.count(leader, "t").await == counts[0] {
-                break counts[0].unwrap();
-            }
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the nodes never agreed: {counts:?}\n{}",
-            c.logs()
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    };
-    assert!(rows == 21 || rows == 22, "{rows} rows\n{}", c.logs());
+        .unwrap_or_else(|| panic!("no leader accepted a write\n{}", c.logs()));
+    insert(&c, 1..=20).await;
+    for id in 1..=3 {
+        c.until_count(id, "t", 20).await;
+    }
+    let down = (1..=3).find(|&id| id != leader).unwrap();
+    c.kill(down);
+    // What it misses: rows it holds are deleted, others added, more than the
+    // logs keep.
+    c.write("DELETE FROM t WHERE id <= 10", Duration::from_secs(10))
+        .await
+        .expect("delete");
+    insert(&c, 21..=40).await;
+    c.start(down);
+    c.until_count(down, "t", 30).await;
+    assert_eq!(sum(&c, down).await, Some((11..=40).sum::<i64>()));
+    assert!(
+        c.log(down).contains("installed a snapshot from the leader"),
+        "the follower did not install a snapshot\n{}",
+        c.logs()
+    );
+    // And it goes on from there with entries.
+    insert(&c, 41..=45).await;
+    c.until_count(down, "t", 35).await;
 }
 
 #[cfg(unix)]

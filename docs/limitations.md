@@ -480,13 +480,14 @@ judge fit before deploying.
   across restarts. **Cluster membership is dynamic**: `elyrasql cluster-ctl
   --action add|remove` changes membership at runtime (send it to the leader,
   which propagates it to followers via heartbeats; a follower refuses it); add
-  one node at a time and start a new node before adding it. **A node cannot
-  yet catch up once the entries it needs have been compacted away**, because
-  snapshots are not transferred. That applies to a node added to a running
-  cluster, or one down long enough for its peers to compact past it. Such a
-  node is refused the log's tail and does not count toward a quorum. Until
-  snapshot transfer lands, adding a node to a cluster that has taken writes is
-  not supported. A membership change also reaches followers only with the leader's
+  one node at a time and start a new node before adding it. A node that needs
+  entries the leader has compacted -- one added to a running cluster, or one
+  down for long -- is sent a **snapshot** of the leader's database instead,
+  a part at a time, and continues with entries from there. While it installs
+  one it refuses queries ("installing a snapshot") and does not stand for
+  election; an install that is interrupted is discarded and the node starts
+  over as a new member. All nodes of a cluster must run a version that
+  supports snapshots: upgrade them together. A membership change also reaches followers only with the leader's
   heartbeats, so one made just before the leader fails can be lost. An even-node cluster can, rarely, need an extra
   election round to break a tie — run an odd number of nodes. Election state
   (current term + vote) is persisted to a `<data>.raftstate` file so a restarted
@@ -518,13 +519,11 @@ judge fit before deploying.
   in-flight writes fail fast and a healthy majority elects a new leader — rather
   than hanging. Because the lease is shorter than the election timeout, a
   lease-valid leader is guaranteed to still be the leader, so its local reads are
-  linearizable without a quorum round-trip. The Raft log is **compacted**: once
-  entries are applied and replicated to every member, each node discards them
-  (keeping only the snapshot boundary term for the consistency check), so the log
-  does not grow unbounded — the applied state machine is the snapshot. Compaction
-  advances only to the slowest member's replicated index, so a permanently
-  lagging/dead member holds it back until the member catches up or is removed
-  from membership. The older `primary`/`replica` mode remains asynchronous
+  linearizable without a quorum round-trip. The Raft log is **compacted**: each
+  node discards applied entries beyond the last `ELYRASQL_RAFT_LOG_KEEP_ENTRIES`
+  (or `ELYRASQL_RAFT_LOG_KEEP_BYTES`), keeping only the boundary term for the
+  consistency check -- the applied database is the snapshot. A member that is
+  down does not hold compaction back: it is sent a snapshot when it returns. The older `primary`/`replica` mode remains asynchronous
   (semi-sync/quorum barrier).
 
 ## Wire protocol
