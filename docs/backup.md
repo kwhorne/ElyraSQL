@@ -93,8 +93,10 @@ than it:
   two. After a crash, records the data file is missing are replayed from the
   binlog at the next start, before any connection is accepted.
 - With `ELYRASQL_SYNC=normal` the binlog is fsynced by the background flush,
-  right before the data file. The crash-loss window is the one that mode
-  already has.
+  right before the data file. A crash of the process loses nothing -- the
+  binlog's writes are with the operating system, and are replayed -- and a
+  crash of the machine loses the commits since the last flush, as in that
+  mode without a binlog.
 
 Every record carries a CRC32. A partial record left by a crash at the end of
 the newest segment is cut off at the next start. Damage anywhere else is

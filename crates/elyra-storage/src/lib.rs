@@ -473,13 +473,27 @@ pub struct Storage {
 }
 
 /// Read the configured durability from `ELYRASQL_SYNC` (`full` -> Immediate,
-/// the default; `normal`/`relaxed` -> Eventual).
+/// the default; `normal`/`relaxed` -> commits without a sync of their own, see
+/// [`DEFERRED`]).
 fn configured_durability() -> Durability {
     match std::env::var("ELYRASQL_SYNC").ok().as_deref() {
-        Some("normal") | Some("relaxed") | Some("eventual") => Durability::Eventual,
+        Some("normal") | Some("relaxed") | Some("eventual") => DEFERRED,
         _ => Durability::Immediate,
     }
 }
+
+/// How a commit is made when it is not to be synced itself -- relaxed
+/// durability, or a database whose binlog is the durable log -- and the
+/// periodic flush (an `Immediate` commit) makes it durable.
+///
+/// It used to be `Durability::Eventual`, which in redb 2.6 still syncs the
+/// file on every commit: a full `fdatasync` on Linux (a cheaper
+/// `F_BARRIERFSYNC` on macOS). `ELYRASQL_SYNC=normal` was then no faster than
+/// `full` on Linux, and with `--binlog` each group paid two syncs, the
+/// binlog's and the data file's. A `Durability::None` commit is not synced;
+/// redb keeps the file consistent and, after a crash, at its last durable
+/// commit.
+const DEFERRED: Durability = Durability::None;
 
 impl Storage {
     /// Open (or create) the single ElyraSQL database file at `path`.
@@ -562,14 +576,14 @@ impl Storage {
         Ok(wtx)
     }
 
-    /// True when running in the relaxed (`Eventual`) durability mode, so the
+    /// True when commits are not synced themselves (see [`DEFERRED`]), so the
     /// group-commit writer knows it must force periodic durable flushes.
     /// Commit data writes without an fsync each, for a database whose binlog
     /// is the durable log (see `Db::open_with_binlog`): the periodic flush
     /// makes the file durable, and records it lacks after a crash are replayed
     /// from the binlog at open.
     pub(crate) fn defer_data_sync(&mut self) {
-        self.durability = Durability::Eventual;
+        self.durability = DEFERRED;
     }
 
     /// How many committed writes have deleted the id counter at `key` since
@@ -602,7 +616,7 @@ impl Storage {
     }
 
     pub fn is_relaxed_durability(&self) -> bool {
-        matches!(self.durability, Durability::Eventual)
+        !matches!(self.durability, Durability::Immediate)
     }
 
     /// Force everything committed so far to disk with an `Immediate` commit.

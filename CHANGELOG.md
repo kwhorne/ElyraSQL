@@ -8,6 +8,26 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ### Fixed
 
+- **`ELYRASQL_SYNC=normal`, and `--binlog`, no longer sync the data file on
+  every commit on Linux.** Commits meant to be made durable by the periodic
+  flush were committed with redb's `Durability::Eventual`, which in redb 2.6
+  still syncs the file on each commit: a full `fdatasync` on Linux (a cheaper
+  barrier on macOS). `normal` was therefore no faster than `full` on Linux,
+  and with `--binlog` each group paid two syncs, the binlog's and the data
+  file's, where one was documented. They now commit with `Durability::None`
+  and the periodic flush makes them durable. Measured on Linux (OrbStack,
+  `INSERT`s, 1 / 8 clients): `normal` 806 / 4040 to 5555 / 10714 per second;
+  `full` with `--binlog` 345 / 1557 to 952 / 3080, now the same as without a
+  binlog. `full` without a binlog is unchanged.
+
+  In `normal` mode a crash of the **process** now loses the commits since
+  the last flush (up to `ELYRASQL_SYNC_INTERVAL_MS`), as a crash of the
+  machine already did -- as with PostgreSQL's `synchronous_commit=off`. With
+  `--binlog` a process crash loses nothing: the binlog is written through
+  to the operating system per commit and replayed at the next start. Pages
+  that commits between two flushes replace are freed only by the next flush,
+  so under a heavy update load the file can hold a few tens of MB more.
+
 - **A Raft snapshot sets AUTO_INCREMENT counters to the leader's.** A write
   only moves an id counter forward unless it deletes it, so a follower that
   installed a snapshot kept its own counter where the leader's was lower --
