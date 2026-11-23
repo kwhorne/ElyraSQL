@@ -250,6 +250,18 @@ enum Msg {
         ok: bool,
         done: bool,
     },
+    /// Would you vote for me in `term`? Asked before standing for election,
+    /// changing nothing on either side (Raft's PreVote).
+    PreVote {
+        term: u64,
+        candidate: u64,
+        last_log_index: u64,
+        last_log_term: u64,
+    },
+    PreVoteReply {
+        term: u64,
+        granted: bool,
+    },
 }
 
 /// A snapshot this node is installing.
@@ -280,6 +292,8 @@ struct State {
     role: Role,
     leader: Option<u64>,
     election_deadline: Instant,
+    /// When this node last heard from a leader of its current term.
+    heard_from_leader: Option<Instant>,
 }
 
 const HEARTBEAT_MS: u64 = 150;
@@ -410,6 +424,7 @@ impl Node {
                 role: Role::Follower,
                 leader: None,
                 election_deadline: Instant::now() + election_timeout(cfg_id),
+                heard_from_leader: None,
             })),
             log: Arc::new(Mutex::new(log)),
             db,
@@ -618,6 +633,12 @@ impl Node {
                     last_log_index,
                     last_log_term,
                 } => self.on_request_vote(term, candidate, last_log_index, last_log_term),
+                Msg::PreVote {
+                    term,
+                    last_log_index,
+                    last_log_term,
+                    ..
+                } => self.on_pre_vote(term, last_log_index, last_log_term),
                 Msg::AppendEntries {
                     term,
                     leader,
@@ -673,6 +694,75 @@ impl Node {
             send(&mut stream, &reply).await?;
         }
         Ok(())
+    }
+
+    /// Answer a PreVote: would this node vote for the asker in `term`? Only if
+    /// that term is not behind its own, the asker's log is at least as
+    /// up to date, and this node has no leader it heard from lately -- a
+    /// leader whose lease holds, or one heard from within the shortest
+    /// election timeout. Nothing changes here, whatever the answer.
+    fn on_pre_vote(&self, term: u64, last_log_index: u64, last_log_term: u64) -> Msg {
+        let s = self.state.lock().unwrap();
+        let recent = Duration::from_millis(ELECTION_LO_MS);
+        let leader_alive = match s.role {
+            Role::Leader => {
+                self.lease.lock().unwrap().elapsed() < Duration::from_millis(LEADER_LEASE_MS)
+            }
+            _ => s.heard_from_leader.is_some_and(|t| t.elapsed() < recent),
+        };
+        let up_to_date = self
+            .log
+            .lock()
+            .unwrap()
+            .is_up_to_date(last_log_term, last_log_index);
+        Msg::PreVoteReply {
+            term: s.term,
+            granted: term >= s.term && !leader_alive && up_to_date,
+        }
+    }
+
+    /// Ask every peer whether it would vote for this node in the next term
+    /// (see [`Node::on_pre_vote`]). True when a majority would.
+    ///
+    /// A node that hears from no leader -- one not yet added to the cluster,
+    /// or cut off from it -- used to stand for election every timeout, each
+    /// time in a higher term. Every peer that heard of that term took it on,
+    /// and a leader stepped down for it: one such node deposed the leader
+    /// every second or two, and a snapshot transfer to a new node never got to
+    /// finish. Now it stands only once a majority would vote for it, which
+    /// they do not while they have a leader.
+    async fn pre_vote(&self) -> bool {
+        let peers = self.peer_snapshot();
+        let m = {
+            let s = self.state.lock().unwrap();
+            let log = self.log.lock().unwrap();
+            Msg::PreVote {
+                term: s.term + 1,
+                candidate: self.cfg.id,
+                last_log_index: log.last_index(),
+                last_log_term: log.last_term(),
+            }
+        };
+        let replies =
+            futures_util::future::join_all(peers.iter().map(|p| rpc(&p.control_addr, &m))).await;
+        let mut granted = 1;
+        for reply in replies {
+            match reply {
+                Ok(Msg::PreVoteReply { granted: true, .. }) => granted += 1,
+                Ok(Msg::PreVoteReply { term, .. }) => {
+                    // A later term elsewhere: take it on, as any reply does.
+                    let mut s = self.state.lock().unwrap();
+                    if term > s.term {
+                        s.term = term;
+                        s.voted_for = None;
+                        s.role = Role::Follower;
+                        let _ = self.save_state(&mut s);
+                    }
+                }
+                _ => {}
+            }
+        }
+        granted >= self.majority()
     }
 
     fn on_request_vote(
@@ -759,7 +849,8 @@ impl Node {
                 // quorum for entries it did not have.
                 (true, prev_index + entries.len() as u64)
             } else {
-                (false, 0)
+                // Where the logs may still agree: the leader goes back there.
+                (false, log.conflict_hint(prev_index))
             }
         };
         if success {
@@ -797,6 +888,7 @@ impl Node {
             s.role = Role::Follower;
             s.leader = Some(leader);
             s.election_deadline = Instant::now() + election_timeout(self.cfg.id);
+            s.heard_from_leader = Some(Instant::now());
             // The term must be on disk before anything in it is acknowledged:
             // restarted with an earlier one, this node would take entries from
             // a deposed leader and could drop ones already committed.
@@ -1083,11 +1175,21 @@ impl Node {
         // vote for itself -- must be on disk first. A node that cannot write
         // them does not stand.
         let log_ok = self.sync_log().is_ok();
-        let (term, last_index, last_term) = {
+        {
             let mut s = self.state.lock().unwrap();
             s.election_deadline = Instant::now() + election_timeout(self.cfg.id);
             // Nor does a node whose data is part of a snapshot install.
             if !log_ok || self.db.fence().is_some() {
+                return;
+            }
+        }
+        if !self.pre_vote().await {
+            return;
+        }
+        let (term, last_index, last_term) = {
+            let mut s = self.state.lock().unwrap();
+            s.election_deadline = Instant::now() + election_timeout(self.cfg.id);
+            if s.role == Role::Leader {
                 return;
             }
             let before = (s.term, s.voted_for);
@@ -1380,9 +1482,12 @@ impl Node {
                     p.next = match_index + 1;
                     ReplyOutcome::Acked
                 } else {
-                    if p.next > 1 {
-                        p.next -= 1; // back off and retry with an earlier prefix
-                    }
+                    // Back off to where the follower says the logs may still
+                    // agree. One entry per round used to be all: a follower
+                    // far behind took longer to reach than a leader lasted
+                    // when it was needed for the quorum, and each new leader
+                    // started over from the end of its log.
+                    p.next = p.next.saturating_sub(1).min(match_index + 1).max(1);
                     ReplyOutcome::Refused
                 }
             }
@@ -2031,7 +2136,12 @@ mod tests {
             "election took {:?}",
             started.elapsed()
         );
-        assert_eq!(node.state.lock().unwrap().role, Role::Candidate);
+        // Nobody answered the PreVote: the node did not stand, nor move its
+        // term on.
+        {
+            let s = node.state.lock().unwrap();
+            assert_eq!((s.role, s.term), (Role::Follower, 0));
+        }
 
         {
             let mut s = node.state.lock().unwrap();
@@ -2406,6 +2516,45 @@ mod tests {
         );
         close(node, db).await;
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A node grants a PreVote only when it has no live leader and the
+    /// asker's log is at least as up to date; answering changes nothing.
+    #[tokio::test]
+    async fn a_pre_vote_is_refused_while_there_is_a_leader() {
+        let node = Node::new(
+            ClusterConfig {
+                id: 1,
+                control_listen: String::new(),
+                replication_addr: String::new(),
+                peers: Vec::new(),
+                state_path: None,
+                log_path: None,
+            },
+            Db::in_memory().unwrap(),
+        )
+        .unwrap();
+        node.log.lock().unwrap().leader_append(3, vec![]);
+        node.state.lock().unwrap().term = 3;
+        let granted = |m: Msg| matches!(m, Msg::PreVoteReply { granted: true, .. });
+        // No leader heard from: an up-to-date asker would get the vote...
+        assert!(granted(node.on_pre_vote(4, 1, 3)));
+        // ...a stale one would not.
+        assert!(!granted(node.on_pre_vote(4, 0, 0)));
+        // A leader was heard from just now: no.
+        node.state.lock().unwrap().heard_from_leader = Some(Instant::now());
+        assert!(!granted(node.on_pre_vote(4, 1, 3)));
+        // Nor while this node leads under a fresh lease.
+        {
+            let mut s = node.state.lock().unwrap();
+            s.heard_from_leader = None;
+            s.role = Role::Leader;
+        }
+        *node.lease.lock().unwrap() = Instant::now();
+        assert!(!granted(node.on_pre_vote(4, 1, 3)));
+        // Answering moved nothing on.
+        let s = node.state.lock().unwrap();
+        assert_eq!((s.term, s.voted_for), (3, None));
     }
 
     #[test]

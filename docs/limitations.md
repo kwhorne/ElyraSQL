@@ -488,8 +488,11 @@ judge fit before deploying.
   election; an install that is interrupted is discarded and the node starts
   over as a new member. All nodes of a cluster must run a version that
   supports snapshots: upgrade them together. A membership change also reaches followers only with the leader's
-  heartbeats, so one made just before the leader fails can be lost. An even-node cluster can, rarely, need an extra
-  election round to break a tie — run an odd number of nodes. Election state
+  heartbeats, so one made just before the leader fails can be lost. A node stands for election only once a majority
+  would vote for it (PreVote), so a node that hears from no leader -- not
+  yet added, or cut off -- does not depose the one there is. An even-node
+  cluster can, rarely, need an extra election round to break a tie — run an
+  odd number of nodes. Election state
   (current term + vote) is persisted to a `<data>.raftstate` file so a restarted
   node never double-votes in a term (a Raft safety requirement). In `cluster`
   mode the **live write path runs through the Raft replicated log**: the leader

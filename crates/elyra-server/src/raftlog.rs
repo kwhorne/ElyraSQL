@@ -367,6 +367,25 @@ impl RaftLog {
         Ok(true)
     }
 
+    /// After refusing entries at `prev_index`: the highest index up to which
+    /// this log may still match the leader's, so the leader can go back there
+    /// at once rather than one entry per round. That is the end of this log
+    /// when it is shorter, or the index before the run of entries in the
+    /// conflicting term when it disagrees (Raft §5.3).
+    pub fn conflict_hint(&self, prev_index: u64) -> u64 {
+        if prev_index > self.last_index() {
+            return self.last_index();
+        }
+        let Some(mut i) = self.pos(prev_index) else {
+            return self.snapshot_index;
+        };
+        let term = self.entries[i].term;
+        while i > 0 && self.entries[i - 1].term == term {
+            i -= 1;
+        }
+        self.entries[i].index - 1
+    }
+
     /// Replace everything up to `index` with a snapshot of the state machine
     /// taken there (Raft's InstallSnapshot): the state machine now holds every
     /// entry up to `index`, whose term is `term`. Entries after it are kept if
@@ -949,6 +968,20 @@ mod tests {
         let log = RaftLog::open(path).unwrap();
         assert_eq!((log.last_index(), log.snapshot_index()), (0, 0));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_refusal_says_how_far_back_the_logs_may_still_agree() {
+        let mut log = RaftLog::new();
+        log.append_entries(0, 0, &[e(1, 1), e(1, 2), e(2, 3), e(2, 4), e(2, 5)])
+            .unwrap();
+        // The leader is past this log's end.
+        assert!(!log.append_entries(9, 3, &[]).unwrap());
+        assert_eq!(log.conflict_hint(9), 5);
+        // It disagrees at 5, which is term 2 here: all of term 2 goes.
+        assert!(!log.append_entries(5, 3, &[]).unwrap());
+        assert_eq!(log.conflict_hint(5), 2);
+        assert_eq!(log.conflict_hint(2), 0);
     }
 
     #[test]
