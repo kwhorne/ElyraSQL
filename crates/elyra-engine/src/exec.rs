@@ -27026,6 +27026,9 @@ pub async fn purge_binary_logs(db: &Session, to: &str) -> Result<QueryResult> {
     let dir = handle
         .binlog_dir()
         .ok_or_else(|| Error::Query("binary logging is not enabled".into()))?;
+    // The data file may lag the binlog by up to one flush interval (the
+    // binlog is the durable log); make it durable before records go.
+    handle.flush()?;
     let n = elyra_storage::binlog::purge(dir, to)?;
     Ok(QueryResult::Affected(n))
 }

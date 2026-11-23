@@ -12,6 +12,7 @@ redb.workspace = true
 libc.workspace = true
 serde = { workspace = true, features = ["derive"] }
 bincode.workspace = true
+crc32fast.workspace = true
 async-trait.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true }

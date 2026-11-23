@@ -36,12 +36,18 @@ pub struct WriteEvent {
     pub deletes: Vec<Vec<u8>>,
 }
 
+/// One job's write-set as the binlog and replicas see it: `(puts, deletes)`.
+type WriteSet = (Vec<(Vec<u8>, Vec<u8>)>, Vec<Vec<u8>>);
+
 /// Commit-log sink owned by the writer thread: assigns LSNs, appends to the
 /// binlog (for point-in-time recovery) and broadcasts to replicas.
 struct Repl {
     lsn: Arc<AtomicU64>,
     tx: broadcast::Sender<Arc<WriteEvent>>,
     binlog: Option<crate::binlog::BinlogWriter>,
+    /// Under relaxed durability, held across logging and committing a group so
+    /// the periodic flush cannot make the database durable ahead of the binlog.
+    relaxed_gate: Option<crate::binlog::BinlogSync>,
 }
 
 impl Repl {
@@ -55,19 +61,83 @@ impl Repl {
         self.binlog.is_some() || self.has_replicas()
     }
 
-    /// Assign the next LSN, append to the binlog, and broadcast a write-set.
+    /// Assign the next LSN and broadcast a committed write-set (no binlog: with
+    /// one, groups go through [`Repl::log_group`] before their commit instead).
     fn publish(&mut self, puts: Vec<(Vec<u8>, Vec<u8>)>, deletes: Vec<Vec<u8>>) {
         if puts.is_empty() && deletes.is_empty() {
             return;
         }
         let lsn = self.lsn.fetch_add(1, Ordering::SeqCst) + 1;
-        if let Some(bl) = &mut self.binlog {
-            if let Err(e) = bl.append(lsn, &puts, &deletes) {
-                tracing::error!(error = %e, "binlog append failed");
-            }
-        }
+        self.broadcast(lsn, puts, deletes);
+    }
+
+    fn broadcast(&self, lsn: u64, puts: Vec<(Vec<u8>, Vec<u8>)>, deletes: Vec<Vec<u8>>) {
         // Ignore send errors: no subscribers is fine.
         let _ = self.tx.send(Arc::new(WriteEvent { lsn, puts, deletes }));
+    }
+
+    /// The binlog half of a group commit, run inside the group's transaction
+    /// just before it commits: give each applied, non-empty write-set the next
+    /// LSN and append them to the binlog durably. Returns the group's last LSN,
+    /// which the transaction records with the data (see
+    /// [`crate::BINLOG_LSN_KEY`]), and fills `lsns` per job.
+    ///
+    /// Writing the binlog first is what keeps it a superset of the database:
+    /// it used to be appended after the commit and only flushed, so a crash
+    /// could keep a write in the database that the binlog -- and so every
+    /// replica catching up from it and every point-in-time restore -- never
+    /// saw, and a failed append was only logged while the client was told the
+    /// commit succeeded.
+    fn log_group(
+        &mut self,
+        writes: &[WriteSet],
+        applied: &[bool],
+        lsns: &mut Vec<Option<u64>>,
+        mark: &mut Option<crate::binlog::GroupMark>,
+    ) -> Result<Option<u64>> {
+        let binlog = self.binlog.as_mut().expect("log_group needs a binlog");
+        let mut next = self.lsn.load(Ordering::SeqCst);
+        lsns.clear();
+        let mut records = Vec::new();
+        for ((puts, deletes), &ok) in writes.iter().zip(applied) {
+            if ok && !(puts.is_empty() && deletes.is_empty()) {
+                next += 1;
+                lsns.push(Some(next));
+                records.push((next, puts.as_slice(), deletes.as_slice()));
+            } else {
+                lsns.push(None);
+            }
+        }
+        if records.is_empty() {
+            return Ok(None);
+        }
+        *mark = Some(binlog.append_group(&records)?);
+        Ok(Some(next))
+    }
+
+    /// After the group's commit: on success advance the LSN and broadcast the
+    /// logged write-sets; on failure take the group back out of the binlog.
+    fn finish_group(
+        &mut self,
+        committed: bool,
+        writes: Vec<WriteSet>,
+        lsns: &[Option<u64>],
+        mark: Option<crate::binlog::GroupMark>,
+    ) {
+        if !committed {
+            if let (Some(mark), Some(binlog)) = (mark, self.binlog.as_mut()) {
+                if let Err(e) = binlog.undo(mark) {
+                    tracing::error!(error = %e, "could not remove a failed commit from the binlog");
+                }
+            }
+            return;
+        }
+        for ((puts, deletes), lsn) in writes.into_iter().zip(lsns) {
+            if let Some(lsn) = *lsn {
+                self.lsn.store(lsn, Ordering::SeqCst);
+                self.broadcast(lsn, puts, deletes);
+            }
+        }
     }
 }
 
@@ -117,6 +187,66 @@ pub trait Consensus: Send + Sync {
 
 /// Max writes folded into a single group commit.
 const GROUP_COMMIT_MAX: usize = 1024;
+/// Make every commit so far durable, the binlog before the database (see
+/// [`crate::binlog::BinlogSync`]).
+fn flush_durably(storage: &Storage, binlog: Option<&crate::binlog::BinlogSync>) -> Result<()> {
+    match binlog {
+        Some(binlog) => binlog.durable_then(|| storage.flush()),
+        None => storage.flush(),
+    }
+}
+
+/// Bring the database up to its binlog and return the LSN to continue from.
+///
+/// The binlog is written durably before the commit that holds the same
+/// write-sets, so after a crash between the two it has records the database
+/// lacks: those past the LSN the database recorded (see
+/// [`crate::BINLOG_LSN_KEY`]) are applied now, before any connection. A
+/// database from before that key existed has nothing to compare against and
+/// is taken as is.
+fn recover_from_binlog(storage: &Storage, dir: &std::path::Path) -> Result<u64> {
+    let logged = crate::binlog::max_lsn(dir)?;
+    let held = storage
+        .get(crate::BINLOG_LSN_KEY)?
+        .filter(|v| v.len() == 8)
+        .map(|v| u64::from_le_bytes(v[..8].try_into().unwrap()));
+    match held {
+        Some(held) if logged > held => {
+            let missing = crate::binlog::read_since(dir, held, logged)?;
+            let jobs: Vec<crate::PlainJob<'_>> = missing
+                .iter()
+                .map(|rec| crate::PlainJob {
+                    new: None,
+                    puts: &rec.puts,
+                    deletes: &rec.deletes,
+                })
+                .collect();
+            let results = storage.apply_jobs_with(&jobs, &mut |_| Ok(Some(logged)))?;
+            if let Some(Err(e)) = results.into_iter().find(Result::is_err) {
+                return Err(e);
+            }
+            tracing::warn!(
+                records = missing.len(),
+                from_lsn = held + 1,
+                to_lsn = logged,
+                "applied binlog records the database did not hold (the last start \
+                 ended between a binlog write and its commit)"
+            );
+            Ok(logged)
+        }
+        Some(held) if held > logged => {
+            tracing::error!(
+                database_lsn = held,
+                binlog_lsn = logged,
+                "the binlog is missing records the database holds (was it truncated or \
+                 replaced?); replicas and point-in-time restores cannot see them"
+            );
+            Ok(held)
+        }
+        _ => Ok(logged),
+    }
+}
+
 /// Bound on the writer queue → backpressure under write storms.
 const WRITE_QUEUE_DEPTH: usize = 4096;
 
@@ -239,6 +369,8 @@ pub struct Db {
     sync_strict: Arc<AtomicBool>,
     /// Binlog directory, if point-in-time recovery is enabled.
     binlog_dir: Option<std::path::PathBuf>,
+    /// The binlog's durability point under relaxed durability.
+    binlog_sync: Option<crate::binlog::BinlogSync>,
     /// Optional consensus layer: when installed (cluster mode), the leader
     /// routes mutations through it (Raft) instead of committing locally.
     consensus: Arc<Mutex<Option<Arc<dyn Consensus>>>>,
@@ -272,12 +404,32 @@ impl Db {
     fn from_storage(storage: Storage, binlog: Option<std::path::PathBuf>) -> Result<Self> {
         static NEXT_DB_ID: AtomicU64 = AtomicU64::new(1);
         let id = NEXT_DB_ID.fetch_add(1, Ordering::Relaxed);
+        // Whether commits are acknowledged before they are durable
+        // (`ELYRASQL_SYNC=normal`), as the user chose it.
+        let acknowledge_early = storage.is_relaxed_durability();
+        let mut storage = storage;
+        if binlog.is_some() {
+            // The binlog is the durable log: each group is fsynced there
+            // before its commit, so the data file needs no fsync per commit
+            // as well -- the periodic flush makes it durable, and what it
+            // lacks after a crash is replayed from the binlog at open. That is
+            // one fsync per group instead of two.
+            storage.defer_data_sync();
+        }
         let storage = Arc::new(storage);
         let (tx, rx) = mpsc::channel::<WriteJob>(WRITE_QUEUE_DEPTH);
-        // Resume the LSN counter from the binlog so it stays monotonic across
-        // restarts (correct binlog ordering + incremental replica catch-up).
-        let initial_lsn = match &binlog {
-            Some(p) => crate::binlog::max_lsn(p).unwrap_or(0),
+        // Opening the binlog cuts off a partial record left by a crash.
+        let binlog_dir = binlog.clone();
+        let binlog = match binlog {
+            Some(p) => Some(crate::binlog::BinlogWriter::open(p, !acknowledge_early)?),
+            None => None,
+        };
+        let binlog_sync = binlog.as_ref().map(|b| b.sync_handle());
+        // Resume the LSN counter so it stays monotonic across restarts (correct
+        // binlog ordering + incremental replica catch-up), after bringing the
+        // database up to the binlog.
+        let initial_lsn = match &binlog_dir {
+            Some(dir) => recover_from_binlog(&storage, dir)?,
             None => 0,
         };
         let lsn = Arc::new(AtomicU64::new(initial_lsn));
@@ -288,15 +440,14 @@ impl Db {
         let sync_replicas = Arc::new(AtomicU64::new(0));
         let sync_timeout_ms = Arc::new(AtomicU64::new(0));
         let sync_strict = Arc::new(AtomicBool::new(false));
-        let binlog_dir = binlog.clone();
-        let binlog = match binlog {
-            Some(p) => Some(crate::binlog::BinlogWriter::open(p)?),
-            None => None,
-        };
+        // Without a per-group fsync of the binlog, the flush must not make the
+        // data durable ahead of it.
+        let relaxed_gate = binlog_sync.clone().filter(|_| acknowledge_early);
         let repl = Repl {
             lsn: lsn.clone(),
             tx: repl_tx.clone(),
             binlog,
+            relaxed_gate,
         };
 
         // Dedicated OS thread owns all writes. redb is single-writer, so
@@ -321,18 +472,21 @@ impl Db {
         // to disk, bounding the crash-loss window (like MySQL's
         // innodb_flush_log_at_trx_commit=2 or PostgreSQL's synchronous_commit
         // = off). It never risks corruption -- redb stays consistent and rolls
-        // back to the last durable commit on crash. The thread exits once the
-        // database is dropped (its weak handle can no longer upgrade).
+        // back to the last durable commit on crash. With a binlog the same
+        // thread bounds how far the data file lags the binlog, which is what
+        // recovery at open replays. The thread exits once the database is
+        // dropped (its weak handle can no longer upgrade).
         if storage.is_relaxed_durability() {
             let weak = Arc::downgrade(&storage);
             let interval = flush_interval();
+            let binlog_sync = binlog_sync.clone();
             thread::Builder::new()
                 .name("elyra-flush".into())
                 .spawn(move || loop {
                     std::thread::sleep(interval);
                     match weak.upgrade() {
                         Some(s) => {
-                            let _ = s.flush();
+                            let _ = flush_durably(&s, binlog_sync.as_ref());
                         }
                         None => break,
                     }
@@ -354,6 +508,7 @@ impl Db {
             sync_timeout_ms,
             sync_strict,
             binlog_dir,
+            binlog_sync: binlog_sync.clone(),
             consensus: Arc::new(Mutex::new(None)),
         })
     }
@@ -373,7 +528,7 @@ impl Db {
     /// is acknowledged before it is durable, and the periodic flush may not
     /// have run since.
     pub fn flush(&self) -> Result<()> {
-        self.storage.flush()
+        flush_durably(&self.storage, self.binlog_sync.as_ref())
     }
 
     /// The data file path this database was opened from, if known (used to derive
@@ -909,7 +1064,7 @@ fn writer_loop(storage: Arc<Storage>, mut rx: mpsc::Receiver<WriteJob>, mut repl
 /// acking each with its individual result and replicating those that committed.
 fn apply_validated_group(storage: &Arc<Storage>, jobs: Vec<WriteJob>, repl: &mut Repl) {
     // Fast path: a single transaction avoids building the borrow vector.
-    if jobs.len() == 1 {
+    if jobs.len() == 1 && repl.binlog.is_none() {
         let job = jobs.into_iter().next().unwrap();
         let v = job.validation.as_ref().unwrap();
         let r = storage.apply_validated(&v.keys, &v.ranges, &job.puts, &job.deletes);
@@ -933,12 +1088,47 @@ fn apply_validated_group(storage: &Arc<Storage>, jobs: Vec<WriteJob>, repl: &mut
         })
         .collect();
 
+    if repl.binlog.is_some() {
+        let writes: Vec<_> = jobs
+            .iter()
+            .map(|j| (j.puts.clone(), j.deletes.clone()))
+            .collect();
+        let (mut lsns, mut mark) = (Vec::new(), None);
+        let gate = repl.relaxed_gate.clone();
+        let held = gate.as_ref().map(|g| g.hold());
+        let outcome = storage.apply_validated_batch_with(&commits, &mut |applied| {
+            repl.log_group(&writes, applied, &mut lsns, &mut mark)
+        });
+        drop(held);
+        drop(commits);
+        repl.finish_group(outcome.is_ok(), writes, &lsns, mark);
+        ack_all(jobs, outcome);
+        return;
+    }
+
     match storage.apply_validated_batch(&commits) {
         Ok(results) => {
             for (job, r) in jobs.into_iter().zip(results) {
                 if r.is_ok() && repl.active() {
                     repl.publish(job.puts.clone(), job.deletes.clone());
                 }
+                let _ = job.ack.send(r);
+            }
+        }
+        Err(e) => {
+            for job in jobs {
+                let _ = job.ack.send(Err(Error::Storage(e.to_string())));
+            }
+        }
+    }
+}
+
+/// Acknowledge each job of a group with its own result, or all of them with the
+/// group's error.
+fn ack_all(jobs: Vec<WriteJob>, outcome: Result<Vec<Result<()>>>) {
+    match outcome {
+        Ok(results) => {
+            for (job, r) in jobs.into_iter().zip(results) {
                 let _ = job.ack.send(r);
             }
         }
@@ -972,7 +1162,7 @@ fn apply_job_group(storage: &Arc<Storage>, jobs: Vec<WriteJob>, repl: &mut Repl)
         None => storage.apply(&j.puts, &j.deletes),
     };
 
-    if jobs.len() == 1 {
+    if jobs.len() == 1 && repl.binlog.is_none() {
         let r = apply_one(&jobs[0]);
         if r.is_ok() && repl.active() {
             repl.publish(job_puts(&jobs[0]), jobs[0].deletes.clone());
@@ -992,6 +1182,24 @@ fn apply_job_group(storage: &Arc<Storage>, jobs: Vec<WriteJob>, repl: &mut Repl)
             deletes: &j.deletes,
         })
         .collect();
+    if repl.binlog.is_some() {
+        let writes: Vec<_> = jobs
+            .iter()
+            .map(|j| (job_puts(j), j.deletes.clone()))
+            .collect();
+        let (mut lsns, mut mark) = (Vec::new(), None);
+        let gate = repl.relaxed_gate.clone();
+        let held = gate.as_ref().map(|g| g.hold());
+        let outcome = storage.apply_jobs_with(&plain, &mut |applied| {
+            repl.log_group(&writes, applied, &mut lsns, &mut mark)
+        });
+        drop(held);
+        drop(plain);
+        repl.finish_group(outcome.is_ok(), writes, &lsns, mark);
+        ack_all(jobs, outcome);
+        return;
+    }
+
     match storage.apply_jobs(&plain) {
         Ok(results) => {
             drop(plain);
@@ -1045,6 +1253,7 @@ mod group_commit_tests {
             lsn: Arc::new(AtomicU64::new(0)),
             tx,
             binlog: None,
+            relaxed_gate: None,
         };
         let k = b"data::t::k".to_vec();
         let (insert, a1) = job(Some(vec![(k.clone(), b"row".to_vec())]), vec![], vec![]);
