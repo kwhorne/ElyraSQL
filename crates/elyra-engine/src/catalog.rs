@@ -363,7 +363,7 @@ pub fn trigname_key(name: &str) -> Vec<u8> {
 pub async fn load_triggers(db: &Session, table: &str) -> Result<Vec<TriggerDef>> {
     let epoch = cache_tag();
     let cache_key = (db.db_id(), table.to_ascii_lowercase());
-    if !db.in_txn() {
+    if db.schema_cache_ok() {
         if let Some((cached_epoch, triggers)) = trigger_cache().read().unwrap().get(&cache_key) {
             if *cached_epoch == epoch {
                 return Ok((**triggers).clone());
@@ -376,7 +376,7 @@ pub async fn load_triggers(db: &Session, table: &str) -> Result<Vec<TriggerDef>>
         .iter()
         .filter_map(|(_, v)| bincode::deserialize(v).ok())
         .collect();
-    if !db.in_txn() {
+    if db.schema_cache_ok() {
         trigger_cache()
             .write()
             .unwrap()
@@ -749,7 +749,7 @@ pub async fn load(db: &Session, table: &str) -> Result<TableDef> {
     // Key the process-global cache by (database id, table name) so multiple Dbs
     // in one process never serve each other's schema for a same-named table.
     let ckey = (db.db_id(), table.to_string());
-    if !db.in_txn() {
+    if db.schema_cache_ok() {
         if let Some((e, def)) = catalog_cache().read().unwrap().get(&ckey) {
             if *e == epoch {
                 return Ok((**def).clone());
@@ -790,7 +790,7 @@ pub async fn load(db: &Session, table: &str) -> Result<TableDef> {
                 .and_then(|length| u32::try_from(length).ok());
         }
     }
-    if !db.in_txn() {
+    if db.schema_cache_ok() {
         catalog_cache()
             .write()
             .unwrap()

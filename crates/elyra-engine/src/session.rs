@@ -59,6 +59,12 @@ struct TxnState {
     /// Approximate bytes buffered by `puts` + `deletes`, maintained
     /// incrementally, to bound in-transaction memory (see `txn_max_bytes`).
     mem: usize,
+    /// The schema caches' tag when the transaction began (see
+    /// [`Session::schema_cache_ok`]).
+    schema_tag: crate::catalog::CacheTag,
+    /// The transaction wrote a schema key: its own reads of the schema must
+    /// see that write, which no cache holds.
+    schema_writes: bool,
 }
 
 /// A savepoint marker: positions into the undo log and range list rather than a
@@ -791,6 +797,30 @@ impl Session {
         self.txn.lock().unwrap().is_some()
     }
 
+    /// Whether the process-wide schema caches (table definitions, triggers,
+    /// the foreign keys that reference a table, other schema keys) answer for
+    /// this session as its own reads would.
+    ///
+    /// Outside a transaction they always do. Inside one they do as long as no
+    /// schema change was committed since it began -- its snapshot then holds
+    /// the schema they hold -- and it wrote none itself. The caches used to be
+    /// skipped in every transaction, and since an autocommit UPDATE or DELETE
+    /// runs as one, each of them read the definition of every table in the
+    /// database to find the foreign keys referencing its own: with 200 tables
+    /// an UPDATE by primary key took 4.6 ms instead of 0.6.
+    ///
+    /// A SERIALIZABLE transaction reads past them, as it records what it reads.
+    pub fn schema_cache_ok(&self) -> bool {
+        match self.txn.lock().unwrap().as_ref() {
+            None => true,
+            Some(tx) => {
+                !tx.serializable
+                    && !tx.schema_writes
+                    && tx.schema_tag == crate::catalog::cache_tag()
+            }
+        }
+    }
+
     /// Mark statements run from here until the guard drops as the engine's own,
     /// exempt from the implicit commit a user's DDL causes.
     pub(crate) fn internal_statements(&self) -> InternalStatements<'_> {
@@ -883,6 +913,9 @@ impl Session {
         let read_only = read_only
             .or(pending)
             .unwrap_or_else(|| self.session_read_only());
+        // Read before the snapshot: a schema change committed in between moves
+        // the tag on, and the caches are not used (see `schema_cache_ok`).
+        let schema_tag = crate::catalog::cache_tag();
         let snapshot = self.db.snapshot()?;
         let serializable = *self.isolation.lock().unwrap() == Isolation::Serializable;
         *self.txn.lock().unwrap() = Some(TxnState {
@@ -899,6 +932,8 @@ impl Session {
             undo: Vec::new(),
             undo_mem: 0,
             mem: 0,
+            schema_tag,
+            schema_writes: false,
         });
         Ok(())
     }
@@ -1053,6 +1088,8 @@ impl Session {
             undo: _,
             mem: _,
             undo_mem: _,
+            schema_tag: _,
+            schema_writes: _,
         } = tx;
         let catalog_changed = puts
             .keys()
@@ -1330,6 +1367,15 @@ impl Session {
         {
             let mut guard = self.txn.lock().unwrap();
             if let Some(tx) = guard.as_mut() {
+                if !tx.schema_writes {
+                    let schema = |k: &[u8]| {
+                        elyra_storage::SCHEMA_PREFIXES
+                            .iter()
+                            .any(|p| k.starts_with(p))
+                    };
+                    tx.schema_writes =
+                        deletes.iter().any(|k| schema(k)) || puts.iter().any(|(k, _)| schema(k));
+                }
                 let budget = txn_max_bytes();
                 let logging = !tx.savepoints.is_empty() || tx.checkpoints > 0;
                 // Match the storage-layer write order: deletes first, then

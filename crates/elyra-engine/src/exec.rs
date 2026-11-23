@@ -16989,7 +16989,7 @@ async fn referencing_children(db: &Session, parent: &str) -> Result<Vec<TableDef
     let cache = CACHE.get_or_init(Default::default);
     let tag = catalog::cache_tag();
     let key = (db.db_id(), parent.to_ascii_lowercase());
-    if !db.in_txn() {
+    if db.schema_cache_ok() {
         if let Some((t, children)) = cache.read().unwrap().get(&key) {
             if *t == tag {
                 return Ok(children.clone());
@@ -17007,7 +17007,7 @@ async fn referencing_children(db: &Session, parent: &str) -> Result<Vec<TableDef
             out.push(def);
         }
     }
-    if !db.in_txn() {
+    if db.schema_cache_ok() {
         let mut cache = cache.write().unwrap();
         if cache.len() >= 4096 {
             cache.clear();
