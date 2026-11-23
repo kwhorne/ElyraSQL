@@ -39,6 +39,21 @@ All notable changes to ElyraSQL are documented here. The format is based on
   them: `SHOW CREATE TABLE`, `information_schema.PARTITIONS` and mysqldump
   gave it the dropped table's `PARTITION BY`, and the planner its
   statistics.
+- **A new replica is copied from one state of the primary, and refuses
+  queries until the copy is complete.** The primary sent its keyspace page by
+  page, each page read in a read transaction of its own, so the copy mixed
+  states the database went through while it was sent (the writes streamed
+  afterwards made it right in the end). It now sends one snapshot. And the
+  replica answered queries from empty or partly filled tables meanwhile, as
+  if the primary held no rows; it now refuses them ("this replica is copying
+  the primary's data"), clients' connection setup included, until the copy
+  ends.
+- **A replica's catch-up and a restart's binlog recovery read only the
+  segments they need.** They read every binlog segment into memory to keep
+  the last few records; they now read back from the newest segment as far as
+  the first record they need, so a damaged segment far back no longer stops
+  them either. `elyrasql replay` reads one segment at a time and applies
+  1000 records per transaction instead of one commit per record.
 
 - **A Raft snapshot sets AUTO_INCREMENT counters to the leader's.** A write
   only moves an id counter forward unless it deletes it, so a follower that

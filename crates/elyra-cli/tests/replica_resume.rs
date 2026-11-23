@@ -285,3 +285,42 @@ async fn a_replica_starts_over_when_the_primary_cannot_continue_it() {
     assert_eq!(until_same(&f, pm, rm).await, (50, 1275));
     assert!(!Path::new(&format!("{}.resync", f.path("replica.edb"))).exists());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replica_refuses_queries_until_its_copy_is_complete() {
+    // A new replica whose primary cannot be reached yet: its tables are empty,
+    // and it used to answer queries from them as if the primary had no rows.
+    let f = Files::new("replfence");
+    let rm = free_port();
+    let rm_a = format!("127.0.0.1:{rm}");
+    let nowhere = format!("127.0.0.1:{}", free_port());
+    let _replica = start(
+        &strs(&replica_args(&f, &nowhere, &rm_a)),
+        &f.dir.join("r.log"),
+    );
+    let opts = mysql_async::OptsBuilder::default()
+        .ip_or_hostname("127.0.0.1")
+        .tcp_port(rm)
+        .user(Some("root"))
+        .pass(Some("rootpw"))
+        .prefer_socket(false);
+    // The client's own setup queries are refused too, with the reason.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let err = loop {
+        match mysql_async::Conn::new(opts.clone()).await {
+            Ok(mut c) => match c.query_drop("SELECT 1").await {
+                Ok(()) => panic!("a replica without its data answered a query"),
+                Err(e) => break e,
+            },
+            Err(e @ mysql_async::Error::Server(_)) => break e,
+            Err(_) if std::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(e) => panic!("the replica never came up: {e}\n{}", f.logs()),
+        }
+    };
+    assert!(
+        err.to_string().contains("copying the primary's data"),
+        "{err}"
+    );
+}

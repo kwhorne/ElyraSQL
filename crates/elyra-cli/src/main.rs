@@ -273,7 +273,11 @@ async fn open_replica(data: &std::path::Path) -> anyhow::Result<Db> {
         Err(e) => return Err(e.into()),
     }
     let _ = std::fs::remove_file(&marker);
-    Ok(Db::open(data)?)
+    let db = Db::open(data)?;
+    // Empty until the primary's data has arrived: refuse queries rather than
+    // answer them from empty tables (lifted at the end of the copy).
+    db.set_fence(Some(elyra_server::repl::COPYING.into()));
+    Ok(db)
 }
 
 async fn shutdown_signal() -> &'static str {
