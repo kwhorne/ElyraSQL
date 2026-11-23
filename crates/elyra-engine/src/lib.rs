@@ -10618,6 +10618,100 @@ mod replicated_counter_reset_tests {
 }
 
 #[cfg(test)]
+mod schema_cache_in_transaction_tests {
+    //! Transactions use the schema caches when those hold what the
+    //! transaction's own reads would: no schema change committed since it
+    //! began, and none of its own. Everything else reads past them.
+    use super::{Engine, Privilege, QueryResult, Session};
+    use elyra_storage::Db;
+
+    async fn run(e: &Engine, s: &Session, sql: &str) -> Vec<QueryResult> {
+        e.execute(sql, Privilege::Admin, s)
+            .await
+            .unwrap_or_else(|err| panic!("{sql}\n  -> {err}"))
+    }
+
+    async fn columns(e: &Engine, s: &Session, sql: &str) -> usize {
+        let QueryResult::Rows(rows) = run(e, s, sql).await.remove(0) else {
+            panic!("expected rows for {sql}");
+        };
+        rows.schema.columns.len()
+    }
+
+    #[tokio::test]
+    async fn a_transaction_reads_the_schema_of_its_snapshot() {
+        let e = Engine::new(Db::in_memory().unwrap());
+        let (a, b) = (e.session(), e.session());
+        run(&e, &a, "CREATE TABLE t (id INT PRIMARY KEY, v INT)").await;
+        run(&e, &a, "INSERT INTO t VALUES (1, 1)").await;
+        // The definition is cached outside any transaction.
+        assert_eq!(columns(&e, &a, "SELECT * FROM t").await, 2);
+        run(&e, &a, "START TRANSACTION").await;
+        assert!(a.schema_cache_ok());
+        assert_eq!(columns(&e, &a, "SELECT * FROM t").await, 2);
+        // A schema change committed after it began: the caches now hold the
+        // new definition, which this transaction must not see.
+        run(&e, &b, "ALTER TABLE t ADD COLUMN w INT").await;
+        assert!(!a.schema_cache_ok());
+        assert_eq!(columns(&e, &a, "SELECT * FROM t").await, 2);
+        run(&e, &a, "COMMIT").await;
+        assert_eq!(columns(&e, &a, "SELECT * FROM t").await, 3);
+    }
+
+    #[tokio::test]
+    async fn a_transaction_that_writes_schema_reads_past_the_caches() {
+        let e = Engine::new(Db::in_memory().unwrap());
+        let s = e.session();
+        run(&e, &s, "CREATE TABLE t (id INT PRIMARY KEY)").await;
+        s.begin().unwrap();
+        assert!(s.schema_cache_ok());
+        // A write to a schema key, as DDL inside a transaction makes.
+        s.commit_write(vec![(b"sys::probe".to_vec(), b"x".to_vec())], vec![])
+            .await
+            .unwrap();
+        assert!(!s.schema_cache_ok());
+        s.rollback();
+        assert!(s.schema_cache_ok());
+    }
+
+    #[tokio::test]
+    async fn a_serializable_transaction_reads_past_the_caches() {
+        let e = Engine::new(Db::in_memory().unwrap());
+        let s = e.session();
+        run(&e, &s, "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE").await;
+        run(&e, &s, "START TRANSACTION").await;
+        assert!(!s.schema_cache_ok());
+        run(&e, &s, "COMMIT").await;
+    }
+
+    /// An autocommit DELETE runs as a transaction of its own: it takes the
+    /// foreign keys that reference its table from the cache, and still
+    /// enforces them.
+    #[tokio::test]
+    async fn an_autocommit_delete_still_enforces_foreign_keys() {
+        let e = Engine::new(Db::in_memory().unwrap());
+        let s = e.session();
+        run(&e, &s, "CREATE TABLE p (id INT PRIMARY KEY)").await;
+        run(
+            &e,
+            &s,
+            "CREATE TABLE c (id INT PRIMARY KEY, p INT, FOREIGN KEY (p) REFERENCES p (id))",
+        )
+        .await;
+        run(&e, &s, "INSERT INTO p VALUES (1)").await;
+        run(&e, &s, "INSERT INTO c VALUES (1, 1)").await;
+        for _ in 0..2 {
+            // The first fills the cache, the second is answered from it.
+            let refused = e
+                .execute("DELETE FROM p WHERE id = 1", Privilege::Admin, &s)
+                .await
+                .is_err();
+            assert!(refused, "a referenced parent row was deleted");
+        }
+    }
+}
+
+#[cfg(test)]
 mod concurrent_insert_id_tests {
     //! Concurrent INSERTs must get distinct AUTO_INCREMENT values and row ids.
     //! Each statement read the stored counter and counted up from it on its

@@ -70,7 +70,7 @@ fn assert_schema_key(key: &[u8]) {
 /// `sess.get(key)` for a schema key, cached outside transactions.
 pub async fn get(sess: &Session, key: Vec<u8>) -> Result<Option<Vec<u8>>> {
     assert_schema_key(&key);
-    if sess.in_txn() {
+    if !sess.schema_cache_ok() {
         return sess.get(key).await;
     }
     let generation = elyra_storage::schema_generation();
@@ -103,7 +103,7 @@ pub async fn keys(sess: &Session, prefix: &[u8]) -> Result<Vec<Vec<u8>>> {
             after = keys.last().cloned();
         }
     };
-    if sess.in_txn() {
+    if !sess.schema_cache_ok() {
         return scan().await;
     }
     let generation = elyra_storage::schema_generation();

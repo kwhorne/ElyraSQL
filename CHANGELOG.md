@@ -21,6 +21,16 @@ All notable changes to ElyraSQL are documented here. The format is based on
   deletion of an id counter, however the write arrived, and an allocator
   whose counter was reset starts again from what is stored.
 
+- **An autocommit UPDATE or DELETE no longer reads every table's definition.**
+  Since 1.12.17 such a statement runs as a transaction of its own, and the
+  schema caches -- table definitions, triggers, the foreign keys referencing
+  a table -- were skipped inside any transaction: each UPDATE and DELETE read
+  the definition of every table in the database to find the foreign keys
+  pointing at its own. With 200 tables an UPDATE by primary key took 4.4 ms
+  instead of 0.7 ms (0.5 ms instead of 0.24 ms with one table). A
+  transaction now uses the caches while no schema change was committed
+  since it began and it made none itself; a SERIALIZABLE one still reads
+  past them.
 - **A new database with a binlog no longer loses its first commits in a power
   loss.** With `--binlog` the data file is synced only by the periodic flush
   (`ELYRASQL_SYNC_INTERVAL_MS`), and what it lacks after a crash is replayed
