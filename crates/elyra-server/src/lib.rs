@@ -1306,8 +1306,22 @@ pub async fn serve(config: ServerConfig, engine: Engine) -> std::io::Result<()> 
     }
 
     let listener = TcpListener::bind(&config.listen).await?;
+    serve_on(listener, config, engine).await
+}
+
+/// [`serve`] on a listener the caller has bound already -- a test that binds
+/// port 0 learns its port without the race of picking a free one first.
+pub async fn serve_on(
+    listener: TcpListener,
+    config: ServerConfig,
+    engine: Engine,
+) -> std::io::Result<()> {
     let tls_enabled = config.tls.is_some();
-    info!(addr = %config.listen, tls = tls_enabled, "ElyraSQL accepting MySQL-protocol connections");
+    let addr = listener
+        .local_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|_| config.listen.clone());
+    info!(addr = %addr, tls = tls_enabled, "ElyraSQL accepting MySQL-protocol connections");
 
     let engine = Arc::new(engine);
     let auth = config.auth;

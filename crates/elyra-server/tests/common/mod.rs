@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use elyra_engine::Engine;
-use elyra_server::{serve, Auth, ServerConfig};
+use elyra_server::{serve_on, Auth, ServerConfig};
 use elyra_storage::Db;
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -53,70 +53,47 @@ impl TestServer {
     async fn start_inner(
         users: Option<Vec<(String, String, elyra_core::Privilege)>>,
     ) -> TestServer {
-        // Retry on the (rare) ephemeral-port race: we reserve a port from the OS
-        // and drop it before the server rebinds, so under heavy parallelism two
-        // servers can occasionally pick the same port. Each attempt uses a fresh
-        // port and a fresh data file (a new redb handle).
-        for _ in 0..8 {
-            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let port = probe.local_addr().unwrap().port();
-            drop(probe);
+        // The test binds the listener itself, on port 0, and hands it to the
+        // server. It used to pick a free port, drop it and let the server bind
+        // it again: under parallel tests another server could take the port in
+        // between, and the readiness check then connected to *that* server --
+        // a test ran against another test's database and accounts, and failed
+        // at random ("connection closed", a wrong password accepted).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a test port");
+        let port = listener.local_addr().unwrap().port();
 
-            let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-            let data_path =
-                std::env::temp_dir().join(format!("elyrasql-it-{}-{}.edb", std::process::id(), n));
-            let _ = std::fs::remove_file(&data_path);
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let data_path =
+            std::env::temp_dir().join(format!("elyrasql-it-{}-{}.edb", std::process::id(), n));
+        let _ = std::fs::remove_file(&data_path);
 
-            let db = Db::open(&data_path).expect("open db");
-            let auth = match &users {
-                None => Auth::open(),
-                Some(entries) => Auth::with_users(entries.clone()),
-            };
-            let auth = Arc::new(auth.with_db(db.clone()));
-            let engine = Engine::new(db);
+        let db = Db::open(&data_path).expect("open db");
+        let auth = match &users {
+            None => Auth::open(),
+            Some(entries) => Auth::with_users(entries.clone()),
+        };
+        let auth = Arc::new(auth.with_db(db.clone()));
+        let engine = Engine::new(db);
 
-            let config = ServerConfig {
-                listen: format!("127.0.0.1:{port}"),
-                auth,
-                tls: None,
-                slow_query_ms: 0,
-                metrics_listen: None,
-                audit_log: None,
-                replication_listen: None,
-                read_only: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            };
+        let config = ServerConfig {
+            listen: format!("127.0.0.1:{port}"),
+            auth,
+            tls: None,
+            slow_query_ms: 0,
+            metrics_listen: None,
+            audit_log: None,
+            replication_listen: None,
+            read_only: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
 
-            let handle = tokio::spawn(async move { serve(config, engine).await });
-
-            // Wait for readiness; bail early to retry if the serve task exits
-            // (e.g. bind failure because the port was taken in the race window).
-            let mut ready = false;
-            for _ in 0..200 {
-                if handle.is_finished() {
-                    break;
-                }
-                if tokio::net::TcpStream::connect(("127.0.0.1", port))
-                    .await
-                    .is_ok()
-                {
-                    ready = true;
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-            }
-
-            if ready {
-                return TestServer {
-                    port,
-                    data_path,
-                    handle,
-                };
-            }
-
-            handle.abort();
-            let _ = std::fs::remove_file(&data_path);
+        let handle = tokio::spawn(async move { serve_on(listener, config, engine).await });
+        TestServer {
+            port,
+            data_path,
+            handle,
         }
-        panic!("could not start a test server after several port attempts");
     }
 
     /// Connect a fresh `mysql_async` connection as `root` with no password.
