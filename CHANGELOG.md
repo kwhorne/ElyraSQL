@@ -6,6 +6,14 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.12.20] - 2026-11-24
+
+Performance work from the review's phase A, each change measured before and
+after (and two of its suggestions left out where the measurement did not
+bear them out), and the bugs that measuring turned up. The Linux binaries
+and the Docker image are many times faster under concurrent load; TLS result
+sets 2-11x; `WITH RECURSIVE` up to 44x.
+
 ### Changed
 
 - **The Linux binaries and the Docker image are many times faster under
@@ -104,6 +112,18 @@ All notable changes to ElyraSQL are documented here. The format is based on
 - **A port the server cannot listen on is named.** Startup failed with
   `Address already in use` alone; it now says which address and what for
   (MySQL clients, replication, the Raft control plane or metrics).
+
+### Upgrading
+
+- No change to the database file; a 1.12.19 database opens in 1.12.20
+  unchanged.
+- The Linux binaries and the Docker image use jemalloc. Under heavy
+  concurrent load the server can hold more memory at peak than before (in
+  the measurement 1.6 GB against 0.9 GB), and hands it back within seconds
+  when the load stops. Size container memory limits by the peak.
+- A write whose Raft leader was deposed before it could confirm the commit
+  fails with `commit not confirmed` instead of waiting; its outcome is
+  unknown (the next leader may still commit it), as after a timeout.
 
 ## [1.12.19] - 2026-11-23
 
