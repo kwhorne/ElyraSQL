@@ -227,3 +227,31 @@ async fn a_leader_that_cannot_write_its_log_acknowledges_nothing() {
     };
     assert!(rows == 7 || rows == 8, "{rows} rows\n{}", c.logs());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn every_node_runs_a_recursive_cte() {
+    // A recursive CTE wrote its working table as replicated data: on a
+    // follower, which may not propose, it failed with "not the leader".
+    let mut c = Cluster::new("rcte", 3);
+    c.start_all();
+    c.write(
+        "CREATE TABLE t (id INT PRIMARY KEY)",
+        Duration::from_secs(30),
+    )
+    .await
+    .unwrap_or_else(|| panic!("no leader accepted a write\n{}", c.logs()));
+    for id in 1..=3 {
+        c.until_count(id, "t", 0).await;
+    }
+    for id in 1..=3 {
+        let mut conn = c.conn(id).await.expect("connect");
+        let n: Option<i64> = conn
+            .query_first(
+                "WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 50) \
+                 SELECT SUM(n) FROM seq",
+            )
+            .await
+            .unwrap_or_else(|e| panic!("node {id}: {e}\n{}", c.logs()));
+        assert_eq!(n, Some(1275), "node {id}");
+    }
+}
