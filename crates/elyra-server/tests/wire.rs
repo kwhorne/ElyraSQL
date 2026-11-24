@@ -16408,3 +16408,62 @@ async fn arithmetic_overflow_is_1690_as_in_mysql() {
     let rows: Vec<(i64, i64, i64, i64, u64)> = c.query("SELECT * FROM d").await.unwrap();
     assert_eq!(rows, vec![(1, 1, 1, 1, 1)]);
 }
+
+#[tokio::test]
+async fn a_tls_connection_answers_every_command_in_full() {
+    // A client that sends its TLS hello right behind the SSL request, as
+    // mysql_async does, could not connect: the server fed the handshake the
+    // SSL request again. And each packet went to the TLS stream as it was
+    // written, a record and a socket write per row; it is buffered now, as
+    // the plain path is, and drained by the flush that ends every command --
+    // so every kind of answer must still arrive whole, and promptly.
+    let server = TestServer::start_with_tls().await;
+    let opts = mysql_async::OptsBuilder::default()
+        .ip_or_hostname("127.0.0.1")
+        .tcp_port(server.port)
+        .user(Some("root"))
+        .prefer_socket(false)
+        .ssl_opts(Some(
+            mysql_async::SslOpts::default().with_danger_accept_invalid_certs(true),
+        ));
+    let run = async {
+        // With `ssl_opts` the client requires TLS: it does not fall back.
+        let mut c = mysql_async::Conn::new(opts).await.expect("TLS connect");
+        c.query_drop("CREATE TABLE t (id INT PRIMARY KEY, pad VARCHAR(64))")
+            .await
+            .unwrap();
+        // Several result-buffer sizes' worth of rows, so the answer is written
+        // in more than one part.
+        for start in (0..5000).step_by(1000) {
+            let values: Vec<String> = (start..start + 1000)
+                .map(|i| format!("({i}, '{}')", "x".repeat(40)))
+                .collect();
+            c.query_drop(format!("INSERT INTO t VALUES {}", values.join(",")))
+                .await
+                .unwrap();
+        }
+        let rows: Vec<(i64, String)> = c.query("SELECT id, pad FROM t ORDER BY id").await.unwrap();
+        assert_eq!(rows.len(), 5000);
+        assert_eq!(
+            rows.iter().map(|r| r.0).sum::<i64>(),
+            (0..5000).sum::<i64>()
+        );
+        // Small answers, one after another: each must arrive without waiting
+        // for the next command.
+        for i in 0..50 {
+            let n: Option<i64> = c
+                .exec_first("SELECT id FROM t WHERE id = ?", (i,))
+                .await
+                .unwrap();
+            assert_eq!(n, Some(i));
+        }
+        let err = c.query_drop("SELECT * FROM missing").await.unwrap_err();
+        assert!(err.to_string().contains("missing"), "{err}");
+        let after: Option<i64> = c.query_first("SELECT COUNT(*) FROM t").await.unwrap();
+        assert_eq!(after, Some(5000));
+        c.disconnect().await.unwrap();
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(60), run)
+        .await
+        .expect("a TLS answer never arrived");
+}

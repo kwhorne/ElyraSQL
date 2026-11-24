@@ -16,7 +16,8 @@ use elyra_wire::{
 };
 use tokio::io::AsyncWrite;
 use tokio::net::TcpListener;
-use tokio_rustls::rustls::ServerConfig as TlsServerConfig;
+/// The TLS configuration `ServerConfig::tls` takes and `load_tls` builds.
+pub use tokio_rustls::rustls::ServerConfig as TlsServerConfig;
 use tracing::{error, info, warn};
 
 pub mod auth;
@@ -1375,6 +1376,11 @@ pub async fn serve_on(
     static CONN_SEQ: AtomicU32 = AtomicU32::new(0);
     loop {
         let (stream, peer) = listener.accept().await?;
+        // No Nagle delay, as MySQL itself sets. Responses are buffered and
+        // flushed once per command, so this matters only for one that spans
+        // several writes (larger than the write buffer): its last segment
+        // need not wait for the client to acknowledge the one before.
+        let _ = stream.set_nodelay(true);
         // Admission control: refuse surplus connections the way MySQL does, with
         // error 1040 as the first packet instead of the handshake, so clients
         // report "Too many connections" rather than a bare reset. Held for the
@@ -1522,7 +1528,8 @@ async fn handle_connection(
         // TcpStream meant a syscall per result row -- the dominant cost for
         // large result sets. A BufWriter coalesces rows into ~64 KiB writes;
         // opensrv's per-command flush still drains it, so responses are prompt.
-        // (TLS is left unbuffered: its handshake needs immediate flushes.)
+        // (Over TLS the handshake needs immediate flushes, so the wire crate
+        // buffers the writer once it is done.)
         let w = tokio::io::BufWriter::with_capacity(64 * 1024, w);
         plain_run_with_options(shim, w, opts, init).await
     }

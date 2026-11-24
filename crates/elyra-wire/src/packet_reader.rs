@@ -105,9 +105,15 @@ impl<R: AsyncRead + Unpin> AsyncRead for PacketReader<R> {
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<io::Result<()>> {
         if self.remaining != 0 {
+            // The unread bytes are the last `remaining` of `bytes`. `start` is
+            // where the last packet began, not where it ended: reading from it
+            // handed out that packet again. A client that sends its TLS hello
+            // right behind the SSL request (mysql_async, among others) had its
+            // handshake fail with a decode error.
+            let start = self.bytes.len() - self.remaining;
             let count = self.remaining.min(buf.remaining());
-            buf.put_slice(&self.bytes[self.start..self.start + count]);
-            self.start += count;
+            buf.put_slice(&self.bytes[start..start + count]);
+            self.start = start + count;
             self.remaining -= count;
             if self.remaining == 0 {
                 self.bytes.clear();
@@ -349,6 +355,23 @@ mod reader_tests {
             r.next_async().await.unwrap().is_none(),
             "expected end of stream"
         );
+    }
+
+    /// What follows a packet in the same read is handed on, as is, to whoever
+    /// reads the stream next -- the TLS handshake after an SSL request. It
+    /// used to hand on the packet again instead.
+    #[tokio::test]
+    async fn bytes_after_a_packet_are_read_as_they_came() {
+        use tokio::io::AsyncReadExt;
+        let mut buf = frame(1, &[0xAA; 32]); // the SSL request
+        buf.extend_from_slice(b"\x16\x03\x01client hello"); // the TLS hello behind it
+        let src: &[u8] = &buf;
+        let mut r = PacketReader::new(src);
+        let (_seq, pkt) = r.next_async().await.unwrap().expect("a packet");
+        assert_eq!(pkt.as_ref(), &[0xAA; 32]);
+        let mut rest = Vec::new();
+        r.read_to_end(&mut rest).await.unwrap();
+        assert_eq!(rest, b"\x16\x03\x01client hello");
     }
 
     #[test]

@@ -26,32 +26,48 @@ pub struct TestServer {
 impl TestServer {
     /// Start a server with no authentication (open mode).
     pub async fn start() -> TestServer {
-        Self::start_inner(None).await
+        Self::start_inner(None, None).await
+    }
+
+    /// Start a server with no authentication that also accepts TLS, with the
+    /// self-signed certificate in `tests/fixtures`.
+    pub async fn start_with_tls() -> TestServer {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let tls = elyra_server::load_tls(dir.join("test-cert.pem"), dir.join("test-key.pem"))
+            .expect("load the test certificate");
+        Self::start_inner(None, Some(Arc::new(tls))).await
     }
 
     /// Start a server that requires `root`/`password` (Admin).
     pub async fn start_with_auth(user: &str, password: &str) -> TestServer {
-        Self::start_inner(Some(vec![(
-            user.to_string(),
-            password.to_string(),
-            elyra_core::Privilege::Admin,
-        )]))
+        Self::start_inner(
+            Some(vec![(
+                user.to_string(),
+                password.to_string(),
+                elyra_core::Privilege::Admin,
+            )]),
+            None,
+        )
         .await
     }
 
     /// Start a server with several accounts at different privilege tiers.
     pub async fn start_with_tiers(users: &[(&str, &str, elyra_core::Privilege)]) -> TestServer {
-        Self::start_inner(Some(
-            users
-                .iter()
-                .map(|(u, p, tier)| (u.to_string(), p.to_string(), *tier))
-                .collect(),
-        ))
+        Self::start_inner(
+            Some(
+                users
+                    .iter()
+                    .map(|(u, p, tier)| (u.to_string(), p.to_string(), *tier))
+                    .collect(),
+            ),
+            None,
+        )
         .await
     }
 
     async fn start_inner(
         users: Option<Vec<(String, String, elyra_core::Privilege)>>,
+        tls: Option<Arc<elyra_server::TlsServerConfig>>,
     ) -> TestServer {
         // The test binds the listener itself, on port 0, and hands it to the
         // server. It used to pick a free port, drop it and let the server bind
@@ -80,7 +96,7 @@ impl TestServer {
         let config = ServerConfig {
             listen: format!("127.0.0.1:{port}"),
             auth,
-            tls: None,
+            tls,
             slow_query_ms: 0,
             metrics_listen: None,
             audit_log: None,
