@@ -89,7 +89,7 @@ jobs:
       - name: Static, and starts
         run: |
           BIN=target/${{ matrix.target }}/debug/elyrasql
-          file "$BIN" | grep -E "static(-pie)? linked"
+          file "$BIN" | grep -E "static(ally|-pie)? linked"
           "$BIN" --version
 
   macos:
