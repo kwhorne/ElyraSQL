@@ -61,22 +61,35 @@ jobs:
   # (jemalloc) is C compiled with musl-gcc: a failure there would otherwise
   # show only when a release is tagged.
   musl:
-    name: Linux musl build
-    runs-on: ubuntu-24.04
+    name: Linux musl build (${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            arch: x86_64
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            arch: aarch64
+    env:
+      # As the release build sets it (see release.yml).
+      CFLAGS_aarch64_unknown_linux_musl: -mno-outline-atomics
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-unknown-linux-musl
+          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
       - name: Install musl tools
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - name: Build
-        run: cargo build --locked --target x86_64-unknown-linux-musl -p elyra-cli
+        run: cargo build --locked --target ${{ matrix.target }} -p elyra-cli
       - name: Static, and starts
         run: |
-          BIN=target/x86_64-unknown-linux-musl/debug/elyrasql
-          file "$BIN" | grep -E "static(-pie)? linked"
+          BIN=target/${{ matrix.target }}/debug/elyrasql
+          file "$BIN" | grep -E "static(ally|-pie)? linked"
           "$BIN" --version
 
   macos:
