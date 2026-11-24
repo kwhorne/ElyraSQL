@@ -44,6 +44,12 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ### Fixed
 
+- **A replica keeps replicating when its primary is killed or restarted.**
+  A stream that was reset rather than closed -- which a killed primary
+  often does -- stopped replication, and the replica process exited (code
+  75) without its data marked for anything; a supervisor restarting it got
+  it going again, without one it stayed down. It now reconnects and resumes,
+  as it did when the stream was closed.
 - **Clients that send their TLS hello right behind the SSL request can
   connect over TLS.** The server handed the TLS handshake the SSL request a
   second time, and the handshake failed with a decode error. The `mysql`
