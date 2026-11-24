@@ -28,8 +28,21 @@ All notable changes to ElyraSQL are documented here. The format is based on
   but held 3.4 GB at peak and kept most of it. macOS keeps its own allocator,
   which was already fast there.
 
+- **Result sets over TLS are 2-11x faster.** Each row was written to the
+  TLS stream on its own: a record and a socket write per row. Writes are
+  now buffered and sent once per command, as without TLS, and TLS is about
+  as fast as a plain connection (2,000 rows: 398 -> 855/s on one connection,
+  347 -> 3,738/s on eight; 100k rows: 13.8 -> 27.3/s). The MySQL listener
+  also sets `TCP_NODELAY`, as MySQL does.
+
 ### Fixed
 
+- **Clients that send their TLS hello right behind the SSL request can
+  connect over TLS.** The server handed the TLS handshake the SSL request a
+  second time, and the handshake failed with a decode error. The `mysql`
+  command-line client waits between the two and was not affected;
+  `mysql_async` (and so Rust clients built on it) could not connect with TLS
+  at all.
 - **A Raft leader deposed by another node's election answers the writes it
   was waiting on.** A leader that learned of a later term from a vote request
   became a follower without a word to its clients: their writes waited with

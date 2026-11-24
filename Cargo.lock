@@ -1157,13 +1157,16 @@ dependencies = [
  "mysql_common",
  "percent-encoding",
  "rand 0.10.2",
+ "rustls",
  "serde",
  "socket2",
  "thiserror",
  "tokio",
+ "tokio-rustls",
  "tokio-util",
  "twox-hash",
  "url",
+ "webpki-roots",
 ]
 
 [[package]]

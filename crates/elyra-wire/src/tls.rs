@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use pin_project_lite::pin_project;
-use tokio::io::{self, AsyncRead, AsyncWrite, ReadBuf, ReadHalf, WriteHalf};
+use tokio::io::{self, AsyncRead, AsyncWrite, BufWriter, ReadBuf, ReadHalf, WriteHalf};
 use tokio_rustls::server::TlsStream;
 use tokio_rustls::{rustls::ServerConfig, TlsAcceptor};
 
@@ -39,8 +39,9 @@ where
     R: AsyncRead + Send + Unpin,
     W: AsyncWrite + Send + Unpin,
 {
+    // The reader that read the handshake goes on reading: wrapped in another,
+    // every byte was copied from one buffer into the next.
     let (handshake, seq, client_capabilities, reader) = init_params;
-    let reader = PacketReader::new(reader);
     let writer = PacketWriter::new(writer);
 
     let process_use_statement_on_query = opts.process_use_statement_on_query;
@@ -65,14 +66,18 @@ pub async fn secure_run_with_options<B, R, W>(
     init_params: (ClientHandshake, u8, CapabilityFlags, PacketReader<R>),
 ) -> Result<(), B::Error>
 where
-    B: AsyncMysqlShim<WriteHalf<TlsStream<Duplex<PacketReader<R>, W>>>> + Send + Sync,
+    B: AsyncMysqlShim<BufWriter<WriteHalf<TlsStream<Duplex<PacketReader<R>, W>>>>> + Send + Sync,
     R: AsyncRead + Send + Unpin,
     W: AsyncWrite + Send + Unpin,
 {
     let (handshake, seq, client_capabilities, reader) = init_params;
     let (reader, writer) = switch_to_tls(tls_config, reader, writer).await?;
     let reader = PacketReader::new(reader);
-    let writer = PacketWriter::new(writer);
+    // Buffered, as the plain path is: each packet written straight to the
+    // TLS stream became a record of its own and a write to the socket, so a
+    // result set cost a record and a syscall per row. Every command ends in
+    // a flush, which drains the buffer.
+    let writer = PacketWriter::new(BufWriter::with_capacity(64 * 1024, writer));
 
     let process_use_statement_on_query = opts.process_use_statement_on_query;
     let reject_connection_on_dbname_absence = opts.reject_connection_on_dbname_absence;
