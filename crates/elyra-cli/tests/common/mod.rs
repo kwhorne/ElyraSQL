@@ -43,6 +43,9 @@ pub struct Cluster {
     /// What each node last answered a write with, when it was not a success:
     /// the error, and when, in seconds since the cluster was made.
     refusals: Mutex<BTreeMap<u64, String>>,
+    /// What each node last answered a count with, and when: with the nodes'
+    /// logs, when a node held which data.
+    answers: Mutex<BTreeMap<u64, Vec<(f64, String)>>>,
     nodes: Vec<Node>,
     /// Environment every node is started with.
     env: Vec<(String, String)>,
@@ -59,6 +62,7 @@ impl Cluster {
             dir,
             started: Instant::now(),
             refusals: Mutex::new(BTreeMap::new()),
+            answers: Mutex::new(BTreeMap::new()),
             nodes: Vec::new(),
             env: Vec::new(),
         };
@@ -384,11 +388,33 @@ impl Cluster {
     }
 
     pub async fn count(&self, id: u64, table: &str) -> Option<i64> {
-        let mut c = self.conn(id).await?;
-        c.query_first(format!("SELECT COUNT(*) FROM {table}"))
-            .await
-            .ok()
-            .flatten()
+        let at = self.started.elapsed().as_secs_f64();
+        let Some(mut c) = self.conn(id).await else {
+            self.answered(id, at, format!("count of {table}: no connection"));
+            return None;
+        };
+        let r: Result<Option<i64>, _> =
+            c.query_first(format!("SELECT COUNT(*) FROM {table}")).await;
+        let what = match &r {
+            Ok(n) => format!("count of {table}: {n:?}"),
+            Err(e) => format!("count of {table}: {e}"),
+        };
+        self.answered(id, at, what);
+        r.ok().flatten()
+    }
+
+    /// Note node `id`'s answer to a query asked at `at`, when it differs from
+    /// the one before: a timeline of what the node held.
+    fn answered(&self, id: u64, at: f64, what: String) {
+        let mut answers = self.answers.lock().unwrap();
+        let timeline = answers.entry(id).or_default();
+        if timeline.last().is_some_and(|(_, last)| *last == what) {
+            return;
+        }
+        timeline.push((at, what));
+        if timeline.len() > 8 {
+            timeline.remove(0);
+        }
     }
 
     /// Wait until node `id` holds `rows` rows in `table`.
@@ -428,6 +454,11 @@ impl Cluster {
         );
         for (id, why) in self.refusals.lock().unwrap().iter() {
             out.push_str(&format!("node {id} last refused a write {why}\n"));
+        }
+        for (id, timeline) in self.answers.lock().unwrap().iter() {
+            for (at, what) in timeline {
+                out.push_str(&format!("node {id} from {at:.2}s answered {what}\n"));
+            }
         }
         for n in &self.nodes {
             let log = std::fs::read_to_string(self.dir.join(format!("n{}.log", n.id)))
