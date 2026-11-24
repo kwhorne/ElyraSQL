@@ -381,9 +381,9 @@ async fn incremental_catchup<W: AsyncWrite + Unpin>(
 
 /// Run as a replica: (re)bootstrap from `primary`, then apply the write stream
 /// into the local `db`, persisting the applied LSN so a reconnect can catch up
-/// incrementally from the primary's binlog. Reconnects transparently on stream
-/// drops; returns only when the primary asks for a clean resync (the caller
-/// should wipe the file and restart).
+/// incrementally from the primary's binlog. Reconnects on a lost stream,
+/// closed or failed; returns when the data cannot be continued (marked for a
+/// new bootstrap) or cannot be written locally.
 pub async fn run_replica(primary: String, db: Db) -> std::io::Result<()> {
     // Fail closed: a replica applies whatever its "primary" streams to it, so
     // an unauthenticated connection is one spoofed host (or MITM on the
@@ -455,7 +455,11 @@ pub async fn run_replica(primary: String, db: Db) -> std::io::Result<()> {
             }
         }
         let (mut rd, mut wr) = tokio::io::split(stream);
-        send_msg(&mut wr, &ReplMsg::Hello { last_lsn }).await?;
+        if let Err(e) = send_msg(&mut wr, &ReplMsg::Hello { last_lsn }).await {
+            warn!(%primary, error = %e, "lost the primary before streaming; reconnecting");
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            continue;
+        }
 
         let mut snap_pairs = 0u64;
         // A full snapshot is being applied and has not finished: until it has,
@@ -477,7 +481,14 @@ pub async fn run_replica(primary: String, db: Db) -> std::io::Result<()> {
                         &format!("the snapshot stream failed: {e}"),
                     ));
                 }
-                Err(e) => return Err(e),
+                // A stream that fails rather than closes -- a primary killed
+                // or restarted resets it -- is lost the same way: reconnect
+                // and resume. It used to stop replication, and the process
+                // exited without the data having been marked for anything.
+                Err(e) => {
+                    warn!(%primary, error = %e, "the stream from the primary failed");
+                    break;
+                }
             };
             match msg {
                 ReplMsg::Resync => {
@@ -510,7 +521,10 @@ pub async fn run_replica(primary: String, db: Db) -> std::io::Result<()> {
                     in_snapshot = false;
                     db.set_fence(None);
                     info!(lsn, rows = snap_pairs, "caught up; streaming writes");
-                    send_msg(&mut wr, &ReplMsg::Ack { lsn }).await?;
+                    if let Err(e) = send_msg(&mut wr, &ReplMsg::Ack { lsn }).await {
+                        warn!(%primary, error = %e, "could not acknowledge to the primary");
+                        break;
+                    }
                 }
                 ReplMsg::Write {
                     lsn,
@@ -519,7 +533,10 @@ pub async fn run_replica(primary: String, db: Db) -> std::io::Result<()> {
                 } => {
                     puts.push(lsn_bytes(lsn));
                     db.commit(puts, deletes).await.map_err(io)?;
-                    send_msg(&mut wr, &ReplMsg::Ack { lsn }).await?;
+                    if let Err(e) = send_msg(&mut wr, &ReplMsg::Ack { lsn }).await {
+                        warn!(%primary, error = %e, "could not acknowledge to the primary");
+                        break;
+                    }
                     if lsn % 10_000 == 0 {
                         info!(lsn, "replica caught up");
                     }
@@ -527,7 +544,7 @@ pub async fn run_replica(primary: String, db: Db) -> std::io::Result<()> {
                 ReplMsg::Hello { .. } | ReplMsg::Ack { .. } => {}
             }
         }
-        warn!(%primary, "primary closed the stream; reconnecting");
+        warn!(%primary, "lost the stream from the primary; reconnecting");
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
 }
@@ -760,5 +777,65 @@ mod tests {
         server.abort();
         set_env("ELYRASQL_CLUSTER_SECRET", None);
         assert!(applied, "snapshot key must reach the replica");
+    }
+
+    /// A primary killed or restarted resets the stream rather than closing it.
+    /// The replica used to stop replicating on that and exit, without its
+    /// data marked for anything; it reconnects and resumes now, as it does
+    /// when the stream is closed.
+    #[tokio::test]
+    async fn a_replica_reconnects_when_the_stream_is_reset() {
+        let _env = ENV_LOCK.lock().await;
+        set_env("ELYRASQL_CLUSTER_SECRET", Some("reset-secret"));
+        set_env("ELYRASQL_ALLOW_OPEN_AUTH", None);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let primary = tokio::spawn(async move {
+            // First stream: a snapshot, acknowledged, then a reset.
+            let (mut s, _) = listener.accept().await.unwrap();
+            crate::cluster::auth_accept(&mut s).await.unwrap();
+            crate::cluster::auth_respond_to_peer(&mut s).await.unwrap();
+            let hello = recv_msg(&mut s).await.unwrap();
+            assert!(matches!(hello, Some(ReplMsg::Hello { last_lsn: 0 })));
+            let snap = vec![(b"k1".to_vec(), b"v1".to_vec())];
+            send_msg(&mut s, &ReplMsg::Snap(snap)).await.unwrap();
+            send_msg(&mut s, &ReplMsg::SnapEnd { lsn: 1 })
+                .await
+                .unwrap();
+            let ack = recv_msg(&mut s).await.unwrap();
+            assert!(matches!(ack, Some(ReplMsg::Ack { lsn: 1 })));
+            #[allow(deprecated)]
+            s.set_linger(Some(std::time::Duration::ZERO)).unwrap();
+            drop(s);
+            // Second stream: the replica is back, from where it was.
+            let (mut s, _) = listener.accept().await.unwrap();
+            crate::cluster::auth_accept(&mut s).await.unwrap();
+            crate::cluster::auth_respond_to_peer(&mut s).await.unwrap();
+            let hello = recv_msg(&mut s).await.unwrap();
+            let write = ReplMsg::Write {
+                lsn: 2,
+                puts: vec![(b"k2".to_vec(), b"v2".to_vec())],
+                deletes: Vec::new(),
+            };
+            send_msg(&mut s, &write).await.unwrap();
+            let ack = recv_msg(&mut s).await.unwrap();
+            (hello, ack)
+        });
+        let replica_db = Db::in_memory().unwrap();
+        let replica = tokio::spawn(run_replica(addr, replica_db.clone()));
+        let streams = tokio::time::timeout(std::time::Duration::from_secs(10), primary).await;
+        let finished = replica.is_finished();
+        replica.abort();
+        set_env("ELYRASQL_CLUSTER_SECRET", None);
+        let (hello, ack) = streams
+            .expect("the replica did not come back after the reset")
+            .unwrap();
+        assert!(!finished, "the replica stopped replicating");
+        assert!(matches!(hello, Some(ReplMsg::Hello { last_lsn: 1 })));
+        assert!(matches!(ack, Some(ReplMsg::Ack { lsn: 2 })));
+        assert_eq!(
+            replica_db.get(b"k2".to_vec()).await.unwrap(),
+            Some(b"v2".to_vec())
+        );
     }
 }
