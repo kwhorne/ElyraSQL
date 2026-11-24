@@ -17,7 +17,7 @@ use std::sync::Arc;
 use elyra_storage::{Db, WriteEvent};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 use tokio::sync::broadcast::error::RecvError;
 use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::rustls::{ClientConfig, RootCertStore, ServerConfig};
@@ -191,7 +191,7 @@ pub async fn serve_replication(addr: String, db: Db) -> std::io::Result<()> {
         warn!(%addr, "replication endpoint is UNAUTHENTICATED (ELYRASQL_ALLOW_OPEN_AUTH=1) - any peer that reaches it receives the full data set");
     }
     let tls = cluster_server_tls()?.map(TlsAcceptor::from);
-    let listener = TcpListener::bind(&addr).await?;
+    let listener = crate::listen(&addr, "replication").await?;
     info!(%addr, tls = tls.is_some(), "ElyraSQL replication endpoint listening");
     if tls.is_none() {
         warn!(%addr, "replication transport is UNENCRYPTED - set ELYRASQL_CLUSTER_TLS_CERT/KEY, or run it on a private network/VPN");

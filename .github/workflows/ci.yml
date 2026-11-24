@@ -49,6 +49,14 @@ jobs:
       - name: Test (nextest)
         run: cargo nextest run --workspace --no-fail-fast
 
+      - name: Keep the logs of failed Raft cluster tests
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: raft-logs-linux
+          path: target/tmp/raft-logs
+          if-no-files-found: ignore
+
   macos:
     name: macOS Apple Silicon
     runs-on: macos-15
@@ -90,6 +98,14 @@ jobs:
 
       - name: Test workspace (nextest)
         run: cargo nextest run --workspace --locked --target aarch64-apple-darwin --no-fail-fast
+
+      - name: Keep the logs of failed Raft cluster tests
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: raft-logs-macos
+          path: target/tmp/raft-logs
+          if-no-files-found: ignore
 
       - name: Build release binary
         run: cargo build --release --locked --target aarch64-apple-darwin -p elyra-cli

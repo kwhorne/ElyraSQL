@@ -101,6 +101,14 @@ jobs:
           ELYRASQL_RAFT_CHAOS_SECS: "45"
         run: cargo test -p elyra-cli --release --test raft_chaos -- --ignored --nocapture
 
+      - name: Keep the Raft chaos logs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: raft-chaos-logs
+          path: target/tmp/raft-logs
+          if-no-files-found: ignore
+
   security:
     name: Privilege enforcement & hostile input
     runs-on: ubuntu-24.04

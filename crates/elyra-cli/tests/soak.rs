@@ -29,6 +29,9 @@
 //!   ELYRASQL_SOAK_ACCOUNTS  number of accounts        (default 16)
 //!   ELYRASQL_SOAK_KILL_MS   chaos kill interval (ms)  (default 2500)
 
+mod ports;
+
+use ports::free_port;
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -65,11 +68,6 @@ impl Cfg {
     fn total(&self) -> i64 {
         self.accounts * INITIAL_BALANCE
     }
-}
-
-fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    l.local_addr().unwrap().port()
 }
 
 fn spawn(data: &std::path::Path, port: u16, sync_full: bool) -> Child {

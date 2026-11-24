@@ -4,17 +4,15 @@
 //! definition after the primary's `ALTER TABLE`, and did not enforce a column
 //! grant created after it had looked for one -- until it was restarted.
 
+mod ports;
+
 use mysql_async::prelude::*;
+use ports::free_port;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 const BIN: &str = env!("CARGO_BIN_EXE_elyrasql");
 const SECRET: &str = "replica-schema-test-secret";
-
-fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    l.local_addr().unwrap().port()
-}
 
 struct Proc(Child, std::path::PathBuf);
 

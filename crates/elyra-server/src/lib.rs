@@ -1214,6 +1214,14 @@ fn incompatible_wire_value(
     )
 }
 
+/// Listen on `addr` for `what`. A failure names the address: "Address
+/// already in use" alone did not say which of a node's ports was taken.
+pub(crate) async fn listen(addr: &str, what: &str) -> std::io::Result<TcpListener> {
+    TcpListener::bind(addr).await.map_err(|e| {
+        std::io::Error::new(e.kind(), format!("cannot listen on {addr} for {what}: {e}"))
+    })
+}
+
 /// Whether a bind address accepts connections from outside the local host.
 /// Loopback (`127.0.0.0/8`, `::1`, `localhost`) is considered local; the
 /// wildcard (`0.0.0.0`, `::`), routable IPs, and unresolved hostnames are treated
@@ -1305,7 +1313,7 @@ pub async fn serve(config: ServerConfig, engine: Engine) -> std::io::Result<()> 
         );
     }
 
-    let listener = TcpListener::bind(&config.listen).await?;
+    let listener = listen(&config.listen, "MySQL clients").await?;
     serve_on(listener, config, engine).await
 }
 
@@ -1426,7 +1434,7 @@ pub async fn serve_on(
 #[allow(clippy::too_many_arguments)]
 /// Serve Prometheus metrics over a minimal HTTP/1.1 endpoint (`GET /metrics`).
 async fn serve_metrics(addr: String, metrics: Arc<Metrics>) -> std::io::Result<()> {
-    let listener = TcpListener::bind(&addr).await?;
+    let listener = listen(&addr, "metrics").await?;
     info!(%addr, "ElyraSQL Prometheus metrics at /metrics");
     loop {
         let (mut stream, _) = listener.accept().await?;

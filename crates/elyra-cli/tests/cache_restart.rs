@@ -5,17 +5,15 @@
 //! had already had: an aggregate cached right after the restart was served
 //! again, stale, once that many writes had gone by.
 
+mod ports;
+
 use mysql_async::prelude::*;
+use ports::free_port;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 const BIN: &str = env!("CARGO_BIN_EXE_elyrasql");
-
-fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    l.local_addr().unwrap().port()
-}
 
 struct Server(Child);
 

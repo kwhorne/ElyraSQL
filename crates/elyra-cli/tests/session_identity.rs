@@ -4,16 +4,14 @@
 //! audit column recorded root for every change. Checked over the wire, as an
 //! application sees it, against what MySQL 8.4 answers in the same places.
 
+mod ports;
+
 use mysql_async::prelude::*;
+use ports::free_port;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 const BIN: &str = env!("CARGO_BIN_EXE_elyrasql");
-
-fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    l.local_addr().unwrap().port()
-}
 
 struct Server(Child, std::path::PathBuf);
 

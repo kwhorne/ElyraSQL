@@ -6,6 +6,20 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **A Raft leader deposed by another node's election answers the writes it
+  was waiting on.** A leader that learned of a later term from a vote request
+  became a follower without a word to its clients: their writes waited with
+  no answer, and the node went on reporting itself as the leader. Those
+  writes are now refused with `commit not confirmed`: their outcome is
+  unknown, since the next leader may still commit them. A leader deposed by a
+  replication reply already refused them, but also went on reporting itself
+  as the leader.
+- **A port the server cannot listen on is named.** Startup failed with
+  `Address already in use` alone; it now says which address and what for
+  (MySQL clients, replication, the Raft control plane or metrics).
+
 ## [1.12.19] - 2026-11-23
 
 Fixes from a second review of 1.12.17–1.12.18, and two performance problems

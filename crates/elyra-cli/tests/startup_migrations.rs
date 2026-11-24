@@ -3,19 +3,17 @@
 //! runs, so a node or replica upgraded from before 1.12.17 kept indexes over
 //! FLOAT/DOUBLE and binary columns that held none of their rows.
 
+mod ports;
+
 use elyra_engine::Engine;
 use elyra_storage::Db;
 use mysql_async::prelude::*;
+use ports::free_port;
 use std::path::Path;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 const BIN: &str = env!("CARGO_BIN_EXE_elyrasql");
-
-fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    l.local_addr().unwrap().port()
-}
 
 /// A directory of its own for one test, removed when it ends.
 struct TempDir(std::path::PathBuf);
