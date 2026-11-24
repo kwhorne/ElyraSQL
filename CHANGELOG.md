@@ -61,8 +61,18 @@ All notable changes to ElyraSQL are documented here. The format is based on
   10,230 -> 12,084/s (+23%), index lookups +14%, single-row INSERTs
   2,170 -> 3,046/s (+40%); unchanged at 8 and 32 connections.
 
+- **`WITH RECURSIVE` is up to 44x faster.** Each iteration wrote its working
+  table as ordinary data, with an fsync each: a 1,000-step CTE took 7.5 s,
+  now 172 ms; 100 steps 792 -> 41 ms; walking a 5,000-node tree 141 -> 65 ms.
+
 ### Fixed
 
+- **`WITH RECURSIVE` runs on a Raft follower, and its working table stays
+  on the node that runs it.** The working table was written as replicated
+  data: every iteration went into the binlog, to every replica and, in a
+  cluster, through the Raft log -- and on a follower, which may not propose,
+  the query failed with "not the leader". It is now written on the node
+  alone, without a sync.
 - **A table's write counter moves on with every write.** Caches built from a
   table (a vector index, a materialized view's freshness) are valid while
   its counter has not moved. Each statement read the counter and wrote it

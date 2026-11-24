@@ -11036,3 +11036,41 @@ mod write_counter_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod recursive_cte_local_tests {
+    use super::{Engine, Privilege, QueryResult};
+
+    /// A recursive CTE's working table lives on this node only: nothing of it
+    /// reaches the replication stream (and so neither a replica nor the
+    /// binlog), and the result is the same.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_recursive_cte_writes_nothing_replicated() {
+        let db = elyra_storage::Db::in_memory().unwrap();
+        let e = Engine::new(db.clone());
+        let s = e.session();
+        e.execute("CREATE TABLE t (id INT PRIMARY KEY)", Privilege::Admin, &s)
+            .await
+            .unwrap();
+        let mut stream = db.repl_subscribe();
+        let mut r = e
+            .execute(
+                "WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 200) \
+                 SELECT COUNT(*), SUM(n) FROM seq",
+                Privilege::Admin,
+                &s,
+            )
+            .await
+            .unwrap();
+        let QueryResult::Rows(mut rows) = r.remove(0) else {
+            panic!("expected rows")
+        };
+        let row = rows.next_batch(1).await.unwrap().remove(0);
+        assert_eq!(row[0].to_wire_string().as_deref(), Some("200"));
+        assert_eq!(row[1].to_wire_string().as_deref(), Some("20100"));
+        assert!(
+            stream.try_recv().is_err(),
+            "the working table went to the replication stream"
+        );
+    }
+}

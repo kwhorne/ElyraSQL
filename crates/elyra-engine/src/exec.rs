@@ -22722,7 +22722,7 @@ async fn create_temp_table(db: &Session, base: &str, schema: &Schema) -> Result<
                 ],
                 ranges: Vec::new(),
             };
-            match db.raw_db().commit_validated(validation, puts, vec![]).await {
+            match db.raw_db().commit_local(validation, puts, vec![]).await {
                 Ok(()) => catalog::bump_epoch(),
                 Err(Error::Conflict(_)) => continue,
                 Err(error) => return Err(error),
@@ -22758,11 +22758,7 @@ async fn drop_temp_table(db: &Session, temp: &OwnedTempTable) -> Result<()> {
         ],
         ranges: Vec::new(),
     };
-    match db
-        .raw_db()
-        .commit_validated(validation, vec![], deletes)
-        .await
-    {
+    match db.raw_db().commit_local(validation, vec![], deletes).await {
         Ok(()) => {
             catalog::bump_epoch();
             Ok(())
@@ -22796,7 +22792,7 @@ async fn commit_temp_write(
     expected.push((table_key, Some(temp.definition.clone())));
     expected.push((owner_key, Some(temp.owner.clone())));
     db.raw_db()
-        .commit_validated(
+        .commit_local(
             elyra_storage::Validation {
                 keys: expected,
                 ranges: Vec::new(),
