@@ -3,16 +3,25 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  # Build and publish an existing tag with this workflow as it is now: for a
+  # tag whose release run failed, without moving the tag.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release, e.g. v1.12.20"
+        required: true
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ inputs.tag || github.ref }}
   cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
+  # The tag being released: the pushed one, or the one asked for by hand.
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
   build:
@@ -38,11 +47,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
+          ref: ${{ inputs.tag || github.ref }}
           persist-credentials: false
 
       - name: Validate release version
         run: |
-          VERSION=${GITHUB_REF_NAME#v}
+          VERSION=${RELEASE_TAG#v}
           MANIFEST_VERSION=$(awk -F '"' '/^version = "/ { print $2; exit }' Cargo.toml)
           test "$VERSION" = "$MANIFEST_VERSION" || {
             echo "tag version $VERSION does not match Cargo.toml $MANIFEST_VERSION" >&2
@@ -120,6 +130,11 @@ jobs:
 
       - name: Build Linux static binary
         if: matrix.platform == 'linux'
+        env:
+          # jemalloc's C on aarch64-musl: GCC calls out to glibc's libgcc for
+          # atomics, which needs `__getauxval` (not in musl); the link checks
+          # fail and jemalloc refuses to build ("Don't have atomics").
+          CFLAGS_aarch64_unknown_linux_musl: -mno-outline-atomics
         run: cargo build --profile dist --locked --target ${{ matrix.target }} -p elyra-cli
 
       - name: Build macOS binary
@@ -130,7 +145,7 @@ jobs:
 
       - name: Package
         run: |
-          VERSION=${GITHUB_REF_NAME#v}
+          VERSION=${RELEASE_TAG#v}
           NAME=elyrasql-${VERSION}-${{ matrix.platform }}-${{ matrix.arch }}
           BIN=target/${{ matrix.target }}/dist/elyrasql
           mkdir -p "dist/$NAME"
@@ -171,6 +186,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
+          ref: ${{ inputs.tag || github.ref }}
           persist-credentials: false
 
       - uses: actions/download-artifact@v8
@@ -183,7 +199,7 @@ jobs:
       # never reached the release page. Extract this version's section instead.
       - name: Release notes from CHANGELOG
         run: |
-          VERSION=${GITHUB_REF_NAME#v}
+          VERSION=${RELEASE_TAG#v}
           awk -v v="## [$VERSION]" '
             index($0, v) == 1 { inside = 1; next }
             inside && /^## \[/ { exit }
@@ -201,6 +217,7 @@ jobs:
           files: |
             artifacts/elyrasql-*.tar.gz
             artifacts/elyrasql-*.tar.gz.sha256
+          tag_name: ${{ env.RELEASE_TAG }}
           body_path: RELEASE_NOTES.md
           append_body: true
           generate_release_notes: true
