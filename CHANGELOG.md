@@ -6,6 +6,28 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed
+
+- **The Linux binaries and the Docker image are many times faster under
+  load.** They are static musl builds, and musl's memory allocator does not
+  scale across threads: queries spent most of their time waiting for it, and
+  more connections made the server slower. They now use jemalloc. Measured
+  in Docker (Linux, 18 cores) on 100k/200k-row tables:
+
+  | | before | now |
+  |---|---|---|
+  | primary-key lookup, 32 connections | 3,910/s | 59,332/s |
+  | `GROUP BY` over 100k rows, 1 connection | 16/s | 425/s |
+  | `GROUP BY` over 100k rows, 32 connections | 7/s | 937/s |
+  | join + `GROUP BY`, 32 connections | 1/s | 61/s |
+  | `ORDER BY ... LIMIT 10`, 32 connections | 3/s | 678/s |
+  | single-row `INSERT`, 32 connections | 5,083/s | 22,000–26,000/s |
+
+  Memory at peak under that load went from 0.9 to 1.6 GB, and is handed back
+  within seconds once idle (back to 180 MB within 30 s). mimalloc was as fast
+  but held 3.4 GB at peak and kept most of it. macOS keeps its own allocator,
+  which was already fast there.
+
 ### Fixed
 
 - **A Raft leader deposed by another node's election answers the writes it

@@ -24,6 +24,10 @@ tracing-subscriber.workspace = true
 # JSON-RPC framing for `elyrasql mcp`.
 serde_json = "1"
 
+# The server's allocator on Linux (see `main.rs`).
+[target.'cfg(target_os = "linux")'.dependencies]
+tikv-jemallocator = { version = "0.6", features = ["background_threads"] }
+
 [dev-dependencies]
 serde_json = "1"
 mysql_async = { version = "0.37", default-features = false, features = ["minimal"] }
