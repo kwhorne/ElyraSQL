@@ -571,14 +571,10 @@ impl Node {
                         tokio::spawn(async move {
                             match tls {
                                 Some(acceptor) => match acceptor.accept(stream).await {
-                                    Ok(s) => {
-                                        let _ = n.handle_control(s).await;
-                                    }
+                                    Ok(s) => log_control_end(n.handle_control(s).await),
                                     Err(e) => warn!(error = %e, "control TLS handshake failed"),
                                 },
-                                None => {
-                                    let _ = n.handle_control(stream).await;
-                                }
+                                None => log_control_end(n.handle_control(stream).await),
                             }
                         });
                     }
@@ -959,6 +955,10 @@ impl Node {
             done: false,
         };
         if let Some(current) = self.follow(term, leader, repl_addr, &members)? {
+            warn!(
+                id = self.cfg.id,
+                term, current, seq, "refused a snapshot part from an earlier term"
+            );
             return Ok(refused(current));
         }
         let mut install = self.install.lock().await;
@@ -995,10 +995,22 @@ impl Node {
             });
         }
         let Some(st) = install.as_mut() else {
+            warn!(
+                id = self.cfg.id,
+                seq, "refused a snapshot part: no install under way"
+            );
             return Ok(refused(term));
         };
         if (st.term, st.last_index, st.last_term, st.seq) != (term, last_index, last_term, seq) {
             // Not the part this install needs next: the leader starts over.
+            warn!(
+                id = self.cfg.id,
+                seq,
+                expected = st.seq,
+                last_index,
+                expected_index = st.last_index,
+                "refused a snapshot part out of order"
+            );
             return Ok(refused(term));
         }
         let from = st.covered.as_deref().map(successor).unwrap_or_default();
@@ -1656,6 +1668,22 @@ pub async fn follow_leadership(node: Arc<Node>, read_only: Arc<AtomicBool>) {
         read_only.store(!is_leader, Ordering::Relaxed);
         if rx.changed().await.is_err() {
             break;
+        }
+    }
+}
+
+/// Log why a control connection ended, unless the peer simply went away. An
+/// error here used to be dropped: a follower that failed to store a snapshot
+/// part closed the connection, and its leader logged only that the part was
+/// refused.
+fn log_control_end(result: std::io::Result<()>) {
+    if let Err(e) = result {
+        use std::io::ErrorKind::*;
+        if !matches!(
+            e.kind(),
+            ConnectionReset | ConnectionAborted | BrokenPipe | UnexpectedEof
+        ) {
+            warn!(error = %e, "a control connection ended with an error");
         }
     }
 }

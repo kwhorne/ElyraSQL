@@ -604,8 +604,18 @@ impl Db {
 
     /// Refuse queries with `why` until called again with `None` (see
     /// [`Db::fence`]).
+    ///
+    /// A change is logged: when a node is seen answering while it should not,
+    /// its log says whether it was refusing queries then.
     pub fn set_fence(&self, why: Option<String>) {
-        *self.fence.lock().unwrap() = why;
+        let mut fence = self.fence.lock().unwrap();
+        if *fence != why {
+            match &why {
+                Some(why) => tracing::info!(reason = %why, "refusing queries"),
+                None => tracing::info!("answering queries again"),
+            }
+        }
+        *fence = why;
     }
 
     /// Why queries are refused right now, if they are: the engine checks this
