@@ -609,6 +609,7 @@ dependencies = [
  "async-trait",
  "byteorder",
  "chrono",
+ "itoa",
  "mysql_common",
  "nom",
  "pin-project-lite",

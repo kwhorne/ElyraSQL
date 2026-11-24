@@ -89,6 +89,7 @@ impl<W: AsyncWrite + Unpin> PacketWriter<W> {
                     self.output_stream.write_all(&remaining).await?
                 }
             }
+            builder.reuse_buffer(raw_packet);
             Ok(())
         } else {
             Ok(())
@@ -134,6 +135,18 @@ impl PacketBuilder {
 
     fn take_buffer(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.buffer)
+    }
+
+    /// Give back the buffer a packet was built in, emptied, for the next one.
+    /// Each row of a result set is a packet: taking the buffer and not giving
+    /// it back meant every row grew a new one from nothing. One that grew past
+    /// `KEEP_AT_MOST` (a large value) is let go, not kept for the connection.
+    fn reuse_buffer(&mut self, mut buffer: Vec<u8>) {
+        const KEEP_AT_MOST: usize = 1 << 20;
+        if buffer.capacity() <= KEEP_AT_MOST && self.buffer.is_empty() {
+            buffer.clear();
+            self.buffer = buffer;
+        }
     }
 
     fn set_seq(&mut self, seq: u8) {

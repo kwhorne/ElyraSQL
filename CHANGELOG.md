@@ -35,6 +35,13 @@ All notable changes to ElyraSQL are documented here. The format is based on
   347 -> 3,738/s on eight; 100k rows: 13.8 -> 27.3/s). The MySQL listener
   also sets `TCP_NODELAY`, as MySQL does.
 
+- **Large result sets are 1.3-1.7x faster to send.** Every row is a packet,
+  and every packet was built in a new buffer grown from nothing; the buffer
+  is now reused. Integers in rows are formatted with `itoa` and floats on
+  the stack instead of in a new string each. The bytes sent are the same.
+  100k rows of integers: 33 -> 57/s on one connection, 111 -> 171/s on
+  eight; of floats: 28 -> 44/s; of text: 28.5 -> 38.5/s.
+
 ### Fixed
 
 - **Clients that send their TLS hello right behind the SSL request can
