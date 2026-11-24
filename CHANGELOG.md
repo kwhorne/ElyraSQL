@@ -42,6 +42,12 @@ All notable changes to ElyraSQL are documented here. The format is based on
   100k rows of integers: 33 -> 57/s on one connection, 111 -> 171/s on
   eight; of floats: 28 -> 44/s; of text: 28.5 -> 38.5/s.
 
+- **`SELECT DISTINCT` is up to 1.6x faster with several connections.** It
+  read a configuration limit from the environment for every distinct row,
+  and an environment lookup takes a process-wide lock: 98 -> 160 queries/s
+  for a DISTINCT over 100k rows on eight connections, 47 -> 53 on one. A
+  merge join did the same for every joined row. Both read it once per query.
+
 ### Fixed
 
 - **Clients that send their TLS hello right behind the SSL request can
