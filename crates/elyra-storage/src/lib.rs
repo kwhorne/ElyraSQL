@@ -286,8 +286,24 @@ pub fn is_id_counter(key: &[u8]) -> bool {
     COUNTER_PREFIXES.iter().any(|p| key.starts_with(p))
 }
 
+/// A table's write counter: every write to the table moves it on, and caches
+/// built from the table -- a vector index, a materialized view's freshness --
+/// are valid while it has not moved.
+const WRITE_COUNTER_PREFIX: &[u8] = b"meta::wcount::";
+
 /// Write `value` at `key` -- except that a counter (see [`COUNTER_PREFIXES`])
-/// never moves backwards unless the same write deletes it first.
+/// never moves backwards unless the same write deletes it first, and a write
+/// counter (see [`WRITE_COUNTER_PREFIX`]) moves on by one from what is stored.
+///
+/// A statement read the write counter and wrote it back plus one, but the
+/// counter is not part of conflict validation: concurrent writes to a table
+/// read the same value and wrote the same next one, and 320 inserts from eight
+/// sessions moved it on 41 times. A cache built between two commits that
+/// wrote the same value would have been taken as current after the second.
+/// (Most such pairs commit in one group and become visible together, so this
+/// was not seen to go wrong; the counter was wrong all the same.) The
+/// increment is now made here, in the write transaction, where writes are
+/// applied one at a time.
 ///
 /// Concurrent statements take ids from one in-memory counter and each persists
 /// its view of it, but their commits can land in either order. A later commit
@@ -300,6 +316,22 @@ fn put_kv(
     value: &[u8],
     deletes: &[Vec<u8>],
 ) -> Result<()> {
+    if value.len() == 8
+        && key.starts_with(WRITE_COUNTER_PREFIX)
+        && !deletes.iter().any(|d| d.as_slice() == key)
+    {
+        let stored = t
+            .get(key)
+            .map_err(|e| Error::Storage(e.to_string()))?
+            .and_then(|current| <[u8; 8]>::try_from(current.value()).ok())
+            .map(u64::from_le_bytes);
+        if let Some(stored) = stored {
+            let next = stored.wrapping_add(1).to_le_bytes();
+            t.insert(key, next.as_slice())
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            return Ok(());
+        }
+    }
     if value.len() == 8
         && COUNTER_PREFIXES.iter().any(|p| key.starts_with(p))
         && !deletes.iter().any(|d| d.as_slice() == key)
