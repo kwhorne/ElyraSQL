@@ -35,13 +35,83 @@ pub trait ToMysqlValue {
     }
 }
 
+// A number in a text-protocol row used to be formatted into a new `String`
+// per value. Integers go through `itoa` and floats through a buffer on the
+// stack; the text is the same, byte for byte (`Display`'s, which is not
+// `ryu`'s: `1e20` stays `100000000000000000000`, as clients have seen it).
 macro_rules! mysql_text_trivial {
     () => {
         fn to_mysql_text<W: Write>(&self, w: &mut W) -> io::Result<()> {
-            w.write_lenenc_str(format!("{}", self).as_bytes())
-                .map(|_| ())
+            NumberText::write(self, w)
         }
     };
+}
+
+trait NumberText {
+    fn write<W: Write>(&self, w: &mut W) -> io::Result<()>;
+}
+
+macro_rules! itoa_text {
+    ($($t:ty),*) => {$(
+        impl NumberText for $t {
+            fn write<W: Write>(&self, w: &mut W) -> io::Result<()> {
+                let mut buf = itoa::Buffer::new();
+                w.write_lenenc_str(buf.format(*self).as_bytes()).map(|_| ())
+            }
+        }
+    )*};
+}
+itoa_text!(u8, i8, u16, i16, u32, i32, u64, i64, usize, isize);
+
+macro_rules! float_text {
+    ($($t:ty),*) => {$(
+        impl NumberText for $t {
+            fn write<W: Write>(&self, w: &mut W) -> io::Result<()> {
+                let mut buf = StackText::default();
+                if fmt::Write::write_fmt(&mut buf, format_args!("{}", self)).is_ok() {
+                    w.write_lenenc_str(buf.as_bytes()).map(|_| ())
+                } else {
+                    // Longer than the buffer (a huge or tiny value written out
+                    // in full): as before.
+                    w.write_lenenc_str(format!("{}", self).as_bytes()).map(|_| ())
+                }
+            }
+        }
+    )*};
+}
+float_text!(f32, f64);
+
+/// Text up to 64 bytes, on the stack. Writing more is an error.
+struct StackText {
+    buf: [u8; 64],
+    len: usize,
+}
+
+impl Default for StackText {
+    fn default() -> Self {
+        StackText {
+            buf: [0; 64],
+            len: 0,
+        }
+    }
+}
+
+impl StackText {
+    fn as_bytes(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+}
+
+impl fmt::Write for StackText {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        let end = self.len + s.len();
+        if end > self.buf.len() {
+            return Err(fmt::Error);
+        }
+        self.buf[self.len..end].copy_from_slice(s.as_bytes());
+        self.len = end;
+        Ok(())
+    }
 }
 
 use std::fmt;
@@ -668,5 +738,57 @@ impl ToMysqlValue for myc::value::Value {
 
     fn is_null(&self) -> bool {
         matches!(*self, myc::value::Value::NULL)
+    }
+}
+
+#[cfg(test)]
+mod number_text_tests {
+    use super::ToMysqlValue;
+    use crate::myc::io::WriteMysqlExt;
+
+    fn text<T: ToMysqlValue>(v: T) -> Vec<u8> {
+        let mut out = Vec::new();
+        v.to_mysql_text(&mut out).unwrap();
+        out
+    }
+
+    fn display<T: std::fmt::Display>(v: T) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.write_lenenc_str(format!("{v}").as_bytes()).unwrap();
+        out
+    }
+
+    #[test]
+    fn numbers_are_written_as_display_writes_them() {
+        for v in [0i64, 1, -1, 42, i64::MIN, i64::MAX, -1_000_000_007] {
+            assert_eq!(text(v), display(v), "{v}");
+            assert_eq!(text(v as i32), display(v as i32), "{v}");
+            assert_eq!(text(v as i8), display(v as i8), "{v}");
+        }
+        for v in [0u64, 7, u64::MAX, u32::MAX as u64 + 1] {
+            assert_eq!(text(v), display(v), "{v}");
+            assert_eq!(text(v as u16), display(v as u16), "{v}");
+        }
+        let floats = [
+            0.0f64,
+            -0.0,
+            1.0,
+            0.1,
+            -2.5,
+            1.0 / 3.0,
+            123456.789,
+            1e20,
+            1e-7,
+            f64::MAX,          // 309 digits: longer than the stack buffer
+            f64::MIN_POSITIVE, // 300+ digits after the point
+            f64::EPSILON,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ];
+        for v in floats {
+            assert_eq!(text(v), display(v), "{v}");
+            assert_eq!(text(v as f32), display(v as f32), "{v}");
+        }
     }
 }
