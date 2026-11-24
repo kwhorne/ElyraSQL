@@ -228,7 +228,7 @@ async fn a_cluster_under_chaos_loses_and_invents_nothing() {
         Duration::from_secs(10),
     )
     .await
-    .expect("create acct");
+    .unwrap_or_else(|| panic!("create acct was not accepted\n{}", c.logs()));
     let accounts: Vec<String> = (0..ACCOUNTS)
         .map(|i| format!("({i}, {OPENING_BALANCE})"))
         .collect();
@@ -237,7 +237,7 @@ async fn a_cluster_under_chaos_loses_and_invents_nothing() {
         Duration::from_secs(10),
     )
     .await
-    .expect("open accounts");
+    .unwrap_or_else(|| panic!("open accounts was not accepted\n{}", c.logs()));
 
     let ports = Arc::new(Mutex::new(
         (1..=3).map(|id| c.node(id).mysql).collect::<Vec<_>>(),

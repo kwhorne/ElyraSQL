@@ -24,7 +24,7 @@ async fn a_cluster_replicates_writes_and_survives_losing_its_leader() {
             Duration::from_secs(10),
         )
         .await
-        .expect("write");
+        .unwrap_or_else(|| panic!("insert {i} was not accepted\n{}", c.logs()));
     }
     for id in 1..=3 {
         c.until_count(id, "t", 20).await;
@@ -130,7 +130,7 @@ async fn a_follower_down_past_compaction_catches_up_deletes_included() {
     // logs keep.
     c.write("DELETE FROM t WHERE id <= 10", Duration::from_secs(10))
         .await
-        .expect("delete");
+        .unwrap_or_else(|| panic!("the delete was not accepted\n{}", c.logs()));
     insert(&c, 21..=40).await;
     c.start(down);
     c.until_count(down, "t", 30).await;
@@ -167,7 +167,7 @@ async fn a_leader_that_cannot_write_its_log_acknowledges_nothing() {
             Duration::from_secs(10),
         )
         .await
-        .expect("write");
+        .unwrap_or_else(|| panic!("insert {i} was not accepted\n{}", c.logs()));
     }
     for id in 1..=3 {
         c.until_count(id, "t", 5).await;

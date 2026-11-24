@@ -3,16 +3,14 @@
 //! `docker stop` killed it, and anywhere else SIGTERM ended it on the spot,
 //! reported as a crash (killed by a signal) rather than a clean stop.
 
+mod ports;
+
 use mysql_async::prelude::*;
+use ports::free_port;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 const BIN: &str = env!("CARGO_BIN_EXE_elyrasql");
-
-fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    l.local_addr().unwrap().port()
-}
 
 fn spawn(data: &std::path::Path, port: u16, env: &[(&str, &str)]) -> Child {
     Command::new(BIN)

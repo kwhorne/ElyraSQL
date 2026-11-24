@@ -6,17 +6,15 @@
 //! committed rows survived. This guards the single-file ACID promise against
 //! regressions.
 
+mod ports;
+
+use ports::free_port;
 use std::process::{Child, Command};
 use std::time::Duration;
 
 use mysql_async::prelude::*;
 
 const BIN: &str = env!("CARGO_BIN_EXE_elyrasql");
-
-fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    l.local_addr().unwrap().port()
-}
 
 fn spawn(data: &std::path::Path, port: u16) -> Child {
     Command::new(BIN)

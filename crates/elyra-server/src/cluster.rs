@@ -25,7 +25,7 @@ use elyra_storage::{Consensus, Db, WriteOp};
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 use tokio_rustls::TlsAcceptor;
 
 use crate::repl::{cluster_client_tls_cached, cluster_server_tls, DuplexStream};
@@ -554,7 +554,7 @@ impl Node {
                 ),
             ));
         }
-        let listener = TcpListener::bind(&self.cfg.control_listen).await?;
+        let listener = crate::listen(&self.cfg.control_listen, "the Raft control plane").await?;
         let tls = cluster_server_tls()?.map(TlsAcceptor::from);
         info!(id = self.cfg.id, addr = %self.cfg.control_listen, tls = tls.is_some(), "raft control plane listening");
         if tls.is_none() {
@@ -773,11 +773,14 @@ impl Node {
         last_log_term: u64,
     ) -> Msg {
         let mut s = self.state.lock().unwrap();
+        let mut deposed = false;
         if term > s.term {
             s.term = term;
             s.voted_for = None;
+            deposed = s.role == Role::Leader;
             if s.role != Role::Follower {
                 s.role = Role::Follower;
+                s.leader = None;
             }
             let _ = self.save_state(&mut s);
         }
@@ -802,6 +805,15 @@ impl Node {
             granted = false;
         }
         let reply_term = s.term;
+        drop(s);
+        // A leader deposed by a later term used to keep its clients waiting:
+        // nothing answered their writes, and it went on calling itself the
+        // leader. Their outcome is unknown now -- a later leader may still
+        // commit them -- and they are told so.
+        if deposed {
+            self.drain_pending("commit not confirmed: a later term deposed this leader");
+            self.publish(None);
+        }
         Msg::Vote {
             term: reply_term,
             granted,
@@ -1474,10 +1486,14 @@ impl Node {
                     if t > s.term {
                         s.term = t;
                         s.role = Role::Follower;
+                        s.leader = None;
                         s.voted_for = None;
                         let _ = self.save_state(&mut s);
                         drop(s);
-                        self.drain_pending("stepped down during replication");
+                        self.drain_pending(
+                            "commit not confirmed: a later term deposed this leader",
+                        );
+                        self.publish(None);
                     }
                     return ReplyOutcome::SteppedDown;
                 }
@@ -2601,6 +2617,61 @@ mod tests {
         // Answering moved nothing on.
         let s = node.state.lock().unwrap();
         assert_eq!((s.term, s.voted_for), (3, None));
+    }
+
+    #[tokio::test]
+    async fn a_leader_deposed_by_a_vote_request_answers_its_clients() {
+        // A leader that took on a later term from a candidate's vote request
+        // left its clients' writes waiting, and went on publishing itself as
+        // the leader.
+        let node = Arc::new(
+            Node::new(
+                ClusterConfig {
+                    id: 1,
+                    control_listen: String::new(),
+                    replication_addr: String::new(),
+                    peers: Vec::new(),
+                    state_path: None,
+                    log_path: None,
+                },
+                Db::in_memory().unwrap(),
+            )
+            .unwrap(),
+        );
+        {
+            let mut s = node.state.lock().unwrap();
+            s.role = Role::Leader;
+            s.term = 1;
+            s.leader = Some(1);
+        }
+        node.publish(Some(Leader {
+            id: 1,
+            is_self: true,
+            repl_addr: String::new(),
+        }));
+        let write = tokio::spawn({
+            let node = node.clone();
+            async move {
+                node.propose(WriteOp::Plain {
+                    puts: vec![(b"k".to_vec(), b"v".to_vec())],
+                    deletes: vec![],
+                })
+                .await
+            }
+        });
+        while node.pending.lock().unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+        node.on_request_vote(2, 3, 0, 0);
+        let answer = tokio::time::timeout(Duration::from_secs(2), write)
+            .await
+            .expect("the write was left waiting")
+            .unwrap();
+        let err = answer.expect_err("an unconfirmed write reported success");
+        assert!(err.to_string().contains("commit not confirmed"), "{err}");
+        assert!(node.leader_rx.borrow().is_none());
+        let s = node.state.lock().unwrap();
+        assert_eq!((s.role, s.term, s.leader), (Role::Follower, 2, None));
     }
 
     #[test]

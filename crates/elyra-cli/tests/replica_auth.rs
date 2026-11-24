@@ -5,15 +5,13 @@
 //! refuses to start a credential-less listener unless explicitly overridden,
 //! and accepts accounts via the same flags as `serve`.
 
+mod ports;
+
+use ports::free_port;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
 const BIN: &str = env!("CARGO_BIN_EXE_elyrasql");
-
-fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    l.local_addr().unwrap().port()
-}
 
 fn replica_cmd(data: &std::path::Path, port: u16) -> Command {
     let mut cmd = Command::new(BIN);

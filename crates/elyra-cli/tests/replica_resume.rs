@@ -8,18 +8,16 @@
 //! again -- a reconnecting replica applied a full snapshot over its old data:
 //! rows the primary had deleted in the meantime stayed on the replica.
 
+mod ports;
+
 use mysql_async::prelude::*;
+use ports::free_port;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::Duration;
 
 const BIN: &str = env!("CARGO_BIN_EXE_elyrasql");
 const SECRET: &str = "replica-resume-test-secret";
-
-fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    l.local_addr().unwrap().port()
-}
 
 struct Proc(Child);
 

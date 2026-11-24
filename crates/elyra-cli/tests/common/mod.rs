@@ -3,22 +3,25 @@
 //!
 //! `Cluster` is the harness. It starts nodes on free ports, each with its data
 //! in a directory of its own, finds the leader by trying a write on every
-//! running node, and keeps each node's log for the failure message.
+//! running node, and keeps each node's log for the failure message. A failing
+//! test leaves the logs, whole, in `target/tmp/raft-logs/<cluster>`, and the
+//! message says what each node last answered a write with.
 
 #![allow(dead_code)]
 
 use mysql_async::prelude::*;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::{Child, Command};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 pub const BIN: &str = env!("CARGO_BIN_EXE_elyrasql");
 pub const SECRET: &str = "raft-cluster-test-secret";
 
-pub fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    l.local_addr().unwrap().port()
-}
+#[path = "../ports/mod.rs"]
+mod ports;
+pub use ports::free_port;
 
 pub struct Node {
     pub id: u64,
@@ -26,10 +29,20 @@ pub struct Node {
     control: u16,
     replication: u16,
     child: Option<Child>,
+    /// Started at least once.
+    started: bool,
+    /// Some node has been started with this one's control port as a peer:
+    /// its ports can no longer change.
+    known: bool,
 }
 
 pub struct Cluster {
+    name: String,
     dir: PathBuf,
+    started: Instant,
+    /// What each node last answered a write with, when it was not a success:
+    /// the error, and when, in seconds since the cluster was made.
+    refusals: Mutex<BTreeMap<u64, String>>,
     nodes: Vec<Node>,
     /// Environment every node is started with.
     env: Vec<(String, String)>,
@@ -42,7 +55,10 @@ impl Cluster {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let mut c = Cluster {
+            name: name.into(),
             dir,
+            started: Instant::now(),
+            refusals: Mutex::new(BTreeMap::new()),
             nodes: Vec::new(),
             env: Vec::new(),
         };
@@ -67,8 +83,60 @@ impl Cluster {
             control: free_port(),
             replication: free_port(),
             child: None,
+            started: false,
+            known: false,
         });
         id
+    }
+
+    /// Give node `id` new ports, and start it from nothing.
+    fn move_ports(&mut self, id: u64) {
+        let n = &mut self.nodes[(id - 1) as usize];
+        assert!(!n.known && n.child.is_none());
+        (n.mysql, n.control, n.replication) = (free_port(), free_port(), free_port());
+        let note = format!(
+            "--- harness: a port was taken; node {id} starts again on mysql {}, control {}, \
+             replication {} ---\n",
+            n.mysql, n.control, n.replication
+        );
+        let _ = std::fs::remove_dir_all(self.data_dir(id));
+        let mut log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.dir.join(format!("n{id}.log")))
+            .unwrap();
+        let _ = std::io::Write::write_all(&mut log, note.as_bytes());
+    }
+
+    /// Wait until node `id`, started for the first time, listens on all its
+    /// ports. `false` if it exited because one was taken.
+    ///
+    /// A port is checked free when it is chosen, but something else can take
+    /// it before the node binds it.
+    fn listens(&mut self, id: u64) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            // Only what this start wrote, not an earlier attempt's.
+            let whole = self.log(id);
+            let log = whole.rsplit("--- harness:").next().unwrap_or_default();
+            if [
+                "raft control plane listening",
+                "accepting MySQL-protocol connections",
+                "replication endpoint listening",
+            ]
+            .iter()
+            .all(|l| log.contains(l))
+            {
+                return true;
+            }
+            let child = self.nodes[(id - 1) as usize].child.as_mut();
+            if let Some(Ok(Some(_))) = child.map(|c| c.try_wait()) {
+                self.nodes[(id - 1) as usize].child = None;
+                return !log.contains("cannot listen on");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        true
     }
 
     pub fn node(&self, id: u64) -> &Node {
@@ -84,8 +152,24 @@ impl Cluster {
         format!("127.0.0.1:{}", self.node(id).control)
     }
 
-    /// Start node `id` with every other configured node as its peer.
+    /// Start node `id` with every other configured node as its peer. A node
+    /// started for the first time that no other node knows yet moves to other
+    /// ports if one of its own was taken.
     pub fn start(&mut self, id: u64) {
+        let first = !self.node(id).started && !self.node(id).known;
+        self.spawn(id);
+        if first {
+            for _ in 0..3 {
+                if self.listens(id) {
+                    return;
+                }
+                self.move_ports(id);
+                self.spawn(id);
+            }
+        }
+    }
+
+    fn spawn(&mut self, id: u64) {
         let peers: Vec<String> = self
             .nodes
             .iter()
@@ -123,12 +207,41 @@ impl Cluster {
             .stderr(log)
             .spawn()
             .expect("spawn elyrasql cluster");
-        self.nodes[(id - 1) as usize].child = Some(child);
+        let mut child = Some(child);
+        for n in self.nodes.iter_mut() {
+            if n.id == id {
+                n.child = child.take();
+                n.started = true;
+            } else {
+                n.known = true;
+            }
+        }
     }
 
+    /// Start every node of a new cluster. If a port was taken, the whole
+    /// cluster starts again on new ones: each node was given the others'.
     pub fn start_all(&mut self) {
-        for id in 1..=self.nodes.len() as u64 {
-            self.start(id);
+        let ids: Vec<u64> = self.nodes.iter().map(|n| n.id).collect();
+        for attempt in 0..3 {
+            for &id in &ids {
+                self.spawn(id);
+            }
+            let mut all = true;
+            for &id in &ids {
+                all &= self.listens(id);
+            }
+            if all || attempt == 2 {
+                return;
+            }
+            for &id in &ids {
+                self.kill(id);
+            }
+            for n in self.nodes.iter_mut() {
+                n.known = false;
+            }
+            for &id in &ids {
+                self.move_ports(id);
+            }
         }
     }
 
@@ -230,16 +343,39 @@ impl Cluster {
 
     /// Run `sql` on whichever node accepts it as the leader, within `within`.
     /// Returns the node that did.
+    ///
+    /// An attempt whose outcome is unknown -- no answer, a dropped connection,
+    /// or a leader deposed before it could confirm the commit -- may still be
+    /// committed by the next leader. Retried, a `CREATE TABLE` then finds the
+    /// table and an `INSERT` its row: after such an attempt, those answers
+    /// mean the statement is done.
     pub async fn write(&self, sql: &str, within: Duration) -> Option<u64> {
         let deadline = Instant::now() + within;
+        let mut uncertain = false;
         while Instant::now() < deadline {
             for id in self.running() {
                 let Some(mut c) = self.conn(id).await else {
+                    self.refused(id, sql, "no connection within 2s");
                     continue;
                 };
                 let attempt = tokio::time::timeout(Duration::from_secs(3), c.query_drop(sql)).await;
-                if let Ok(Ok(())) = attempt {
-                    return Some(id);
+                match attempt {
+                    Ok(Ok(())) => return Some(id),
+                    Ok(Err(mysql_async::Error::Server(e))) => {
+                        if uncertain && (e.code == 1050 || e.code == 1062) {
+                            return Some(id);
+                        }
+                        uncertain |= e.message.contains("commit not confirmed");
+                        self.refused(id, sql, &format!("{} ({})", e.message, e.code));
+                    }
+                    Ok(Err(e)) => {
+                        uncertain = true;
+                        self.refused(id, sql, &e.to_string());
+                    }
+                    Err(_) => {
+                        uncertain = true;
+                        self.refused(id, sql, "no answer within 3s");
+                    }
                 }
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -271,13 +407,36 @@ impl Cluster {
         );
     }
 
+    /// Note what node `id` answered `sql` with. A node that is not the leader
+    /// refuses every write, so only the last answer is kept.
+    fn refused(&self, id: u64, sql: &str, why: &str) {
+        let at = self.started.elapsed().as_secs_f64();
+        let sql: String = sql.chars().take(60).collect();
+        self.refusals
+            .lock()
+            .unwrap()
+            .insert(id, format!("at {at:.1}s, {sql:?}: {why}"));
+    }
+
+    /// The end of every node's log, and what each last refused a write with.
     pub fn logs(&self) -> String {
-        let mut out = String::new();
+        let mut out = format!(
+            "--- cluster {:?}, {:.1}s old; whole logs are kept in {} ---\n",
+            self.name,
+            self.started.elapsed().as_secs_f64(),
+            self.kept_logs().display()
+        );
+        for (id, why) in self.refusals.lock().unwrap().iter() {
+            out.push_str(&format!("node {id} last refused a write {why}\n"));
+        }
         for n in &self.nodes {
             let log = std::fs::read_to_string(self.dir.join(format!("n{}.log", n.id)))
                 .unwrap_or_default();
-            let tail: Vec<&str> = log.lines().rev().take(25).collect();
-            out.push_str(&format!("--- node {} (last lines) ---\n", n.id));
+            let tail: Vec<&str> = log.lines().rev().take(40).collect();
+            out.push_str(&format!(
+                "--- node {} (mysql {}, control {}, replication {}; last lines) ---\n",
+                n.id, n.mysql, n.control, n.replication
+            ));
             for line in tail.into_iter().rev() {
                 out.push_str(line);
                 out.push('\n');
@@ -289,12 +448,41 @@ impl Cluster {
     pub fn log(&self, id: u64) -> String {
         std::fs::read_to_string(self.dir.join(format!("n{id}.log"))).unwrap_or_default()
     }
+
+    /// Where a failed test leaves its nodes' logs (CI uploads the directory).
+    fn kept_logs(&self) -> PathBuf {
+        PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+            .join("raft-logs")
+            .join(format!("{}-{}", self.name, std::process::id()))
+    }
+
+    fn keep_logs(&self) {
+        let to = self.kept_logs();
+        if std::fs::create_dir_all(&to).is_err() {
+            return;
+        }
+        for n in &self.nodes {
+            let f = format!("n{}.log", n.id);
+            let _ = std::fs::copy(self.dir.join(&f), to.join(&f));
+        }
+        let refusals: String = self
+            .refusals
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, why)| format!("node {id}: {why}\n"))
+            .collect();
+        let _ = std::fs::write(to.join("refusals.txt"), refusals);
+    }
 }
 
 impl Drop for Cluster {
     fn drop(&mut self) {
         for id in self.running() {
             self.kill(id);
+        }
+        if std::thread::panicking() {
+            self.keep_logs();
         }
         #[cfg(unix)]
         for n in &self.nodes {
