@@ -48,6 +48,12 @@ All notable changes to ElyraSQL are documented here. The format is based on
   for a DISTINCT over 100k rows on eight connections, 47 -> 53 on one. A
   merge join did the same for every joined row. Both read it once per query.
 
+- **`GROUP BY`, `DISTINCT` and joins on DATE, DATETIME, TIME and binary
+  columns are 1.2-2.5x faster.** Their grouping key was the value's debug
+  text, a new string per row; it is now its binary value. `GROUP BY` on a
+  DATE column over 100k rows: 70 -> 172 queries/s; `COUNT(DISTINCT
+  datetime)`: 123 -> 172/s; `GROUP BY` on VARBINARY: 85 -> 100/s.
+
 ### Fixed
 
 - **A replica keeps replicating when its primary is killed or restarted.**
