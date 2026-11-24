@@ -14039,6 +14039,8 @@ fn sorted_keyed<'a>(
 fn merge_join_inner(l: KeyedRows, r: KeyedRows) -> Option<Vec<Vec<Value>>> {
     use std::cmp::Ordering;
     let mut out = Vec::new();
+    // Once, not per joined row: it is an environment lookup.
+    let max_rows = join_max_rows();
     let (mut i, mut j) = (0usize, 0usize);
     while i < l.len() && j < r.len() {
         match l[i].0.compare(&r[j].0)? {
@@ -14058,7 +14060,7 @@ fn merge_join_inner(l: KeyedRows, r: KeyedRows) -> Option<Vec<Vec<Value>>> {
                     for b in &r[j..je] {
                         // Over budget: give up on the merge path and let the
                         // caller's hash join report the limit with a clear error.
-                        if out.len() > join_max_rows() {
+                        if out.len() > max_rows {
                             return None;
                         }
                         let mut combined = a.1.clone();
@@ -15009,6 +15011,9 @@ async fn distinct_rows(
     let mut seen = std::collections::HashSet::new();
     let mut resident: Vec<(u64, Vec<Value>)> = Vec::new();
     let mut resident_bytes = 0usize;
+    // Read once per query: in the loop it was an environment lookup -- a
+    // process-wide lock in libc -- for every distinct row.
+    let max_bytes = distinct_max_bytes();
     let mut value_sorter = None;
     let mut ordinal = 0u64;
     let mut check = elyra_core::cancel::CancelCheck::new(cancel.clone());
@@ -15062,7 +15067,7 @@ async fn distinct_rows(
                         resident.len(),
                         resident_bytes,
                         memory_rows,
-                        distinct_max_bytes(),
+                        max_bytes,
                     ) {
                         let mut sorter = crate::sort::Sorter::new(
                             vec![true, true],
