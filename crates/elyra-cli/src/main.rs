@@ -4,6 +4,19 @@ mod mcp;
 
 use std::path::PathBuf;
 
+/// jemalloc on Linux rather than the system allocator. The Linux binaries
+/// and the Docker image are static musl builds, and musl's allocator does not
+/// scale: a query that runs on several threads, or several queries at once,
+/// spent most of its time in it (a GROUP BY over 100k rows ran 16 times a
+/// second on one connection, 425 with jemalloc). jemalloc rather than
+/// mimalloc, which was as fast but held twice the memory at peak and kept it
+/// when idle; jemalloc's background threads hand freed memory back within
+/// seconds. Not on macOS: its own allocator is fast, and jemalloc there was
+/// up to ten times slower.
+#[cfg(target_os = "linux")]
+#[global_allocator]
+static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use clap::{Parser, Subcommand};
 use elyra_engine::Engine;
 use elyra_storage::Db;
