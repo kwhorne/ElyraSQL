@@ -17,6 +17,20 @@ ElyraSQL release builds target **Ubuntu 24.04+** and **Apple Silicon macOS
     done, so an interrupted upgrade simply resumes on the next start. **Take a backup
     first, and note that downgrading to 1.4.x afterwards is not supported.**
 
+!!! note "Upgrading to 1.12.20 — memory and Raft write errors"
+
+    No change to the database file; a 1.12.19 database opens in 1.12.20
+    unchanged.
+
+    - **The Linux binaries and the Docker image use jemalloc.** They are much
+      faster under concurrent load, and can hold more memory at peak than
+      before (1.6 GB against 0.9 GB in the measurement with 32 connections
+      running analytical queries); it is handed back within seconds once
+      the load stops. Size container memory limits by the peak.
+    - **A write whose Raft leader was deposed before confirming it fails with
+      `commit not confirmed`** instead of waiting with no answer. Its outcome
+      is unknown -- the next leader may still commit it -- as after a timeout.
+
 !!! warning "Upgrading to 1.12.19 — relaxed durability and replicas"
 
     No change to the database file; a 1.12.18 database opens in 1.12.19
@@ -842,8 +856,8 @@ macOS).
 Multi-arch image (`amd64` + `arm64`) on the GitHub Container Registry:
 
 ```bash
-docker pull ghcr.io/kwhorne/elyrasql:1.12.19   # or :latest
-docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.12.19
+docker pull ghcr.io/kwhorne/elyrasql:1.12.20   # or :latest
+docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.12.20
 ```
 
 The image is ~15 MB, runs as a non-root user, stores data in the
