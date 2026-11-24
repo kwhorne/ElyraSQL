@@ -56,6 +56,14 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ### Fixed
 
+- **A table's write counter moves on with every write.** Caches built from a
+  table (a vector index, a materialized view's freshness) are valid while
+  its counter has not moved. Each statement read the counter and wrote it
+  back plus one, outside conflict validation, so concurrent writes wrote
+  the same value: 320 inserts from eight sessions moved it on 41 times.
+  Storage now makes the increment in the write transaction. A stale result
+  was not reproduced (most such writes commit together), but the counter
+  was wrong.
 - **A replica keeps replicating when its primary is killed or restarted.**
   A stream that was reset rather than closed -- which a killed primary
   often does -- stopped replication, and the replica process exited (code

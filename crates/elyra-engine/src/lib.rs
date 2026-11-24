@@ -10987,3 +10987,52 @@ mod concurrent_insert_id_tests {
         });
     }
 }
+
+#[cfg(test)]
+mod write_counter_tests {
+    //! A table's write counter (`meta::wcount::<table>`) tells caches built
+    //! from the table -- a vector index, a materialized view's freshness --
+    //! whether it was written since. Each statement read it and wrote it back
+    //! plus one, outside conflict validation, so concurrent writes read the
+    //! same value and wrote the same next one: 320 inserts from eight sessions
+    //! moved it on 41 times. Storage now makes the increment, in the write
+    //! transaction.
+    use super::{Engine, Privilege};
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_writes_each_move_the_write_counter_on() {
+        let e = Engine::new(elyra_storage::Db::in_memory().unwrap());
+        let s = e.session();
+        e.execute(
+            "CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, v INT)",
+            Privilege::Admin,
+            &s,
+        )
+        .await
+        .unwrap();
+        let before = crate::vindex::read_wcount(&s, "t").await.unwrap();
+        let tasks: Vec<_> = (0..8)
+            .map(|_| {
+                let e = e.clone();
+                tokio::spawn(async move {
+                    let s = e.session();
+                    for _ in 0..40 {
+                        e.execute("INSERT INTO t (v) VALUES (1)", Privilege::Admin, &s)
+                            .await
+                            .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for t in tasks {
+            t.await.unwrap();
+        }
+        let after = crate::vindex::read_wcount(&s, "t").await.unwrap();
+        assert_eq!(
+            after - before,
+            320,
+            "320 writes moved the counter on {}",
+            after - before
+        );
+    }
+}
