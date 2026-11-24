@@ -7,6 +7,33 @@ use serde::{Deserialize, Serialize};
 /// Case-fold text for the default case-insensitive collation. Applied at every
 /// point text is compared, ordered, indexed, grouped, or de-duplicated, so all
 /// paths agree that e.g. `'Foo' = 'foo'`.
+/// Append `s` folded as [`fold`] folds it, behind its length (4 bytes, LE),
+/// without building the folded `String`.
+fn push_folded(out: &mut Vec<u8>, s: &str) {
+    let len_at = out.len();
+    out.extend_from_slice(&[0; 4]);
+    let start = out.len();
+    if s.is_ascii() {
+        out.extend_from_slice(s.as_bytes());
+        out[start..].make_ascii_lowercase();
+    } else {
+        let mut buf = [0u8; 4];
+        for c in s.chars() {
+            if c.is_ascii() {
+                out.push(c.to_ascii_lowercase() as u8);
+            } else if let Some(f) = crate::collfold::fold_char(c) {
+                out.extend_from_slice(f.as_bytes());
+            } else {
+                for l in c.to_lowercase() {
+                    out.extend_from_slice(l.encode_utf8(&mut buf).as_bytes());
+                }
+            }
+        }
+    }
+    let len = (out.len() - start) as u32;
+    out[len_at..start].copy_from_slice(&len.to_le_bytes());
+}
+
 pub fn fold(s: &str) -> String {
     if s.is_ascii() {
         let mut o = s.to_string();
@@ -235,9 +262,7 @@ impl Value {
             }
             Value::Text(s) | Value::Json(s) => {
                 out.push(4);
-                let f = fold(s);
-                out.extend_from_slice(&(f.len() as u32).to_le_bytes());
-                out.extend_from_slice(f.as_bytes());
+                push_folded(out, s);
             }
             // UInt that fits in i64 keys identically to Int (so 5 == 5 across
             // signedness for GROUP BY/DISTINCT); larger values get their own tag.
@@ -264,11 +289,38 @@ impl Value {
                 out.extend_from_slice(&unscaled.to_le_bytes());
                 out.push(scale);
             }
-            other => {
-                out.push(5);
-                let s = format!("{other:?}");
-                out.extend_from_slice(&(s.len() as u32).to_le_bytes());
-                out.extend_from_slice(s.as_bytes());
+            // The rest used to key on their `Debug` text, a new `String` per
+            // value. Each has a tag of its own, so values of different types
+            // still never share a key, and equal values still do.
+            Value::Date(days) => {
+                out.push(8);
+                out.extend_from_slice(&days.to_le_bytes());
+            }
+            Value::DateTime(micros) => {
+                out.push(9);
+                out.extend_from_slice(&micros.to_le_bytes());
+            }
+            Value::Time(micros) => {
+                out.push(10);
+                out.extend_from_slice(&micros.to_le_bytes());
+            }
+            Value::Bytes(b) => {
+                out.push(11);
+                out.extend_from_slice(&(b.len() as u32).to_le_bytes());
+                out.extend_from_slice(b);
+            }
+            Value::Vector(v) => {
+                out.push(12);
+                out.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                for x in v {
+                    // As `Debug` keyed them: every NaN alike, -0.0 apart from 0.0.
+                    let bits = if x.is_nan() {
+                        f32::NAN.to_bits()
+                    } else {
+                        x.to_bits()
+                    };
+                    out.extend_from_slice(&bits.to_le_bytes());
+                }
             }
         }
     }
@@ -1121,5 +1173,128 @@ mod collation_ai_tests {
         for s in ["Ape", "cat", "ZZ_9", "a-b_c"] {
             assert_eq!(fold(s), s.to_ascii_lowercase());
         }
+    }
+}
+
+#[cfg(test)]
+mod collation_key_encoding_tests {
+    use super::{fold, Value};
+
+    /// The keys as they were built before: text via `fold`, the rest via
+    /// their `Debug` text.
+    fn old_key(v: &Value) -> Vec<u8> {
+        let mut out = Vec::new();
+        match v {
+            Value::Text(s) | Value::Json(s) => {
+                out.push(4);
+                let f = fold(s);
+                out.extend_from_slice(&(f.len() as u32).to_le_bytes());
+                out.extend_from_slice(f.as_bytes());
+            }
+            Value::Date(_)
+            | Value::DateTime(_)
+            | Value::Time(_)
+            | Value::Bytes(_)
+            | Value::Vector(_) => {
+                out.push(5);
+                let s = format!("{v:?}");
+                out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                out.extend_from_slice(s.as_bytes());
+            }
+            other => other.push_collation_key(&mut out),
+        }
+        out
+    }
+
+    fn key(v: &Value) -> Vec<u8> {
+        let mut out = Vec::new();
+        v.push_collation_key(&mut out);
+        out
+    }
+
+    #[test]
+    fn text_keys_are_the_folded_text_as_before() {
+        for s in [
+            "",
+            "abc",
+            "ABC",
+            "MiXeD 123",
+            "Ærlig",
+            "ål",
+            "café",
+            "CAFÉ",
+            "Straße",
+            "İstanbul",
+            "þorn",
+            "ŋ",
+            "日本語",
+            "emoji 🦀",
+            "Ölçü",
+            "œuvre",
+            "ﬁ",
+        ] {
+            assert_eq!(
+                key(&Value::Text(s.into())),
+                old_key(&Value::Text(s.into())),
+                "{s}"
+            );
+            assert_eq!(
+                key(&Value::Json(s.into())),
+                old_key(&Value::Json(s.into())),
+                "{s}"
+            );
+        }
+    }
+
+    #[test]
+    fn other_keys_are_equal_exactly_when_they_were() {
+        let values = vec![
+            Value::Null,
+            Value::Int(0),
+            Value::Int(19000),
+            Value::Float(0.0),
+            Value::Text("2022-01-01".into()),
+            Value::Date(0),
+            Value::Date(19000),
+            Value::Date(-1),
+            Value::DateTime(0),
+            Value::DateTime(19000),
+            Value::DateTime(1_641_000_000_000_000),
+            Value::Time(0),
+            Value::Time(19000),
+            Value::Time(-3_600_000_000),
+            Value::Bytes(vec![]),
+            Value::Bytes(vec![0]),
+            Value::Bytes(vec![0, 0]),
+            Value::Bytes(vec![1, 2, 3]),
+            Value::Bytes(b"abc".to_vec()),
+            Value::Vector(vec![]),
+            Value::Vector(vec![0.0]),
+            Value::Vector(vec![-0.0]),
+            Value::Vector(vec![1.5, 2.0]),
+            Value::Vector(vec![f32::NAN]),
+            Value::Vector(vec![-f32::NAN]),
+            Value::Decimal(19000, 0),
+            Value::UInt(19000),
+        ];
+        for a in &values {
+            for b in &values {
+                assert_eq!(
+                    key(a) == key(b),
+                    old_key(a) == old_key(b),
+                    "{a:?} and {b:?}"
+                );
+            }
+        }
+        // Equal values from separate allocations still share a key.
+        assert_eq!(
+            key(&Value::Bytes(vec![7, 8])),
+            key(&Value::Bytes(vec![7, 8]))
+        );
+        // A row's key stays self-delimiting: the split between two values
+        // cannot move.
+        let ab = Value::row_collation_key(&[Value::Bytes(vec![1]), Value::Bytes(vec![2, 3])]);
+        let ba = Value::row_collation_key(&[Value::Bytes(vec![1, 2]), Value::Bytes(vec![3])]);
+        assert_ne!(ab, ba);
     }
 }
