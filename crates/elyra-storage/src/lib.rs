@@ -15,7 +15,7 @@
 
 pub mod binlog;
 mod db;
-pub use db::{CloseWaiter, Consensus, Db, Validation, WriteEvent, WriteOp};
+pub use db::{read_in_place, CloseWaiter, Consensus, Db, Validation, WriteEvent, WriteOp};
 
 mod cache;
 pub use cache::{page_cache_bytes, CacheSource, PAGE_CACHE_ENV};

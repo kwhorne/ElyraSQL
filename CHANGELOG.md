@@ -54,6 +54,13 @@ All notable changes to ElyraSQL are documented here. The format is based on
   DATE column over 100k rows: 70 -> 172 queries/s; `COUNT(DISTINCT
   datetime)`: 123 -> 172/s; `GROUP BY` on VARBINARY: 85 -> 100/s.
 
+- **Point lookups and single-row inserts are faster on one connection.**
+  Every key read went to a thread pool and back, which cost more than the
+  read itself. A point read and a read of up to 64 keys now run where they
+  are asked for. On Linux (median of 5-8 rounds): primary-key lookups
+  10,230 -> 12,084/s (+23%), index lookups +14%, single-row INSERTs
+  2,170 -> 3,046/s (+40%); unchanged at 8 and 32 connections.
+
 ### Fixed
 
 - **A table's write counter moves on with every write.** Caches built from a

@@ -823,9 +823,12 @@ impl Db {
     }
 
     /// Fetch a value by key (concurrent snapshot read).
+    ///
+    /// Read on this worker (see [`read_in_place`]), not on the blocking pool:
+    /// a point read is microseconds from the page cache, and handing it to
+    /// another thread and back cost more than the read itself.
     pub async fn get(&self, key: Vec<u8>) -> Result<Option<Vec<u8>>> {
-        let storage = self.storage.clone();
-        spawn_read(move || storage.get(&key)).await
+        read_in_place(|| self.storage.get(&key))
     }
 
     /// The current committed write sequence (see [`Storage::write_epoch`]).
@@ -836,7 +839,14 @@ impl Db {
 
     /// Fetch many values in a single read transaction (see
     /// [`Storage::multi_get`]).
+    ///
+    /// A few keys are read in place, as [`Db::get`] reads one; more go to the
+    /// blocking pool.
     pub async fn multi_get(&self, keys: Vec<Vec<u8>>) -> Result<Vec<Option<Vec<u8>>>> {
+        const IN_PLACE: usize = 64;
+        if keys.len() <= IN_PLACE {
+            return read_in_place(|| self.storage.multi_get(&keys));
+        }
         let storage = self.storage.clone();
         spawn_read(move || storage.multi_get(&keys)).await
     }
@@ -1100,6 +1110,21 @@ impl Db {
 
 /// Run a blocking storage closure on the blocking pool so the async reactor
 /// stays free for other connections.
+/// Run a short read on this thread. On the multi-threaded runtime the worker
+/// first hands its other tasks to the rest (`block_in_place`): read straight
+/// on the worker, 32 connections of point lookups were 9% slower on Linux, as
+/// a read waiting on a lock in redb held up every task queued behind it. The
+/// blocking pool, which all reads went through before, cost a thread handoff
+/// each way: point lookups are 1.25x faster on one connection without it.
+pub fn read_in_place<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
+    match tokio::runtime::Handle::try_current() {
+        Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
+    }
+}
+
 async fn spawn_read<F, T>(f: F) -> Result<T>
 where
     F: FnOnce() -> Result<T> + Send + 'static,

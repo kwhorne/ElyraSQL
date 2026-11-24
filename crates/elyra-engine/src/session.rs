@@ -1222,8 +1222,9 @@ impl Session {
                 }
             }
         };
+        // In place, as `Db::get` reads: one key is a few microseconds.
         match snapshot {
-            Some(snap) => spawn(move || snap.get(&key)).await,
+            Some(snap) => elyra_storage::read_in_place(|| snap.get(&key)),
             None => self.db.get(key).await,
         }
     }
