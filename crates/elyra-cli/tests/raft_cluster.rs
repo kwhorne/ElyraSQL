@@ -255,3 +255,73 @@ async fn every_node_runs_a_recursive_cte() {
         assert_eq!(n, Some(1275), "node {id}");
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_follower_caught_up_by_snapshot_applies_a_later_alter_table() {
+    // A snapshot left a table's write counter at the follower's own value
+    // plus one instead of the leader's. ALTER TABLE ... ADD PRIMARY KEY (a
+    // table rebuilt in the background) validates against that counter:
+    // committed and applied on the leader, it was refused on the follower,
+    // which went on without the key.
+    let mut c = compacting(Cluster::new("alter", 3));
+    c.start_all();
+    let leader = c
+        .write("CREATE TABLE t (id INT, v INT)", Duration::from_secs(30))
+        .await
+        .unwrap_or_else(|| panic!("no leader accepted a write\n{}", c.logs()));
+    let rows = |ids: std::ops::RangeInclusive<i64>| {
+        ids.map(|i| format!("({i}, {i})"))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    for chunk in [1..=10, 11..=20] {
+        c.write(
+            &format!("INSERT INTO t VALUES {}", rows(chunk)),
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap_or_else(|| panic!("insert not accepted\n{}", c.logs()));
+    }
+    for id in 1..=3 {
+        c.until_count(id, "t", 20).await;
+    }
+    let down = (1..=3).find(|&id| id != leader).unwrap();
+    c.kill(down);
+    // More writes than the logs keep: the follower needs a snapshot.
+    for i in 21..=40 {
+        c.write(
+            &format!("INSERT INTO t VALUES ({i}, {i})"),
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap_or_else(|| panic!("insert {i} not accepted\n{}", c.logs()));
+    }
+    c.start(down);
+    c.until_count(down, "t", 40).await;
+    c.write(
+        "ALTER TABLE t ADD PRIMARY KEY (id)",
+        Duration::from_secs(20),
+    )
+    .await
+    .unwrap_or_else(|| panic!("the ALTER was not accepted\n{}", c.logs()));
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let mut keyed = Vec::new();
+        for id in 1..=3 {
+            let ddl: Option<(String, String)> = match c.conn(id).await {
+                Some(mut conn) => conn.query_first("SHOW CREATE TABLE t").await.ok().flatten(),
+                None => None,
+            };
+            keyed.push(ddl.is_some_and(|(_, ddl)| ddl.contains("PRIMARY KEY")));
+        }
+        if keyed.iter().all(|k| *k) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "nodes with the primary key after ALTER TABLE: {keyed:?}\n{}",
+            c.logs()
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}

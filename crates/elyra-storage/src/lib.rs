@@ -291,6 +291,13 @@ pub fn is_id_counter(key: &[u8]) -> bool {
 /// are valid while it has not moved.
 const WRITE_COUNTER_PREFIX: &[u8] = b"meta::wcount::";
 
+/// Whether `key` is a table's write counter (see [`WRITE_COUNTER_PREFIX`]): a
+/// write that must set one exactly -- not move it on from what is stored --
+/// deletes it in the same write.
+pub fn is_write_counter(key: &[u8]) -> bool {
+    key.starts_with(WRITE_COUNTER_PREFIX)
+}
+
 /// Write `value` at `key` -- except that a counter (see [`COUNTER_PREFIXES`])
 /// never moves backwards unless the same write deletes it first, and a write
 /// counter (see [`WRITE_COUNTER_PREFIX`]) moves on by one from what is stored.
