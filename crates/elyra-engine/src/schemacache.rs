@@ -56,14 +56,15 @@ pub(crate) static AFTER_CHECK: std::sync::Mutex<Option<(u64, Hook)>> = std::sync
 
 #[cfg(test)]
 async fn after_check(db: u64) {
+    // Looked at, and taken only when it is this database's: taken and put
+    // back, a concurrent test's read could find the slot empty and its hook
+    // would never run.
     let hook = {
         let mut slot = AFTER_CHECK.lock().unwrap();
-        match slot.take() {
-            Some((id, hook)) if id == db => Some(hook),
-            other => {
-                *slot = other;
-                None
-            }
+        if slot.as_ref().is_some_and(|(id, _)| *id == db) {
+            slot.take().map(|(_, hook)| hook)
+        } else {
+            None
         }
     };
     if let Some(hook) = hook {

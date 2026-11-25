@@ -11073,6 +11073,39 @@ mod recursive_cte_local_tests {
             "the working table went to the replication stream"
         );
     }
+
+    /// Its working table no longer touches the catalog: running one used to
+    /// move the schema generation and the catalog epoch on twice, emptying
+    /// every session's cached schema.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_recursive_cte_leaves_the_cached_schema_alone() {
+        let db = elyra_storage::Db::in_memory().unwrap();
+        let e = Engine::new(db.clone());
+        let s = e.session();
+        e.execute("CREATE TABLE t (id INT PRIMARY KEY)", Privilege::Admin, &s)
+            .await
+            .unwrap();
+        let mut stream = db.repl_subscribe();
+        let epoch = crate::catalog::cache_tag().0;
+        let writes = db.write_epoch().unwrap();
+        e.execute(
+            "WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 20) \
+             SELECT COUNT(*) FROM seq",
+            Privilege::Admin,
+            &s,
+        )
+        .await
+        .unwrap();
+        // Process-wide, so other tests may move them; this database's write
+        // sequence and replication stream are its own.
+        let _ = epoch;
+        assert_eq!(
+            db.write_epoch().unwrap(),
+            writes,
+            "the CTE wrote to storage"
+        );
+        assert!(stream.try_recv().is_err());
+    }
 }
 
 #[cfg(test)]
@@ -11085,6 +11118,21 @@ mod schema_cache_race_tests {
     /// the old schema until the next change.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_transaction_never_caches_a_read_under_a_later_generation() {
+        // The schema generation is the process's: a schema change by a test
+        // running alongside can make the transaction skip the cache, and the
+        // hook (which runs only on the cached path) with it. Try again then.
+        for _ in 0..50 {
+            if let Some(served) = transaction_read_beside_a_schema_change().await {
+                assert!(served, "the cache served the transaction's old read");
+                return;
+            }
+        }
+        panic!("the transaction never took the cached path");
+    }
+
+    /// `None` if the transaction did not take the cached path; otherwise
+    /// whether a session after it is served the schema change.
+    async fn transaction_read_beside_a_schema_change() -> Option<bool> {
         let db = elyra_storage::Db::in_memory().unwrap();
         let e = Engine::new(db.clone());
         let a = e.session();
@@ -11095,6 +11143,8 @@ mod schema_cache_race_tests {
         e.execute("SELECT 1", Privilege::Admin, &a).await.unwrap();
         let key = crate::catalog::view_key("v");
         let other = e.clone();
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = ran.clone();
         *crate::schemacache::AFTER_CHECK.lock().unwrap() = Some((
             db.id(),
             Box::new(move || {
@@ -11104,6 +11154,7 @@ mod schema_cache_race_tests {
                         .execute("CREATE VIEW v AS SELECT 1 AS x", Privilege::Admin, &b)
                         .await
                         .unwrap();
+                    flag.store(true, std::sync::atomic::Ordering::SeqCst);
                 })
             }),
         ));
@@ -11111,19 +11162,26 @@ mod schema_cache_race_tests {
         let seen = crate::schemacache::get(&a, key.clone()).await.unwrap();
         assert!(seen.is_none());
         e.execute("COMMIT", Privilege::Admin, &a).await.unwrap();
+        if !ran.load(std::sync::atomic::Ordering::SeqCst) {
+            let mut slot = crate::schemacache::AFTER_CHECK.lock().unwrap();
+            if slot.as_ref().is_some_and(|(id, _)| *id == db.id()) {
+                *slot = None;
+            }
+            return None;
+        }
         // Any session now: the view exists.
         let c = e.session();
-        assert!(
-            crate::schemacache::get(&c, key).await.unwrap().is_some(),
-            "the cache served the transaction's old read"
-        );
-        let mut r = e
-            .execute("SELECT x FROM v", Privilege::Admin, &c)
-            .await
-            .unwrap();
-        let super::QueryResult::Rows(mut rows) = r.remove(0) else {
-            panic!("expected rows")
-        };
-        assert_eq!(rows.next_batch(1).await.unwrap().len(), 1);
+        let served = crate::schemacache::get(&c, key).await.unwrap().is_some();
+        if served {
+            let mut r = e
+                .execute("SELECT x FROM v", Privilege::Admin, &c)
+                .await
+                .unwrap();
+            let super::QueryResult::Rows(mut rows) = r.remove(0) else {
+                panic!("expected rows")
+            };
+            assert_eq!(rows.next_batch(1).await.unwrap().len(), 1);
+        }
+        Some(served)
     }
 }

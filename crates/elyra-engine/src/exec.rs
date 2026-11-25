@@ -29,9 +29,9 @@ use crate::zonemap;
 use elyra_olap::GroupAggregator;
 
 use crate::catalog::{
-    self, autoinc_key, catalog_key, data_key, data_prefix, index_table_prefix,
-    indexnull_table_prefix, partmeta_key, rowid_key, stats_key, wcount_key, ColMeta, ForeignKey,
-    IndexDef, RefAction, TableDef,
+    self, autoinc_key, catalog_key, data_key, index_table_prefix, indexnull_table_prefix,
+    partmeta_key, rowid_key, stats_key, wcount_key, ColMeta, ForeignKey, IndexDef, RefAction,
+    TableDef,
 };
 use crate::eval::eval_expr;
 use crate::keyenc;
@@ -2631,6 +2631,25 @@ pub async fn show_index(db: &Session, name: &str) -> Result<QueryResult> {
     Ok(QueryResult::Rows(RowStream::literal(schema, rows)))
 }
 
+/// The working relation `tf` names, if it names one of this session's (a
+/// recursive CTE's rows; see `Session::local_relation`).
+fn local_relation(db: &Session, tf: &TableFactor) -> Option<crate::session::LocalRelation> {
+    let TableFactor::Table { name, args, .. } = tf else {
+        return None;
+    };
+    match (name.0.as_slice(), args) {
+        ([only], None) if only.value.starts_with("__cte_") => db.local_relation(&only.value),
+        _ => None,
+    }
+}
+
+/// Whether `tf` names a working relation, of any session: their names are
+/// reserved (`__cte_`), never a stored table's.
+fn names_local_relation(tf: &TableFactor) -> bool {
+    matches!(tf, TableFactor::Table { name, args: None, .. }
+        if matches!(name.0.as_slice(), [only] if only.value.starts_with("__cte_")))
+}
+
 /// If `tf` is `information_schema.<view>`, return the lowercase view name.
 fn information_schema_view(tf: &TableFactor) -> Option<String> {
     if let TableFactor::Table { name, .. } = tf {
@@ -2681,7 +2700,9 @@ const COLUMN_PRIVILEGES: &str = "select,insert,update,references";
 /// real [`TableDef`]; virtual relations must use the materialising path, which
 /// obtains their schema and rows from [`information_schema`].
 fn stored_table_factor(tf: &TableFactor) -> bool {
-    matches!(tf, TableFactor::Table { .. }) && information_schema_view(tf).is_none()
+    matches!(tf, TableFactor::Table { .. })
+        && information_schema_view(tf).is_none()
+        && !names_local_relation(tf)
 }
 
 /// The `Key` letter (PRI/UNI/MUL/empty) for column `i` of a table.
@@ -8326,6 +8347,25 @@ async fn select_inner(
         ));
     }
 
+    // A recursive CTE's working relation, held by this session.
+    if let Some(relation) = local_relation(db, &select.from[0].relation) {
+        let qualifier = wildcard_schema_qualifier(db, &select.from[0].relation)
+            .ok_or_else(|| Error::Query("a working relation without a name".into()))?;
+        let schema = qualify_relation_schema(relation.schema, &qualifier);
+        return run_virtual_select(
+            db,
+            vindex,
+            select,
+            schema,
+            (*relation.rows).clone(),
+            &group_by,
+            &order_exprs,
+            offset,
+            limit,
+        )
+        .await;
+    }
+
     // information_schema.<view> as a single virtual relation.
     if let Some(view) = information_schema_view(&select.from[0].relation) {
         let include_catalog_rows = select
@@ -11137,6 +11177,9 @@ pub(crate) async fn describe_relation_schema(
     if let Some(view) = information_schema_view(relation) {
         return information_schema_schema(&view);
     }
+    if let Some(local) = local_relation(db, relation) {
+        return Ok(local.schema);
+    }
     let TableFactor::Table { name, .. } = relation else {
         return Err(Error::Unsupported(
             "only plain table references can be described".into(),
@@ -11456,6 +11499,14 @@ async fn load_relation(
         let qualifier =
             wildcard_schema_qualifier(db, tf).unwrap_or_else(|| ObjectName(vec![Ident::new(view)]));
         return Ok((qualify_relation_schema(schema, &qualifier).columns, rows));
+    }
+
+    // A recursive CTE's working relation, held by this session.
+    if let Some(relation) = local_relation(db, tf) {
+        let qualifier = factor_qualifier_object(db, tf)
+            .ok_or_else(|| Error::Query("a working relation without a name".into()))?;
+        let cols = qualify_columns(&relation.schema, &qualifier);
+        return Ok((cols, (*relation.rows).clone()));
     }
 
     // Derived table: materialise the subquery and qualify its columns.
@@ -21240,6 +21291,9 @@ async fn static_factor_schema(
                 let schema = information_schema_schema(&view)?;
                 return qualify_static_schema(db, schema, factor);
             }
+            if let Some(local) = local_relation(db, factor) {
+                return qualify_static_schema(db, local.schema, factor);
+            }
             let table = stored_table_ident(db, name)?;
             if let Some(sql) = catalog::load_view(db, &table).await? {
                 let schema = Box::pin(static_query_schema(db, &parse_query(&sql)?, outer)).await?;
@@ -21725,7 +21779,7 @@ async fn expand_views(db: &Session, query: &SqlQuery) -> Result<SqlQuery> {
 }
 
 async fn expand_view_factor(db: &Session, tf: &mut TableFactor) -> Result<()> {
-    if information_schema_view(tf).is_some() {
+    if information_schema_view(tf).is_some() || names_local_relation(tf) {
         return Ok(());
     }
     if let TableFactor::Table { name, alias, .. } = tf {
@@ -21811,15 +21865,6 @@ async fn read_autoinc(db: &Session, table: &str) -> Result<i64> {
 }
 
 static TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static TEMP_OWNER_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-#[derive(Debug, Clone)]
-struct OwnedTempTable {
-    name: String,
-    definition: Vec<u8>,
-    owner: Vec<u8>,
-}
-
 fn temp_name(n: u64, base: &str) -> String {
     let clean: String = base.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
     format!("__cte_{n}_{clean}")
@@ -21877,7 +21922,7 @@ async fn execute_recursive_cte(
     let with = query.with.as_ref().expect("with present");
     let mut temp_names: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
-    let mut created: Vec<OwnedTempTable> = Vec::new();
+    let mut created: Vec<String> = Vec::new();
     let reachable = reachable_recursive_ctes(query, with);
 
     let result = async {
@@ -21900,10 +21945,9 @@ async fn execute_recursive_cte(
             } else {
                 let (schema, rows) = run_subquery_schema(db, vindex, &body).await?;
                 let schema = apply_col_aliases(schema, &alias_cols)?;
-                let owned = create_temp_table(db, &cname, &schema).await?;
-                let temp = owned.name.clone();
-                created.push(owned.clone());
-                fill_table(db, &owned, &schema, &rows).await?;
+                let temp = new_working_relation(db, &cname, &schema);
+                created.push(temp.clone());
+                set_working_rows(db, &temp, &schema, &rows)?;
                 temp
             };
             temp_names.insert(cname.to_ascii_lowercase(), temp);
@@ -21917,9 +21961,9 @@ async fn execute_recursive_cte(
     }
     .await;
 
-    // Always drop the temporary relations.
+    // Always drop the working relations.
     for temp in &created {
-        let _ = drop_temp_table(db, temp).await;
+        db.drop_local_relation(temp);
     }
 
     let (schema, rows) = result?;
@@ -21933,7 +21977,7 @@ async fn materialize_recursive(
     cname: &str,
     body: &SqlQuery,
     alias_cols: &[String],
-    created: &mut Vec<OwnedTempTable>,
+    created: &mut Vec<String>,
 ) -> Result<String> {
     const MAX_ITERS: usize = 1000;
     let (distinct, anchor_q, rec_q) = split_recursive(body, cname)?;
@@ -21946,9 +21990,8 @@ async fn materialize_recursive(
         .map(|column| column.name.clone())
         .collect::<Vec<_>>();
     validate_recursive_table_reference(rec_q.body.as_ref(), cname, &recursive_columns)?;
-    let owned = create_temp_table(db, cname, &schema).await?;
-    let temp = owned.name.clone();
-    created.push(owned.clone());
+    let temp = new_working_relation(db, cname, &schema);
+    created.push(temp.clone());
 
     let row_key = |r: &[Value]| -> Vec<u8> { Value::row_collation_key(r) };
     let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
@@ -21981,8 +22024,7 @@ async fn materialize_recursive(
             )));
         }
         // The recursive term sees only the previous iteration's rows.
-        clear_table(db, &owned).await?;
-        fill_table(db, &owned, &schema, &frontier).await?;
+        set_working_rows(db, &temp, &schema, &frontier)?;
 
         let new_rows = run_subquery(db, vindex, &rec_q).await?;
         let mut fresh: Vec<Vec<Value>> = Vec::new();
@@ -21999,9 +22041,52 @@ async fn materialize_recursive(
     }
 
     // Final contents: the full accumulated set.
-    clear_table(db, &owned).await?;
-    fill_table(db, &owned, &schema, &all_rows).await?;
+    set_working_rows(db, &temp, &schema, &all_rows)?;
     Ok(temp)
+}
+
+/// A new, empty working relation for CTE `base`, held by this session for
+/// the statement (see `Session::local_relation`). Its rows used to be a table
+/// in storage: every iteration of a recursive CTE was two commits, went to
+/// the binlog, replicas and the Raft log, bumped the schema generation twice
+/// (emptying every session's schema caches), and in a transaction made a
+/// read-only statement a write -- refused on a Raft follower at COMMIT.
+fn new_working_relation(db: &Session, base: &str, schema: &Schema) -> String {
+    let name = temp_name(
+        TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        base,
+    );
+    db.set_local_relation(
+        &name,
+        crate::session::LocalRelation {
+            schema: schema.clone(),
+            rows: std::sync::Arc::new(Vec::new()),
+        },
+    );
+    name
+}
+
+/// Make `rows` the working relation `name`'s rows, each value coerced to its
+/// column's type, as writing them to a table did.
+fn set_working_rows(db: &Session, name: &str, schema: &Schema, rows: &[Vec<Value>]) -> Result<()> {
+    let mut held = Vec::with_capacity(rows.len());
+    for r in rows {
+        let mut row = vec![Value::Null; schema.columns.len()];
+        for (i, col) in schema.columns.iter().enumerate() {
+            if let Some(v) = r.get(i) {
+                row[i] = coerce(v.clone(), &col.ty, &col.name)?;
+            }
+        }
+        held.push(row);
+    }
+    db.set_local_relation(
+        name,
+        crate::session::LocalRelation {
+            schema: schema.clone(),
+            rows: std::sync::Arc::new(held),
+        },
+    );
+    Ok(())
 }
 
 /// Split a recursive CTE body `anchor UNION [ALL] recursive` into its parts.
@@ -22669,205 +22754,6 @@ fn apply_col_aliases(mut schema: Schema, alias_cols: &[String]) -> Result<Schema
         column.name.clone_from(alias);
     }
     Ok(schema)
-}
-
-async fn create_temp_table(db: &Session, base: &str, schema: &Schema) -> Result<OwnedTempTable> {
-    loop {
-        let number = TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let name = temp_name(number, base);
-        let definition = TableDef {
-            name: name.clone(),
-            schema: schema.clone(),
-            pk_cols: Vec::new(),
-            indexes: Vec::new(),
-            col_meta: Vec::new(),
-            checks: Vec::new(),
-            foreign_keys: Vec::new(),
-            storage_generation: 0,
-        }
-        .encode()?;
-        let owner_number = TEMP_OWNER_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let owner = format!(
-            "{}:{}:{owner_number}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        )
-        .into_bytes();
-        let table_key = catalog_key(&name);
-        let owner_key = temp_owner_key(&name);
-        let puts = vec![
-            (table_key.clone(), definition.clone()),
-            (owner_key.clone(), owner.clone()),
-        ];
-
-        if db.in_txn() {
-            if db.get(table_key).await?.is_some()
-                || db.get(catalog::view_key(&name)).await?.is_some()
-                || db.get(catalog::matview_key(&name)).await?.is_some()
-                || db.get(owner_key).await?.is_some()
-            {
-                continue;
-            }
-            db.commit_write(puts, vec![]).await?;
-        } else {
-            let validation = elyra_storage::Validation {
-                keys: vec![
-                    (table_key, None),
-                    (catalog::view_key(&name), None),
-                    (catalog::matview_key(&name), None),
-                    (owner_key, None),
-                ],
-                ranges: Vec::new(),
-            };
-            match db.raw_db().commit_local(validation, puts, vec![]).await {
-                Ok(()) => catalog::bump_epoch(),
-                Err(Error::Conflict(_)) => continue,
-                Err(error) => return Err(error),
-            }
-        }
-
-        return Ok(OwnedTempTable {
-            name,
-            definition,
-            owner,
-        });
-    }
-}
-
-async fn drop_temp_table(db: &Session, temp: &OwnedTempTable) -> Result<()> {
-    let table_key = catalog_key(&temp.name);
-    let owner_key = temp_owner_key(&temp.name);
-    if db.get(table_key.clone()).await?.as_deref() != Some(temp.definition.as_slice())
-        || db.get(owner_key.clone()).await?.as_deref() != Some(temp.owner.as_slice())
-    {
-        return Ok(());
-    }
-
-    let deletes = table_delete_keys(db, &temp.name).await?;
-    if db.in_txn() {
-        return db.commit_write(vec![], deletes).await;
-    }
-
-    let validation = elyra_storage::Validation {
-        keys: vec![
-            (table_key, Some(temp.definition.clone())),
-            (owner_key, Some(temp.owner.clone())),
-        ],
-        ranges: Vec::new(),
-    };
-    match db.raw_db().commit_local(validation, vec![], deletes).await {
-        Ok(()) => {
-            catalog::bump_epoch();
-            Ok(())
-        }
-        // The relation changed after our read and is no longer ours to drop.
-        Err(Error::Conflict(_)) => Ok(()),
-        Err(error) => Err(error),
-    }
-}
-
-async fn commit_temp_write(
-    db: &Session,
-    temp: &OwnedTempTable,
-    mut expected: Vec<(Vec<u8>, Option<Vec<u8>>)>,
-    puts: Vec<(Vec<u8>, Vec<u8>)>,
-    deletes: Vec<Vec<u8>>,
-) -> Result<()> {
-    let table_key = catalog_key(&temp.name);
-    let owner_key = temp_owner_key(&temp.name);
-    if db.in_txn() {
-        if db.get(table_key).await?.as_deref() != Some(temp.definition.as_slice())
-            || db.get(owner_key).await?.as_deref() != Some(temp.owner.as_slice())
-        {
-            return Err(Error::Conflict(
-                "temporary CTE relation ownership changed".into(),
-            ));
-        }
-        return db.commit_write(puts, deletes).await;
-    }
-
-    expected.push((table_key, Some(temp.definition.clone())));
-    expected.push((owner_key, Some(temp.owner.clone())));
-    db.raw_db()
-        .commit_local(
-            elyra_storage::Validation {
-                keys: expected,
-                ranges: Vec::new(),
-            },
-            puts,
-            deletes,
-        )
-        .await
-}
-
-async fn fill_table(
-    db: &Session,
-    temp: &OwnedTempTable,
-    schema: &Schema,
-    rows: &[Vec<Value>],
-) -> Result<()> {
-    let mut puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(rows.len() + 1);
-    let rowid_storage_key = rowid_key(&temp.name);
-    let expected_rowid = db.get(rowid_storage_key.clone()).await?;
-    let mut rowid = match expected_rowid.as_deref() {
-        Some(bytes) if bytes.len() == 8 => {
-            u64::from_le_bytes(bytes.try_into().expect("checked length"))
-        }
-        _ => 0,
-    };
-    for r in rows {
-        rowid += 1;
-        let mut row = vec![Value::Null; schema.columns.len()];
-        for (i, col) in schema.columns.iter().enumerate() {
-            if let Some(v) = r.get(i) {
-                row[i] = coerce(v.clone(), &col.ty, &col.name)?;
-            }
-        }
-        let encoded = bincode::serialize(&row).map_err(|e| Error::Storage(e.to_string()))?;
-        puts.push((data_key(&temp.name, &keyenc::encode_rowid(rowid)), encoded));
-    }
-    puts.push((rowid_storage_key.clone(), rowid.to_le_bytes().to_vec()));
-    commit_temp_write(
-        db,
-        temp,
-        vec![(rowid_storage_key, expected_rowid)],
-        puts,
-        vec![],
-    )
-    .await
-}
-
-async fn clear_table(db: &Session, temp: &OwnedTempTable) -> Result<()> {
-    let prefix = data_prefix(&temp.name);
-    let rowid_storage_key = rowid_key(&temp.name);
-    // Read the row counter before the range. Every normal insert advances it,
-    // so validating this value catches rows added during the subsequent scan.
-    let expected_rowid = db.get(rowid_storage_key.clone()).await?;
-    let mut deletes = vec![rowid_storage_key.clone()];
-    let mut cursor: Option<Vec<u8>> = None;
-    loop {
-        let batch = db.scan_batch(prefix.clone(), cursor.clone(), 4096).await?;
-        if batch.is_empty() {
-            break;
-        }
-        cursor = batch.last().map(|(k, _)| k.clone());
-        let last = batch.len() < 4096;
-        deletes.extend(batch.into_iter().map(|(k, _)| k));
-        if last {
-            break;
-        }
-    }
-    commit_temp_write(
-        db,
-        temp,
-        vec![(rowid_storage_key, expected_rowid)],
-        vec![],
-        deletes,
-    )
-    .await
 }
 
 /// True if a projection contains any subquery (scalar/IN/EXISTS).
@@ -27397,7 +27283,7 @@ mod generation_cleanup_tests {
 #[cfg(test)]
 mod cte_rewrite_tests {
     use crate::{Engine, QueryResult, Session};
-    use elyra_core::{ColumnDef, ColumnType, Error, Privilege, Schema, Value};
+    use elyra_core::{Error, Privilege, Value};
     use elyra_storage::Db;
 
     const EXPANSION_LIMIT_CHILD: &str = "ELYRASQL_CTE_EXPANSION_LIMIT_CHILD";
@@ -28009,52 +27895,6 @@ mod cte_rewrite_tests {
             )
             .await,
             vec![vec![Value::Int(5)]]
-        );
-    }
-
-    #[tokio::test]
-    async fn temp_cleanup_does_not_drop_a_replacement_table() {
-        let (engine, session) = engine_and_session();
-        let schema = Schema::new(vec![ColumnDef::new("n", ColumnType::Int, true)]);
-        let owned = super::create_temp_table(&session, "owner_race", &schema)
-            .await
-            .unwrap();
-
-        engine
-            .execute(
-                &format!("DROP TABLE {}", owned.name),
-                Privilege::Admin,
-                &session,
-            )
-            .await
-            .unwrap();
-        engine
-            .execute(
-                &format!("CREATE TABLE {} (n INT)", owned.name),
-                Privilege::Admin,
-                &session,
-            )
-            .await
-            .unwrap();
-        engine
-            .execute(
-                &format!("INSERT INTO {} VALUES (99)", owned.name),
-                Privilege::Admin,
-                &session,
-            )
-            .await
-            .unwrap();
-
-        let replacement_write =
-            super::fill_table(&session, &owned, &schema, &[vec![Value::Int(7)]]).await;
-        assert!(
-            matches!(replacement_write, Err(Error::Conflict(_))),
-            "materialization must stop when the temporary relation was replaced"
-        );
-        super::drop_temp_table(&session, &owned).await.unwrap();
-        assert_eq!(
-            rows(&engine, &session, &format!("SELECT n FROM {}", owned.name),).await,
-            vec![vec![Value::Int(99)]]
         );
     }
 
