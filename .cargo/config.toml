@@ -1,0 +1,6 @@
+[env]
+# jemalloc on aarch64-unknown-linux-musl: GCC calls out to glibc's libgcc for
+# atomics, which needs `__getauxval` (not in musl), and jemalloc's configure
+# then finds no atomics and refuses to build. Inline atomics instead. Applies
+# to that target only; CI and the release workflow set it too.
+CFLAGS_aarch64_unknown_linux_musl = "-mno-outline-atomics"

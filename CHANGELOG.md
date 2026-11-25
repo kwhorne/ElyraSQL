@@ -6,7 +6,20 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed
+
+- **Point reads inside a transaction no longer go through a thread pool**
+  (up to 64 keys at a time), as autocommit reads stopped doing in 1.12.20;
+  a read the transaction's own writes answer entirely reads nothing.
+- `cargo build --target aarch64-unknown-linux-musl` works from a checkout:
+  `.cargo/config.toml` sets the flag jemalloc needs there, as CI does.
+
 ### Fixed
+
+- **A Raft leader that stops leading stops its snapshot transfers.** One
+  left running could send a follower parts while the next leadership's
+  transfer did; the follower refused one of them. And a follower logs that
+  it installed a snapshot before it answers queries again.
 
 - **A schema change committed while a transaction reads the schema can no
   longer leave the old schema cached for every session.** A transaction

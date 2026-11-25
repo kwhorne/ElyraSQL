@@ -1043,11 +1043,13 @@ impl Node {
                 .map_err(storage_io)?;
             *install = None;
             self.discard_install.store(false, Ordering::SeqCst);
-            self.db.set_fence(None);
+            // Logged before queries are answered again, so a log read after
+            // an answer from the new data always has it.
             info!(
                 id = self.cfg.id,
                 last_index, "installed a snapshot from the leader"
             );
+            self.db.set_fence(None);
         }
         Ok(Msg::SnapshotAck {
             term,
@@ -1383,7 +1385,7 @@ impl Node {
                 };
                 let tx = repl.tx.clone();
                 let peer_id = peer.id;
-                tokio::spawn(async move {
+                let task = tokio::spawn(async move {
                     let reply = send.run().await;
                     let _ = tx.send(PeerReply {
                         peer: peer_id,
@@ -1394,6 +1396,9 @@ impl Node {
                         snapshot: true,
                     });
                 });
+                if let Some(earlier) = repl.snapshots.insert(peer.id, task.abort_handle()) {
+                    earlier.abort();
+                }
                 continue;
             }
             let (prev_term, entries) = {
@@ -1475,6 +1480,9 @@ impl Node {
     fn take_reply(&self, repl: &mut Replication, term: u64, reply: PeerReply) -> ReplyOutcome {
         if repl.inflight.get(&reply.peer) == Some(&reply.round) {
             repl.inflight.remove(&reply.peer);
+        }
+        if reply.snapshot {
+            repl.snapshots.remove(&reply.peer);
         }
         if reply.term != term {
             return ReplyOutcome::Ignored;
@@ -1846,6 +1854,8 @@ struct Replication {
     /// Followers not to be sent a snapshot again before then: their last
     /// transfer failed.
     snapshot_retry: HashMap<u64, Instant>,
+    /// The snapshot transfers under way, per follower.
+    snapshots: HashMap<u64, tokio::task::AbortHandle>,
 }
 
 impl Replication {
@@ -1858,14 +1868,22 @@ impl Replication {
             tx,
             replies,
             snapshot_retry: HashMap::new(),
+            snapshots: HashMap::new(),
         }
     }
 
     /// Forget every follower's connection and exchange: no longer leader.
     /// Answers still to come are from an earlier term and will be dropped.
+    ///
+    /// Snapshot transfers under way are stopped. They used to go on: the
+    /// next leadership could start another to the same follower, and the two
+    /// sent it parts of different transfers, which it refused.
     fn reset(&mut self) {
         self.conns.clear();
         self.inflight.clear();
+        for (_, task) in self.snapshots.drain() {
+            task.abort();
+        }
     }
 }
 
@@ -2687,6 +2705,22 @@ mod tests {
         // Answering moved nothing on.
         let s = node.state.lock().unwrap();
         assert_eq!((s.term, s.voted_for), (3, None));
+    }
+
+    /// A leader's snapshot transfers stop when it stops leading: one left
+    /// running could send a follower parts while the next leadership's
+    /// transfer did, and the follower refused one of them.
+    #[tokio::test]
+    async fn a_reset_stops_snapshot_transfers_under_way() {
+        let mut repl = Replication::new();
+        let transfer = tokio::spawn(std::future::pending::<()>());
+        repl.snapshots.insert(2, transfer.abort_handle());
+        repl.reset();
+        let stopped = tokio::time::timeout(Duration::from_secs(2), transfer)
+            .await
+            .expect("the transfer went on");
+        assert!(stopped.unwrap_err().is_cancelled());
+        assert!(repl.snapshots.is_empty());
     }
 
     #[tokio::test]
