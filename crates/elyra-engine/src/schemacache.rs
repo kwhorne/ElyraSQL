@@ -15,9 +15,13 @@
 //! leaves the entry stale. An entry is therefore served only while it equals
 //! the committed state.
 //!
-//! Inside a transaction every read goes to the session as before, so the
-//! transaction sees its own uncommitted writes and serializable read tracking
-//! is unaffected; nothing read there is cached.
+//! A transaction uses the cache only while no schema change has committed
+//! since it began, and it has written none (see `Session::schema_cache_ok`):
+//! what it reads from its snapshot is then the committed state of the
+//! generation it loaded. The generation is loaded *before* that check, as
+//! outside a transaction. Loaded after it, a schema change committed in
+//! between put the transaction's older read in the cache under the new
+//! generation, and every session read it until the next change.
 
 use crate::session::Session;
 use elyra_core::Result;
@@ -39,6 +43,32 @@ fn cache() -> &'static std::sync::RwLock<std::collections::HashMap<Key, (u64, Re
     use std::sync::{OnceLock, RwLock};
     static C: OnceLock<RwLock<std::collections::HashMap<Key, (u64, Read)>>> = OnceLock::new();
     C.get_or_init(|| RwLock::new(std::collections::HashMap::new()))
+}
+
+/// A test's step between the check and the read (see the module docs).
+#[cfg(test)]
+type Hook =
+    Box<dyn FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send>;
+
+/// Run once, for the database with this id only.
+#[cfg(test)]
+pub(crate) static AFTER_CHECK: std::sync::Mutex<Option<(u64, Hook)>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+async fn after_check(db: u64) {
+    let hook = {
+        let mut slot = AFTER_CHECK.lock().unwrap();
+        match slot.take() {
+            Some((id, hook)) if id == db => Some(hook),
+            other => {
+                *slot = other;
+                None
+            }
+        }
+    };
+    if let Some(hook) = hook {
+        hook().await;
+    }
 }
 
 fn cached(key: &Key, generation: u64) -> Option<Read> {
@@ -70,10 +100,12 @@ fn assert_schema_key(key: &[u8]) {
 /// `sess.get(key)` for a schema key, cached outside transactions.
 pub async fn get(sess: &Session, key: Vec<u8>) -> Result<Option<Vec<u8>>> {
     assert_schema_key(&key);
+    let generation = elyra_storage::schema_generation();
     if !sess.schema_cache_ok() {
         return sess.get(key).await;
     }
-    let generation = elyra_storage::schema_generation();
+    #[cfg(test)]
+    after_check(sess.db_id()).await;
     let ck = (sess.db_id(), 0, key);
     if let Some(Read::Value(v)) = cached(&ck, generation) {
         return Ok(v);
@@ -103,10 +135,10 @@ pub async fn keys(sess: &Session, prefix: &[u8]) -> Result<Vec<Vec<u8>>> {
             after = keys.last().cloned();
         }
     };
+    let generation = elyra_storage::schema_generation();
     if !sess.schema_cache_ok() {
         return scan().await;
     }
-    let generation = elyra_storage::schema_generation();
     let ck = (sess.db_id(), 1, prefix.to_vec());
     if let Some(Read::Keys(keys)) = cached(&ck, generation) {
         return Ok(keys);

@@ -11074,3 +11074,56 @@ mod recursive_cte_local_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod schema_cache_race_tests {
+    use super::{Engine, Privilege};
+
+    /// A transaction that checked it may use the schema cache, then read a
+    /// schema key while another session committed a schema change, cached
+    /// its own older read under the new generation: every session then saw
+    /// the old schema until the next change.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_transaction_never_caches_a_read_under_a_later_generation() {
+        let db = elyra_storage::Db::in_memory().unwrap();
+        let e = Engine::new(db.clone());
+        let a = e.session();
+        e.execute("START TRANSACTION", Privilege::Admin, &a)
+            .await
+            .unwrap();
+        // Begin the snapshot before the view exists.
+        e.execute("SELECT 1", Privilege::Admin, &a).await.unwrap();
+        let key = crate::catalog::view_key("v");
+        let other = e.clone();
+        *crate::schemacache::AFTER_CHECK.lock().unwrap() = Some((
+            db.id(),
+            Box::new(move || {
+                Box::pin(async move {
+                    let b = other.session();
+                    other
+                        .execute("CREATE VIEW v AS SELECT 1 AS x", Privilege::Admin, &b)
+                        .await
+                        .unwrap();
+                })
+            }),
+        ));
+        // The transaction's own read: no view in its snapshot.
+        let seen = crate::schemacache::get(&a, key.clone()).await.unwrap();
+        assert!(seen.is_none());
+        e.execute("COMMIT", Privilege::Admin, &a).await.unwrap();
+        // Any session now: the view exists.
+        let c = e.session();
+        assert!(
+            crate::schemacache::get(&c, key).await.unwrap().is_some(),
+            "the cache served the transaction's old read"
+        );
+        let mut r = e
+            .execute("SELECT x FROM v", Privilege::Admin, &c)
+            .await
+            .unwrap();
+        let super::QueryResult::Rows(mut rows) = r.remove(0) else {
+            panic!("expected rows")
+        };
+        assert_eq!(rows.next_batch(1).await.unwrap().len(), 1);
+    }
+}
