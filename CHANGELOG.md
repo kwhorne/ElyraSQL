@@ -8,6 +8,11 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ### Changed
 
+- **`WITH RECURSIVE` keeps its working rows in memory**, as a relation of
+  the statement, instead of a table in storage: a 1,000-step CTE 191 -> 29 ms
+  (7.5 s in 1.12.19), a 5,000-node tree walk 65 -> 35 ms. It no longer
+  empties every session's schema caches, and its rows can no longer end up
+  in a replica's or a Raft follower's copy.
 - **Release binaries get the full benefit of profile-guided optimization.**
   The profile was recorded from a build without `--target` and applied to
   the release build with it; `--target` changes every symbol name, so about
@@ -24,6 +29,15 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ### Fixed
 
+- **`COMMIT` of a transaction that wrote nothing succeeds on a Raft
+  follower.** It went through the write path all the same: on a follower,
+  which may not propose, it failed with "not the leader" -- every read-only
+  transaction, `START TRANSACTION READ ONLY` included -- and on the leader
+  each one was a Raft entry with its sync. It now ends without a write.
+  (Serializable transactions, which validate what they read, are as before.)
+- **`WITH RECURSIVE` in a transaction no longer makes it a write.** Its
+  working table was written through the transaction, so its COMMIT was a
+  write too.
 - **A Raft leader that stops leading stops its snapshot transfers.** One
   left running could send a follower parts while the next leadership's
   transfer did; the follower refused one of them. And a follower logs that

@@ -1334,20 +1334,6 @@ impl Storage {
         self.apply_validated_in(self.raw_begin_write()?, keys, ranges, puts, deletes)
     }
 
-    /// [`Storage::apply_validated`], committed without a sync: for data that
-    /// lives only while one statement runs (see `Db::commit_local`).
-    pub fn apply_validated_unsynced(
-        &self,
-        keys: &[(Vec<u8>, Option<Vec<u8>>)],
-        ranges: &[RangeSnapshot],
-        puts: &[(Vec<u8>, Vec<u8>)],
-        deletes: &[Vec<u8>],
-    ) -> Result<()> {
-        let mut wtx = self.raw_begin_write()?;
-        wtx.set_durability(DEFERRED);
-        self.apply_validated_in(wtx, keys, ranges, puts, deletes)
-    }
-
     fn apply_validated_in(
         &self,
         wtx: WriteTransaction,

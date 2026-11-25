@@ -241,6 +241,18 @@ pub struct Session {
     /// The definer clauses taken out of the statement being run, for the
     /// `CREATE VIEW` in it (see `crate::definer`).
     view_clauses: Mutex<Option<crate::definer::Clauses>>,
+    /// The working relations of the `WITH RECURSIVE` statements running on
+    /// this session, by name (see [`Session::local_relation`]).
+    local_relations: Mutex<std::collections::HashMap<String, LocalRelation>>,
+}
+
+/// A relation that exists only while one statement runs: a recursive CTE's
+/// rows, read as a virtual relation (as `information_schema`'s are) instead of
+/// a table in storage.
+#[derive(Clone)]
+pub struct LocalRelation {
+    pub schema: elyra_core::Schema,
+    pub rows: Arc<Vec<Vec<Value>>>,
 }
 
 fn is_meta(k: &[u8]) -> bool {
@@ -305,7 +317,33 @@ impl Session {
             identity: Mutex::new(crate::sessfn::Identity::default()),
             definer_depth: std::sync::atomic::AtomicUsize::new(0),
             view_clauses: Mutex::new(None),
+            local_relations: Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// The working relation called `name` (any case), if a statement on this
+    /// session has one.
+    pub fn local_relation(&self, name: &str) -> Option<LocalRelation> {
+        self.local_relations
+            .lock()
+            .unwrap()
+            .get(&name.to_ascii_lowercase())
+            .cloned()
+    }
+
+    /// Set the rows of working relation `name`, creating it.
+    pub fn set_local_relation(&self, name: &str, relation: LocalRelation) {
+        self.local_relations
+            .lock()
+            .unwrap()
+            .insert(name.to_ascii_lowercase(), relation);
+    }
+
+    pub fn drop_local_relation(&self, name: &str) {
+        self.local_relations
+            .lock()
+            .unwrap()
+            .remove(&name.to_ascii_lowercase());
     }
 
     /// Bytes still available to a DDL rewrite inside the active transaction.
@@ -1091,6 +1129,14 @@ impl Session {
             schema_tag: _,
             schema_writes: _,
         } = tx;
+        // Nothing written, nothing locked, no reads to validate: there is
+        // nothing to commit. Such a COMMIT used to go through the write path
+        // all the same -- in a cluster, a Raft entry (and its sync) for every
+        // read-only transaction, and on a follower, which may not propose, an
+        // error ("not the leader") for a transaction that only read.
+        if puts.is_empty() && deletes.is_empty() && locked.is_empty() && !serializable {
+            return Ok(());
+        }
         let catalog_changed = puts
             .keys()
             .any(|key| key.starts_with(b"catalog::") || key.starts_with(b"sys::trigger::"))

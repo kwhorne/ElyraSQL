@@ -323,17 +323,6 @@ enum Job {
     Write(WriteJob),
     /// Applied alone.
     Ordered(OrderedBatch),
-    /// Applied alone, without a sync, and kept on this node (see
-    /// [`Db::commit_local`]).
-    Local(LocalJob),
-}
-
-/// A validated write of data that lives only while a statement runs.
-struct LocalJob {
-    validation: Validation,
-    puts: Vec<(Vec<u8>, Vec<u8>)>,
-    deletes: Vec<Vec<u8>>,
-    ack: oneshot::Sender<Result<()>>,
 }
 
 /// Set by the writer thread as it exits, after its `Arc<Storage>` is gone.
@@ -1059,35 +1048,6 @@ impl Db {
         self.await_sync().await
     }
 
-    /// A validated write of data that lives only while one statement runs --
-    /// a recursive CTE's working table: applied on this node alone, without a
-    /// sync, and left out of the binlog, replication and Raft.
-    ///
-    /// Each iteration of a `WITH RECURSIVE` wrote its working table as any
-    /// other data: an fsync each (a 1,000-step CTE took 7.4 s), a record each
-    /// in the binlog and on every replica, an entry each in the Raft log --
-    /// and on a Raft follower, which may not propose, the query failed with
-    /// "not the leader".
-    pub async fn commit_local(
-        &self,
-        validation: Validation,
-        puts: Vec<(Vec<u8>, Vec<u8>)>,
-        deletes: Vec<Vec<u8>>,
-    ) -> Result<()> {
-        let (ack, wait) = oneshot::channel();
-        self.writer
-            .send(Job::Local(LocalJob {
-                validation,
-                puts,
-                deletes,
-                ack,
-            }))
-            .await
-            .map_err(|_| Error::Storage("writer thread stopped".into()))?;
-        wait.await
-            .map_err(|_| Error::Storage("write acknowledgement lost".into()))?
-    }
-
     /// Submit a plain `INSERT`: `new` keys must not already exist (duplicate
     /// detection happens in the write transaction), `aux` puts (index entries,
     /// counters) may overwrite. No separate existence read.
@@ -1193,16 +1153,6 @@ fn writer_loop(storage: Arc<Storage>, mut rx: mpsc::Receiver<Job>, mut repl: Rep
             Job::Write(j) => j,
             Job::Ordered(batch) => {
                 apply_ordered_batch(&storage, batch, &mut repl);
-                continue;
-            }
-            Job::Local(job) => {
-                let r = storage.apply_validated_unsynced(
-                    &job.validation.keys,
-                    &job.validation.ranges,
-                    &job.puts,
-                    &job.deletes,
-                );
-                let _ = job.ack.send(r);
                 continue;
             }
         };

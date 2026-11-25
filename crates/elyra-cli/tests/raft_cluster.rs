@@ -325,3 +325,38 @@ async fn a_follower_caught_up_by_snapshot_applies_a_later_alter_table() {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn every_node_runs_a_recursive_cte_in_a_transaction() {
+    // The working table was written through the transaction: COMMIT made a
+    // read-only statement a write, and a follower refused it ("not the
+    // leader"), READ ONLY transactions included.
+    let mut c = Cluster::new("rcte-txn", 3);
+    c.start_all();
+    c.write(
+        "CREATE TABLE t (id INT PRIMARY KEY)",
+        Duration::from_secs(30),
+    )
+    .await
+    .unwrap_or_else(|| panic!("no leader accepted a write\n{}", c.logs()));
+    for id in 1..=3 {
+        c.until_count(id, "t", 0).await;
+    }
+    for id in 1..=3 {
+        for begin in ["START TRANSACTION READ ONLY", "START TRANSACTION"] {
+            let mut conn = c.conn(id).await.expect("connect");
+            conn.query_drop(begin).await.unwrap();
+            let n: Option<i64> = conn
+                .query_first(
+                    "WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 50) \
+                     SELECT SUM(n) FROM s",
+                )
+                .await
+                .unwrap_or_else(|e| panic!("node {id}, {begin}: {e}\n{}", c.logs()));
+            assert_eq!(n, Some(1275), "node {id}, {begin}");
+            conn.query_drop("COMMIT")
+                .await
+                .unwrap_or_else(|e| panic!("node {id}, {begin}: COMMIT: {e}\n{}", c.logs()));
+        }
+    }
+}
