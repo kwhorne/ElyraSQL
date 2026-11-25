@@ -6,6 +6,16 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **A Raft node that caught up from a snapshot applies a later
+  `ALTER TABLE ... ADD PRIMARY KEY`.** Since 1.12.20 a table's write counter
+  is moved on from what each node stores; a snapshot left it at the
+  follower's own value plus one instead of the leader's. `ADD PRIMARY KEY`
+  on a table without one checks that counter, so it was applied on the
+  leader and refused on that follower, which went on without the key. A
+  snapshot now sets write counters exactly, as it sets id counters.
+
 ## [1.12.20] - 2026-11-24
 
 Performance work from the review's phase A, each change measured before and

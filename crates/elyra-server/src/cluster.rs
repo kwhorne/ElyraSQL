@@ -1109,10 +1109,14 @@ impl Node {
             .collect();
         // An id counter is written only forward, unless the same write deletes
         // it: the leader's may be lower than this node's -- a TRUNCATE since --
-        // and used to be refused, so the node kept its own.
+        // and used to be refused, so the node kept its own. A write counter is
+        // moved on from what is stored, unless the same write deletes it: it
+        // became this node's own plus one, not the leader's, and a later
+        // validated write that checks it (ALTER TABLE does) was refused here
+        // and applied on the leader -- an entry committed everywhere but here.
         let counters: Vec<Vec<u8>> = puts
             .iter()
-            .filter(|(k, _)| elyra_storage::is_id_counter(k))
+            .filter(|(k, _)| elyra_storage::is_id_counter(k) || elyra_storage::is_write_counter(k))
             .map(|(k, _)| k.clone())
             .collect();
         if !puts.is_empty() {
@@ -2520,6 +2524,44 @@ mod tests {
             Some(5u64.to_le_bytes().to_vec())
         );
         assert_eq!(db.counter_resets(b"meta::autoinc::orders"), 1);
+        close(node, db).await;
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A table's write counter is the leader's after a snapshot. It is moved
+    /// on from what is stored on every other write, and became this node's
+    /// own plus one: a validated write checking it -- ALTER TABLE -- was then
+    /// refused here and applied on the leader.
+    #[tokio::test]
+    async fn a_snapshot_sets_write_counters_exactly() {
+        let dir = temp_dir("install-wcount");
+        let (node, db) = single_node(&dir);
+        let key = b"meta::wcount::orders".to_vec();
+        db.commit(vec![(key.clone(), 50u64.to_le_bytes().to_vec())], vec![])
+            .await
+            .unwrap();
+        let chunk = vec![(key.clone(), 5000u64.to_le_bytes().to_vec())];
+        let ack = snapshot_part(&node, 1, 0, chunk, true).await.unwrap();
+        assert!(matches!(
+            ack,
+            Msg::SnapshotAck {
+                ok: true,
+                done: true,
+                ..
+            }
+        ));
+        assert_eq!(
+            db.get(key.clone()).await.unwrap(),
+            Some(5000u64.to_le_bytes().to_vec())
+        );
+        // And the next write moves it on from there.
+        db.commit(vec![(key.clone(), 0u64.to_le_bytes().to_vec())], vec![])
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get(key).await.unwrap(),
+            Some(5001u64.to_le_bytes().to_vec())
+        );
         close(node, db).await;
         std::fs::remove_dir_all(&dir).unwrap();
     }
