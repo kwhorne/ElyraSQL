@@ -8,6 +8,13 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ### Fixed
 
+- **A schema change committed while a transaction reads the schema can no
+  longer leave the old schema cached for every session.** A transaction
+  that may use the schema cache checked that, then loaded the cache's
+  generation. A view, grant or table definition committed in between was
+  read from the transaction's older snapshot and cached under the new
+  generation: every session saw the old one until the next schema change.
+  The generation is now loaded before the check.
 - **A Raft node that caught up from a snapshot applies a later
   `ALTER TABLE ... ADD PRIMARY KEY`.** Since 1.12.20 a table's write counter
   is moved on from what each node stores; a snapshot left it at the
