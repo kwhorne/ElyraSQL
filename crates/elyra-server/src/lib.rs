@@ -247,6 +247,9 @@ impl Drop for StmtPermit {
 struct Prepared {
     sql: String,
     params: usize,
+    /// The statement parsed once at prepare time, when the engine can take it
+    /// (see `Engine::prepare_plan`); `None` runs every execution as text.
+    plan: Option<elyra_engine::PreparedPlan>,
     /// Holds this statement's slot in the global budget; released on drop.
     _permit: StmtPermit,
 }
@@ -625,11 +628,17 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for ElyraShim {
         };
         let id = self.next_id;
         self.next_id += 1;
+        let plan = self.engine.prepare_plan(
+            &prepared::number_placeholders(query),
+            param_count,
+            &self.session,
+        );
         self.stmts.insert(
             id,
             Prepared {
                 sql: query.to_string(),
                 params: param_count,
+                plan,
                 _permit: permit,
             },
         );
@@ -709,10 +718,23 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for ElyraShim {
         let user = self.user();
         self.procs.begin_query(self.conn_id, &sql);
         let start = std::time::Instant::now();
-        let res = with_query_timeout(
+        // The statement as parsed at prepare time, with the parameters put in
+        // its tree -- or, when it has no plan or this execution can't use it,
+        // the text with them substituted, as every execution used to run.
+        let res = with_query_timeout(async {
+            if let Some(plan) = &stmt.plan {
+                if let Some(res) = self
+                    .engine
+                    .execute_plan(plan, &literals, privilege, &user, &self.session)
+                    .await
+                {
+                    return res;
+                }
+            }
             self.engine
-                .execute_as(&sql, privilege, &user, &self.session),
-        )
+                .execute_as(&sql, privilege, &user, &self.session)
+                .await
+        })
         .await;
         self.metrics.record(&sql, res.is_ok(), start.elapsed());
         self.procs.end_query(self.conn_id);
@@ -1593,6 +1615,7 @@ mod guard_tests {
                 Prepared {
                     sql: "SELECT 1".into(),
                     params: 0,
+                    plan: None,
                     _permit: StmtPermit::acquire().expect("slot available"),
                 },
             );
