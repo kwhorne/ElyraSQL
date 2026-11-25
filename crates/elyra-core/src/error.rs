@@ -264,6 +264,26 @@ pub enum Error {
     #[error("Result consisted of more than one row")]
     TooManyRows,
 
+    /// EXECUTE or DEALLOCATE PREPARE of a name no PREPARE made (MySQL 1243).
+    #[error("Unknown prepared statement handler ({0}) given to {1}")]
+    UnknownStmtHandler(String, &'static str),
+
+    /// EXECUTE with a USING list of the wrong length (MySQL 1210).
+    #[error("Incorrect arguments to {0}")]
+    WrongArguments(&'static str),
+
+    /// A prepare past `max_prepared_stmt_count` (MySQL 1461).
+    #[error("Can't create more than max_prepared_stmt_count statements (current value: {0})")]
+    MaxPreparedStmts(usize),
+
+    /// A statement PREPARE does not take, PREPARE itself among them (MySQL 1295).
+    #[error("This command is not supported in the prepared statement protocol yet")]
+    UnsupportedPs,
+
+    /// An empty statement text (MySQL 1065).
+    #[error("Query was empty")]
+    EmptyQuery,
+
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -326,6 +346,11 @@ impl Error {
             Error::UnknownCollation(_) => 1273, // ER_UNKNOWN_COLLATION
             Error::CollationCharset(_) => 1253, // ER_COLLATION_CHARSET_MISMATCH
             Error::CollationMix(..) => 1267, // ER_CANT_AGGREGATE_2COLLATIONS
+            Error::UnknownStmtHandler(..) => 1243, // ER_UNKNOWN_STMT_HANDLER
+            Error::WrongArguments(_) => 1210, // ER_WRONG_ARGUMENTS
+            Error::MaxPreparedStmts(_) => 1461, // ER_MAX_PREPARED_STMT_COUNT_REACHED
+            Error::UnsupportedPs => 1295, // ER_UNSUPPORTED_PS
+            Error::EmptyQuery => 1065,    // ER_EMPTY_QUERY
             _ => 1105,
         }
     }
@@ -361,6 +386,7 @@ impl Error {
             Error::RoutineMissing(..) => b"42000",
             Error::NotUniqueTable(_) => b"42000",
             Error::CollationCharset(_) => b"42000",
+            Error::MaxPreparedStmts(_) | Error::EmptyQuery => b"42000",
             _ => b"HY000",
         }
     }

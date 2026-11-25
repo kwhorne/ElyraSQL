@@ -218,6 +218,9 @@ pub struct Session {
     pending_triggers: Mutex<Vec<String>>,
     /// Session user variables (`@name`).
     user_vars: Mutex<std::collections::HashMap<String, elyra_core::Value>>,
+    /// Statements made by SQL-level `PREPARE`, by lowercased name.
+    sql_prepared:
+        Mutex<std::collections::HashMap<String, std::sync::Arc<crate::sqlprepare::SqlPrepared>>>,
     /// Shared pessimistic table-lock manager.
     locks: Arc<LockManager>,
     /// Explicit `LOCK TABLES` guards held until `UNLOCK TABLES` or disconnect.
@@ -308,6 +311,7 @@ impl Session {
             call_depth: std::sync::atomic::AtomicUsize::new(0),
             pending_triggers: Mutex::new(Vec::new()),
             user_vars: Mutex::new(std::collections::HashMap::new()),
+            sql_prepared: Mutex::new(std::collections::HashMap::new()),
             locks,
             held_locks: Mutex::new(Vec::new()),
             global_read_lock: std::sync::atomic::AtomicBool::new(false),
@@ -713,6 +717,26 @@ impl Session {
     }
 
     /// Snapshot of all user variables (for substitution).
+    pub(crate) fn sql_prepared(
+        &self,
+        name: &str,
+    ) -> Option<std::sync::Arc<crate::sqlprepare::SqlPrepared>> {
+        self.sql_prepared.lock().unwrap().get(name).cloned()
+    }
+
+    pub(crate) fn set_sql_prepared(
+        &self,
+        name: String,
+        stmt: std::sync::Arc<crate::sqlprepare::SqlPrepared>,
+    ) {
+        self.sql_prepared.lock().unwrap().insert(name, stmt);
+    }
+
+    /// Whether there was one to drop.
+    pub(crate) fn drop_sql_prepared(&self, name: &str) -> bool {
+        self.sql_prepared.lock().unwrap().remove(name).is_some()
+    }
+
     pub fn user_vars_snapshot(&self) -> std::collections::HashMap<String, elyra_core::Value> {
         self.user_vars.lock().unwrap().clone()
     }

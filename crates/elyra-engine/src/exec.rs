@@ -6971,7 +6971,19 @@ pub(crate) fn copy_quoted_segment(chars: &[char], start: usize, out: &mut String
 }
 
 /// Render a value as a SQL literal (for splicing NEW/OLD into trigger bodies).
+/// `v` as a SQL literal, to put into a statement's text. A negative number
+/// starts with a space: after a minus in the text (`SELECT 3-@b`), a bare `-2`
+/// made `3--2`, and `--` starts a comment -- it answered 3, without an error.
 pub(crate) fn value_sql_literal(v: &Value) -> String {
+    let literal = value_sql_literal_bare(v);
+    if literal.starts_with('-') {
+        format!(" {literal}")
+    } else {
+        literal
+    }
+}
+
+fn value_sql_literal_bare(v: &Value) -> String {
     match v {
         Value::Null => "NULL".into(),
         Value::Bool(b) => {

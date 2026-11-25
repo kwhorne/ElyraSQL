@@ -6,6 +6,23 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **SQL-level prepared statements**: `PREPARE name FROM 'text' | @var`,
+  `EXECUTE name [USING @a, ...]` and `{DEALLOCATE | DROP} PREPARE name`. They
+  failed with a syntax error. As in MySQL they are per connection, share
+  `max_prepared_stmt_count` (`ELYRASQL_MAX_PREPARED_STMTS`) with the binary
+  protocol's, do not commit a transaction, and report MySQL's errors (1243,
+  1210, 1295, 1065). A SELECT, INSERT, REPLACE, UPDATE or DELETE is parsed
+  at PREPARE and planned as a binary prepared statement is.
+
+### Fixed
+
+- **A negative user variable after a minus no longer starts a comment.**
+  `SET @b = -2; SELECT 3-@b` substituted `3--2`, and `--` began a comment:
+  it answered 3, without an error. The same held for a procedure's local
+  variables and a trigger's `NEW`/`OLD` values.
+
 ## [1.13.0] - 2026-11-25
 
 Query plans: a prepared statement is parsed once, and a text query once per
