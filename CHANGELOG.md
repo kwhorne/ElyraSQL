@@ -6,6 +6,12 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.12.21] - 2026-11-25
+
+Fixes from a review of 1.12.19-1.12.20, most of them for Raft clusters, and
+release binaries that finally get profile-guided optimization's full effect.
+
+
 ### Changed
 
 - **`WITH RECURSIVE` keeps its working rows in memory**, as a relation of
@@ -57,6 +63,17 @@ All notable changes to ElyraSQL are documented here. The format is based on
   on a table without one checks that counter, so it was applied on the
   leader and refused on that follower, which went on without the key. A
   snapshot now sets write counters exactly, as it sets id counters.
+
+### Upgrading
+
+- No change to the database file; a 1.12.20 database opens in 1.12.21
+  unchanged.
+- Raft clusters that ran 1.12.20: a node that caught up from a snapshot
+  under 1.12.20 may hold a table write counter that differs from the
+  leader's, until its next snapshot. If `ALTER TABLE ... ADD PRIMARY KEY` ran
+  on such a cluster, check `SHOW CREATE TABLE` on every node; a node without
+  the key is brought back by stopping it, removing its data directory and
+  starting it again, so that it catches up from a snapshot.
 
 ## [1.12.20] - 2026-11-24
 

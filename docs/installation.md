@@ -17,6 +17,22 @@ ElyraSQL release builds target **Ubuntu 24.04+** and **Apple Silicon macOS
     done, so an interrupted upgrade simply resumes on the next start. **Take a backup
     first, and note that downgrading to 1.4.x afterwards is not supported.**
 
+!!! note "Upgrading to 1.12.21 — Raft clusters from 1.12.20"
+
+    No change to the database file; a 1.12.20 database opens in 1.12.21
+    unchanged.
+
+    - **Raft clusters that ran 1.12.20:** a node that caught up from a
+      snapshot under 1.12.20 may hold a table write counter that differs from
+      the leader's until its next snapshot, and `ALTER TABLE ... ADD PRIMARY
+      KEY` on a table without one could be applied everywhere but there. If
+      you ran one, check `SHOW CREATE TABLE` on every node; bring a node
+      without the key back by stopping it, removing its data directory and
+      starting it again -- it catches up from a snapshot.
+    - **A transaction that wrote nothing commits on a Raft follower** (it
+      failed with "not the leader"), and on the leader it no longer costs a
+      Raft entry.
+
 !!! note "Upgrading to 1.12.20 — memory and Raft write errors"
 
     No change to the database file; a 1.12.19 database opens in 1.12.20
@@ -856,8 +872,8 @@ macOS).
 Multi-arch image (`amd64` + `arm64`) on the GitHub Container Registry:
 
 ```bash
-docker pull ghcr.io/kwhorne/elyrasql:1.12.20   # or :latest
-docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.12.20
+docker pull ghcr.io/kwhorne/elyrasql:1.12.21   # or :latest
+docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.12.21
 ```
 
 The image is ~15 MB, runs as a non-root user, stores data in the
