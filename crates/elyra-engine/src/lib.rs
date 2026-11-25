@@ -55,6 +55,7 @@ use std::borrow::Cow;
 
 pub use stream::RowStream;
 
+#[derive(Clone)]
 struct UpdateModifiers {
     base_sql: String,
     order_by: Vec<sqlparser::ast::OrderByExpr>,
@@ -1898,6 +1899,170 @@ impl Engine {
             }
         }
 
+        let Frontend {
+            statements,
+            update_modifiers,
+            dml_limit,
+        } = self.parse_frontend(sql, sess)?;
+        self.run_statements(
+            statements,
+            privilege,
+            user,
+            sess,
+            update_modifiers,
+            dml_limit,
+        )
+        .await
+    }
+
+    /// Prepare `numbered_sql` -- a prepared statement's text with its `params`
+    /// placeholders numbered `?1`..`?N` -- for [`Engine::execute_plan`]: its
+    /// text passes and parse run once here instead of on every execution.
+    ///
+    /// `COM_STMT_EXECUTE` used to substitute the parameters into the text as
+    /// literals and run the whole statement through `execute_as` -- the text
+    /// passes and a full parse, about 30% of a point lookup's time in the
+    /// engine. `None` when the statement is not one this can take: anything
+    /// but one SELECT, INSERT, REPLACE, UPDATE or DELETE that none of
+    /// `execute_as`'s own paths handles, or that reads `@` variables (their
+    /// values are substituted into the text, so they belong to an execution);
+    /// such a statement keeps the text path.
+    pub fn prepare_plan(
+        &self,
+        numbered_sql: &str,
+        params: usize,
+        sess: &Session,
+    ) -> Option<PreparedPlan> {
+        let sql = numbered_sql;
+        guard_sql_complexity(sql).ok()?;
+        if sqllex::expand_version_comments(sql, sqllex::mysql_version_id()).is_some()
+            || definer::strip(sql).is_some()
+            || exec::contains_uvar_reference(sql)
+            || sql.contains("@@")
+            || self.intercept_session(sql, sess).is_some()
+        {
+            return None;
+        }
+        let head: String = sql
+            .trim_start()
+            .chars()
+            .take(24)
+            .collect::<String>()
+            .to_ascii_lowercase();
+        let first = head
+            .split(|c: char| !c.is_ascii_alphabetic())
+            .next()
+            .unwrap_or("");
+        if !matches!(
+            first,
+            "select" | "insert" | "replace" | "update" | "delete" | "with"
+        ) {
+            return None;
+        }
+        // `SELECT ... INTO @var` assigns, through a path of its own. `BINARY
+        // <operand>` is rewritten as text, and `?` is not an operand that
+        // rewrite takes.
+        if (head.starts_with("select") && split_select_into(sql.trim_start()).is_some())
+            || contains_ci(sql, "binary")
+        {
+            return None;
+        }
+        let frontend = self.parse_frontend(sql, sess).ok()?;
+        let [stmt] = frontend.statements.as_slice() else {
+            return None;
+        };
+        if !matches!(
+            stmt,
+            Statement::Query(_)
+                | Statement::Insert(_)
+                | Statement::Update { .. }
+                | Statement::Delete(_)
+        ) {
+            return None;
+        }
+        // Every `?k` exactly once: none lost, none duplicated by a text pass.
+        let mut seen = vec![false; params];
+        let mut count = 0usize;
+        let mut ok = true;
+        let _ = sqlparser::ast::visit_expressions(&frontend.statements, |e| {
+            if let sqlparser::ast::Expr::Value(sqlparser::ast::Value::Placeholder(p)) = e {
+                count += 1;
+                match p.strip_prefix('?').and_then(|n| n.parse::<usize>().ok()) {
+                    Some(k) if (1..=params).contains(&k) && !seen[k - 1] => seen[k - 1] = true,
+                    _ => ok = false,
+                }
+            }
+            std::ops::ControlFlow::<()>::Continue(())
+        });
+        if !ok || count != params || seen.iter().any(|s| !s) {
+            return None;
+        }
+        Some(PreparedPlan {
+            frontend,
+            params,
+            ansi_quotes: sess.ansi_quotes(),
+            writes: text_statement_writes(&head),
+        })
+    }
+
+    /// Run `plan` with `literals` -- the parameters as SQL literals, in order
+    /// -- as `execute_as` runs the statement with them in its text. `None`:
+    /// this execution must take the text path instead (the session's
+    /// `ANSI_QUOTES` changed since the prepare, or a parameter is not a plain
+    /// literal).
+    pub async fn execute_plan(
+        &self,
+        plan: &PreparedPlan,
+        literals: &[String],
+        privilege: Privilege,
+        user: &str,
+        sess: &Session,
+    ) -> Option<Result<Vec<QueryResult>>> {
+        if literals.len() != plan.params || sess.ansi_quotes() != plan.ansi_quotes {
+            return None;
+        }
+        let mut values = Vec::with_capacity(literals.len());
+        for literal in literals {
+            values.push(literal_expr(literal)?);
+        }
+        let _cancel = CancelGuard::new(sess);
+        if let Some(why) = self.db.fence() {
+            return Some(Err(Error::Storage(why)));
+        }
+        if plan.writes && sess.read_only_now() {
+            return Some(Err(Error::ReadOnlyTransaction));
+        }
+        let Frontend {
+            mut statements,
+            update_modifiers,
+            dml_limit,
+        } = plan.frontend.clone();
+        let _ = sqlparser::ast::visit_expressions_mut(&mut statements, |e| {
+            if let sqlparser::ast::Expr::Value(sqlparser::ast::Value::Placeholder(p)) = e {
+                if let Some(k) = p.strip_prefix('?').and_then(|n| n.parse::<usize>().ok()) {
+                    *e = values[k - 1].clone();
+                }
+            }
+            std::ops::ControlFlow::<()>::Continue(())
+        });
+        Some(
+            self.run_statements(
+                statements,
+                privilege,
+                user,
+                sess,
+                update_modifiers,
+                dml_limit,
+            )
+            .await,
+        )
+    }
+
+    /// The text passes and the parse, from the statement's text to what
+    /// `run_statements` runs: everything `execute_as` does to a statement that
+    /// none of its own paths took. Shared with `prepare_plan`, which runs it
+    /// once on a prepared statement's text.
+    fn parse_frontend(&self, sql: &str, sess: &Session) -> Result<Frontend> {
         let dialect = MySqlDialect {};
         // Substitute @user variables (leaving @@system vars) before parsing.
         let mut subst_sql: Cow<'_, str> = if exec::contains_uvar_reference(sql) {
@@ -2030,15 +2195,11 @@ impl Engine {
             }
         };
 
-        self.run_statements(
+        Ok(Frontend {
             statements,
-            privilege,
-            user,
-            sess,
             update_modifiers,
             dml_limit,
-        )
-        .await
+        })
     }
 
     /// Run the query of a `SELECT ... INTO`, as MySQL does: the select list must
@@ -2837,6 +2998,50 @@ impl Engine {
             _ => None,
         }
     }
+}
+
+/// A prepared statement's text passes and parse, done once (see
+/// [`Engine::prepare_plan`]).
+#[derive(Clone)]
+pub struct PreparedPlan {
+    frontend: Frontend,
+    params: usize,
+    ansi_quotes: bool,
+    writes: bool,
+}
+
+/// A parameter literal (as `COM_STMT_EXECUTE` renders it) as the expression
+/// the parser makes of it inside a statement: through the same literal pass
+/// (`keep_like_escapes`) and parser. `None` for anything but a literal -- a
+/// float rendered as `NaN` or `inf` parses as a column name, and the text
+/// path is left to report that as it does.
+fn literal_expr(literal: &str) -> Option<sqlparser::ast::Expr> {
+    use sqlparser::ast::{Expr, UnaryOperator};
+    let escaped = sqllex::keep_like_escapes(literal);
+    let text = escaped.as_deref().unwrap_or(literal);
+    let expr = Parser::new(&MySqlDialect {})
+        .try_with_sql(text)
+        .ok()?
+        .parse_expr()
+        .ok()?;
+    let plain = match &expr {
+        Expr::Value(_) => true,
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr,
+        } => matches!(expr.as_ref(), Expr::Value(_)),
+        _ => false,
+    };
+    plain.then_some(expr)
+}
+
+/// A statement through the text passes and the parse (see
+/// `Engine::parse_frontend`).
+#[derive(Clone)]
+struct Frontend {
+    statements: Vec<Statement>,
+    update_modifiers: Option<UpdateModifiers>,
+    dml_limit: Option<usize>,
 }
 
 /// The query inside `(SELECT ...)` when a SET value is a scalar subquery.
@@ -11185,3 +11390,6 @@ mod schema_cache_race_tests {
         Some(served)
     }
 }
+
+#[cfg(test)]
+mod prepared_plan_tests;

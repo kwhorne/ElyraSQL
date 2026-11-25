@@ -6,6 +6,26 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed
+
+- **Prepared statements are parsed once, at prepare time.** Every
+  `COM_STMT_EXECUTE` used to put its parameters into the statement's text as
+  literals and run it as a new query: the text passes and a full parse each
+  time, about 30% of a primary-key lookup's time in the engine. A SELECT,
+  INSERT, REPLACE, UPDATE or DELETE is now parsed when it is prepared, and
+  each execution puts its parameters into the parsed statement. Through the
+  binary protocol with one client: point lookups +8-17%, a lookup with two
+  parameters +21-27%, a 10-row range +18-24%; writes, bound by their commit,
+  are unchanged within the noise. Statements it does not take (`@`
+  variables, `SELECT ... INTO`, `CALL`, SHOW, more than one statement, ...)
+  run as before.
+
+### Fixed
+
+- **A negative parameter after a minus no longer starts a comment.**
+  `SELECT ?-?` with 3 and -2 became `3--2`, and `--` began a comment: it
+  answered 3, without an error. `-?` with -4 failed to parse.
+
 ## [1.12.21] - 2026-11-25
 
 Fixes from a review of 1.12.19-1.12.20, most of them for Raft clusters, and

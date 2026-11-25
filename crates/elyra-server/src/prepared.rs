@@ -1,10 +1,13 @@
 //! Prepared-statement support.
 //!
 //! ElyraSQL implements `COM_STMT_PREPARE`/`EXECUTE` by counting `?`
-//! placeholders at prepare time and, at execute time, rendering the bound
-//! parameters as SQL literals and substituting them into the statement. This
-//! reuses the full query engine without a separate parameterised code path,
-//! while quoting/escaping values so it stays injection-safe.
+//! placeholders at prepare time and rendering the bound parameters as SQL
+//! literals at execute time. A statement the engine can plan
+//! (`Engine::prepare_plan`, given the text with its placeholders numbered by
+//! [`number_placeholders`]) is parsed once, and each execution puts the
+//! literals into the parsed statement; any other is run with the literals
+//! substituted into its text ([`bind`]), quoted and escaped so it stays
+//! injection-safe.
 
 use elyra_wire::ValueInner;
 
@@ -50,12 +53,36 @@ pub fn bind(sql: &str, literals: &[String]) -> Result<String, String> {
     Ok(out)
 }
 
+/// `sql` with its `?` placeholders numbered `?1`, `?2`, ... in order, for the
+/// engine's prepared plan: each parameter goes to its own position in the
+/// parsed statement, whatever a text pass did to the order of the text.
+pub fn number_placeholders(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len() + 8);
+    let mut n = 0usize;
+    scan(sql, |t| match t {
+        Tok::Placeholder => {
+            n += 1;
+            out.push('?');
+            out.push_str(&n.to_string());
+        }
+        Tok::Char(ch) => out.push(ch),
+    });
+    out
+}
+
 /// Render a bound parameter value as a SQL literal.
+///
+/// A negative number starts with a space. Put after a minus in the text --
+/// `SELECT ?-?`, `SELECT -?` -- a bare `-2` made `3--2`, and `--` starts a
+/// comment: the statement answered 3 instead of 5, without an error, and
+/// `-?` with -4 failed to parse.
 pub fn value_to_literal(v: ValueInner<'_>) -> String {
     match v {
         ValueInner::NULL => "NULL".to_string(),
+        ValueInner::Int(i) if i < 0 => format!(" {i}"),
         ValueInner::Int(i) => i.to_string(),
         ValueInner::UInt(u) => u.to_string(),
+        ValueInner::Double(d) if d.is_sign_negative() => format!(" {d}"),
         ValueInner::Double(d) => d.to_string(),
         ValueInner::Bytes(b) => quote(b),
         // Temporal parameters arrive as MySQL binary encodings; decode them to
@@ -242,6 +269,23 @@ fn scan(sql: &str, mut emit: impl FnMut(Tok)) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_negative_number_after_a_minus_does_not_start_a_comment() {
+        let lit = |v| value_to_literal(v);
+        let sql = bind(
+            "SELECT ?-?, -?, ?-?",
+            &[
+                lit(ValueInner::Int(3)),
+                lit(ValueInner::Int(-2)),
+                lit(ValueInner::Int(-4)),
+                lit(ValueInner::Double(1.5)),
+                lit(ValueInner::Double(-0.5)),
+            ],
+        )
+        .unwrap();
+        assert_eq!(sql, "SELECT 3- -2, - -4, 1.5- -0.5");
+    }
 
     #[test]
     fn counts_placeholders_ignoring_quotes() {
