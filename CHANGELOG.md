@@ -8,6 +8,14 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ### Changed
 
+- **Release binaries get the full benefit of profile-guided optimization.**
+  The profile was recorded from a build without `--target` and applied to
+  the release build with it; `--target` changes every symbol name, so about
+  11,000 functions found no profile data and most of the binary was built
+  as if without PGO. The profile is now recorded with the same `--target`
+  (0 functions without data). Measured on Linux arm64 against a build
+  without PGO: `ORDER BY ... LIMIT` +17-27%, `GROUP BY` +14-16%, `DISTINCT`
+  +12%, inserts +11%, joins +6-15%; point lookups unchanged.
 - **Point reads inside a transaction no longer go through a thread pool**
   (up to 64 keys at a time), as autocommit reads stopped doing in 1.12.20;
   a read the transaction's own writes answer entirely reads nothing.

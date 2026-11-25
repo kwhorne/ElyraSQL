@@ -81,16 +81,39 @@ jobs:
           # because $GITHUB_ENV wants KEY=value.
           echo "/opt/homebrew/opt/mysql-client/bin" >> "$GITHUB_PATH"
 
+      # Before the PGO step: its instrumented build is a musl build too.
+      - name: Install musl tools
+        if: matrix.platform == 'linux'
+        # ports.ubuntu.com (the arm64 mirror) has intermittent connectivity from
+        # the arm64 runners, so retry the update+install a few times before giving
+        # up rather than failing the whole release on a transient network blip.
+        run: |
+          for attempt in 1 2 3 4 5; do
+            if sudo apt-get update && sudo apt-get install -y musl-tools; then
+              exit 0
+            fi
+            echo "apt attempt $attempt failed; retrying in $((attempt * 15))s..."
+            sleep $((attempt * 15))
+          done
+          echo "musl-tools install failed after retries" >&2
+          exit 1
+
       - name: Generate PGO profile (fail-safe)
         id: pgo
         continue-on-error: true
         env:
           PGO_DIR: ${{ github.workspace }}/target/pgo
+          # As the macOS build below sets it: the profile is used by a build
+          # with the same flags.
+          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.platform == 'macos' && '11.0' || '' }}
         run: |
           rustup component add llvm-tools-preview
           mkdir -p "$PGO_DIR/training-sql"
           python3 scripts/generate-training-sql.py --all --rows 50000 --output-dir "$PGO_DIR/training-sql"
-          ./scripts/pgo-build.sh --profile-only --train-data-dir "$PGO_DIR/train-data"
+          # The same --target as the build that uses the profile: without it
+          # every symbol name differs (`-C metadata`) and ~11,000 functions
+          # found no profile data, on every platform.
+          ./scripts/pgo-build.sh --profile-only --target ${{ matrix.target }} --train-data-dir "$PGO_DIR/train-data"
           # Fail loudly if training produced no profile: continue-on-error then
           # turns this into a visible step failure and the warning step below
           # annotates the run instead of silently shipping a plain dist build.
@@ -111,22 +134,6 @@ jobs:
         if: steps.pgo.outcome == 'success'
         run: |
           echo "PGO profile generated and applied to this release build." >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Install musl tools
-        if: matrix.platform == 'linux'
-        # ports.ubuntu.com (the arm64 mirror) has intermittent connectivity from
-        # the arm64 runners, so retry the update+install a few times before giving
-        # up rather than failing the whole release on a transient network blip.
-        run: |
-          for attempt in 1 2 3 4 5; do
-            if sudo apt-get update && sudo apt-get install -y musl-tools; then
-              exit 0
-            fi
-            echo "apt attempt $attempt failed; retrying in $((attempt * 15))s..."
-            sleep $((attempt * 15))
-          done
-          echo "musl-tools install failed after retries" >&2
-          exit 1
 
       - name: Build Linux static binary
         if: matrix.platform == 'linux'

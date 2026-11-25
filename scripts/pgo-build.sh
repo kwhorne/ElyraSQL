@@ -19,6 +19,11 @@
 # Options:
 #   --train-data-dir DIR    training data directory (default target/pgo/train-data)
 #   --profile-only          stop after merging profiles; print RUSTFLAGS to consume
+#   --target TRIPLE         build for TRIPLE, as the build that uses the profile
+#                           must: `--target` changes every crate's `-C metadata`
+#                           and with it every symbol name, so a profile of a
+#                           build without it matches almost nothing in a build
+#                           with it (the release builds use `--target`).
 #
 # Env knobs: TRAIN_SQL_DIR (default target/pgo/training-sql),
 #            BENCH_PORT (default 3308), BENCH_ROWS (default 50000), OLAP_ROWS (default 500000).
@@ -35,11 +40,13 @@ cd "$ROOT"
 
 PROFILE_ONLY=0
 TRAIN_DATA_DIR=""
+TARGET=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --profile-only) PROFILE_ONLY=1; shift ;;
     --train-data-dir) TRAIN_DATA_DIR="$2"; shift 2 ;;
+    --target) TARGET="$2"; shift 2 ;;
     *) echo "unknown option: $1" >&2; exit 1 ;;
   esac
 done
@@ -53,7 +60,12 @@ BENCH_PORT="${BENCH_PORT:-3308}"
 BENCH_ROWS="${BENCH_ROWS:-50000}"
 OLAP_ROWS="${OLAP_ROWS:-500000}"
 LATEMAT_ROWS="${LATEMAT_ROWS:-100000}"
+TARGET_ARGS=()
 BENCH_BIN="$ROOT/target/dist/elyrasql"
+if [[ -n "$TARGET" ]]; then
+  TARGET_ARGS=(--target "$TARGET")
+  BENCH_BIN="$ROOT/target/$TARGET/dist/elyrasql"
+fi
 
 # ---- helpers ----------------------------------------------------------------
 
@@ -96,7 +108,7 @@ rm -rf "$PROFRAW_DIR" "$PROFDATA" "$TRAIN_DATA_DIR"
 mkdir -p "$PROFRAW_DIR" "$TRAIN_DATA_DIR"
 
 echo "==> [1/4] instrumented build"
-RUSTFLAGS="-Cprofile-generate=$PROFRAW_DIR" cargo build --profile dist --locked -p elyra-cli
+RUSTFLAGS="-Cprofile-generate=$PROFRAW_DIR" cargo build --profile dist --locked ${TARGET_ARGS[@]+"${TARGET_ARGS[@]}"} -p elyra-cli
 
 # ---- stage 2: training ------------------------------------------------------
 
@@ -171,11 +183,11 @@ echo "    profile: $PROFDATA ($(du -h "$PROFDATA" | cut -f1))"
 
 if [[ "$PROFILE_ONLY" == "1" ]]; then
   echo "==> profile-only: skipping optimized rebuild. Consume with:"
-  echo "    RUSTFLAGS=\"-Cprofile-use=$PROFDATA -Cllvm-args=-pgo-warn-missing-function\" cargo build --profile dist --locked -p elyra-cli"
+  echo "    RUSTFLAGS=\"-Cprofile-use=$PROFDATA -Cllvm-args=-pgo-warn-missing-function\" cargo build --profile dist --locked ${TARGET_ARGS[*]} -p elyra-cli"
   exit 0
 fi
 
 echo "==> [4/4] optimized build (profile-use)"
 RUSTFLAGS="-Cprofile-use=$PROFDATA -Cllvm-args=-pgo-warn-missing-function" \
-  cargo build --profile dist --locked -p elyra-cli
+  cargo build --profile dist --locked ${TARGET_ARGS[@]+"${TARGET_ARGS[@]}"} -p elyra-cli
 echo "PGO build complete: $BENCH_BIN"
