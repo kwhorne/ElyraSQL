@@ -274,6 +274,17 @@ pub trait AsyncMysqlShim<W: Send> {
     where
         W: 'async_trait;
 
+    /// `COM_RESET_CONNECTION` (`change_user` false), or the start of a
+    /// `COM_CHANGE_USER` before its authentication (true): drop the session's
+    /// state -- transaction, locks, variables, prepared statements -- as a new
+    /// connection has none. A reset keeps the user and the database; a change
+    /// of user keeps neither (the authentication that follows sets the user).
+    async fn on_reset<'a>(&'a mut self, _change_user: bool)
+    where
+        W: 'async_trait,
+    {
+    }
+
     /// Called when the client issues a query for immediate execution.
     ///
     /// Results should be returned using the given
@@ -395,6 +406,124 @@ where
     /// disconnects or an error occurs.
     pub async fn run_on(shim: B, stream: R, output_stream: W) -> Result<(), B::Error> {
         Self::run_with_options(shim, stream, output_stream, &Default::default()).await
+    }
+
+    /// Finish a `COM_CHANGE_USER` whose session the shim has reset:
+    /// authenticate the new user as the handshake does (with the
+    /// connection's scramble, the one the client answered), then make its
+    /// database current. A failed authentication ends the connection, as the
+    /// session it had is gone.
+    async fn change_user(
+        &mut self,
+        change: commands::ChangeUser,
+        mut seq: u8,
+    ) -> Result<(), B::Error> {
+        let scramble = self.shim.salt();
+        let authenticated = self
+            .authenticate_client(
+                &change.username,
+                &change.auth_plugin,
+                change.auth_response,
+                &scramble,
+                &mut seq,
+            )
+            .await?;
+        if !authenticated {
+            let msg = format!(
+                "Access denied for user '{}'",
+                String::from_utf8_lossy(&change.username)
+            );
+            writers::write_err(
+                ErrorKind::ER_ACCESS_DENIED_ERROR,
+                msg.as_bytes(),
+                &mut self.writer,
+            )
+            .await?;
+            self.writer.flush_all().await?;
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, msg).into());
+        }
+        if let Some((kind, msg)) = self.shim.post_auth_check(&change.username).await {
+            writers::write_err(kind, msg.as_bytes(), &mut self.writer).await?;
+            self.writer.flush_all().await?;
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, msg).into());
+        }
+        match change.db.as_deref().map(std::str::from_utf8) {
+            Some(Ok(db)) => {
+                let w = InitWriter {
+                    client_capabilities: self.client_capabilities,
+                    writer: &mut self.writer,
+                };
+                self.shim.on_init(db, w).await?;
+            }
+            _ => {
+                writers::write_ok_packet(
+                    &mut self.writer,
+                    self.client_capabilities,
+                    OkResponse::default(),
+                )
+                .await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Authenticate `username` with what the client sent -- in the handshake,
+    /// or in a `COM_CHANGE_USER` -- as the account's plugin requires: when the
+    /// client used another plugin and sent no response, switch it to the
+    /// account's (an Auth Switch Request with `scramble`), then verify.
+    /// Leaves the writer positioned for the OK or error that follows.
+    async fn authenticate_client(
+        &mut self,
+        username: &[u8],
+        client_plugin: &[u8],
+        mut auth_response: Vec<u8>,
+        scramble: &[u8; SCRAMBLE_SIZE],
+        seq: &mut u8,
+    ) -> Result<bool, B::Error> {
+        let auth_plugin_expect = self
+            .shim
+            .auth_plugin_for_username(username)
+            .await
+            .to_string();
+
+        // auth switch
+        if !auth_plugin_expect.is_empty()
+            && auth_response.is_empty()
+            && client_plugin != auth_plugin_expect.as_bytes()
+        {
+            self.writer.set_seq(*seq + 1);
+            self.writer.write_all(&[0xfe])?;
+            self.writer.write_all(auth_plugin_expect.as_bytes())?;
+            self.writer.write_all(&[0x00])?;
+            self.writer.write_all(scramble)?;
+            self.writer.write_all(&[0x00])?;
+
+            self.writer.end_packet().await?;
+            self.writer.flush_all().await?;
+
+            let (rseq, auth_response_data) = self.reader.next_async().await?.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "peer terminated connection",
+                )
+            })?;
+            *seq = rseq;
+            auth_response = auth_response_data.to_vec();
+        }
+
+        self.writer.set_seq(*seq + 1);
+
+        let is_secure = self
+            .client_capabilities
+            .contains(CapabilityFlags::CLIENT_SSL);
+        Ok(if auth_plugin_expect == CACHING_SHA2_PASSWORD {
+            self.caching_sha2_auth(username, scramble, &auth_response, is_secure, seq)
+                .await?
+        } else {
+            self.shim
+                .authenticate(&auth_plugin_expect, username, scramble, &auth_response)
+                .await
+        })
     }
 
     /// Drive the `caching_sha2_password` authentication exchange. We keep no
@@ -705,66 +834,22 @@ where
             }
 
             self.client_capabilities = handshake.capabilities;
-            let mut auth_response = handshake.auth_response.clone();
             if let Some(username) = &handshake.username {
-                let auth_plugin_expect = self
-                    .shim
-                    .auth_plugin_for_username(username)
-                    .await
-                    .to_string();
-
-                // auth switch
-                if !auth_plugin_expect.is_empty()
-                    && auth_response.is_empty()
-                    && handshake.auth_plugin != auth_plugin_expect.as_bytes()
-                {
-                    self.writer.set_seq(seq + 1);
-                    self.writer.write_all(&[0xfe])?;
-                    self.writer.write_all(auth_plugin_expect.as_bytes())?;
-                    self.writer.write_all(&[0x00])?;
-                    self.writer.write_all(&scramble)?;
-                    self.writer.write_all(&[0x00])?;
-
-                    self.writer.end_packet().await?;
-                    self.writer.flush_all().await?;
-
-                    {
-                        let (rseq, auth_response_data) =
-                            self.reader.next_async().await?.ok_or_else(|| {
-                                io::Error::new(
-                                    io::ErrorKind::ConnectionAborted,
-                                    "peer terminated connection",
-                                )
-                            })?;
-
-                        seq = rseq;
-                        auth_response = auth_response_data.to_vec();
-                    }
-                }
-
-                self.writer.set_seq(seq + 1);
-
-                let is_secure = handshake.capabilities.contains(CapabilityFlags::CLIENT_SSL);
-                let authenticated = if auth_plugin_expect == CACHING_SHA2_PASSWORD {
-                    self.caching_sha2_auth(
+                let authenticated = self
+                    .authenticate_client(
                         username,
+                        &handshake.auth_plugin,
+                        handshake.auth_response.clone(),
                         &scramble,
-                        auth_response.as_slice(),
-                        is_secure,
                         &mut seq,
                     )
-                    .await?
-                } else {
-                    self.shim
-                        .authenticate(
-                            &auth_plugin_expect,
-                            username,
-                            &scramble,
-                            auth_response.as_slice(),
-                        )
-                        .await
-                };
+                    .await?;
                 if !authenticated {
+                    let auth_plugin_expect = self
+                        .shim
+                        .auth_plugin_for_username(username)
+                        .await
+                        .to_string();
                     let err_msg = format!(
                         "Authenticate failed, user: {:?}, auth_plugin: {:?}",
                         String::from_utf8_lossy(username),
@@ -990,6 +1075,33 @@ where
                         }
                         Command::Quit => {
                             break;
+                        }
+                        Command::ResetConnection => {
+                            stmts.clear();
+                            self.shim.on_reset(false).await;
+                            writers::write_ok_packet(
+                                &mut self.writer,
+                                self.client_capabilities,
+                                OkResponse::default(),
+                            )
+                            .await?;
+                        }
+                        Command::ChangeUser(payload) => {
+                            let Some(change) =
+                                commands::change_user(payload, self.client_capabilities)
+                            else {
+                                writers::write_err(
+                                    ErrorKind::ER_MALFORMED_PACKET,
+                                    b"Malformed COM_CHANGE_USER packet",
+                                    &mut self.writer,
+                                )
+                                .await?;
+                                self.writer.flush_all().await?;
+                                continue;
+                            };
+                            stmts.clear();
+                            self.shim.on_reset(true).await;
+                            self.change_user(change, seq).await?;
                         }
                     }
                     self.writer.flush_all().await?;

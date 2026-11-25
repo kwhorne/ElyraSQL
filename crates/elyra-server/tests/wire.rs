@@ -16467,3 +16467,167 @@ async fn a_tls_connection_answers_every_command_in_full() {
         .await
         .expect("a TLS answer never arrived");
 }
+
+/// `COM_RESET_CONNECTION` -- what a pool sends before it hands a connection
+/// to its next user (`mysql_async` does on every return) -- starts the
+/// session afresh, as MySQL does: the transaction rolled back, variables,
+/// `sql_mode`, `LAST_INSERT_ID`, prepared statements and table locks gone,
+/// the user and the database kept. It used to be answered with an OK and
+/// nothing else, so the next user of a pooled connection got the last one's
+/// session.
+#[tokio::test]
+async fn reset_connection_starts_the_session_afresh() {
+    let srv = TestServer::start().await;
+    let mut other = srv.conn().await;
+    other
+        .query_drop("CREATE TABLE rc (id INT PRIMARY KEY AUTO_INCREMENT, v INT)")
+        .await
+        .unwrap();
+
+    let mut c = srv.conn().await;
+    for sql in [
+        "USE elyra",
+        "SET @v = 42",
+        "SET sql_mode = 'ANSI_QUOTES'",
+        "INSERT INTO rc (v) VALUES (1)",
+        "PREPARE s FROM 'SELECT 1'",
+        "START TRANSACTION",
+        "INSERT INTO rc (v) VALUES (2)",
+    ] {
+        c.query_drop(sql)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+    }
+    assert!(c.reset().await.unwrap(), "COM_RESET_CONNECTION is sent");
+
+    let v: Option<Option<i64>> = c.query_first("SELECT @v").await.unwrap();
+    assert_eq!(v, Some(None), "user variables are gone");
+    let mode: Option<String> = c.query_first("SELECT @@sql_mode").await.unwrap();
+    assert!(
+        !mode.unwrap().contains("ANSI_QUOTES"),
+        "sql_mode is the default"
+    );
+    let id: Option<i64> = c.query_first("SELECT LAST_INSERT_ID()").await.unwrap();
+    assert_eq!(id, Some(0));
+    let gone = c.query_drop("EXECUTE s").await.unwrap_err();
+    assert!(
+        matches!(gone, mysql_async::Error::Server(ref e) if e.code == 1243),
+        "{gone:?}"
+    );
+    let db: Option<String> = c.query_first("SELECT DATABASE()").await.unwrap();
+    assert_eq!(db.as_deref(), Some("elyra"), "the database is kept");
+    for conn in [&mut c, &mut other] {
+        let n: Option<i64> = conn.query_first("SELECT COUNT(*) FROM rc").await.unwrap();
+        assert_eq!(n, Some(1), "the open transaction was rolled back");
+    }
+
+    // A table lock goes with the session.
+    c.query_drop("LOCK TABLES rc WRITE").await.unwrap();
+    assert!(c.reset().await.unwrap());
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        other.query_drop("INSERT INTO rc (v) VALUES (3)"),
+    )
+    .await
+    .expect("the lock was released")
+    .unwrap();
+}
+
+/// `COM_CHANGE_USER` authenticates the new user and gives it a new session.
+/// It used to be answered with an OK: the client believed it had changed
+/// user, while the session went on as the old one -- with its privileges --
+/// and no password was checked.
+#[tokio::test]
+async fn change_user_authenticates_the_new_user() {
+    let srv = TestServer::start_with_tiers(&[
+        ("admin", "adminpw", elyra_core::Privilege::Admin),
+        ("reader", "readerpw", elyra_core::Privilege::Read),
+    ])
+    .await;
+    let mut c = srv.conn_as("admin", "adminpw").await;
+    c.query_drop("CREATE TABLE cu (id INT)").await.unwrap();
+    c.query_drop("SET @v = 1").await.unwrap();
+
+    c.change_user(
+        mysql_async::ChangeUserOpts::default()
+            .with_user(Some("reader".into()))
+            .with_pass(Some("readerpw".into()))
+            .with_db_name(Some("elyra".into())),
+    )
+    .await
+    .unwrap();
+    let (user, db): (String, String) = c
+        .query_first("SELECT USER(), DATABASE()")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(user.starts_with("reader@"), "{user}");
+    assert_eq!(db, "elyra");
+    let v: Option<Option<i64>> = c.query_first("SELECT @v").await.unwrap();
+    assert_eq!(v, Some(None), "the old session's variables are gone");
+    let denied = c.query_drop("INSERT INTO cu VALUES (1)").await.unwrap_err();
+    assert!(
+        matches!(denied, mysql_async::Error::Server(ref e) if e.message.contains("access denied")),
+        "the reader's privileges apply: {denied:?}"
+    );
+
+    // Back to the admin, then a wrong password: refused, and the connection
+    // ends, as the session it had is gone.
+    c.change_user(
+        mysql_async::ChangeUserOpts::default()
+            .with_user(Some("admin".into()))
+            .with_pass(Some("adminpw".into())),
+    )
+    .await
+    .unwrap();
+    c.query_drop("INSERT INTO cu VALUES (1)").await.unwrap();
+    let refused = c
+        .change_user(
+            mysql_async::ChangeUserOpts::default()
+                .with_user(Some("reader".into()))
+                .with_pass(Some("wrong".into())),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(refused, mysql_async::Error::Server(ref e) if e.code == 1045),
+        "{refused:?}"
+    );
+    assert!(c.query_drop("SELECT 1").await.is_err());
+}
+
+/// The case that matters: a pooled connection handed to its next user. A
+/// `mysql_async` pool resets a connection as it takes it back; the next
+/// `get_conn` must not see the last user's session.
+#[tokio::test]
+async fn a_pooled_connection_comes_back_clean() {
+    let srv = TestServer::start().await;
+    let opts = mysql_async::OptsBuilder::default()
+        .ip_or_hostname("127.0.0.1")
+        .tcp_port(srv.port)
+        .user(Some("root"))
+        .prefer_socket(false)
+        .pool_opts(
+            mysql_async::PoolOpts::default()
+                .with_constraints(mysql_async::PoolConstraints::new(1, 1).unwrap()),
+        );
+    let pool = mysql_async::Pool::new(opts);
+    let first_id = {
+        let mut c = pool.get_conn().await.unwrap();
+        c.query_drop("SET @tenant = 'first', sql_mode = 'ANSI_QUOTES'")
+            .await
+            .unwrap();
+        c.id()
+    };
+    let mut c = pool.get_conn().await.unwrap();
+    assert_eq!(c.id(), first_id, "the same connection, back from the pool");
+    let (tenant, mode): (Option<String>, String) = c
+        .query_first("SELECT @tenant, @@sql_mode")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(tenant, None);
+    assert!(!mode.contains("ANSI_QUOTES"), "{mode}");
+    drop(c);
+    pool.disconnect().await.unwrap();
+}

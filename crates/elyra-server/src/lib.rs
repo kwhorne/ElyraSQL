@@ -694,6 +694,25 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for ElyraShim {
         self.stmts.remove(&stmt);
     }
 
+    /// A new session in place of the old, as a new connection gets: the old
+    /// one's transaction is rolled back (its writes were only buffered), and
+    /// its locks, variables, `sql_mode`, `LAST_INSERT_ID` and prepared
+    /// statements go with it, as they do when a connection ends. A reset
+    /// keeps the user and the database, as in MySQL; a change of user
+    /// starts with neither, and the authentication that follows sets it.
+    async fn on_reset(&mut self, change_user: bool) {
+        self.stmts.clear();
+        let old = std::mem::replace(&mut self.session, self.engine.session());
+        if change_user {
+            *self.privilege.lock().unwrap() = elyra_core::Privilege::Read;
+            self.user.lock().unwrap().clear();
+        } else {
+            self.session.set_identity(old.identity());
+            self.session.set_database(&old.database());
+        }
+        drop(old);
+    }
+
     async fn on_init<'a>(
         &'a mut self,
         schema: &'a str,

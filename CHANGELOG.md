@@ -6,6 +6,23 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **`COM_CHANGE_USER` authenticates the new user.** It was answered with an
+  OK and nothing else: the client believed it had changed user, while the
+  session went on as the old one, with its privileges, and no password was
+  checked. A connection that switches between accounts ran the second
+  account's queries with the first one's rights. The new user is now
+  authenticated as in the handshake and gets a new session; a wrong password
+  is refused (1045) and ends the connection.
+- **`COM_RESET_CONNECTION` resets the session.** It was answered with an OK
+  and nothing reset, and `mysql_async`'s pool (among others) sends it every
+  time it takes a connection back: the next user of a pooled connection got
+  the last one's user variables, `sql_mode`, `LAST_INSERT_ID`, SQL-level
+  prepared statements and table locks -- and an open transaction. It now
+  starts the session afresh, keeping the user and the database, as MySQL
+  does.
+
 ## [1.13.1] - 2026-11-25
 
 SQL-level prepared statements, and a fix for negative variables after a
