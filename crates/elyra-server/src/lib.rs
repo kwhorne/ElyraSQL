@@ -9,6 +9,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use elyra_engine::sqlprepare::{max_prepared_stmts, StmtPermit};
 use elyra_engine::{Engine, QueryResult, Session};
 use elyra_wire::{
     AsyncMysqlIntermediary, AsyncMysqlShim, Column, ColumnFlags, ColumnType, ErrorKind, InitWriter,
@@ -81,27 +82,6 @@ pub fn load_tls(
 // (client-side) prepares are the recommended setting for maximum compatibility.
 // The MySQL wire layer is our first-party elyra-wire crate (forked from
 // opensrv-mysql), which also implements caching_sha2_password auth.
-
-/// A parsed prepared statement: the SQL template and its placeholder count.
-/// Server-wide limit on live prepared statements, mirroring MySQL's
-/// `max_prepared_stmt_count` (same default, 16382). The limit is global rather
-/// than per connection for the same reason MySQL's is: a per-connection cap does
-/// not bound total memory when the number of connections is itself unbounded.
-/// Configurable via `ELYRASQL_MAX_PREPARED_STMTS`.
-fn max_prepared_stmts() -> usize {
-    use std::sync::OnceLock;
-    static CACHE: OnceLock<usize> = OnceLock::new();
-    *CACHE.get_or_init(|| {
-        std::env::var("ELYRASQL_MAX_PREPARED_STMTS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|&n| n >= 1)
-            .unwrap_or(16_382)
-    })
-}
-
-/// Number of prepared statements currently live across all connections.
-static PREPARED_LIVE: AtomicUsize = AtomicUsize::new(0);
 
 /// Maximum client connections served at once, mirroring MySQL's `max_connections`
 /// (same default, 151). Surplus connections are refused with error 1040 before the
@@ -200,50 +180,7 @@ impl Drop for ConnPermit {
     }
 }
 
-/// An RAII slot in the global prepared-statement budget.
-///
-/// Releasing on `Drop` is what makes the accounting safe: a statement freed by
-/// `COM_STMT_CLOSE`, a connection that goes away without closing its statements,
-/// and an unwind all release their slots automatically. A manual decrement on
-/// each exit path would risk *leaking* slots, and a leaked global counter would
-/// eventually refuse every prepare server-wide - worse than the unbounded growth
-/// this replaces.
-struct StmtPermit;
-
-impl StmtPermit {
-    /// Reserve one slot, or `None` when the server-wide limit is reached.
-    fn acquire() -> Option<Self> {
-        let limit = max_prepared_stmts();
-        let mut cur = PREPARED_LIVE.load(Ordering::Relaxed);
-        loop {
-            if cur >= limit {
-                return None;
-            }
-            match PREPARED_LIVE.compare_exchange_weak(
-                cur,
-                cur + 1,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return Some(StmtPermit),
-                Err(observed) => cur = observed,
-            }
-        }
-    }
-
-    /// Live count across all connections (used to assert the accounting in tests).
-    #[cfg(test)]
-    fn live() -> usize {
-        PREPARED_LIVE.load(Ordering::Relaxed)
-    }
-}
-
-impl Drop for StmtPermit {
-    fn drop(&mut self) {
-        PREPARED_LIVE.fetch_sub(1, Ordering::AcqRel);
-    }
-}
-
+/// A prepared statement: its text, its placeholder count and its plan.
 struct Prepared {
     sql: String,
     params: usize,
@@ -403,23 +340,6 @@ fn elyra_kind(e: &elyra_core::Error) -> ErrorKind {
 /// (`ELYRASQL_STMT_DESCRIBE=on|1|true`). Off by default: it lets lenient drivers
 /// (sqlx) resolve result columns by name, but strict libmysqlclient-based
 /// clients mishandle a prepare response that carries result columns.
-/// `ELYRASQL_PLAN_CACHE=off` runs every query and prepared statement through
-/// the text path, as before plans existed: a way back should a plan ever
-/// answer differently. On by default.
-fn plans_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        !matches!(
-            std::env::var("ELYRASQL_PLAN_CACHE")
-                .unwrap_or_default()
-                .to_ascii_lowercase()
-                .as_str(),
-            "off" | "0" | "false" | "no"
-        )
-    })
-}
-
 fn stmt_describe_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
@@ -645,15 +565,11 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for ElyraShim {
         };
         let id = self.next_id;
         self.next_id += 1;
-        let plan = plans_enabled()
-            .then(|| {
-                self.engine.prepare_plan(
-                    &prepared::number_placeholders(query),
-                    param_count,
-                    &self.session,
-                )
-            })
-            .flatten();
+        let plan = self.engine.prepare_plan(
+            &prepared::number_placeholders(query),
+            param_count,
+            &self.session,
+        );
         self.stmts.insert(
             id,
             Prepared {
@@ -820,18 +736,12 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for ElyraShim {
         let user = self.user();
         self.procs.begin_query(self.conn_id, query);
         let start = std::time::Instant::now();
-        let res = with_query_timeout(async {
-            if plans_enabled() {
+        let res =
+            with_query_timeout(
                 self.engine
-                    .execute_text(query, privilege, &user, &self.session)
-                    .await
-            } else {
-                self.engine
-                    .execute_as(query, privilege, &user, &self.session)
-                    .await
-            }
-        })
-        .await;
+                    .execute_text(query, privilege, &user, &self.session),
+            )
+            .await;
         self.metrics.record(query, res.is_ok(), start.elapsed());
         self.procs.end_query(self.conn_id);
         if let Some(a) = &self.audit {

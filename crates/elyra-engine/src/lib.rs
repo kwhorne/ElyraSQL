@@ -26,6 +26,7 @@ mod keyenc;
 pub mod lockmgr;
 mod nestjoin;
 mod opprec;
+pub mod params;
 mod plancache;
 mod predicate;
 mod proc;
@@ -36,6 +37,7 @@ pub use sessfn::Identity;
 mod session;
 mod sort;
 pub mod sqllex;
+pub mod sqlprepare;
 mod stream;
 mod users;
 mod viewtype;
@@ -1214,6 +1216,13 @@ impl Engine {
             .collect::<String>()
             .to_ascii_lowercase();
 
+        // PREPARE / EXECUTE / DEALLOCATE PREPARE: before the implicit commit
+        // (MySQL's do not commit) and the read-only check (DROP PREPARE is no
+        // write); the statement EXECUTE runs gets both checks of its own.
+        if sqlprepare::is_command(&head) {
+            return self.run_sql_prepare(trimmed, privilege, user, sess).await;
+        }
+
         // DDL, account statements, LOCK TABLES and a new BEGIN commit the open
         // transaction first, as in MySQL -- even when the statement then fails.
         // They used to run inside it, so a ROLLBACK undid the transaction's
@@ -1944,6 +1953,9 @@ impl Engine {
         user: &str,
         sess: &Session,
     ) -> Option<Result<Vec<QueryResult>>> {
+        if !sqlprepare::plans_enabled() {
+            return None;
+        }
         let (shape, literals) = plancache::normalize(sql)?;
         let key = (sess.ansi_quotes(), shape);
         let plan = match self.plans.lookup(&key) {
@@ -1978,6 +1990,9 @@ impl Engine {
         params: usize,
         sess: &Session,
     ) -> Option<PreparedPlan> {
+        if !sqlprepare::plans_enabled() {
+            return None;
+        }
         let sql = numbered_sql;
         guard_sql_complexity(sql).ok()?;
         if sqllex::expand_version_comments(sql, sqllex::mysql_version_id()).is_some()

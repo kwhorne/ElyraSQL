@@ -9,6 +9,12 @@ drivers connect without modification.
 - **Prepared statements** (`COM_STMT_PREPARE`/`EXECUTE`) — typed parameters
   (including `DATE`/`DATETIME`/`TIME` from the binary protocol), value escaping,
   statement reuse; used by many ORMs and drivers.
+- **SQL-level prepared statements** — `PREPARE name FROM 'text' | @var`,
+  `EXECUTE name [USING @a, ...]` and `{DEALLOCATE | DROP} PREPARE name`, with
+  MySQL's errors (1243 unknown name, 1210 wrong argument count, 1295 for a
+  nested PREPARE). As in MySQL, statements are per connection and do not
+  commit a transaction, and a SELECT, INSERT, REPLACE, UPDATE or DELETE is
+  parsed at PREPARE; another statement's syntax is checked when it runs.
 - **Authentication** — `mysql_native_password` by **default** (widest driver
   compatibility), with `caching_sha2_password` available opt-in (see below).
 - **TLS** — clients may negotiate SSL.
