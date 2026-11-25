@@ -1262,8 +1262,18 @@ impl Session {
         match snapshot {
             None => self.db.multi_get(keys).await,
             Some((snap, mut result, misses)) => {
+                if misses.is_empty() {
+                    return Ok(result);
+                }
                 let miss_keys: Vec<Vec<u8>> = misses.iter().map(|(_, k)| k.clone()).collect();
-                let fetched = spawn(move || snap.multi_get(&miss_keys)).await?;
+                // As `Db::multi_get` reads: a few keys in place, more on the
+                // blocking pool. Every read here went to the pool, even when
+                // the transaction's own writes answered all of it.
+                let fetched = if miss_keys.len() <= 64 {
+                    elyra_storage::read_in_place(|| snap.multi_get(&miss_keys))?
+                } else {
+                    spawn(move || snap.multi_get(&miss_keys)).await?
+                };
                 for ((i, _), v) in misses.into_iter().zip(fetched) {
                     result[i] = v;
                 }
