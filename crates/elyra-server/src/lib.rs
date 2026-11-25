@@ -403,6 +403,23 @@ fn elyra_kind(e: &elyra_core::Error) -> ErrorKind {
 /// (`ELYRASQL_STMT_DESCRIBE=on|1|true`). Off by default: it lets lenient drivers
 /// (sqlx) resolve result columns by name, but strict libmysqlclient-based
 /// clients mishandle a prepare response that carries result columns.
+/// `ELYRASQL_PLAN_CACHE=off` runs every query and prepared statement through
+/// the text path, as before plans existed: a way back should a plan ever
+/// answer differently. On by default.
+fn plans_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("ELYRASQL_PLAN_CACHE")
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .as_str(),
+            "off" | "0" | "false" | "no"
+        )
+    })
+}
+
 fn stmt_describe_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
@@ -628,11 +645,15 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for ElyraShim {
         };
         let id = self.next_id;
         self.next_id += 1;
-        let plan = self.engine.prepare_plan(
-            &prepared::number_placeholders(query),
-            param_count,
-            &self.session,
-        );
+        let plan = plans_enabled()
+            .then(|| {
+                self.engine.prepare_plan(
+                    &prepared::number_placeholders(query),
+                    param_count,
+                    &self.session,
+                )
+            })
+            .flatten();
         self.stmts.insert(
             id,
             Prepared {
@@ -799,12 +820,18 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for ElyraShim {
         let user = self.user();
         self.procs.begin_query(self.conn_id, query);
         let start = std::time::Instant::now();
-        let res =
-            with_query_timeout(
+        let res = with_query_timeout(async {
+            if plans_enabled() {
                 self.engine
-                    .execute_as(query, privilege, &user, &self.session),
-            )
-            .await;
+                    .execute_text(query, privilege, &user, &self.session)
+                    .await
+            } else {
+                self.engine
+                    .execute_as(query, privilege, &user, &self.session)
+                    .await
+            }
+        })
+        .await;
         self.metrics.record(query, res.is_ok(), start.elapsed());
         self.procs.end_query(self.conn_id);
         if let Some(a) = &self.audit {
