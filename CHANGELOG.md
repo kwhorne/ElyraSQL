@@ -6,6 +6,13 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.13.0] - 2026-11-25
+
+Query plans: a prepared statement is parsed once, and a text query once per
+shape in a cache shared by all connections -- Laravel's queries included,
+through PDO's emulated prepares. Primary-key lookups are 8-18% and small
+ranges 14-24% faster end to end with one client, through either protocol.
+
 ### Changed
 
 - **Prepared statements are parsed once, at prepare time.** Every
@@ -40,6 +47,15 @@ All notable changes to ElyraSQL are documented here. The format is based on
 - **A negative parameter after a minus no longer starts a comment.**
   `SELECT ?-?` with 3 and -2 became `3--2`, and `--` began a comment: it
   answered 3, without an error. `-?` with -4 failed to parse.
+
+### Upgrading
+
+- No change to the database file; a 1.12.21 database opens in 1.13.0
+  unchanged.
+- Plans are on by default and answer as the text path did;
+  `ELYRASQL_PLAN_CACHE=off` turns them off.
+- Rows written by an earlier version with `lock in share mode` in a string
+  value hold `for share` instead.
 
 ## [1.12.21] - 2026-11-25
 
