@@ -17,6 +17,21 @@ ElyraSQL release builds target **Ubuntu 24.04+** and **Apple Silicon macOS
     done, so an interrupted upgrade simply resumes on the next start. **Take a backup
     first, and note that downgrading to 1.4.x afterwards is not supported.**
 
+!!! note "Upgrading to 1.13.0 — query plans"
+
+    No change to the database file; a 1.12.21 database opens in 1.13.0
+    unchanged.
+
+    - **Queries and prepared statements are planned.** A prepared statement
+      is parsed once, when it is prepared, and a text query once per shape
+      (its text with the values taken out), in a cache shared by all
+      connections. Results are the same as before; set
+      `ELYRASQL_PLAN_CACHE=off` to run everything through the text path as
+      1.12.21 did (see [configuration](configuration.md)).
+    - **Text containing `lock in share mode`** is stored as written. Before,
+      the words were rewritten to `for share` inside strings too, so rows
+      written with them by an earlier version hold `for share`.
+
 !!! note "Upgrading to 1.12.21 — Raft clusters from 1.12.20"
 
     No change to the database file; a 1.12.20 database opens in 1.12.21
@@ -872,8 +887,8 @@ macOS).
 Multi-arch image (`amd64` + `arm64`) on the GitHub Container Registry:
 
 ```bash
-docker pull ghcr.io/kwhorne/elyrasql:1.12.21   # or :latest
-docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.12.21
+docker pull ghcr.io/kwhorne/elyrasql:1.13.0   # or :latest
+docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.13.0
 ```
 
 The image is ~15 MB, runs as a non-root user, stores data in the
