@@ -26,6 +26,7 @@ mod keyenc;
 pub mod lockmgr;
 mod nestjoin;
 mod opprec;
+mod plancache;
 mod predicate;
 mod proc;
 mod rowdec;
@@ -107,6 +108,8 @@ pub struct Engine {
     vindex: vindex::VectorRegistry,
     locks: std::sync::Arc<lockmgr::LockManager>,
     retry_gates: RetryGates,
+    /// Text queries' plans, by shape (see `plancache`).
+    plans: std::sync::Arc<plancache::PlanCache>,
 }
 
 /// One queue per table for autocommit statements re-run after losing a write
@@ -122,6 +125,7 @@ impl Engine {
             vindex: vindex::VectorRegistry::new(),
             locks: std::sync::Arc::new(lockmgr::LockManager::new()),
             retry_gates: RetryGates::default(),
+            plans: std::sync::Arc::new(plancache::PlanCache::new()),
         }
     }
 
@@ -1915,6 +1919,47 @@ impl Engine {
         .await
     }
 
+    /// Run a client's text query: through the plan cache when its shape is
+    /// one the engine plans (see `plancache`), as `execute_as` runs it
+    /// otherwise.
+    pub async fn execute_text(
+        &self,
+        sql: &str,
+        privilege: Privilege,
+        user: &str,
+        sess: &Session,
+    ) -> Result<Vec<QueryResult>> {
+        if let Some(res) = self.execute_cached(sql, privilege, user, sess).await {
+            return res;
+        }
+        self.execute_as(sql, privilege, user, sess).await
+    }
+
+    /// `sql` through its shape's plan, planning the shape the first time it
+    /// is seen. `None`: the text path runs it.
+    async fn execute_cached(
+        &self,
+        sql: &str,
+        privilege: Privilege,
+        user: &str,
+        sess: &Session,
+    ) -> Option<Result<Vec<QueryResult>>> {
+        let (shape, literals) = plancache::normalize(sql)?;
+        let key = (sess.ansi_quotes(), shape);
+        let plan = match self.plans.lookup(&key) {
+            Some(plan) => plan?,
+            None => {
+                let plan = self
+                    .prepare_plan(&key.1, literals.len(), sess)
+                    .map(std::sync::Arc::new);
+                self.plans.insert(key, plan.clone());
+                plan?
+            }
+        };
+        self.execute_plan(&plan, &literals, privilege, user, sess)
+            .await
+    }
+
     /// Prepare `numbered_sql` -- a prepared statement's text with its `params`
     /// placeholders numbered `?1`..`?N` -- for [`Engine::execute_plan`]: its
     /// text passes and parse run once here instead of on every execution.
@@ -2013,7 +2058,7 @@ impl Engine {
     pub async fn execute_plan(
         &self,
         plan: &PreparedPlan,
-        literals: &[String],
+        literals: &[impl AsRef<str>],
         privilege: Privilege,
         user: &str,
         sess: &Session,
@@ -2023,7 +2068,7 @@ impl Engine {
         }
         let mut values = Vec::with_capacity(literals.len());
         for literal in literals {
-            values.push(literal_expr(literal)?);
+            values.push(literal_expr(literal.as_ref())?);
         }
         let _cancel = CancelGuard::new(sess);
         if let Some(why) = self.db.fence() {
@@ -3017,6 +3062,9 @@ pub struct PreparedPlan {
 /// path is left to report that as it does.
 fn literal_expr(literal: &str) -> Option<sqlparser::ast::Expr> {
     use sqlparser::ast::{Expr, UnaryOperator};
+    if let Some(expr) = plain_literal_expr(literal) {
+        return Some(expr);
+    }
     let escaped = sqllex::keep_like_escapes(literal);
     let text = escaped.as_deref().unwrap_or(literal);
     let expr = Parser::new(&MySqlDialect {})
@@ -3033,6 +3081,57 @@ fn literal_expr(literal: &str) -> Option<sqlparser::ast::Expr> {
         _ => false,
     };
     plain.then_some(expr)
+}
+
+/// The common literals -- `42`, `-1.50`, `'text'` without a backslash,
+/// `NULL` -- as [`literal_expr`]'s parse makes them, without the parser
+/// (which costs ~0.4 µs a literal, more than the rest of putting it in the
+/// plan). `None` for any other: the parser reads it.
+fn plain_literal_expr(literal: &str) -> Option<sqlparser::ast::Expr> {
+    use sqlparser::ast::{Expr, UnaryOperator, Value};
+    let trimmed = literal.trim_start();
+    let (negative, body) = match trimmed.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, trimmed),
+    };
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit());
+    let number = match body.split_once('.') {
+        Some((int, frac)) => digits(int) && digits(frac),
+        None => digits(body),
+    };
+    let value = if number {
+        Value::Number(body.to_string(), false)
+    } else if negative {
+        return None;
+    } else if body.len() >= 2
+        && body.starts_with('\'')
+        && body.ends_with('\'')
+        && !body.contains('\\')
+    {
+        let mut text = String::with_capacity(body.len() - 2);
+        let mut chars = body[1..body.len() - 1].chars();
+        while let Some(c) = chars.next() {
+            // Inside, a quote comes doubled; a lone one ends the literal.
+            if c == '\'' && chars.next() != Some('\'') {
+                return None;
+            }
+            text.push(c);
+        }
+        Value::SingleQuotedString(text)
+    } else if body.eq_ignore_ascii_case("null") {
+        Value::Null
+    } else {
+        return None;
+    };
+    let expr = Expr::Value(value);
+    Some(if negative {
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr: Box::new(expr),
+        }
+    } else {
+        expr
+    })
 }
 
 /// A statement through the text passes and the parse (see
@@ -4017,22 +4116,38 @@ fn contains_ci(haystack: &str, needle: &str) -> bool {
             .any(|window| window.eq_ignore_ascii_case(needle))
 }
 
-/// Case-insensitive substring replace (used to normalize `LOCK IN SHARE MODE`).
+/// Case-insensitive replace of `needle` where it is code (used to normalize
+/// `LOCK IN SHARE MODE`): not inside a string, quoted identifier or comment.
+/// It used to replace everywhere, so `INSERT ... VALUES ('lock in share
+/// mode')` stored `for share`.
 fn replace_ci(haystack: &str, needle: &str, replacement: &str) -> String {
     let needle_bytes = needle.as_bytes();
     if needle_bytes.is_empty() {
         return haystack.to_owned();
     }
+    let code: Vec<usize> = sqllex::code_bytes(haystack).map(|c| c.index).collect();
+    // A match is code when its bytes are a run of code bytes.
+    let in_code = |at: usize| {
+        code.binary_search(&at).is_ok_and(|k| {
+            code.get(k + needle_bytes.len() - 1) == Some(&(at + needle_bytes.len() - 1))
+        })
+    };
     let mut out = String::with_capacity(haystack.len());
     let mut i = 0;
-    while let Some(pos) = haystack.as_bytes()[i..]
+    let mut from = 0;
+    while let Some(pos) = haystack.as_bytes()[from..]
         .windows(needle_bytes.len())
         .position(|window| window.eq_ignore_ascii_case(needle_bytes))
     {
-        let at = i + pos;
+        let at = from + pos;
+        if !in_code(at) {
+            from = at + 1;
+            continue;
+        }
         out.push_str(&haystack[i..at]);
         out.push_str(replacement);
         i = at + needle.len();
+        from = i;
     }
     out.push_str(&haystack[i..]);
     out
@@ -7562,6 +7677,14 @@ mod case_insensitive_search_tests {
                 "for share"
             ),
             "SELECT 'å🚗' for share for share"
+        );
+        assert_eq!(
+            replace_ci(
+                "INSERT INTO t VALUES ('lock in share mode', \"LOCK IN SHARE MODE\") /* lock in share mode */",
+                "lock in share mode",
+                "for share"
+            ),
+            "INSERT INTO t VALUES ('lock in share mode', \"LOCK IN SHARE MODE\") /* lock in share mode */"
         );
     }
 

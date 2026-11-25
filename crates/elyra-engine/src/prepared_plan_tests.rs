@@ -304,3 +304,205 @@ async fn statements_the_plan_does_not_take_keep_the_text_path() {
         );
     }
 }
+
+/// Queries as clients write them, for the plan cache: the values in the text.
+const TEXT_CASES: &[&str] = &[
+    "select * from `t` where `t`.`id` = 1 limit 1",
+    "select * from `t` where `t`.`id` = 2 limit 1",
+    "select * from `t` where `t`.`id` = '3' limit 1",
+    "select * from `t` where `t`.`id` = 3.0 limit 1",
+    "select * from `t` where `t`.`id` = -1 limit 1",
+    "select count(*) as aggregate from `t` where `flag` = 1",
+    "select exists(select * from `t` where `name` = 'name1') as `exists`",
+    "select * from `t` where `name` = 'NAME3' and `flag` is null limit 15 offset 0",
+    "SELECT id FROM t WHERE name = 'name1' OR name = \"name2\"",
+    "SELECT id FROM t WHERE name LIKE 'na\\_e%'",
+    "SELECT id FROM t WHERE name LIKE 'na\\\\_e%'",
+    "SELECT id FROM t WHERE note = 'O\\'Brien' OR note = 'O''Brien'",
+    "SELECT id FROM t WHERE note = 'a\\\\b'",
+    "SELECT 'tab\\there', 'nl\\n', 'z\\Z', 'pct\\%', 'x\\y'",
+    "SELECT x'41', X'00ff', 0x41, 0x123, b'101', N'abc', _utf8mb4'abc'",
+    "SELECT 1e3, 1.5e-3, .5, 007, 1.50, -0, 18446744073709551616, 99999999999999999999.5",
+    "SELECT DATE '2020-01-01', TIMESTAMP '2020-01-01 10:00:00', DATE_ADD('2020-01-01', INTERVAL '1' DAY)",
+    "SELECT CAST(score AS DECIMAL(10,1)), CAST('7' AS CHAR(3)) FROM t WHERE id = 1",
+    "SELECT name AS 'n' FROM t WHERE id = 2",
+    "SELECT GROUP_CONCAT(name ORDER BY id SEPARATOR ', ') FROM t",
+    "SELECT id FROM t WHERE id IN (1, 2, 3) ORDER BY 1 DESC",
+    "SELECT flag, COUNT(*) FROM t GROUP BY 1 ORDER BY 2 DESC, 1",
+    "SELECT id FROM t ORDER BY id LIMIT 2, 1",
+    "SELECT 1 + 1, '1' + 1, 1 = '1', 'a' = 'A', 'a' = 'a '",
+    "SELECT 'é', 'ø' FROM t WHERE name <> 'æøå' AND id = 1",
+    "SELECT 1",
+    "SELECT 1;",
+    "SELECT ~1",
+    "SELECT 3--2",
+    "SELECT 3- -2, - -4",
+    "SELECT 1 -- comment",
+    "select version()",
+    "SELECT * FROM t WHERE id = 1; SELECT 2",
+    "SELECT id FROM t WHERE id = 1 FOR UPDATE",
+    "SELECT id FROM t WHERE id = 1 LOCK IN SHARE MODE",
+    "SELECT * FROM t WHERE MATCH (name) AGAINST ('name1')",
+    // The text path rewrote `lock in share mode` inside strings too.
+    "SELECT 'lock in share mode', id FROM t WHERE id = 1 LOCK IN SHARE MODE",
+    "insert into `a` (`tid`, `v`) values (8, 'lock in share mode')",
+    "SELECT JSON_EXTRACT('{\"a\": [1, 2]}', '$.a[1]')",
+    "SELECT id FROM t WHERE id BETWEEN 2 AND 4 AND score > -3",
+    "insert into `a` (`tid`, `v`) values (5, 'q')",
+    "insert into `a` (`tid`, `v`) values (6, 'r')",
+    "insert into `a` (`tid`, `v`) values (7, 'r')",
+    "insert into `t` (`id`, `name`, `score`, `born`, `at`) values (50, 'fifty', '1.239', '2020-02-30', '2020-01-01 10:00:00')",
+    "insert into `t` (`id`, `flag`) values (51, 300)",
+    "insert into `t` (`id`, `data`) values (52, x'00ff')",
+    "INSERT INTO t SET id = 53, name = 'set'",
+    "INSERT INTO t (id, name) VALUES (54, 'x') ON DUPLICATE KEY UPDATE name = 'dup'",
+    "INSERT INTO t (id, name) VALUES (54, 'y') ON DUPLICATE KEY UPDATE name = 'dup2'",
+    "update `t` set `score` = 2.5, `note` = 'u' where `id` = 2",
+    "update `t` set `score` = `score` + 1 where `id` in (1, 2)",
+    "UPDATE t SET name = 'lim' WHERE id > 1 LIMIT 1",
+    "UPDATE t SET name = 'ord' WHERE id > 1 ORDER BY id DESC LIMIT 1",
+    "delete from `a` where `v` = 'r'",
+    "DELETE FROM t WHERE id > 50 LIMIT 1",
+    "SELECT * FROM t ORDER BY id",
+];
+
+/// Every query runs on two databases alike, through the text path on one and
+/// through `execute_text` on the other -- twice, so the second round is
+/// served from the plans the first made, and each shape also with values of
+/// other kinds (`id = 1`, `'3'`, `3.0`). The results and what is left behind
+/// must be the same.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_plan_cache_runs_a_query_as_the_text_path_does() {
+    let (e1, s1) = engine().await;
+    let (e2, s2) = engine().await;
+    let mut texts: Vec<String> = CASES.iter().map(|(t, l)| render(t, l, false)).collect();
+    texts.extend(TEXT_CASES.iter().map(|t| t.to_string()));
+    for round in 0..2 {
+        for text in &texts {
+            let expected = describe(e1.execute_as(text, Privilege::Admin, "root", &s1).await).await
+                + &after(&e1, &s1).await;
+            let got = describe(e2.execute_text(text, Privilege::Admin, "root", &s2).await).await
+                + &after(&e2, &s2).await;
+            assert_eq!(got, expected, "\nround {round}: {text}");
+        }
+    }
+    let mut not_planned: Vec<&str> = Vec::new();
+    for text in &texts {
+        let planned = super::plancache::normalize(text)
+            .and_then(|(shape, _)| e2.plans.lookup(&(false, shape)))
+            .flatten()
+            .is_some();
+        if !planned {
+            not_planned.push(text);
+        }
+    }
+    assert_eq!(
+        not_planned,
+        [
+            // Type parameters are not values: `DECIMAL(?1, ?2)` does not parse.
+            "SELECT CAST('12abc' AS SIGNED), CONVERT(42, CHAR), CAST('3.14159' AS DECIMAL(5,1))",
+            // `~` and `!` are rewritten as text, around an operand `?k` is not.
+            "SELECT ~0",
+            "SELECT !0",
+            // UPDATE's LIMIT is taken out as text, a number only.
+            "UPDATE t SET name = 'last' WHERE id > 2 ORDER BY id DESC LIMIT 2",
+            "UPDATE t SET name = 'lim' WHERE id > 1 LIMIT 1",
+            "SELECT CAST(score AS DECIMAL(10,1)), CAST('7' AS CHAR(3)) FROM t WHERE id = 1",
+            "SELECT ~1",
+            // Comments, an intercepted query, two statements.
+            "SELECT 3--2",
+            "SELECT 1 -- comment",
+            "select version()",
+            "SELECT * FROM t WHERE id = 1; SELECT 2",
+            // AGAINST takes a literal, not an expression: `?k` is no value.
+            "SELECT * FROM t WHERE MATCH (name) AGAINST ('name1')",
+            "UPDATE t SET name = 'lim' WHERE id > 1 LIMIT 1",
+            "UPDATE t SET name = 'ord' WHERE id > 1 ORDER BY id DESC LIMIT 1",
+        ]
+    );
+}
+
+/// Under ANSI_QUOTES `"x"` is a column, otherwise a string: the same text is
+/// two shapes, and each session gets its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ansi_quotes_has_its_own_plans() {
+    let (e1, s1) = engine().await;
+    let (e2, s2) = engine().await;
+    for mode in ["''", "'ANSI_QUOTES'", "''", "'ANSI_QUOTES'"] {
+        for (e, s) in [(&e1, &s1), (&e2, &s2)] {
+            e.execute(&format!("SET sql_mode = {mode}"), Privilege::Admin, s)
+                .await
+                .unwrap();
+        }
+        for text in [
+            "SELECT \"name\" FROM t WHERE id = 1",
+            "SELECT \"name\" FROM t WHERE id = 2",
+        ] {
+            let expected = describe(e1.execute_as(text, Privilege::Admin, "root", &s1).await).await;
+            let got = describe(e2.execute_text(text, Privilege::Admin, "root", &s2).await).await;
+            assert_eq!(got, expected, "{mode}: {text}");
+        }
+    }
+}
+
+/// The literals `plain_literal_expr` makes without the parser are the ones
+/// the parser makes.
+#[test]
+fn plain_literals_are_what_the_parser_makes() {
+    let parse = |l: &str| {
+        let escaped = super::sqllex::keep_like_escapes(l);
+        sqlparser::parser::Parser::new(&sqlparser::dialect::MySqlDialect {})
+            .try_with_sql(escaped.as_deref().unwrap_or(l))
+            .unwrap()
+            .parse_expr()
+            .unwrap()
+    };
+    let mut fast = 0;
+    for l in [
+        "0",
+        "42",
+        "007",
+        "-5",
+        " -5",
+        "1.50",
+        " -0.5",
+        "-0",
+        "18446744073709551615",
+        "99999999999999999999999999.000001",
+        "NULL",
+        "null",
+        "''",
+        "'a'",
+        "'O''Brien'",
+        "''''",
+        "'æøå'",
+        "'a b  c'",
+        "'?'",
+        "'\"'",
+        "'2026-11-25 15:00:00'",
+        "'a\\_b'",
+        "'a\\\\b'",
+        "'it\\'s'",
+        "x'41'",
+        "1e3",
+        "'a''",
+        "1.",
+        ".5",
+    ] {
+        if let Some(expr) = super::plain_literal_expr(l) {
+            fast += 1;
+            assert_eq!(expr, parse(l), "{l}");
+        }
+        if l != "'a''" {
+            assert_eq!(
+                super::literal_expr(l),
+                Some(parse(l)).filter(|e| matches!(
+                    e,
+                    sqlparser::ast::Expr::Value(_) | sqlparser::ast::Expr::UnaryOp { .. }
+                )),
+                "{l}"
+            );
+        }
+    }
+    assert_eq!(fast, 21);
+}

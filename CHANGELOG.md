@@ -19,9 +19,24 @@ All notable changes to ElyraSQL are documented here. The format is based on
   are unchanged within the noise. Statements it does not take (`@`
   variables, `SELECT ... INTO`, `CALL`, SHOW, more than one statement, ...)
   run as before.
+- **Text queries are planned once per shape.** A client that writes its
+  values into the SQL -- PHP's PDO with its default emulated prepares, so
+  Laravel -- sent each query through the text passes and a full parse. The
+  values are now taken out (`... where id = ?1 limit ?2`), each shape is
+  planned once in a cache shared by all connections (1024 shapes), and each
+  query puts its own values into the plan. In the engine, Eloquent's
+  queries are 20-31% faster (`find`, `firstWhere`, `count`, `paginate`,
+  `exists`, an INSERT), an UPDATE 8%. Through the text protocol: lookups
+  +8-16%, `count(*)` +6-17%, a 10-row range +14-16%; writes unchanged within
+  the noise. `ELYRASQL_PLAN_CACHE=off` turns plans off, for prepared
+  statements too.
 
 ### Fixed
 
+- **`lock in share mode` inside a string is no longer rewritten.** The
+  rewrite to `FOR SHARE` replaced the words wherever they were, so `INSERT
+  ... VALUES ('lock in share mode')` stored `for share`. Only the clause is
+  rewritten now.
 - **A negative parameter after a minus no longer starts a comment.**
   `SELECT ?-?` with 3 and -2 became `3--2`, and `--` began a comment: it
   answered 3, without an error. `-?` with -4 failed to parse.
