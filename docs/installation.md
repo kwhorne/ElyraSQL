@@ -17,6 +17,20 @@ ElyraSQL release builds target **Ubuntu 24.04+** and **Apple Silicon macOS
     done, so an interrupted upgrade simply resumes on the next start. **Take a backup
     first, and note that downgrading to 1.4.x afterwards is not supported.**
 
+!!! note "Upgrading to 1.13.1 — negative variables, SQL PREPARE"
+
+    No change to the database file; a 1.13.0 database opens in 1.13.1
+    unchanged.
+
+    - **A negative user variable after a minus answered wrong.** `SET @b =
+      -2; SELECT 3-@b` gave 3 instead of 5, without an error, in earlier
+      versions (1.12.21 and 1.13.0 checked); so did a procedure's local variable or a
+      trigger's `NEW`/`OLD` value after a minus. A trigger or procedure
+      that computed with such a value may have written wrong results.
+    - **SQL-level `PREPARE` / `EXECUTE` / `DEALLOCATE PREPARE`** now work;
+      they share `ELYRASQL_MAX_PREPARED_STMTS` with the binary protocol's
+      prepared statements.
+
 !!! note "Upgrading to 1.13.0 — query plans"
 
     No change to the database file; a 1.12.21 database opens in 1.13.0
@@ -887,8 +901,8 @@ macOS).
 Multi-arch image (`amd64` + `arm64`) on the GitHub Container Registry:
 
 ```bash
-docker pull ghcr.io/kwhorne/elyrasql:1.13.0   # or :latest
-docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.13.0
+docker pull ghcr.io/kwhorne/elyrasql:1.13.1   # or :latest
+docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.13.1
 ```
 
 The image is ~15 MB, runs as a non-root user, stores data in the

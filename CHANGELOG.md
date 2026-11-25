@@ -6,6 +6,11 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.13.1] - 2026-11-25
+
+SQL-level prepared statements, and a fix for negative variables after a
+minus, which answered wrong without an error.
+
 ### Added
 
 - **SQL-level prepared statements**: `PREPARE name FROM 'text' | @var`,
@@ -22,6 +27,14 @@ All notable changes to ElyraSQL are documented here. The format is based on
   `SET @b = -2; SELECT 3-@b` substituted `3--2`, and `--` began a comment:
   it answered 3, without an error. The same held for a procedure's local
   variables and a trigger's `NEW`/`OLD` values.
+
+### Upgrading
+
+- No change to the database file; a 1.13.0 database opens in 1.13.1
+  unchanged.
+- A trigger or procedure that subtracted a negative local variable or
+  `NEW`/`OLD` value (`3-v` with `v = -2`) computed the wrong result in
+  earlier versions; data it wrote may need checking.
 
 ## [1.13.0] - 2026-11-25
 
