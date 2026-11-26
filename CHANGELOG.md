@@ -24,8 +24,8 @@ All notable changes to ElyraSQL are documented here. The format is based on
   value it was copied into each future from `run_statements` down to
   `execute_stmt`: about half of the 18 KB future allocated and copied for
   every statement. That future is now 8.7 KB. In the engine, a primary-key
-  lookup is 9% faster, `firstWhere` 4%, `paginate` 3.6%; the rest within
-  the noise.
+  lookup is 9% faster (0.6 µs), `firstWhere` 4%, `paginate` 3.6%; end to
+  end, where a lookup takes about 33 µs, that is 1-2%, within the noise.
 
 ## [1.13.2] - 2026-11-26
 
