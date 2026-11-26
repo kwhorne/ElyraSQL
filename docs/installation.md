@@ -17,6 +17,13 @@ ElyraSQL release builds target **Ubuntu 24.04+** and **Apple Silicon macOS
     done, so an interrupted upgrade simply resumes on the next start. **Take a backup
     first, and note that downgrading to 1.4.x afterwards is not supported.**
 
+!!! note "Upgrading to 1.13.4"
+
+    No change to the database file; a 1.13.3 database opens in 1.13.4
+    unchanged, and no configuration changes. A SELECT is no longer copied
+    before it runs unless its column qualifiers need rewriting: lookups are
+    8-10% faster in the engine, 1-4% end to end.
+
 !!! note "Upgrading to 1.13.3 — faster planned queries"
 
     No change to the database file; a 1.13.2 database opens in 1.13.3
@@ -928,8 +935,8 @@ macOS).
 Multi-arch image (`amd64` + `arm64`) on the GitHub Container Registry:
 
 ```bash
-docker pull ghcr.io/kwhorne/elyrasql:1.13.3   # or :latest
-docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.13.3
+docker pull ghcr.io/kwhorne/elyrasql:1.13.4   # or :latest
+docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.13.4
 ```
 
 The image is ~15 MB, runs as a non-root user, stores data in the
