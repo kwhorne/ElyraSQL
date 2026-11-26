@@ -1562,7 +1562,7 @@ impl Engine {
             for rows in exec::load_batches(&spec, &content, 50_000) {
                 let stmt = exec::load_insert(&spec, rows)?;
                 for r in self
-                    .run_statements(vec![stmt], privilege, user, sess, None, None)
+                    .run_statements(vec![stmt], privilege, user, sess, None, None, None)
                     .await?
                 {
                     match r {
@@ -1924,6 +1924,7 @@ impl Engine {
             sess,
             update_modifiers,
             dml_limit,
+            None,
         )
         .await
     }
@@ -2057,11 +2058,17 @@ impl Engine {
         if !ok || count != params || seen.iter().any(|s| !s) {
             return None;
         }
+        // A recursive CTE's working relation (`__cte_*`) belongs to the
+        // session running it, not to the schema: such a query is checked
+        // every time.
+        let columns_checked = (matches!(stmt, Statement::Query(_)) && !contains_ci(sql, "__cte_"))
+            .then(std::sync::Arc::default);
         Some(PreparedPlan {
             frontend,
             params,
             ansi_quotes: sess.ansi_quotes(),
             writes: text_statement_writes(&head),
+            columns_checked,
         })
     }
 
@@ -2113,6 +2120,7 @@ impl Engine {
                 sess,
                 update_modifiers,
                 dml_limit,
+                plan.columns_checked.as_deref(),
             )
             .await,
         )
@@ -2296,6 +2304,10 @@ impl Engine {
     /// function rewrites, implicit transactions, materialised-view refreshes and
     /// `ROW_COUNT()` tracking, then execution. Every statement goes through here,
     /// whether parsed from SQL text or built directly (`LOAD DATA`).
+    ///
+    /// `columns_checked`: a plan's record of its query's column check (see
+    /// [`ColumnsChecked`]); `None` checks every time.
+    #[allow(clippy::too_many_arguments)]
     async fn run_statements(
         &self,
         statements: Vec<Statement>,
@@ -2304,6 +2316,7 @@ impl Engine {
         sess: &Session,
         update_modifiers: Option<UpdateModifiers>,
         dml_limit: Option<usize>,
+        columns_checked: Option<&ColumnsChecked>,
     ) -> Result<Vec<QueryResult>> {
         let mut out = Vec::with_capacity(statements.len());
         for stmt in statements {
@@ -2433,6 +2446,7 @@ impl Engine {
                     update_modifiers.as_ref(),
                     dml_limit,
                     statement_transaction,
+                    columns_checked,
                 ))
                 .await;
                 match outcome {
@@ -2482,6 +2496,7 @@ impl Engine {
         update_modifiers: Option<&UpdateModifiers>,
         dml_limit: Option<usize>,
         statement_transaction: bool,
+        columns_checked: Option<&ColumnsChecked>,
     ) -> Result<QueryResult> {
         if statement_transaction {
             sess.begin()?;
@@ -2543,7 +2558,7 @@ impl Engine {
                     _guards.push(lockmgr::transient(&self.locks, &t, mode).await?);
                 }
             }
-            self.execute_stmt(stmt, sess, update_modifiers, dml_limit)
+            self.execute_stmt(stmt, sess, update_modifiers, dml_limit, columns_checked)
                 .await
         }
         .await;
@@ -2626,6 +2641,7 @@ impl Engine {
         sess: &Session,
         update_modifiers: Option<&UpdateModifiers>,
         dml_limit: Option<usize>,
+        columns_checked: Option<&ColumnsChecked>,
     ) -> Result<QueryResult> {
         if matches!(
             stmt,
@@ -2641,8 +2657,15 @@ impl Engine {
                     // evaluator intentionally accepts qualified references on
                     // an unqualified single-table scan, so this preflight is
                     // what prevents an unknown qualifier from degrading into a
-                    // unique bare-column match.
-                    exec::validate_query_columns(sess, &q).await?;
+                    // unique bare-column match. A plan's query passes it once
+                    // per schema (see `ColumnsChecked`).
+                    if !columns_checked.is_some_and(|checked| checked.holds(sess)) {
+                        let tag = catalog::cache_tag();
+                        exec::validate_query_columns(sess, &q).await?;
+                        if let Some(checked) = columns_checked {
+                            checked.record(tag, sess);
+                        }
+                    }
                     exec::select(sess, &self.vindex, &q).await
                 } else {
                     eval::eval_literal_select(&q)
@@ -3068,6 +3091,49 @@ pub struct PreparedPlan {
     params: usize,
     ansi_quotes: bool,
     writes: bool,
+    /// For a SELECT: when its column check last passed. Shared by the clones
+    /// of a plan, as by the sessions that run it from the plan cache.
+    columns_checked: Option<std::sync::Arc<ColumnsChecked>>,
+}
+
+/// When a plan's query last passed the column check `execute_stmt` runs
+/// before a SELECT (`exec::validate_query_columns`): the schema it was
+/// checked against, as the catalog cache tags it, and the session's database,
+/// which resolves its unqualified table names.
+///
+/// The check resolves every column reference against the schemas of the
+/// tables and views the query names, and a parameter is a literal, never a
+/// name: its result is the same for every execution of the plan while that
+/// schema and database are. It cost a point lookup by primary key 4.7 of its
+/// 18 µs, run again on every execution.
+#[derive(Default)]
+pub(crate) struct ColumnsChecked(std::sync::Mutex<Option<(catalog::CacheTag, String)>>);
+
+impl ColumnsChecked {
+    /// Whether the query passed the check against the schema `sess` reads
+    /// now: the current one, through the caches (`schema_cache_ok`: not a
+    /// transaction that wrote schema, or began before a schema change), in
+    /// the same database.
+    fn holds(&self, sess: &Session) -> bool {
+        sess.schema_cache_ok()
+            && self
+                .0
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|(tag, database)| {
+                    *tag == catalog::cache_tag() && sess.database_is(database)
+                })
+    }
+
+    /// The query passed the check, which read the schema at `tag` (taken
+    /// before it): a schema change committed since moved the tag on, so a
+    /// later `holds` checks again.
+    fn record(&self, tag: catalog::CacheTag, sess: &Session) {
+        if sess.schema_cache_ok() {
+            *self.0.lock().unwrap() = Some((tag, sess.database()));
+        }
+    }
 }
 
 /// A parameter literal (as `COM_STMT_EXECUTE` renders it) as the expression

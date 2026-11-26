@@ -506,3 +506,96 @@ fn plain_literals_are_what_the_parser_makes() {
     }
     assert_eq!(fast, 21);
 }
+
+/// A plan's query passes the column check once per schema: a schema change,
+/// a transaction that reads an older schema, or an unknown qualifier gets the
+/// error the text path gives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_column_check_follows_the_schema() {
+    let (e1, s1) = engine().await;
+    let (e2, s2) = engine().await;
+    let same = |text: &'static str| {
+        let (e1, s1, e2, s2) = (&e1, &s1, &e2, &s2);
+        async move {
+            let expected = describe(e1.execute_as(text, Privilege::Admin, "root", s1).await).await;
+            let got = describe(e2.execute_text(text, Privilege::Admin, "root", s2).await).await;
+            assert_eq!(got, expected, "{text}");
+            got
+        }
+    };
+    let both = |sql: &'static str| {
+        let (e1, s1, e2, s2) = (&e1, &s1, &e2, &s2);
+        async move {
+            e1.execute(sql, Privilege::Admin, s1).await.unwrap();
+            e2.execute(sql, Privilege::Admin, s2).await.unwrap();
+        }
+    };
+
+    // Checked, then the column is dropped: the next execution is refused.
+    assert!(!same("SELECT note FROM t WHERE id = 1")
+        .await
+        .starts_with("error"));
+    assert!(!same("SELECT note FROM t WHERE id = 2")
+        .await
+        .starts_with("error"));
+    both("ALTER TABLE t DROP COLUMN note").await;
+    assert!(same("SELECT note FROM t WHERE id = 3")
+        .await
+        .starts_with("error"));
+    both("ALTER TABLE t ADD COLUMN note TEXT").await;
+    assert!(!same("SELECT note FROM t WHERE id = 4")
+        .await
+        .starts_with("error"));
+
+    // An unknown qualifier fails the check every time; the scan alone would
+    // take it as the one column of that name.
+    for text in [
+        "SELECT nope.name FROM t WHERE id = 1",
+        "SELECT nope.name FROM t WHERE id = 2",
+        "SELECT nope.name FROM t WHERE id = 3",
+    ] {
+        assert!(same(text).await.starts_with("error"), "{text}");
+    }
+
+    // A transaction that began before a column was added reads the schema of
+    // its snapshot, which another session's check of the new schema says
+    // nothing about.
+    let r1 = e1.session();
+    let r2 = e2.session();
+    for (e, s, r) in [(&e1, &s1, &r1), (&e2, &s2, &r2)] {
+        e.execute("BEGIN", Privilege::Admin, r).await.unwrap();
+        e.execute("SELECT name FROM t WHERE id = 1", Privilege::Admin, r)
+            .await
+            .unwrap();
+        e.execute("ALTER TABLE t ADD COLUMN extra INT", Privilege::Admin, s)
+            .await
+            .unwrap();
+    }
+    assert!(!same("SELECT extra FROM t WHERE id = 1")
+        .await
+        .starts_with("error"));
+    assert!(!same("SELECT extra FROM t WHERE id = 2")
+        .await
+        .starts_with("error"));
+    let expected = describe(
+        e1.execute_as(
+            "SELECT extra FROM t WHERE id = 3",
+            Privilege::Admin,
+            "root",
+            &r1,
+        )
+        .await,
+    )
+    .await;
+    let got = describe(
+        e2.execute_text(
+            "SELECT extra FROM t WHERE id = 3",
+            Privilege::Admin,
+            "root",
+            &r2,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(got, expected, "in the older transaction");
+}
