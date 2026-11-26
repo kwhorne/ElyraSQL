@@ -9,6 +9,13 @@ drivers connect without modification.
 - **Prepared statements** (`COM_STMT_PREPARE`/`EXECUTE`) — typed parameters
   (including `DATE`/`DATETIME`/`TIME` from the binary protocol), value escaping,
   statement reuse; used by many ORMs and drivers.
+- **`COM_RESET_CONNECTION` and `COM_CHANGE_USER`** — a reset (what a
+  connection pool sends before reusing a connection) starts the session
+  afresh: the open transaction rolled back, user variables, `sql_mode`,
+  `LAST_INSERT_ID`, prepared statements and table locks gone, the user and
+  database kept. A change of user authenticates the new user as the
+  handshake does and gives it a new session; a failed one ends the
+  connection.
 - **SQL-level prepared statements** — `PREPARE name FROM 'text' | @var`,
   `EXECUTE name [USING @a, ...]` and `{DEALLOCATE | DROP} PREPARE name`, with
   MySQL's errors (1243 unknown name, 1210 wrong argument count, 1295 for a

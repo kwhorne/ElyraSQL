@@ -181,6 +181,60 @@ pub enum Command<'a> {
     },
     Ping,
     Quit,
+    ResetConnection,
+    ChangeUser(&'a [u8]),
+}
+
+/// A `COM_CHANGE_USER` request.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ChangeUser {
+    pub username: Vec<u8>,
+    pub auth_response: Vec<u8>,
+    pub db: Option<Vec<u8>>,
+    pub auth_plugin: Vec<u8>,
+}
+
+/// Read a `COM_CHANGE_USER` payload (after the command byte): user, auth
+/// response (length-prefixed with `CLIENT_SECURE_CONNECTION`), database,
+/// character set, auth plugin (with `CLIENT_PLUGIN_AUTH`); connection
+/// attributes are not read. `None` for a malformed one.
+pub fn change_user(i: &[u8], caps: CapabilityFlags) -> Option<ChangeUser> {
+    let nul = |b: &[u8]| b.iter().position(|&c| c == 0);
+    let u = nul(i)?;
+    let username = i[..u].to_vec();
+    let mut rest = &i[u + 1..];
+    let auth_response = if caps.contains(CapabilityFlags::CLIENT_SECURE_CONNECTION) {
+        let n = *rest.first()? as usize;
+        let auth = rest.get(1..1 + n)?.to_vec();
+        rest = &rest[1 + n..];
+        auth
+    } else {
+        let p = nul(rest)?;
+        let auth = rest[..p].to_vec();
+        rest = &rest[p + 1..];
+        auth
+    };
+    let db = match nul(rest) {
+        Some(p) => {
+            let db = rest[..p].to_vec();
+            rest = &rest[p + 1..];
+            db
+        }
+        None => std::mem::take(&mut rest).to_vec(),
+    };
+    // The character set: the session's stays utf8mb4.
+    rest = rest.get(2..).unwrap_or(&[]);
+    let auth_plugin = if caps.contains(CapabilityFlags::CLIENT_PLUGIN_AUTH) {
+        rest[..nul(rest).unwrap_or(rest.len())].to_vec()
+    } else {
+        Vec::new()
+    };
+    Some(ChangeUser {
+        username,
+        auth_response,
+        db: (!db.is_empty()).then_some(db),
+        auth_plugin,
+    })
 }
 
 pub fn execute(i: &[u8]) -> nom::IResult<&[u8], Command<'_>> {
@@ -238,5 +292,67 @@ pub fn parse(i: &[u8]) -> nom::IResult<&[u8], Command<'_>> {
         ),
         map(tag(&[CommandByte::COM_QUIT as u8]), |_| Command::Quit),
         map(tag(&[CommandByte::COM_PING as u8]), |_| Command::Ping),
+        map(tag(&[CommandByte::COM_RESET_CONNECTION as u8]), |_| {
+            Command::ResetConnection
+        }),
+        map(
+            preceded(tag(&[CommandByte::COM_CHANGE_USER as u8]), rest),
+            Command::ChangeUser,
+        ),
     ))(i)
+}
+
+#[cfg(test)]
+mod change_user_tests {
+    use super::*;
+
+    #[test]
+    fn reads_a_change_user_packet() {
+        let caps = CapabilityFlags::CLIENT_PROTOCOL_41
+            | CapabilityFlags::CLIENT_SECURE_CONNECTION
+            | CapabilityFlags::CLIENT_PLUGIN_AUTH;
+        let mut p = b"reader\0".to_vec();
+        p.push(3);
+        p.extend_from_slice(&[1, 0, 2]);
+        p.extend_from_slice(b"elyra\0");
+        p.extend_from_slice(&[0xff, 0x00]);
+        p.extend_from_slice(b"mysql_native_password\0");
+        p.extend_from_slice(&[0x05, 0x01, b'a', 0x01, b'b']);
+        assert_eq!(
+            change_user(&p, caps),
+            Some(ChangeUser {
+                username: b"reader".to_vec(),
+                auth_response: vec![1, 0, 2],
+                db: Some(b"elyra".to_vec()),
+                auth_plugin: b"mysql_native_password".to_vec(),
+            })
+        );
+        // No database, no plugin capability, an old-style auth response.
+        let caps = CapabilityFlags::CLIENT_PROTOCOL_41;
+        assert_eq!(
+            change_user(b"u\0pw\0\0", caps),
+            Some(ChangeUser {
+                username: b"u".to_vec(),
+                auth_response: b"pw".to_vec(),
+                db: None,
+                auth_plugin: Vec::new(),
+            })
+        );
+        // Truncated packets are refused, not read past their end.
+        assert_eq!(change_user(b"u", caps), None);
+        let caps = CapabilityFlags::CLIENT_SECURE_CONNECTION;
+        assert_eq!(change_user(b"u\0\x09ab", caps), None);
+    }
+
+    #[test]
+    fn parses_reset_and_change_user_commands() {
+        assert!(matches!(
+            parse(&[0x1f]).unwrap().1,
+            Command::ResetConnection
+        ));
+        assert!(matches!(
+            parse(&[0x11, b'u', 0]).unwrap().1,
+            Command::ChangeUser(b"u\0")
+        ));
+    }
 }
