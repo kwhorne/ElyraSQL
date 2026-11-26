@@ -17,6 +17,22 @@ ElyraSQL release builds target **Ubuntu 24.04+** and **Apple Silicon macOS
     done, so an interrupted upgrade simply resumes on the next start. **Take a backup
     first, and note that downgrading to 1.4.x afterwards is not supported.**
 
+!!! note "Upgrading to 1.13.2 — COM_CHANGE_USER, COM_RESET_CONNECTION"
+
+    No change to the database file; a 1.13.1 database opens in 1.13.2
+    unchanged.
+
+    - **Security: `COM_CHANGE_USER` did not authenticate.** The client
+      believed it had changed user, while the session kept the first
+      user's privileges and the new password was not checked. The new user
+      is now authenticated as at connect; a wrong password gives 1045 and
+      closes the connection.
+    - **`COM_RESET_CONNECTION` reset nothing.** Connection pools that reset
+      a connection on return (`mysql_async` among them) handed the next
+      user the last one's variables, `sql_mode`, prepared statements, table
+      locks and an open transaction. It now starts the session afresh,
+      keeping the user and database, as MySQL does.
+
 !!! note "Upgrading to 1.13.1 — negative variables, SQL PREPARE"
 
     No change to the database file; a 1.13.0 database opens in 1.13.1
@@ -901,8 +917,8 @@ macOS).
 Multi-arch image (`amd64` + `arm64`) on the GitHub Container Registry:
 
 ```bash
-docker pull ghcr.io/kwhorne/elyrasql:1.13.1   # or :latest
-docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.13.1
+docker pull ghcr.io/kwhorne/elyrasql:1.13.2   # or :latest
+docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.13.2
 ```
 
 The image is ~15 MB, runs as a non-root user, stores data in the

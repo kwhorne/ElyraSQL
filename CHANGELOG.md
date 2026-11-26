@@ -6,6 +6,11 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.13.2] - 2026-11-26
+
+A security fix for `COM_CHANGE_USER`, and `COM_RESET_CONNECTION`, which
+reset nothing.
+
 ### Fixed
 
 - **`COM_CHANGE_USER` authenticates the new user.** It was answered with an
@@ -22,6 +27,17 @@ All notable changes to ElyraSQL are documented here. The format is based on
   prepared statements and table locks -- and an open transaction. It now
   starts the session afresh, keeping the user and the database, as MySQL
   does.
+
+### Upgrading
+
+- No change to the database file; a 1.13.1 database opens in 1.13.2
+  unchanged.
+- **Security:** in earlier versions a client that sent `COM_CHANGE_USER`
+  kept the first user's privileges, and the new user's password was not
+  checked. Upgrade if any client switches accounts on a connection.
+- A pooled connection that a client reset could carry an open transaction
+  into its next use, and a later `COMMIT` there committed the earlier
+  user's writes.
 
 ## [1.13.1] - 2026-11-25
 
