@@ -6,6 +6,12 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.13.3] - 2026-11-26
+
+Faster planned queries: a prepared statement or a text query's shape checks
+its columns once per schema instead of on every execution. Primary-key
+lookups are 5-17% faster end to end with one client.
+
 ### Changed
 
 - **A planned SELECT checks its columns once per schema.** Before a SELECT
@@ -26,6 +32,13 @@ All notable changes to ElyraSQL are documented here. The format is based on
   every statement. That future is now 8.7 KB. In the engine, a primary-key
   lookup is 9% faster (0.6 µs), `firstWhere` 4%, `paginate` 3.6%; end to
   end, where a lookup takes about 33 µs, that is 1-2%, within the noise.
+
+### Upgrading
+
+- No change to the database file; a 1.13.2 database opens in 1.13.3
+  unchanged.
+- No configuration changes. `ELYRASQL_PLAN_CACHE=off` still turns plans off,
+  and the column check with them.
 
 ## [1.13.2] - 2026-11-26
 

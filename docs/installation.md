@@ -17,6 +17,17 @@ ElyraSQL release builds target **Ubuntu 24.04+** and **Apple Silicon macOS
     done, so an interrupted upgrade simply resumes on the next start. **Take a backup
     first, and note that downgrading to 1.4.x afterwards is not supported.**
 
+!!! note "Upgrading to 1.13.3 — faster planned queries"
+
+    No change to the database file; a 1.13.2 database opens in 1.13.3
+    unchanged, and no configuration changes.
+
+    - A prepared statement or a text query's shape now checks its columns
+      once per schema instead of on every execution: primary-key lookups
+      are 5-17% faster end to end with one client. A schema change, another
+      database, or a transaction that began before a schema change checks
+      again.
+
 !!! note "Upgrading to 1.13.2 — COM_CHANGE_USER, COM_RESET_CONNECTION"
 
     No change to the database file; a 1.13.1 database opens in 1.13.2
@@ -917,8 +928,8 @@ macOS).
 Multi-arch image (`amd64` + `arm64`) on the GitHub Container Registry:
 
 ```bash
-docker pull ghcr.io/kwhorne/elyrasql:1.13.2   # or :latest
-docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.13.2
+docker pull ghcr.io/kwhorne/elyrasql:1.13.3   # or :latest
+docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.13.3
 ```
 
 The image is ~15 MB, runs as a non-root user, stores data in the
