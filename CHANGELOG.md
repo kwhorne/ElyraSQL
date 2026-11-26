@@ -6,6 +6,21 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed
+
+- **A planned SELECT checks its columns once per schema.** Before a SELECT
+  runs, every column it names is resolved against the schemas of its tables
+  and views, so an unknown qualifier is refused (1054) instead of matching a
+  column of the same name. A plan (a prepared statement, or a text query's
+  shape) ran that check again on every execution, although its parameters
+  are values and never names: 4.7 of a primary-key lookup's 18 µs in the
+  engine. A plan now records the schema it passed against and checks again
+  only after a schema change, in another database, or in a transaction that
+  changed the schema or began before a change. Through either protocol with
+  one client: point lookups +5-17%, `count(*)` +9-11%, a 10-row range
+  +7-13%, a lookup with two parameters +13-17%; with eight, +5-11%. Writes,
+  which do not take the check, are unchanged.
+
 ## [1.13.2] - 2026-11-26
 
 A security fix for `COM_CHANGE_USER`, and `COM_RESET_CONNECTION`, which

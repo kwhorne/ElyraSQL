@@ -369,6 +369,11 @@ impl Session {
         self.database.lock().unwrap().clone()
     }
 
+    /// Whether the current database is `database`, without copying it.
+    pub fn database_is(&self, database: &str) -> bool {
+        *self.database.lock().unwrap() == database
+    }
+
     pub fn set_database(&self, database: &str) {
         *self.database.lock().unwrap() = database.to_string();
     }
