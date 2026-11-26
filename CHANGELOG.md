@@ -6,6 +6,18 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed
+
+- **A SELECT is copied only when its qualifiers change.** Before running, a
+  SELECT's column qualifiers are normalized (`t.id` to `elyra.t.id`), once
+  before view expansion and once after, and its views expanded; each of the
+  three cloned the whole query first, at 0.39 µs a clone for a primary-key
+  lookup. A read-only walk with the normalizer's own logic now decides
+  whether anything would change or be refused, and the query is copied only
+  then; view expansion copies it only when its FROM names a view. In the
+  engine: lookups +8-10%, `firstWhere` +7-10%, `paginate` +6-11%, `count(*)`
+  +2-4%. End to end, where a lookup takes about 33 µs: +1-4% for reads.
+
 ## [1.13.3] - 2026-11-26
 
 Faster planned queries: a prepared statement or a text query's shape checks

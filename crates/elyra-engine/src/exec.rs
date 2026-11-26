@@ -8001,12 +8001,8 @@ async fn select_inner(
     // into a derived table and changes the applicable qualifier policy.
     let qualifier_normalized;
     let query = if from_has_plain_table(query) {
-        qualifier_normalized = {
-            let mut normalized = query.clone();
-            normalize_query_qualifiers(&mut normalized, &db.database())?;
-            normalized
-        };
-        &qualifier_normalized
+        qualifier_normalized = qualifiers_normalized(query, &db.database())?;
+        &*qualifier_normalized
     } else {
         query
     };
@@ -8019,11 +8015,15 @@ async fn select_inner(
 
     // Expand view references in FROM into derived tables.
     let view_expanded;
-    let query = if from_has_plain_table(query) {
-        view_expanded = expand_views(db, query).await?;
-        &view_expanded
-    } else {
-        query
+    let query = match from_has_plain_table(query) {
+        true => match expand_views(db, query).await? {
+            Some(expanded) => {
+                view_expanded = expanded;
+                &view_expanded
+            }
+            None => query,
+        },
+        false => query,
     };
 
     // Top-level set operations (UNION / INTERSECT / EXCEPT).
@@ -8100,24 +8100,32 @@ async fn select_inner(
 
     // View expansion and derived-only queries can introduce query-scoped
     // relations. Normalize again under those final relation policies.
-    let mut normalized_query = query.clone();
-    normalize_query_qualifiers(&mut normalized_query, &db.database())?;
-    if let SetExpr::Select(select) = normalized_query.body.as_mut() {
-        if let Some(from) = resolve_join_on_subqueries(db, vindex, &select.from).await? {
-            select.from = from;
-        }
+    let mut normalized_query = qualifiers_normalized(query, &db.database())?;
+    if let SetExpr::Select(select) = normalized_query.body.as_ref() {
+        let from = resolve_join_on_subqueries(db, vindex, &select.from).await?;
         // An uncorrelated subquery in HAVING is one value for every group:
         // resolve it once. One that names the grouped row cannot run
         // standalone (1054) and is left for the evaluator to refuse.
-        if let Some(having) = select.having.as_ref().filter(|h| expr_has_subquery(h)) {
-            match resolve_subqueries(db, vindex, having.clone()).await {
-                Ok(resolved) => select.having = Some(resolved),
-                Err(error) if error.mysql_code() == 1054 => {}
+        let having = match select.having.as_ref().filter(|h| expr_has_subquery(h)) {
+            Some(having) => match resolve_subqueries(db, vindex, having.clone()).await {
+                Ok(resolved) => Some(resolved),
+                Err(error) if error.mysql_code() == 1054 => None,
                 Err(error) => return Err(error),
+            },
+            None => None,
+        };
+        if from.is_some() || having.is_some() {
+            if let SetExpr::Select(select) = normalized_query.to_mut().body.as_mut() {
+                if let Some(from) = from {
+                    select.from = from;
+                }
+                if let Some(having) = having {
+                    select.having = Some(having);
+                }
             }
         }
     }
-    let query = &normalized_query;
+    let query: &SqlQuery = &normalized_query;
     let select = match query.body.as_ref() {
         SetExpr::Select(s) => s,
         _ => return Err(Error::Unsupported("only simple SELECT is supported".into())),
@@ -10773,6 +10781,67 @@ fn normalize_query_qualifiers(query: &mut SqlQuery, selected_database: &str) -> 
     match query.visit(&mut normalizer) {
         ControlFlow::Continue(()) => Ok(()),
         ControlFlow::Break(error) => Err(error),
+    }
+}
+
+/// `query` as [`normalize_query_qualifiers`] leaves it, borrowed when the
+/// normalization would change nothing. A SELECT is normalized before and
+/// again after view expansion, and each time it was cloned first: for a
+/// primary-key lookup the clone cost 0.39 µs, the walk 0.1, and the second
+/// normalization almost never changes anything.
+fn qualifiers_normalized<'q>(
+    query: &'q SqlQuery,
+    selected_database: &str,
+) -> Result<std::borrow::Cow<'q, SqlQuery>> {
+    let mut check = QualifierCheck(QualifierNormalizer {
+        selected_database,
+        scopes: Vec::new(),
+    });
+    if query.visit(&mut check).is_continue() {
+        return Ok(std::borrow::Cow::Borrowed(query));
+    }
+    let mut normalized = query.clone();
+    normalize_query_qualifiers(&mut normalized, selected_database)?;
+    Ok(std::borrow::Cow::Owned(normalized))
+}
+
+/// [`QualifierNormalizer`]'s walk, reading only: it breaks at the first
+/// qualifier the normalizer would rewrite or refuse, and runs through when
+/// the normalizer would leave the query as it is.
+struct QualifierCheck<'a>(QualifierNormalizer<'a>);
+
+impl Visitor for QualifierCheck<'_> {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, query: &SqlQuery) -> ControlFlow<Self::Break> {
+        let mut qualifiers = Vec::new();
+        collect_query_relation_qualifiers(&query.body, self.0.selected_database, &mut qualifiers);
+        self.0.scopes.push(qualifiers);
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_query(&mut self, _query: &SqlQuery) -> ControlFlow<Self::Break> {
+        self.0.scopes.pop();
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
+        let Expr::CompoundIdentifier(parts) = expr else {
+            return ControlFlow::Continue(());
+        };
+        if parts
+            .first()
+            .is_some_and(|identifier| identifier.value.starts_with("@@"))
+        {
+            return ControlFlow::Continue(());
+        }
+        let Some((_, prefix)) = parts.split_last() else {
+            return ControlFlow::Continue(());
+        };
+        match self.0.canonical(prefix) {
+            Some(canonical) if canonical.as_slice() == prefix => ControlFlow::Continue(()),
+            _ => ControlFlow::Break(()),
+        }
     }
 }
 
@@ -21649,8 +21718,7 @@ async fn static_query_schema_scoped_inner(
 }
 
 pub(crate) async fn validate_query_columns(db: &Session, query: &SqlQuery) -> Result<()> {
-    let mut normalized = query.clone();
-    normalize_query_qualifiers(&mut normalized, &db.database())?;
+    let normalized = qualifiers_normalized(query, &db.database())?;
     static_query_schema(db, &normalized, None).await.map(|_| ())
 }
 
@@ -21777,7 +21845,25 @@ pub async fn drop_view(db: &Session, name: &str, if_exists: bool) -> Result<Quer
 /// Replace references to views in a query's `FROM` with derived tables backed
 /// by the view's stored SELECT. Nested views expand when the derived subquery
 /// is itself executed.
-async fn expand_views(db: &Session, query: &SqlQuery) -> Result<SqlQuery> {
+/// `query` with the views in its FROM expanded into derived tables; `None`
+/// when it names none, so a query without views is not copied.
+async fn expand_views(db: &Session, query: &SqlQuery) -> Result<Option<SqlQuery>> {
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return Ok(None);
+    };
+    let mut names_view = false;
+    'from: for twj in &select.from {
+        for relation in std::iter::once(&twj.relation).chain(twj.joins.iter().map(|j| &j.relation))
+        {
+            if view_factor(db, relation).await? {
+                names_view = true;
+                break 'from;
+            }
+        }
+    }
+    if !names_view {
+        return Ok(None);
+    }
     let mut q = query.clone();
     if let SetExpr::Select(select) = q.body.as_mut() {
         for twj in &mut select.from {
@@ -21787,7 +21873,23 @@ async fn expand_views(db: &Session, query: &SqlQuery) -> Result<SqlQuery> {
             }
         }
     }
-    Ok(q)
+    Ok(Some(q))
+}
+
+/// Whether [`expand_view_factor`] would expand `tf`: a stored view, not
+/// information_schema or a session's working relation. It fails where that
+/// would, on a name it cannot resolve.
+async fn view_factor(db: &Session, tf: &TableFactor) -> Result<bool> {
+    if information_schema_view(tf).is_some() || names_local_relation(tf) {
+        return Ok(false);
+    }
+    match tf {
+        TableFactor::Table { name, .. } => {
+            let table = stored_table_ident(db, name)?;
+            Ok(catalog::load_view(db, &table).await?.is_some())
+        }
+        _ => Ok(false),
+    }
 }
 
 async fn expand_view_factor(db: &Session, tf: &mut TableFactor) -> Result<()> {
@@ -29009,5 +29111,83 @@ mod composite_join_tests {
                 .filter(|row| !row[1].is_null())
                 .all(|row| row[0] == row[1] && row[2] == Value::Int(1)));
         }
+    }
+}
+
+#[cfg(test)]
+mod qualifier_normalization_tests {
+    use super::*;
+
+    /// `qualifiers_normalized` gives what cloning and normalizing gives: the
+    /// same query, or the same error. The second pass is the case it is for:
+    /// a query normalized once is normalized again after view expansion.
+    #[test]
+    fn borrowing_when_nothing_changes_is_normalizing() {
+        let normalize = |query: &SqlQuery, database: &str| {
+            let mut normalized = query.clone();
+            normalize_query_qualifiers(&mut normalized, database).map(|()| normalized)
+        };
+        // `Query`'s equality ignores source spans, which the normalizer does
+        // not keep for the identifiers it writes and the engine never reads.
+        let same = |got: &Result<SqlQuery>, expected: &Result<SqlQuery>| match (got, expected) {
+            (Ok(got), Ok(expected)) => got == expected,
+            (Err(got), Err(expected)) => got.to_string() == expected.to_string(),
+            _ => false,
+        };
+        let render = |result: &Result<SqlQuery>| match result {
+            Ok(query) => query.to_string(),
+            Err(error) => format!("error: {error}"),
+        };
+        let mut borrowed = 0;
+        for sql in [
+            "SELECT * FROM t WHERE id = 1",
+            "SELECT t.id, t.name FROM t WHERE t.id = 1",
+            "SELECT `t`.`id` FROM `t` WHERE `t`.`id` = 1",
+            "SELECT elyra.t.id FROM elyra.t",
+            "SELECT `elyra`.`t`.`id` FROM `elyra`.`t`",
+            "SELECT other.t.id FROM other.t",
+            "SELECT x.id FROM t AS x WHERE x.id > 2",
+            "SELECT t.id FROM t AS x",
+            "SELECT nope.id FROM t",
+            "SELECT a.id, b.v FROM a JOIN b ON a.id = b.tid WHERE b.v = 'x'",
+            "SELECT t.id FROM elyra.t JOIN other.t ON elyra.t.id = other.t.id",
+            "SELECT t.id FROM elyra.t JOIN (SELECT 1 AS id) AS t ON 1 = 1",
+            "SELECT d.id FROM (SELECT t.id FROM t) AS d",
+            "SELECT elyra.d.id FROM (SELECT id FROM t) AS d",
+            "SELECT id FROM t WHERE id IN (SELECT a.tid FROM a WHERE a.tid = t.id)",
+            "SELECT (SELECT MAX(a.id) FROM a) AS m FROM t",
+            "SELECT @@version, @@session.sql_mode FROM t",
+            "SELECT t.id FROM t UNION SELECT a.id FROM a",
+            "SELECT t.name, COUNT(*) FROM t GROUP BY t.name HAVING COUNT(t.id) > 1 ORDER BY t.name",
+            "SELECT 1",
+            "SELECT t.* FROM t",
+        ] {
+            let query = parse_query(sql).unwrap();
+            for database in ["elyra", "other"] {
+                let once = normalize(&query, database);
+                let got = qualifiers_normalized(&query, database).map(|q| q.into_owned());
+                assert!(
+                    same(&got, &once),
+                    "{sql} in {database}: {} != {}",
+                    render(&got),
+                    render(&once)
+                );
+                let Ok(once) = once else { continue };
+                let twice = normalize(&once, database);
+                let result = qualifiers_normalized(&once, database);
+                if matches!(result, Ok(std::borrow::Cow::Borrowed(_))) {
+                    borrowed += 1;
+                }
+                let got = result.map(|q| q.into_owned());
+                assert!(
+                    same(&got, &twice),
+                    "again: {sql} in {database}: {} != {}",
+                    render(&got),
+                    render(&twice)
+                );
+            }
+        }
+        // The second pass borrows for nearly every query.
+        assert!(borrowed >= 30, "{borrowed}");
     }
 }
