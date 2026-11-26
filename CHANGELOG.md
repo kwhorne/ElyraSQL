@@ -6,6 +6,26 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.13.5] - 2026-11-26
+
+Dependency updates; no change in behaviour or speed.
+
+### Changed
+
+- **Dependencies updated.** `tokio` 1.53.2 → 1.54.1, `ureq` 3.4.2 → 3.5.2
+  (the `ai_embed()` HTTP client), `rustls-pki-types` 1.15.1 → 1.16.0, and
+  patch releases of `regex`, `libc`, `crc32fast`, `anyhow`, `clap`,
+  `serde_json`, `rustix`, `itoa` and `pin-project-lite`; `proptest` 1.12.0
+  for the tests. tokio 1.54 needs Rust 1.85, below the documented minimum
+  of 1.88. Measured end to end against 1.13.4, reads and writes are the
+  same within the noise.
+
+### Upgrading
+
+- No change to the database file; a 1.13.4 database opens in 1.13.5
+  unchanged.
+- No configuration changes.
+
 ## [1.13.4] - 2026-11-26
 
 A SELECT is no longer copied before it runs unless its qualifiers change:
