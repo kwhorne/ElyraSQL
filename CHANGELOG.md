@@ -6,6 +6,11 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.13.4] - 2026-11-26
+
+A SELECT is no longer copied before it runs unless its qualifiers change:
+primary-key lookups are 8-10% faster in the engine, 1-4% end to end.
+
 ### Changed
 
 - **A SELECT is copied only when its qualifiers change.** Before running, a
@@ -17,6 +22,12 @@ All notable changes to ElyraSQL are documented here. The format is based on
   then; view expansion copies it only when its FROM names a view. In the
   engine: lookups +8-10%, `firstWhere` +7-10%, `paginate` +6-11%, `count(*)`
   +2-4%. End to end, where a lookup takes about 33 µs: +1-4% for reads.
+
+### Upgrading
+
+- No change to the database file; a 1.13.3 database opens in 1.13.4
+  unchanged.
+- No configuration changes.
 
 ## [1.13.3] - 2026-11-26
 
