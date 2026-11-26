@@ -20,6 +20,12 @@ All notable changes to ElyraSQL are documented here. The format is based on
   one client: point lookups +5-17%, `count(*)` +9-11%, a 10-row range
   +7-13%, a lookup with two parameters +13-17%; with eight, +5-11%. Writes,
   which do not take the check, are unchanged.
+- **A statement is handed to execution boxed.** It is 1.9 KB, and held by
+  value it was copied into each future from `run_statements` down to
+  `execute_stmt`: about half of the 18 KB future allocated and copied for
+  every statement. That future is now 8.7 KB. In the engine, a primary-key
+  lookup is 9% faster, `firstWhere` 4%, `paginate` 3.6%; the rest within
+  the noise.
 
 ## [1.13.2] - 2026-11-26
 
