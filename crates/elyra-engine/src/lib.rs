@@ -2320,7 +2320,11 @@ impl Engine {
     ) -> Result<Vec<QueryResult>> {
         let mut out = Vec::with_capacity(statements.len());
         for stmt in statements {
-            let mut stmt = stmt;
+            // Boxed: a statement is 1.9 KB, and held by value it was copied
+            // into each future down to execution -- this one, the attempt and
+            // `execute_stmt` -- about half of the 18 KB the attempt's future
+            // allocated and copied for every statement.
+            let mut stmt = Box::new(stmt);
             // Resolve session-backed functions before execution because the
             // stateless evaluator cannot read connection state.
             let database = sess.database();
@@ -2488,7 +2492,7 @@ impl Engine {
     #[allow(clippy::too_many_arguments)]
     async fn run_statement_attempt(
         &self,
-        stmt: Statement,
+        stmt: Box<Statement>,
         sess: &Session,
         privilege: Privilege,
         user: &str,
@@ -2637,19 +2641,19 @@ impl Engine {
 
     async fn execute_stmt(
         &self,
-        stmt: Statement,
+        stmt: Box<Statement>,
         sess: &Session,
         update_modifiers: Option<&UpdateModifiers>,
         dml_limit: Option<usize>,
         columns_checked: Option<&ColumnsChecked>,
     ) -> Result<QueryResult> {
         if matches!(
-            stmt,
+            *stmt,
             Statement::Insert(_) | Statement::Update { .. } | Statement::Delete(_)
         ) {
             check_subquery_targets(sess, &stmt).await?;
         }
-        match stmt {
+        match *stmt {
             Statement::Query(q) => {
                 if query_has_from(&q) {
                     // Resolve columns against the same structured schemas used
