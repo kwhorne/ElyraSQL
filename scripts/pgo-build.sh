@@ -95,6 +95,13 @@ require_cmd() {
 PROFDATA_BIN="$(find_profdata)"
 require_cmd python3
 require_cmd mysql
+# The Python benchmarks below are most of the training. They run with
+# `|| true`, so without pymysql each one failed at its import and training
+# went on without them: release builds were trained on the SQL dumps alone.
+if ! python3 -c "import pymysql" 2>/dev/null; then
+  echo "ERROR: python3 cannot import pymysql (pip install pymysql); training needs it" >&2
+  exit 1
+fi
 
 if [[ ! -d "$TRAIN_SQL_DIR" ]] || [[ -z "$(ls -A "$TRAIN_SQL_DIR"/*.sql 2>/dev/null)" ]]; then
   echo "ERROR: no training SQL dumps found in $TRAIN_SQL_DIR" >&2
@@ -108,7 +115,13 @@ rm -rf "$PROFRAW_DIR" "$PROFDATA" "$TRAIN_DATA_DIR"
 mkdir -p "$PROFRAW_DIR" "$TRAIN_DATA_DIR"
 
 echo "==> [1/4] instrumented build"
-RUSTFLAGS="-Cprofile-generate=$PROFRAW_DIR" cargo build --profile dist --locked ${TARGET_ARGS[@]+"${TARGET_ARGS[@]}"} -p elyra-cli
+GEN_FLAGS="-Cprofile-generate=$PROFRAW_DIR"
+# macOS: link without dead stripping, which drops the profile records of
+# functions the release build still has (see scripts/link-keeping-profiles.sh).
+if [[ "$TARGET" == *-apple-darwin || ( -z "$TARGET" && "$(uname -s)" == Darwin ) ]]; then
+  GEN_FLAGS="$GEN_FLAGS -Clinker=$ROOT/scripts/link-keeping-profiles.sh"
+fi
+RUSTFLAGS="$GEN_FLAGS" cargo build --profile dist --locked ${TARGET_ARGS[@]+"${TARGET_ARGS[@]}"} -p elyra-cli
 
 # ---- stage 2: training ------------------------------------------------------
 

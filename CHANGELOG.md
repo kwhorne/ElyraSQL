@@ -6,6 +6,25 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **Release builds are trained on the whole PGO workload.** The training's
+  OLTP, OLAP and late-materialisation benchmarks need `pymysql`, which the
+  release workflow never installed. Each one failed at its import, and every
+  release since PGO came in (#63) was trained on the four SQL dumps alone.
+  The workflow installs it in a venv now, and `scripts/pgo-build.sh` stops
+  if it is missing instead of training without it.
+- **macOS release builds have profile data for every function.** ld64's
+  dead stripping dropped the profile records of functions inlined
+  everywhere in the instrumented build, about 5,000 of them, and 191
+  functions of the release build had no profile data. Among them were
+  `Storage::apply_validated_batch` and `QualifierNormalizer::post_visit_query`.
+  The instrumented build is linked without `-dead_strip` now
+  (`scripts/link-keeping-profiles.sh`), and 0 functions are left without
+  data. Measured on macOS against the 1.13.5 binary, with both fixes:
+  `ORDER BY ... LIMIT` +6-9%. Point lookups, joins, inserts and `DISTINCT`
+  are the same within the noise.
+
 ## [1.13.5] - 2026-11-26
 
 Dependency updates; no change in behaviour or speed.
