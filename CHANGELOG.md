@@ -6,6 +6,10 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.13.6] - 2026-11-27
+
+Release binaries built from complete PGO profiles; no change in behaviour.
+
 ### Fixed
 
 - **Release builds are trained on the whole PGO workload.** The training's
@@ -24,6 +28,14 @@ All notable changes to ElyraSQL are documented here. The format is based on
   data. Measured on macOS against the 1.13.5 binary, with both fixes:
   `ORDER BY ... LIMIT` +6-9%. Point lookups, joins, inserts and `DISTINCT`
   are the same within the noise.
+- Both concern the release binaries (the `.tar.gz` downloads). The Docker
+  image is built without PGO, as before.
+
+### Upgrading
+
+- No change to the database file; a 1.13.5 database opens in 1.13.6
+  unchanged.
+- No configuration changes.
 
 ## [1.13.5] - 2026-11-26
 
