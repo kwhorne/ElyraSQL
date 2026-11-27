@@ -2177,6 +2177,8 @@ mod tests {
     /// lease, and a reconnect that stalled had no deadline at all.
     #[tokio::test]
     async fn silent_peers_cost_one_deadline_not_one_each() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        crate::test_env::set_env("ELYRASQL_CLUSTER_SECRET", None);
         // Listeners that are never accepted from: the connection is made, and
         // nothing is ever answered.
         let mut silent = Vec::new();
@@ -2237,6 +2239,10 @@ mod tests {
     /// round, which goes on without it while it is still being waited for.
     #[tokio::test]
     async fn a_round_commits_on_a_majority_without_waiting_for_a_silent_peer() {
+        // The fake follower answers no handshake: with a cluster secret set by
+        // another test, the leader would wait its deadline for a nonce.
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        crate::test_env::set_env("ELYRASQL_CLUSTER_SECRET", None);
         let answering = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let peers = vec![
