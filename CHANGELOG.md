@@ -6,6 +6,23 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed
+
+- **Point reads under concurrency no longer hand off their thread.** A
+  primary-key or index lookup reads on the worker that runs the query; on the
+  multi-threaded runtime that went through `block_in_place`, which gives the
+  worker's core to another thread and wakes one, on every read. While other
+  reads are in progress, it now reads straight on the worker. A read with no
+  other in progress keeps the handoff: one connection on Linux in a VM was
+  2.6x slower without it, so one connection answers as before.
+
+  Linux arm64 (OrbStack, clients in the same container), queries per second:
+  point lookups at 8 / 32 / 128 connections 15% / 48% / 116% more, index
+  lookups at 32 connections 58%, point lookups mixed with single-row INSERTs
+  at 32 / 128 connections 19% / 31%. macOS: point lookups at 8 / 32 / 128
+  connections 14% / 9% / 51% more, index lookups at 32 connections 51%. One
+  connection unchanged on both.
+
 ## [1.13.7] - 2026-11-27
 
 Faster results of more than a few rows; no change in behaviour.

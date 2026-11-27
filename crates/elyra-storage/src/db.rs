@@ -1108,16 +1108,42 @@ impl Db {
     }
 }
 
-/// Run a short read on this thread. On the multi-threaded runtime the worker
-/// first hands its other tasks to the rest (`block_in_place`): read straight
-/// on the worker, 32 connections of point lookups were 9% slower on Linux, as
-/// a read waiting on a lock in redb held up every task queued behind it. The
-/// blocking pool, which all reads went through before, cost a thread handoff
-/// each way: point lookups are 1.25x faster on one connection without it.
+/// Point reads in progress through [`read_in_place`], across the process.
+static READS_IN_PLACE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Run a short read on this thread, never on the blocking pool: a handoff to
+/// a pool thread and back cost more than the read (point lookups are 1.25x
+/// faster on one connection without it).
+///
+/// While other reads are in progress, it reads straight on the worker. On the
+/// multi-threaded runtime, `block_in_place` gives the worker's core to another
+/// thread and wakes one for it, on every read; under concurrency that handoff
+/// was the cost. Point lookups at 32 connections were 1.5x as fast without it
+/// on Linux arm64 (2.2x at 128), 1.1x on macOS.
+///
+/// A read with no other in progress still goes through `block_in_place`. One
+/// connection on Linux in a VM (OrbStack) answered 2.6x slower read straight
+/// on the worker, in five of six rounds, and 32 connections through its port
+/// forwarding 10% slower -- where the extra wakeup appears to keep the VM's
+/// CPUs from going idle between queries. Kept for a lone read, one connection
+/// answers as before on every setup measured.
 pub fn read_in_place<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
+    use std::sync::atomic::Ordering;
+    struct InProgress;
+    impl Drop for InProgress {
+        fn drop(&mut self) {
+            READS_IN_PLACE.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
     match tokio::runtime::Handle::try_current() {
         Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
-            tokio::task::block_in_place(f)
+            let alone = READS_IN_PLACE.fetch_add(1, Ordering::Relaxed) == 0;
+            let _in_progress = InProgress;
+            if alone {
+                tokio::task::block_in_place(f)
+            } else {
+                f()
+            }
         }
         _ => f(),
     }
