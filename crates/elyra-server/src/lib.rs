@@ -1171,7 +1171,13 @@ fn write_cell<W: AsyncWrite + Send + Unpin>(
         // Decimal and JSON both use length-encoded binary values in the MySQL
         // binary protocol, just as text/vector result values do.
         ColumnType::Text | ColumnType::Vector(_) | ColumnType::Decimal(_, _) | ColumnType::Json => {
-            rw.write_col(v.to_wire_string())
+            match v {
+                // Written from the value itself: `to_wire_string` copied every
+                // text cell into a new `String` first. The bytes are the same
+                // (`String` and `str` both encode as their bytes).
+                Value::Text(s) | Value::Json(s) => rw.write_col(s.as_str()),
+                _ => rw.write_col(v.to_wire_string()),
+            }
         }
     }
 }

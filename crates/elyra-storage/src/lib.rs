@@ -54,6 +54,13 @@ pub struct Snapshot {
     rtx: Arc<ReadTransaction>,
 }
 
+/// The values [`Snapshot::scan_range_values`] read, in key order, and the key
+/// of the last of them (`None` when there were none).
+pub struct ValueChunk {
+    pub values: Vec<Vec<u8>>,
+    pub last_key: Option<Vec<u8>>,
+}
+
 impl Snapshot {
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let t = self
@@ -163,6 +170,43 @@ impl Snapshot {
             }
         }
         Ok(out)
+    }
+
+    /// As [`scan_range`](Self::scan_range), but returns only the values, and the
+    /// last key read -- where a scan resumes. A scan that needs no other key
+    /// does not copy one out per row.
+    pub fn scan_range_values(
+        &self,
+        start: &[u8],
+        end: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<ValueChunk> {
+        use std::ops::Bound;
+        let t = self
+            .rtx
+            .open_table(KV)
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        let upper = match end {
+            Some(e) => Bound::Excluded(e),
+            None => Bound::Unbounded,
+        };
+        let mut out = Vec::with_capacity(limit.min(1024));
+        let mut last = None;
+        for item in t
+            .range::<&[u8]>((Bound::Included(start), upper))
+            .map_err(|e| Error::Storage(e.to_string()))?
+        {
+            let (k, v) = item.map_err(|e| Error::Storage(e.to_string()))?;
+            out.push(v.value().to_vec());
+            last = Some(k);
+            if out.len() >= limit {
+                break;
+            }
+        }
+        Ok(ValueChunk {
+            values: out,
+            last_key: last.map(|k| k.value().to_vec()),
+        })
     }
 
     /// Streaming ordered scan over `[start, end)` within this snapshot, invoking

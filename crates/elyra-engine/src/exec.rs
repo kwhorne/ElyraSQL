@@ -8654,10 +8654,7 @@ async fn select_inner(
                     let blobs = db.multi_get(keys).await?;
                     let mut rows = Vec::with_capacity(blobs.len());
                     for bytes in blobs.into_iter().flatten() {
-                        rows.push(
-                            bincode::deserialize::<Vec<Value>>(&bytes)
-                                .map_err(|e| Error::Storage(e.to_string()))?,
-                        );
+                        rows.push(rowdec::decode_row(&bytes)?);
                     }
                     // Order the candidate set by exact distance for a clean top-k.
                     sort_full_rows(&mut rows, &def.schema, &resolved, &db.cancel_token())?;
@@ -9163,10 +9160,7 @@ async fn select_inner(
             .map(|(_, r)| r)
             .collect();
         apply_offset_limit(&mut rows, offset, limit);
-        let out: Vec<Vec<Value>> = rows
-            .iter()
-            .map(|r| projection.iter().map(|&i| r[i].clone()).collect())
-            .collect();
+        let out = project_rows(rows, &projection);
         return Ok(QueryResult::Rows(RowStream::literal(out_schema, out)));
     }
 
@@ -9176,13 +9170,11 @@ async fn select_inner(
     if db.in_txn() {
         let mut rows = scan_rows(db, &def, filter.as_ref()).await?;
         apply_offset_limit(&mut rows, offset, limit);
-        let out: Vec<Vec<Value>> = rows
-            .iter()
-            .map(|r| projection.iter().map(|&i| r[i].clone()).collect())
-            .collect();
+        let out = project_rows(rows, &projection);
         return Ok(QueryResult::Rows(RowStream::literal(out_schema, out)));
     }
 
+    let needed = scan_needed_mask(&def.schema, filter.as_ref(), &projection);
     Ok(QueryResult::Rows(RowStream::scan(
         db.raw_db(),
         &def,
@@ -9190,6 +9182,7 @@ async fn select_inner(
             projection,
             out_schema,
             filter,
+            needed,
             offset,
             limit,
         },
@@ -11665,9 +11658,7 @@ async fn lookup_rows_by_eq(
     col: usize,
     value: &Value,
 ) -> Result<Vec<Vec<Value>>> {
-    let deser = |b: Vec<u8>| -> Result<Vec<Value>> {
-        bincode::deserialize(&b).map_err(|e| Error::Storage(e.to_string()))
-    };
+    let deser = |b: Vec<u8>| -> Result<Vec<Value>> { rowdec::decode_row(&b) };
     if def.pk_cols == [col] {
         let key = data_key(
             &def.storage_name(),
@@ -11698,6 +11689,10 @@ async fn lookup_rows_by_eq(
 /// Keys first, rows later: an `IN` list can be unioned and size-checked against the
 /// index-range budget while it is still cheap, so abandoning a too-wide list costs
 /// only the key lookups.
+///
+/// For the primary key this is the key the row would have, whether or not it
+/// exists: the caller's fetch skips a key with no row. Reading each row here
+/// only to see that it exists read every row twice.
 async fn lookup_keys_by_eq(
     db: &Session,
     def: &TableDef,
@@ -11709,12 +11704,7 @@ async fn lookup_keys_by_eq(
             &def.storage_name(),
             &keyenc::encode_coll(value, def.collation_of(col))?,
         );
-        // The primary key identifies at most one row, but it still has to exist.
-        return Ok(if db.get(key.clone()).await?.is_some() {
-            vec![key]
-        } else {
-            Vec::new()
-        });
+        return Ok(vec![key]);
     }
     let Some(idx) = index::index_on(def, col) else {
         return Ok(Vec::new());
@@ -12220,8 +12210,7 @@ async fn clustered_range(
             })
             .unwrap();
         for (k, v) in batch {
-            let row = bincode::deserialize(&v).map_err(|e| Error::Storage(e.to_string()))?;
-            out.push((k, row));
+            out.push((k, rowdec::decode_row(&v)?));
         }
         if last {
             break;
@@ -12256,10 +12245,7 @@ async fn index_range(
     let mut out = Vec::new();
     for (k, blob) in data_keys.into_iter().zip(blobs) {
         if let Some(b) = blob {
-            out.push((
-                k,
-                bincode::deserialize(&b).map_err(|e| Error::Storage(e.to_string()))?,
-            ));
+            out.push((k, rowdec::decode_row(&b)?));
         }
     }
     Ok(Some(out))
@@ -15916,6 +15902,17 @@ async fn collect_matches_inner(
             None => Ok(true),
         }
     };
+    // The paths below that test many rows compile the filter once (column
+    // references to indexes, literals to values) instead of interpreting the
+    // AST for every row; `CExpr` returns what the interpreter returns. A lookup
+    // that tests one row keeps `recheck`, as compiling costs about one test.
+    let compile = || filter.map(|f| CExpr::compile(f, &def.schema));
+    let passes = |compiled: &Option<CExpr>, row: &[Value]| -> Result<bool> {
+        match compiled {
+            Some(c) => c.matches(&def.schema, row),
+            None => Ok(true),
+        }
+    };
 
     // Full-text fast path: a MATCH(col) AGAINST(...) conjunct on a column with a
     // FULLTEXT index -> fetch candidates from the inverted index (union of the
@@ -16052,13 +16049,12 @@ async fn collect_matches_inner(
         if !over_budget {
             // One batched read for the whole list rather than one per value.
             let blobs = db.multi_get(keys.clone()).await?;
+            let compiled = compile();
             for (k, blob) in keys.into_iter().zip(blobs) {
                 let Some(b) = blob else { continue };
                 let row: Vec<Value> = rowdec::decode_row(&b)?;
-                if let Some(f) = filter {
-                    if !predicate::matches(f, &def.schema, &row)? {
-                        continue;
-                    }
+                if !passes(&compiled, &row)? {
+                    continue;
                 }
                 out.push((k, row));
                 if let Some(l) = limit {
@@ -16080,8 +16076,9 @@ async fn collect_matches_inner(
     if let Some(query) = composite_range_bounds(def, filter)? {
         let budget = index_range_budget(db, def).await?;
         if let Some(candidates) = composite_index_range(db, def, &query, budget).await? {
+            let compiled = compile();
             for (key, row) in candidates {
-                if recheck(&row)? {
+                if passes(&compiled, &row)? {
                     out.push((key, row));
                     if limit.is_some_and(|limit| out.len() >= limit) {
                         return Ok(Some(out));
@@ -16110,11 +16107,10 @@ async fn collect_matches_inner(
             index_range(db, def, idx, &rq, budget).await?
         };
         if let Some(candidates) = candidates {
+            let compiled = compile();
             for (k, row) in candidates {
-                if let Some(f) = filter {
-                    if !predicate::matches(f, &def.schema, &row)? {
-                        continue;
-                    }
+                if !passes(&compiled, &row)? {
+                    continue;
                 }
                 out.push((k, row));
                 if let Some(l) = limit {
@@ -16131,6 +16127,7 @@ async fn collect_matches_inner(
     }
 
     let prefix = def.data_prefix();
+    let compiled = compile();
     let mut cursor: Option<Vec<u8>> = None;
     loop {
         let chunk = db.scan_batch(prefix.clone(), cursor.clone(), 4096).await?;
@@ -16141,11 +16138,7 @@ async fn collect_matches_inner(
         cursor = chunk.last().map(|(k, _)| k.clone());
         for (k, v) in chunk {
             let row: Vec<Value> = rowdec::decode_row(&v)?;
-            let keep = match filter {
-                Some(f) => predicate::matches(f, &def.schema, &row)?,
-                None => true,
-            };
-            if keep {
+            if passes(&compiled, &row)? {
                 out.push((k, row));
                 if let Some(l) = limit {
                     if out.len() >= l {
@@ -17415,10 +17408,7 @@ async fn lookup_child_rows(
         let mut out = Vec::new();
         for (k, b) in data_keys.into_iter().zip(blobs) {
             if let Some(bytes) = b {
-                out.push((
-                    k,
-                    bincode::deserialize(&bytes).map_err(|e| Error::Storage(e.to_string()))?,
-                ));
+                out.push((k, rowdec::decode_row(&bytes)?));
             }
         }
         return Ok(out);
@@ -26576,6 +26566,29 @@ fn order_probe_mask(
     Some(mask)
 }
 
+/// The columns a streaming scan decodes: those it projects and those its filter
+/// reads. `None` -- decode every column -- when the filter has a form
+/// `collect_col_refs` cannot resolve.
+fn scan_needed_mask(
+    schema: &Schema,
+    filter: Option<&Expr>,
+    projection: &[usize],
+) -> Option<Vec<bool>> {
+    let mut refs = projection.to_vec();
+    if let Some(f) = filter {
+        if !collect_col_refs(f, schema, &mut refs) {
+            return None;
+        }
+    }
+    let mut mask = vec![false; schema.columns.len()];
+    for i in refs {
+        if i < mask.len() {
+            mask[i] = true;
+        }
+    }
+    Some(mask)
+}
+
 /// The set of columns an aggregation reads: filter + group-by + aggregate
 /// arguments. `None` means "couldn't determine statically -> decode all".
 fn agg_needed_mask(schema: &Schema, filter: Option<&Expr>, plan: &AggPlan) -> Option<Vec<bool>> {
@@ -26704,6 +26717,37 @@ async fn scan_rows(db: &Session, def: &TableDef, filter: Option<&Expr>) -> Resul
         .into_iter()
         .map(|(_, r)| r)
         .collect())
+}
+
+/// Project owned rows onto `projection` (row indexes, one per output column).
+///
+/// The rows are the caller's, so values are moved out rather than cloned -- a
+/// text column was copied once per row -- and a projection of every column in
+/// table order (`SELECT *`) hands the rows back as they are. A column projected
+/// twice is cloned for its later uses. Panics, as indexing did, on a row shorter
+/// than a projected index.
+fn project_rows(rows: Vec<Vec<Value>>, projection: &[usize]) -> Vec<Vec<Value>> {
+    let identity = projection.iter().enumerate().all(|(n, &i)| n == i);
+    let unique = {
+        let mut seen = projection.to_vec();
+        seen.sort_unstable();
+        seen.windows(2).all(|w| w[0] != w[1])
+    };
+    rows.into_iter()
+        .map(|mut r| {
+            if identity && r.len() == projection.len() {
+                return r;
+            }
+            if unique {
+                projection
+                    .iter()
+                    .map(|&i| std::mem::replace(&mut r[i], Value::Null))
+                    .collect()
+            } else {
+                projection.iter().map(|&i| r[i].clone()).collect()
+            }
+        })
+        .collect()
 }
 
 fn apply_offset_limit(rows: &mut Vec<Vec<Value>>, offset: usize, limit: Option<usize>) {

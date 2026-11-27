@@ -3178,7 +3178,7 @@ pub(crate) fn against_integer_column(
     }
 }
 
-fn is_column_ref(e: &Expr) -> bool {
+pub(crate) fn is_column_ref(e: &Expr) -> bool {
     match e {
         Expr::Nested(inner) => is_column_ref(inner),
         Expr::Identifier(id) => !id.value.starts_with('@'),
