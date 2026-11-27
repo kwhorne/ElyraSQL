@@ -40,6 +40,20 @@ pub(crate) enum CExpr {
         operand: Box<CExpr>,
         negated: bool,
     },
+    /// `operand [NOT] IN (items)` where every item is a constant or NULL, so
+    /// each is evaluated once here instead of once per row. Each item is kept
+    /// as evaluated and as an integer column compares it (see
+    /// `predicate::against_integer_column`), which depends on the operand's
+    /// value and so is chosen per row.
+    InList {
+        operand: Box<CExpr>,
+        /// Whether the operand is a column reference: only then does an
+        /// integer operand compare the items as integers.
+        column: bool,
+        items: Vec<(Value, Value)>,
+        collation: Collation,
+        negated: bool,
+    },
     /// No compiled form: evaluated by the interpreter.
     Ast(Box<Expr>),
 }
@@ -114,6 +128,11 @@ impl CExpr {
                 operand: Box::new(CExpr::compile(e, schema)),
                 negated: true,
             },
+            Expr::InList {
+                expr: operand,
+                list,
+                negated,
+            } => compile_in_list(expr, operand, list, *negated, schema),
             _ => ast(expr),
         }
     }
@@ -138,6 +157,35 @@ impl CExpr {
             CExpr::IsNull { operand, negated } => Ok(Value::Bool(
                 operand.eval(schema, row)?.is_null() != *negated,
             )),
+            CExpr::InList {
+                operand,
+                column,
+                items,
+                collation,
+                negated,
+            } => {
+                // As `predicate::eval_row` evaluates `Expr::InList`.
+                let v = operand.eval(schema, row)?;
+                if v.is_null() {
+                    return Ok(Value::Null);
+                }
+                let as_integer = *column && matches!(v, Value::Int(_) | Value::UInt(_));
+                let mut saw_null = false;
+                for (value, integer) in items {
+                    let rv = if as_integer { integer } else { value };
+                    if rv.is_null() {
+                        saw_null = true;
+                        continue;
+                    }
+                    if v.compare_coll(rv, *collation) == Some(std::cmp::Ordering::Equal) {
+                        return Ok(Value::Bool(!*negated));
+                    }
+                }
+                if saw_null {
+                    return Ok(Value::Null);
+                }
+                Ok(Value::Bool(*negated))
+            }
             CExpr::Ast(e) => predicate::eval_row(e, schema, row),
         }
     }
@@ -165,6 +213,54 @@ fn integer_column_constant(column: &CExpr, constant: &Expr, compiled: &mut CExpr
     }
     if let Ok(value) = predicate::eval_row(constant, schema, &[]) {
         *compiled = CExpr::Lit(predicate::int_constant(value));
+    }
+}
+
+/// Compile `operand [NOT] IN (list)` when every item is a constant or NULL and
+/// evaluates without error; otherwise the interpreter keeps it (a row-tuple
+/// operand, a column or expression in the list, or an item that would fail --
+/// which the interpreter reports only when it reaches that item).
+fn compile_in_list(
+    whole: &Expr,
+    operand: &Expr,
+    list: &[Expr],
+    negated: bool,
+    schema: &Schema,
+) -> CExpr {
+    if matches!(operand, Expr::Tuple(_)) {
+        return ast(whole);
+    }
+    let mut items = Vec::with_capacity(list.len());
+    for item in list {
+        let constant = predicate::is_constant(item);
+        let null = matches!(item, Expr::Value(sqlparser::ast::Value::Null));
+        if !constant && !null {
+            return ast(whole);
+        }
+        let Ok(value) = predicate::eval_row(item, schema, &[]) else {
+            return ast(whole);
+        };
+        // `against_integer_column` converts only a constant item.
+        let integer = if constant {
+            predicate::int_constant(value.clone())
+        } else {
+            value.clone()
+        };
+        items.push((value, integer));
+    }
+    // The column's collation, or an explicit COLLATE on either side, as the
+    // interpreter picks it: the first item whose comparison is not `Ci`.
+    let collation = list
+        .iter()
+        .map(|item| cmp_collation(operand, item, schema))
+        .find(|c| *c != Collation::Ci)
+        .unwrap_or(Collation::Ci);
+    CExpr::InList {
+        operand: Box::new(CExpr::compile(operand, schema)),
+        column: predicate::is_column_ref(operand),
+        items,
+        collation,
+        negated,
     }
 }
 
@@ -217,6 +313,7 @@ mod tests {
         let sch = schema();
         let rows = [
             vec![Value::Int(3), Value::Float(2.5), Value::Text("Abc".into())],
+            vec![Value::Int(-3), Value::Float(0.0), Value::Text("x".into())],
             vec![Value::Null, Value::Float(-1.0), Value::Text("abc".into())],
             vec![Value::Int(i64::MAX), Value::Null, Value::Null],
             vec![Value::Int(0), Value::Float(0.0), Value::Text("".into())],
@@ -242,6 +339,22 @@ mod tests {
             "CONCAT(s, 'x')",    // function: interpreted fallback
             "a BETWEEN 1 AND 5", // interpreted fallback
             "a IN (1, 3, NULL)",
+            "a IN (1, 3)",
+            "a NOT IN (1, 3)",
+            "a NOT IN (1, NULL)",
+            "a IN ('3', '3.0', ' 3')", // integer column against text constants
+            "a IN (3.0, 2.5)",
+            "a IN (-3, +0)",
+            "f IN (2.5, 0)",
+            "f IN ('2.5')",
+            "s IN ('abc', 'x')", // case-insensitive
+            "s IN ('abc' COLLATE utf8mb4_bin)",
+            "s NOT IN ('ABC', NULL)",
+            "a + 0 IN (3, 0)", // not a column reference: no integer conversion
+            "a IN (f, 3)",     // a column in the list: interpreted fallback
+            "a IN (1 + 2)",    // an expression in the list: interpreted fallback
+            "(a, f) IN ((3, 2.5))",
+            "nope IN (1, 2)",
             "(a)",
             "nope + 1", // unknown column: same error
             "a & 6",
@@ -256,6 +369,20 @@ mod tests {
                 assert_eq!(got, want, "{c} on {row:?}");
             }
         }
+    }
+
+    /// A list of constants is compiled -- the point of it: the interpreter
+    /// evaluated every item for every row -- and anything else is not.
+    #[test]
+    fn in_lists_of_constants_compile() {
+        let sch = schema();
+        let compiled = |sql: &str| matches!(CExpr::compile(&expr(sql), &sch), CExpr::InList { .. });
+        assert!(compiled("a IN (1, 3, NULL)"));
+        assert!(compiled("a NOT IN ('3', -4)"));
+        assert!(compiled("s IN ('abc')"));
+        assert!(!compiled("a IN (f, 3)"));
+        assert!(!compiled("a IN (1 + 2)"));
+        assert!(!compiled("(a, f) IN ((3, 2.5))"));
     }
 
     #[test]

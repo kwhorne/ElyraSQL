@@ -57,6 +57,11 @@ struct Scan {
     projection_unique: bool,
     /// The WHERE clause, compiled once for the scan (see `crate::cexpr`).
     filter: Option<CExpr>,
+    /// The columns to decode (projected or read by the filter); the others
+    /// stay `Null`. `None` decodes every column.
+    needed: Option<Vec<bool>>,
+    /// The decoded row, reused from one row to the next.
+    buf: Vec<Value>,
     offset: usize,
     limit: Option<usize>,
     done: bool,
@@ -67,6 +72,10 @@ pub struct ScanSpec {
     pub projection: Vec<usize>,
     pub out_schema: Schema,
     pub filter: Option<Expr>,
+    /// The columns the projection and the filter read, by row index; the scan
+    /// decodes only these. `None` decodes every column -- what a filter whose
+    /// column references cannot be resolved statically must have.
+    pub needed: Option<Vec<bool>>,
     pub offset: usize,
     pub limit: Option<usize>,
 }
@@ -162,6 +171,8 @@ impl RowStream {
                     .filter
                     .as_ref()
                     .map(|f| CExpr::compile(f, &table.schema)),
+                needed: spec.needed,
+                buf: Vec::new(),
                 offset: spec.offset,
                 limit: spec.limit,
                 done: false,
@@ -273,8 +284,11 @@ impl Scan {
                 None => self.prefix.clone(),
             };
             let (snapshot, end) = (self.snapshot.clone(), self.end.clone());
-            let chunk = tokio::task::spawn_blocking(move || {
-                snapshot.scan_range(&from, Some(&end), SCAN_CHUNK)
+            let elyra_storage::ValueChunk {
+                values: chunk,
+                last_key,
+            } = tokio::task::spawn_blocking(move || {
+                snapshot.scan_range_values(&from, Some(&end), SCAN_CHUNK)
             })
             .await
             .map_err(|e| Error::Storage(format!("scan task failed: {e}")))??;
@@ -282,12 +296,23 @@ impl Scan {
             if chunk.len() < SCAN_CHUNK {
                 self.done = true;
             }
-            if let Some((last_key, _)) = chunk.last() {
-                self.cursor = Some(last_key.clone());
+            if last_key.is_some() {
+                self.cursor = last_key;
             }
 
-            for (_, value) in chunk {
-                let row: Vec<Value> = crate::rowdec::decode_row(&value)?;
+            // Each row decodes into the one buffer, only the columns the query
+            // reads; the output row takes its values out of it.
+            let mut row = std::mem::take(&mut self.buf);
+            for value in chunk {
+                match &self.needed {
+                    Some(mask) => crate::rowdec::decode_projected_into(
+                        &value,
+                        self.full_schema.columns.len(),
+                        mask,
+                        &mut row,
+                    )?,
+                    None => row = crate::rowdec::decode_row(&value)?,
+                }
 
                 // WHERE
                 if let Some(f) = &self.filter {
@@ -301,17 +326,18 @@ impl Scan {
                     continue;
                 }
 
-                out.push(self.project(row));
+                out.push(self.project(&mut row));
 
                 // LIMIT
                 if let Some(l) = self.limit.as_mut() {
                     *l -= 1;
                     if *l == 0 {
                         self.done = true;
-                        return Ok(out);
+                        break;
                     }
                 }
             }
+            self.buf = row;
         }
 
         Ok(out)
@@ -320,7 +346,7 @@ impl Scan {
     /// The output row. The decoded row is this scan's own, so its values are
     /// moved rather than cloned -- a text column used to be copied once per
     /// row -- unless a column is projected more than once.
-    fn project(&self, mut row: Vec<Value>) -> Vec<Value> {
+    fn project(&self, row: &mut [Value]) -> Vec<Value> {
         if self.projection_unique {
             self.projection
                 .iter()

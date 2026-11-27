@@ -6,6 +6,28 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed
+
+- **Less work per row in results of more than a few rows.** Measured against
+  MySQL 8.4 on the same machine, one round trip already costs the same
+  (`COM_PING`, `SELECT 1`); ElyraSQL lost on the rows. The gap is narrower now:
+  - A WHERE that is re-checked on many rows (an `IN` list, a range, a scan
+    the indexes do not cover) is compiled once instead of interpreted per
+    row, and an `IN` list of constants is compiled too: the interpreter
+    evaluated every item of the list for every row.
+  - `col IN (…)` on the primary key read every row twice, once to see that
+    it exists and once to fetch it; it is read once.
+  - A table scan decodes only the columns the query reads, into one buffer,
+    and copies no key per row; a range on the primary key decodes with the
+    row decoder instead of bincode's generic one, and a projection moves its
+    values instead of cloning them. Text cells go to the wire without being
+    copied into a new string first.
+
+  End to end on one connection (macOS / Linux arm64): an `IN` list of 100
+  primary keys 67% / 72% faster, 2 000 rows by a primary-key range 33% / 23%,
+  100 rows 12% / 21%, a 100 000-row scan 19-32% / 12-19%. A single-row lookup
+  is unchanged.
+
 ## [1.13.6] - 2026-11-27
 
 Release binaries built from complete PGO profiles; no change in behaviour.
