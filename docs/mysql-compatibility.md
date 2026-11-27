@@ -25,7 +25,7 @@ drivers connect without modification.
 - **Authentication** — `mysql_native_password` by **default** (widest driver
   compatibility), with `caching_sha2_password` available opt-in (see below).
 - **TLS** — clients may negotiate SSL.
-- **Handshake** — reports a MySQL-looking version, e.g. `8.0.12-ElyraSQL-1.13.6`,
+- **Handshake** — reports a MySQL-looking version, e.g. `8.0.12-ElyraSQL-1.13.7`,
   and answers the session/introspection queries clients send on connect
   (`SELECT @@version_comment`, `SELECT VERSION()`, `SET ...`,
   `SHOW VARIABLES/STATUS/COLLATION/DATABASES/TABLE STATUS`, and the

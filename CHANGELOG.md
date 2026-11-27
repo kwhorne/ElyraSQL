@@ -6,6 +6,10 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.13.7] - 2026-11-27
+
+Faster results of more than a few rows; no change in behaviour.
+
 ### Changed
 
 - **Less work per row in results of more than a few rows.** Measured against
@@ -27,6 +31,12 @@ All notable changes to ElyraSQL are documented here. The format is based on
   primary keys 67% / 72% faster, 2 000 rows by a primary-key range 33% / 23%,
   100 rows 12% / 21%, a 100 000-row scan 19-32% / 12-19%. A single-row lookup
   is unchanged.
+
+### Upgrading
+
+- No change to the database file; a 1.13.6 database opens in 1.13.7
+  unchanged.
+- No configuration changes.
 
 ## [1.13.6] - 2026-11-27
 
