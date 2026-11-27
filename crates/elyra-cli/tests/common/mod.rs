@@ -487,14 +487,47 @@ impl Cluster {
             .join(format!("{}-{}", self.name, std::process::id()))
     }
 
-    fn keep_logs(&self) {
+    /// How long each node's log is: where the test had got to.
+    fn log_ends(&self) -> Vec<usize> {
+        self.nodes
+            .iter()
+            .map(|n| {
+                std::fs::metadata(self.dir.join(format!("n{}.log", n.id)))
+                    .map_or(0, |m| m.len() as usize)
+            })
+            .collect()
+    }
+
+    /// Keep the logs, each marked at `ends` (see [`Cluster::log_ends`]):
+    /// what follows the mark was logged while the cluster was torn down.
+    /// Killing one node makes the others log it -- a leader whose follower
+    /// went away reports the transfer to it as refused -- and the kept logs
+    /// were once read as if that were part of the failure.
+    fn keep_logs(&self, ends: &[usize]) {
         let to = self.kept_logs();
         if std::fs::create_dir_all(&to).is_err() {
             return;
         }
-        for n in &self.nodes {
+        for (n, &end) in self.nodes.iter().zip(ends) {
             let f = format!("n{}.log", n.id);
-            let _ = std::fs::copy(self.dir.join(&f), to.join(&f));
+            let Ok(log) = std::fs::read(self.dir.join(&f)) else {
+                continue;
+            };
+            // A line being written at the end belongs before the mark.
+            let mut end = end.min(log.len());
+            if end > 0 && log[end - 1] != b'\n' {
+                end = log[end..]
+                    .iter()
+                    .position(|&b| b == b'\n')
+                    .map_or(log.len(), |i| end + i + 1);
+            }
+            let mut kept = log[..end].to_vec();
+            kept.extend_from_slice(
+                b"--- the test failed here; what follows was logged as the cluster was torn \
+                  down (nodes are killed in id order) ---\n",
+            );
+            kept.extend_from_slice(&log[end..]);
+            let _ = std::fs::write(to.join(&f), kept);
         }
         let refusals: String = self
             .refusals
@@ -509,11 +542,12 @@ impl Cluster {
 
 impl Drop for Cluster {
     fn drop(&mut self) {
+        let ends = std::thread::panicking().then(|| self.log_ends());
         for id in self.running() {
             self.kill(id);
         }
-        if std::thread::panicking() {
-            self.keep_logs();
+        if let Some(ends) = ends {
+            self.keep_logs(&ends);
         }
         #[cfg(unix)]
         for n in &self.nodes {
