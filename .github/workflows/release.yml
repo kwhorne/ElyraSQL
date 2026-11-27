@@ -108,6 +108,14 @@ jobs:
           MACOSX_DEPLOYMENT_TARGET: ${{ matrix.platform == 'macos' && '11.0' || '' }}
         run: |
           rustup component add llvm-tools-preview
+          # The training's Python benchmarks need pymysql. Without it each
+          # one failed at its import, and every release since PGO came in
+          # was trained on the SQL dumps alone; pgo-build.sh now stops
+          # instead. A venv: the runners' system Pythons refuse a plain
+          # `pip install` (PEP 668) on some images.
+          python3 -m venv "$PGO_DIR/venv"
+          "$PGO_DIR/venv/bin/pip" install --quiet pymysql
+          export PATH="$PGO_DIR/venv/bin:$PATH"
           mkdir -p "$PGO_DIR/training-sql"
           python3 scripts/generate-training-sql.py --all --rows 50000 --output-dir "$PGO_DIR/training-sql"
           # The same --target as the build that uses the profile: without it
