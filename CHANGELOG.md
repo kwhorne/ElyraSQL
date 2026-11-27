@@ -6,6 +6,10 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.13.8] - 2026-11-27
+
+Faster point lookups under concurrency; no change in behaviour.
+
 ### Changed
 
 - **Point reads under concurrency no longer hand off their thread.** A
@@ -22,6 +26,12 @@ All notable changes to ElyraSQL are documented here. The format is based on
   at 32 / 128 connections 19% / 31%. macOS: point lookups at 8 / 32 / 128
   connections 14% / 9% / 51% more, index lookups at 32 connections 51%. One
   connection unchanged on both.
+
+### Upgrading
+
+- No change to the database file; a 1.13.7 database opens in 1.13.8
+  unchanged.
+- No configuration changes.
 
 ## [1.13.7] - 2026-11-27
 
