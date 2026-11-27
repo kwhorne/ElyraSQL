@@ -596,18 +596,7 @@ pub async fn applied_lsn(db: &Db) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The guards and handshake helpers read process-global env vars; serialize
-    /// the tests that touch them so parallel test threads cannot observe each
-    /// other's mutations. Async mutex because the guard is held across `.await`.
-    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-    fn set_env(key: &str, value: Option<&str>) {
-        match value {
-            Some(v) => std::env::set_var(key, v),
-            None => std::env::remove_var(key),
-        }
-    }
+    use crate::test_env::{set_env, ENV_LOCK};
 
     /// Run the endpoint's startup guard and cancel it right after a successful
     /// bind (the accept loop runs until cancelled).

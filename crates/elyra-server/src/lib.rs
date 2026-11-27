@@ -27,6 +27,8 @@ mod observ;
 mod prepared;
 pub mod raftlog;
 pub mod repl;
+#[cfg(test)]
+mod test_env;
 
 pub use auth::Auth;
 pub use observ::{AuditLog, Metrics, ProcRegistry};
