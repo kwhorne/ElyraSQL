@@ -121,6 +121,47 @@ fn map_collation(name: &ObjectName) -> elyra_core::Collation {
         .unwrap_or_default()
 }
 
+/// A column's collation as MySQL picks it: its own `COLLATE`, else the default
+/// one of its own `CHARACTER SET`, else -- for a text column -- the table's.
+fn column_collation(
+    explicit: Option<elyra_core::Collation>,
+    options: &[ColumnOption],
+    ty: &ColumnType,
+    table: elyra_core::Collation,
+) -> elyra_core::Collation {
+    explicit
+        .or_else(|| options.iter().rev().find_map(option_collation))
+        .unwrap_or(if *ty == ColumnType::Text {
+            table
+        } else {
+            elyra_core::Collation::default()
+        })
+}
+
+/// The MySQL name a collation is shown as.
+fn collation_name(collation: elyra_core::Collation) -> &'static str {
+    match collation {
+        elyra_core::Collation::Bin => "utf8mb4_bin",
+        elyra_core::Collation::Ci => "utf8mb4_0900_ai_ci",
+    }
+}
+
+/// Record `table`'s own collation (see `catalog::tblcollation_key`).
+pub async fn set_table_collation(
+    db: &Session,
+    table: &str,
+    collation: elyra_core::Collation,
+) -> Result<()> {
+    let key = catalog::tblcollation_key(table);
+    match collation {
+        elyra_core::Collation::Bin => {
+            db.commit_write(vec![(key, b"bin".to_vec())], Vec::new())
+                .await
+        }
+        elyra_core::Collation::Ci => db.commit_write(Vec::new(), vec![key]).await,
+    }
+}
+
 /// Escape regex metacharacters so a literal string can be embedded in a pattern
 /// (used to build the SET-membership CHECK).
 fn regex_escape(s: &str) -> String {
@@ -540,6 +581,7 @@ pub async fn create_table(
             catalog::colwidth_key as fn(&str) -> Vec<u8>,
             catalog::coldecl_key,
             catalog::tblcomment_key,
+            catalog::tblcollation_key,
         ] {
             if let Some(value) = db.get(key(&sname)).await? {
                 puts.push((key(&name), value));
@@ -555,6 +597,13 @@ pub async fn create_table(
         return create_table_as(db, vindex, &name, &ct, q).await;
     }
 
+    // The table's collation, which its text columns take unless they name
+    // one (kept by `strip_create_table_options` when it compares exactly).
+    let table_collation = ct
+        .collation
+        .as_deref()
+        .map(elyra_core::Collation::from_name)
+        .unwrap_or_default();
     let mut columns = Vec::with_capacity(ct.columns.len());
     let mut declarations = Vec::with_capacity(ct.columns.len());
     let mut col_meta: Vec<ColMeta> = Vec::with_capacity(ct.columns.len());
@@ -588,11 +637,15 @@ pub async fn create_table(
         checks.extend(member_check(&col.name.value, &col.data_type));
         let mut nullable = true;
         let mut meta = ColMeta::default();
-        let collation = col
-            .collation
-            .as_ref()
-            .map(map_collation)
-            .unwrap_or_default();
+        let collation = column_collation(
+            col.collation.as_ref().map(map_collation),
+            &col.options
+                .iter()
+                .map(|option| option.option.clone())
+                .collect::<Vec<_>>(),
+            &ty,
+            table_collation,
+        );
         for opt in &col.options {
             match &opt.option {
                 ColumnOption::NotNull => nullable = false,
@@ -827,7 +880,7 @@ pub async fn create_table(
     };
     // Written unconditionally: a table re-created under a name that previously
     // had widths must not inherit them.
-    let puts = vec![
+    let mut puts = vec![
         (catalog_key(&name), def.encode()?),
         (
             catalog::colwidth_key(&name),
@@ -838,6 +891,10 @@ pub async fn create_table(
             bincode::serialize(&declarations).map_err(|e| Error::Storage(e.to_string()))?,
         ),
     ];
+    // Kept for the columns added later (DROP removes it).
+    if table_collation == elyra_core::Collation::Bin {
+        puts.push((catalog::tblcollation_key(&name), b"bin".to_vec()));
+    }
     db.commit_write(puts, table_trigger_keys(db, &name).await?)
         .await?;
     Ok(QueryResult::Affected(0))
@@ -1944,25 +2001,26 @@ pub async fn show_table_status(db: &Session, pattern: Option<&str>) -> Result<Qu
             Value::Null
         };
         let comment = catalog::load_table_comment(db, &n).await?;
+        let collation = collation_name(catalog::load_table_collation(db, &n).await?);
         rows.push(vec![
-            Value::Text(n),                           // Name
-            Value::Text("InnoDB".into()),             // Engine
-            Value::Text("10".into()),                 // Version
-            Value::Text("Dynamic".into()),            // Row_format
-            Value::Text(nrows),                       // Rows
-            Value::Text("0".into()),                  // Avg_row_length
-            Value::Text("0".into()),                  // Data_length
-            Value::Text("0".into()),                  // Max_data_length
-            Value::Text("0".into()),                  // Index_length
-            Value::Text("0".into()),                  // Data_free
-            auto_increment,                           // Auto_increment
-            Value::Null,                              // Create_time
-            Value::Null,                              // Update_time
-            Value::Null,                              // Check_time
-            Value::Text("utf8mb4_0900_ai_ci".into()), // Collation
-            Value::Null,                              // Checksum
-            Value::Text(String::new()),               // Create_options
-            Value::Text(comment),                     // Comment
+            Value::Text(n),                // Name
+            Value::Text("InnoDB".into()),  // Engine
+            Value::Text("10".into()),      // Version
+            Value::Text("Dynamic".into()), // Row_format
+            Value::Text(nrows),            // Rows
+            Value::Text("0".into()),       // Avg_row_length
+            Value::Text("0".into()),       // Data_length
+            Value::Text("0".into()),       // Max_data_length
+            Value::Text("0".into()),       // Index_length
+            Value::Text("0".into()),       // Data_free
+            auto_increment,                // Auto_increment
+            Value::Null,                   // Create_time
+            Value::Null,                   // Update_time
+            Value::Null,                   // Check_time
+            Value::Text(collation.into()), // Collation
+            Value::Null,                   // Checksum
+            Value::Text(String::new()),    // Create_options
+            Value::Text(comment),          // Comment
         ]);
     }
     Ok(QueryResult::Rows(RowStream::literal(schema, rows)))
@@ -2439,6 +2497,12 @@ pub async fn show_create_table(db: &Session, name: &str) -> Result<QueryResult> 
             quoted_name(&c.name),
             declaration.column_type.to_ascii_uppercase()
         );
+        // A text column's collation when it is not the default, as MySQL
+        // writes it; a dump left it out, and the column came back
+        // case-insensitive.
+        if c.ty == ColumnType::Text && c.collation == elyra_core::Collation::Bin {
+            s.push_str(" COLLATE utf8mb4_bin");
+        }
         if !c.nullable {
             s.push_str(" NOT NULL");
         }
@@ -2525,6 +2589,9 @@ pub async fn show_create_table(db: &Session, name: &str) -> Result<QueryResult> 
         if next > 1 {
             ddl.push_str(&format!(" AUTO_INCREMENT={next}"));
         }
+    }
+    if catalog::load_table_collation(db, name).await? == elyra_core::Collation::Bin {
+        ddl.push_str(" DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin");
     }
     let comment = catalog::load_table_comment(db, name).await?;
     if !comment.is_empty() {
@@ -3199,6 +3266,7 @@ async fn information_schema(
                     Value::Null
                 };
                 let comment = catalog::load_table_comment(db, &n).await?;
+                let table_collation = collation_name(catalog::load_table_collation(db, &n).await?);
                 rows.push(vec![
                     Value::Text(database.clone()),
                     Value::Text(n),
@@ -3212,7 +3280,7 @@ async fn information_schema(
                     Value::Int(0),
                     Value::Int(0),
                     Value::Text(comment),
-                    Value::Text("utf8mb4_0900_ai_ci".into()),
+                    Value::Text(table_collation.into()),
                     auto_increment,
                     Value::Text(String::new()),
                 ]);
@@ -3260,7 +3328,9 @@ async fn information_schema(
                 for (i, c) in def.schema.columns.iter().enumerate() {
                     let declaration = column_declaration(declarations.as_ref(), c, i);
                     let meta = def.meta(i);
-                    let is_text = matches!(c.ty, ColumnType::Text | ColumnType::Json);
+                    // A JSON column has neither collation nor character set
+                    // in MySQL.
+                    let is_text = c.ty == ColumnType::Text;
                     let collation = match (is_text, c.collation) {
                         (true, elyra_core::Collation::Bin) => Value::Text("utf8mb4_bin".into()),
                         (true, _) => Value::Text("utf8mb4_0900_ai_ci".into()),
@@ -4765,11 +4835,16 @@ async fn alter_change_column(
     let declared_type = declaration_from_data_type(data_type)?;
     let old_ty = def.schema.columns[i].ty.clone();
     let old_collation = def.schema.columns[i].collation;
-    let new_collation = options
-        .iter()
-        .rev()
-        .find_map(option_collation)
-        .unwrap_or(old_collation);
+    // A text column redefined without a collation takes the table's, as in
+    // MySQL -- but a primary-key column keeps its own: its rows would have to
+    // move to new keys, which is not supported (see below).
+    let new_collation = match options.iter().rev().find_map(option_collation) {
+        Some(named) => named,
+        None if new_ty == ColumnType::Text && !def.pk_cols.contains(&i) => {
+            catalog::load_table_collation(db, &def.name).await?
+        }
+        None => old_collation,
+    };
     if def.pk_cols.contains(&i) && new_ty != old_ty {
         return Err(Error::Unsupported(
             "cannot change the type of a primary key column".into(),
@@ -4830,22 +4905,31 @@ async fn alter_change_column(
                     .collect();
             }
         }
-        rebuild_indexes_for_column(db, def, i).await?;
+        rebuild_indexes_for_columns(db, def, &[i]).await?;
     }
     adjust_widths(db, &def.name, i, WidthOp::Set(declared_int_bits(data_type))).await?;
     adjust_declarations(db, &def.name, i, DeclarationOp::Set(declared_type)).await?;
     Ok(())
 }
 
-async fn rebuild_indexes_for_column(db: &Session, def: &TableDef, column: usize) -> Result<()> {
+/// Rebuild the indexes on `columns` after their collation changed, and write
+/// `def`. A unique index that two rows now share a value of is MySQL's 1062,
+/// and nothing is written: rebuilt anyway, one row's entry replaced the
+/// other's, and lookups by that value found only one of them.
+async fn rebuild_indexes_for_columns(
+    db: &Session,
+    def: &TableDef,
+    columns: &[usize],
+) -> Result<()> {
     let indexes = def
         .indexes
         .iter()
-        .filter(|index| index.cols.contains(&column))
+        .filter(|index| index.cols.iter().any(|column| columns.contains(column)))
         .cloned()
         .collect::<Vec<_>>();
+    let mut puts = vec![(catalog_key(&def.name), def.encode()?)];
     if indexes.is_empty() {
-        return Ok(());
+        return db.commit_write(puts, Vec::new()).await;
     }
 
     let index_names = indexes
@@ -4854,16 +4938,73 @@ async fn rebuild_indexes_for_column(db: &Session, def: &TableDef, column: usize)
         .collect::<Vec<_>>();
     let deletes = collect_index_entry_keys(db, &def.name, &index_names).await?;
 
-    let indexed_def = TableDef {
-        indexes,
-        ..def.clone()
-    };
     let rows = collect_matches(db, def, None, None).await?;
-    let mut puts = vec![(catalog_key(&def.name), def.encode()?)];
-    for (key, row) in rows {
-        puts.extend(index::entries_for_row(&indexed_def, &row, &key)?);
+    let mut seen = std::collections::HashSet::new();
+    for index in &indexes {
+        let one = TableDef {
+            indexes: vec![index.clone()],
+            ..def.clone()
+        };
+        for (key, row) in &rows {
+            for entry in index::entries_for_row(&one, row, key)? {
+                if index.unique && !seen.insert(entry.0.clone()) {
+                    let value = index
+                        .cols
+                        .iter()
+                        .map(|&c| row[c].to_wire_string().unwrap_or_else(|| "NULL".into()))
+                        .collect::<Vec<_>>()
+                        .join("-");
+                    return Err(Error::Duplicate(
+                        DuplicateError::Entry,
+                        format!(
+                            "Duplicate entry '{value}' for key '{}.{}'",
+                            def.name, index.name
+                        ),
+                    ));
+                }
+                puts.push(entry);
+            }
+        }
     }
     db.commit_write(puts, deletes).await
+}
+
+/// `ALTER TABLE ... CONVERT TO CHARACTER SET cs [COLLATE c]`: every text column
+/// to `collation`, and the table's own collation with them, as in MySQL. A
+/// primary-key column it would change is refused, as `MODIFY` refuses it.
+pub async fn convert_table_collation(
+    db: &Session,
+    table: &str,
+    collation: elyra_core::Collation,
+) -> Result<()> {
+    let mut def = catalog::load(db, table).await?;
+    let changed = (0..def.schema.columns.len())
+        .filter(|&i| {
+            def.schema.columns[i].ty == ColumnType::Text
+                && def.schema.columns[i].collation != collation
+        })
+        .collect::<Vec<_>>();
+    if changed.iter().any(|i| def.pk_cols.contains(i)) {
+        return Err(Error::Unsupported(
+            "cannot change the collation of a primary key column".into(),
+        ));
+    }
+    if !changed.is_empty() {
+        for &i in &changed {
+            def.schema.columns[i].collation = collation;
+        }
+        let schema_collations = def
+            .schema
+            .columns
+            .iter()
+            .map(|column| column.collation)
+            .collect::<Vec<_>>();
+        for index in &mut def.indexes {
+            index.col_collations = index.cols.iter().map(|&c| schema_collations[c]).collect();
+        }
+        rebuild_indexes_for_columns(db, &def, &changed).await?;
+    }
+    set_table_collation(db, table, collation).await
 }
 
 /// `ALTER COLUMN ... SET/DROP DEFAULT | SET/DROP NOT NULL | SET DATA TYPE`.
@@ -5250,21 +5391,20 @@ async fn alter_add_column(
     }
     ensure_col_meta(def);
     let new_column = def.schema.columns.len();
+    let collation = column_collation(
+        col.collation.as_ref().map(map_collation),
+        &col.options
+            .iter()
+            .map(|option| option.option.clone())
+            .collect::<Vec<_>>(),
+        &ty,
+        catalog::load_table_collation(db, &def.name).await?,
+    );
     def.schema.columns.push(ColumnDef {
         name: col.name.value.clone(),
         ty: ty.clone(),
         nullable,
-        collation: col
-            .collation
-            .as_ref()
-            .map(map_collation)
-            .or_else(|| {
-                col.options
-                    .iter()
-                    .rev()
-                    .find_map(|option| option_collation(&option.option))
-            })
-            .unwrap_or_default(),
+        collation,
         qualifier: Vec::new(),
         result_metadata: Default::default(),
     });
@@ -5597,6 +5737,7 @@ async fn alter_rename_table(db: &Session, def: &mut TableDef, new: &str) -> Resu
         catalog::colwidth_key as fn(&str) -> Vec<u8>,
         catalog::coldecl_key,
         catalog::tblcomment_key,
+        catalog::tblcollation_key,
     ] {
         let old_key = key(&old);
         if let Some(value) = db.get(old_key.clone()).await? {
@@ -27267,6 +27408,7 @@ async fn table_delete_keys(db: &Session, name: &str) -> Result<Vec<Vec<u8>>> {
         catalog::colwidth_key(name),
         catalog::coldecl_key(name),
         catalog::tblcomment_key(name),
+        catalog::tblcollation_key(name),
         partmeta_key(name),
         stats_key(name),
     ];

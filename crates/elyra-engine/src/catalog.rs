@@ -519,6 +519,20 @@ pub fn tblcomment_key(table: &str) -> Vec<u8> {
     format!("tblcomment::{table}").into_bytes()
 }
 
+/// A table's collation when it compares exactly (`b"bin"`); absent for the
+/// default, `utf8mb4_0900_ai_ci`.
+pub fn tblcollation_key(table: &str) -> Vec<u8> {
+    format!("tblcollation::{table}").into_bytes()
+}
+
+/// `table`'s own collation, which its text columns take unless they name one.
+pub async fn load_table_collation(db: &Session, table: &str) -> Result<elyra_core::Collation> {
+    Ok(match db.get(tblcollation_key(table)).await? {
+        Some(bytes) if bytes == b"bin" => elyra_core::Collation::Bin,
+        _ => elyra_core::Collation::Ci,
+    })
+}
+
 /// `table`'s comment, or `""` when it has none, as MySQL shows it.
 pub async fn load_table_comment(db: &Session, table: &str) -> Result<String> {
     Ok(db

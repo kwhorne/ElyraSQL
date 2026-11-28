@@ -6,17 +6,23 @@
 //! t comment = '...'` for `$table->comment()` and `auto_increment = 100` for
 //! `->from(100)`, phpMyAdmin dumps `ALTER TABLE t MODIFY ... AUTO_INCREMENT,
 //! AUTO_INCREMENT=5` -- and `CREATE TABLE` drops them before parsing (see
-//! `strip_create_table_options`). Two of them carry meaning here and are kept:
-//! `AUTO_INCREMENT`, the next value the counter hands out, and `COMMENT`. The
-//! rest name a storage engine, a character set, a row format or an InnoDB
-//! tuning knob: there is one engine, text is utf8mb4, and the table's own
-//! collation does not reach its columns here, so they change nothing.
+//! `strip_create_table_options`). Three of them carry meaning here and are
+//! kept: `AUTO_INCREMENT`, the next value the counter hands out; `COMMENT`;
+//! and the table's collation (`COLLATE`, or a `CHARSET`'s default one), which
+//! its text columns take unless they name their own. The rest name a storage
+//! engine, a row format or an InnoDB tuning knob, and change nothing: there is
+//! one engine. `ALTER TABLE ... CONVERT TO CHARACTER SET` is read here too.
+//!
+//! A `CREATE TABLE`'s collation is not applied afterwards like the others:
+//! `strip_create_table_options` keeps it in a spelling sqlparser reads, so the
+//! columns take it as they are made.
 //!
 //! An option this does not know makes the whole text "not table options", so
 //! the statement goes on to the parser and fails there rather than losing it.
 
 use crate::indexddl::{tokens, Tok};
 use crate::sqllex::split_top_level;
+use elyra_core::Collation;
 
 /// The table options that change anything here.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -25,13 +31,35 @@ pub(crate) struct TableOptions {
     pub auto_increment: Option<u64>,
     /// `COMMENT = '...'`, unquoted; an empty comment removes it, as in MySQL.
     pub comment: Option<String>,
+    /// The table's collation: `COLLATE = c`, or else the default collation of
+    /// `[DEFAULT] CHARSET = cs`. Its text columns that name neither take it.
+    pub collation: Option<Collation>,
+    /// `CONVERT TO CHARACTER SET cs [COLLATE c]`: every text column, and the
+    /// table, to this collation.
+    pub convert: Option<Collation>,
 }
 
 impl TableOptions {
-    /// Whether any option needs applying.
+    /// Whether a CREATE TABLE has options to apply once the table exists (its
+    /// collation is applied as the columns are made; see `create_table`).
     pub fn any(&self) -> bool {
         self.auto_increment.is_some() || self.comment.is_some()
     }
+
+    /// Fold in the options of another specification of the same statement.
+    fn merge(&mut self, other: TableOptions) {
+        self.auto_increment = other.auto_increment.or(self.auto_increment);
+        self.comment = other.comment.or(self.comment.take());
+        self.collation = other.collation.or(self.collation);
+        self.convert = other.convert.or(self.convert);
+    }
+}
+
+/// The collation `name` -- a collation, or a character set standing for its
+/// default one -- comes to: `binary`, `_bin` and `_cs` compare exactly, the
+/// rest as `utf8mb4_0900_ai_ci` (see `Collation::from_name`).
+fn collation_named(name: &str) -> Collation {
+    Collation::from_name(name)
 }
 
 /// `text` read as a run of table options -- separated by spaces or commas --
@@ -58,6 +86,16 @@ pub(crate) fn parse(text: &str) -> Option<TableOptions> {
             _ => None,
         }
     };
+    // A value's text: a word without backticks, a string without its quotes.
+    let text_at = |at: usize| -> Option<String> {
+        match toks.get(at)? {
+            Tok::Word(w) => Some(w.text.trim_matches('`').to_string()),
+            Tok::Other(start, end) => unquote(&text[*start..*end]),
+            Tok::Eq => None,
+        }
+    };
+    let mut charset: Option<String> = None;
+    let mut collate: Option<String> = None;
     while i < toks.len() {
         if let Tok::Other(start, end) = &toks[i] {
             if &text[*start..*end] == "," {
@@ -74,9 +112,42 @@ pub(crate) fn parse(text: &str) -> Option<TableOptions> {
                 _ => return None,
             },
             "character" => match word(i + 1).as_deref() {
-                Some("set") => value(i + 2)?.1,
+                Some("set") => {
+                    let (at, next) = value(i + 2)?;
+                    charset = Some(text_at(at)?);
+                    next
+                }
                 _ => return None,
             },
+            "charset" => {
+                let (at, next) = value(i + 1)?;
+                charset = Some(text_at(at)?);
+                next
+            }
+            "collate" => {
+                let (at, next) = value(i + 1)?;
+                collate = Some(text_at(at)?);
+                next
+            }
+            // `CONVERT TO {CHARACTER SET | CHARSET} cs [COLLATE c]`.
+            "convert" => {
+                let at = match (word(i + 1).as_deref(), word(i + 2).as_deref()) {
+                    (Some("to"), Some("charset")) => i + 3,
+                    (Some("to"), Some("character")) if word(i + 3).as_deref() == Some("set") => {
+                        i + 4
+                    }
+                    _ => return None,
+                };
+                let (cs, mut next) = value(at)?;
+                let mut target = collation_named(&text_at(cs)?);
+                if word(next).as_deref() == Some("collate") {
+                    let (c, after) = value(next + 1)?;
+                    target = collation_named(&text_at(c)?);
+                    next = after;
+                }
+                out.convert = Some(target);
+                next
+            }
             "auto_increment" => {
                 let (at, next) = value(i + 1)?;
                 out.auto_increment = Some(word(at)?.parse().ok()?);
@@ -90,7 +161,7 @@ pub(crate) fn parse(text: &str) -> Option<TableOptions> {
                 out.comment = Some(unquote(&text[*start..*end])?);
                 next
             }
-            "charset" | "collate" | "engine" | "row_format" | "insert_method"
+            "engine" | "row_format" | "insert_method"
             | "stats_auto_recalc" | "stats_persistent" | "stats_sample_pages" | "pack_keys"
             | "checksum" | "table_checksum" | "delay_key_write" | "key_block_size"
             | "avg_row_length" | "max_rows" | "min_rows" | "compression" | "encryption"
@@ -109,6 +180,7 @@ pub(crate) fn parse(text: &str) -> Option<TableOptions> {
             _ => return None,
         };
     }
+    out.collation = collate.or(charset).map(|name| collation_named(&name));
     Some(out)
 }
 
@@ -156,12 +228,7 @@ pub(crate) fn alter_table(sql: &str) -> Option<AlterOptions> {
                         || w.text.eq_ignore_ascii_case("lock")
                 );
                 any_option |= !hint;
-                if found.auto_increment.is_some() {
-                    options.auto_increment = found.auto_increment;
-                }
-                if found.comment.is_some() {
-                    options.comment = found.comment;
-                }
+                options.merge(found);
             }
             _ => rest.push(spec),
         }
@@ -286,8 +353,31 @@ mod tests {
         );
 
         let alter = alter_table("alter table t ENGINE=InnoDB DEFAULT CHARSET=utf8mb4").unwrap();
-        assert_eq!(alter.options, TableOptions::default());
+        assert_eq!(alter.options.collation, Some(Collation::Ci));
         assert_eq!(alter.rest, None);
+
+        // The table's collation: COLLATE over a CHARSET's default one.
+        let alter =
+            alter_table("ALTER TABLE t DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin, ADD c INT")
+                .unwrap();
+        assert_eq!(alter.options.collation, Some(Collation::Bin));
+        assert_eq!(alter.rest.as_deref(), Some("ALTER TABLE t ADD c INT"));
+        let alter = alter_table("ALTER TABLE t CHARACTER SET binary").unwrap();
+        assert_eq!(alter.options.collation, Some(Collation::Bin));
+
+        // CONVERT TO, with and without its own COLLATE.
+        let alter =
+            alter_table("ALTER TABLE t CONVERT TO CHARACTER SET utf8mb4 COLLATE 'utf8mb4_bin'")
+                .unwrap();
+        assert_eq!(alter.options.convert, Some(Collation::Bin));
+        assert_eq!(alter.options.collation, None);
+        let alter = alter_table("ALTER TABLE t CONVERT TO CHARSET utf8mb4").unwrap();
+        assert_eq!(alter.options.convert, Some(Collation::Ci));
+        assert_eq!(parse("CONVERT utf8mb4"), None);
+
+        // Text that is not ASCII is no option, and no panic either.
+        assert_eq!(parse("COMMENT = 'ø' \u{202e}"), None);
+        assert_eq!(parse("\u{80}"), None);
 
         assert_eq!(alter_table("ALTER TABLE t ADD COLUMN c INT"), None);
         assert_eq!(

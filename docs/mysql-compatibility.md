@@ -184,7 +184,10 @@ gaps:
   `AUTO_INCREMENT = n` sets the next value (no lower than one past the largest
   in the column, as in MySQL) and `COMMENT = '...'` is kept and shown by
   `SHOW CREATE TABLE`, `SHOW TABLE STATUS` and `information_schema.TABLES`.
-  `ENGINE`, `[DEFAULT] CHARSET` / `COLLATE`, `ROW_FORMAT`, `FORCE` and InnoDB's
+  The table's collation (`COLLATE`, or a `CHARSET`'s default one) is what its
+  text columns take unless they name their own, at CREATE TABLE and for the
+  columns ALTER TABLE adds or redefines later; `CONVERT TO CHARACTER SET`
+  converts every text column. `ENGINE`, `ROW_FORMAT`, `FORCE` and InnoDB's
   tuning options are accepted and change nothing.
 - A broad scalar function library (string, math, date/time, JSON, `MD5`/`SHA1`/
   `SHA2`, `HEX`/`UNHEX`, `FORMAT`, `FIND_IN_SET`, `FROM_UNIXTIME`, ...),

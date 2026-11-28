@@ -391,8 +391,10 @@ pub(crate) fn tokens(text: &str) -> Vec<Tok> {
                 out.push(Tok::Other(start, i));
             }
         } else {
-            out.push(Tok::Other(i, i + 1));
-            i += 1;
+            // A whole character: slicing the text at a byte inside one panics.
+            let len = text[i..].chars().next().map_or(1, char::len_utf8);
+            out.push(Tok::Other(i, i + len));
+            i += len;
         }
     }
     out
