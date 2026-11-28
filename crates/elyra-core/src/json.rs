@@ -20,8 +20,13 @@ pub enum Json {
 /// validator in `value.rs`.
 const MAX_JSON_DEPTH: usize = 200;
 
-/// Parse a JSON document. Returns `None` if it is not valid JSON (including when
-/// it nests deeper than [`MAX_JSON_DEPTH`]).
+/// Parse a JSON document, its numbers kept as written. Returns `None` if it is
+/// not valid JSON (including when it nests deeper than [`MAX_JSON_DEPTH`]).
+///
+/// For a JSON value: a JSON column's text or a JSON function's result, already
+/// in MySQL's form, whose numbers may carry a DECIMAL's scale (`[1.50]` from
+/// `JSON_ARRAY(1.50)`). JSON *text* -- a string literal, a parameter -- is read
+/// with [`parse_text`].
 pub fn parse(s: &str) -> Option<Json> {
     let b = s.as_bytes();
     let mut p = 0;
@@ -35,8 +40,35 @@ pub fn parse(s: &str) -> Option<Json> {
     }
 }
 
+/// Parse JSON text as MySQL reads it: as [`parse`], a number then read as an
+/// integer or a double and written the one way MySQL writes that (see
+/// [`canonical_number`]), so `'[1.50, 1e2]'` is `[1.5, 100.0]`.
+pub fn parse_text(s: &str) -> Option<Json> {
+    let mut json = parse(s)?;
+    json.canonicalize_numbers();
+    Some(json)
+}
+
+/// `text` as MySQL stores and prints a JSON document, or `None` if it is not
+/// valid JSON: no whitespace but `", "` and `": "`, an object's keys in MySQL's
+/// order (shorter first, then by bytes) with the last of a duplicated key
+/// kept, numbers and strings written the one way MySQL writes them (see
+/// [`canonical_number`], `write_quoted`).
+pub fn canonical(text: &str) -> Option<String> {
+    parse_text(text).map(|json| json.to_json_string())
+}
+
 impl Json {
-    /// Canonical JSON text (strings quoted).
+    fn canonicalize_numbers(&mut self) {
+        match self {
+            Json::Num(n) => *n = canonical_number(n),
+            Json::Arr(items) => items.iter_mut().for_each(Json::canonicalize_numbers),
+            Json::Obj(pairs) => pairs.iter_mut().for_each(|(_, v)| v.canonicalize_numbers()),
+            _ => {}
+        }
+    }
+
+    /// The document as MySQL writes it (see [`canonical`]).
     pub fn to_json_string(&self) -> String {
         let mut out = String::new();
         self.write(&mut out);
@@ -72,7 +104,7 @@ impl Json {
             }
             Json::Obj(pairs) => {
                 out.push('{');
-                for (i, (k, v)) in pairs.iter().enumerate() {
+                for (i, (k, v)) in mysql_key_order(pairs).into_iter().enumerate() {
                     if i > 0 {
                         out.push_str(", ");
                     }
@@ -129,7 +161,12 @@ impl Json {
     /// `JSON_KEYS`: object keys, or `None` for non-objects.
     pub fn keys(&self) -> Option<Vec<String>> {
         match self {
-            Json::Obj(o) => Some(o.iter().map(|(k, _)| k.clone()).collect()),
+            Json::Obj(o) => Some(
+                mysql_key_order(o)
+                    .into_iter()
+                    .map(|(k, _)| k.clone())
+                    .collect(),
+            ),
             _ => None,
         }
     }
@@ -144,7 +181,16 @@ impl Json {
             }),
             (Json::Arr(t), Json::Arr(c)) => c.iter().all(|ce| t.iter().any(|te| te.contains(ce))),
             (Json::Arr(t), c) => t.iter().any(|te| te.contains(c)),
-            (t, c) => t == c,
+            (t, c) => t.same_scalar(c),
+        }
+    }
+
+    /// Equal as MySQL compares two JSON scalars: numbers by value, so `1.0`
+    /// is `1` and `1.50` is `1.5`.
+    fn same_scalar(&self, other: &Json) -> bool {
+        match (self, other) {
+            (Json::Num(a), Json::Num(b)) => same_number(a, b),
+            _ => self == other,
         }
     }
 
@@ -155,7 +201,14 @@ impl Json {
             Value::Null => Json::Null,
             Value::Bool(b) => Json::Bool(*b),
             Value::Int(i) => Json::Num(i.to_string()),
-            Value::Float(f) => Json::Num(f.to_string()),
+            Value::UInt(u) => Json::Num(u.to_string()),
+            Value::Float(f) if f.is_finite() => Json::Num(format_double(*f)),
+            // A DECIMAL is a number in JSON, with its scale, as in MySQL
+            // (`JSON_ARRAY(1.50)` is `[1.50]`); it became the string "1.50".
+            Value::Decimal(..) => match v.to_wire_string() {
+                Some(text) => Json::Num(text),
+                None => Json::Null,
+            },
             Value::Text(s) => Json::Str(s.clone()),
             Value::Json(s) => parse(s).unwrap_or_else(|| Json::Str(s.clone())),
             other => Json::Str(other.to_wire_string().unwrap_or_default()),
@@ -490,13 +543,16 @@ fn parse_object(b: &[u8], p: &mut usize, depth: usize) -> Option<Json> {
             }
             b'}' => {
                 *p += 1;
-                return Some(Json::Obj(pairs));
+                return Some(Json::Obj(into_mysql_key_order(pairs)));
             }
             _ => return None,
         }
     }
 }
 
+/// A string as MySQL quotes it in JSON: `"` and `\\` escaped, the control
+/// characters with a short escape as that (`\\b \\f \\n \\r \\t`), the rest
+/// below U+0020 as `\\u00XX`, and everything else -- `/`, non-ASCII -- as is.
 fn write_quoted(s: &str, out: &mut String) {
     out.push('"');
     for c in s.chars() {
@@ -506,10 +562,134 @@ fn write_quoted(s: &str, out: &mut String) {
             '\n' => out.push_str("\\n"),
             '\t' => out.push_str("\\t"),
             '\r' => out.push_str("\\r"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
             _ => out.push(c),
         }
     }
     out.push('"');
+}
+
+/// MySQL's order of an object's keys: shorter (in bytes) first, then by bytes.
+fn mysql_key_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    a.len()
+        .cmp(&b.len())
+        .then_with(|| a.as_bytes().cmp(b.as_bytes()))
+}
+
+/// An object's members in the order MySQL stores and prints them (see
+/// [`mysql_key_cmp`]); a duplicated key keeps its last value.
+fn mysql_key_order(pairs: &[(String, Json)]) -> Vec<&(String, Json)> {
+    let mut order: Vec<&(String, Json)> = pairs.iter().collect();
+    // Stable, so of a duplicated key the last one written comes last.
+    order.sort_by(|(a, _), (b, _)| mysql_key_cmp(a, b));
+    let mut out: Vec<&(String, Json)> = Vec::with_capacity(order.len());
+    for pair in order {
+        match out.last_mut() {
+            Some(last) if last.0 == pair.0 => *last = pair,
+            _ => out.push(pair),
+        }
+    }
+    out
+}
+
+/// [`mysql_key_order`] of a parsed object's own members.
+fn into_mysql_key_order(mut pairs: Vec<(String, Json)>) -> Vec<(String, Json)> {
+    pairs.sort_by(|(a, _), (b, _)| mysql_key_cmp(a, b));
+    // `dedup_by` drops the later of two equal keys; give the kept one its value.
+    pairs.dedup_by(|later, kept| {
+        let same = later.0 == kept.0;
+        if same {
+            std::mem::swap(&mut later.1, &mut kept.1);
+        }
+        same
+    });
+    pairs
+}
+
+/// Two JSON numbers equal by value: as integers while both are, else as
+/// doubles.
+fn same_number(a: &str, b: &str) -> bool {
+    let int = |s: &str| -> Option<i128> {
+        if s.contains(['.', 'e', 'E']) {
+            None
+        } else {
+            s.parse().ok()
+        }
+    };
+    match (int(a), int(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => match (a.parse::<f64>(), b.parse::<f64>()) {
+            (Ok(x), Ok(y)) => x == y,
+            _ => a == b,
+        },
+    }
+}
+
+/// A JSON number as MySQL writes it. An integer that fits a signed or an
+/// unsigned 64-bit one stays an integer (`-0` is `0`); anything else is a
+/// double, written in the fewest digits that read back as it -- in fixed
+/// notation while its decimal exponent is from -15 to 14 (or the digits run
+/// past the point), with `.0` when it is whole, else as `1.5e16`. MySQL's
+/// parser can land one unit in the last place away from the nearest double
+/// on 16- and 17-digit input; this one does not.
+pub fn canonical_number(text: &str) -> String {
+    let integer = !text.contains(['.', 'e', 'E']);
+    if integer {
+        if let Ok(i) = text.parse::<i64>() {
+            return i.to_string();
+        }
+        if let Ok(u) = text.parse::<u64>() {
+            return u.to_string();
+        }
+    }
+    match text.parse::<f64>() {
+        Ok(d) if d.is_finite() => format_double(d),
+        _ => text.to_string(),
+    }
+}
+
+fn format_double(d: f64) -> String {
+    // `{:e}` gives the shortest digits that round-trip: "1.25e-15", "-0e0".
+    let sci = format!("{d:e}");
+    let (mantissa, exp) = sci.split_once('e').expect("`{:e}` has an exponent");
+    let exp: i32 = exp.parse().expect("`{:e}` exponent is an integer");
+    let (sign, mantissa) = match mantissa.strip_prefix('-') {
+        Some(m) => ("-", m),
+        None => ("", mantissa),
+    };
+    let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
+    let n = digits.len() as i32;
+    // Where the decimal point falls, counted from the first digit.
+    let point = exp + 1;
+    let fixed = if point > 0 {
+        point <= 15 || point < n
+    } else {
+        point >= -14
+    };
+    let mut out = String::from(sign);
+    if !fixed {
+        out.push_str(&digits[..1]);
+        if n > 1 {
+            out.push('.');
+            out.push_str(&digits[1..]);
+        }
+        out.push_str(&format!("e{exp}"));
+    } else if point <= 0 {
+        out.push_str("0.");
+        out.push_str(&"0".repeat((-point) as usize));
+        out.push_str(&digits);
+    } else if point < n {
+        out.push_str(&digits[..point as usize]);
+        out.push('.');
+        out.push_str(&digits[point as usize..]);
+    } else {
+        out.push_str(&digits);
+        out.push_str(&"0".repeat((point - n) as usize));
+        out.push_str(".0");
+    }
+    out
 }
 
 #[cfg(test)]
@@ -523,12 +703,125 @@ mod tests {
         assert_eq!(doc.extract("$.navn"), Some(Json::Str("Blåbær".into())));
         assert_eq!(doc.extract("$.ø"), Some(Json::Str("æå".into())));
         assert_eq!(doc.extract("$.emoji"), Some(Json::Str("😀 😀".into())));
-        assert_eq!(doc.keys().unwrap(), vec!["navn", "ø", "emoji"]);
+        // MySQL orders keys by their length in bytes: "ø" is two.
+        assert_eq!(doc.keys().unwrap(), vec!["ø", "navn", "emoji"]);
         assert!(doc.to_json_string().contains("\"Blåbær\""));
         // A surrogate half on its own is no character.
         assert!(parse(r#""\ud83d""#).is_none());
         assert!(parse(r#""\ud83d\u0041""#).is_none());
         assert!(parse(r#""\ude00""#).is_none());
+    }
+
+    #[test]
+    fn canonical_is_mysqls_normal_form() {
+        // Each checked against MySQL 8.4: the text stored into a JSON column
+        // and read back.
+        let cases = [
+            (r#"{"b":1,"a":2}"#, r#"{"a": 2, "b": 1}"#),
+            (
+                r#"{"bb":1,"a":2,"c":3,"aa":4}"#,
+                r#"{"a": 2, "c": 3, "aa": 4, "bb": 1}"#,
+            ),
+            (r#"{"a":1,"a":2}"#, r#"{"a": 2}"#),
+            (
+                r#"  { "x" : [ 1 , { "y" : null } ] }  "#,
+                r#"{"x": [1, {"y": null}]}"#,
+            ),
+            (
+                r#"{"Z":1,"a":2,"é":3,"B":4}"#,
+                r#"{"B": 4, "Z": 1, "a": 2, "é": 3}"#,
+            ),
+            (
+                "[1.0, 1.50, 1e2, 1E-2, -0, 0.1, 123456789012345678901234567890, \
+                 18446744073709551615, 9223372036854775808, -9223372036854775809, \
+                 3.0e0, 2.5e-7, 1e21]",
+                "[1.0, 1.5, 100.0, 0.01, 0, 0.1, 1.2345678901234568e29, \
+                 18446744073709551615, 9223372036854775808, -9.223372036854776e18, \
+                 3.0, 0.00000025, 1e21]",
+            ),
+            (
+                r#"["a\"b", "\u00e9", "\n", "\u0001", "\/", "\t", "\b", "\f", "\ud83d\ude00"]"#,
+                r#"["a\"b", "é", "\n", "\u0001", "/", "\t", "\b", "\f", "😀"]"#,
+            ),
+            ("[[],{}]", "[[], {}]"),
+            ("-1.25", "-1.25"),
+            (r#""\\""#, r#""\\""#),
+        ];
+        for (text, mysql) in cases {
+            assert_eq!(canonical(text).as_deref(), Some(mysql), "{text}");
+            // The normal form is its own normal form.
+            assert_eq!(canonical(mysql).as_deref(), Some(mysql), "{mysql}");
+        }
+        assert_eq!(canonical("[1,"), None);
+    }
+
+    #[test]
+    fn a_json_value_keeps_its_numbers() {
+        // A DECIMAL put in by a JSON function keeps its scale, as in MySQL,
+        // when the value is read again; JSON text does not.
+        let stored = Json::Arr(vec![Json::Num("1.50".into())]).to_json_string();
+        assert_eq!(stored, "[1.50]");
+        assert_eq!(parse(&stored).unwrap().to_json_string(), "[1.50]");
+        assert_eq!(parse_text(&stored).unwrap().to_json_string(), "[1.5]");
+    }
+
+    #[test]
+    fn duplicated_keys_keep_the_last_value_in_any_number() {
+        let doc = parse(r#"{"b": 1, "a": 2, "b": 3, "a": 4, "b": 5}"#).unwrap();
+        assert_eq!(doc.to_json_string(), r#"{"a": 4, "b": 5}"#);
+        assert_eq!(doc.extract("$.b"), Some(Json::Num("5".into())));
+        // Built, not parsed (`JSON_OBJECT('a', 1, 'a', 2)`): the same.
+        let built = Json::Obj(vec![
+            ("a".into(), Json::Num("1".into())),
+            ("a".into(), Json::Num("2".into())),
+        ]);
+        assert_eq!(built.to_json_string(), r#"{"a": 2}"#);
+        assert_eq!(built.keys().unwrap(), vec!["a"]);
+        // Many keys, many duplicated, parse in time.
+        let text = format!(
+            "{{{}}}",
+            (0..40_000)
+                .map(|i| format!(r#""k{}": {i}"#, i % 20_000))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let doc = parse(&text).unwrap();
+        assert_eq!(doc.length(), 20_000);
+        assert_eq!(doc.extract("$.k7"), Some(Json::Num("20007".into())));
+    }
+
+    #[test]
+    fn contains_compares_numbers_by_value() {
+        let has = |t: &str, c: &str| parse(t).unwrap().contains(&parse(c).unwrap());
+        assert!(has(r#"{"n": 1.0}"#, r#"{"n": 1}"#));
+        assert!(has("[1.0, 2]", "1"));
+        assert!(has("[1]", "1.0"));
+        assert!(has("[1.50]", "1.5"));
+        assert!(has("[18446744073709551615]", "18446744073709551615"));
+        assert!(!has("[1]", "2"));
+        assert!(!has("[1]", r#""1""#));
+    }
+
+    #[test]
+    fn numbers_are_written_as_mysql_writes_a_double() {
+        // From MySQL 8.4: `CAST('[1e15, ...]' AS JSON)`.
+        for (text, mysql) in [
+            ("1e14", "100000000000000.0"),
+            ("9.99e14", "999000000000000.0"),
+            ("1e15", "1e15"),
+            ("1.25e15", "1.25e15"),
+            ("1.5e16", "1.5e16"),
+            ("123456789012345678.5", "1.2345678901234568e17"),
+            ("123.456e3", "123456.0"),
+            ("1e-5", "0.00001"),
+            ("1e-14", "0.00000000000001"),
+            ("1e-15", "0.000000000000001"),
+            ("-2.5e-20", "-2.5e-20"),
+            ("-0.0", "-0.0"),
+            ("0e5", "0.0"),
+        ] {
+            assert_eq!(canonical_number(text), mysql, "{text}");
+        }
     }
 
     #[test]

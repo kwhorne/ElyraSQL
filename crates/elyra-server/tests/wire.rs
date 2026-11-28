@@ -232,7 +232,7 @@ async fn temporal_decimal_and_json_result_metadata_uses_native_mysql_types() {
             "2026-08-02 13:45:30".into(),
             "12:34:56".into(),
             "42.50".into(),
-            "{\"ok\":true}".into(),
+            "{\"ok\": true}".into(),
         )]
     );
 
@@ -265,7 +265,7 @@ async fn temporal_decimal_and_json_result_metadata_uses_native_mysql_types() {
     );
     assert_eq!(
         row.as_ref(4),
-        Some(&mysql_async::Value::Bytes(b"{\"ok\":true}".to_vec()))
+        Some(&mysql_async::Value::Bytes(b"{\"ok\": true}".to_vec()))
     );
 }
 
@@ -17363,4 +17363,70 @@ async fn json_functions_keep_text_that_is_not_ascii() {
         .unwrap()
         .unwrap();
     assert_eq!(found, 1);
+}
+
+/// A JSON column stores and returns MySQL's normal form (checked against
+/// MySQL 8.4): keys sorted shorter first, the last of a duplicated key kept,
+/// `", "` and `": "` between members, numbers read from text as integers or
+/// doubles, a DECIMAL from a JSON function with its scale.
+#[tokio::test]
+async fn json_columns_store_mysqls_normal_form() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop("CREATE TABLE jc (id INT PRIMARY KEY, j JSON, d DECIMAL(6,2))")
+        .await
+        .unwrap();
+    c.query_drop(
+        r#"INSERT INTO jc VALUES
+           (1, '{"bb":1,"a":2,"c":3,"aa":4,"a":5}', NULL),
+           (2, ' [1.0, 1.50, 1e2, -0, 18446744073709551615, "\/é"] ', NULL),
+           (3, JSON_OBJECT('b', 2.50, 'a', 1), 1.50),
+           (4, '{"n": 1}', 2.00)"#,
+    )
+    .await
+    .unwrap();
+    c.query_drop("UPDATE jc SET j = JSON_SET(j, '$.n', d) WHERE id = 4")
+        .await
+        .unwrap();
+    // A prepared statement's parameter is JSON text, as a literal is.
+    c.exec_drop(
+        "INSERT INTO jc VALUES (5, ?, NULL)",
+        (r#"{"z": 1E1, "y": [ ]}"#,),
+    )
+    .await
+    .unwrap();
+    let rows: Vec<(i64, String)> = c.query("SELECT id, j FROM jc ORDER BY id").await.unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            (1, r#"{"a": 5, "c": 3, "aa": 4, "bb": 1}"#.to_string()),
+            (
+                2,
+                r#"[1.0, 1.5, 100.0, 0, 18446744073709551615, "/é"]"#.to_string()
+            ),
+            (3, r#"{"a": 1, "b": 2.50}"#.to_string()),
+            (4, r#"{"n": 2.00}"#.to_string()),
+            (5, r#"{"y": [], "z": 10.0}"#.to_string()),
+        ]
+    );
+    // Functions over JSON text read it as MySQL does; numbers compare by value.
+    let row: (String, String, String, i64, i64) = c
+        .query_first(
+            r#"SELECT JSON_EXTRACT('{"b":1,"a":2.50}', '$'), JSON_KEYS('{"bb":1,"a":2}'),
+                      JSON_ARRAY(d), JSON_CONTAINS(j, '{"a": 1.0}'), JSON_CONTAINS('[1.0, 2]', '1')
+               FROM jc WHERE id = 3"#,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row,
+        (
+            r#"{"a": 2.5, "b": 1}"#.to_string(),
+            r#"["a", "bb"]"#.to_string(),
+            "[1.50]".to_string(),
+            1,
+            1
+        )
+    );
 }
