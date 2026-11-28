@@ -376,24 +376,51 @@ fn parse_string(b: &[u8], p: &mut usize) -> Option<String> {
                     b'b' => out.push('\u{8}'),
                     b'f' => out.push('\u{c}'),
                     b'u' => {
-                        let hex = std::str::from_utf8(b.get(*p + 1..*p + 5)?).ok()?;
-                        let cp = u32::from_str_radix(hex, 16).ok()?;
-                        out.push(char::from_u32(cp)?);
+                        let unit = hex4(b, *p + 1)?;
                         *p += 4;
+                        let cp = match unit {
+                            // A UTF-16 surrogate pair: `\ud83d\ude00` is one
+                            // character, and was refused as two halves.
+                            0xD800..=0xDBFF => {
+                                if b.get(*p + 1..*p + 3) != Some(b"\\u".as_slice()) {
+                                    return None;
+                                }
+                                let low = hex4(b, *p + 3)?;
+                                if !(0xDC00..=0xDFFF).contains(&low) {
+                                    return None;
+                                }
+                                *p += 6;
+                                0x10000 + ((unit - 0xD800) << 10) + (low - 0xDC00)
+                            }
+                            other => other,
+                        };
+                        out.push(char::from_u32(cp)?);
                     }
                     _ => return None,
                 }
                 *p += 1;
             }
             _ => {
-                // Copy one UTF-8 byte at a time (valid because input is &str).
+                // Up to the next quote or backslash, as text. The bytes are a
+                // `&str`'s, and those two are ASCII, so the run is whole UTF-8.
+                // Copied one byte at a time, each byte of a character that is
+                // not ASCII failed to decode on its own and was dropped:
+                // "Blåbær" came out "Blbr", from JSON_EXTRACT and JSON_SET.
                 let start = *p;
-                *p += 1;
-                out.push_str(std::str::from_utf8(&b[start..*p]).unwrap_or(""));
+                while *p < b.len() && b[*p] != b'"' && b[*p] != b'\\' {
+                    *p += 1;
+                }
+                out.push_str(std::str::from_utf8(&b[start..*p]).ok()?);
             }
         }
     }
     None
+}
+
+/// The four hex digits at `at` as a UTF-16 code unit.
+fn hex4(b: &[u8], at: usize) -> Option<u32> {
+    let hex = std::str::from_utf8(b.get(at..at + 4)?).ok()?;
+    u32::from_str_radix(hex, 16).ok()
 }
 
 fn parse_number(b: &[u8], p: &mut usize) -> Option<Json> {
@@ -488,6 +515,21 @@ fn write_quoted(s: &str, out: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strings_keep_text_that_is_not_ascii() {
+        let doc =
+            parse(r#"{"navn": "Blåbær", "ø": "æ\u00e5", "emoji": "😀 \ud83d\ude00"}"#).unwrap();
+        assert_eq!(doc.extract("$.navn"), Some(Json::Str("Blåbær".into())));
+        assert_eq!(doc.extract("$.ø"), Some(Json::Str("æå".into())));
+        assert_eq!(doc.extract("$.emoji"), Some(Json::Str("😀 😀".into())));
+        assert_eq!(doc.keys().unwrap(), vec!["navn", "ø", "emoji"]);
+        assert!(doc.to_json_string().contains("\"Blåbær\""));
+        // A surrogate half on its own is no character.
+        assert!(parse(r#""\ud83d""#).is_none());
+        assert!(parse(r#""\ud83d\u0041""#).is_none());
+        assert!(parse(r#""\ude00""#).is_none());
+    }
 
     #[test]
     fn rejects_pathologically_deep_nesting() {
