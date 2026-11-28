@@ -514,6 +514,20 @@ pub fn coldecl_key(table: &str) -> Vec<u8> {
     format!("coldecl::{table}").into_bytes()
 }
 
+/// A table's `COMMENT`, as UTF-8; absent when it has none.
+pub fn tblcomment_key(table: &str) -> Vec<u8> {
+    format!("tblcomment::{table}").into_bytes()
+}
+
+/// `table`'s comment, or `""` when it has none, as MySQL shows it.
+pub async fn load_table_comment(db: &Session, table: &str) -> Result<String> {
+    Ok(db
+        .get(tblcomment_key(table))
+        .await?
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .unwrap_or_default())
+}
+
 /// The declared types of `table`, or `None` when the table predates this
 /// metadata. Missing metadata is deliberately not an error: old catalog files
 /// stay readable and retain their pre-existing storage semantics.

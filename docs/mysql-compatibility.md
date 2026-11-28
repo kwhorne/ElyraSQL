@@ -180,6 +180,12 @@ gaps:
   1062, 1452, 3819). `SHOW CREATE TABLE` echoes
   `CHECK` and `FOREIGN KEY` constraints (with their referential actions) since
   1.8.0, so its output can be replayed without losing them.
+- Table options, in `CREATE TABLE` and as `ALTER TABLE` specifications:
+  `AUTO_INCREMENT = n` sets the next value (no lower than one past the largest
+  in the column, as in MySQL) and `COMMENT = '...'` is kept and shown by
+  `SHOW CREATE TABLE`, `SHOW TABLE STATUS` and `information_schema.TABLES`.
+  `ENGINE`, `[DEFAULT] CHARSET` / `COLLATE`, `ROW_FORMAT`, `FORCE` and InnoDB's
+  tuning options are accepted and change nothing.
 - A broad scalar function library (string, math, date/time, JSON, `MD5`/`SHA1`/
   `SHA2`, `HEX`/`UNHEX`, `FORMAT`, `FIND_IN_SET`, `FROM_UNIXTIME`, ...),
   statistical and bitwise aggregates (`STDDEV*`, `VAR*`, `BIT_OR`/`AND`/`XOR`),

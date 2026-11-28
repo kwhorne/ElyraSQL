@@ -539,6 +539,7 @@ pub async fn create_table(
         for key in [
             catalog::colwidth_key as fn(&str) -> Vec<u8>,
             catalog::coldecl_key,
+            catalog::tblcomment_key,
         ] {
             if let Some(value) = db.get(key(&sname)).await? {
                 puts.push((key(&name), value));
@@ -1936,6 +1937,13 @@ pub async fn show_table_status(db: &Session, pattern: Option<&str>) -> Result<Qu
             Some(s) => s.rows.to_string(),
             None => "0".to_string(),
         };
+        let def = catalog::load(db, &n).await?;
+        let auto_increment = if (0..def.schema.columns.len()).any(|i| def.meta(i).auto_increment) {
+            Value::Text(read_autoinc(db, &n).await?.saturating_add(1).to_string())
+        } else {
+            Value::Null
+        };
+        let comment = catalog::load_table_comment(db, &n).await?;
         rows.push(vec![
             Value::Text(n),                           // Name
             Value::Text("InnoDB".into()),             // Engine
@@ -1947,14 +1955,14 @@ pub async fn show_table_status(db: &Session, pattern: Option<&str>) -> Result<Qu
             Value::Text("0".into()),                  // Max_data_length
             Value::Text("0".into()),                  // Index_length
             Value::Text("0".into()),                  // Data_free
-            Value::Null,                              // Auto_increment
+            auto_increment,                           // Auto_increment
             Value::Null,                              // Create_time
             Value::Null,                              // Update_time
             Value::Null,                              // Check_time
             Value::Text("utf8mb4_0900_ai_ci".into()), // Collation
             Value::Null,                              // Checksum
             Value::Text(String::new()),               // Create_options
-            Value::Text(String::new()),               // Comment
+            Value::Text(comment),                     // Comment
         ]);
     }
     Ok(QueryResult::Rows(RowStream::literal(schema, rows)))
@@ -2509,6 +2517,22 @@ pub async fn show_create_table(db: &Session, name: &str) -> Result<QueryResult> 
         quoted_name(name),
         lines.join(",\n")
     );
+    // The counter and the comment, as MySQL writes them: a dump that
+    // recreates the table goes on from the same AUTO_INCREMENT, rather than
+    // reusing the ids of rows deleted from its end.
+    if (0..def.schema.columns.len()).any(|i| def.meta(i).auto_increment) {
+        let next = read_autoinc(db, name).await?.saturating_add(1);
+        if next > 1 {
+            ddl.push_str(&format!(" AUTO_INCREMENT={next}"));
+        }
+    }
+    let comment = catalog::load_table_comment(db, name).await?;
+    if !comment.is_empty() {
+        ddl.push_str(&format!(
+            " COMMENT='{}'",
+            comment.replace('\\', "\\\\").replace('\'', "''")
+        ));
+    }
     // Partitioning, as MySQL writes it, so a dump recreates it.
     if let Some(spec) = catalog::load_partspec(db, name).await? {
         ddl.push_str(&partition_clause_sql(&spec));
@@ -3174,6 +3198,7 @@ async fn information_schema(
                 } else {
                     Value::Null
                 };
+                let comment = catalog::load_table_comment(db, &n).await?;
                 rows.push(vec![
                     Value::Text(database.clone()),
                     Value::Text(n),
@@ -3181,12 +3206,12 @@ async fn information_schema(
                     Value::Text("ElyraSQL".into()),
                     table_rows,
                     // ElyraSQL does not currently maintain MySQL's physical
-                    // per-table byte estimates or table comments. Expose the
-                    // columns with stable best-effort values so schema tools
-                    // can consume the standard information_schema shape.
+                    // per-table byte estimates. Expose the columns with stable
+                    // best-effort values so schema tools can consume the
+                    // standard information_schema shape.
                     Value::Int(0),
                     Value::Int(0),
-                    Value::Text(String::new()),
+                    Value::Text(comment),
                     Value::Text("utf8mb4_0900_ai_ci".into()),
                     auto_increment,
                     Value::Text(String::new()),
@@ -5571,6 +5596,7 @@ async fn alter_rename_table(db: &Session, def: &mut TableDef, new: &str) -> Resu
     for key in [
         catalog::colwidth_key as fn(&str) -> Vec<u8>,
         catalog::coldecl_key,
+        catalog::tblcomment_key,
     ] {
         let old_key = key(&old);
         if let Some(value) = db.get(old_key.clone()).await? {
@@ -22049,6 +22075,39 @@ fn parse_scalar_expr(sql: &str) -> Result<Expr> {
     Err(Error::Query(format!("cannot parse expression: {sql}")))
 }
 
+/// Set `table`'s comment; an empty one removes it, as in MySQL.
+pub async fn set_table_comment(db: &Session, table: &str, comment: &str) -> Result<()> {
+    let key = catalog::tblcomment_key(table);
+    if comment.is_empty() {
+        db.commit_write(Vec::new(), vec![key]).await
+    } else {
+        db.commit_write(vec![(key, comment.as_bytes().to_vec())], Vec::new())
+            .await
+    }
+}
+
+/// `AUTO_INCREMENT = next`: the counter hands out `next` -- or, as in MySQL,
+/// one more than the largest value the column holds, `max`, when that is
+/// higher. The counter may go down that way, so it is deleted and written
+/// in one commit: storage keeps a counter from moving back otherwise, and
+/// the in-memory allocators reload a counter that was deleted.
+pub async fn set_auto_increment(db: &Session, table: &str, next: u64, max: i64) -> Result<()> {
+    let last = i64::try_from(next.saturating_sub(1))
+        .unwrap_or(i64::MAX)
+        .max(max);
+    let key = autoinc_key(table);
+    db.commit_write(vec![(key.clone(), last.to_le_bytes().to_vec())], vec![key])
+        .await
+}
+
+/// The name of `table`'s AUTO_INCREMENT column, if it has one.
+pub async fn auto_increment_column(db: &Session, table: &str) -> Result<Option<String>> {
+    let def = catalog::load(db, table).await?;
+    Ok((0..def.schema.columns.len())
+        .find(|i| def.meta(*i).auto_increment)
+        .map(|i| def.schema.columns[i].name.clone()))
+}
+
 async fn read_autoinc(db: &Session, table: &str) -> Result<i64> {
     Ok(match db.get(autoinc_key(table)).await? {
         Some(bytes) if bytes.len() == 8 => {
@@ -27207,6 +27266,7 @@ async fn table_delete_keys(db: &Session, name: &str) -> Result<Vec<Vec<u8>>> {
         temp_owner_key(name),
         catalog::colwidth_key(name),
         catalog::coldecl_key(name),
+        catalog::tblcomment_key(name),
         partmeta_key(name),
         stats_key(name),
     ];

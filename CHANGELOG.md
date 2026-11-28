@@ -27,6 +27,22 @@ All notable changes to ElyraSQL are documented here. The format is based on
   `mysql` client and Python's mysqlclient use, reads it that way.
 - `ROW_COUNT()` after `DROP INDEX`, `ALTER TABLE ... DROP FOREIGN KEY`, a
   `CREATE FULLTEXT INDEX` and `RENAME TABLE` is 0, as after other DDL; it was -1.
+- **Table options in ALTER TABLE.** `ALTER TABLE t COMMENT = '...'`,
+  `AUTO_INCREMENT = n`, `ENGINE = ...`, `[DEFAULT] CHARSET` / `COLLATE`,
+  `ROW_FORMAT`, `FORCE` and InnoDB's tuning options were syntax errors (1064).
+  Laravel writes the first two for `$table->comment()` and `->from(n)`, and a
+  phpMyAdmin dump ends each table with `ALTER TABLE t MODIFY id ...
+  AUTO_INCREMENT, AUTO_INCREMENT=n`. `AUTO_INCREMENT` sets the next value, no
+  lower than one past the largest the column holds, as in MySQL; `COMMENT` is
+  kept, and an empty one removes it. The others change nothing here. They can
+  be combined with other specifications in one statement.
+- **CREATE TABLE keeps `AUTO_INCREMENT = n` and `COMMENT`.** Both were dropped
+  with the other table options: the counter started at 1, so restoring a dump
+  of a table whose last rows had been deleted gave their ids out again.
+  `SHOW CREATE TABLE` now writes the counter and the comment back as MySQL
+  does, `information_schema.TABLES` and `SHOW TABLE STATUS` show the comment,
+  and `SHOW TABLE STATUS` the counter. The comment follows the table through
+  `RENAME` and `CREATE TABLE ... LIKE`, and goes with `DROP`.
 
 ## [1.13.8] - 2026-11-27
 

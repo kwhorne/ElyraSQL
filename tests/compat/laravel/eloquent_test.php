@@ -78,6 +78,26 @@ try {
     check("add index on posts.views", true);
 } catch (\Throwable $e) { check("migrations", false, $e->getMessage()); }
 
+// ---------------- TABLE OPTIONS ----------------
+// `->from(n)` and `->comment()` come out as `alter table ... auto_increment = n`
+// and `alter table ... comment = '...'`, which were syntax errors.
+section("Table options");
+try {
+    $schema->dropIfExists('invoices');
+    $schema->create('invoices', function (Blueprint $t) {
+        $t->id()->from(1000);
+        $t->string('number');
+        $t->comment('Customer invoices');
+    });
+    $id = $db->table('invoices')->insertGetId(['number' => 'A-1']);
+    check("->from(1000) starts the ids at 1000", $id == 1000, "got $id");
+    $comment = $db->selectOne(
+        "SELECT TABLE_COMMENT AS c FROM information_schema.TABLES WHERE TABLE_NAME = 'invoices'"
+    )->c;
+    check("->comment() is stored", $comment === 'Customer invoices', "got '$comment'");
+    $schema->drop('invoices');
+} catch (\Throwable $e) { check("table options", false, $e->getMessage()); }
+
 // ---------------- MODELS ----------------
 class User extends Model {
     public $timestamps = true;

@@ -318,12 +318,12 @@ fn keyword_position(sql: &str, kw: &str) -> Option<usize> {
         .map(|c| c.index)
 }
 
-struct Word {
-    start: usize,
-    text: String,
+pub(crate) struct Word {
+    pub(crate) start: usize,
+    pub(crate) text: String,
 }
 
-enum Tok {
+pub(crate) enum Tok {
     Word(Word),
     Eq,
     Other(usize, usize),
@@ -341,7 +341,7 @@ impl Tok {
 
 /// Words (bare or backtick-quoted, and numbers), `=`, and anything else
 /// (a quoted string, punctuation) as an opaque token.
-fn tokens(text: &str) -> Vec<Tok> {
+pub(crate) fn tokens(text: &str) -> Vec<Tok> {
     let bytes = text.as_bytes();
     let mut out = Vec::new();
     let mut i = 0;
@@ -366,9 +366,18 @@ fn tokens(text: &str) -> Vec<Tok> {
         } else if matches!(b, b'\'' | b'"' | b'`') {
             let start = i;
             i += 1;
-            while i < bytes.len() && bytes[i] != b {
-                if bytes[i] == b'\\' {
-                    i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'\\' && b != b'`' {
+                    i += 2;
+                    continue;
+                }
+                // A doubled quote is one quote inside the literal.
+                if bytes[i] == b {
+                    if bytes.get(i + 1) == Some(&b) {
+                        i += 2;
+                        continue;
+                    }
+                    break;
                 }
                 i += 1;
             }
