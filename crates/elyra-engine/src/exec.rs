@@ -138,6 +138,80 @@ fn column_collation(
         })
 }
 
+/// MySQL's 1062 for `row` colliding on the key that the stored key `key`
+/// belongs to (see `index::key_owner`): `Duplicate entry '1-2' for key
+/// 't.team_num'`. The message used to say `key 'PRIMARY'` whichever key it
+/// was, or `a unique key`; code that reads the key's name from it -- which
+/// field was taken -- found the wrong one or none.
+pub(crate) fn duplicate_entry(def: &TableDef, row: &[Value], key: &[u8]) -> Error {
+    match index::key_owner(def, key) {
+        Some(None) => duplicate_entry_on(&def.name, "PRIMARY", &def.pk_cols, row),
+        Some(Some(index)) => duplicate_entry_on(&def.name, &index.name, &index.cols, row),
+        None => Error::Duplicate(
+            DuplicateError::Entry,
+            format!("Duplicate entry for a key of '{}'", def.name),
+        ),
+    }
+}
+
+/// The 1062 of an INSERT whose write storage refused for a duplicate key: the
+/// first row, in the statement's order, whose primary key or unique index
+/// entry -- checked in that order, as MySQL does -- a stored row or an earlier
+/// row of the statement holds. `None` if no row does (a concurrent statement
+/// may have taken the value and released it again).
+async fn insert_duplicate(
+    db: &Session,
+    def: &TableDef,
+    built: &[(Vec<u8>, Vec<Value>)],
+) -> Result<Option<Error>> {
+    let mut keys_per_row = Vec::with_capacity(built.len());
+    let mut all = Vec::new();
+    for (key, row) in built {
+        let mut keys = vec![key.clone()];
+        let (_, unique) = index::partition_entries_for_row(def, row, key)?;
+        keys.extend(unique.into_iter().map(|(entry, _)| entry));
+        all.extend(keys.iter().cloned());
+        keys_per_row.push(keys);
+    }
+    let mut stored = db.multi_get(all).await?.into_iter();
+    let mut seen = std::collections::HashSet::new();
+    for ((_, row), keys) in built.iter().zip(&keys_per_row) {
+        for key in keys {
+            let held = stored.next().flatten().is_some();
+            if !seen.insert(key.clone()) || held {
+                return Ok(Some(duplicate_entry(def, row, key)));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// MySQL's 1062 for `row` colliding on key `key_name` over `columns` of
+/// `table`: the row's values for them, joined by `-` and cut to 64 characters,
+/// and the key named after its table (`'%-.64s'`, `'%-.192s'` in MySQL).
+pub(crate) fn duplicate_entry_on(
+    table: &str,
+    key_name: &str,
+    columns: &[usize],
+    row: &[Value],
+) -> Error {
+    let value = columns
+        .iter()
+        .map(|&c| {
+            row.get(c)
+                .and_then(Value::to_wire_string)
+                .unwrap_or_else(|| "NULL".into())
+        })
+        .collect::<Vec<_>>()
+        .join("-");
+    let value: String = value.chars().take(64).collect();
+    let key: String = format!("{table}.{key_name}").chars().take(192).collect();
+    Error::Duplicate(
+        DuplicateError::Entry,
+        format!("Duplicate entry '{value}' for key '{key}'"),
+    )
+}
+
 /// The MySQL name a collation is shown as.
 fn collation_name(collation: elyra_core::Collation) -> &'static str {
     match collation {
@@ -621,7 +695,7 @@ pub async fn create_table(
         {
             return Err(Error::Duplicate(
                 DuplicateError::ColumnName,
-                format!("duplicate column name '{}'", col.name.value),
+                format!("Duplicate column name '{}'", col.name.value),
             ));
         }
         let ty = map_type(&col.data_type)?;
@@ -4316,6 +4390,8 @@ async fn alter_add_primary_key_shadow(
             cursor = batch.last().map(|(key, _)| key.clone());
             let mut new_entries = Vec::new();
             let mut auxiliary_entries = Vec::new();
+            // The batch's rows at their new keys, to name a duplicate.
+            let mut placed = Vec::new();
             for (_, encoded_row) in batch {
                 cancel.tick()?;
                 pacer.tick().await;
@@ -4333,13 +4409,25 @@ async fn alter_add_primary_key_shadow(
                 data_key.extend_from_slice(&clustered);
                 let (non_unique, unique) =
                     index::partition_entries_for_row(&definition, &row, &data_key)?;
-                new_entries.push((data_key, encoded_row));
+                new_entries.push((data_key.clone(), encoded_row));
                 new_entries.extend(unique);
                 auxiliary_entries.extend(non_unique);
+                placed.push((data_key, row));
             }
-            db.raw_db()
+            if let Err(error) = db
+                .raw_db()
                 .commit_insert(new_entries, auxiliary_entries, Vec::new())
-                .await?;
+                .await
+            {
+                return Err(match error {
+                    Error::Duplicate(DuplicateError::Entry, _) => {
+                        insert_duplicate(db, &definition, &placed)
+                            .await?
+                            .unwrap_or(error)
+                    }
+                    other => other,
+                });
+            }
             if last {
                 break;
             }
@@ -4709,10 +4797,7 @@ async fn alter_add_primary_key(db: &Session, def: &mut TableDef, columns: &[Iden
             }
             let clustered = keyenc::encode_columns_coll(&row, &def.pk_cols, &pk_collations)?;
             if !clustered_keys.insert(clustered.clone()) {
-                return Err(Error::Duplicate(
-                    DuplicateError::Entry,
-                    "duplicate primary key".into(),
-                ));
+                return Err(duplicate_entry_on(&def.name, "PRIMARY", &def.pk_cols, &row));
             }
             let mut new_key = clustered_prefix.clone();
             new_key.extend_from_slice(&clustered);
@@ -4948,19 +5033,7 @@ async fn rebuild_indexes_for_columns(
         for (key, row) in &rows {
             for entry in index::entries_for_row(&one, row, key)? {
                 if index.unique && !seen.insert(entry.0.clone()) {
-                    let value = index
-                        .cols
-                        .iter()
-                        .map(|&c| row[c].to_wire_string().unwrap_or_else(|| "NULL".into()))
-                        .collect::<Vec<_>>()
-                        .join("-");
-                    return Err(Error::Duplicate(
-                        DuplicateError::Entry,
-                        format!(
-                            "Duplicate entry '{value}' for key '{}.{}'",
-                            def.name, index.name
-                        ),
-                    ));
+                    return Err(duplicate_entry_on(&def.name, &index.name, &index.cols, row));
                 }
                 puts.push(entry);
             }
@@ -5331,7 +5404,7 @@ async fn alter_add_column(
     {
         return Err(Error::Duplicate(
             DuplicateError::ColumnName,
-            format!("duplicate column name '{}'", col.name.value),
+            format!("Duplicate column name '{}'", col.name.value),
         ));
     }
     let ty = map_type(&col.data_type)?;
@@ -5913,20 +5986,7 @@ pub async fn create_index(db: &Session, ci: CreateIndex) -> Result<QueryResult> 
             if let (Some(index), Some(unique_only)) = (&new_index, &unique_only) {
                 for probe in index::unique_probe_keys(unique_only, &row)? {
                     if !seen.insert(probe) {
-                        return Err(Error::Duplicate(
-                            DuplicateError::Entry,
-                            format!(
-                                "Duplicate entry '{}' for key '{}.{}'",
-                                index
-                                    .cols
-                                    .iter()
-                                    .map(|&c| row[c].to_wire_string().unwrap_or_default())
-                                    .collect::<Vec<_>>()
-                                    .join("-"),
-                                table,
-                                index.name
-                            ),
-                        ));
+                        return Err(duplicate_entry_on(&table, &index.name, &index.cols, &row));
                     }
                 }
             }
@@ -6480,9 +6540,20 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
         } else {
             String::new()
         };
-        db.raw_db()
+        // Storage refuses a duplicate key without knowing whose it is; find
+        // the row and key so the error names them, as MySQL's does.
+        if let Err(error) = db
+            .raw_db()
             .commit_insert(new_puts, aux_puts, Vec::new())
-            .await?;
+            .await
+        {
+            return Err(match error {
+                Error::Duplicate(DuplicateError::Entry, _) => {
+                    insert_duplicate(db, &def, &built).await?.unwrap_or(error)
+                }
+                other => other,
+            });
+        }
         if !after_ins.is_empty() {
             for (_, row) in &built {
                 queue_after(db, &after_ins, &def.schema, Some(row), None)?;
@@ -6538,10 +6609,7 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
                 }
                 affected += updated_row_count(&previous, &batch[pos].1);
             } else if !ignore {
-                return Err(Error::Duplicate(
-                    DuplicateError::Entry,
-                    format!("Duplicate entry for key 'PRIMARY' on '{name}'"),
-                ));
+                return Err(duplicate_entry(&def, &row, &key));
             }
             continue;
         }
@@ -6552,10 +6620,7 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
                 if ignore {
                     continue;
                 }
-                return Err(Error::Duplicate(
-                    DuplicateError::Entry,
-                    format!("Duplicate entry for key 'PRIMARY' on '{name}'"),
-                ));
+                return Err(duplicate_entry(&def, &row, &key));
             }
             let old_row: Vec<Value> = rowdec::decode_row(old_enc)?;
             deletes.extend(index::entry_keys_for_row(&def, &old_row, &key)?);
@@ -7711,24 +7776,18 @@ async fn check_unique_batch(
     }
     // Two batch rows sharing a probe key violate uniqueness.
     let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
-    for (pk, _) in &probes {
+    for (pk, i) in &probes {
         if !seen.insert(pk.clone()) {
-            return Err(Error::Duplicate(
-                DuplicateError::Entry,
-                "Duplicate entry for a unique key".into(),
-            ));
+            return Err(duplicate_entry(def, &batch[*i].1, pk));
         }
     }
     // A stored value under the probe key that belongs to a different row.
     let keys: Vec<Vec<u8>> = probes.iter().map(|(k, _)| k.clone()).collect();
     let existing = db.multi_get(keys).await?;
-    for ((_, i), owner) in probes.iter().zip(existing) {
+    for ((probe, i), owner) in probes.iter().zip(existing) {
         if let Some(owner_key) = owner {
             if owner_key != batch[*i].0 {
-                return Err(Error::Duplicate(
-                    DuplicateError::Entry,
-                    "Duplicate entry for a unique key".into(),
-                ));
+                return Err(duplicate_entry(def, &batch[*i].1, probe));
             }
         }
     }
@@ -17144,23 +17203,23 @@ async fn unique_in_row_order(
     let mut claimed: std::collections::HashSet<Vec<u8>> = Default::default();
     let mut released: std::collections::HashSet<Vec<u8>> = Default::default();
     let mut written = Vec::with_capacity(rows.len());
-    for ((taken, vacated), &ok) in taken.into_iter().zip(vacated).zip(eligible) {
+    for (row, ((taken, vacated), &ok)) in rows
+        .iter()
+        .zip(taken.into_iter().zip(vacated).zip(eligible))
+    {
         if !ok {
             written.push(false);
             continue;
         }
-        let collides = taken
+        let collision = taken
             .iter()
-            .any(|p| claimed.contains(p) || (stored.contains(p) && !released.contains(p)));
-        if collides {
+            .find(|p| claimed.contains(*p) || (stored.contains(*p) && !released.contains(*p)));
+        if let Some(probe) = collision {
             if skip {
                 written.push(false);
                 continue;
             }
-            return Err(Error::Duplicate(
-                DuplicateError::Entry,
-                "Duplicate entry for a unique key".into(),
-            ));
+            return Err(duplicate_entry(def, &row.new_row, probe));
         }
         released.extend(vacated);
         claimed.extend(taken);

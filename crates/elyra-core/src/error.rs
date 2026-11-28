@@ -82,7 +82,9 @@ pub enum Error {
     #[error("serialization failure: {0}")]
     Conflict(String),
 
-    #[error("duplicate entry: {1}")]
+    /// The message is MySQL's whole text (`Duplicate entry '1' for key
+    /// 't.PRIMARY'`, `Duplicate column name 'a'`), with no prefix of ours.
+    #[error("{1}")]
     Duplicate(DuplicateError, String),
 
     /// A child row whose reference has no parent. MySQL 1452

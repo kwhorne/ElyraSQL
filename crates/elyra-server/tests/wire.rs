@@ -17179,3 +17179,137 @@ async fn converting_a_tables_collation_checks_its_unique_keys() {
         .unwrap();
     assert_eq!(found, 1);
 }
+
+/// A duplicate key is MySQL 8.4's 1062 text, word for word (every message
+/// below taken from it): the value and the key, named after its table.
+/// INSERTs said `key 'PRIMARY'` whichever key was hit, UPDATEs `a unique
+/// key`, and each had a `duplicate entry: ` of ours in front; code that reads
+/// which key -- which field was taken -- from the message found the wrong one.
+#[tokio::test]
+async fn duplicate_keys_are_named_as_mysql_names_them() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    for sql in [
+        "CREATE TABLE users (id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY, \
+         email VARCHAR(100) NOT NULL, team INT, num INT, \
+         UNIQUE KEY users_email_unique (email), UNIQUE KEY team_num (team, num))",
+        "INSERT INTO users (id, email, team, num) VALUES (1, 'a@x', 1, 1), (2, 'b@x', 1, 2)",
+        "CREATE TABLE nopk (a INT, b VARCHAR(10), UNIQUE KEY ub (b))",
+        "INSERT INTO nopk VALUES (1, 'x')",
+        "CREATE TABLE ck (a INT, b INT, PRIMARY KEY (a, b))",
+        "INSERT INTO ck VALUES (1, 2)",
+        "CREATE TABLE np (id INT NOT NULL, u INT)",
+        "INSERT INTO np VALUES (1, 1), (2, 1), (1, 3)",
+    ] {
+        c.query_drop(sql).await.unwrap();
+    }
+    let long = "l".repeat(90);
+    let cases: Vec<(String, String)> = vec![
+        (
+            "INSERT INTO users (id, email) VALUES (1, 'z@x')".into(),
+            "Duplicate entry '1' for key 'users.PRIMARY'".into(),
+        ),
+        (
+            "INSERT INTO users (email) VALUES ('a@x')".into(),
+            "Duplicate entry 'a@x' for key 'users.users_email_unique'".into(),
+        ),
+        (
+            "INSERT INTO users (email, team, num) VALUES ('c@x', 1, 2)".into(),
+            "Duplicate entry '1-2' for key 'users.team_num'".into(),
+        ),
+        (
+            "INSERT INTO users (email) VALUES ('d@x'), ('d@x')".into(),
+            "Duplicate entry 'd@x' for key 'users.users_email_unique'".into(),
+        ),
+        // The value as the row gives it, not as the collation folds it.
+        (
+            "INSERT INTO users (email) VALUES ('A@X')".into(),
+            "Duplicate entry 'A@X' for key 'users.users_email_unique'".into(),
+        ),
+        (
+            "INSERT INTO users (email) SELECT email FROM users WHERE id = 1".into(),
+            "Duplicate entry 'a@x' for key 'users.users_email_unique'".into(),
+        ),
+        (
+            "UPDATE users SET email = 'a@x' WHERE id = 2".into(),
+            "Duplicate entry 'a@x' for key 'users.users_email_unique'".into(),
+        ),
+        (
+            "UPDATE users SET id = 1 WHERE id = 2".into(),
+            "Duplicate entry '1' for key 'users.PRIMARY'".into(),
+        ),
+        (
+            "UPDATE users SET num = 1 WHERE id = 2".into(),
+            "Duplicate entry '1-1' for key 'users.team_num'".into(),
+        ),
+        (
+            "INSERT INTO nopk VALUES (2, 'x')".into(),
+            "Duplicate entry 'x' for key 'nopk.ub'".into(),
+        ),
+        (
+            "INSERT INTO ck VALUES (1, 2)".into(),
+            "Duplicate entry '1-2' for key 'ck.PRIMARY'".into(),
+        ),
+        (
+            "ALTER TABLE np ADD PRIMARY KEY (id)".into(),
+            "Duplicate entry '1' for key 'np.PRIMARY'".into(),
+        ),
+        (
+            "CREATE UNIQUE INDEX nu ON np (u)".into(),
+            "Duplicate entry '1' for key 'np.nu'".into(),
+        ),
+        (
+            "ALTER TABLE users ADD COLUMN email INT".into(),
+            "Duplicate column name 'email'".into(),
+        ),
+    ];
+    let check = |sql: &str, want: &str, got: mysql_async::Error| match got {
+        mysql_async::Error::Server(e) => {
+            assert_eq!(e.message, want, "{sql}");
+            let code = if want.starts_with("Duplicate column") {
+                1060
+            } else {
+                1062
+            };
+            assert_eq!(e.code, code, "{sql}");
+        }
+        other => panic!("{sql}: expected a server error, got {other:?}"),
+    };
+    for (sql, want) in &cases {
+        check(sql, want, c.query_drop(sql.as_str()).await.unwrap_err());
+    }
+    // In a transaction (another path), and over the binary protocol.
+    c.query_drop("BEGIN").await.unwrap();
+    let err = c
+        .query_drop("INSERT INTO users (id, email) VALUES (1, 'q@x')")
+        .await
+        .unwrap_err();
+    check(
+        "in a transaction",
+        "Duplicate entry '1' for key 'users.PRIMARY'",
+        err,
+    );
+    let err = c
+        .exec_drop("INSERT INTO users (email) VALUES (?)", ("b@x",))
+        .await
+        .unwrap_err();
+    check(
+        "prepared, in a transaction",
+        "Duplicate entry 'b@x' for key 'users.users_email_unique'",
+        err,
+    );
+    c.query_drop("ROLLBACK").await.unwrap();
+    // A long value is cut to 64 characters, as MySQL's `%-.64s` cuts it.
+    c.exec_drop("INSERT INTO users (email) VALUES (?)", (&long,))
+        .await
+        .unwrap();
+    let err = c
+        .exec_drop("INSERT INTO users (email) VALUES (?)", (&long,))
+        .await
+        .unwrap_err();
+    let want = format!(
+        "Duplicate entry '{}' for key 'users.users_email_unique'",
+        &long[..64]
+    );
+    check("long value", &want, err);
+}

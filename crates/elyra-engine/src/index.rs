@@ -243,6 +243,22 @@ pub fn unique_probe_keys(def: &TableDef, row: &[Value]) -> Result<Vec<Vec<u8>>> 
     Ok(out)
 }
 
+/// Which key of `def` a stored key -- a row's key, or a unique index's entry
+/// or probe key -- belongs to: `Some(None)` for the primary key,
+/// `Some(Some(index))` for an index, `None` for neither.
+pub fn key_owner<'a>(def: &'a TableDef, key: &[u8]) -> Option<Option<&'a IndexDef>> {
+    if key.starts_with(&def.data_prefix()) {
+        return Some(None);
+    }
+    let storage_table = def.storage_name();
+    def.indexes
+        .iter()
+        .filter(|index| key.starts_with(&index_prefix_storage(&storage_table, &index.name)))
+        // The longest prefix: an index named `a` must not claim `a::b`'s keys.
+        .max_by_key(|index| index.name.len())
+        .map(Some)
+}
+
 /// True if the table has any enforceable unique secondary index.
 pub fn has_unique(def: &TableDef) -> bool {
     def.indexes.iter().any(|i| i.unique && !i.vector)
