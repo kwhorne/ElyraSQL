@@ -333,7 +333,11 @@ judge fit before deploying.
   case-sensitive `..._as_cs` collation to `utf8mb4_bin`, everything else --
   `utf8mb4_0900_as_ci`, `utf8mb4_unicode_ci`, `latin1_swedish_ci`, ... -- to
   `utf8mb4_0900_ai_ci`. An `_as_ci` column is therefore accent-insensitive,
-  where MySQL's is not. In an expression, `COLLATE` and the `BINARY` operator
+  where MySQL's is not. A table's own default collation (`CREATE TABLE ...
+  COLLATE=utf8mb4_bin`, `ALTER TABLE ... COLLATE ...`) does not reach its
+  columns: a column that does not declare one compares as
+  `utf8mb4_0900_ai_ci`, where MySQL's takes the table's. `ALTER TABLE ...
+  CONVERT TO CHARACTER SET` is not supported. In an expression, `COLLATE` and the `BINARY` operator
   work as in MySQL -- `WHERE s COLLATE utf8mb4_bin = 'x'`, `WHERE BINARY s =
   'x'`, `ORDER BY s COLLATE utf8mb4_bin`, `GROUP BY`, `DISTINCT`, `LIKE`, `IN`,
   `MIN`/`MAX` -- with the same mapping: a `_bin` or `_cs` collation compares

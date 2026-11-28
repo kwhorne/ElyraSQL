@@ -39,6 +39,7 @@ mod sort;
 pub mod sqllex;
 pub mod sqlprepare;
 mod stream;
+mod tableopts;
 mod users;
 mod viewtype;
 mod vindex;
@@ -1414,6 +1415,70 @@ impl Engine {
             return Ok(vec![exec::show_processlist(sess)?]);
         }
 
+        // Table options -- `COMMENT = '...'`, `AUTO_INCREMENT = 100`,
+        // `ENGINE = InnoDB` -- as ALTER TABLE specifications, which sqlparser
+        // rejects; see `tableopts`. The other specifications run as usual.
+        if head.starts_with("alter table") {
+            if let Some(alter) = tableopts::alter_table(trimmed) {
+                require_privilege(privilege, PrivilegedAction::AlterTable)?;
+                let table =
+                    exec::stored_table_ident(sess, &mysql_table_name_fragment(&alter.table)?)?;
+                let mut out = match &alter.rest {
+                    Some(rest) => Box::pin(self.execute_as(rest, privilege, user, sess)).await?,
+                    None => {
+                        // As for any ALTER, the table must exist (1146).
+                        catalog::load(sess, &table).await?;
+                        vec![QueryResult::AffectedInfo {
+                            affected_rows: 0,
+                            info: exec::records_info(0, 0),
+                        }]
+                    }
+                };
+                self.apply_table_options(
+                    &alter.table,
+                    &table,
+                    &alter.options,
+                    privilege,
+                    user,
+                    sess,
+                )
+                .await?;
+                sess.set_row_count(0);
+                if let Some(QueryResult::Affected(n)) = out.last() {
+                    let n = *n;
+                    *out.last_mut().expect("checked") = QueryResult::AffectedInfo {
+                        affected_rows: n,
+                        info: exec::records_info(n, 0),
+                    };
+                }
+                return Ok(out);
+            }
+        }
+
+        // A CREATE TABLE's `AUTO_INCREMENT = n` and `COMMENT = '...'`, which
+        // the frontend drops with the other table options (see
+        // `strip_create_table_options`): the table is created without them,
+        // then they are applied -- unless IF NOT EXISTS found the table there.
+        if head.starts_with("create") {
+            if let Some(stripped) = strip_create_table_options(trimmed) {
+                if let Some((name, if_not_exists, options)) =
+                    tableopts::create_table(trimmed, &stripped)
+                {
+                    let table = exec::stored_table_ident(sess, &mysql_table_name_fragment(&name)?)?;
+                    let existed = if_not_exists && catalog::exists(sess, &table).await?;
+                    let out = Box::pin(self.execute_as(&stripped, privilege, user, sess)).await?;
+                    if !existed {
+                        self.apply_table_options(&name, &table, &options, privilege, user, sess)
+                            .await?;
+                        // DDL leaves ROW_COUNT() at 0; the counter's MAX()
+                        // query moved it.
+                        sess.set_row_count(0);
+                    }
+                    return Ok(out);
+                }
+            }
+        }
+
         // sqlparser 0.53 does not recognize standalone RENAME TABLE, and parses
         // ALTER TABLE ... RENAME INDEX as a malformed column rename. Handle
         // those narrow MySQL forms before the generic frontend.
@@ -2157,6 +2222,45 @@ impl Engine {
             )
             .await,
         )
+    }
+
+    /// Apply the table options that change anything here (see `tableopts`)
+    /// to `table`, named `written` in the statement.
+    async fn apply_table_options(
+        &self,
+        written: &str,
+        table: &str,
+        options: &tableopts::TableOptions,
+        privilege: Privilege,
+        user: &str,
+        sess: &Session,
+    ) -> Result<()> {
+        if let Some(comment) = &options.comment {
+            exec::set_table_comment(sess, table, comment).await?;
+        }
+        if let Some(next) = options.auto_increment {
+            // MySQL goes no lower than one past the largest value held.
+            let max = match exec::auto_increment_column(sess, table).await? {
+                Some(column) => {
+                    let sql = format!("SELECT MAX(`{}`) FROM {written}", column.replace('`', "``"));
+                    let mut out = Box::pin(self.execute_as(&sql, privilege, user, sess)).await?;
+                    let mut largest = 0i64;
+                    if let Some(QueryResult::Rows(mut rows)) = out.pop() {
+                        if let Some(row) = rows.next_batch(1).await?.first() {
+                            largest = match row.first() {
+                                Some(Value::Int(n)) => *n,
+                                Some(Value::UInt(n)) => i64::try_from(*n).unwrap_or(i64::MAX),
+                                _ => 0,
+                            };
+                        }
+                    }
+                    largest
+                }
+                None => 0,
+            };
+            exec::set_auto_increment(sess, table, next, max).await?;
+        }
+        Ok(())
     }
 
     /// The text passes and the parse, from the statement's text to what

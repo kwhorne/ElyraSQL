@@ -16810,3 +16810,166 @@ async fn ok_packets_carry_mysqls_info() {
     let row_count: i64 = c.query_first("SELECT ROW_COUNT()").await.unwrap().unwrap();
     assert_eq!(row_count, 0);
 }
+
+/// The id an INSERT into `ao` was given.
+async fn next_ao_id(c: &mut mysql_async::Conn) -> u64 {
+    c.query_drop("INSERT INTO ao (v) VALUES (0)").await.unwrap();
+    c.last_insert_id().unwrap()
+}
+
+/// Table options as ALTER TABLE specifications, which were syntax errors
+/// (1064): Laravel writes `alter table t comment = '...'` for
+/// `$table->comment()` and `auto_increment = n` for `->from(n)`, phpMyAdmin
+/// dumps `MODIFY ... AUTO_INCREMENT, AUTO_INCREMENT=n`. The counter and the
+/// comment take effect as in MySQL 8.4, every value below taken from it; the
+/// engine, character set and row format change nothing here.
+#[tokio::test]
+async fn alter_table_options_apply_as_in_mysql() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop("CREATE TABLE ao (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, v INT)")
+        .await
+        .unwrap();
+    assert_eq!(next_ao_id(&mut c).await, 1);
+
+    c.query_drop("ALTER TABLE ao AUTO_INCREMENT = 100")
+        .await
+        .unwrap();
+    assert_eq!(c.info(), "Records: 0  Duplicates: 0  Warnings: 0");
+    assert_eq!(next_ao_id(&mut c).await, 100);
+    // No lower than one past the largest id.
+    c.query_drop("ALTER TABLE ao AUTO_INCREMENT = 5")
+        .await
+        .unwrap();
+    assert_eq!(next_ao_id(&mut c).await, 101);
+    // Lower than the counter is fine once the rows above are gone.
+    c.query_drop("DELETE FROM ao WHERE id > 1").await.unwrap();
+    c.query_drop("ALTER TABLE ao AUTO_INCREMENT = 50")
+        .await
+        .unwrap();
+    assert_eq!(next_ao_id(&mut c).await, 50);
+
+    // phpMyAdmin's form, with another specification before it.
+    c.query_drop("ALTER TABLE `ao` MODIFY `id` INT NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=1000")
+        .await
+        .unwrap();
+    assert_eq!(next_ao_id(&mut c).await, 1000);
+
+    // Laravel's, over the binary protocol as its native prepares send it.
+    c.exec_drop("alter table `ao` comment = 'Orders, archived'", ())
+        .await
+        .unwrap();
+    c.exec_drop("alter table `ao` auto_increment = 2000", ())
+        .await
+        .unwrap();
+    assert_eq!(next_ao_id(&mut c).await, 2000);
+
+    let row: (String, i64) = c
+        .query_first(
+            "SELECT TABLE_COMMENT, AUTO_INCREMENT FROM information_schema.TABLES \
+             WHERE TABLE_NAME = 'ao'",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row, ("Orders, archived".to_string(), 2001));
+    let (_, ddl): (String, String) = c
+        .query_first("SHOW CREATE TABLE ao")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        ddl.ends_with(") AUTO_INCREMENT=2001 COMMENT='Orders, archived'"),
+        "{ddl}"
+    );
+
+    // Options that change nothing here, alone or together.
+    for sql in [
+        "ALTER TABLE ao ENGINE = InnoDB",
+        "ALTER TABLE ao ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
+        "ALTER TABLE ao CHARACTER SET utf8mb4, ROW_FORMAT = DYNAMIC",
+        "ALTER TABLE ao STATS_PERSISTENT = 0, PACK_KEYS = 1, CHECKSUM = 1",
+        "ALTER TABLE ao FORCE",
+        "ALTER TABLE ao ENGINE=InnoDB, ALGORITHM=COPY",
+    ] {
+        c.query_drop(sql)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+        assert_eq!(c.info(), "Records: 0  Duplicates: 0  Warnings: 0", "{sql}");
+    }
+    // An empty comment removes it, as in MySQL.
+    c.query_drop("ALTER TABLE ao COMMENT ''").await.unwrap();
+    let comment: String = c
+        .query_first("SELECT TABLE_COMMENT FROM information_schema.TABLES WHERE TABLE_NAME = 'ao'")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(comment, "");
+
+    // As for any ALTER, a missing table is 1146.
+    let err = c
+        .query_drop("ALTER TABLE no_such_table COMMENT = 'x'")
+        .await
+        .unwrap_err();
+    match err {
+        mysql_async::Error::Server(e) => assert_eq!(e.code, 1146),
+        other => panic!("expected 1146, got {other:?}"),
+    }
+}
+
+/// A CREATE TABLE's `AUTO_INCREMENT` and `COMMENT` were dropped with the other
+/// table options: the counter started at 1, so a dump of a table whose last
+/// rows had been deleted gave their ids out again once restored. They are
+/// kept now, written back by SHOW CREATE TABLE, and the comment follows the
+/// table through RENAME and LIKE and goes with DROP, as in MySQL.
+#[tokio::test]
+async fn create_table_keeps_its_counter_and_comment() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop(
+        "CREATE TABLE ct (id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, n INT) \
+         ENGINE=InnoDB AUTO_INCREMENT=10 DEFAULT CHARSET=utf8mb4 COMMENT='it''s kept'",
+    )
+    .await
+    .unwrap();
+    let row_count: i64 = c.query_first("SELECT ROW_COUNT()").await.unwrap().unwrap();
+    assert_eq!(row_count, 0);
+    c.query_drop("INSERT INTO ct (n) VALUES (1)").await.unwrap();
+    assert_eq!(c.last_insert_id(), Some(10));
+
+    // IF NOT EXISTS on an existing table changes nothing.
+    c.query_drop("CREATE TABLE IF NOT EXISTS ct (id INT) AUTO_INCREMENT=500 COMMENT='no'")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO ct (n) VALUES (2)").await.unwrap();
+    assert_eq!(c.last_insert_id(), Some(11));
+
+    // SHOW CREATE TABLE recreates the counter and the comment.
+    let (_, ddl): (String, String) = c
+        .query_first("SHOW CREATE TABLE ct")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        ddl.ends_with(") AUTO_INCREMENT=12 COMMENT='it''s kept'"),
+        "{ddl}"
+    );
+    c.query_drop("DROP TABLE ct").await.unwrap();
+    c.query_drop(ddl.as_str()).await.unwrap();
+    c.query_drop("INSERT INTO ct (n) VALUES (3)").await.unwrap();
+    assert_eq!(c.last_insert_id(), Some(12));
+
+    let comment = |name: &'static str| {
+        format!("SELECT TABLE_COMMENT FROM information_schema.TABLES WHERE TABLE_NAME = '{name}'")
+    };
+    c.query_drop("RENAME TABLE ct TO ct2").await.unwrap();
+    let kept: String = c.query_first(comment("ct2")).await.unwrap().unwrap();
+    assert_eq!(kept, "it's kept");
+    c.query_drop("CREATE TABLE ct3 LIKE ct2").await.unwrap();
+    let copied: String = c.query_first(comment("ct3")).await.unwrap().unwrap();
+    assert_eq!(copied, "it's kept");
+    c.query_drop("DROP TABLE ct2").await.unwrap();
+    c.query_drop("CREATE TABLE ct2 (id INT)").await.unwrap();
+    let gone: String = c.query_first(comment("ct2")).await.unwrap().unwrap();
+    assert_eq!(gone, "");
+}
