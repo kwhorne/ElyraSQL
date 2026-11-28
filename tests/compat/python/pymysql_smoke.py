@@ -64,6 +64,25 @@ def main() -> int:
     cur.execute("SELECT COUNT(*) FROM py_items")
     check("delete", cur.fetchone()[0] == 2)
 
+    # An UPDATE that leaves its row as it was: 0 rows by default, 1 for a
+    # client with CLIENT_FOUND_ROWS. Django connects with that flag and takes
+    # 0 for a missing row, so its save() of an unchanged row INSERTed it.
+    n = cur.execute("UPDATE py_items SET price = price WHERE id = 1")
+    check("unchanged update counts 0 rows", n == 0, str(n))
+    found = pymysql.connect(
+        host=os.environ.get("ELYRASQL_HOST", "127.0.0.1"),
+        port=int(os.environ.get("ELYRASQL_PORT", "3307")),
+        user=os.environ.get("ELYRASQL_USER", "root"),
+        password=os.environ.get("ELYRASQL_PASS", ""),
+        autocommit=True,
+        client_flag=pymysql.constants.CLIENT.FOUND_ROWS,
+    )
+    fcur = found.cursor()
+    n = fcur.execute("UPDATE py_items SET price = price WHERE id = 1")
+    check("unchanged update counts 1 row with FOUND_ROWS", n == 1, str(n))
+    fcur.close()
+    found.close()
+
     cur.close()
     conn.close()
 

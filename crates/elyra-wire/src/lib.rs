@@ -678,7 +678,12 @@ where
             // over the text and the binary protocol, as MySQL's does. A client
             // only asks for what the server offers.
             | CapabilityFlags::CLIENT_MULTI_RESULTS
-            | CapabilityFlags::CLIENT_PS_MULTI_RESULTS;
+            | CapabilityFlags::CLIENT_PS_MULTI_RESULTS
+            // An UPDATE counts the rows it matched rather than changed, for a
+            // client that asks: Django, Rails' mysql2 and Connector/J do.
+            // Clients that mask their flags with the server's would not ask
+            // if it were not offered.
+            | CapabilityFlags::CLIENT_FOUND_ROWS;
 
         #[cfg(feature = "tls")]
         let server_capabilities = if tls_conf.is_some() {

@@ -209,6 +209,13 @@ impl<'a, W: AsyncWrite + Unpin> QueryResultWriter<'a, W> {
         )
     }
 
+    /// Whether the client asked for an UPDATE's matched rows rather than its
+    /// changed ones (`CLIENT_FOUND_ROWS`).
+    pub fn client_found_rows(&self) -> bool {
+        self.client_capabilities
+            .contains(CapabilityFlags::CLIENT_FOUND_ROWS)
+    }
+
     /// Send the last bits of the last resultset to the client, and indicate that there are no more
     /// resultsets coming.
     pub async fn no_more_results(mut self) -> io::Result<()> {

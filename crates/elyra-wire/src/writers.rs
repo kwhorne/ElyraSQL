@@ -54,8 +54,11 @@ pub(crate) async fn write_ok_packet<W: AsyncWrite + Unpin>(
         {
             w.write_lenenc_str(ok_packet.session_state_info.as_bytes())?;
         }
-    } else {
-        w.write_all(ok_packet.info.as_bytes())?;
+    } else if !ok_packet.info.is_empty() {
+        // Length-encoded here too: MySQL's server always sends the info that
+        // way, and libmysqlclient always reads it that way. Sent bare, its
+        // first byte was read as the length ("Rows matched" as 82 bytes).
+        w.write_lenenc_str(ok_packet.info.as_bytes())?;
     }
     w.end_packet().await
 }

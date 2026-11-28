@@ -25,6 +25,13 @@ drivers connect without modification.
 - **Authentication** — `mysql_native_password` by **default** (widest driver
   compatibility), with `caching_sha2_password` available opt-in (see below).
 - **TLS** — clients may negotiate SSL.
+- **Affected rows** — as MySQL counts them: an UPDATE counts the rows it
+  changed, or with `CLIENT_FOUND_ROWS` (Django, Rails' mysql2 and
+  Connector/J connect with it) the rows it matched, and `ROW_COUNT()` follows.
+  The OK packet carries MySQL's info text — `Rows matched: 2  Changed: 1
+  Warnings: 0` after an UPDATE, `Records: 3  Duplicates: 0  Warnings: 0` after
+  an INSERT of several rows or from a SELECT, a REPLACE or an ALTER TABLE —
+  which the `mysql` client prints under "Query OK".
 - **Handshake** — reports a MySQL-looking version, e.g. `8.0.12-ElyraSQL-1.13.8`,
   and answers the session/introspection queries clients send on connect
   (`SELECT @@version_comment`, `SELECT VERSION()`, `SET ...`,

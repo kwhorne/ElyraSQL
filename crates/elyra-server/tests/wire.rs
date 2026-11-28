@@ -16631,3 +16631,182 @@ async fn a_pooled_connection_comes_back_clean() {
     drop(c);
     pool.disconnect().await.unwrap();
 }
+
+/// A connection that asks for found rows (`CLIENT_FOUND_ROWS`), as Django,
+/// Rails' mysql2 and Connector/J do by default.
+async fn found_rows_conn(srv: &TestServer) -> mysql_async::Conn {
+    let opts = mysql_async::OptsBuilder::default()
+        .ip_or_hostname("127.0.0.1")
+        .tcp_port(srv.port)
+        .user(Some("root"))
+        .prefer_socket(false)
+        .client_found_rows(true);
+    mysql_async::Conn::new(opts).await.expect("connect")
+}
+
+/// With `CLIENT_FOUND_ROWS`, an UPDATE counts the rows it matched, not only
+/// those it changed, and so does an `ON DUPLICATE KEY UPDATE` that leaves a
+/// row as it was -- as MySQL 8.4 does, every count below taken from it. The
+/// flag was never negotiated: a Django `save()` of an unchanged row got 0,
+/// took the row for missing, and INSERTed it into a duplicate-key error.
+#[tokio::test]
+async fn found_rows_clients_get_the_rows_an_update_matched() {
+    let srv = TestServer::start().await;
+    let mut plain = srv.conn().await;
+    let mut found = found_rows_conn(&srv).await;
+    plain
+        .query_drop("CREATE TABLE fr (id INT PRIMARY KEY, v INT, u INT, UNIQUE KEY (u))")
+        .await
+        .unwrap();
+    plain
+        .query_drop("INSERT INTO fr VALUES (1, 10, 1), (2, 20, 2), (3, 30, 3)")
+        .await
+        .unwrap();
+
+    // (statement, rows without the flag, rows with it)
+    let cases: &[(&str, u64, u64)] = &[
+        ("UPDATE fr SET v = 10 WHERE id = 1", 0, 1),
+        ("UPDATE fr SET v = v WHERE id IN (1, 2, 3)", 0, 3),
+        ("UPDATE fr SET v = v WHERE id > 100", 0, 0),
+        (
+            "INSERT INTO fr VALUES (1, 10, 1) ON DUPLICATE KEY UPDATE v = 10",
+            0,
+            1,
+        ),
+        (
+            "INSERT INTO fr VALUES (4, 4, 4), (4, 4, 4) ON DUPLICATE KEY UPDATE v = 4",
+            1,
+            2,
+        ),
+        // A row UPDATE IGNORE leaves as it was after a duplicate still matched.
+        ("UPDATE IGNORE fr SET u = 1 WHERE id = 2", 0, 1),
+    ];
+    for (sql, want_plain, want_found) in cases {
+        for (c, want, who) in [
+            (&mut plain, *want_plain, "plain"),
+            (&mut found, *want_found, "found rows"),
+        ] {
+            c.query_drop(*sql).await.unwrap();
+            assert_eq!(c.affected_rows(), want, "{who}: {sql}");
+            let row_count: i64 = c.query_first("SELECT ROW_COUNT()").await.unwrap().unwrap();
+            assert_eq!(row_count, want as i64, "{who}: ROW_COUNT() after {sql}");
+            // Put the upsert's new row back so both connections see the same.
+            c.query_drop("DELETE FROM fr WHERE id = 4").await.unwrap();
+        }
+    }
+
+    // A multi-table UPDATE counts each target row once.
+    plain
+        .query_drop("CREATE TABLE fr2 (id INT PRIMARY KEY, x INT)")
+        .await
+        .unwrap();
+    plain
+        .query_drop("INSERT INTO fr2 VALUES (1, 1), (2, 2)")
+        .await
+        .unwrap();
+    found
+        .query_drop("UPDATE fr JOIN fr2 ON fr.id = fr2.id SET fr.v = fr.v + 1, fr2.x = fr2.x")
+        .await
+        .unwrap();
+    assert_eq!(found.affected_rows(), 4);
+    assert_eq!(found.info(), "Rows matched: 4  Changed: 2  Warnings: 0");
+
+    // The binary protocol too.
+    found
+        .exec_drop("UPDATE fr SET v = ? WHERE id = ?", (11, 1))
+        .await
+        .unwrap();
+    assert_eq!(found.affected_rows(), 1);
+    assert_eq!(found.info(), "Rows matched: 1  Changed: 0  Warnings: 0");
+}
+
+/// The OK packet carries the info text MySQL sends with it, as MySQL 8.4
+/// words it for these statements; the mysql client prints it under "Query
+/// OK". Warnings are 0: none are recorded (`SHOW WARNINGS` is empty).
+#[tokio::test]
+async fn ok_packets_carry_mysqls_info() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    let cases: &[(&str, u64, &str)] = &[
+        (
+            "CREATE TABLE oi (id INT PRIMARY KEY, v INT, u INT, UNIQUE KEY (u))",
+            0,
+            "",
+        ),
+        ("INSERT INTO oi VALUES (1, 10, 1)", 1, ""),
+        (
+            "INSERT INTO oi VALUES (2, 20, 2), (3, 30, 3)",
+            2,
+            "Records: 2  Duplicates: 0  Warnings: 0",
+        ),
+        (
+            "INSERT INTO oi VALUES (4, 1, 4), (4, 2, 4) ON DUPLICATE KEY UPDATE v = 2",
+            3,
+            "Records: 2  Duplicates: 1  Warnings: 0",
+        ),
+        (
+            "INSERT IGNORE INTO oi VALUES (1, 0, 1), (6, 0, 6), (7, 0, 2)",
+            1,
+            "Records: 3  Duplicates: 2  Warnings: 0",
+        ),
+        (
+            "REPLACE INTO oi VALUES (6, 1, 6), (8, 1, 8), (9, 1, 3)",
+            5,
+            "Records: 3  Duplicates: 2  Warnings: 0",
+        ),
+        (
+            "UPDATE oi SET v = 0 WHERE id < 3",
+            2,
+            "Rows matched: 2  Changed: 2  Warnings: 0",
+        ),
+        (
+            "UPDATE oi SET v = 0 WHERE id < 3",
+            0,
+            "Rows matched: 2  Changed: 0  Warnings: 0",
+        ),
+        ("DELETE FROM oi WHERE id = 9", 1, ""),
+        ("CREATE TABLE oi2 (id INT PRIMARY KEY, x INT)", 0, ""),
+        (
+            "INSERT INTO oi2 SELECT id, v FROM oi",
+            5,
+            "Records: 5  Duplicates: 0  Warnings: 0",
+        ),
+        (
+            "INSERT INTO oi2 SELECT id, v FROM oi WHERE 1 = 0",
+            0,
+            "Records: 0  Duplicates: 0  Warnings: 0",
+        ),
+        (
+            "CREATE TABLE oi3 AS SELECT id, v FROM oi",
+            5,
+            "Records: 5  Duplicates: 0  Warnings: 0",
+        ),
+        (
+            "ALTER TABLE oi3 ADD COLUMN z INT",
+            0,
+            "Records: 0  Duplicates: 0  Warnings: 0",
+        ),
+        (
+            "CREATE INDEX oi3_v ON oi3 (v)",
+            0,
+            "Records: 0  Duplicates: 0  Warnings: 0",
+        ),
+        (
+            "DROP INDEX oi3_v ON oi3",
+            0,
+            "Records: 0  Duplicates: 0  Warnings: 0",
+        ),
+        ("ALTER TABLE oi3 RENAME TO oi4", 0, ""),
+        ("TRUNCATE TABLE oi4", 0, ""),
+    ];
+    for (sql, rows, info) in cases {
+        c.query_drop(*sql).await.unwrap();
+        assert_eq!(c.affected_rows(), *rows, "{sql}");
+        assert_eq!(c.info(), *info, "{sql}");
+    }
+    // DDL leaves ROW_COUNT() at 0, as MySQL's does; DROP INDEX left -1.
+    c.query_drop("CREATE INDEX oi4_v ON oi4 (v)").await.unwrap();
+    c.query_drop("DROP INDEX oi4_v ON oi4").await.unwrap();
+    let row_count: i64 = c.query_first("SELECT ROW_COUNT()").await.unwrap().unwrap();
+    assert_eq!(row_count, 0);
+}

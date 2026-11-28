@@ -110,7 +110,12 @@ judge fit before deploying.
   column cannot hold is stored as the nearest one it can (the implicit default
   for NULL in a NOT NULL column, the bound of an integer range, a truncated
   string, `''` for an unknown `ENUM` member). `SHOW WARNINGS` is always empty,
-  so the warnings MySQL lists for those rows are not reported.
+  so the warnings MySQL lists for those rows are not reported, and the
+  `Warnings:` count in a statement's info text (`Records: 3  Duplicates: 2
+  Warnings: 0`) is always 0.
+- An ALTER TABLE that MySQL runs by copying the table (a column's type
+  changed, such as `INT` to `BIGINT`) reports its rows there as affected and
+  in `Records:`; ElyraSQL reports 0 for every ALTER TABLE.
 - Constraint names in error messages: a `CHECK` is named `<table>_chk_<n>`
   even when it was declared with `CONSTRAINT name`, and a foreign key declared
   without a name is `fk_<table>_<n>` rather than MySQL's `<table>_ibfk_<n>`.

@@ -6,6 +6,28 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **A client that asks for found rows gets them.** Django, Rails' mysql2 and
+  Connector/J connect with `CLIENT_FOUND_ROWS`, which asks an UPDATE to count
+  the rows it matched rather than those it changed. The flag was neither
+  offered nor honoured, so an UPDATE that left its row as it was counted 0.
+  Django reads 0 as "no such row": a `save()` of an unchanged model INSERTed
+  it, into a duplicate-key error (1062). An UPDATE now counts its matched rows
+  for such a client, an `ON DUPLICATE KEY UPDATE` that leaves a row as it was
+  counts 1, and `ROW_COUNT()` follows; other clients get the changed rows, as
+  before.
+- **The OK packet carries MySQL's info text.** `Rows matched: 2  Changed: 1
+  Warnings: 0` after an UPDATE; `Records: 3  Duplicates: 1  Warnings: 0` after
+  an INSERT of several rows or from a SELECT, a REPLACE, a CREATE TABLE ...
+  SELECT and an ALTER TABLE, CREATE INDEX or DROP INDEX; `Records: 3  Deleted:
+  0  Skipped: 0  Warnings: 0` after LOAD DATA. Each count matches MySQL 8.4's
+  for the same statements, except `Warnings:`, which is 0 (none are recorded).
+  The info is length-encoded, as MySQL sends it: libmysqlclient, which the
+  `mysql` client and Python's mysqlclient use, reads it that way.
+- `ROW_COUNT()` after `DROP INDEX`, `ALTER TABLE ... DROP FOREIGN KEY`, a
+  `CREATE FULLTEXT INDEX` and `RENAME TABLE` is 0, as after other DDL; it was -1.
+
 ## [1.13.8] - 2026-11-27
 
 Faster point lookups under concurrency; no change in behaviour.

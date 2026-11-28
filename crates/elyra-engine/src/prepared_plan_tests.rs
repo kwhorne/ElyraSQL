@@ -74,7 +74,12 @@ async fn describe(results: super::Result<Vec<QueryResult>>) -> String {
                     QueryResult::Insert {
                         affected_rows,
                         last_insert_id,
-                    } => out.push_str(&format!("insert {affected_rows} {last_insert_id}\n")),
+                        info,
+                    } => out.push_str(&format!("insert {affected_rows} {last_insert_id} {info}\n")),
+                    QueryResult::AffectedInfo {
+                        affected_rows,
+                        info,
+                    } => out.push_str(&format!("affected {affected_rows} {info}\n")),
                 }
             }
             out

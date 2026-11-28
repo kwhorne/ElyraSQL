@@ -233,10 +233,14 @@ impl Server {
                 }
                 Ok(out.to_string())
             }
-            QueryResult::Affected(n) => Ok(json!({"affected_rows": n}).to_string()),
+            QueryResult::Affected(n)
+            | QueryResult::AffectedInfo {
+                affected_rows: n, ..
+            } => Ok(json!({"affected_rows": n}).to_string()),
             QueryResult::Insert {
                 affected_rows,
                 last_insert_id,
+                ..
             } => Ok(json!({
                 "affected_rows": affected_rows,
                 "last_insert_id": last_insert_id,
