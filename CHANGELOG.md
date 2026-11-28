@@ -6,6 +6,11 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.13.9] - 2026-11-28
+
+MySQL compatibility fixes: found rows for Django and other ORMs, table options
+in ALTER TABLE, table collations, OK info text and duplicate-key messages.
+
 ### Fixed
 
 - **A client that asks for found rows gets them.** Django, Rails' mysql2 and
@@ -78,6 +83,22 @@ All notable changes to ElyraSQL are documented here. The format is based on
   VALUES or a SELECT), UPDATE, tables without a primary key, `ALTER TABLE ...
   ADD PRIMARY KEY` and `ADD UNIQUE`. A duplicate column name (1060) reads
   `Duplicate column name 'a'`, as in MySQL.
+
+### Upgrading
+
+- No change to the database file; a 1.13.8 database opens in 1.13.9
+  unchanged.
+- No configuration changes.
+- Tables created before keep their columns' collations. A table declared with
+  `COLLATE=utf8mb4_bin` (or `CHARSET=binary`) had its columns created
+  case-insensitive; `ALTER TABLE t CONVERT TO CHARACTER SET utf8mb4 COLLATE
+  utf8mb4_bin` gives them the table's collation (it refuses, with 1062, if
+  that would merge two values of a UNIQUE key).
+- `SHOW CREATE TABLE` now also writes `AUTO_INCREMENT=n`, a table `COMMENT`,
+  a column's `COLLATE utf8mb4_bin` and a `_bin` table's `DEFAULT
+  CHARSET=utf8mb4 COLLATE=utf8mb4_bin`, so dumps differ from 1.13.8's.
+- 1062 messages are MySQL's text (`Duplicate entry 'a@x' for key
+  'users.users_email_unique'`); code that matched the old wording needs it.
 
 ## [1.13.8] - 2026-11-27
 
