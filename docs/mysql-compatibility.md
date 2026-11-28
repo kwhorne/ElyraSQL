@@ -196,6 +196,19 @@ gaps:
   MySQL shorthands `INSERT ... SET` and the `<<`/`>>`/`~` bitwise operators all
   work. `LOAD DATA INFILE` reads a server-side file using bounded bulk insert
   units; client-streamed `LOAD DATA LOCAL INFILE` is not supported.
+- **JSON is stored in MySQL's normal form** (since 1.13.11): keys sorted
+  shorter first then by bytes, the last of a duplicated key kept, `", "` and
+  `": "` between members, numbers in JSON text read as integers or doubles
+  (`1.50` is `1.5`), a JSON function's DECIMAL kept with its scale
+  (`JSON_ARRAY(1.50)` is `[1.50]`). A document is kept as text, not MySQL's
+  binary form; rows stored by an earlier version keep their text until
+  rewritten (`UPDATE t SET j = CAST(j AS CHAR)`). A double in JSON text with
+  16 or 17 significant digits can read back one unit in the last place apart
+  from MySQL, whose parser does not always land on the nearest double.
+  `CAST(... AS JSON)`, `JSON_MERGE_PATCH`, `JSON_ARRAYAGG`, `JSON_PRETTY`,
+  `JSON_SEARCH`, `JSON_DEPTH`, `JSON_ARRAY_APPEND` and `JSON_OVERLAPS` are not
+  yet supported, and `JSON_TYPE` reports a JSON function's DECIMAL as
+  `DOUBLE`.
 - Vector search and `VEC_DISTANCE(...)` are ElyraSQL extensions (they mirror
   MySQL 9's vector direction but are not identical).
 - **Integer storage is always 64-bit**, but the declared width and `UNSIGNED`

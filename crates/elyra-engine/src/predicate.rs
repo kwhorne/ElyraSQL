@@ -655,8 +655,9 @@ fn json_path(
             )))
         }
     };
-    let text = match &doc {
-        Value::Json(s) | Value::Text(s) => s.clone(),
+    let parsed = match &doc {
+        Value::Json(s) => elyra_core::json::parse(s),
+        Value::Text(s) => elyra_core::json::parse_text(s),
         Value::Null => return Ok(Value::Null),
         other => {
             return Err(Error::Type(format!(
@@ -664,7 +665,7 @@ fn json_path(
             )))
         }
     };
-    let Some(parsed) = elyra_core::json::parse(&text) else {
+    let Some(parsed) = parsed else {
         return Err(Error::Type("left side of -> is not valid JSON".into()));
     };
     Ok(match parsed.extract(&path) {
@@ -846,15 +847,18 @@ fn eval_function(f: &sqlparser::ast::Function, schema: &Schema, row: &[Value]) -
 fn eval_json_fn(name: &str, vals: &[Value]) -> Result<Value> {
     use elyra_core::json::{self, Json, SetMode};
 
-    // Parse a value as a JSON document (NULL propagates).
+    // Parse a value as a JSON document (NULL propagates): a JSON value as it
+    // is, text as MySQL reads JSON text (see `json::parse_text`).
     let get_doc = |v: &Value| -> Result<Option<Json>> {
-        match v {
-            Value::Null => Ok(None),
-            Value::Json(s) | Value::Text(s) => json::parse(s)
-                .map(Some)
-                .ok_or_else(|| Error::Type("invalid JSON document".into())),
-            other => Err(Error::Type(format!("not a JSON document: {other:?}"))),
-        }
+        let parsed = match v {
+            Value::Null => return Ok(None),
+            Value::Json(s) => json::parse(s),
+            Value::Text(s) => json::parse_text(s),
+            other => return Err(Error::Type(format!("not a JSON document: {other:?}"))),
+        };
+        parsed
+            .map(Some)
+            .ok_or_else(|| Error::Type("invalid JSON document".into()))
     };
     let as_str = |v: &Value| -> Result<String> {
         match v {

@@ -27573,10 +27573,19 @@ fn coerce_with_mode(v: Value, ty: &ColumnType, col: &str, strict: bool) -> Resul
             None if !strict => Value::Text("00:00:00".into()),
             None => return Err(Error::Type(format!("invalid TIME literal: {s}"))),
         },
-        (ColumnType::Json, Value::Json(s)) => Value::Json(s),
+        // Stored as MySQL stores it, normalised (see `json::canonical`): read
+        // back, `{"b":1,"a":2}` is `{"a": 2, "b": 1}`, as from MySQL. A JSON
+        // value keeps its numbers as they are -- a JSON function's DECIMAL
+        // keeps its scale (`JSON_ARRAY(1.50)` is `[1.50]`), as in MySQL --
+        // so writing it again changes only a row stored before this form.
+        (ColumnType::Json, Value::Json(s)) => Value::Json(
+            elyra_core::json::parse(&s)
+                .map(|json| json.to_json_string())
+                .unwrap_or(s),
+        ),
         (ColumnType::Json, Value::Text(s)) => {
             if elyra_core::value::is_valid_json(&s) {
-                Value::Json(s)
+                Value::Json(elyra_core::json::canonical(&s).unwrap_or(s))
             } else {
                 return Err(Error::Type(format!("invalid JSON literal: {s}")));
             }

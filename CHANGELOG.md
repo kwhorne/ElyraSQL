@@ -6,6 +6,29 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed
+
+- **A JSON column stores and returns JSON as MySQL does.** MySQL keeps a JSON
+  document in a normal form, and that is what a client reads back; ElyraSQL
+  kept the text as written. Now `'{"b":1, "a":2}'` reads back as
+  `{"a": 2, "b": 1}`, as from MySQL: an object's keys in MySQL's order
+  (shorter first, then by bytes) with the last of a duplicated key kept, `", "`
+  and `": "` between members and no other whitespace, a number in JSON text
+  read as an integer or a double (`1.50` is `1.5`, `1e2` is `100.0`), and a
+  string escaped only where MySQL escapes (`\/` is `/`, `\u00e9` is `é`). A
+  DECIMAL that a JSON function puts in keeps its scale (`JSON_ARRAY(1.50)` is
+  `[1.50]`), as in MySQL; a DECIMAL argument used to become the string
+  `"1.50"`. JSON functions given JSON text return the same normal form, and
+  `JSON_KEYS` lists keys in MySQL's order. Rows stored before keep their text
+  until written again; `UPDATE t SET j = CAST(j AS CHAR)` brings them to the
+  normal form (it reads the text as JSON text, as inserting it again would).
+
+### Fixed
+
+- **`JSON_CONTAINS` compared numbers as text.** `JSON_CONTAINS('[1.0]', '1')`
+  and `JSON_CONTAINS('{"n": 1.0}', '{"n": 1}')` were 0; numbers now compare
+  by value, so they are 1, as in MySQL.
+
 ## [1.13.10] - 2026-11-28
 
 JSON functions no longer drop characters outside ASCII.
