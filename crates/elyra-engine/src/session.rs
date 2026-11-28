@@ -231,6 +231,10 @@ pub struct Session {
     last_insert_id: std::sync::atomic::AtomicI64,
     /// `ROW_COUNT()` -- rows changed by the last DML (-1 after a SELECT/DDL).
     row_count: std::sync::atomic::AtomicI64,
+    /// The client connected with `CLIENT_FOUND_ROWS`: an UPDATE, and an
+    /// `ON DUPLICATE KEY UPDATE` that hits a row, count the rows they matched
+    /// instead of the rows they changed (see [`Session::client_found_rows`]).
+    client_found_rows: std::sync::atomic::AtomicBool,
     /// Cooperative cancellation for the statement currently running on this
     /// session: armed with the query timeout on entry, checked inside the hot row
     /// loops so a runaway statement stops burning CPU instead of running to
@@ -317,6 +321,7 @@ impl Session {
             global_read_lock: std::sync::atomic::AtomicBool::new(false),
             last_insert_id: std::sync::atomic::AtomicI64::new(0),
             row_count: std::sync::atomic::AtomicI64::new(-1),
+            client_found_rows: std::sync::atomic::AtomicBool::new(false),
             cancel: Arc::new(elyra_core::cancel::QueryCancel::new()),
             identity: Mutex::new(crate::sessfn::Identity::default()),
             definer_depth: std::sync::atomic::AtomicUsize::new(0),
@@ -598,6 +603,20 @@ impl Session {
     pub fn set_row_count(&self, n: i64) {
         self.row_count
             .store(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether the client asked for found rows (`CLIENT_FOUND_ROWS`) when it
+    /// connected. Django, Rails' mysql2 and Connector/J do by default, and
+    /// read an UPDATE's count as "the row exists": MySQL then counts a row
+    /// the UPDATE matched but left as it was, and so must this.
+    pub fn client_found_rows(&self) -> bool {
+        self.client_found_rows
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn set_client_found_rows(&self, on: bool) {
+        self.client_found_rows
+            .store(on, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// The shared lock manager (engine-wide).

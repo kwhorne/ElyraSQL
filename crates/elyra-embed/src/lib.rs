@@ -442,10 +442,14 @@ impl std::fmt::Debug for Connection {
 /// and any future helper share one definition of "materialised".
 async fn materialise(result: elyra_engine::QueryResult) -> Result<Outcome> {
     match result {
-        elyra_engine::QueryResult::Affected(n) => Ok(Outcome::Affected(n)),
+        elyra_engine::QueryResult::Affected(n)
+        | elyra_engine::QueryResult::AffectedInfo {
+            affected_rows: n, ..
+        } => Ok(Outcome::Affected(n)),
         elyra_engine::QueryResult::Insert {
             affected_rows,
             last_insert_id,
+            ..
         } => Ok(Outcome::Insert {
             affected_rows,
             last_insert_id,

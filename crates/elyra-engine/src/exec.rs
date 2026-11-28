@@ -3992,7 +3992,10 @@ async fn create_table_as(
     let affected = rows.len() as u64;
     db.commit_write(puts, table_trigger_keys(db, name).await?)
         .await?;
-    Ok(QueryResult::Affected(affected))
+    Ok(QueryResult::AffectedInfo {
+        affected_rows: affected,
+        info: records_info(affected, 0),
+    })
 }
 
 /// TRUNCATE TABLE: remove all rows and index entries, reset counters.
@@ -5924,6 +5927,7 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
         .ok_or_else(|| Error::Unsupported("INSERT without VALUES is not supported".into()))?;
     // Rows come either from `VALUES (...)` (literal expressions, evaluated
     // here) or from `INSERT ... SELECT` (executed through the query engine).
+    let mut from_select = false;
     let rows: Vec<Vec<Value>> = match source_rows(source)? {
         Some(expr_rows) => {
             let mut out = Vec::with_capacity(expr_rows.len());
@@ -5941,8 +5945,15 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
             }
             out
         }
-        None => run_subquery(db, vindex, source).await?,
+        None => {
+            from_select = true;
+            run_subquery(db, vindex, source).await?
+        }
     };
+    // MySQL's OK info ("Records: 3  Duplicates: 1  Warnings: 0") comes with
+    // an INSERT of several rows or from a SELECT; one row's VALUES has none.
+    let records = rows.len() as u64;
+    let with_info = from_select || records > 1;
 
     // Upsert mode: REPLACE INTO, INSERT IGNORE, ON DUPLICATE KEY UPDATE.
     let replace = ins.replace_into;
@@ -6053,6 +6064,11 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
 
     let mut deletes: Vec<Vec<u8>> = Vec::new();
     let mut affected: u64 = 0;
+    // Rows written as new, and `ON DUPLICATE KEY UPDATE` rows that landed on
+    // an existing row and changed it or left it as it was.
+    let mut new_rows: u64 = 0;
+    let mut dup_changed: u64 = 0;
+    let mut dup_unchanged: u64 = 0;
     // PK rows coalesce by clustered key so within-statement duplicates merge;
     // rowid rows are always fresh inserts.
     let mut batch: Vec<(Vec<u8>, Vec<Value>)> = Vec::new();
@@ -6292,6 +6308,11 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
         new_puts.sort_unstable_by(|left, right| left.0.cmp(&right.0));
         aux_puts.sort_unstable_by(|left, right| left.0.cmp(&right.0));
         let affected = built.len() as u64;
+        let info = if with_info {
+            records_info(records, 0)
+        } else {
+            String::new()
+        };
         db.raw_db()
             .commit_insert(new_puts, aux_puts, Vec::new())
             .await?;
@@ -6312,6 +6333,7 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
                     .find_map(|(_, row)| stored_auto_id(row))
                     .unwrap_or(0)
             },
+            info,
         });
     }
 
@@ -6330,6 +6352,7 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
         if !clustered_conflicts {
             batch.push((key, row));
             affected += 1;
+            new_rows += 1;
             continue;
         }
 
@@ -6341,6 +6364,11 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
             } else if on_dup {
                 let previous = batch[pos].1.clone();
                 batch[pos].1 = apply_dup(&previous, &row)?;
+                if previous == batch[pos].1 {
+                    dup_unchanged += 1;
+                } else {
+                    dup_changed += 1;
+                }
                 affected += updated_row_count(&previous, &batch[pos].1);
             } else if !ignore {
                 return Err(Error::Duplicate(
@@ -6372,6 +6400,11 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
             affected += if replace {
                 replaced_row_count(&old_row, &new_row)
             } else {
+                if old_row == new_row {
+                    dup_unchanged += 1;
+                } else {
+                    dup_changed += 1;
+                }
                 updated_row_count(&old_row, &new_row)
             };
             pos_of.insert(key.clone(), batch.len());
@@ -6380,8 +6413,28 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
             pos_of.insert(key.clone(), batch.len());
             batch.push((key, row));
             affected += 1;
+            new_rows += 1;
         }
     }
+    // A row `ON DUPLICATE KEY UPDATE` left as it was counts 0, or 1 for a
+    // client with `CLIENT_FOUND_ROWS`, as in MySQL.
+    let found_rows = db.client_found_rows();
+    if found_rows {
+        affected += dup_unchanged;
+    }
+    // "Duplicates": the rows REPLACE deleted, the rows IGNORE left out, or
+    // the existing rows `ON DUPLICATE KEY UPDATE` changed -- and, with found
+    // rows, those it left as they were, though not from a SELECT: MySQL's
+    // INSERT ... SELECT counts only the changed ones either way.
+    let duplicates = if replace {
+        affected.saturating_sub(records)
+    } else if ignore {
+        records.saturating_sub(new_rows + dup_changed)
+    } else if found_rows && !from_select {
+        dup_changed + dup_unchanged
+    } else {
+        dup_changed
+    };
     // Enforce unique secondary indexes for plain INSERT on the slow path
     // (transactions, rowid tables) where writer-side detection is not used.
     if !replace && !on_dup && !ignore && index::has_unique(&def) {
@@ -6431,6 +6484,11 @@ pub async fn insert(db: &Session, vindex: &VectorRegistry, ins: Insert) -> Resul
                 .rev()
                 .find_map(|(_, row)| stored_auto_id(row))
                 .unwrap_or(0)
+        },
+        info: if with_info {
+            records_info(records, duplicates)
+        } else {
+            String::new()
         },
     })
 }
@@ -16358,7 +16416,36 @@ pub async fn update(
     for (triggers, schema, old_row, new_row) in &writes.after {
         queue_after(db, triggers, schema, Some(new_row), Some(old_row))?;
     }
-    Ok(QueryResult::Affected(writes.affected))
+    Ok(update_result(db, writes.matched, writes.affected))
+}
+
+/// An UPDATE's OK: the rows it changed, or with `CLIENT_FOUND_ROWS` the rows
+/// it matched, and MySQL's "Rows matched: 2  Changed: 1  Warnings: 0".
+fn update_result(db: &Session, matched: u64, changed: u64) -> QueryResult {
+    QueryResult::AffectedInfo {
+        affected_rows: if db.client_found_rows() {
+            matched
+        } else {
+            changed
+        },
+        info: format!("Rows matched: {matched}  Changed: {changed}  Warnings: 0"),
+    }
+}
+
+/// MySQL's OK info for an INSERT or REPLACE of several rows or from a SELECT,
+/// and for an ALTER TABLE. Warnings are always 0: none are recorded (`SHOW
+/// WARNINGS` is empty), so none can be counted.
+pub(crate) fn records_info(records: u64, duplicates: u64) -> String {
+    format!("Records: {records}  Duplicates: {duplicates}  Warnings: 0")
+}
+
+/// MySQL's OK info for `LOAD DATA`: the rows read from the file, and those
+/// not loaded.
+pub(crate) fn load_data_info(records: u64, loaded: u64) -> String {
+    format!(
+        "Records: {records}  Deleted: 0  Skipped: {}  Warnings: 0",
+        records.saturating_sub(loaded)
+    )
 }
 
 /// An expression evaluated per row -- an UPDATE's assigned value, a `JOIN ...
@@ -16616,13 +16703,15 @@ struct UpdateWrites {
     deletes: Vec<Vec<u8>>,
     /// Tables whose write counters move.
     wcounts: Vec<String>,
-    /// MySQL reports *changed* rows, not matched rows: an UPDATE that assigns
-    /// a column the value it already had reports 0. (With CLIENT_FOUND_ROWS a
-    /// client asks for matched rows instead, but that capability is not
-    /// negotiated here, so the changed-row count is always the right answer.
-    /// If it is ever honoured, this and the upsert counts in `insert` become
-    /// conditional.)
+    /// Rows the UPDATE changed: one that assigns a column the value it already
+    /// had is not counted. MySQL reports this, unless the client asked for
+    /// found rows (see `matched`).
     affected: u64,
+    /// Rows the UPDATE matched, changed or not: "Rows matched" in MySQL's OK
+    /// info, and the count itself for a client with `CLIENT_FOUND_ROWS`. A row
+    /// `UPDATE IGNORE` leaves as it was after an error still counts, as in
+    /// MySQL.
+    matched: u64,
     /// AFTER UPDATE triggers to queue once the write commits.
     after: Vec<AfterUpdate>,
 }
@@ -16650,6 +16739,7 @@ async fn stage_row_updates(
     ignore: bool,
     writes: &mut UpdateWrites,
 ) -> Result<()> {
+    writes.matched += changes.len() as u64;
     // Stored generated columns are recomputed after each update.
     let generated: Vec<(usize, Expr)> = if def.has_col_meta() {
         let mut v = Vec::new();
@@ -17692,7 +17782,7 @@ async fn multi_update(
     for (triggers, schema, old_row, new_row) in &writes.after {
         queue_after(db, triggers, schema, Some(new_row), Some(old_row))?;
     }
-    Ok(QueryResult::Affected(writes.affected))
+    Ok(update_result(db, writes.matched, writes.affected))
 }
 
 /// Multi-table DELETE: `DELETE t1 FROM t1 JOIN t2 ON ... WHERE ...`.
@@ -23678,7 +23768,9 @@ async fn run_subquery_capped(
             }
             Ok(rows)
         }
-        QueryResult::Affected(_) | QueryResult::Insert { .. } => Ok(Vec::new()),
+        QueryResult::Affected(_)
+        | QueryResult::Insert { .. }
+        | QueryResult::AffectedInfo { .. } => Ok(Vec::new()),
     }
 }
 
@@ -24042,9 +24134,9 @@ async fn materialize_query_result(result: QueryResult) -> Result<(Schema, Vec<Ve
             }
             Ok((schema, rows))
         }
-        QueryResult::Affected(_) | QueryResult::Insert { .. } => {
-            Ok((Schema::new(Vec::new()), Vec::new()))
-        }
+        QueryResult::Affected(_)
+        | QueryResult::Insert { .. }
+        | QueryResult::AffectedInfo { .. } => Ok((Schema::new(Vec::new()), Vec::new())),
     }
 }
 

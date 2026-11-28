@@ -77,16 +77,50 @@ pub enum QueryResult {
     Rows(RowStream),
     /// A statement that changed state; carries affected row count.
     Affected(u64),
-    /// An INSERT result, including the statement-local ID for the OK packet.
+    /// An INSERT result, including the statement-local ID for the OK packet,
+    /// and the info text MySQL sends with an INSERT of several rows or from a
+    /// SELECT ("Records: 3  Duplicates: 0  Warnings: 0"; empty otherwise).
     Insert {
         affected_rows: u64,
         last_insert_id: u64,
+        info: String,
     },
+    /// A statement that changed state, with the info text MySQL's OK packet
+    /// carries besides the count: an UPDATE's "Rows matched: 2  Changed: 1
+    /// Warnings: 0", an ALTER TABLE's "Records: 0  Duplicates: 0  Warnings: 0".
+    AffectedInfo { affected_rows: u64, info: String },
+}
+
+/// An ALTER TABLE's OK, with the info MySQL sends for one: "Records: 0
+/// Duplicates: 0  Warnings: 0". MySQL counts the rows a copying ALTER wrote;
+/// none of this server's ALTERs report rows, so it is 0 here.
+fn with_records_info(r: QueryResult) -> QueryResult {
+    match r {
+        QueryResult::Affected(n) => QueryResult::AffectedInfo {
+            affected_rows: n,
+            info: exec::records_info(n, 0),
+        },
+        other => other,
+    }
 }
 
 impl QueryResult {
     pub fn empty_ok() -> Self {
         QueryResult::Affected(0)
+    }
+
+    /// The rows a statement affected, or `None` for a result set.
+    pub fn affected_rows(&self) -> Option<u64> {
+        match self {
+            QueryResult::Rows(_) => None,
+            QueryResult::Affected(n)
+            | QueryResult::Insert {
+                affected_rows: n, ..
+            }
+            | QueryResult::AffectedInfo {
+                affected_rows: n, ..
+            } => Some(*n),
+        }
     }
 
     /// One column, one row — used for `SELECT 1`, `@@version`, etc.
@@ -508,10 +542,7 @@ impl Engine {
                                         ctx.results.push((rows.schema.clone(), all));
                                         0
                                     }
-                                    QueryResult::Affected(n)
-                                    | QueryResult::Insert {
-                                        affected_rows: n, ..
-                                    } => n,
+                                    other => other.affected_rows().unwrap_or(0),
                                 };
                             }
                         }
@@ -1396,9 +1427,10 @@ impl Engine {
                 }
                 MysqlRename::Index { table, old, new } => {
                     let table = exec::stored_table_ident(sess, &table)?;
-                    exec::rename_index(sess, &table, &old, &new).await?
+                    with_records_info(exec::rename_index(sess, &table, &old, &new).await?)
                 }
             };
+            sess.set_row_count(0);
             return Ok(vec![result]);
         }
 
@@ -1414,7 +1446,8 @@ impl Engine {
                     exec::drop_foreign_key(sess, &table, &drop.name).await?
                 }
             };
-            return Ok(vec![result]);
+            sess.set_row_count(0);
+            return Ok(vec![with_records_info(result)]);
         }
 
         // BACKUP [DATABASE] TO '<path>' — hot, consistent copy of the whole
@@ -1464,9 +1497,9 @@ impl Engine {
                 .map(|c| c.trim().trim_matches(['`', '"']).to_string())
                 .filter(|c| !c.is_empty())
                 .collect();
-            return Ok(vec![
-                exec::create_fulltext_index(sess, &name, &table, &cols).await?,
-            ]);
+            let result = exec::create_fulltext_index(sess, &name, &table, &cols).await?;
+            sess.set_row_count(0);
+            return Ok(vec![with_records_info(result)]);
         }
 
         // CREATE TABLE ... PARTITION BY ... — sqlparser doesn't parse MySQL
@@ -1559,22 +1592,22 @@ impl Engine {
             // parse -- and one at a time, so a large file never exists as
             // statements all at once.
             let mut total = 0u64;
+            let mut records = 0u64;
             for rows in exec::load_batches(&spec, &content, 50_000) {
+                records += rows.len() as u64;
                 let stmt = exec::load_insert(&spec, rows)?;
                 for r in self
                     .run_statements(vec![stmt], privilege, user, sess, None, None, None)
                     .await?
                 {
-                    match r {
-                        QueryResult::Affected(n)
-                        | QueryResult::Insert {
-                            affected_rows: n, ..
-                        } => total += n,
-                        QueryResult::Rows(_) => {}
-                    }
+                    total += r.affected_rows().unwrap_or(0);
                 }
             }
-            return Ok(vec![QueryResult::Affected(total)]);
+            sess.set_row_count(total as i64);
+            return Ok(vec![QueryResult::AffectedInfo {
+                affected_rows: total,
+                info: exec::load_data_info(records, total),
+            }]);
         }
 
         // FLUSH: mysqldump --lock-all-tables opens with `FLUSH /*!40101 LOCAL
@@ -2471,13 +2504,7 @@ impl Engine {
             drop(retry_gates);
             // Track ROW_COUNT(): rows changed by DML, or -1 after a result set
             // (matches MySQL).
-            match &r {
-                QueryResult::Affected(n) => sess.set_row_count(*n as i64),
-                QueryResult::Insert { affected_rows, .. } => {
-                    sess.set_row_count(*affected_rows as i64)
-                }
-                QueryResult::Rows(_) => sess.set_row_count(-1),
-            }
+            sess.set_row_count(r.affected_rows().map_or(-1, |n| n as i64));
             out.push(r);
         }
         Ok(out)
@@ -2693,10 +2720,17 @@ impl Engine {
                 or_replace,
                 ..
             } => exec::create_view(sess, &name, &columns, &query, or_replace).await,
-            Statement::CreateIndex(ci) => exec::create_index(sess, ci).await,
+            Statement::CreateIndex(ci) => exec::create_index(sess, ci).await.map(with_records_info),
             Statement::AlterTable {
                 name, operations, ..
-            } => exec::alter_table(sess, &name, &operations).await,
+            } => {
+                let r = exec::alter_table(sess, &name, &operations).await?;
+                // A rename alone answers without MySQL's info, as MySQL's does.
+                Ok(match operations.as_slice() {
+                    [sqlparser::ast::AlterTableOperation::RenameTable { .. }] => r,
+                    _ => with_records_info(r),
+                })
+            }
             Statement::Insert(ins) => {
                 let r = exec::insert(sess, &self.vindex, ins).await?;
                 self.fire_triggers(sess).await?;
@@ -9491,7 +9525,16 @@ mod load_data_engine_tests {
         )
         .await;
         std::fs::remove_file(&path).unwrap();
-        assert!(matches!(res[..], [QueryResult::Affected(3)]));
+        match &res[..] {
+            [QueryResult::AffectedInfo {
+                affected_rows,
+                info,
+            }] => {
+                assert_eq!(*affected_rows, 3);
+                assert_eq!(info, "Records: 3  Deleted: 0  Skipped: 0  Warnings: 0");
+            }
+            _ => panic!("LOAD DATA should answer with its row count and info"),
+        }
         assert_eq!(
             rows(
                 &engine,
@@ -10486,10 +10529,11 @@ mod transaction_scan_after_write_tests {
     }
 
     async fn affected(engine: &Engine, session: &Session, sql: &str) -> u64 {
-        match run(engine, session, sql).await.remove(0) {
-            QueryResult::Affected(n) => n,
-            _ => panic!("expected an affected-row count for {sql}"),
-        }
+        run(engine, session, sql)
+            .await
+            .remove(0)
+            .affected_rows()
+            .unwrap_or_else(|| panic!("expected an affected-row count for {sql}"))
     }
 
     #[tokio::test]

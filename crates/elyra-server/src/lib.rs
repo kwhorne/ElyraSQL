@@ -655,6 +655,8 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for ElyraShim {
 
         let privilege = self.privilege();
         let user = self.user();
+        self.session
+            .set_client_found_rows(results.client_found_rows());
         self.procs.begin_query(self.conn_id, &sql);
         let start = std::time::Instant::now();
         // The statement as parsed at prepare time, with the parameters put in
@@ -755,6 +757,8 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for ElyraShim {
         }
         let privilege = self.privilege();
         let user = self.user();
+        self.session
+            .set_client_found_rows(results.client_found_rows());
         self.procs.begin_query(self.conn_id, query);
         let start = std::time::Instant::now();
         let res =
@@ -907,12 +911,27 @@ async fn write_outcomes<W: AsyncWrite + Send + Unpin>(
         Some(QueryResult::Insert {
             affected_rows,
             last_insert_id,
+            info,
         }) => {
             results
                 .completed(OkResponse {
                     affected_rows,
                     last_insert_id,
                     status_flags,
+                    info,
+                    ..Default::default()
+                })
+                .await
+        }
+        Some(QueryResult::AffectedInfo {
+            affected_rows,
+            info,
+        }) => {
+            results
+                .completed(OkResponse {
+                    affected_rows,
+                    status_flags,
+                    info,
                     ..Default::default()
                 })
                 .await
@@ -945,13 +964,10 @@ async fn write_call_outcomes<W: AsyncWrite + Send + Unpin>(
             )
             .await;
     }
-    let affected_rows = match outcomes.pop() {
-        Some(QueryResult::Affected(n))
-        | Some(QueryResult::Insert {
-            affected_rows: n, ..
-        }) => n,
-        _ => 0,
-    };
+    let affected_rows = outcomes
+        .pop()
+        .and_then(|last| last.affected_rows())
+        .unwrap_or(0);
     let columns: Vec<Vec<Column>> = outcomes
         .iter()
         .map(|outcome| match outcome {
@@ -970,13 +986,10 @@ async fn write_call_outcomes<W: AsyncWrite + Send + Unpin>(
                 }
                 rw.finish_one_with_status(status_flags).await?
             }
-            QueryResult::Affected(n)
-            | QueryResult::Insert {
-                affected_rows: n, ..
-            } => {
+            other => {
                 writer
                     .complete_one(OkResponse {
-                        affected_rows: n,
+                        affected_rows: other.affected_rows().unwrap_or(0),
                         status_flags,
                         ..Default::default()
                     })
