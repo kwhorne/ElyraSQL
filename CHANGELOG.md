@@ -6,6 +6,18 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **JSON functions kept dropping text that is not ASCII.** The JSON parser
+  copied a string one byte at a time, and each byte of a character outside
+  ASCII failed to decode on its own and was dropped: `JSON_EXTRACT`, `->`
+  and `->>` of `"Blåbær"` gave `"Blbr"`, `JSON_KEYS('{"ø": 1}')` gave `[""]`,
+  and `JSON_SET`, `JSON_INSERT`, `JSON_REPLACE` and `JSON_REMOVE` wrote the
+  document back without those characters -- so `UPDATE t SET j =
+  JSON_SET(j, ...)` lost them for good. Stored JSON a function did not
+  rewrite is intact. A `\uXXXX` surrogate pair (`\ud83d\ude00`, an emoji)
+  is read as the one character it is; it was refused.
+
 ## [1.13.9] - 2026-11-28
 
 MySQL compatibility fixes: found rows for Django and other ORMs, table options

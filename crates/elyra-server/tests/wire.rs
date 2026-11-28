@@ -17313,3 +17313,54 @@ async fn duplicate_keys_are_named_as_mysql_names_them() {
     );
     check("long value", &want, err);
 }
+
+/// Text in a JSON string that is not ASCII survives the JSON functions. The
+/// parser copied a string one byte at a time and dropped each byte of a
+/// multi-byte character: `JSON_EXTRACT` of "Blåbær" gave "Blbr", and
+/// `JSON_SET` wrote the document back without them, losing them for good.
+#[tokio::test]
+async fn json_functions_keep_text_that_is_not_ascii() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop("CREATE TABLE jn (id INT PRIMARY KEY, j JSON)")
+        .await
+        .unwrap();
+    c.query_drop(
+        r#"INSERT INTO jn VALUES (1, '{"navn": "Blåbær", "ø": "Ærlig talt", "e": "😀"}')"#,
+    )
+    .await
+    .unwrap();
+    let row: (String, String, i64, String) = c
+        .query_first(
+            "SELECT JSON_EXTRACT(j, '$.navn'), j->>'$.ø', \
+             JSON_CONTAINS(JSON_KEYS(j), '\"ø\"'), j->>'$.e' FROM jn",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row,
+        (
+            "\"Blåbær\"".to_string(),
+            "Ærlig talt".to_string(),
+            1,
+            "😀".to_string()
+        )
+    );
+    // Written back through a JSON function, the text is all still there.
+    c.query_drop("UPDATE jn SET j = JSON_SET(j, '$.n', 1) WHERE id = 1")
+        .await
+        .unwrap();
+    let (navn, o): (String, String) = c
+        .query_first("SELECT j->>'$.navn', j->>'$.ø' FROM jn")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((navn.as_str(), o.as_str()), ("Blåbær", "Ærlig talt"));
+    let found: i64 = c
+        .query_first(r#"SELECT COUNT(*) FROM jn WHERE JSON_CONTAINS(j, '"Blåbær"', '$.navn')"#)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(found, 1);
+}
