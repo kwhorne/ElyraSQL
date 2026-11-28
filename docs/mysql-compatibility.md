@@ -32,7 +32,7 @@ drivers connect without modification.
   Warnings: 0` after an UPDATE, `Records: 3  Duplicates: 0  Warnings: 0` after
   an INSERT of several rows or from a SELECT, a REPLACE or an ALTER TABLE —
   which the `mysql` client prints under "Query OK".
-- **Handshake** — reports a MySQL-looking version, e.g. `8.0.12-ElyraSQL-1.13.10`,
+- **Handshake** — reports a MySQL-looking version, e.g. `8.0.12-ElyraSQL-1.13.11`,
   and answers the session/introspection queries clients send on connect
   (`SELECT @@version_comment`, `SELECT VERSION()`, `SET ...`,
   `SHOW VARIABLES/STATUS/COLLATION/DATABASES/TABLE STATUS`, and the

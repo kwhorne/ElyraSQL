@@ -17,6 +17,16 @@ ElyraSQL release builds target **Ubuntu 24.04+** and **Apple Silicon macOS
     done, so an interrupted upgrade simply resumes on the next start. **Take a backup
     first, and note that downgrading to 1.4.x afterwards is not supported.**
 
+!!! note "Upgrading to 1.13.11"
+
+    No change to the database file; a 1.13.10 database opens in 1.13.11
+    unchanged, and no configuration changes. A JSON column now stores and
+    returns MySQL's normal form (`{"b":1,"a":2}` reads back as
+    `{"a": 2, "b": 1}`, `1.50` in JSON text as `1.5`). Rows stored before keep
+    their text until written again; `UPDATE t SET j = CAST(j AS CHAR)` brings
+    them to the normal form. An application that compared JSON column text
+    with the text it inserted should compare the values instead.
+
 !!! note "Upgrading to 1.13.10"
 
     No change to the database file; a 1.13.9 database opens in 1.13.10
@@ -982,8 +992,8 @@ macOS).
 Multi-arch image (`amd64` + `arm64`) on the GitHub Container Registry:
 
 ```bash
-docker pull ghcr.io/kwhorne/elyrasql:1.13.10   # or :latest
-docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.13.10
+docker pull ghcr.io/kwhorne/elyrasql:1.13.11   # or :latest
+docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.13.11
 ```
 
 The image is ~15 MB, runs as a non-root user, stores data in the

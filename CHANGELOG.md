@@ -6,6 +6,11 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.13.11] - 2026-11-28
+
+JSON columns store and return JSON in MySQL's normal form, and
+`JSON_CONTAINS` compares numbers by value.
+
 ### Changed
 
 - **A JSON column stores and returns JSON as MySQL does.** MySQL keeps a JSON
@@ -28,6 +33,17 @@ All notable changes to ElyraSQL are documented here. The format is based on
 - **`JSON_CONTAINS` compared numbers as text.** `JSON_CONTAINS('[1.0]', '1')`
   and `JSON_CONTAINS('{"n": 1.0}', '{"n": 1}')` were 0; numbers now compare
   by value, so they are 1, as in MySQL.
+
+### Upgrading
+
+- No change to the database file; a 1.13.10 database opens in 1.13.11
+  unchanged.
+- No configuration changes.
+- JSON read from a JSON column now comes back in MySQL's normal form rather
+  than as it was written. Rows stored before keep their text until written
+  again; `UPDATE t SET j = CAST(j AS CHAR)` brings them to the normal form.
+  An application that compared the column's text with the text it inserted
+  should compare the values instead (`JSON_CONTAINS`, `->>`).
 
 ## [1.13.10] - 2026-11-28
 
