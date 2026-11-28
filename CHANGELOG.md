@@ -6,6 +6,10 @@ All notable changes to ElyraSQL are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.13.10] - 2026-11-28
+
+JSON functions no longer drop characters outside ASCII.
+
 ### Fixed
 
 - **JSON functions kept dropping text that is not ASCII.** The JSON parser
@@ -17,6 +21,17 @@ All notable changes to ElyraSQL are documented here. The format is based on
   JSON_SET(j, ...)` lost them for good. Stored JSON a function did not
   rewrite is intact. A `\uXXXX` surrogate pair (`\ud83d\ude00`, an emoji)
   is read as the one character it is; it was refused.
+
+### Upgrading
+
+- No change to the database file; a 1.13.9 database opens in 1.13.10
+  unchanged.
+- No configuration changes.
+- JSON that a function wrote back before this release (`UPDATE ... SET j =
+  JSON_SET(j, ...)`, `JSON_INSERT`, `JSON_REPLACE`, `JSON_REMOVE`) lost its
+  characters outside ASCII then; upgrading cannot bring them back. To find
+  rows that may be affected, compare with a backup or the source of the
+  data. JSON inserted as text and never rewritten by a function is intact.
 
 ## [1.13.9] - 2026-11-28
 
