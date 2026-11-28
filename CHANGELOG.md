@@ -67,6 +67,17 @@ All notable changes to ElyraSQL are documented here. The format is based on
 - A non-ASCII character among `ALTER TABLE` specifications or after a
   `CREATE TABLE`'s column list no longer panics the table-option parser
   (which, in a release build, stopped the server).
+- **A duplicate key names its key and value, as MySQL's 1062 does.** An
+  INSERT that broke any unique key said `Duplicate entry for key 'PRIMARY'`,
+  an UPDATE `Duplicate entry for a unique key`, and each began with a
+  `duplicate entry: ` of ours; code that reads which key was hit from the
+  message -- `users_email_unique`, which field is taken -- found the wrong one
+  or none. Every path now gives MySQL 8.4's text, word for word: `Duplicate
+  entry 'a@x' for key 'users.users_email_unique'`, the key's columns joined by
+  `-` and cut to 64 characters -- INSERT (in and out of a transaction, from
+  VALUES or a SELECT), UPDATE, tables without a primary key, `ALTER TABLE ...
+  ADD PRIMARY KEY` and `ADD UNIQUE`. A duplicate column name (1060) reads
+  `Duplicate column name 'a'`, as in MySQL.
 
 ## [1.13.8] - 2026-11-27
 
