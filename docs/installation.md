@@ -17,6 +17,15 @@ ElyraSQL release builds target **Ubuntu 24.04+** and **Apple Silicon macOS
     done, so an interrupted upgrade simply resumes on the next start. **Take a backup
     first, and note that downgrading to 1.4.x afterwards is not supported.**
 
+!!! note "Upgrading to 1.13.10"
+
+    No change to the database file; a 1.13.9 database opens in 1.13.10
+    unchanged, and no configuration changes. JSON functions no longer drop
+    characters outside ASCII (`"Blåbær"` came out `"Blbr"`). JSON a function
+    already wrote back (`UPDATE ... SET j = JSON_SET(j, ...)`) lost them
+    then, and upgrading cannot bring them back; JSON inserted as text and
+    never rewritten by a function is intact.
+
 !!! note "Upgrading to 1.13.9"
 
     No change to the database file; a 1.13.8 database opens in 1.13.9
@@ -973,8 +982,8 @@ macOS).
 Multi-arch image (`amd64` + `arm64`) on the GitHub Container Registry:
 
 ```bash
-docker pull ghcr.io/kwhorne/elyrasql:1.13.9   # or :latest
-docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.13.9
+docker pull ghcr.io/kwhorne/elyrasql:1.13.10   # or :latest
+docker run -p 3307:3307 -v elyra:/var/lib/elyrasql ghcr.io/kwhorne/elyrasql:1.13.10
 ```
 
 The image is ~15 MB, runs as a non-root user, stores data in the
