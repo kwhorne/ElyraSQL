@@ -1423,17 +1423,25 @@ impl Engine {
                 require_privilege(privilege, PrivilegedAction::AlterTable)?;
                 let table =
                     exec::stored_table_ident(sess, &mysql_table_name_fragment(&alter.table)?)?;
+                // As for any ALTER, the table must exist (1146).
+                catalog::load(sess, &table).await?;
+                // The table's collation first: a column the same statement
+                // adds takes it, as in MySQL.
+                if let Some(collation) = alter.options.collation {
+                    exec::set_table_collation(sess, &table, collation).await?;
+                }
                 let mut out = match &alter.rest {
                     Some(rest) => Box::pin(self.execute_as(rest, privilege, user, sess)).await?,
-                    None => {
-                        // As for any ALTER, the table must exist (1146).
-                        catalog::load(sess, &table).await?;
-                        vec![QueryResult::AffectedInfo {
-                            affected_rows: 0,
-                            info: exec::records_info(0, 0),
-                        }]
-                    }
+                    None => vec![QueryResult::AffectedInfo {
+                        affected_rows: 0,
+                        info: exec::records_info(0, 0),
+                    }],
                 };
+                // After the other specifications, so the columns they add
+                // are converted too.
+                if let Some(collation) = alter.options.convert {
+                    exec::convert_table_collation(sess, &table, collation).await?;
+                }
                 self.apply_table_options(
                     &alter.table,
                     &table,
@@ -1461,8 +1469,11 @@ impl Engine {
         // then they are applied -- unless IF NOT EXISTS found the table there.
         if head.starts_with("create") {
             if let Some(stripped) = strip_create_table_options(trimmed) {
+                let column_list = stripped
+                    .strip_suffix(EXACT_TABLE_COLLATION)
+                    .unwrap_or(&stripped);
                 if let Some((name, if_not_exists, options)) =
-                    tableopts::create_table(trimmed, &stripped)
+                    tableopts::create_table(trimmed, column_list)
                 {
                     let table = exec::stored_table_ident(sess, &mysql_table_name_fragment(&name)?)?;
                     let existed = if_not_exists && catalog::exists(sess, &table).await?;
@@ -6689,9 +6700,22 @@ fn strip_create_table_options(sql: &str) -> Option<String> {
     if tail_up.contains("PARTITION") || tail_up.contains("SELECT") || tail_up.starts_with("LIKE") {
         return None;
     }
-    // Everything after the column list is table options -> drop it.
-    Some(sql[..=close].to_string())
+    // Everything after the column list is table options -> drop it, but for
+    // the table's collation when it compares exactly: written back in the one
+    // spelling the parser reads, it reaches the columns (see `create_table`).
+    let exact = tableopts::parse(tail)
+        .and_then(|options| options.collation)
+        .is_some_and(|collation| collation == elyra_core::Collation::Bin);
+    Some(if exact {
+        format!("{}{EXACT_TABLE_COLLATION}", &sql[..=close])
+    } else {
+        sql[..=close].to_string()
+    })
 }
+
+/// The table option `strip_create_table_options` keeps for a table whose
+/// collation compares exactly.
+const EXACT_TABLE_COLLATION: &str = " COLLATE=utf8mb4_bin";
 
 /// Strip MySQL key-part prefix lengths from inline `CREATE TABLE` indexes.
 ///

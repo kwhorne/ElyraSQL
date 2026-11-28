@@ -43,6 +43,30 @@ All notable changes to ElyraSQL are documented here. The format is based on
   does, `information_schema.TABLES` and `SHOW TABLE STATUS` show the comment,
   and `SHOW TABLE STATUS` the counter. The comment follows the table through
   `RENAME` and `CREATE TABLE ... LIKE`, and goes with `DROP`.
+- **A table's collation reaches its columns.** `CREATE TABLE ...
+  COLLATE=utf8mb4_bin` (or `CHARSET=binary`) was dropped with the other table
+  options, so its text columns compared case-insensitively: `WHERE s = 'A'`
+  matched `'a'`, and a UNIQUE key or a text primary key refused `'A'` next to
+  `'a'`. As in MySQL, a text column (CHAR, VARCHAR, TEXT, ENUM, SET) that
+  names neither a collation nor a character set now takes the table's, at
+  CREATE TABLE and when ALTER TABLE adds or redefines it; `ALTER TABLE ...
+  COLLATE` changes the table's for those, and `ALTER TABLE ... CONVERT TO
+  CHARACTER SET cs [COLLATE c]` converts every text column. `SHOW CREATE
+  TABLE` writes a column's `COLLATE utf8mb4_bin` and the table's
+  `DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin`, which a dump left out, and
+  `information_schema` / `SHOW TABLE STATUS` show the table's collation. A
+  JSON column has no collation in `information_schema.COLUMNS`, as in MySQL.
+  Tables created before keep their columns as they are; `CONVERT TO` gives
+  them the table's collation.
+- **A collation change that breaks a UNIQUE key is refused.** `ALTER TABLE ...
+  MODIFY s ... COLLATE utf8mb4_0900_ai_ci` on a unique column holding `'a'`
+  and `'A'` went through: the rebuilt index kept one entry for both rows, and
+  a lookup by that value found only one of them. It is now MySQL's 1062,
+  `Duplicate entry 'A' for key 't.us'`, and nothing changes; `CONVERT TO`
+  checks the same way.
+- A non-ASCII character among `ALTER TABLE` specifications or after a
+  `CREATE TABLE`'s column list no longer panics the table-option parser
+  (which, in a release build, stopped the server).
 
 ## [1.13.8] - 2026-11-27
 

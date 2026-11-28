@@ -16973,3 +16973,209 @@ async fn create_table_keeps_its_counter_and_comment() {
     let gone: String = c.query_first(comment("ct2")).await.unwrap().unwrap();
     assert_eq!(gone, "");
 }
+
+/// A table's collation reaches its text columns, as in MySQL 8.4 (every value
+/// below taken from it): `CREATE TABLE ... COLLATE=utf8mb4_bin` was dropped
+/// with the other table options, so its columns compared case-insensitively
+/// -- `WHERE s = 'A'` matched 'a', and a UNIQUE key or a text primary key
+/// refused 'A' next to 'a'.
+#[tokio::test]
+async fn a_tables_collation_reaches_its_columns() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    async fn collations(c: &mut mysql_async::Conn, table: &str) -> Vec<(String, Option<String>)> {
+        c.exec(
+            "SELECT COLUMN_NAME, COLLATION_NAME FROM information_schema.COLUMNS \
+             WHERE TABLE_NAME = ? ORDER BY ORDINAL_POSITION",
+            (table,),
+        )
+        .await
+        .unwrap()
+    }
+    let bin = Some("utf8mb4_bin".to_string());
+    let ai = Some("utf8mb4_0900_ai_ci".to_string());
+
+    c.query_drop(
+        "CREATE TABLE tb (k VARCHAR(10) PRIMARY KEY, s VARCHAR(10), e ENUM('a','A'), \
+         own VARCHAR(10) COLLATE utf8mb4_0900_ai_ci, cs VARCHAR(10) CHARACTER SET utf8mb4, \
+         j JSON, n INT, UNIQUE KEY us (s)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        collations(&mut c, "tb").await,
+        vec![
+            ("k".into(), bin.clone()),
+            ("s".into(), bin.clone()),
+            ("e".into(), bin.clone()),
+            // Its own COLLATE, or its own CHARACTER SET's default, wins.
+            ("own".into(), ai.clone()),
+            ("cs".into(), ai.clone()),
+            // JSON has no collation in MySQL.
+            ("j".into(), None),
+            ("n".into(), None),
+        ]
+    );
+    let table: String = c
+        .query_first(
+            "SELECT TABLE_COLLATION FROM information_schema.TABLES WHERE TABLE_NAME = 'tb'",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(table, "utf8mb4_bin");
+    // 'a' and 'A' are two values, in the key and in the UNIQUE index.
+    c.query_drop("INSERT INTO tb (k, s, own) VALUES ('a', 'a', 'a'), ('A', 'A', 'x')")
+        .await
+        .unwrap();
+    let exact: i64 = c
+        .query_first("SELECT COUNT(*) FROM tb WHERE s = 'A'")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(exact, 1);
+    let folded: i64 = c
+        .query_first("SELECT COUNT(*) FROM tb WHERE own = 'A'")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(folded, 1);
+
+    // ALTER sets the table's collation for what comes after: a column the
+    // same statement adds takes it, the existing ones keep theirs, and a
+    // non-key text column redefined without a collation takes it.
+    c.query_drop("CREATE TABLE ta (id INT PRIMARY KEY, s VARCHAR(10)) CHARSET=utf8mb4")
+        .await
+        .unwrap();
+    c.query_drop(
+        "ALTER TABLE ta DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin, ADD COLUMN v VARCHAR(10)",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        collations(&mut c, "ta").await,
+        vec![
+            ("id".into(), None),
+            ("s".into(), ai.clone()),
+            ("v".into(), bin.clone())
+        ]
+    );
+    c.query_drop("ALTER TABLE ta MODIFY s VARCHAR(20)")
+        .await
+        .unwrap();
+    assert_eq!(collations(&mut c, "ta").await[1], ("s".into(), bin.clone()));
+    // LIKE copies it; DROP takes it away with the table.
+    c.query_drop("CREATE TABLE tl LIKE ta").await.unwrap();
+    c.query_drop("ALTER TABLE tl ADD COLUMN w VARCHAR(10)")
+        .await
+        .unwrap();
+    assert_eq!(collations(&mut c, "tl").await[3], ("w".into(), bin.clone()));
+    c.query_drop("DROP TABLE tl").await.unwrap();
+    c.query_drop("CREATE TABLE tl (w VARCHAR(10))")
+        .await
+        .unwrap();
+    assert_eq!(collations(&mut c, "tl").await[0], ("w".into(), ai.clone()));
+
+    // SHOW CREATE TABLE writes both back, and replaying it gives them back.
+    let (_, ddl): (String, String) = c
+        .query_first("SHOW CREATE TABLE ta")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(ddl.contains("`s` VARCHAR(20) COLLATE utf8mb4_bin"), "{ddl}");
+    assert!(
+        ddl.ends_with(") DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin"),
+        "{ddl}"
+    );
+    c.query_drop("DROP TABLE ta").await.unwrap();
+    c.query_drop(ddl.as_str()).await.unwrap();
+    c.query_drop("ALTER TABLE ta ADD COLUMN x VARCHAR(10)")
+        .await
+        .unwrap();
+    assert_eq!(
+        collations(&mut c, "ta").await,
+        vec![
+            ("id".into(), None),
+            ("s".into(), bin.clone()),
+            ("v".into(), bin.clone()),
+            ("x".into(), bin.clone())
+        ]
+    );
+}
+
+/// `ALTER TABLE ... CONVERT TO CHARACTER SET` converts every text column and
+/// the table, as in MySQL. A collation change that leaves a UNIQUE index with
+/// two rows of one value is MySQL's 1062 and changes nothing -- `MODIFY ...
+/// COLLATE` used to go through, keep one entry for both rows, and lose the
+/// other from lookups by that value.
+#[tokio::test]
+async fn converting_a_tables_collation_checks_its_unique_keys() {
+    let srv = TestServer::start().await;
+    let mut c = srv.conn().await;
+    c.query_drop(
+        "CREATE TABLE cv (id INT PRIMARY KEY, s VARCHAR(10), t TEXT, j JSON, UNIQUE KEY us (s))",
+    )
+    .await
+    .unwrap();
+    c.query_drop("INSERT INTO cv VALUES (1, 'a', 'a', NULL)")
+        .await
+        .unwrap();
+    c.query_drop("ALTER TABLE cv CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_bin")
+        .await
+        .unwrap();
+    let rows: Vec<(String, Option<String>)> = c
+        .query(
+            "SELECT COLUMN_NAME, COLLATION_NAME FROM information_schema.COLUMNS \
+             WHERE TABLE_NAME = 'cv' ORDER BY ORDINAL_POSITION",
+        )
+        .await
+        .unwrap();
+    let bin = Some("utf8mb4_bin".to_string());
+    assert_eq!(
+        rows,
+        vec![
+            ("id".into(), None),
+            ("s".into(), bin.clone()),
+            ("t".into(), bin.clone()),
+            ("j".into(), None)
+        ]
+    );
+    c.query_drop("INSERT INTO cv VALUES (2, 'A', 'A', NULL)")
+        .await
+        .unwrap();
+
+    // Back to case-insensitive: 'a' and 'A' collide in `us`.
+    for sql in [
+        "ALTER TABLE cv CONVERT TO CHARACTER SET utf8mb4",
+        "ALTER TABLE cv MODIFY s VARCHAR(10) COLLATE utf8mb4_0900_ai_ci",
+    ] {
+        match c.query_drop(sql).await.unwrap_err() {
+            mysql_async::Error::Server(e) => {
+                assert_eq!(e.code, 1062, "{sql}");
+                assert!(
+                    e.message.contains("Duplicate entry 'A' for key 'cv.us'"),
+                    "{}",
+                    e.message
+                );
+            }
+            other => panic!("{sql}: expected 1062, got {other:?}"),
+        }
+        // Both rows are still found by their value.
+        let ids: Vec<i64> = c
+            .query("SELECT id FROM cv WHERE s = 'a' OR s = 'A' ORDER BY id")
+            .await
+            .unwrap();
+        assert_eq!(ids, vec![1, 2], "{sql}");
+    }
+    // Without the collision it goes through.
+    c.query_drop("DELETE FROM cv WHERE id = 2").await.unwrap();
+    c.query_drop("ALTER TABLE cv CONVERT TO CHARACTER SET utf8mb4")
+        .await
+        .unwrap();
+    let found: i64 = c
+        .query_first("SELECT id FROM cv WHERE s = 'A'")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(found, 1);
+}
